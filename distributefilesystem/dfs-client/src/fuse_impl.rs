@@ -1,8 +1,8 @@
 use anyhow::Result;
 use dfs_common::{ChunkId, FileMetadata, FileType};
 use fuser::{
-    FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEntry, Request as FuseRequest,
+    FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEntry, Request as FuseRequest,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -345,6 +345,536 @@ impl Filesystem for DfsFilesystem {
             }
             Err(e) => {
                 error!("Failed to read directory {}: {}", path, e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn create(
+        &mut self,
+        _req: &FuseRequest,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        debug!("create: parent={}, name={:?}, mode={:o}", parent, name, mode);
+
+        let path = match self.get_path_from_parent(parent, name) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Create file metadata
+        let metadata = FileMetadata {
+            id: dfs_common::FileId::new(),
+            path: path.clone(),
+            size: 0,
+            chunks: Vec::new(),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            modified_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            mode,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            file_type: FileType::RegularFile,
+        };
+
+        // Store metadata on cluster
+        let client = self.client.clone();
+        let metadata_clone = metadata.clone();
+        let result = self.runtime.block_on(async {
+            client.put_file_metadata(&metadata_clone).await
+        });
+
+        match result {
+            Ok(_) => {
+                // Allocate inode
+                let ino = self.get_or_create_inode(&path);
+
+                // Cache metadata
+                self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
+
+                // Convert to FUSE attr
+                let attr = self.metadata_to_attr(ino, &metadata);
+                // ReplyCreate expects: ttl, attr, generation, fh, flags
+                reply.created(&Duration::from_secs(1), &attr, 0, 0, 0);
+            }
+            Err(e) => {
+                error!("Failed to create file {}: {}", path, e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        debug!("write: ino={}, offset={}, size={}", ino, offset, data.len());
+
+        let mut metadata = {
+            let cache = self.metadata_cache.read().unwrap();
+            match cache.get(&ino) {
+                Some(m) => m.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+        };
+
+        if metadata.file_type != FileType::RegularFile {
+            reply.error(libc::EISDIR);
+            return;
+        }
+
+        // Read existing data if we're writing to middle of file
+        let client = self.client.clone();
+        let existing_data = if !metadata.chunks.is_empty() {
+            let chunk_ids = metadata.chunks.clone();
+            match self.runtime.block_on(async {
+                client.read_data(&chunk_ids).await
+            }) {
+                Ok(data) => data,
+                Err(e) => {
+                    error!("Failed to read existing data: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Merge new data with existing
+        let offset = offset as usize;
+        let mut new_data = existing_data;
+
+        // Extend if necessary
+        if offset + data.len() > new_data.len() {
+            new_data.resize(offset + data.len(), 0);
+        }
+
+        // Write new data at offset
+        new_data[offset..offset + data.len()].copy_from_slice(data);
+
+        // Write to cluster
+        let result = self.runtime.block_on(async {
+            client.write_data(&new_data).await
+        });
+
+        match result {
+            Ok(chunk_ids) => {
+                // Update metadata
+                metadata.chunks = chunk_ids;
+                metadata.size = new_data.len() as u64;
+                metadata.modified_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                // Store updated metadata
+                let metadata_clone = metadata.clone();
+                let update_result = self.runtime.block_on(async {
+                    client.put_file_metadata(&metadata_clone).await
+                });
+
+                match update_result {
+                    Ok(_) => {
+                        // Update cache
+                        self.metadata_cache.write().unwrap().insert(ino, metadata);
+                        reply.written(data.len() as u32);
+                    }
+                    Err(e) => {
+                        error!("Failed to update metadata: {}", e);
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to write data: {}", e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &FuseRequest,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        debug!("mkdir: parent={}, name={:?}, mode={:o}", parent, name, mode);
+
+        let path = match self.get_path_from_parent(parent, name) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Create directory metadata
+        let metadata = FileMetadata {
+            id: dfs_common::FileId::new(),
+            path: path.clone(),
+            size: 0,
+            chunks: Vec::new(),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            modified_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            mode,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            file_type: FileType::Directory,
+        };
+
+        // Store metadata on cluster
+        let client = self.client.clone();
+        let metadata_clone = metadata.clone();
+        let result = self.runtime.block_on(async {
+            client.put_file_metadata(&metadata_clone).await
+        });
+
+        match result {
+            Ok(_) => {
+                // Allocate inode
+                let ino = self.get_or_create_inode(&path);
+
+                // Cache metadata
+                self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
+
+                // Convert to FUSE attr
+                let attr = self.metadata_to_attr(ino, &metadata);
+                reply.entry(&Duration::from_secs(1), &attr, 0);
+            }
+            Err(e) => {
+                error!("Failed to create directory {}: {}", path, e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn unlink(&mut self, _req: &FuseRequest, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+        debug!("unlink: parent={}, name={:?}", parent, name);
+
+        let path = match self.get_path_from_parent(parent, name) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Delete file from cluster
+        let client = self.client.clone();
+        let result = self.runtime.block_on(async {
+            client.delete_file(&path).await
+        });
+
+        match result {
+            Ok(_) => {
+                // Remove from cache
+                if let Some(&ino) = self.path_to_inode.read().unwrap().get(&path) {
+                    self.metadata_cache.write().unwrap().remove(&ino);
+                }
+                self.path_to_inode.write().unwrap().remove(&path);
+
+                reply.ok();
+            }
+            Err(e) => {
+                error!("Failed to delete file {}: {}", path, e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rmdir(&mut self, _req: &FuseRequest, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+        debug!("rmdir: parent={}, name={:?}", parent, name);
+
+        let path = match self.get_path_from_parent(parent, name) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Check if directory is empty
+        let client = self.client.clone();
+        let path_clone = path.clone();
+        let result = self.runtime.block_on(async {
+            client.list_directory(&path_clone).await
+        });
+
+        match result {
+            Ok(entries) => {
+                if !entries.is_empty() {
+                    reply.error(libc::ENOTEMPTY);
+                    return;
+                }
+
+                // Delete directory
+                let delete_result = self.runtime.block_on(async {
+                    client.delete_file(&path).await
+                });
+
+                match delete_result {
+                    Ok(_) => {
+                        // Remove from cache
+                        if let Some(&ino) = self.path_to_inode.read().unwrap().get(&path) {
+                            self.metadata_cache.write().unwrap().remove(&ino);
+                        }
+                        self.path_to_inode.write().unwrap().remove(&path);
+
+                        reply.ok();
+                    }
+                    Err(e) => {
+                        error!("Failed to delete directory {}: {}", path, e);
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to check directory {}: {}", path, e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &FuseRequest,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!(
+            "rename: parent={}, name={:?} -> newparent={}, newname={:?}",
+            parent, name, newparent, newname
+        );
+
+        let old_path = match self.get_path_from_parent(parent, name) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let new_path = match self.get_path_from_parent(newparent, newname) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Get existing metadata
+        let client = self.client.clone();
+        let old_path_clone = old_path.clone();
+        let result = self.runtime.block_on(async {
+            client.get_file_metadata(&old_path_clone).await
+        });
+
+        match result {
+            Ok(Some(mut metadata)) => {
+                // Update path
+                metadata.path = new_path.clone();
+                metadata.modified_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                // Put new metadata
+                let metadata_clone = metadata.clone();
+                let put_result = self.runtime.block_on(async {
+                    client.put_file_metadata(&metadata_clone).await
+                });
+
+                match put_result {
+                    Ok(_) => {
+                        // Delete old metadata
+                        let delete_result = self.runtime.block_on(async {
+                            client.delete_file(&old_path).await
+                        });
+
+                        match delete_result {
+                            Ok(_) => {
+                                // Update cache
+                                if let Some(&old_ino) = self.path_to_inode.read().unwrap().get(&old_path) {
+                                    self.metadata_cache.write().unwrap().remove(&old_ino);
+                                }
+                                self.path_to_inode.write().unwrap().remove(&old_path);
+
+                                let new_ino = self.get_or_create_inode(&new_path);
+                                self.metadata_cache.write().unwrap().insert(new_ino, metadata);
+
+                                reply.ok();
+                            }
+                            Err(e) => {
+                                error!("Failed to delete old file {}: {}", old_path, e);
+                                reply.error(libc::EIO);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to create new file {}: {}", new_path, e);
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+            Ok(None) => {
+                reply.error(libc::ENOENT);
+            }
+            Err(e) => {
+                error!("Failed to get file metadata {}: {}", old_path, e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        debug!("setattr: ino={}, mode={:?}, uid={:?}, gid={:?}, size={:?}",
+               ino, mode, uid, gid, size);
+
+        let mut metadata = {
+            let cache = self.metadata_cache.read().unwrap();
+            match cache.get(&ino) {
+                Some(m) => m.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+        };
+
+        // Update attributes
+        if let Some(mode) = mode {
+            metadata.mode = mode;
+        }
+        if let Some(uid) = uid {
+            metadata.uid = uid;
+        }
+        if let Some(gid) = gid {
+            metadata.gid = gid;
+        }
+
+        // Handle truncate
+        if let Some(new_size) = size {
+            if new_size != metadata.size {
+                let client = self.client.clone();
+
+                // Read existing data
+                let existing_data = if !metadata.chunks.is_empty() {
+                    let chunk_ids = metadata.chunks.clone();
+                    match self.runtime.block_on(async {
+                        client.read_data(&chunk_ids).await
+                    }) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            error!("Failed to read existing data for truncate: {}", e);
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                // Resize data
+                let mut new_data = existing_data;
+                new_data.resize(new_size as usize, 0);
+
+                // Write back
+                let result = self.runtime.block_on(async {
+                    client.write_data(&new_data).await
+                });
+
+                match result {
+                    Ok(chunk_ids) => {
+                        metadata.chunks = chunk_ids;
+                        metadata.size = new_size;
+                    }
+                    Err(e) => {
+                        error!("Failed to write truncated data: {}", e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                }
+            }
+        }
+
+        metadata.modified_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Store updated metadata
+        let client = self.client.clone();
+        let metadata_clone = metadata.clone();
+        let result = self.runtime.block_on(async {
+            client.put_file_metadata(&metadata_clone).await
+        });
+
+        match result {
+            Ok(_) => {
+                // Update cache
+                self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
+
+                // Convert to FUSE attr
+                let attr = self.metadata_to_attr(ino, &metadata);
+                reply.attr(&Duration::from_secs(1), &attr);
+            }
+            Err(e) => {
+                error!("Failed to update attributes: {}", e);
                 reply.error(libc::EIO);
             }
         }

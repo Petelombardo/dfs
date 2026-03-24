@@ -1,4 +1,4 @@
-use crate::types::{ChunkId, FileId, FileMetadata, NodeId, NodeInfo};
+use crate::types::{ChunkId, ChunkLocation, FileId, FileMetadata, NodeId, NodeInfo};
 use serde::{Deserialize, Serialize};
 
 /// Messages exchanged between nodes
@@ -80,6 +80,38 @@ pub enum Request {
         data: Vec<u8>,
         checksum: [u8; 32],
     },
+
+    // Admin requests
+    /// Get cluster status
+    GetClusterStatus,
+
+    /// Get storage statistics
+    GetStorageStats,
+
+    /// Get healing status
+    GetHealingStatus,
+
+    /// Trigger manual scrub
+    TriggerScrub,
+
+    /// Enable healing
+    EnableHealing,
+
+    /// Disable healing
+    DisableHealing,
+
+    /// Trigger immediate healing check
+    TriggerHealing,
+
+    /// Get file information with chunk locations
+    GetFileInfo {
+        path: String,
+    },
+
+    /// Get chunk replica locations
+    GetChunkReplicas {
+        chunk_id: ChunkId,
+    },
 }
 
 /// Response types
@@ -114,6 +146,40 @@ pub enum Response {
     /// Chunk IDs response (for WriteFile)
     ChunkIds {
         chunk_ids: Vec<ChunkId>,
+    },
+
+    /// Cluster status response
+    ClusterStatus {
+        nodes: Vec<NodeInfo>,
+        total_nodes: usize,
+        healthy_nodes: usize,
+    },
+
+    /// Storage statistics response
+    StorageStats {
+        total_chunks: usize,
+        total_size: u64,
+        replication_factor: usize,
+        nodes_count: usize,
+    },
+
+    /// Healing status response
+    HealingStatus {
+        enabled: bool,
+        pending_count: usize,
+        last_check: u64,
+    },
+
+    /// File info with chunk locations
+    FileInfo {
+        metadata: FileMetadata,
+        chunk_locations: Vec<ChunkLocation>,
+    },
+
+    /// Chunk replicas response
+    ChunkReplicas {
+        chunk_id: ChunkId,
+        nodes: Vec<NodeId>,
     },
 
     /// Error response

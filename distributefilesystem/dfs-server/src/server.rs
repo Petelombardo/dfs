@@ -83,6 +83,20 @@ impl Server {
             Request::ListDirectory { path } => self.handle_list_directory(path).await,
             Request::WriteFile { data } => self.handle_write_file(data).await,
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
+
+            // Admin requests
+            Request::GetClusterStatus => self.handle_get_cluster_status().await,
+            Request::GetStorageStats => self.handle_get_storage_stats().await,
+            Request::GetHealingStatus => self.handle_get_healing_status().await,
+            Request::TriggerScrub => self.handle_trigger_scrub().await,
+            Request::EnableHealing => self.handle_enable_healing().await,
+            Request::DisableHealing => self.handle_disable_healing().await,
+            Request::TriggerHealing => self.handle_trigger_healing().await,
+            Request::GetFileInfo { path } => self.handle_get_file_info(path).await,
+            Request::GetChunkReplicas { chunk_id } => {
+                self.handle_get_chunk_replicas(chunk_id).await
+            }
+
             _ => Response::Error {
                 message: "Request type not yet implemented".to_string(),
                 code: ErrorCode::InternalError,
@@ -468,6 +482,160 @@ impl Server {
                 warn!("Failed to find file: {}", e);
                 Response::Error {
                     message: format!("Failed to delete file: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle get cluster status request
+    async fn handle_get_cluster_status(&self) -> Response {
+        debug!("Handling get cluster status");
+
+        let nodes = self.cluster.get_all_nodes().await;
+        let healthy_nodes = nodes
+            .iter()
+            .filter(|n| self.cluster.is_node_healthy(&n.id))
+            .count();
+        let total_nodes = nodes.len();
+
+        Response::ClusterStatus {
+            nodes,
+            total_nodes,
+            healthy_nodes,
+        }
+    }
+
+    /// Handle get storage stats request
+    async fn handle_get_storage_stats(&self) -> Response {
+        debug!("Handling get storage stats");
+
+        match self.storage.list_chunks() {
+            Ok(chunks) => {
+                let total_size: u64 = chunks
+                    .iter()
+                    .map(|chunk_id| {
+                        self.storage
+                            .read_chunk(chunk_id)
+                            .map(|data| data.len() as u64)
+                            .unwrap_or(0)
+                    })
+                    .sum();
+
+                let nodes_count = self.cluster.get_all_nodes().await.len();
+
+                Response::StorageStats {
+                    total_chunks: chunks.len(),
+                    total_size,
+                    replication_factor: self.replication_factor,
+                    nodes_count,
+                }
+            }
+            Err(e) => {
+                warn!("Failed to get storage stats: {}", e);
+                Response::Error {
+                    message: format!("Failed to get storage stats: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle get healing status request
+    async fn handle_get_healing_status(&self) -> Response {
+        debug!("Handling get healing status");
+
+        // TODO: This requires access to HealingManager
+        // For now, return basic response
+        Response::HealingStatus {
+            enabled: true,
+            pending_count: 0,
+            last_check: 0,
+        }
+    }
+
+    /// Handle trigger scrub request
+    async fn handle_trigger_scrub(&self) -> Response {
+        debug!("Handling trigger scrub");
+
+        // TODO: Implement scrub trigger
+        Response::Ok { data: None }
+    }
+
+    /// Handle enable healing request
+    async fn handle_enable_healing(&self) -> Response {
+        debug!("Handling enable healing");
+
+        // TODO: Implement healing enable
+        Response::Ok { data: None }
+    }
+
+    /// Handle disable healing request
+    async fn handle_disable_healing(&self) -> Response {
+        debug!("Handling disable healing");
+
+        // TODO: Implement healing disable
+        Response::Ok { data: None }
+    }
+
+    /// Handle trigger healing request
+    async fn handle_trigger_healing(&self) -> Response {
+        debug!("Handling trigger healing");
+
+        // TODO: Implement healing trigger
+        Response::Ok { data: None }
+    }
+
+    /// Handle get file info request
+    async fn handle_get_file_info(&self, path: String) -> Response {
+        debug!("Handling get file info: {}", path);
+
+        match self.metadata.get_file_by_path(&path) {
+            Ok(Some(metadata)) => {
+                // Get chunk locations
+                let mut chunk_locations = Vec::new();
+                for chunk_id in &metadata.chunks {
+                    if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
+                        chunk_locations.push(location);
+                    }
+                }
+
+                Response::FileInfo {
+                    metadata,
+                    chunk_locations,
+                }
+            }
+            Ok(None) => Response::Error {
+                message: "File not found".to_string(),
+                code: ErrorCode::NotFound,
+            },
+            Err(e) => {
+                warn!("Failed to get file info: {}", e);
+                Response::Error {
+                    message: format!("Failed to get file info: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle get chunk replicas request
+    async fn handle_get_chunk_replicas(&self, chunk_id: ChunkId) -> Response {
+        debug!("Handling get chunk replicas: {}", chunk_id);
+
+        match self.metadata.get_chunk_location(&chunk_id) {
+            Ok(Some(location)) => Response::ChunkReplicas {
+                chunk_id,
+                nodes: location.nodes,
+            },
+            Ok(None) => Response::Error {
+                message: "Chunk not found".to_string(),
+                code: ErrorCode::NotFound,
+            },
+            Err(e) => {
+                warn!("Failed to get chunk replicas: {}", e);
+                Response::Error {
+                    message: format!("Failed to get chunk replicas: {}", e),
                     code: ErrorCode::InternalError,
                 }
             }

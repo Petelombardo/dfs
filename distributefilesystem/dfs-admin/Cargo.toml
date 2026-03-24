@@ -9,6 +9,9 @@ license.workspace = true
 dfs-common = { path = "../dfs-common" }
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = "1.0"
 bincode = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

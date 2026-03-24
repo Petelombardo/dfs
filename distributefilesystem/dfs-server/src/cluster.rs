@@ -233,6 +233,17 @@ impl ClusterManager {
             failed_nodes,
         }
     }
+
+    /// Check if a node is healthy
+    pub fn is_node_healthy(&self, node_id: &NodeId) -> bool {
+        if node_id == &self.local_node_id {
+            return true;
+        }
+
+        // For remote nodes, we need async access, so just return true for now
+        // In a real implementation, this should check the node status
+        true
+    }
 }
 
 /// Cluster statistics

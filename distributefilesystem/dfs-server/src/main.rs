@@ -1,5 +1,6 @@
 mod chunker;
 mod cluster;
+mod healing;
 mod metadata;
 mod network;
 mod server;
@@ -124,29 +125,29 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     info!("  Listen address: {}", config.node.listen_addr);
 
     // Initialize storage
-    let storage = storage::ChunkStorage::new(config.storage.data_dir.clone())?;
+    let storage = std::sync::Arc::new(storage::ChunkStorage::new(config.storage.data_dir.clone())?);
     info!("✓ Chunk storage initialized");
 
     // Initialize metadata store
-    let metadata = metadata::MetadataStore::new(config.storage.metadata_dir.clone())?;
+    let metadata = std::sync::Arc::new(metadata::MetadataStore::new(config.storage.metadata_dir.clone())?);
     info!("✓ Metadata store initialized");
 
     // Initialize cluster manager
     let node_id = dfs_common::NodeId::new();
-    let cluster = cluster::ClusterManager::new(
+    let cluster = std::sync::Arc::new(cluster::ClusterManager::new(
         node_id,
         config.node.listen_addr,
         config.cluster.heartbeat_interval_secs,
         config.cluster.failure_timeout_secs,
-    );
+    ));
     info!("✓ Cluster manager initialized (Node ID: {})", node_id);
 
     // Create server instance
     let server = std::sync::Arc::new(server::Server::new(
-        storage,
-        metadata,
+        storage.clone(),
+        metadata.clone(),
         config.chunk_size_bytes(),
-        cluster,
+        cluster.clone(),
         config.replication.replication_factor,
     ));
     info!("✓ Server instance created");
@@ -154,6 +155,19 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     // Start failure detector
     server.cluster().start_failure_detector().await;
     info!("✓ Failure detector started");
+
+    // Start healing manager
+    let healing = std::sync::Arc::new(healing::HealingManager::new(
+        storage,
+        metadata,
+        cluster,
+        config.replication.replication_factor,
+        config.replication.healing_delay_secs,
+        config.replication.scrub_interval_hours,
+        config.replication.auto_heal,
+    ));
+    healing.clone().start().await;
+    info!("✓ Healing manager started");
 
     // Start network server
     let mut net_server = network::NetworkServer::new(config.node.listen_addr, server.clone());

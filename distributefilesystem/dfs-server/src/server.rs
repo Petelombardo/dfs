@@ -37,17 +37,17 @@ pub struct Server {
 impl Server {
     /// Create a new server instance
     pub fn new(
-        storage: ChunkStorage,
-        metadata: MetadataStore,
+        storage: Arc<ChunkStorage>,
+        metadata: Arc<MetadataStore>,
         chunk_size: usize,
-        cluster: ClusterManager,
+        cluster: Arc<ClusterManager>,
         replication_factor: usize,
     ) -> Self {
         Self {
-            storage: Arc::new(storage),
-            metadata: Arc::new(metadata),
+            storage,
+            metadata,
             chunker: Arc::new(Chunker::new(chunk_size)),
-            cluster: Arc::new(cluster),
+            cluster,
             client: Arc::new(NetworkClient::new()),
             replication_factor,
         }
@@ -374,12 +374,12 @@ mod tests {
         let temp_storage = TempDir::new().unwrap();
         let temp_metadata = TempDir::new().unwrap();
 
-        let storage = ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap();
-        let metadata = MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
 
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
-        let cluster = ClusterManager::new(node_id, addr, 10, 30);
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
         let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3);
 
@@ -399,12 +399,12 @@ mod tests {
         let temp_storage = TempDir::new().unwrap();
         let temp_metadata = TempDir::new().unwrap();
 
-        let storage = ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap();
-        let metadata = MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
 
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
-        let cluster = ClusterManager::new(node_id, addr, 10, 30);
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
         let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3);
 
@@ -438,12 +438,12 @@ mod tests {
         let temp_storage = TempDir::new().unwrap();
         let temp_metadata = TempDir::new().unwrap();
 
-        let storage = ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap();
-        let metadata = MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
 
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
-        let cluster = ClusterManager::new(node_id, addr, 10, 30);
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
         let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3);
 

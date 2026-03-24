@@ -1,28 +1,39 @@
 # DFS Implementation Progress
 
-## Current Status: **Setup Phase**
+## Current Status: **Phase 2 Complete - Starting Phase 3**
 
 ### Completed
 - [x] Architecture design discussion
 - [x] Design decisions finalized
 - [x] Project plan created
+- [x] Rust toolchain installed (v1.94.0)
+- [x] Cargo workspace created
+- [x] Core types and protocols defined
+- [x] Configuration system implemented
+- [x] Consistent hashing implemented
+- [x] Local chunk storage implemented
+- [x] Sled metadata database integrated
+- [x] File chunking/reassembly working
+- [x] Checksum verification (write-only, SBC-optimized)
+- [x] CLI commands (init, start, status)
+- [x] All tests passing (27/27)
 
 ### In Progress
-- [ ] Installing Rust toolchain
-- [ ] Creating initial project structure
+- [ ] Phase 3: Network Layer
 
 ### Next Steps
-1. Install Rust
-2. Create Cargo workspace
-3. Set up basic project structure
-4. Start Phase 1: Foundation
+1. Implement TCP server/client with tokio
+2. Binary protocol implementation
+3. Connection pooling
+4. Node-to-node RPC
+5. Heartbeat/gossip protocol
 
 ---
 
 ## Phase Completion
 
-- [ ] Phase 1: Foundation
-- [ ] Phase 2: Local Storage
+- [x] Phase 1: Foundation (✅ Complete - commit 84aff18)
+- [x] Phase 2: Local Storage (✅ Complete - commit d5bf1f7)
 - [ ] Phase 3: Network Layer
 - [ ] Phase 4: Distributed Operations
 - [ ] Phase 5: Replication & Healing
@@ -36,15 +47,22 @@
 
 ## Key Decisions Log
 
-**2026-03-24**
+**2026-03-24 (Initial Design)**
 - Language: Rust (for performance + safety)
 - Deployment: Native binaries (not containers)
-- Replication: Default 3 copies
+- Replication: Default 3 copies, quorum writes
 - Metadata: Sled embedded database
-- Network: TCP with binary protocol
+- Network: TCP with binary protocol (bincode)
 - Healing delay: 300 seconds
 - Data path: Configurable (default `/var/lib/dfs/data/`)
 - Metadata path: Configurable (default `/var/lib/dfs/metadata/`)
+
+**2026-03-24 (SBC Optimizations)**
+- Chunk size: 4MB (balanced for SBCs)
+- Virtual nodes: 100 (consistent hashing)
+- Checksum strategy: On write + scrubbing only (skip on read)
+- Connection limits: User-controlled via client count
+- Algorithm: Blake3 (ARM-optimized, SIMD-friendly)
 
 ---
 

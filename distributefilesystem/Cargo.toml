@@ -45,6 +45,7 @@ clap = { version = "4.5", features = ["derive"] }
 
 # FUSE
 fuser = "0.16"
+libc = "0.2"
 
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }

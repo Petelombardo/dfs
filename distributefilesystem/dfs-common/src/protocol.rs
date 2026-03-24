@@ -39,9 +39,14 @@ pub enum Request {
         chunk_id: ChunkId,
     },
 
-    /// Get file metadata
+    /// Get file metadata by file ID
     GetFileMetadata {
         file_id: FileId,
+    },
+
+    /// Get file metadata by path (for FUSE client)
+    GetFileMetadataByPath {
+        path: String,
     },
 
     /// Update file metadata
@@ -49,8 +54,23 @@ pub enum Request {
         metadata: FileMetadata,
     },
 
+    /// Put file metadata (create or update)
+    PutFileMetadata {
+        metadata: FileMetadata,
+    },
+
     /// List directory contents
     ListDirectory {
+        path: String,
+    },
+
+    /// Write file data (returns chunk IDs)
+    WriteFile {
+        data: Vec<u8>,
+    },
+
+    /// Delete file by path
+    DeleteFile {
         path: String,
     },
 
@@ -89,6 +109,11 @@ pub enum Response {
     /// Boolean response (for HasChunk, etc.)
     Bool {
         value: bool,
+    },
+
+    /// Chunk IDs response (for WriteFile)
+    ChunkIds {
+        chunk_ids: Vec<ChunkId>,
     },
 
     /// Error response

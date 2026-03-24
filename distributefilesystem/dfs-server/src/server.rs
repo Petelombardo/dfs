@@ -74,6 +74,15 @@ impl Server {
                 data,
                 checksum,
             } => self.handle_replicate_chunk(chunk_id, data, checksum).await,
+            Request::GetFileMetadataByPath { path } => {
+                self.handle_get_file_metadata_by_path(path).await
+            }
+            Request::PutFileMetadata { metadata } => {
+                self.handle_put_file_metadata(metadata).await
+            }
+            Request::ListDirectory { path } => self.handle_list_directory(path).await,
+            Request::WriteFile { data } => self.handle_write_file(data).await,
+            Request::DeleteFile { path } => self.handle_delete_file(path).await,
             _ => Response::Error {
                 message: "Request type not yet implemented".to_string(),
                 code: ErrorCode::InternalError,
@@ -360,6 +369,108 @@ impl Server {
                 size,
                 checksum: chunk_id.hash,
             })
+        }
+    }
+
+    /// Handle get file metadata by path request
+    async fn handle_get_file_metadata_by_path(&self, path: String) -> Response {
+        debug!("Handling get file metadata by path: {}", path);
+
+        match self.metadata.get_file_by_path(&path) {
+            Ok(Some(metadata)) => Response::FileMetadata { metadata },
+            Ok(None) => Response::Error {
+                message: "File not found".to_string(),
+                code: ErrorCode::NotFound,
+            },
+            Err(e) => {
+                warn!("Failed to get file metadata: {}", e);
+                Response::Error {
+                    message: format!("Failed to get file metadata: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle put file metadata request
+    async fn handle_put_file_metadata(&self, metadata: FileMetadata) -> Response {
+        debug!("Handling put file metadata: {}", metadata.path);
+
+        match self.metadata.put_file(&metadata) {
+            Ok(_) => Response::Ok { data: None },
+            Err(e) => {
+                warn!("Failed to put file metadata: {}", e);
+                Response::Error {
+                    message: format!("Failed to put file metadata: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle list directory request
+    async fn handle_list_directory(&self, path: String) -> Response {
+        debug!("Handling list directory: {}", path);
+
+        match self.metadata.list_directory(&path) {
+            Ok(entries) => Response::DirectoryListing { entries },
+            Err(e) => {
+                warn!("Failed to list directory: {}", e);
+                Response::Error {
+                    message: format!("Failed to list directory: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle write file request (client writes entire file)
+    async fn handle_write_file(&self, data: Vec<u8>) -> Response {
+        debug!("Handling write file: {} bytes", data.len());
+
+        match self.write_data(&data).await {
+            Ok(chunk_ids) => Response::ChunkIds { chunk_ids },
+            Err(e) => {
+                warn!("Failed to write file: {}", e);
+                Response::Error {
+                    message: format!("Failed to write file: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle delete file request
+    async fn handle_delete_file(&self, path: String) -> Response {
+        debug!("Handling delete file: {}", path);
+
+        // Get file metadata first to find chunks
+        match self.metadata.get_file_by_path(&path) {
+            Ok(Some(metadata)) => {
+                // Delete the file metadata
+                match self.metadata.delete_file(&metadata.id) {
+                    Ok(_) => Response::Ok { data: None },
+                    Err(e) => {
+                        warn!("Failed to delete file metadata: {}", e);
+                        Response::Error {
+                            message: format!("Failed to delete file: {}", e),
+                            code: ErrorCode::InternalError,
+                        }
+                    }
+                }
+                // Note: Chunk cleanup will be handled by garbage collection later
+            }
+            Ok(None) => Response::Error {
+                message: "File not found".to_string(),
+                code: ErrorCode::NotFound,
+            },
+            Err(e) => {
+                warn!("Failed to find file: {}", e);
+                Response::Error {
+                    message: format!("Failed to delete file: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
         }
     }
 }

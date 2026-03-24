@@ -9,6 +9,7 @@ license.workspace = true
 dfs-common = { path = "../dfs-common" }
 tokio = { workspace = true }
 fuser = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 anyhow = { workspace = true }

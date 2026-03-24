@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
-use dfs_common::{ChunkId, FileMetadata, Message, Request, Response};
+use dfs_common::{ChunkId, FileMetadata, Message, MessageEnvelope, Request, RequestId, Response};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Client for communicating with DFS cluster
 pub struct DfsClient {
@@ -68,9 +71,10 @@ impl DfsClient {
             .await
             .context("Failed to connect to node")?;
 
-        // Serialize message
-        let message = Message::Request(request);
-        let encoded = bincode::serialize(&message).context("Failed to serialize message")?;
+        // Create envelope with request ID
+        let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let envelope = MessageEnvelope::new(request_id, Message::Request(request));
+        let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
         // Send message with length prefix
         let len = encoded.len() as u32;
@@ -98,11 +102,11 @@ impl DfsClient {
             .await
             .context("Failed to read response")?;
 
-        // Deserialize response
-        let response_message: Message =
-            bincode::deserialize(&buf).context("Failed to deserialize response")?;
+        // Deserialize response envelope
+        let response_envelope = MessageEnvelope::from_bytes(&buf)
+            .context("Failed to deserialize response")?;
 
-        match response_message {
+        match response_envelope.message {
             Message::Response(response) => Ok(response),
             _ => anyhow::bail!("Expected Response message"),
         }

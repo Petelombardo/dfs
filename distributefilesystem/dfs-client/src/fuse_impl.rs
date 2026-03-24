@@ -79,6 +79,15 @@ impl DfsFilesystem {
         })
     }
 
+    /// Execute an async operation in a blocking context
+    /// Uses block_in_place to allow blocking within an async runtime
+    fn block_on<F, T>(&self, future: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::task::block_in_place(|| self.runtime.block_on(future))
+    }
+
     /// Convert FileMetadata to FUSE FileAttr
     fn metadata_to_attr(&self, ino: u64, metadata: &FileMetadata) -> FileAttr {
         let kind = match metadata.file_type {
@@ -172,7 +181,7 @@ impl Filesystem for DfsFilesystem {
 
         // Fetch from cluster
         let client = self.client.clone();
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.get_file_metadata(&path).await
         });
 
@@ -242,7 +251,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let chunk_ids = metadata.chunks.clone();
 
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.read_data(&chunk_ids).await
         });
 
@@ -293,7 +302,7 @@ impl Filesystem for DfsFilesystem {
         };
 
         let client = self.client.clone();
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.list_directory(&path).await
         });
 
@@ -393,7 +402,7 @@ impl Filesystem for DfsFilesystem {
         // Store metadata on cluster
         let client = self.client.clone();
         let metadata_clone = metadata.clone();
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.put_file_metadata(&metadata_clone).await
         });
 
@@ -451,7 +460,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let existing_data = if !metadata.chunks.is_empty() {
             let chunk_ids = metadata.chunks.clone();
-            match self.runtime.block_on(async {
+            match self.block_on(async {
                 client.read_data(&chunk_ids).await
             }) {
                 Ok(data) => data,
@@ -478,7 +487,7 @@ impl Filesystem for DfsFilesystem {
         new_data[offset..offset + data.len()].copy_from_slice(data);
 
         // Write to cluster
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.write_data(&new_data).await
         });
 
@@ -494,7 +503,7 @@ impl Filesystem for DfsFilesystem {
 
                 // Store updated metadata
                 let metadata_clone = metadata.clone();
-                let update_result = self.runtime.block_on(async {
+                let update_result = self.block_on(async {
                     client.put_file_metadata(&metadata_clone).await
                 });
 
@@ -559,7 +568,7 @@ impl Filesystem for DfsFilesystem {
         // Store metadata on cluster
         let client = self.client.clone();
         let metadata_clone = metadata.clone();
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.put_file_metadata(&metadata_clone).await
         });
 
@@ -595,7 +604,7 @@ impl Filesystem for DfsFilesystem {
 
         // Delete file from cluster
         let client = self.client.clone();
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.delete_file(&path).await
         });
 
@@ -630,7 +639,7 @@ impl Filesystem for DfsFilesystem {
         // Check if directory is empty
         let client = self.client.clone();
         let path_clone = path.clone();
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.list_directory(&path_clone).await
         });
 
@@ -642,7 +651,7 @@ impl Filesystem for DfsFilesystem {
                 }
 
                 // Delete directory
-                let delete_result = self.runtime.block_on(async {
+                let delete_result = self.block_on(async {
                     client.delete_file(&path).await
                 });
 
@@ -703,7 +712,7 @@ impl Filesystem for DfsFilesystem {
         // Get existing metadata
         let client = self.client.clone();
         let old_path_clone = old_path.clone();
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.get_file_metadata(&old_path_clone).await
         });
 
@@ -718,14 +727,14 @@ impl Filesystem for DfsFilesystem {
 
                 // Put new metadata
                 let metadata_clone = metadata.clone();
-                let put_result = self.runtime.block_on(async {
+                let put_result = self.block_on(async {
                     client.put_file_metadata(&metadata_clone).await
                 });
 
                 match put_result {
                     Ok(_) => {
                         // Delete old metadata
-                        let delete_result = self.runtime.block_on(async {
+                        let delete_result = self.block_on(async {
                             client.delete_file(&old_path).await
                         });
 
@@ -815,7 +824,7 @@ impl Filesystem for DfsFilesystem {
                 // Read existing data
                 let existing_data = if !metadata.chunks.is_empty() {
                     let chunk_ids = metadata.chunks.clone();
-                    match self.runtime.block_on(async {
+                    match self.block_on(async {
                         client.read_data(&chunk_ids).await
                     }) {
                         Ok(data) => data,
@@ -834,7 +843,7 @@ impl Filesystem for DfsFilesystem {
                 new_data.resize(new_size as usize, 0);
 
                 // Write back
-                let result = self.runtime.block_on(async {
+                let result = self.block_on(async {
                     client.write_data(&new_data).await
                 });
 
@@ -860,7 +869,7 @@ impl Filesystem for DfsFilesystem {
         // Store updated metadata
         let client = self.client.clone();
         let metadata_clone = metadata.clone();
-        let result = self.runtime.block_on(async {
+        let result = self.block_on(async {
             client.put_file_metadata(&metadata_clone).await
         });
 

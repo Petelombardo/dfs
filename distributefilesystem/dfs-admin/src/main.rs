@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dfs_common::{ChunkId, Message, Request, Response};
+use dfs_common::{ChunkId, Message, MessageEnvelope, Request, RequestId, Response};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{error, Level};
@@ -491,15 +492,18 @@ fn parse_chunk_id(s: &str) -> Result<ChunkId> {
     Ok(ChunkId::from_hash(hash))
 }
 
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 async fn send_request(addr: SocketAddr, request: Request) -> Result<Response> {
     // Connect to node
     let mut stream = TcpStream::connect(addr)
         .await
         .context("Failed to connect to cluster node")?;
 
-    // Serialize message
-    let message = Message::Request(request);
-    let encoded = bincode::serialize(&message).context("Failed to serialize message")?;
+    // Create envelope with request ID
+    let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let envelope = MessageEnvelope::new(request_id, Message::Request(request));
+    let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
     // Send message with length prefix
     let len = encoded.len() as u32;
@@ -528,11 +532,11 @@ async fn send_request(addr: SocketAddr, request: Request) -> Result<Response> {
         .await
         .context("Failed to read response")?;
 
-    // Deserialize response
-    let response_message: Message =
-        bincode::deserialize(&buf).context("Failed to deserialize response")?;
+    // Deserialize response envelope
+    let response_envelope = MessageEnvelope::from_bytes(&buf)
+        .context("Failed to deserialize response")?;
 
-    match response_message {
+    match response_envelope.message {
         Message::Response(response) => Ok(response),
         _ => anyhow::bail!("Expected Response message"),
     }

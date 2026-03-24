@@ -1,5 +1,7 @@
 mod chunker;
+mod cluster;
 mod metadata;
+mod network;
 mod storage;
 
 use anyhow::Result;
@@ -128,16 +130,38 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     let _metadata = metadata::MetadataStore::new(config.storage.metadata_dir.clone())?;
     info!("✓ Metadata store initialized");
 
+    // Initialize cluster manager
+    let node_id = dfs_common::NodeId::new();
+    let cluster = std::sync::Arc::new(cluster::ClusterManager::new(
+        node_id,
+        config.node.listen_addr,
+        config.cluster.heartbeat_interval_secs,
+        config.cluster.failure_timeout_secs,
+    ));
+    info!("✓ Cluster manager initialized (Node ID: {})", node_id);
+
+    // Start failure detector
+    cluster.clone().start_failure_detector().await;
+    info!("✓ Failure detector started");
+
+    // Start network server
+    let mut server = network::NetworkServer::new(config.node.listen_addr);
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = server.start().await {
+            tracing::error!("Network server error: {}", e);
+        }
+    });
+
     info!("");
     info!("DFS server is ready!");
     info!("Listening on: {}", config.node.listen_addr);
+    info!("Node ID: {}", node_id);
 
-    // TODO: Start network server in Phase 3
-    info!("Note: Network layer not yet implemented (Phase 3)");
-
-    // Keep running
+    // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
+
+    server_handle.abort();
 
     Ok(())
 }

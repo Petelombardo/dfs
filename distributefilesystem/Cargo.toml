@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "dfs-common",
+    "dfs-server",
+    "dfs-client",
+    "dfs-admin",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["DFS Contributors"]
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+toml = "0.8"
+
+# Embedded database
+sled = "0.34"
+
+# Hashing and crypto
+blake3 = "1.5"
+sha2 = "0.10"
+
+# Networking
+bytes = "1.9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# FUSE
+fuser = "0.16"
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }

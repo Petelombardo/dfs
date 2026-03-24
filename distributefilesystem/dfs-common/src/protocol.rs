@@ -1,0 +1,217 @@
+use crate::types::{ChunkId, FileId, FileMetadata, NodeId, NodeInfo};
+use serde::{Deserialize, Serialize};
+
+/// Messages exchanged between nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Message {
+    /// Request messages
+    Request(Request),
+
+    /// Response messages
+    Response(Response),
+
+    /// Cluster management messages
+    Cluster(ClusterMessage),
+}
+
+/// Request types sent between nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Request {
+    /// Read a chunk
+    ReadChunk {
+        chunk_id: ChunkId,
+    },
+
+    /// Write a chunk
+    WriteChunk {
+        chunk_id: ChunkId,
+        data: Vec<u8>,
+        checksum: [u8; 32],
+    },
+
+    /// Delete a chunk
+    DeleteChunk {
+        chunk_id: ChunkId,
+    },
+
+    /// Check if a chunk exists
+    HasChunk {
+        chunk_id: ChunkId,
+    },
+
+    /// Get file metadata
+    GetFileMetadata {
+        file_id: FileId,
+    },
+
+    /// Update file metadata
+    UpdateFileMetadata {
+        metadata: FileMetadata,
+    },
+
+    /// List directory contents
+    ListDirectory {
+        path: String,
+    },
+
+    /// Replicate a chunk to this node
+    ReplicateChunk {
+        chunk_id: ChunkId,
+        data: Vec<u8>,
+        checksum: [u8; 32],
+    },
+}
+
+/// Response types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Response {
+    /// Success with optional data
+    Ok {
+        data: Option<Vec<u8>>,
+    },
+
+    /// Success with chunk data
+    ChunkData {
+        chunk_id: ChunkId,
+        data: Vec<u8>,
+    },
+
+    /// Success with file metadata
+    FileMetadata {
+        metadata: FileMetadata,
+    },
+
+    /// Success with directory listing
+    DirectoryListing {
+        entries: Vec<FileMetadata>,
+    },
+
+    /// Boolean response (for HasChunk, etc.)
+    Bool {
+        value: bool,
+    },
+
+    /// Error response
+    Error {
+        message: String,
+        code: ErrorCode,
+    },
+}
+
+/// Error codes for protocol operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorCode {
+    NotFound,
+    AlreadyExists,
+    PermissionDenied,
+    IOError,
+    NetworkError,
+    ChecksumMismatch,
+    InvalidRequest,
+    InternalError,
+}
+
+/// Cluster management messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClusterMessage {
+    /// Heartbeat to indicate node is alive
+    Heartbeat {
+        node_info: NodeInfo,
+    },
+
+    /// Join cluster request
+    Join {
+        node_info: NodeInfo,
+    },
+
+    /// Leave cluster announcement
+    Leave {
+        node_id: NodeId,
+    },
+
+    /// Node failure detected
+    NodeFailed {
+        node_id: NodeId,
+    },
+
+    /// Node recovered
+    NodeRecovered {
+        node_id: NodeId,
+    },
+
+    /// Request cluster membership information
+    GetClusterInfo,
+
+    /// Cluster membership information
+    ClusterInfo {
+        nodes: Vec<NodeInfo>,
+    },
+
+    /// Metadata update broadcast (for consistency)
+    MetadataUpdate {
+        metadata: FileMetadata,
+        operation: MetadataOperation,
+    },
+}
+
+/// Type of metadata operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataOperation {
+    Create,
+    Update,
+    Delete,
+}
+
+/// Request ID for tracking request/response pairs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestId(pub u64);
+
+impl RequestId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// Message envelope with request ID for tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageEnvelope {
+    pub request_id: RequestId,
+    pub message: Message,
+}
+
+impl MessageEnvelope {
+    pub fn new(request_id: RequestId, message: Message) -> Self {
+        Self {
+            request_id,
+            message,
+        }
+    }
+
+    /// Serialize to bytes using bincode
+    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
+    }
+
+    /// Deserialize from bytes using bincode
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_message_serialization() {
+        let msg = Message::Request(Request::HasChunk {
+            chunk_id: ChunkId::from_hash([0u8; 32]),
+        });
+        let envelope = MessageEnvelope::new(RequestId::new(1), msg);
+
+        let bytes = envelope.to_bytes().unwrap();
+        let decoded = MessageEnvelope::from_bytes(&bytes).unwrap();
+
+        assert_eq!(envelope.request_id, decoded.request_id);
+    }
+}

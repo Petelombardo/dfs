@@ -2,6 +2,7 @@ mod chunker;
 mod cluster;
 mod metadata;
 mod network;
+mod server;
 mod storage;
 
 use anyhow::Result;
@@ -123,31 +124,41 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     info!("  Listen address: {}", config.node.listen_addr);
 
     // Initialize storage
-    let _storage = storage::ChunkStorage::new(config.storage.data_dir.clone())?;
+    let storage = storage::ChunkStorage::new(config.storage.data_dir.clone())?;
     info!("✓ Chunk storage initialized");
 
     // Initialize metadata store
-    let _metadata = metadata::MetadataStore::new(config.storage.metadata_dir.clone())?;
+    let metadata = metadata::MetadataStore::new(config.storage.metadata_dir.clone())?;
     info!("✓ Metadata store initialized");
 
     // Initialize cluster manager
     let node_id = dfs_common::NodeId::new();
-    let cluster = std::sync::Arc::new(cluster::ClusterManager::new(
+    let cluster = cluster::ClusterManager::new(
         node_id,
         config.node.listen_addr,
         config.cluster.heartbeat_interval_secs,
         config.cluster.failure_timeout_secs,
-    ));
+    );
     info!("✓ Cluster manager initialized (Node ID: {})", node_id);
 
+    // Create server instance
+    let server = std::sync::Arc::new(server::Server::new(
+        storage,
+        metadata,
+        config.chunk_size_bytes(),
+        cluster,
+        config.replication.replication_factor,
+    ));
+    info!("✓ Server instance created");
+
     // Start failure detector
-    cluster.clone().start_failure_detector().await;
+    server.cluster().start_failure_detector().await;
     info!("✓ Failure detector started");
 
     // Start network server
-    let mut server = network::NetworkServer::new(config.node.listen_addr);
+    let mut net_server = network::NetworkServer::new(config.node.listen_addr, server.clone());
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = server.start().await {
+        if let Err(e) = net_server.start().await {
             tracing::error!("Network server error: {}", e);
         }
     });

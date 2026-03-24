@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use bytes::{Buf, BufMut, BytesMut};
-use dfs_common::{Message, MessageEnvelope, RequestId};
+use bytes::{Buf, BytesMut};
+use dfs_common::{Message, MessageEnvelope, Request, RequestId, Response, ErrorCode, ClusterMessage};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -9,9 +9,22 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// Handler trait for processing messages
+pub trait MessageHandler: Send + Sync {
+    fn handle_request(
+        &self,
+        request: Request,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>>;
+
+    fn handle_cluster_message(
+        &self,
+        message: ClusterMessage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>>;
+}
+
 /// Network server for handling node-to-node communication
 /// Optimized for SBC environments (connection reuse, async I/O)
-pub struct NetworkServer {
+pub struct NetworkServer<H: MessageHandler> {
     /// Address to listen on
     listen_addr: SocketAddr,
 
@@ -20,15 +33,19 @@ pub struct NetworkServer {
 
     /// Shutdown signal
     shutdown_tx: Option<mpsc::Sender<()>>,
+
+    /// Message handler
+    handler: Arc<H>,
 }
 
-impl NetworkServer {
+impl<H: MessageHandler + 'static> NetworkServer<H> {
     /// Create a new network server
-    pub fn new(listen_addr: SocketAddr) -> Self {
+    pub fn new(listen_addr: SocketAddr, handler: Arc<H>) -> Self {
         Self {
             listen_addr,
             next_request_id: Arc::new(AtomicU64::new(1)),
             shutdown_tx: None,
+            handler,
         }
     }
 
@@ -49,8 +66,9 @@ impl NetworkServer {
                     match result {
                         Ok((stream, peer_addr)) => {
                             debug!("Accepted connection from {}", peer_addr);
+                            let handler = self.handler.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, peer_addr).await {
+                                if let Err(e) = handle_connection(stream, peer_addr, handler).await {
                                     error!("Connection error from {}: {}", peer_addr, e);
                                 }
                             });
@@ -86,7 +104,11 @@ impl NetworkServer {
 }
 
 /// Handle a single TCP connection
-async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr) -> Result<()> {
+async fn handle_connection<H: MessageHandler>(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    handler: Arc<H>,
+) -> Result<()> {
     let mut read_buf = BytesMut::with_capacity(8192); // 8KB buffer (SBC-friendly)
 
     loop {
@@ -99,7 +121,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr) -> Resu
                 );
 
                 // Process message and send response
-                let response = process_message(envelope).await;
+                let response = process_message(envelope, handler.clone()).await;
 
                 // Send response
                 if let Err(e) = write_message(&mut stream, &response).await {
@@ -177,18 +199,15 @@ async fn write_message(stream: &mut TcpStream, envelope: &MessageEnvelope) -> Re
 }
 
 /// Process a message and return response
-/// TODO: Wire up to actual storage/metadata in Phase 4
-async fn process_message(envelope: MessageEnvelope) -> MessageEnvelope {
-    use dfs_common::{ErrorCode, Response};
-
+async fn process_message<H: MessageHandler>(
+    envelope: MessageEnvelope,
+    handler: Arc<H>,
+) -> MessageEnvelope {
     let response = match envelope.message {
         Message::Request(req) => {
             debug!("Processing request: {:?}", req);
-            // TODO: Handle actual requests in Phase 4
-            Message::Response(Response::Error {
-                message: "Not yet implemented".to_string(),
-                code: ErrorCode::InternalError,
-            })
+            let response = handler.handle_request(req).await;
+            Message::Response(response)
         }
         Message::Response(_) => {
             warn!("Received response message on server - ignoring");
@@ -199,8 +218,8 @@ async fn process_message(envelope: MessageEnvelope) -> MessageEnvelope {
         }
         Message::Cluster(cluster_msg) => {
             debug!("Processing cluster message: {:?}", cluster_msg);
-            // TODO: Handle cluster messages in Phase 4
-            Message::Response(Response::Ok { data: None })
+            let response = handler.handle_cluster_message(cluster_msg).await;
+            Message::Response(response)
         }
     };
 
@@ -306,6 +325,29 @@ mod tests {
         assert_eq!(original.request_id, received.request_id);
     }
 
+    // Simple test handler
+    struct TestHandler;
+
+    impl MessageHandler for TestHandler {
+        fn handle_request(
+            &self,
+            _request: Request,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                Response::Bool { value: false }
+            })
+        }
+
+        fn handle_cluster_message(
+            &self,
+            _message: ClusterMessage,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                Response::Ok { data: None }
+            })
+        }
+    }
+
     #[tokio::test]
     async fn test_client_server() {
         // Start server
@@ -314,9 +356,10 @@ mod tests {
         let actual_addr = listener.local_addr().unwrap();
 
         // Spawn server task
+        let handler = Arc::new(TestHandler);
         tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer).await.ok();
+            handle_connection(stream, peer, handler).await.ok();
         });
 
         // Give server time to start
@@ -330,12 +373,12 @@ mod tests {
 
         let response = client.send_message(actual_addr, message).await.unwrap();
 
-        // Should get an error response (not implemented yet)
+        // Should get a Bool response from our test handler
         match response.message {
-            Message::Response(Response::Error { .. }) => {
-                // Expected
+            Message::Response(Response::Bool { value }) => {
+                assert!(!value);
             }
-            _ => panic!("Expected error response"),
+            _ => panic!("Expected Bool response"),
         }
     }
 }

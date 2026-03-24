@@ -1,6 +1,6 @@
 # DFS Implementation Progress
 
-## Current Status: **Phase 3 Complete - Ready for Phase 4**
+## Current Status: **Phase 4 Complete - Core DFS Functional!**
 
 ### Completed
 - [x] Architecture design discussion
@@ -20,17 +20,21 @@
 - [x] Binary protocol with message framing
 - [x] Cluster membership management
 - [x] Heartbeat-based failure detection
-- [x] All tests passing (23/23)
+- [x] Distributed write with quorum
+- [x] Distributed read with failover
+- [x] Chunk replication across nodes
+- [x] Request/cluster message handling
+- [x] All tests passing (26/26)
 
 ### In Progress
-- [ ] Phase 4: Distributed Operations
+- [ ] Phase 5: Replication & Healing
 
 ### Next Steps
-1. Wire network layer to storage/metadata
-2. Implement distributed write operations
-3. Implement distributed read operations
-4. Add quorum logic for durability
-5. Handle node failures gracefully
+1. Implement healing detection (under-replicated chunks)
+2. Add 300s delay timer before healing
+3. Implement re-replication logic
+4. Detect and cleanup over-replicated chunks
+5. Background scrubbing
 
 ---
 
@@ -39,6 +43,7 @@
 - [x] Phase 1: Foundation (✅ Complete - commit 84aff18)
 - [x] Phase 2: Local Storage (✅ Complete - commit d5bf1f7)
 - [x] Phase 3: Network Layer (✅ Complete - commit 554ae58)
+- [x] Phase 4: Distributed Operations (✅ Complete - commit 73233c0)
 - [ ] Phase 4: Distributed Operations
 - [ ] Phase 5: Replication & Healing
 - [ ] Phase 6: FUSE Client

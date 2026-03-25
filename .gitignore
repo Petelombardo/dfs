@@ -38,6 +38,3 @@ SESSION*.md
 TESTING_GUIDE.md
 TEST_REPORT.md
 config.example.toml
-
-# Scripts (deployment specific)
-scripts/

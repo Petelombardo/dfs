@@ -1,34 +1,40 @@
-# DFS - Distributed Filesystem
+# DFS - Distributed File System
 
-A high-performance, data-loss-resistant distributed filesystem built in Rust using FUSE.
+A high-performance distributed file system written in Rust with FUSE support, designed for reliability, scalability, and performance.
 
 ## Features
 
-- **High Performance**: Native Rust implementation with zero-cost abstractions
-- **Data Safety**: Configurable replication (default 3x) with checksums and automatic healing
-- **KISS Design**: Simple to deploy and manage - single binary, minimal configuration
-- **Automatic Healing**: Self-healing with configurable delay (default 300s) to handle reboots
-- **Consistent Hashing**: Balanced data distribution across nodes
-- **FUSE Integration**: Mount as a standard filesystem
-
-## Project Status
-
-🚧 **Under Active Development** - Phase 1 (Foundation) Complete
-
-See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full implementation roadmap.
+- **Distributed Storage**: Data is automatically distributed across multiple nodes using consistent hashing
+- **Replication**: Configurable replication factor (default RF=3) ensures data durability
+- **FUSE Mount**: Standard filesystem interface - mount as a regular directory
+- **Self-Healing**: Automatic data repair and rebalancing on node failures
+- **Cluster Resilience**: Persistent peer discovery allows nodes to rejoin after restart
+- **Chunk-based Storage**: Files are split into 4MB chunks with BLAKE3 hashing for integrity
+- **Performance**: Optimized read/write with caching and parallel operations
 
 ## Architecture
 
-- **dfs-server**: Storage node daemon
-- **dfs-client**: FUSE mount client
-- **dfs-admin**: Cluster administration tool
-- **dfs-common**: Shared library (types, protocol, hashing)
+### Components
+
+- **dfs-server**: Storage node daemon that stores and serves chunks
+- **dfs-client**: FUSE client for mounting the filesystem
+- **dfs-admin**: Administrative CLI for cluster management
+- **dfs-common**: Shared library with protocols and data structures
+
+### Key Technologies
+
+- Rust for memory safety and performance
+- Tokio async runtime for concurrent operations
+- FUSE for filesystem integration
+- Sled embedded database for metadata
+- BLAKE3 for cryptographic hashing
+- Bincode for efficient serialization
 
 ## Quick Start
 
 ### Prerequisites
 
-- Rust 1.94+ (install from https://rustup.rs)
+- Rust 1.70+ (`cargo` and `rustc`)
 - Linux with FUSE support
 
 ### Build
@@ -37,62 +43,129 @@ See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the full implementation roadmap.
 cargo build --release
 ```
 
-### Configuration
-
-1. Copy example config:
-```bash
-cp config.example.toml /etc/dfs/config.toml
-```
-
-2. Edit configuration:
-```bash
-# Customize paths, replication factor, etc.
-vim /etc/dfs/config.toml
-```
-
-### Running (Coming Soon)
+### Initialize a Node
 
 ```bash
-# Initialize first node
-dfs-server init --data-dir /mnt/storage
+# Initialize storage directories and config
+sudo dfs-server init \
+  --data-dir /var/lib/dfs/data \
+  --meta-dir /var/lib/dfs/metadata \
+  --config /etc/dfs/config.toml
 
-# Start server
-dfs-server start
-
-# Join additional nodes to cluster
-dfs-admin node add <node-ip>:8900
-
-# Mount filesystem
-dfs-client mount /mnt/dfs --cluster node1:8900,node2:8900
+# Edit config to set:
+# - listen_addr (e.g., "0.0.0.0:8900")
+# - seed_nodes (addresses of existing cluster nodes)
 ```
 
-## Design Decisions
-
-- **Chunk Size**: 4MB (configurable) - balanced for most workloads
-- **Replication**: Write to N nodes with quorum acknowledgment
-- **Metadata**: Sled embedded database (pure Rust, transactional)
-- **Network**: TCP with binary protocol (bincode serialization)
-- **Healing Delay**: 300 seconds to avoid premature data movement during reboots
-
-## Development
-
-### Run Tests
+### Start Server
 
 ```bash
-cargo test
+sudo dfs-server start --config /etc/dfs/config.toml
 ```
 
-### Check Code
+### Mount Client
 
 ```bash
-cargo clippy
-cargo fmt
+# Mount on a directory
+dfs-client mount /mnt/dfs --cluster 10.0.1.10:8900
+
+# Use the filesystem
+cd /mnt/dfs
+echo "Hello DFS" > test.txt
+cat test.txt
 ```
+
+## Configuration
+
+Example `/etc/dfs/config.toml`:
+
+```toml
+[node]
+listen_addr = "0.0.0.0:8900"
+
+[storage]
+data_dir = "/var/lib/dfs/data"
+metadata_dir = "/var/lib/dfs/metadata"
+chunk_size_mb = 4
+
+[replication]
+replication_factor = 3
+auto_heal = true
+healing_delay_secs = 30
+scrub_interval_hours = 24
+
+[cluster]
+heartbeat_interval_secs = 10
+failure_timeout_secs = 30
+seed_nodes = [
+    "10.0.1.10:8900",
+    "10.0.1.11:8900",
+    "10.0.1.12:8900"
+]
+```
+
+## Cluster Management
+
+```bash
+# View cluster status
+dfs-admin cluster status --config /etc/dfs/config.toml
+
+# List all nodes
+dfs-admin cluster nodes --config /etc/dfs/config.toml
+
+# Trigger healing check
+dfs-admin heal check --config /etc/dfs/config.toml
+
+# View storage statistics
+dfs-server status --config /etc/dfs/config.toml
+```
+
+## Development Status
+
+✅ **Completed Features**:
+- Core distributed storage engine
+- Consistent hashing for data placement
+- Chunk replication with quorum writes
+- FUSE filesystem interface
+- Heartbeat-based failure detection
+- Automatic healing and rebalancing
+- Persistent peer discovery
+- Read/write caching
+
+🚧 **In Progress**:
+- Performance optimizations (write throughput)
+- Admin CLI enhancements
+- Graceful node removal
+
+📋 **Planned**:
+- Encryption at rest and in transit
+- Authentication and authorization
+- Compression support
+- Web dashboard for monitoring
+- Metrics and alerting integration
+
+## Performance
+
+Current benchmarks on ARM64 (NanoPi R3) with GlusterFS backend:
+
+- **Read**: 23 MB/s (with chunk caching)
+- **Write**: 14-15 MB/s (investigating optimizations)
+
+## Documentation
+
+- [Cluster Rejoin Plan](CLUSTER-REJOIN-PLAN.md)
+- [Performance Investigation](PERFORMANCE-INVESTIGATION.md)
+- [Quick Start Guide](QUICK-START.md)
+- [Testing Guide](TESTING.md)
 
 ## Contributing
 
-See [PROJECT_PLAN.md](PROJECT_PLAN.md) for the development roadmap and current phase.
+Contributions welcome! This is an experimental project for learning distributed systems concepts.
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT
+
+## Author
+
+Built with assistance from Claude Code.

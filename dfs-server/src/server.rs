@@ -6,7 +6,7 @@ use crate::storage::ChunkStorage;
 use anyhow::{Context, Result};
 use dfs_common::{
     compute_chunk_hash, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileMetadata, Message,
-    NodeId, Request, Response,
+    NodeId, NodeInfo, Request, Response,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -983,6 +983,8 @@ impl MessageHandler for Server {
                 }
                 ClusterMessage::NodeJoined { node_info } => {
                     info!("Node {} joined the cluster (broadcast)", node_info.id);
+                    let new_node_addr = node_info.addr;
+
                     if let Err(e) = self.cluster.add_node(node_info).await {
                         warn!("Failed to add node from broadcast: {}", e);
                     }
@@ -992,6 +994,39 @@ impl MessageHandler for Server {
                     if let Err(e) = ClusterManager::save_persisted_peers(&peer_addrs, &self.metadata_dir).await {
                         warn!("Failed to save persisted peers after NodeJoined: {}", e);
                     }
+
+                    // Send our own announcement back to the new node for bidirectional discovery
+                    let local_node_id = self.cluster.local_node_id();
+                    let local_addr = self.cluster.local_addr();
+                    let our_node_info = NodeInfo::new(local_node_id, local_addr, None);
+
+                    tokio::spawn(async move {
+                        use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
+                        use dfs_common::types::NodeInfo;
+                        use tokio::io::AsyncWriteExt;
+                        use tokio::net::TcpStream;
+
+                        debug!("Sending reciprocal announcement to {}", new_node_addr);
+
+                        match TcpStream::connect(new_node_addr).await {
+                            Ok(mut stream) => {
+                                let announcement = ClusterMessage::NodeJoined {
+                                    node_info: our_node_info,
+                                };
+                                let request_id = RequestId::new(1);
+                                let envelope = MessageEnvelope::new(request_id, Message::Cluster(announcement));
+
+                                if let Ok(encoded) = envelope.to_bytes() {
+                                    let _ = stream.write_u32(encoded.len() as u32).await;
+                                    let _ = stream.write_all(&encoded).await;
+                                    debug!("Sent reciprocal announcement to {}", new_node_addr);
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to send reciprocal announcement to {}: {}", new_node_addr, e);
+                            }
+                        }
+                    });
 
                     Response::Ok { data: None }
                 }

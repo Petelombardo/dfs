@@ -38,3 +38,7 @@ SESSION*.md
 TESTING_GUIDE.md
 TEST_REPORT.md
 config.example.toml
+
+# Private deployment scripts (network-specific)
+scripts/deploy-all.sh
+build.sh

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use crate::NodeId;
 
 /// Main configuration for a DFS node
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +186,33 @@ impl Config {
     /// Get chunk size in bytes
     pub fn chunk_size_bytes(&self) -> usize {
         self.storage.chunk_size_mb * 1024 * 1024
+    }
+
+    /// Load or create a persistent node ID
+    ///
+    /// The node ID is stored in the metadata directory to ensure it persists across restarts.
+    /// This prevents a node from joining the cluster with a new ID after every restart.
+    pub fn load_or_create_node_id(&self) -> anyhow::Result<NodeId> {
+        let node_id_path = self.storage.metadata_dir.join("node_id.json");
+
+        // Try to load existing node ID
+        if node_id_path.exists() {
+            let contents = std::fs::read_to_string(&node_id_path)?;
+            let node_id: NodeId = serde_json::from_str(&contents)?;
+            Ok(node_id)
+        } else {
+            // Create new node ID and save it
+            let node_id = NodeId::new();
+
+            // Ensure metadata directory exists
+            std::fs::create_dir_all(&self.storage.metadata_dir)?;
+
+            // Save node ID to file
+            let contents = serde_json::to_string_pretty(&node_id)?;
+            std::fs::write(&node_id_path, contents)?;
+
+            Ok(node_id)
+        }
     }
 }
 

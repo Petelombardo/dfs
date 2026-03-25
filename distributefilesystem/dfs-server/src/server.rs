@@ -9,6 +9,7 @@ use dfs_common::{
     NodeId, Request, Response,
 };
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -32,6 +33,9 @@ pub struct Server {
 
     /// Replication factor
     replication_factor: usize,
+
+    /// Metadata directory path for persisting peer list
+    metadata_dir: PathBuf,
 }
 
 impl Server {
@@ -42,6 +46,7 @@ impl Server {
         chunk_size: usize,
         cluster: Arc<ClusterManager>,
         replication_factor: usize,
+        metadata_dir: PathBuf,
     ) -> Self {
         Self {
             storage,
@@ -50,12 +55,18 @@ impl Server {
             cluster,
             client: Arc::new(NetworkClient::new()),
             replication_factor,
+            metadata_dir,
         }
     }
 
     /// Get reference to cluster manager
     pub fn cluster(&self) -> Arc<ClusterManager> {
         self.cluster.clone()
+    }
+
+    /// Get reference to network client
+    pub fn network_client(&self) -> Arc<NetworkClient> {
+        self.client.clone()
     }
 
     /// Handle an incoming request message
@@ -104,11 +115,13 @@ impl Server {
         }
     }
 
-    /// Handle read chunk request (local read only)
+    /// Handle read chunk request (try local first, then forward to other nodes)
     async fn handle_read_chunk(&self, chunk_id: ChunkId) -> Response {
         debug!("Handling read chunk: {}", chunk_id);
 
-        match self.storage.read_chunk(&chunk_id) {
+        // Use the internal read_chunk method which tries local first,
+        // then forwards to other nodes if needed
+        match self.read_chunk(&chunk_id).await {
             Ok(data) => Response::ChunkData { chunk_id, data },
             Err(e) => {
                 warn!("Failed to read chunk {}: {}", chunk_id, e);
@@ -199,103 +212,186 @@ impl Server {
 
     /// Write data to the cluster with replication
     pub async fn write_data(&self, data: &[u8]) -> Result<Vec<ChunkId>> {
+        let total_start = std::time::Instant::now();
         info!("Writing {} bytes to cluster", data.len());
 
         // Chunk the data
+        let chunk_start = std::time::Instant::now();
         let chunks = self.chunker.chunk_data(data);
-        let mut chunk_ids = Vec::new();
+        let chunk_time = chunk_start.elapsed();
+        info!("Chunking took {:?} for {} chunks", chunk_time, chunks.len());
+
+        // Process ALL chunks in parallel for maximum throughput
+        let mut chunk_tasks = Vec::new();
 
         for (chunk_id, chunk_data) in chunks {
-            // Determine target nodes using consistent hashing
-            let target_nodes = self
-                .cluster
-                .get_nodes_for_chunk(&chunk_id, self.replication_factor)
-                .await;
+            let cluster = self.cluster.clone();
+            let storage = self.storage.clone();
+            let metadata = self.metadata.clone();
+            let client = self.client.clone();
+            let replication_factor = self.replication_factor;
 
-            if target_nodes.is_empty() {
-                anyhow::bail!("No nodes available for chunk {}", chunk_id);
-            }
+            // Spawn a task for each chunk
+            let task = tokio::spawn(async move {
+                let chunk_total_start = std::time::Instant::now();
 
-            debug!(
-                "Replicating chunk {} to {} nodes",
-                chunk_id,
-                target_nodes.len()
-            );
+                // Determine target nodes using consistent hashing
+                let target_nodes = cluster
+                    .get_nodes_for_chunk(&chunk_id, replication_factor)
+                    .await;
 
-            // Write to nodes (quorum approach - wait for majority)
-            let quorum = (target_nodes.len() / 2) + 1;
-            let mut success_count = 0;
+                if target_nodes.is_empty() {
+                    anyhow::bail!("No nodes available for chunk {}", chunk_id);
+                }
 
-            for node_id in &target_nodes {
-                // If it's the local node, write locally
-                if node_id == &self.cluster.local_node_id() {
-                    if self
-                        .storage
-                        .write_chunk(&chunk_id, &chunk_data)
-                        .is_ok()
-                    {
-                        success_count += 1;
-                        debug!("Wrote chunk {} locally", chunk_id);
-                    }
+                debug!(
+                    "Replicating chunk {} to {} nodes",
+                    chunk_id,
+                    target_nodes.len()
+                );
+
+                // Optimized replication strategy:
+                // - RF=2: Write to 2 nodes synchronously (quorum=2)
+                // - RF=3: Write to 2 nodes synchronously, 3rd replica happens in background
+                // This reduces client bandwidth and network hops for RF=3
+                let immediate_replicas = if replication_factor >= 3 {
+                    2  // For RF=3+, only write 2 copies immediately
                 } else {
-                    // Send to remote node
-                    if let Some(node_info) = self.cluster.get_node(node_id).await {
-                        let request = Request::ReplicateChunk {
-                            chunk_id,
-                            data: chunk_data.clone(),
-                            checksum: chunk_id.hash,
-                        };
+                    replication_factor  // For RF=1 or RF=2, write all immediately
+                };
 
-                        match self
-                            .client
-                            .send_message(node_info.addr, Message::Request(request))
-                            .await
-                        {
-                            Ok(response) => match response.message {
-                                Message::Response(Response::Ok { .. }) => {
-                                    success_count += 1;
-                                    debug!("Replicated chunk {} to {}", chunk_id, node_id);
+                let quorum = immediate_replicas;
+
+                // Spawn parallel replication tasks
+                let mut quorum_tasks = Vec::new();
+                let mut async_tasks = Vec::new();
+
+                for (idx, node_id) in target_nodes.iter().enumerate() {
+                    let node_id = *node_id;
+                    let chunk_id = chunk_id;
+                    let chunk_data = chunk_data.clone();
+
+                    // First 'quorum' nodes: wait for these
+                    // Remaining nodes: fire-and-forget (async replication)
+                    let is_quorum_node = idx < quorum;
+
+                    if node_id == cluster.local_node_id() {
+                        // Local write
+                        let storage = storage.clone();
+                        let task = tokio::spawn(async move {
+                            storage.write_chunk(&chunk_id, &chunk_data).is_ok()
+                        });
+
+                        if is_quorum_node {
+                            quorum_tasks.push(task);
+                        } else {
+                            async_tasks.push(task);
+                        }
+                    } else {
+                        // Remote write
+                        let cluster = cluster.clone();
+                        let client = client.clone();
+
+                        let task = tokio::spawn(async move {
+                            if let Some(node_info) = cluster.get_node(&node_id).await {
+                                let request = Request::ReplicateChunk {
+                                    chunk_id,
+                                    data: chunk_data,
+                                    checksum: chunk_id.hash,
+                                };
+
+                                match client
+                                    .send_message(node_info.addr, Message::Request(request))
+                                    .await
+                                {
+                                    Ok(response) => matches!(
+                                        response.message,
+                                        Message::Response(Response::Ok { .. })
+                                    ),
+                                    Err(_) => false,
                                 }
-                                _ => {
-                                    warn!("Failed to replicate chunk {} to {}", chunk_id, node_id);
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Network error replicating to {}: {}", node_id, e);
+                            } else {
+                                false
                             }
+                        });
+
+                        if is_quorum_node {
+                            quorum_tasks.push(task);
+                        } else {
+                            async_tasks.push(task);
                         }
                     }
                 }
 
-                // Check if we've reached quorum
-                if success_count >= quorum {
-                    break;
+                // Wait ONLY for quorum tasks (fast path)
+                let quorum_start = std::time::Instant::now();
+                let mut success_count = 0;
+                for task in quorum_tasks {
+                    if let Ok(true) = task.await {
+                        success_count += 1;
+                    }
                 }
-            }
+                let quorum_time = quorum_start.elapsed();
 
-            if success_count < quorum {
-                anyhow::bail!(
-                    "Failed to achieve quorum for chunk {} ({}/{})",
+                if success_count < quorum {
+                    anyhow::bail!(
+                        "Failed to achieve quorum for chunk {} ({}/{})",
+                        chunk_id,
+                        success_count,
+                        quorum
+                    );
+                }
+
+                info!("Chunk {} quorum write took {:?} ({} nodes)", chunk_id, quorum_time, success_count);
+
+                // Async tasks continue in background - no waiting!
+                // Auto-healing will catch any failures later
+                debug!(
+                    "Chunk {} written to quorum ({} nodes), {} additional replicas in progress",
                     chunk_id,
                     success_count,
-                    quorum
+                    async_tasks.len()
                 );
-            }
 
-            // Store chunk location metadata
-            let location = ChunkLocation {
-                chunk_id,
-                nodes: target_nodes,
-                size: chunk_data.len(),
-                checksum: chunk_id.hash,
-            };
+                // Store chunk location metadata
+                let location = ChunkLocation {
+                    chunk_id,
+                    nodes: target_nodes.clone(),
+                    size: chunk_data.len(),
+                    checksum: chunk_id.hash,
+                };
 
-            self.metadata
-                .put_chunk_location(&location)
-                .context("Failed to store chunk location")?;
+                let metadata_start = std::time::Instant::now();
+                metadata
+                    .put_chunk_location(&location)
+                    .context("Failed to store chunk location")?;
+                let metadata_time = metadata_start.elapsed();
 
-            chunk_ids.push(chunk_id);
+                let chunk_total_time = chunk_total_start.elapsed();
+                info!("Chunk {} complete in {:?} (metadata: {:?})", chunk_id, chunk_total_time, metadata_time);
+
+                Ok::<ChunkId, anyhow::Error>(chunk_id)
+            });
+
+            chunk_tasks.push(task);
         }
+
+        // Wait for all chunk tasks to complete in parallel
+        let gather_start = std::time::Instant::now();
+        let mut chunk_ids = Vec::new();
+        for task in chunk_tasks {
+            match task.await {
+                Ok(Ok(chunk_id)) => chunk_ids.push(chunk_id),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => anyhow::bail!("Chunk task panicked: {}", e),
+            }
+        }
+        let gather_time = gather_start.elapsed();
+
+        let total_time = total_start.elapsed();
+        let throughput = (data.len() as f64 / 1024.0 / 1024.0) / total_time.as_secs_f64();
+        info!("Write complete: {} bytes in {:?} ({:.2} MB/s) - gather: {:?}",
+              data.len(), total_time, throughput, gather_time);
 
         info!("Successfully wrote {} chunks", chunk_ids.len());
         Ok(chunk_ids)
@@ -461,9 +557,61 @@ impl Server {
         // Get file metadata first to find chunks
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
+                // Get chunk IDs before deleting metadata
+                let chunk_ids = metadata.chunks.clone();
+
                 // Delete the file metadata
                 match self.metadata.delete_file(&metadata.id) {
-                    Ok(_) => Response::Ok { data: None },
+                    Ok(_) => {
+                        // Delete chunks from all nodes asynchronously
+                        let cluster = self.cluster.clone();
+                        let client = self.client.clone();
+                        let storage = self.storage.clone();
+                        let metadata_store = self.metadata.clone();
+
+                        tokio::spawn(async move {
+                            info!("Deleting {} chunks for file: {}", chunk_ids.len(), path);
+
+                            for chunk_id in &chunk_ids {
+                                // Get chunk location
+                                let location = match metadata_store.get_chunk_location(chunk_id) {
+                                    Ok(Some(loc)) => loc,
+                                    _ => continue,
+                                };
+
+                                // Delete from all nodes that have it
+                                for node_id in &location.nodes {
+                                    if *node_id == cluster.local_node_id() {
+                                        // Delete locally
+                                        if let Err(e) = storage.delete_chunk(chunk_id) {
+                                            warn!("Failed to delete local chunk {}: {}", chunk_id, e);
+                                        }
+                                    } else {
+                                        // Delete from remote node
+                                        if let Some(node_info) = cluster.get_node(node_id).await {
+                                            let request = Request::DeleteChunk {
+                                                chunk_id: *chunk_id,
+                                            };
+
+                                            if let Err(e) = client
+                                                .send_message(node_info.addr, Message::Request(request))
+                                                .await
+                                            {
+                                                warn!(
+                                                    "Failed to delete chunk {} from node {}: {}",
+                                                    chunk_id, node_id, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            info!("Chunk deletion complete for file: {}", path);
+                        });
+
+                        Response::Ok { data: None }
+                    }
                     Err(e) => {
                         warn!("Failed to delete file metadata: {}", e);
                         Response::Error {
@@ -472,7 +620,6 @@ impl Server {
                         }
                     }
                 }
-                // Note: Chunk cleanup will be handled by garbage collection later
             }
             Ok(None) => Response::Error {
                 message: "File not found".to_string(),
@@ -495,7 +642,7 @@ impl Server {
         let nodes = self.cluster.get_all_nodes().await;
         let healthy_nodes = nodes
             .iter()
-            .filter(|n| self.cluster.is_node_healthy(&n.id))
+            .filter(|n| n.status == dfs_common::NodeStatus::Online)
             .count();
         let total_nodes = nodes.len();
 
@@ -524,11 +671,18 @@ impl Server {
 
                 let nodes_count = self.cluster.get_all_nodes().await.len();
 
+                // Get filesystem statistics
+                let (total_space, free_space, available_space) = self.storage.get_filesystem_stats()
+                    .unwrap_or((0, 0, 0));
+
                 Response::StorageStats {
                     total_chunks: chunks.len(),
                     total_size,
                     replication_factor: self.replication_factor,
                     nodes_count,
+                    total_space,
+                    free_space,
+                    available_space,
                 }
             }
             Err(e) => {
@@ -791,6 +945,54 @@ impl MessageHandler for Server {
                     if let Err(e) = self.cluster.remove_node(&node_id).await {
                         warn!("Failed to remove node: {}", e);
                     }
+                    Response::Ok { data: None }
+                }
+                ClusterMessage::JoinRequest { node_info } => {
+                    info!("Received join request from node {}", node_info.id);
+
+                    // Add node to cluster
+                    if let Err(e) = self.cluster.add_node(node_info.clone()).await {
+                        warn!("Failed to add node: {}", e);
+                        let response = ClusterMessage::JoinResponse {
+                            accepted: false,
+                            cluster_nodes: vec![],
+                        };
+                        return Response::Ok {
+                            data: Some(bincode::serialize(&response).unwrap()),
+                        };
+                    }
+
+                    // Get all cluster nodes
+                    let cluster_nodes = self.cluster.get_all_nodes().await;
+
+                    info!(
+                        "Node {} joined cluster, now {} nodes total",
+                        node_info.id,
+                        cluster_nodes.len()
+                    );
+
+                    // Return success with cluster state
+                    let response = ClusterMessage::JoinResponse {
+                        accepted: true,
+                        cluster_nodes,
+                    };
+
+                    Response::Ok {
+                        data: Some(bincode::serialize(&response).unwrap()),
+                    }
+                }
+                ClusterMessage::NodeJoined { node_info } => {
+                    info!("Node {} joined the cluster (broadcast)", node_info.id);
+                    if let Err(e) = self.cluster.add_node(node_info).await {
+                        warn!("Failed to add node from broadcast: {}", e);
+                    }
+
+                    // Save updated peer list to disk
+                    let peer_addrs = self.cluster.get_all_peer_addrs().await;
+                    if let Err(e) = ClusterManager::save_persisted_peers(&peer_addrs, &self.metadata_dir).await {
+                        warn!("Failed to save persisted peers after NodeJoined: {}", e);
+                    }
+
                     Response::Ok { data: None }
                 }
                 _ => Response::Error {

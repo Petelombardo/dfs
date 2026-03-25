@@ -1,11 +1,21 @@
 use anyhow::Result;
 use dfs_common::{ConsistentHashRing, NodeId, NodeInfo, NodeStatus};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
+
+/// Persisted peer list for cluster recovery
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPeers {
+    peers: Vec<SocketAddr>,
+    last_updated: u64, // Unix timestamp
+}
 
 /// Cluster membership manager
 /// Tracks all nodes in the cluster and their status
@@ -162,6 +172,60 @@ impl ClusterManager {
         });
     }
 
+    /// Start background task to send heartbeats to all nodes
+    pub async fn start_heartbeat_sender(self: Arc<Self>) {
+        let mut heartbeat_interval = interval(Duration::from_secs(self.heartbeat_interval));
+
+        tokio::spawn(async move {
+            loop {
+                heartbeat_interval.tick().await;
+
+                if let Err(e) = self.send_heartbeats().await {
+                    warn!("Error sending heartbeats: {}", e);
+                }
+            }
+        });
+    }
+
+    /// Send heartbeats to all nodes in the cluster
+    async fn send_heartbeats(&self) -> Result<()> {
+        use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
+        use dfs_common::NodeInfo;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let nodes = self.nodes.read().await.clone();
+        let local_node_id = self.local_node_id;
+        let local_addr = self.local_addr;
+
+        for (node_id, node_info) in nodes {
+            // Skip self
+            if node_id == local_node_id {
+                continue;
+            }
+
+            // Skip failed nodes
+            if node_info.status == NodeStatus::Failed {
+                continue;
+            }
+
+            let local_node_info = NodeInfo::new(local_node_id, local_addr, None);
+            let heartbeat = ClusterMessage::Heartbeat {
+                node_info: local_node_info,
+            };
+
+            // Send heartbeat asynchronously (don't wait for response)
+            let target_addr = node_info.addr;
+            tokio::spawn(async move {
+                if let Err(e) = send_heartbeat_message(target_addr, heartbeat).await {
+                    debug!("Failed to send heartbeat to {}: {}", target_addr, e);
+                }
+            });
+        }
+
+        Ok(())
+    }
+
     /// Check for nodes that have failed (no heartbeat within timeout)
     async fn check_failed_nodes(&self) -> Result<()> {
         let mut nodes = self.nodes.write().await;
@@ -244,6 +308,50 @@ impl ClusterManager {
         // In a real implementation, this should check the node status
         true
     }
+
+    /// Load persisted peer list from disk
+    pub async fn load_persisted_peers(metadata_dir: &Path) -> Result<Vec<SocketAddr>> {
+        let peers_file = metadata_dir.join("peers.json");
+
+        if !peers_file.exists() {
+            debug!("No persisted peers file found at {}", peers_file.display());
+            return Ok(Vec::new());
+        }
+
+        let data = tokio::fs::read_to_string(&peers_file).await?;
+        let persisted: PersistedPeers = serde_json::from_str(&data)?;
+
+        info!("✓ Loaded {} persisted peers from {}", persisted.peers.len(), peers_file.display());
+        Ok(persisted.peers)
+    }
+
+    /// Save peer list to disk for cluster recovery
+    pub async fn save_persisted_peers(peers: &[SocketAddr], metadata_dir: &Path) -> Result<()> {
+        let persisted = PersistedPeers {
+            peers: peers.to_vec(),
+            last_updated: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+
+        let peers_file = metadata_dir.join("peers.json");
+        let data = serde_json::to_string_pretty(&persisted)?;
+        tokio::fs::write(&peers_file, data).await?;
+
+        debug!("✓ Saved {} peers to {}", peers.len(), peers_file.display());
+        Ok(())
+    }
+
+    /// Get all peer addresses (excluding self) for persistence
+    pub async fn get_all_peer_addrs(&self) -> Vec<SocketAddr> {
+        let nodes = self.nodes.read().await;
+        nodes
+            .values()
+            .filter(|n| n.id != self.local_node_id) // Exclude self
+            .map(|n| n.addr)
+            .collect()
+    }
 }
 
 /// Cluster statistics
@@ -252,6 +360,31 @@ pub struct ClusterStats {
     pub total_nodes: usize,
     pub online_nodes: usize,
     pub failed_nodes: usize,
+}
+
+/// Helper function to send heartbeat message to a node
+async fn send_heartbeat_message(
+    target_addr: SocketAddr,
+    heartbeat: dfs_common::protocol::ClusterMessage,
+) -> Result<()> {
+    use dfs_common::protocol::{Message, MessageEnvelope, RequestId};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    // Connect to target node
+    let mut stream = TcpStream::connect(target_addr).await?;
+
+    // Create message envelope
+    let request_id = RequestId::new(0); // Heartbeats don't need tracking
+    let envelope = MessageEnvelope::new(request_id, Message::Cluster(heartbeat));
+    let encoded = envelope.to_bytes()?;
+
+    // Send length prefix + message
+    stream.write_u32(encoded.len() as u32).await?;
+    stream.write_all(&encoded).await?;
+
+    // Don't wait for response (fire and forget)
+    Ok(())
 }
 
 #[cfg(test)]

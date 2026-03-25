@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use dfs_common::Config;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{debug, info, warn};
 use tracing_subscriber;
 
 #[derive(Parser)]
@@ -149,6 +149,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config.chunk_size_bytes(),
         cluster.clone(),
         config.replication.replication_factor,
+        config.storage.metadata_dir.clone(),
     ));
     info!("✓ Server instance created");
 
@@ -156,11 +157,16 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.cluster().start_failure_detector().await;
     info!("✓ Failure detector started");
 
+    // Start heartbeat sender
+    server.cluster().start_heartbeat_sender().await;
+    info!("✓ Heartbeat sender started");
+
     // Start healing manager
     let healing = std::sync::Arc::new(healing::HealingManager::new(
         storage,
         metadata,
         cluster,
+        server.network_client(),
         config.replication.replication_factor,
         config.replication.healing_delay_secs,
         config.replication.scrub_interval_hours,
@@ -182,6 +188,34 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     info!("Listening on: {}", config.node.listen_addr);
     info!("Node ID: {}", node_id);
 
+    // Load persisted peers and merge with config seed nodes
+    let metadata_dir = std::path::PathBuf::from(&config.storage.metadata_dir);
+    let mut all_seed_nodes = config.cluster.seed_nodes.clone();
+
+    match cluster::ClusterManager::load_persisted_peers(&metadata_dir).await {
+        Ok(persisted_peers) => {
+            if !persisted_peers.is_empty() {
+                info!("✓ Loaded {} persisted peers", persisted_peers.len());
+                // Add persisted peers to seed list (dedup happens in join_cluster)
+                all_seed_nodes.extend(persisted_peers);
+            }
+        }
+        Err(e) => warn!("Failed to load persisted peers: {}", e),
+    }
+
+    // Join cluster if we have any seed nodes (config or persisted)
+    if !all_seed_nodes.is_empty() {
+        info!("Attempting to join cluster via {} total seed/peer nodes...", all_seed_nodes.len());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await; // Let server start
+
+        match join_cluster(server.clone(), &all_seed_nodes, &metadata_dir).await {
+            Ok(_) => info!("✓ Successfully joined cluster"),
+            Err(e) => tracing::warn!("Failed to join cluster: {}", e),
+        }
+    } else {
+        info!("No seed nodes configured - running as standalone node");
+    }
+
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     info!("Shutting down...");
@@ -189,6 +223,132 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server_handle.abort();
 
     Ok(())
+}
+
+/// Attempt to join cluster via seed nodes
+async fn join_cluster(
+    server: std::sync::Arc<server::Server>,
+    seed_nodes: &[std::net::SocketAddr],
+    metadata_dir: &std::path::Path,
+) -> Result<()> {
+    use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
+    use tracing::warn;
+
+    info!("Attempting to join cluster via {} seed/peer nodes", seed_nodes.len());
+
+    // Deduplicate seed nodes
+    let unique_seeds: std::collections::HashSet<_> = seed_nodes.iter().cloned().collect();
+
+    for seed_addr in &unique_seeds {
+        match send_join_request(*seed_addr, &server).await {
+            Ok(cluster_nodes) => {
+                info!("✓ Successfully joined cluster via {} - learned about {} total nodes",
+                    seed_addr, cluster_nodes.len());
+
+                // Save all discovered peers to disk for future recovery
+                let peer_addrs: Vec<std::net::SocketAddr> = cluster_nodes
+                    .iter()
+                    .map(|n| n.addr)
+                    .collect();
+
+                if let Err(e) = cluster::ClusterManager::save_persisted_peers(&peer_addrs, metadata_dir).await {
+                    warn!("Failed to save persisted peers: {}", e);
+                }
+
+                return Ok(());
+            }
+            Err(e) => {
+                debug!("Failed to join via {}: {}", seed_addr, e);
+                continue;
+            }
+        }
+    }
+
+    anyhow::bail!("Failed to join cluster - all {} seed/peer nodes unreachable", unique_seeds.len())
+}
+
+/// Send join request to a seed node
+async fn send_join_request(
+    seed_addr: std::net::SocketAddr,
+    server: &std::sync::Arc<server::Server>,
+) -> Result<Vec<dfs_common::types::NodeInfo>> {
+    use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
+    use dfs_common::types::NodeInfo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let local_node_id = server.cluster().local_node_id();
+    let local_addr = server.cluster().local_addr();
+
+    let node_info = NodeInfo::new(local_node_id, local_addr, None);
+
+    // Send join request
+    let request = ClusterMessage::JoinRequest {
+        node_info: node_info.clone(),
+    };
+
+    // Connect to seed node
+    let mut stream = TcpStream::connect(seed_addr).await?;
+
+    // Create message envelope
+    let request_id = RequestId::new(1);
+    let envelope = MessageEnvelope::new(request_id, Message::Cluster(request));
+    let encoded = envelope.to_bytes()?;
+
+    // Send length prefix + message
+    stream.write_u32(encoded.len() as u32).await?;
+    stream.write_all(&encoded).await?;
+
+    // Read response length
+    let response_len = stream.read_u32().await?;
+
+    // Read response
+    let mut buf = vec![0u8; response_len as usize];
+    stream.read_exact(&mut buf).await?;
+
+    // Deserialize response
+    let response_envelope = MessageEnvelope::from_bytes(&buf)?;
+
+    match response_envelope.message {
+        Message::Response(dfs_common::protocol::Response::Ok { data }) => {
+            // Decode JoinResponse
+            if let Some(data) = data {
+                let join_response: ClusterMessage = bincode::deserialize(&data)?;
+
+                if let ClusterMessage::JoinResponse {
+                    accepted,
+                    cluster_nodes,
+                } = join_response
+                {
+                    if !accepted {
+                        anyhow::bail!("Join request rejected by seed node");
+                    }
+
+                    info!(
+                        "Join request accepted, received {} cluster nodes",
+                        cluster_nodes.len()
+                    );
+
+                    // Clone cluster_nodes before consuming it in the loop
+                    let cluster_nodes_clone = cluster_nodes.clone();
+
+                    // Add all cluster nodes (except self)
+                    for node in cluster_nodes {
+                        if node.id != local_node_id {
+                            server.cluster().add_node(node).await?;
+                        }
+                    }
+
+                    Ok(cluster_nodes_clone)
+                } else {
+                    anyhow::bail!("Unexpected cluster message type in response")
+                }
+            } else {
+                anyhow::bail!("No data in join response")
+            }
+        }
+        _ => anyhow::bail!("Unexpected response type to join request"),
+    }
 }
 
 /// Show server status

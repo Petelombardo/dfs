@@ -26,20 +26,27 @@ impl ChunkStorage {
 
     /// Write a chunk to local storage with checksum verification
     pub fn write_chunk(&self, chunk_id: &ChunkId, data: &[u8]) -> Result<()> {
+        let start = std::time::Instant::now();
+
         // Verify checksum before writing
+        let checksum_start = std::time::Instant::now();
         if !verify_chunk_hash(data, &chunk_id.hash) {
             anyhow::bail!("Checksum mismatch: data does not match chunk ID");
         }
+        let checksum_time = checksum_start.elapsed();
 
         let path = self.get_chunk_path(chunk_id);
 
         // Create parent directories
+        let mkdir_start = std::time::Instant::now();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create chunk directory: {:?}", parent))?;
         }
+        let mkdir_time = mkdir_start.elapsed();
 
         // Write data atomically using temporary file
+        let write_start = std::time::Instant::now();
         let temp_path = path.with_extension("tmp");
         let mut file = fs::File::create(&temp_path)
             .with_context(|| format!("Failed to create temporary file: {:?}", temp_path))?;
@@ -47,13 +54,19 @@ impl ChunkStorage {
         file.write_all(data)
             .context("Failed to write chunk data")?;
 
+        let sync_start = std::time::Instant::now();
         file.sync_all().context("Failed to sync chunk data")?;
+        let sync_time = sync_start.elapsed();
 
         // Atomic rename
+        let rename_start = std::time::Instant::now();
         fs::rename(&temp_path, &path)
             .with_context(|| format!("Failed to rename chunk file: {:?}", path))?;
+        let rename_time = rename_start.elapsed();
 
-        debug!("Wrote chunk {} ({} bytes)", chunk_id, data.len());
+        let total_time = start.elapsed();
+        debug!("Wrote chunk {} ({} bytes) in {:?} - checksum: {:?}, mkdir: {:?}, sync: {:?}, rename: {:?}",
+               chunk_id, data.len(), total_time, checksum_time, mkdir_time, sync_time, rename_time);
 
         Ok(())
     }
@@ -163,6 +176,27 @@ impl ChunkStorage {
         }
 
         Ok(chunk_ids)
+    }
+
+    /// Get filesystem statistics for the data directory
+    /// Returns (total_space, free_space, available_space) in bytes
+    pub fn get_filesystem_stats(&self) -> Result<(u64, u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        // Get filesystem stats using statvfs
+        let metadata = fs::metadata(&self.data_dir)?;
+        let dev = metadata.dev();
+
+        // Use nix crate for statvfs
+        use nix::sys::statvfs::statvfs;
+        let stat = statvfs(&self.data_dir)?;
+
+        let block_size = stat.block_size();
+        let total_space = stat.blocks() * block_size;
+        let free_space = stat.blocks_free() * block_size;
+        let available_space = stat.blocks_available() * block_size;
+
+        Ok((total_space, free_space, available_space))
     }
 
     /// Recursively collect chunk IDs

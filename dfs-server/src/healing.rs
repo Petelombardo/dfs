@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::{ChunkId, ChunkLocation, NodeId};
+use dfs_common::{ChunkId, ChunkLocation, Message, NodeId, Request, Response};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::cluster::ClusterManager;
 use crate::metadata::MetadataStore;
+use crate::network::NetworkClient;
 use crate::storage::ChunkStorage;
 
 /// Healing manager - monitors and repairs chunk replication
@@ -22,6 +23,9 @@ pub struct HealingManager {
 
     /// Cluster manager
     cluster: Arc<ClusterManager>,
+
+    /// Network client for inter-node communication
+    client: Arc<NetworkClient>,
 
     /// Target replication factor
     replication_factor: usize,
@@ -45,6 +49,7 @@ impl HealingManager {
         storage: Arc<ChunkStorage>,
         metadata: Arc<MetadataStore>,
         cluster: Arc<ClusterManager>,
+        client: Arc<NetworkClient>,
         replication_factor: usize,
         healing_delay_secs: u64,
         scrub_interval_hours: u64,
@@ -54,6 +59,7 @@ impl HealingManager {
             storage,
             metadata,
             cluster,
+            client,
             replication_factor,
             healing_delay_secs,
             scrub_interval_hours,
@@ -206,20 +212,36 @@ impl HealingManager {
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
-        // Count how many nodes still have the chunk
-        let mut alive_replicas = 0;
+        // Count how many nodes actually have the chunk
+        // Note: For RF=3 optimization, chunks are initially written to 2 nodes,
+        // then the 3rd replica is created in the background by the healing manager
+        let mut actual_replicas = 0;
 
         for node_id in &location.nodes {
+            // Check if node is online AND has the chunk
             if let Some(node_info) = self.cluster.get_node(node_id).await {
                 if node_info.status == dfs_common::NodeStatus::Online {
-                    alive_replicas += 1;
+                    // Check if this node actually has the chunk
+                    let has_chunk = if *node_id == self.cluster.local_node_id() {
+                        // Local check
+                        self.storage.has_chunk(chunk_id)
+                    } else {
+                        // Remote check - would need to query the node
+                        // For now, assume metadata is accurate for remote nodes
+                        // (proper implementation would use HasChunk request)
+                        true
+                    };
+
+                    if has_chunk {
+                        actual_replicas += 1;
+                    }
                 }
             }
         }
 
-        if alive_replicas < self.replication_factor {
+        if actual_replicas < self.replication_factor {
             Ok(ReplicationStatus::UnderReplicated)
-        } else if alive_replicas > self.replication_factor {
+        } else if actual_replicas > self.replication_factor {
             Ok(ReplicationStatus::OverReplicated)
         } else {
             Ok(ReplicationStatus::Ok)
@@ -291,12 +313,31 @@ impl HealingManager {
 
         for node_id in &new_targets {
             if let Some(node_info) = self.cluster.get_node(node_id).await {
-                // For now, we'll just log - actual replication would use NetworkClient
                 info!(
-                    "Would replicate chunk {} to node {} ({})",
+                    "Replicating chunk {} to node {} ({})",
                     chunk_id, node_id, node_info.addr
                 );
-                replicated_count += 1;
+
+                // Send replication request
+                let request = Request::ReplicateChunk {
+                    chunk_id: *chunk_id,
+                    data: chunk_data.clone(),
+                    checksum: chunk_id.hash,
+                };
+
+                match self.client.send_message(node_info.addr, Message::Request(request)).await {
+                    Ok(response) => {
+                        if matches!(response.message, Message::Response(Response::Ok { .. })) {
+                            replicated_count += 1;
+                            info!("Successfully replicated chunk {} to node {}", chunk_id, node_id);
+                        } else {
+                            warn!("Failed to replicate chunk {} to node {}: unexpected response", chunk_id, node_id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to replicate chunk {} to node {}: {}", chunk_id, node_id, e);
+                    }
+                }
             }
         }
 
@@ -305,6 +346,22 @@ impl HealingManager {
                 "Healed chunk {}: added {} replicas",
                 chunk_id, replicated_count
             );
+
+            // Update metadata with new node list
+            let mut updated_nodes = alive_nodes.clone();
+            updated_nodes.extend(new_targets.iter().take(replicated_count));
+
+            let updated_location = ChunkLocation {
+                chunk_id: *chunk_id,
+                nodes: updated_nodes,
+                size: location.size,
+                checksum: location.checksum,
+            };
+
+            if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
+                warn!("Failed to update chunk location metadata: {}", e);
+            }
+
             // Remove from pending
             self.pending_healing.write().await.remove(chunk_id);
         }

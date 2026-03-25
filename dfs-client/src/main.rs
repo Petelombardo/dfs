@@ -32,6 +32,10 @@ enum Commands {
         /// Run in foreground (don't daemonize)
         #[arg(short, long)]
         foreground: bool,
+
+        /// Enable write-behind buffering for better performance (may lose unflushed data on crash)
+        #[arg(long)]
+        write_buffer: bool,
     },
 
     /// Unmount the DFS filesystem
@@ -42,8 +46,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
@@ -57,21 +60,25 @@ async fn main() -> Result<()> {
             mountpoint,
             cluster,
             foreground,
+            write_buffer,
         } => {
-            mount_filesystem(mountpoint, cluster, foreground).await?;
+            mount_filesystem(mountpoint, cluster, foreground, write_buffer)?;
         }
         Commands::Unmount { mountpoint } => {
-            unmount_filesystem(mountpoint).await?;
+            // For unmount, we can use a temporary runtime
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(unmount_filesystem(mountpoint))?;
         }
     }
 
     Ok(())
 }
 
-async fn mount_filesystem(
+fn mount_filesystem(
     mountpoint: PathBuf,
     cluster_nodes: Vec<String>,
     foreground: bool,
+    write_buffer: bool,
 ) -> Result<()> {
     info!("Mounting DFS at {:?}", mountpoint);
 
@@ -90,13 +97,48 @@ async fn mount_filesystem(
 
     info!("Connecting to cluster nodes: {:?}", addrs);
 
-    // Create filesystem
-    let fs = DfsFilesystem::new(addrs)?;
+    if write_buffer {
+        info!("Write-behind buffering ENABLED - better performance, may lose unflushed data on crash");
+    } else {
+        info!("Write-behind buffering DISABLED - all writes go through Raft immediately");
+    }
+
+    // Create filesystem WITH a tokio runtime running in a background thread
+    // This is necessary because FUSE callbacks run on non-tokio threads
+    // and need to call async functions
+    use std::sync::Arc;
+    use std::thread;
+
+    let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+    let runtime_clone = runtime.clone();
+
+    // Spawn a thread to keep the runtime alive
+    // It will just park itself, keeping the runtime alive for the duration
+    let _runtime_thread = thread::spawn(move || {
+        runtime_clone.block_on(async {
+            // Just sleep forever - this keeps the runtime alive
+            // The thread will be killed when the process exits
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            }
+        })
+    });
+
+    // Give the runtime thread a moment to start
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Now create the filesystem with access to the runtime handle
+    let runtime_handle = runtime.handle().clone();
+    let fs = DfsFilesystem::new_with_runtime(addrs, write_buffer, runtime_handle)?;
 
     // Mount options
     let mut options = vec![
         fuser::MountOption::FSName("dfs".to_string()),
         fuser::MountOption::AutoUnmount,
+        // Enable write-back caching for better performance
+        fuser::MountOption::Async,
+        // Allow root to access (needed for write-back caching)
+        fuser::MountOption::AllowRoot,
     ];
 
     if foreground {
@@ -107,6 +149,7 @@ async fn mount_filesystem(
 
     // Mount the filesystem
     // Note: This blocks until unmount
+    // The runtime stays alive because _rt is in scope
     fuser::mount2(fs, mountpoint, &options)
         .context("Failed to mount filesystem")?;
 

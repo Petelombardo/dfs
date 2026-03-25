@@ -207,6 +207,9 @@ async fn handle_storage_command(
                     total_size,
                     replication_factor,
                     nodes_count,
+                    total_space,
+                    free_space,
+                    available_space,
                 } => {
                     if json_output {
                         let output = serde_json::json!({
@@ -215,6 +218,9 @@ async fn handle_storage_command(
                             "total_size_mb": total_size / (1024 * 1024),
                             "replication_factor": replication_factor,
                             "nodes_count": nodes_count,
+                            "total_space_gb": total_space / (1024 * 1024 * 1024),
+                            "free_space_gb": free_space / (1024 * 1024 * 1024),
+                            "available_space_gb": available_space / (1024 * 1024 * 1024),
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
@@ -224,6 +230,9 @@ async fn handle_storage_command(
                         println!("Total Size:         {} MB", total_size / (1024 * 1024));
                         println!("Replication Factor: {}", replication_factor);
                         println!("Nodes Count:        {}", nodes_count);
+                        println!("Total Space:        {} GB", total_space / (1024 * 1024 * 1024));
+                        println!("Free Space:         {} GB", free_space / (1024 * 1024 * 1024));
+                        println!("Available Space:    {} GB", available_space / (1024 * 1024 * 1024));
                     }
                 }
                 Response::Error { message, .. } => {

@@ -1,0 +1,43 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# DFS Runtime
+/data/
+/metadata/
+*.db
+*.log
+
+# Test artifacts
+/test_data/
+
+# Documentation and session notes (private)
+CLUSTER-REJOIN-PLAN.md
+PERFORMANCE-INVESTIGATION.md
+QUICK-START.md
+TESTING.md
+DEPLOYMENT-RESTARTOS.md
+API_REFERENCE.md
+PHASE*.md
+PROGRESS.md
+PROJECT_PLAN.md
+REMAINING_WORK.md
+SESSION*.md
+TESTING_GUIDE.md
+TEST_REPORT.md
+config.example.toml
+
+# Scripts (deployment specific)
+scripts/

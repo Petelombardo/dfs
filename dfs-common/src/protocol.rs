@@ -161,6 +161,12 @@ pub enum Response {
         total_size: u64,
         replication_factor: usize,
         nodes_count: usize,
+        /// Total disk space in bytes (smallest node capacity * node count / replication factor)
+        total_space: u64,
+        /// Free disk space in bytes (smallest node free space * node count / replication factor)
+        free_space: u64,
+        /// Available disk space in bytes (smallest node available * node count / replication factor)
+        available_space: u64,
     },
 
     /// Healing status response
@@ -242,6 +248,22 @@ pub enum ClusterMessage {
     MetadataUpdate {
         metadata: FileMetadata,
         operation: MetadataOperation,
+    },
+
+    /// Request to join the cluster
+    JoinRequest {
+        node_info: NodeInfo,
+    },
+
+    /// Response to join request
+    JoinResponse {
+        accepted: bool,
+        cluster_nodes: Vec<NodeInfo>,
+    },
+
+    /// Broadcast that a node has joined
+    NodeJoined {
+        node_info: NodeInfo,
     },
 }
 

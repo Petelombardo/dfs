@@ -2,16 +2,26 @@ use anyhow::Result;
 use dfs_common::{ChunkId, FileMetadata, FileType};
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEntry, Request as FuseRequest,
+    ReplyDirectory, ReplyEntry, ReplyStatfs, Request as FuseRequest,
 };
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error};
+use tokio::sync::Mutex;
+use tracing::{debug, error, info};
 
 use crate::client::DfsClient;
+
+/// Buffered write data for a single file
+#[derive(Clone)]
+struct WriteBuffer {
+    /// Buffered data
+    data: Vec<u8>,
+    /// When this buffer was last modified
+    last_modified: SystemTime,
+}
 
 /// FUSE filesystem implementation for DFS
 pub struct DfsFilesystem {
@@ -32,11 +42,28 @@ pub struct DfsFilesystem {
 
     /// Tokio runtime handle for async operations
     runtime: tokio::runtime::Handle,
+
+    /// Write counter per inode for batching metadata updates
+    write_counters: Arc<RwLock<HashMap<u64, usize>>>,
+
+    /// Enable write-behind buffering
+    write_buffer_enabled: bool,
+
+    /// Write buffers per inode (only used if write_buffer_enabled)
+    write_buffers: Arc<Mutex<HashMap<u64, WriteBuffer>>>,
+
+    /// Last read chunk cache: (ino, chunk_index, data)
+    /// Prevents re-fetching same 4MB chunk for multiple 128KB FUSE reads
+    last_chunk_cache: Arc<RwLock<Option<(u64, usize, Vec<u8>)>>>,
 }
 
 impl DfsFilesystem {
-    /// Create a new DFS filesystem
-    pub fn new(cluster_nodes: Vec<SocketAddr>) -> Result<Self> {
+    /// Create a new DFS filesystem with an explicit runtime handle
+    pub fn new_with_runtime(
+        cluster_nodes: Vec<SocketAddr>,
+        write_buffer_enabled: bool,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self> {
         let client = Arc::new(DfsClient::new(cluster_nodes)?);
 
         let metadata_cache = Arc::new(RwLock::new(HashMap::new()));
@@ -66,9 +93,6 @@ impl DfsFilesystem {
         metadata_cache.write().unwrap().insert(1, root_metadata);
         path_to_inode.write().unwrap().insert("/".to_string(), 1);
 
-        // Get the current tokio runtime handle
-        let runtime = tokio::runtime::Handle::current();
-
         Ok(Self {
             client,
             metadata_cache,
@@ -76,7 +100,20 @@ impl DfsFilesystem {
             next_inode,
             root_inode: 1,
             runtime,
+            write_counters: Arc::new(RwLock::new(HashMap::new())),
+            write_buffer_enabled,
+            write_buffers: Arc::new(Mutex::new(HashMap::new())),
+            last_chunk_cache: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Create a new DFS filesystem (deprecated - use new_with_runtime)
+    #[allow(dead_code)]
+    pub fn new(cluster_nodes: Vec<SocketAddr>, write_buffer_enabled: bool) -> Result<Self> {
+        // This version tries to get the current runtime handle
+        // Only works if called from within a tokio runtime context
+        let runtime = tokio::runtime::Handle::current();
+        Self::new_with_runtime(cluster_nodes, write_buffer_enabled, runtime)
     }
 
     /// Execute an async operation in a blocking context
@@ -85,7 +122,51 @@ impl DfsFilesystem {
     where
         F: std::future::Future<Output = T>,
     {
-        tokio::task::block_in_place(|| self.runtime.block_on(future))
+        // NOTE: We can't use block_in_place because FUSE callbacks don't run on tokio worker threads
+        // Just block_on directly using the runtime handle
+        self.runtime.block_on(future)
+    }
+
+    /// Flush buffered writes for a specific inode to the cluster
+    async fn flush_buffer_async(&self, ino: u64) -> Result<()> {
+        // Get and remove buffer for this inode
+        let buffer_opt = {
+            let mut buffers = self.write_buffers.lock().await;
+            buffers.remove(&ino)
+        };
+
+        if let Some(buffer) = buffer_opt {
+            info!("Flushing {} bytes for inode {}", buffer.data.len(), ino);
+
+            // Get current metadata to get existing chunks
+            let mut metadata = {
+                let cache = self.metadata_cache.read().unwrap();
+                match cache.get(&ino) {
+                    Some(m) => m.clone(),
+                    None => {
+                        anyhow::bail!("Metadata not found for inode {}", ino);
+                    }
+                }
+            };
+
+            // Write buffered data as new chunks (appending)
+            let new_chunk_ids = self.client.write_data(&buffer.data).await?;
+
+            // Append new chunks to existing chunks
+            metadata.chunks.extend(new_chunk_ids);
+            metadata.modified_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            // Store updated metadata
+            self.client.put_file_metadata(&metadata).await?;
+
+            // Update cache
+            self.metadata_cache.write().unwrap().insert(ino, metadata);
+        }
+
+        Ok(())
     }
 
     /// Convert FileMetadata to FUSE FileAttr
@@ -173,7 +254,7 @@ impl Filesystem for DfsFilesystem {
                 let cache = self.metadata_cache.read().unwrap();
                 if let Some(metadata) = cache.get(&ino) {
                     let attr = self.metadata_to_attr(ino, metadata);
-                    reply.entry(&Duration::from_secs(1), &attr, 0);
+                    reply.entry(&Duration::from_secs(300), &attr, 0); // 5 minutes
                     return;
                 }
             }
@@ -195,7 +276,7 @@ impl Filesystem for DfsFilesystem {
 
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
-                reply.entry(&Duration::from_secs(1), &attr, 0);
+                reply.entry(&Duration::from_secs(3600), &attr, 0);
             }
             Ok(None) => {
                 reply.error(libc::ENOENT);
@@ -207,13 +288,23 @@ impl Filesystem for DfsFilesystem {
         }
     }
 
+    fn open(&mut self, _req: &FuseRequest, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        info!("open: ino={}", ino);
+
+        // Return success with file handle 0 and NO direct_io flag
+        // This tells the kernel to use page cache for reads
+        reply.opened(0, fuser::consts::FOPEN_KEEP_CACHE);
+    }
+
     fn getattr(&mut self, _req: &FuseRequest, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         debug!("getattr: ino={}", ino);
 
         let cache = self.metadata_cache.read().unwrap();
         if let Some(metadata) = cache.get(&ino) {
             let attr = self.metadata_to_attr(ino, metadata);
-            reply.attr(&Duration::from_secs(1), &attr);
+            // 5 minute TTL for kernel page caching
+            // Balances performance vs. freshness for multi-client scenarios
+            reply.attr(&Duration::from_secs(300), &attr);
         } else {
             reply.error(libc::ENOENT);
         }
@@ -230,7 +321,8 @@ impl Filesystem for DfsFilesystem {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        debug!("read: ino={}, offset={}, size={}", ino, offset, size);
+        let start = std::time::Instant::now();
+        info!("FUSE read START: ino={}, offset={}, size={}", ino, offset, size);
 
         let metadata = {
             let cache = self.metadata_cache.read().unwrap();
@@ -248,30 +340,70 @@ impl Filesystem for DfsFilesystem {
             return;
         }
 
-        let client = self.client.clone();
-        let chunk_ids = metadata.chunks.clone();
+        let offset = offset as usize;
+        let size = size as usize;
 
-        let result = self.block_on(async {
-            client.read_data(&chunk_ids).await
-        });
+        // Early return for out of bounds
+        if offset >= metadata.size as usize {
+            reply.data(&[]);
+            return;
+        }
 
-        match result {
-            Ok(data) => {
-                let offset = offset as usize;
-                let size = size as usize;
+        // Calculate which chunks we actually need
+        const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
+        let start_chunk = offset / CHUNK_SIZE;
 
-                if offset >= data.len() {
-                    reply.data(&[]);
-                } else {
-                    let end = std::cmp::min(offset + size, data.len());
-                    reply.data(&data[offset..end]);
+        // Check cache first for single-chunk reads (most common case)
+        let cache_hit = {
+            let cache = self.last_chunk_cache.read().unwrap();
+            if let Some((cached_ino, cached_idx, cached_data)) = cache.as_ref() {
+                *cached_ino == ino && *cached_idx == start_chunk
+            } else {
+                false
+            }
+        };
+
+        let chunk_data = if cache_hit {
+            // Use cached chunk
+            let cache = self.last_chunk_cache.read().unwrap();
+            cache.as_ref().unwrap().2.clone()
+        } else {
+            // Fetch chunk from server
+            let chunk_ids = vec![metadata.chunks[start_chunk]];
+            let client = self.client.clone();
+
+            let result = self.block_on(async {
+                client.read_data(&chunk_ids).await
+            });
+
+            match result {
+                Ok(data) => {
+                    // Cache this chunk for next read
+                    *self.last_chunk_cache.write().unwrap() = Some((ino, start_chunk, data.clone()));
+                    data
+                }
+                Err(e) => {
+                    error!("Failed to read data: {}", e);
+                    reply.error(libc::EIO);
+                    return;
                 }
             }
-            Err(e) => {
-                error!("Failed to read data: {}", e);
-                reply.error(libc::EIO);
-            }
+        };
+
+        // Calculate offset within the chunk and return requested slice
+        let offset_in_chunk = offset % CHUNK_SIZE;
+        let data_start = offset_in_chunk;
+        let data_end = std::cmp::min(data_start + size, chunk_data.len());
+
+        if data_start >= chunk_data.len() {
+            reply.data(&[]);
+        } else {
+            reply.data(&chunk_data[data_start..data_end]);
         }
+
+        let elapsed = start.elapsed();
+        info!("FUSE read COMPLETE: ino={}, offset={}, size={}, took {:?}",
+              ino, offset, size, elapsed);
     }
 
     fn readdir(
@@ -312,14 +444,14 @@ impl Filesystem for DfsFilesystem {
 
                 // Add . and ..
                 if offset == 0 {
-                    if reply.add(ino, entry_offset + 1, FuseFileType::Directory, ".") {
+                    if reply.add(ino, 1, FuseFileType::Directory, ".") {
                         reply.ok();
                         return;
                     }
                     entry_offset += 1;
                 }
                 if offset <= 1 {
-                    if reply.add(ino, entry_offset + 1, FuseFileType::Directory, "..") {
+                    if reply.add(ino, 2, FuseFileType::Directory, "..") {
                         reply.ok();
                         return;
                     }
@@ -330,6 +462,13 @@ impl Filesystem for DfsFilesystem {
                 let skip_count = if offset > 2 { (offset - 2) as usize } else { 0 };
                 for (i, entry) in entries.iter().enumerate().skip(skip_count) {
                     let file_name = entry.path.rsplit('/').next().unwrap_or("");
+
+                    // Skip entries with empty filenames (like the root directory "/")
+                    if file_name.is_empty() {
+                        debug!("Skipping entry with empty filename: path={}", entry.path);
+                        continue;
+                    }
+
                     let kind = match entry.file_type {
                         FileType::RegularFile => FuseFileType::RegularFile,
                         FileType::Directory => FuseFileType::Directory,
@@ -345,7 +484,8 @@ impl Filesystem for DfsFilesystem {
                         .unwrap()
                         .insert(entry_ino, entry.clone());
 
-                    if reply.add(entry_ino, offset + 2 + i as i64 + 1, kind, file_name) {
+                    let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
+                    if reply.add(entry_ino, next_offset, kind, file_name) {
                         break; // Buffer full
                     }
                 }
@@ -417,7 +557,7 @@ impl Filesystem for DfsFilesystem {
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
                 // ReplyCreate expects: ttl, attr, generation, fh, flags
-                reply.created(&Duration::from_secs(1), &attr, 0, 0, 0);
+                reply.created(&Duration::from_secs(300), &attr, 0, 0, 0); // 5 minutes
             }
             Err(e) => {
                 error!("Failed to create file {}: {}", path, e);
@@ -438,6 +578,7 @@ impl Filesystem for DfsFilesystem {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
+        let start = std::time::Instant::now();
         debug!("write: ino={}, offset={}, size={}", ino, offset, data.len());
 
         let mut metadata = {
@@ -456,73 +597,244 @@ impl Filesystem for DfsFilesystem {
             return;
         }
 
-        // Read existing data if we're writing to middle of file
-        let client = self.client.clone();
-        let existing_data = if !metadata.chunks.is_empty() {
-            let chunk_ids = metadata.chunks.clone();
-            match self.block_on(async {
-                client.read_data(&chunk_ids).await
-            }) {
-                Ok(data) => data,
-                Err(e) => {
-                    error!("Failed to read existing data: {}", e);
-                    reply.error(libc::EIO);
-                    return;
+        // Write-behind buffering: buffer sequential appends in memory
+        if self.write_buffer_enabled {
+            let offset_usize = offset as usize;
+            let current_size = metadata.size as usize;
+
+            // Only buffer sequential appends
+            if offset_usize == current_size {
+                // Buffer size threshold: 4MB (same as chunk size)
+                const BUFFER_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
+
+                let write_buffers = self.write_buffers.clone();
+                let should_flush = self.block_on(async move {
+                    let mut buffers = write_buffers.lock().await;
+                    let buffer = buffers.entry(ino).or_insert_with(|| WriteBuffer {
+                        data: Vec::new(),
+                        last_modified: SystemTime::now(),
+                    });
+
+                    // Append data to buffer
+                    buffer.data.extend_from_slice(data);
+                    buffer.last_modified = SystemTime::now();
+
+                    // Check if buffer exceeds threshold
+                    Ok::<bool, anyhow::Error>(buffer.data.len() >= BUFFER_FLUSH_THRESHOLD)
+                });
+
+                match should_flush {
+                    Ok(flush_now) => {
+                        // Update metadata size in cache (but don't persist yet)
+                        metadata.size = (current_size + data.len()) as u64;
+                        metadata.modified_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        self.metadata_cache.write().unwrap().insert(ino, metadata);
+
+                        // Flush if buffer is too large
+                        if flush_now {
+                            debug!("Buffer threshold reached, flushing inode {}", ino);
+                            if let Err(e) = self.block_on(self.flush_buffer_async(ino)) {
+                                error!("Failed to auto-flush buffer: {}", e);
+                                reply.error(libc::EIO);
+                                return;
+                            }
+                        }
+
+                        let total_elapsed = start.elapsed();
+                        debug!("BUFFERED write() took {:?} for {} bytes ({:.2} MB/s)",
+                            total_elapsed, data.len(),
+                            (data.len() as f64 / 1024.0 / 1024.0) / total_elapsed.as_secs_f64());
+                        reply.written(data.len() as u32);
+                        return;
+                    }
+                    Err(e) => {
+                        error!("Failed to buffer write: {}", e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
                 }
             }
-        } else {
-            Vec::new()
-        };
-
-        // Merge new data with existing
-        let offset = offset as usize;
-        let mut new_data = existing_data;
-
-        // Extend if necessary
-        if offset + data.len() > new_data.len() {
-            new_data.resize(offset + data.len(), 0);
         }
 
-        // Write new data at offset
-        new_data[offset..offset + data.len()].copy_from_slice(data);
+        // Optimize for sequential writes (appends)
+        let client = self.client.clone();
+        let offset = offset as usize;
+        let current_size = metadata.size as usize;
 
-        // Write to cluster
-        let result = self.block_on(async {
-            client.write_data(&new_data).await
-        });
+        let new_data = if offset == current_size {
+            // Sequential write/append - just write new data
+            // This is the fast path for DVR recordings, dd, etc.
+            data.to_vec()
+        } else if offset > current_size {
+            // Writing past end of file - need to pad with zeros
+            let mut padded = vec![0u8; offset - current_size];
+            padded.extend_from_slice(data);
+            padded
+        } else {
+            // Random write in middle of file - need read-modify-write
+            // This is slow but necessary for correctness
+            let existing_data = if !metadata.chunks.is_empty() {
+                let chunk_ids = metadata.chunks.clone();
+                match self.block_on(async {
+                    client.read_data(&chunk_ids).await
+                }) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        error!("Failed to read existing data: {}", e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            let mut merged = existing_data;
+            if offset + data.len() > merged.len() {
+                merged.resize(offset + data.len(), 0);
+            }
+            merged[offset..offset + data.len()].copy_from_slice(data);
+            merged
+        };
+
+        // Write to cluster (only new/modified data for appends)
+        let write_start = std::time::Instant::now();
+        let result = if offset == current_size {
+            // Append: write just the new data as new chunks
+            self.block_on(async {
+                client.write_data(&new_data).await
+            })
+        } else {
+            // Rewrite: write entire file
+            self.block_on(async {
+                client.write_data(&new_data).await
+            })
+        };
+        let write_elapsed = write_start.elapsed();
+        debug!("write_data took {:?}", write_elapsed);
 
         match result {
-            Ok(chunk_ids) => {
+            Ok(new_chunk_ids) => {
                 // Update metadata
-                metadata.chunks = chunk_ids;
-                metadata.size = new_data.len() as u64;
+                if offset == current_size {
+                    // Append: add new chunks to existing list
+                    metadata.chunks.extend(new_chunk_ids);
+                    metadata.size = current_size as u64 + new_data.len() as u64;
+                } else {
+                    // Rewrite: replace all chunks
+                    metadata.chunks = new_chunk_ids;
+                    metadata.size = new_data.len() as u64;
+                }
                 metadata.modified_at = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
 
-                // Store updated metadata
-                let metadata_clone = metadata.clone();
-                let update_result = self.block_on(async {
-                    client.put_file_metadata(&metadata_clone).await
-                });
+                // Batch metadata updates: only update every 10 writes
+                let count = {
+                    let mut counters = self.write_counters.write().unwrap();
+                    let c = counters.entry(ino).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                let should_update = count % 10 == 0;
 
-                match update_result {
-                    Ok(_) => {
-                        // Update cache
-                        self.metadata_cache.write().unwrap().insert(ino, metadata);
-                        reply.written(data.len() as u32);
+                if should_update {
+                    // Store updated metadata
+                    let metadata_start = std::time::Instant::now();
+                    let metadata_clone = metadata.clone();
+                    let update_result = self.block_on(async {
+                        client.put_file_metadata(&metadata_clone).await
+                    });
+                    let metadata_elapsed = metadata_start.elapsed();
+                    debug!("put_file_metadata took {:?} (batched at write #{})", metadata_elapsed, count);
+
+                    match update_result {
+                        Ok(_) => {
+                            // Update cache
+                            self.metadata_cache.write().unwrap().insert(ino, metadata);
+                            let total_elapsed = start.elapsed();
+                            debug!("TOTAL write() took {:?} for {} bytes ({:.2} MB/s)",
+                                total_elapsed, data.len(),
+                                (data.len() as f64 / 1024.0 / 1024.0) / total_elapsed.as_secs_f64());
+                            reply.written(data.len() as u32);
+                        }
+                        Err(e) => {
+                            error!("Failed to update metadata: {}", e);
+                            reply.error(libc::EIO);
+                        }
                     }
-                    Err(e) => {
-                        error!("Failed to update metadata: {}", e);
-                        reply.error(libc::EIO);
-                    }
+                } else {
+                    // Skip metadata update for this write, just cache locally
+                    self.metadata_cache.write().unwrap().insert(ino, metadata);
+                    let total_elapsed = start.elapsed();
+                    debug!("TOTAL write() took {:?} for {} bytes (metadata skipped) ({:.2} MB/s)",
+                        total_elapsed, data.len(),
+                        (data.len() as f64 / 1024.0 / 1024.0) / total_elapsed.as_secs_f64());
+                    reply.written(data.len() as u32);
                 }
             }
             Err(e) => {
                 error!("Failed to write data: {}", e);
                 reply.error(libc::EIO);
             }
+        }
+    }
+
+    fn flush(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("flush: ino={}", ino);
+
+        if self.write_buffer_enabled {
+            // Flush any buffered writes
+            let result = self.block_on(self.flush_buffer_async(ino));
+
+            match result {
+                Ok(_) => reply.ok(),
+                Err(e) => {
+                    error!("Failed to flush buffer for inode {}: {}", ino, e);
+                    reply.error(libc::EIO);
+                }
+            }
+        } else {
+            reply.ok();
+        }
+    }
+
+    fn release(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("release: ino={}", ino);
+
+        if self.write_buffer_enabled {
+            // Flush any buffered writes on file close
+            let result = self.block_on(self.flush_buffer_async(ino));
+
+            match result {
+                Ok(_) => reply.ok(),
+                Err(e) => {
+                    error!("Failed to flush buffer on release for inode {}: {}", ino, e);
+                    reply.error(libc::EIO);
+                }
+            }
+        } else {
+            reply.ok();
         }
     }
 
@@ -582,7 +894,7 @@ impl Filesystem for DfsFilesystem {
 
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
-                reply.entry(&Duration::from_secs(1), &attr, 0);
+                reply.entry(&Duration::from_secs(3600), &attr, 0);
             }
             Err(e) => {
                 error!("Failed to create directory {}: {}", path, e);
@@ -880,12 +1192,116 @@ impl Filesystem for DfsFilesystem {
 
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
-                reply.attr(&Duration::from_secs(1), &attr);
+                reply.attr(&Duration::from_secs(3600), &attr);
             }
             Err(e) => {
                 error!("Failed to update attributes: {}", e);
                 reply.error(libc::EIO);
             }
+        }
+    }
+
+    fn statfs(&mut self, _req: &FuseRequest, _ino: u64, reply: ReplyStatfs) {
+        debug!("statfs");
+
+        // Query actual storage stats from cluster
+        let client = self.client.clone();
+        let result = self.block_on(async {
+            client.get_storage_stats().await
+        });
+
+        const BLOCK_SIZE: u32 = 4096;
+
+        let (total_blocks, free_blocks, avail_blocks) = match result {
+            Ok((total_space, free_space, available_space, _replication_factor)) => {
+                // Convert bytes to blocks
+                let total = total_space / BLOCK_SIZE as u64;
+                let free = free_space / BLOCK_SIZE as u64;
+                let avail = available_space / BLOCK_SIZE as u64;
+                (total, free, avail)
+            }
+            Err(e) => {
+                error!("Failed to get storage stats: {}", e);
+                // Return reasonable defaults on error
+                (1_000_000_000, 500_000_000, 500_000_000)
+            }
+        };
+
+        reply.statfs(
+            total_blocks,  // blocks - total data blocks in filesystem
+            free_blocks,   // bfree - free blocks in filesystem
+            avail_blocks,  // bavail - free blocks available to non-privileged user
+            0,             // files - total file nodes in filesystem (unlimited)
+            0,             // ffree - free file nodes in filesystem (unlimited)
+            BLOCK_SIZE,    // bsize - block size
+            255,           // namelen - maximum filename length
+            BLOCK_SIZE,    // frsize - fragment size
+        );
+    }
+
+    fn access(&mut self, _req: &FuseRequest, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
+        debug!("access: ino={}, mask={}", ino, mask);
+
+        // Check if inode exists
+        let cache = self.metadata_cache.read().unwrap();
+        if cache.get(&ino).is_some() {
+            // For simplicity, allow all access
+            // A real implementation would check permissions based on mask
+            reply.ok();
+        } else {
+            reply.error(libc::ENOENT);
+        }
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        _fh: u64,
+        datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("fsync: ino={}, datasync={}", ino, datasync);
+
+        if self.write_buffer_enabled {
+            // Flush any buffered writes
+            let result = self.block_on(self.flush_buffer_async(ino));
+
+            match result {
+                Ok(_) => reply.ok(),
+                Err(e) => {
+                    error!("Failed to fsync inode {}: {}", ino, e);
+                    reply.error(libc::EIO);
+                }
+            }
+        } else {
+            // No buffering, data is already synced
+            reply.ok();
+        }
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &FuseRequest,
+        _ino: u64,
+        name: &std::ffi::OsStr,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        debug!("getxattr: name={:?}, size={}", name, size);
+        // We don't support extended attributes
+        reply.error(libc::ENODATA);
+    }
+
+    fn listxattr(&mut self, _req: &FuseRequest, _ino: u64, size: u32, reply: fuser::ReplyXattr) {
+        debug!("listxattr: size={}", size);
+        // We don't support extended attributes, return empty list
+        if size == 0 {
+            // Query size
+            reply.size(0);
+        } else {
+            // Return empty list
+            reply.data(&[]);
         }
     }
 }

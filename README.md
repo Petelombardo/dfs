@@ -146,8 +146,11 @@ dfs-server status --config /etc/dfs/config.toml
 
 ## Performance
 
-Current benchmarks on ARM64 (NanoPi R3) with GlusterFS backend:
+Current benchmarks with 3-node ARM64 cluster:
+- **Servers**: 3x Odroid M1S with GlusterFS backend
+- **Client**: NanoPi R3 (FUSE mount)
 
+Performance:
 - **Read**: 23 MB/s (with chunk caching)
 - **Write**: 14-15 MB/s (investigating optimizations)
 

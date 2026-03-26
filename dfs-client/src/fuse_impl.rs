@@ -66,6 +66,18 @@ impl DfsFilesystem {
     ) -> Result<Self> {
         let client = Arc::new(DfsClient::new(cluster_nodes)?);
 
+        // Start background task to periodically refresh cluster nodes
+        let client_clone = client.clone();
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = client_clone.refresh_cluster_nodes().await {
+                    tracing::debug!("Failed to refresh cluster nodes: {}", e);
+                }
+            }
+        });
+
         let metadata_cache = Arc::new(RwLock::new(HashMap::new()));
         let path_to_inode = Arc::new(RwLock::new(HashMap::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
@@ -76,6 +88,7 @@ impl DfsFilesystem {
             path: "/".to_string(),
             size: 0,
             chunks: Vec::new(),
+            chunk_sizes: Vec::new(),
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -138,7 +151,9 @@ impl DfsFilesystem {
         if let Some(buffer) = buffer_opt {
             info!("Flushing {} bytes for inode {}", buffer.data.len(), ino);
 
-            // Get current metadata to get existing chunks
+            // Get current metadata from cache
+            // NOTE: metadata.size has already been updated by buffered writes
+            // We only need to add the chunks for the buffered data
             let mut metadata = {
                 let cache = self.metadata_cache.read().unwrap();
                 match cache.get(&ino) {
@@ -150,10 +165,16 @@ impl DfsFilesystem {
             };
 
             // Write buffered data as new chunks (appending)
-            let new_chunk_ids = self.client.write_data(&buffer.data).await?;
+            // Use single-chunk write to maintain 4MB chunk alignment for reads
+            let (new_chunk_ids, new_chunk_sizes) = self.client.write_data_single_chunk(&buffer.data).await?;
+
+            info!("Flush complete: {} chunks added, total file size {}",
+                  new_chunk_ids.len(), metadata.size);
 
             // Append new chunks to existing chunks
+            // Size was already updated during buffered writes, don't update again
             metadata.chunks.extend(new_chunk_ids);
+            metadata.chunk_sizes.extend(new_chunk_sizes);
             metadata.modified_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -349,56 +370,83 @@ impl Filesystem for DfsFilesystem {
             return;
         }
 
-        // Calculate which chunks we actually need
-        const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
-        let start_chunk = offset / CHUNK_SIZE;
+        if metadata.chunks.is_empty() {
+            reply.data(&[]);
+            return;
+        }
 
-        // Check cache first for single-chunk reads (most common case)
-        let cache_hit = {
-            let cache = self.last_chunk_cache.read().unwrap();
-            if let Some((cached_ino, cached_idx, cached_data)) = cache.as_ref() {
-                *cached_ino == ino && *cached_idx == start_chunk
-            } else {
-                false
+        // Build chunk offset map for efficient lookups using chunk_sizes
+        let mut chunk_offsets = Vec::with_capacity(metadata.chunks.len());
+        let mut current_offset = 0usize;
+
+        for (idx, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
+            chunk_offsets.push((current_offset, chunk_size as usize));
+            current_offset += chunk_size as usize;
+        }
+
+        // Find which chunks we need to read
+        let end_offset = std::cmp::min(offset + size, metadata.size as usize);
+        let mut chunks_to_read = Vec::new();
+        let mut first_chunk_offset = 0usize;
+
+        for (idx, &(chunk_start, chunk_size)) in chunk_offsets.iter().enumerate() {
+            let chunk_end = chunk_start + chunk_size;
+
+            // Check if this chunk overlaps with requested range
+            if chunk_end > offset && chunk_start < end_offset {
+                chunks_to_read.push((idx, chunk_start, chunk_size));
+                if chunks_to_read.len() == 1 {
+                    first_chunk_offset = chunk_start;
+                }
+            }
+
+            // Stop once we've found all needed chunks
+            if chunk_start >= end_offset {
+                break;
+            }
+        }
+
+        if chunks_to_read.is_empty() {
+            reply.data(&[]);
+            return;
+        }
+
+        debug!("Reading {} chunks (indices {:?}) for offset {} size {}",
+               chunks_to_read.len(),
+               chunks_to_read.iter().map(|(idx, _, _)| idx).collect::<Vec<_>>(),
+               offset, size);
+
+        // Read only the needed chunks in one batch
+        let chunk_ids: Vec<ChunkId> = chunks_to_read
+            .iter()
+            .map(|(idx, _, _)| metadata.chunks[*idx])
+            .collect();
+
+        let client = self.client.clone();
+        let result = self.block_on(async {
+            client.read_data(&chunk_ids).await
+        });
+
+        let all_data = match result {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Failed to read {} chunks: {}", chunk_ids.len(), e);
+                reply.error(libc::EIO);
+                return;
             }
         };
 
-        let chunk_data = if cache_hit {
-            // Use cached chunk
-            let cache = self.last_chunk_cache.read().unwrap();
-            cache.as_ref().unwrap().2.clone()
-        } else {
-            // Fetch chunk from server
-            let chunk_ids = vec![metadata.chunks[start_chunk]];
-            let client = self.client.clone();
+        // Calculate offset within the read data
+        let offset_in_data = offset.saturating_sub(first_chunk_offset);
+        let data_end = std::cmp::min(offset_in_data + size, all_data.len());
 
-            let result = self.block_on(async {
-                client.read_data(&chunk_ids).await
-            });
-
-            match result {
-                Ok(data) => {
-                    // Cache this chunk for next read
-                    *self.last_chunk_cache.write().unwrap() = Some((ino, start_chunk, data.clone()));
-                    data
-                }
-                Err(e) => {
-                    error!("Failed to read data: {}", e);
-                    reply.error(libc::EIO);
-                    return;
-                }
-            }
-        };
-
-        // Calculate offset within the chunk and return requested slice
-        let offset_in_chunk = offset % CHUNK_SIZE;
-        let data_start = offset_in_chunk;
-        let data_end = std::cmp::min(data_start + size, chunk_data.len());
-
-        if data_start >= chunk_data.len() {
+        if offset_in_data >= all_data.len() {
+            debug!("Read offset {} beyond data length {}", offset_in_data, all_data.len());
             reply.data(&[]);
         } else {
-            reply.data(&chunk_data[data_start..data_end]);
+            debug!("Returning {} bytes from offset {} (read {} chunks, total {} bytes)",
+                   data_end - offset_in_data, offset, chunk_ids.len(), all_data.len());
+            reply.data(&all_data[offset_in_data..data_end]);
         }
 
         let elapsed = start.elapsed();
@@ -525,6 +573,7 @@ impl Filesystem for DfsFilesystem {
             path: path.clone(),
             size: 0,
             chunks: Vec::new(),
+            chunk_sizes: Vec::new(),
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -717,15 +766,17 @@ impl Filesystem for DfsFilesystem {
         debug!("write_data took {:?}", write_elapsed);
 
         match result {
-            Ok(new_chunk_ids) => {
+            Ok((new_chunk_ids, new_chunk_sizes)) => {
                 // Update metadata
                 if offset == current_size {
                     // Append: add new chunks to existing list
                     metadata.chunks.extend(new_chunk_ids);
+                    metadata.chunk_sizes.extend(new_chunk_sizes);
                     metadata.size = current_size as u64 + new_data.len() as u64;
                 } else {
                     // Rewrite: replace all chunks
                     metadata.chunks = new_chunk_ids;
+                    metadata.chunk_sizes = new_chunk_sizes;
                     metadata.size = new_data.len() as u64;
                 }
                 metadata.modified_at = SystemTime::now()
@@ -863,6 +914,7 @@ impl Filesystem for DfsFilesystem {
             path: path.clone(),
             size: 0,
             chunks: Vec::new(),
+            chunk_sizes: Vec::new(),
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1160,8 +1212,9 @@ impl Filesystem for DfsFilesystem {
                 });
 
                 match result {
-                    Ok(chunk_ids) => {
+                    Ok((chunk_ids, chunk_sizes)) => {
                         metadata.chunks = chunk_ids;
+                        metadata.chunk_sizes = chunk_sizes;
                         metadata.size = new_size;
                     }
                     Err(e) => {

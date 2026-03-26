@@ -17,6 +17,14 @@ struct PersistedPeers {
     last_updated: u64, // Unix timestamp
 }
 
+/// Node capacity information for placement decisions
+#[derive(Debug, Clone)]
+struct NodeCapacity {
+    available: u64,
+    total: u64,
+    last_updated: u64, // Unix timestamp
+}
+
 /// Cluster membership manager
 /// Tracks all nodes in the cluster and their status
 pub struct ClusterManager {
@@ -31,6 +39,9 @@ pub struct ClusterManager {
 
     /// Consistent hash ring for data placement
     hash_ring: Arc<RwLock<ConsistentHashRing>>,
+
+    /// Node capacity information for capacity-aware placement
+    node_capacities: Arc<RwLock<HashMap<NodeId, NodeCapacity>>>,
 
     /// Heartbeat interval in seconds
     heartbeat_interval: u64,
@@ -59,6 +70,7 @@ impl ClusterManager {
             local_addr,
             nodes: Arc::new(RwLock::new(nodes)),
             hash_ring: Arc::new(RwLock::new(hash_ring)),
+            node_capacities: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_interval,
             failure_timeout,
         }
@@ -155,6 +167,83 @@ impl ClusterManager {
     ) -> Option<NodeId> {
         let ring = self.hash_ring.read().await;
         ring.get_primary_node(chunk_id)
+    }
+
+    /// Get nodes for chunk with smart replica set selection
+    /// Picks the replica set with highest minimum capacity to prevent small nodes from bottlenecking
+    /// Works for any replication factor (not hardcoded to triplets)
+    pub async fn get_nodes_with_capacity_awareness(
+        &self,
+        chunk_id: &dfs_common::ChunkId,
+        count: usize,
+    ) -> Vec<NodeId> {
+        let ring = self.hash_ring.read().await;
+        let all_nodes: Vec<NodeId> = ring.nodes().to_vec();
+        drop(ring);
+
+        if all_nodes.len() <= count {
+            return all_nodes;
+        }
+
+        // Get capacity information
+        let capacities = self.node_capacities.read().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Build list of (node_id, available_capacity)
+        let mut node_capacities_vec: Vec<(NodeId, u64)> = Vec::new();
+        for node_id in &all_nodes {
+            let available = if let Some(cap) = capacities.get(node_id) {
+                if cap.total > 0 && now - cap.last_updated < 60 {
+                    cap.available
+                } else {
+                    // Stale data, assume moderate capacity
+                    cap.total / 2
+                }
+            } else {
+                // No capacity data, assume moderate capacity (1TB)
+                1_000_000_000_000
+            };
+            node_capacities_vec.push((*node_id, available));
+        }
+
+        // SMART REPLICA SET SELECTION (Greedy Algorithm):
+        // Sort nodes by available capacity descending and take top 'count' nodes
+        // This is the replica set with the highest minimum capacity
+        //
+        // Example: RF=3, nodes (100G, 100G, 100G, 10G)
+        //   Top 3: (100G, 100G, 100G) - min=100G ← BEST choice
+        //   Avoids picking (100G, 100G, 10G) which has min=10G
+        //
+        // This greedy choice maximizes the bottleneck node in each replica set,
+        // which maximizes total usable cluster capacity
+        node_capacities_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+        node_capacities_vec
+            .into_iter()
+            .take(count)
+            .map(|(node_id, _)| node_id)
+            .collect()
+    }
+
+    /// Update capacity information for a node
+    pub async fn update_node_capacity(&self, node_id: NodeId, available: u64, total: u64) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut capacities = self.node_capacities.write().await;
+        capacities.insert(
+            node_id,
+            NodeCapacity {
+                available,
+                total,
+                last_updated: now,
+            },
+        );
     }
 
     /// Start background task to check for failed nodes

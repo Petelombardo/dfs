@@ -160,6 +160,9 @@ pub struct FileMetadata {
     /// Chunk IDs that make up this file (in order)
     pub chunks: Vec<ChunkId>,
 
+    /// Size of each chunk in bytes (parallel to chunks vec)
+    pub chunk_sizes: Vec<u64>,
+
     /// Creation timestamp (Unix epoch seconds)
     pub created_at: u64,
 
@@ -187,6 +190,7 @@ impl FileMetadata {
             path,
             size: 0,
             chunks: Vec::new(),
+            chunk_sizes: Vec::new(),
             created_at: now,
             modified_at: now,
             mode: if file_type == FileType::Directory {

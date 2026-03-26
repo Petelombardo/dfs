@@ -12,7 +12,8 @@ use tracing::{error, Level};
 #[command(about = "DFS cluster administration tool", long_about = None)]
 struct Cli {
     /// Cluster nodes (comma-separated, e.g., 192.168.1.10:8900,192.168.1.11:8900)
-    #[arg(short, long, value_delimiter = ',', required = true)]
+    /// If not specified, will attempt to auto-detect local server
+    #[arg(short, long, value_delimiter = ',')]
     cluster: Vec<String>,
 
     /// Output format (text or json)
@@ -54,6 +55,11 @@ enum Commands {
 enum ClusterCommands {
     /// Show cluster status
     Status,
+    /// Remove a node from the cluster
+    RemoveNode {
+        /// Node ID to remove
+        node_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -101,7 +107,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Parse cluster addresses
-    let cluster_addrs = parse_cluster_addrs(&cli.cluster)?;
+    let cluster_addrs = if cli.cluster.is_empty() {
+        // Try to auto-detect local server
+        detect_local_servers()?
+    } else {
+        parse_cluster_addrs(&cli.cluster)?
+    };
+
     if cluster_addrs.is_empty() {
         anyhow::bail!("No valid cluster addresses provided");
     }
@@ -136,12 +148,96 @@ fn parse_cluster_addrs(addrs: &[String]) -> Result<Vec<SocketAddr>> {
     Ok(result)
 }
 
+fn detect_local_servers() -> Result<Vec<SocketAddr>> {
+    // Scan for /tmp/dfs-server-*.addr files
+    let pattern = "/tmp/dfs-server-*.addr";
+    let mut servers = Vec::new();
+
+    // Use glob to find matching files
+    for entry in std::fs::read_dir("/tmp")? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if file_name.starts_with("dfs-server-") && file_name.ends_with(".addr") {
+            // Read the address from the file
+            match std::fs::read_to_string(&path) {
+                Ok(addr_str) => match addr_str.trim().parse::<SocketAddr>() {
+                    Ok(addr) => servers.push(addr),
+                    Err(e) => {
+                        tracing::warn!("Invalid address in {}: {}", path.display(), e);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to read {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
+    match servers.len() {
+        0 => {
+            anyhow::bail!(
+                "No local dfs-server detected. Either:\n\
+                 1. Start a dfs-server instance, or\n\
+                 2. Specify --cluster <address> to connect to a remote server"
+            );
+        }
+        1 => {
+            println!("Auto-detected local server at {}", servers[0]);
+            Ok(servers)
+        }
+        _ => {
+            anyhow::bail!(
+                "Multiple dfs-server instances detected:\n{}\n\n\
+                 Please specify which server to connect to using --cluster <address>",
+                servers
+                    .iter()
+                    .map(|s| format!("  - {}", s))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+    }
+}
+
 async fn handle_cluster_command(
     cmd: ClusterCommands,
     cluster_addrs: &[SocketAddr],
     json_output: bool,
 ) -> Result<()> {
     match cmd {
+        ClusterCommands::RemoveNode { node_id } => {
+            // Parse node ID from UUID string
+            let uuid = uuid::Uuid::parse_str(&node_id)
+                .with_context(|| format!("Invalid node ID (must be a UUID): {}", node_id))?;
+            let node_id_parsed = dfs_common::NodeId::from_uuid(uuid);
+
+            let response = send_request(
+                cluster_addrs[0],
+                Request::RemoveNode {
+                    node_id: node_id_parsed,
+                },
+            )
+            .await?;
+
+            match response {
+                Response::Ok { .. } => {
+                    if json_output {
+                        println!("{{\"success\": true, \"message\": \"Node removed successfully\"}}");
+                    } else {
+                        println!("Node {} removed successfully", node_id);
+                    }
+                }
+                Response::Error { message, .. } => {
+                    error!("Error: {}", message);
+                    anyhow::bail!("Command failed: {}", message);
+                }
+                _ => {
+                    anyhow::bail!("Unexpected response type");
+                }
+            }
+        }
         ClusterCommands::Status => {
             let response = send_request(cluster_addrs[0], Request::GetClusterStatus).await?;
 
@@ -159,6 +255,8 @@ async fn handle_cluster_command(
                                 serde_json::json!({
                                     "id": n.id.to_string(),
                                     "address": n.addr.to_string(),
+                                    "status": format!("{:?}", n.status),
+                                    "last_heartbeat": n.last_heartbeat,
                                 })
                             }).collect::<Vec<_>>()
                         });
@@ -170,11 +268,24 @@ async fn handle_cluster_command(
                         println!("Healthy Nodes: {}", healthy_nodes);
                         println!();
                         println!("Nodes:");
-                        println!("{:<40} {:<20}", "ID", "Address");
-                        println!("{}", "-".repeat(60));
+                        println!("{:<40} {:<20} {:<12} {}", "ID", "Address", "Status", "Last Heartbeat");
+                        println!("{}", "-".repeat(95));
 
                         for node in nodes {
-                            println!("{:<40} {:<20}", node.id.to_string(), node.addr);
+                            let status_str = format!("{:?}", node.status);
+                            let status_display = match node.status {
+                                dfs_common::NodeStatus::Online => format!("✓ {}", status_str),
+                                dfs_common::NodeStatus::Suspected => format!("? {}", status_str),
+                                dfs_common::NodeStatus::Failed => format!("✗ {}", status_str),
+                                dfs_common::NodeStatus::Leaving => format!("← {}", status_str),
+                            };
+                            println!(
+                                "{:<40} {:<20} {:<12} {}s ago",
+                                node.id.to_string(),
+                                node.addr,
+                                status_display,
+                                node.last_heartbeat
+                            );
                         }
                     }
                 }

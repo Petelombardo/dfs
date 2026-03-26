@@ -259,7 +259,7 @@ impl DfsClient {
     /// Write data to cluster with dual-stream parallelization
     /// For RF=3: Split data in half, send to 2 servers simultaneously
     /// Each server replicates to 2 nodes, 3rd replica created in background
-    pub async fn write_data(&self, data: &[u8]) -> Result<Vec<ChunkId>> {
+    pub async fn write_data(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
         const MIN_PARALLEL_SIZE: usize = 512 * 1024; // 512KB minimum
 
         // For small writes, use single server (less overhead)
@@ -291,17 +291,24 @@ impl DfsClient {
 
         let (result1, result2) = tokio::join!(task1, task2);
 
+        let (chunk_ids_1, chunk_sizes_1) = result1?;
+        let (chunk_ids_2, chunk_sizes_2) = result2?;
+
         let mut all_chunk_ids = Vec::new();
-        all_chunk_ids.extend(result1?);
-        all_chunk_ids.extend(result2?);
+        all_chunk_ids.extend(chunk_ids_1);
+        all_chunk_ids.extend(chunk_ids_2);
+
+        let mut all_chunk_sizes = Vec::new();
+        all_chunk_sizes.extend(chunk_sizes_1);
+        all_chunk_sizes.extend(chunk_sizes_2);
 
         info!("Completed dual-stream write: {} total chunks", all_chunk_ids.len());
 
-        Ok(all_chunk_ids)
+        Ok((all_chunk_ids, all_chunk_sizes))
     }
 
     /// Write a chunk to a specific server
-    async fn write_chunk_to_server(server_addr: SocketAddr, data: Vec<u8>) -> Result<Vec<ChunkId>> {
+    async fn write_chunk_to_server(server_addr: SocketAddr, data: Vec<u8>) -> Result<(Vec<ChunkId>, Vec<u64>)> {
         let total_start = std::time::Instant::now();
         let data_len = data.len();
 
@@ -349,7 +356,7 @@ impl DfsClient {
               server_addr, data_len, total_time, throughput, connect_time, serialize_time, send_time, recv_time, deserialize_time);
 
         match response_envelope.message {
-            Message::Response(Response::ChunkIds { chunk_ids }) => Ok(chunk_ids),
+            Message::Response(Response::ChunkIds { chunk_ids, chunk_sizes }) => Ok((chunk_ids, chunk_sizes)),
             Message::Response(Response::Error { message, .. }) => {
                 anyhow::bail!("Server error: {}", message);
             }
@@ -358,7 +365,7 @@ impl DfsClient {
     }
 
     /// Write small data via single server (old path)
-    async fn write_data_single_chunk(&self, data: &[u8]) -> Result<Vec<ChunkId>> {
+    pub async fn write_data_single_chunk(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
         let request = Request::WriteFile {
             data: data.to_vec(),
         };
@@ -366,7 +373,7 @@ impl DfsClient {
         let response = self.send_request_with_retry(request).await?;
 
         match response {
-            Response::ChunkIds { chunk_ids } => Ok(chunk_ids),
+            Response::ChunkIds { chunk_ids, chunk_sizes } => Ok((chunk_ids, chunk_sizes)),
             Response::Error { message, .. } => {
                 anyhow::bail!("Failed to write data: {}", message);
             }
@@ -408,64 +415,200 @@ impl DfsClient {
         }
     }
 
+    /// Refresh cluster node list by querying GetClusterStatus
+    pub async fn refresh_cluster_nodes(&self) -> Result<()> {
+        let nodes = self.cluster_nodes.read().await.clone();
+
+        // Try to get cluster status from any node
+        for node_addr in &nodes {
+            let request = Request::GetClusterStatus;
+
+            match self.send_request(*node_addr, request).await {
+                Ok(Response::ClusterStatus { nodes: cluster_nodes, .. }) => {
+                    // Extract online node addresses
+                    let new_addrs: Vec<SocketAddr> = cluster_nodes
+                        .iter()
+                        .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                        .map(|n| n.addr)
+                        .collect();
+
+                    if !new_addrs.is_empty() {
+                        let mut cluster_nodes = self.cluster_nodes.write().await;
+                        *cluster_nodes = new_addrs;
+                        info!("Refreshed cluster nodes: {} nodes", cluster_nodes.len());
+                        return Ok(());
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to refresh cluster nodes from any server"))
+    }
+
     /// Get storage statistics from all nodes and aggregate them
     /// Returns (total_space, free_space, available_space, replication_factor)
     pub async fn get_storage_stats(&self) -> Result<(u64, u64, u64, usize)> {
         let nodes = self.cluster_nodes.read().await.clone();
         let request = Request::GetStorageStats;
 
-        // Query all nodes
-        let mut min_total = u64::MAX;
-        let mut min_free = u64::MAX;
-        let mut min_available = u64::MAX;
+        // Query all nodes IN PARALLEL for speed
+        let mut tasks: Vec<tokio::task::JoinHandle<Result<Option<(u64, u64, u64, usize)>, Box<dyn std::error::Error + Send + Sync>>>> = Vec::new();
+
+        for node_addr in nodes {
+            let request = request.clone();
+            let task = tokio::spawn(async move {
+                // Wrap entire query with 2s timeout to avoid hanging on offline nodes
+                // (ARM servers are slower, need more generous timeout)
+                let query_future = async {
+                    // Create a temporary client for this request with 1s connect timeout
+                    let mut stream = tokio::time::timeout(
+                        std::time::Duration::from_millis(1000),
+                        tokio::net::TcpStream::connect(node_addr)
+                    ).await
+                        .map_err(|_| Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")) as Box<dyn std::error::Error + Send + Sync>)?
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                let request_id = dfs_common::RequestId::new(
+                    std::sync::atomic::AtomicU64::new(1).fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                );
+                let envelope = dfs_common::MessageEnvelope::new(
+                    request_id,
+                    dfs_common::Message::Request(request)
+                );
+                let encoded = envelope.to_bytes().map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                use tokio::io::{AsyncWriteExt, AsyncReadExt};
+                stream.write_u32(encoded.len() as u32).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                stream.write_all(&encoded).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                stream.flush().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                    let response_envelope = dfs_common::MessageEnvelope::from_bytes(&buf).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                    match response_envelope.message {
+                        dfs_common::Message::Response(dfs_common::Response::StorageStats {
+                            total_space,
+                            free_space,
+                            available_space,
+                            replication_factor,
+                            ..
+                        }) => Ok(Some((total_space, free_space, available_space, replication_factor))),
+                        _ => Ok(None),
+                    }
+                };
+
+                // Apply overall 2s timeout to entire query
+                tokio::time::timeout(std::time::Duration::from_millis(2000), query_future)
+                    .await
+                    .map_err(|_| Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "query timeout")) as Box<dyn std::error::Error + Send + Sync>)?
+            });
+
+            tasks.push(task);
+        }
+
+        // Wait for all queries to complete
+        let mut total_raw_space = 0u64;
+        let mut node_capacities: Vec<(u64, u64)> = Vec::new(); // (total, available) per node
         let mut replication_factor = 3; // default
 
-        for node_addr in &nodes {
-            match self.send_request(*node_addr, request.clone()).await {
-                Ok(Response::StorageStats {
-                    total_space,
-                    free_space,
-                    available_space,
-                    replication_factor: rf,
-                    ..
-                }) => {
-                    // Track minimum values (bottleneck node determines capacity)
-                    if total_space > 0 && total_space < min_total {
-                        min_total = total_space;
-                    }
-                    if free_space > 0 && free_space < min_free {
-                        min_free = free_space;
-                    }
-                    if available_space > 0 && available_space < min_available {
-                        min_available = available_space;
-                    }
-                    replication_factor = rf;
-                }
-                Ok(Response::Error { message, .. }) => {
-                    warn!("Failed to get stats from {}: {}", node_addr, message);
-                }
-                Err(e) => {
-                    warn!("Failed to query {}: {}", node_addr, e);
-                }
-                _ => {}
+        for task in tasks {
+            if let Ok(Ok(Some((total, free, avail, rf)))) = task.await {
+                total_raw_space += total;
+                node_capacities.push((total, avail));
+                replication_factor = rf;
             }
         }
 
         // If we didn't get any valid stats, return error
-        if min_total == u64::MAX {
+        if node_capacities.is_empty() {
             anyhow::bail!("Failed to get storage stats from any node");
         }
 
-        // For replica 3 setup: the usable space is the smallest node's capacity
-        // because all 3 copies must fit, and we're limited by the smallest node
-        // The actual capacity calculation:
-        // - With N nodes and replication factor R, we have N/R sets of replicas
-        // - Each set can store (smallest_node_size) worth of unique data
-        // - But since all our nodes are the same, we just report the smallest node's space
+        // Calculate usable capacity using greedy algorithm:
+        // Iteratively select the best RF nodes and add their bottleneck to total capacity
         //
-        // For your setup: 3 nodes with replica 3 means 1 set of replicas
-        // So usable space = smallest node space (not divided by RF)
+        // This correctly handles heterogeneous clusters where smart replica set selection
+        // can dramatically increase usable capacity.
+        //
+        // Example: RF=3, nodes (100G, 100G, 100G, 10G)
+        //   Iteration 1: Pick top 3 (100,100,100), min=100G, total=100G
+        //   Iteration 2: Pick top 3 (0,0,0), min=0G, done
+        //   → Total = 100G (NOT 13G from naive formula!)
+        let usable_total = total_raw_space / replication_factor as u64;
+        let usable_available = calculate_usable_capacity(
+            &node_capacities.iter().map(|(_, avail)| *avail).collect::<Vec<_>>(),
+            replication_factor
+        );
 
-        Ok((min_total, min_free, min_available, replication_factor))
+        info!("Storage stats: {} nodes, usable_total={}, usable_avail={} (RF={})",
+              node_capacities.len(), usable_total, usable_available, replication_factor);
+
+        // Calculate usable_free as the complement of used space
+        // (usable_total - usable_available gives used space on a per-replica basis)
+        let usable_free = usable_available;
+
+        Ok((usable_total, usable_free, usable_available, replication_factor))
     }
+}
+
+/// Calculate usable capacity using greedy algorithm for smart replica set selection
+///
+/// This algorithm correctly handles heterogeneous clusters by iteratively selecting
+/// the best replica sets (top RF nodes by capacity) and accounting for their bottleneck.
+///
+/// Example: RF=3, nodes (100G, 100G, 100G, 10G)
+///   - Iteration 1: Pick top 3 (100,100,100), min=100G, add 100G to total
+///   - Iteration 2: Pick top 3 (0,0,0), min=0G, done
+///   - Result: 100G (NOT 13G from naive min×nodes/RF formula)
+///
+/// This matches the bash algorithm provided by the user and works for any RF value.
+fn calculate_usable_capacity(node_capacities: &[u64], replication_factor: usize) -> u64 {
+    if node_capacities.is_empty() || replication_factor == 0 {
+        return 0;
+    }
+
+    let mut capacities = node_capacities.to_vec();
+    let mut total = 0u64;
+
+    loop {
+        // Filter out zeros and sort descending
+        let mut non_zero: Vec<u64> = capacities.iter()
+            .copied()
+            .filter(|&c| c > 0)
+            .collect();
+
+        // Check if we have at least RF nodes with capacity > 0
+        if non_zero.len() < replication_factor {
+            break;
+        }
+
+        // Sort descending
+        non_zero.sort_by(|a, b| b.cmp(a));
+
+        // The decrement is the minimum of the top RF nodes (the RF-th largest value)
+        let decrement = non_zero[replication_factor - 1];
+        total += decrement;
+
+        // Subtract decrement ONLY from the top RF nodes
+        let mut decremented_count = 0;
+        for val in &non_zero[0..replication_factor] {
+            // Find this value in the original capacities array and decrement it
+            for capacity in &mut capacities {
+                if *capacity == *val && decremented_count < replication_factor {
+                    *capacity = capacity.saturating_sub(decrement);
+                    decremented_count += 1;
+                    break; // Move to next value in the top RF
+                }
+            }
+        }
+    }
+
+    total
 }

@@ -289,15 +289,16 @@ impl HealingManager {
             return Ok(());
         }
 
-        // Get candidate nodes from consistent hash
-        let target_nodes = self
+        // Get candidate nodes using capacity-aware placement
+        // This matches how writes work, so healing won't fight against placement decisions
+        let candidate_nodes = self
             .cluster
-            .get_nodes_for_chunk(chunk_id, self.replication_factor)
+            .get_nodes_with_capacity_awareness(chunk_id, self.replication_factor + needed_replicas)
             .await;
 
         // Find nodes that don't have the chunk yet
         let alive_set: HashSet<_> = alive_nodes.iter().copied().collect();
-        let new_targets: Vec<_> = target_nodes
+        let new_targets: Vec<_> = candidate_nodes
             .into_iter()
             .filter(|n| !alive_set.contains(n))
             .take(needed_replicas)
@@ -490,8 +491,9 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
 
-        let healing = HealingManager::new(storage, metadata, cluster, 3, 300, 24, true);
+        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 300, 24, true);
 
         let stats = healing.get_stats().await;
         assert_eq!(stats.pending_healing, 0);
@@ -510,8 +512,9 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
 
-        let healing = HealingManager::new(storage, metadata, cluster, 3, 2, 24, true); // 2s delay
+        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 2, 24, true); // 2s delay
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"test"));
 

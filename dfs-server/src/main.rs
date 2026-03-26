@@ -190,6 +190,14 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     info!("DFS server is ready!");
     info!("Listening on: {}", config.node.listen_addr);
 
+    // Write address to port-specific file for dfs-admin auto-discovery
+    let addr_file = format!("/tmp/dfs-server-{}.addr", config.node.listen_addr.port());
+    if let Err(e) = std::fs::write(&addr_file, config.node.listen_addr.to_string()) {
+        warn!("Failed to write address file {}: {}", addr_file, e);
+    } else {
+        debug!("Wrote server address to {}", addr_file);
+    }
+
     // Try to join cluster using both seed nodes AND persisted peers
     // This ensures any node can rejoin even if the seed node is down
     let metadata_dir = std::path::PathBuf::from(&config.storage.metadata_dir);

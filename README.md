@@ -147,7 +147,7 @@ dfs-server status --config /etc/dfs/config.toml
 ## Performance
 
 Current benchmarks with 3-node ARM64 cluster:
-- **Servers**: 3x Odroid M1S with GlusterFS backend
+- **Servers**: 3x Odroid M1S with NVME backend storage
 - **Client**: NanoPi R3 (FUSE mount)
 
 Performance:

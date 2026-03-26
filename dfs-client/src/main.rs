@@ -82,20 +82,24 @@ fn mount_filesystem(
 ) -> Result<()> {
     info!("Mounting DFS at {:?}", mountpoint);
 
-    // Parse cluster node addresses
-    let mut addrs = Vec::new();
+    // Parse cluster node addresses - add default port 8900 if not specified
+    let mut seed_addrs = Vec::new();
     for node_str in cluster_nodes {
-        let addr: SocketAddr = node_str
-            .parse()
+        let addr = parse_node_address(&node_str)
             .with_context(|| format!("Invalid node address: {}", node_str))?;
-        addrs.push(addr);
+        seed_addrs.push(addr);
     }
 
-    if addrs.is_empty() {
-        anyhow::bail!("No cluster nodes specified. Use --cluster to specify at least one node.");
+    if seed_addrs.is_empty() {
+        anyhow::bail!("No cluster nodes specified. Use --cluster to specify at least one seed node.");
     }
 
-    info!("Connecting to cluster nodes: {:?}", addrs);
+    info!("Connecting to seed node(s): {:?}", seed_addrs);
+
+    // Auto-discover full cluster by querying the first reachable seed node
+    let addrs = discover_cluster_nodes(&seed_addrs)?;
+
+    info!("Discovered {} cluster nodes: {:?}", addrs.len(), addrs);
 
     if write_buffer {
         info!("Write-behind buffering ENABLED - better performance, may lose unflushed data on crash");
@@ -188,4 +192,84 @@ async fn unmount_filesystem(mountpoint: PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse node address, adding default port 8900 if not specified
+fn parse_node_address(node_str: &str) -> Result<SocketAddr> {
+    // If it already has a port, parse directly
+    if node_str.contains(':') {
+        return node_str.parse().context("Invalid address format");
+    }
+
+    // Otherwise, add default port 8900
+    let with_port = format!("{}:8900", node_str);
+    with_port.parse().context("Invalid IP address")
+}
+
+/// Discover all cluster nodes by querying GetClusterStatus from a seed node
+fn discover_cluster_nodes(seed_addrs: &[SocketAddr]) -> Result<Vec<SocketAddr>> {
+    use dfs_common::{Message, MessageEnvelope, Request, RequestId, Response};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    // Try each seed node until one responds
+    for seed_addr in seed_addrs {
+        info!("Querying cluster status from {}", seed_addr);
+
+        let result = tokio::runtime::Runtime::new()?.block_on(async {
+            // Connect to seed node
+            let mut stream = match TcpStream::connect(seed_addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    info!("Failed to connect to {}: {}", seed_addr, e);
+                    return Err(anyhow::anyhow!("Connection failed"));
+                }
+            };
+
+            // Send GetClusterStatus request
+            let request = Request::GetClusterStatus;
+            let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+            let envelope = MessageEnvelope::new(request_id, Message::Request(request));
+            let encoded = envelope.to_bytes()?;
+
+            stream.write_u32(encoded.len() as u32).await?;
+            stream.write_all(&encoded).await?;
+            stream.flush().await?;
+
+            // Read response
+            let response_len = stream.read_u32().await?;
+            let mut buf = vec![0u8; response_len as usize];
+            stream.read_exact(&mut buf).await?;
+
+            let response_envelope = MessageEnvelope::from_bytes(&buf)?;
+
+            match response_envelope.message {
+                Message::Response(Response::ClusterStatus { nodes, .. }) => {
+                    // Extract addresses from all online nodes
+                    let addrs: Vec<SocketAddr> = nodes
+                        .iter()
+                        .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                        .map(|n| n.addr)
+                        .collect();
+
+                    if addrs.is_empty() {
+                        anyhow::bail!("No online nodes in cluster");
+                    }
+
+                    info!("Discovered {} online nodes from {}", addrs.len(), seed_addr);
+                    Ok(addrs)
+                }
+                _ => anyhow::bail!("Unexpected response to GetClusterStatus"),
+            }
+        });
+
+        if let Ok(addrs) = result {
+            return Ok(addrs);
+        }
+    }
+
+    anyhow::bail!("Failed to discover cluster: all seed nodes unreachable")
 }

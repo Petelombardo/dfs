@@ -81,6 +81,11 @@ pub enum Request {
         checksum: [u8; 32],
     },
 
+    /// Replicate metadata to this node (internal cluster operation)
+    ReplicateMetadata {
+        metadata: FileMetadata,
+    },
+
     // Admin requests
     /// Get cluster status
     GetClusterStatus,
@@ -111,6 +116,11 @@ pub enum Request {
     /// Get chunk replica locations
     GetChunkReplicas {
         chunk_id: ChunkId,
+    },
+
+    /// Remove a node from the cluster
+    RemoveNode {
+        node_id: NodeId,
     },
 }
 
@@ -146,6 +156,7 @@ pub enum Response {
     /// Chunk IDs response (for WriteFile)
     ChunkIds {
         chunk_ids: Vec<ChunkId>,
+        chunk_sizes: Vec<u64>,
     },
 
     /// Cluster status response

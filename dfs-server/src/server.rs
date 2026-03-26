@@ -85,6 +85,9 @@ impl Server {
                 data,
                 checksum,
             } => self.handle_replicate_chunk(chunk_id, data, checksum).await,
+            Request::ReplicateMetadata { metadata } => {
+                self.handle_replicate_metadata(metadata).await
+            }
             Request::GetFileMetadataByPath { path } => {
                 self.handle_get_file_metadata_by_path(path).await
             }
@@ -107,6 +110,7 @@ impl Server {
             Request::GetChunkReplicas { chunk_id } => {
                 self.handle_get_chunk_replicas(chunk_id).await
             }
+            Request::RemoveNode { node_id } => self.handle_remove_node(node_id).await,
 
             _ => Response::Error {
                 message: "Request type not yet implemented".to_string(),
@@ -188,6 +192,26 @@ impl Server {
         self.handle_write_chunk(chunk_id, data, checksum).await
     }
 
+    /// Handle replicate metadata request (metadata replication from another node)
+    async fn handle_replicate_metadata(&self, metadata: FileMetadata) -> Response {
+        debug!("Handling replicate metadata: {}", metadata.path);
+
+        // Store metadata locally without re-replicating (to avoid loops)
+        match self.metadata.put_file(&metadata) {
+            Ok(_) => {
+                debug!("Successfully replicated metadata for {}", metadata.path);
+                Response::Ok { data: None }
+            }
+            Err(e) => {
+                warn!("Failed to replicate metadata: {}", e);
+                Response::Error {
+                    message: format!("Failed to replicate metadata: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
     /// Handle delete chunk request
     async fn handle_delete_chunk(&self, chunk_id: ChunkId) -> Response {
         debug!("Handling delete chunk: {}", chunk_id);
@@ -211,7 +235,7 @@ impl Server {
     }
 
     /// Write data to the cluster with replication
-    pub async fn write_data(&self, data: &[u8]) -> Result<Vec<ChunkId>> {
+    pub async fn write_data(&self, data: &[u8]) -> Result<Vec<(ChunkId, u64)>> {
         let total_start = std::time::Instant::now();
         info!("Writing {} bytes to cluster", data.len());
 
@@ -235,9 +259,10 @@ impl Server {
             let task = tokio::spawn(async move {
                 let chunk_total_start = std::time::Instant::now();
 
-                // Determine target nodes using consistent hashing
+                // Determine target nodes using capacity-aware placement
+                // This prefers nodes with more available space
                 let target_nodes = cluster
-                    .get_nodes_for_chunk(&chunk_id, replication_factor)
+                    .get_nodes_with_capacity_awareness(&chunk_id, replication_factor)
                     .await;
 
                 if target_nodes.is_empty() {
@@ -370,7 +395,7 @@ impl Server {
                 let chunk_total_time = chunk_total_start.elapsed();
                 info!("Chunk {} complete in {:?} (metadata: {:?})", chunk_id, chunk_total_time, metadata_time);
 
-                Ok::<ChunkId, anyhow::Error>(chunk_id)
+                Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
             });
 
             chunk_tasks.push(task);
@@ -378,10 +403,10 @@ impl Server {
 
         // Wait for all chunk tasks to complete in parallel
         let gather_start = std::time::Instant::now();
-        let mut chunk_ids = Vec::new();
+        let mut chunk_ids_with_sizes = Vec::new();
         for task in chunk_tasks {
             match task.await {
-                Ok(Ok(chunk_id)) => chunk_ids.push(chunk_id),
+                Ok(Ok(chunk_id_with_size)) => chunk_ids_with_sizes.push(chunk_id_with_size),
                 Ok(Err(e)) => return Err(e),
                 Err(e) => anyhow::bail!("Chunk task panicked: {}", e),
             }
@@ -393,8 +418,8 @@ impl Server {
         info!("Write complete: {} bytes in {:?} ({:.2} MB/s) - gather: {:?}",
               data.len(), total_time, throughput, gather_time);
 
-        info!("Successfully wrote {} chunks", chunk_ids.len());
-        Ok(chunk_ids)
+        info!("Successfully wrote {} chunks", chunk_ids_with_sizes.len());
+        Ok(chunk_ids_with_sizes)
     }
 
     /// Read data from the cluster by chunk IDs
@@ -486,12 +511,17 @@ impl Server {
     async fn handle_get_file_metadata_by_path(&self, path: String) -> Response {
         debug!("Handling get file metadata by path: {}", path);
 
+        // Try local first
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => Response::FileMetadata { metadata },
-            Ok(None) => Response::Error {
-                message: "File not found".to_string(),
-                code: ErrorCode::NotFound,
-            },
+            Ok(None) => {
+                // Not found locally - with metadata replication, this means file doesn't exist
+                // Don't query other nodes for performance (replication ensures consistency)
+                Response::Error {
+                    message: "File not found".to_string(),
+                    code: ErrorCode::NotFound,
+                }
+            }
             Err(e) => {
                 warn!("Failed to get file metadata: {}", e);
                 Response::Error {
@@ -506,8 +536,71 @@ impl Server {
     async fn handle_put_file_metadata(&self, metadata: FileMetadata) -> Response {
         debug!("Handling put file metadata: {}", metadata.path);
 
+        // Store metadata locally first
         match self.metadata.put_file(&metadata) {
-            Ok(_) => Response::Ok { data: None },
+            Ok(_) => {
+                // Replicate metadata to all other nodes asynchronously with timeout
+                let cluster = self.cluster.clone();
+                let client = self.client.clone();
+                let metadata_clone = metadata.clone();
+
+                tokio::spawn(async move {
+                    let nodes = cluster.get_all_nodes().await;
+                    let local_id = cluster.local_node_id();
+
+                    // Limit to max 10 concurrent replications to prevent storms
+                    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
+                    let mut tasks = Vec::new();
+
+                    for node in nodes {
+                        // Skip self and offline nodes
+                        if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                            continue;
+                        }
+
+                        let request = Request::ReplicateMetadata {
+                            metadata: metadata_clone.clone(),
+                        };
+
+                        let client_clone = client.clone();
+                        let node_addr = node.addr;
+                        let semaphore_clone = semaphore.clone();
+
+                        let task = tokio::spawn(async move {
+                            // Acquire semaphore permit
+                            let _permit = semaphore_clone.acquire().await.ok()?;
+
+                            // Replicate with 5 second timeout
+                            let result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(5),
+                                client_clone.send_message(node_addr, Message::Request(request))
+                            ).await;
+
+                            match result {
+                                Ok(Ok(_)) => {
+                                    debug!("Replicated metadata to {}", node_addr);
+                                    Some(())
+                                }
+                                Ok(Err(e)) => {
+                                    debug!("Failed to replicate metadata to {}: {}", node_addr, e);
+                                    None
+                                }
+                                Err(_) => {
+                                    debug!("Timeout replicating metadata to {}", node_addr);
+                                    None
+                                }
+                            }
+                        });
+
+                        tasks.push(task);
+                    }
+
+                    // Don't wait for all tasks, just spawn them
+                    drop(tasks);
+                });
+
+                Response::Ok { data: None }
+            }
             Err(e) => {
                 warn!("Failed to put file metadata: {}", e);
                 Response::Error {
@@ -522,6 +615,8 @@ impl Server {
     async fn handle_list_directory(&self, path: String) -> Response {
         debug!("Handling list directory: {}", path);
 
+        // ALWAYS return local only for performance
+        // Metadata replication ensures all nodes have the same data
         match self.metadata.list_directory(&path) {
             Ok(entries) => Response::DirectoryListing { entries },
             Err(e) => {
@@ -539,7 +634,12 @@ impl Server {
         debug!("Handling write file: {} bytes", data.len());
 
         match self.write_data(&data).await {
-            Ok(chunk_ids) => Response::ChunkIds { chunk_ids },
+            Ok(chunk_ids_with_sizes) => {
+                // Separate chunk IDs from sizes
+                let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
+                let chunk_sizes: Vec<u64> = chunk_ids_with_sizes.iter().map(|(_, size)| *size).collect();
+                Response::ChunkIds { chunk_ids, chunk_sizes }
+            }
             Err(e) => {
                 warn!("Failed to write file: {}", e);
                 Response::Error {
@@ -659,21 +759,22 @@ impl Server {
 
         match self.storage.list_chunks() {
             Ok(chunks) => {
-                let total_size: u64 = chunks
-                    .iter()
-                    .map(|chunk_id| {
-                        self.storage
-                            .read_chunk(chunk_id)
-                            .map(|data| data.len() as u64)
-                            .unwrap_or(0)
-                    })
-                    .sum();
-
                 let nodes_count = self.cluster.get_all_nodes().await.len();
 
-                // Get filesystem statistics
+                // Get filesystem statistics (fast - just statvfs syscall)
                 let (total_space, free_space, available_space) = self.storage.get_filesystem_stats()
                     .unwrap_or((0, 0, 0));
+
+                // Calculate total_size as used space on filesystem
+                // This is much faster than reading every chunk!
+                let total_size = total_space.saturating_sub(available_space);
+
+                // Update local node's capacity for placement decisions
+                self.cluster.update_node_capacity(
+                    self.cluster.local_node_id(),
+                    available_space,
+                    total_space
+                ).await;
 
                 Response::StorageStats {
                     total_chunks: chunks.len(),
@@ -795,6 +896,33 @@ impl Server {
             }
         }
     }
+
+    async fn handle_remove_node(&self, node_id: NodeId) -> Response {
+        info!("Handling remove node request: {}", node_id);
+
+        // Check if node exists
+        if self.cluster.get_node(&node_id).await.is_none() {
+            return Response::Error {
+                message: format!("Node {} not found in cluster", node_id),
+                code: ErrorCode::NotFound,
+            };
+        }
+
+        // Remove from cluster
+        match self.cluster.remove_node(&node_id).await {
+            Ok(_) => {
+                info!("Successfully removed node {} from cluster", node_id);
+                Response::Ok { data: None }
+            }
+            Err(e) => {
+                warn!("Failed to remove node {}: {}", node_id, e);
+                Response::Error {
+                    message: format!("Failed to remove node: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -806,6 +934,7 @@ mod tests {
     async fn test_server_write_read_local() {
         let temp_storage = TempDir::new().unwrap();
         let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
 
         let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
         let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
@@ -814,15 +943,16 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3);
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
 
         // Write data
         let data = b"Hello, distributed filesystem!";
-        let chunk_ids = server.write_data(data).await.unwrap();
+        let chunk_ids_with_sizes = server.write_data(data).await.unwrap();
 
-        assert!(!chunk_ids.is_empty());
+        assert!(!chunk_ids_with_sizes.is_empty());
 
         // Read data back
+        let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
         let read_data = server.read_data(&chunk_ids).await.unwrap();
         assert_eq!(data.as_slice(), read_data.as_slice());
     }
@@ -831,6 +961,7 @@ mod tests {
     async fn test_handle_write_read_chunk() {
         let temp_storage = TempDir::new().unwrap();
         let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
 
         let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
         let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
@@ -839,7 +970,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3);
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
 
         // Test write
         let data = b"Test chunk data";
@@ -870,6 +1001,7 @@ mod tests {
     async fn test_handle_has_chunk() {
         let temp_storage = TempDir::new().unwrap();
         let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
 
         let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
         let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
@@ -878,7 +1010,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3);
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
 
         let data = b"Test";
         let hash = compute_chunk_hash(data);
@@ -982,52 +1114,27 @@ impl MessageHandler for Server {
                     }
                 }
                 ClusterMessage::NodeJoined { node_info } => {
-                    info!("Node {} joined the cluster (broadcast)", node_info.id);
-                    let new_node_addr = node_info.addr;
+                    debug!("Node {} joined the cluster (broadcast)", node_info.id);
 
-                    if let Err(e) = self.cluster.add_node(node_info).await {
-                        warn!("Failed to add node from broadcast: {}", e);
-                    }
+                    // Only add if not already known (prevents re-processing)
+                    let already_known = self.cluster.get_node(&node_info.id).await.is_some();
 
-                    // Save updated peer list to disk
-                    let peer_addrs = self.cluster.get_all_peer_addrs().await;
-                    if let Err(e) = ClusterManager::save_persisted_peers(&peer_addrs, &self.metadata_dir).await {
-                        warn!("Failed to save persisted peers after NodeJoined: {}", e);
-                    }
-
-                    // Send our own announcement back to the new node for bidirectional discovery
-                    let local_node_id = self.cluster.local_node_id();
-                    let local_addr = self.cluster.local_addr();
-                    let our_node_info = NodeInfo::new(local_node_id, local_addr, None);
-
-                    tokio::spawn(async move {
-                        use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
-                        use dfs_common::types::NodeInfo;
-                        use tokio::io::AsyncWriteExt;
-                        use tokio::net::TcpStream;
-
-                        debug!("Sending reciprocal announcement to {}", new_node_addr);
-
-                        match TcpStream::connect(new_node_addr).await {
-                            Ok(mut stream) => {
-                                let announcement = ClusterMessage::NodeJoined {
-                                    node_info: our_node_info,
-                                };
-                                let request_id = RequestId::new(1);
-                                let envelope = MessageEnvelope::new(request_id, Message::Cluster(announcement));
-
-                                if let Ok(encoded) = envelope.to_bytes() {
-                                    let _ = stream.write_u32(encoded.len() as u32).await;
-                                    let _ = stream.write_all(&encoded).await;
-                                    debug!("Sent reciprocal announcement to {}", new_node_addr);
-                                }
-                            }
-                            Err(e) => {
-                                debug!("Failed to send reciprocal announcement to {}: {}", new_node_addr, e);
-                            }
+                    if !already_known {
+                        info!("New node {} joined the cluster", node_info.id);
+                        if let Err(e) = self.cluster.add_node(node_info).await {
+                            warn!("Failed to add node from broadcast: {}", e);
                         }
-                    });
 
+                        // Save updated peer list to disk
+                        let peer_addrs = self.cluster.get_all_peer_addrs().await;
+                        if let Err(e) = ClusterManager::save_persisted_peers(&peer_addrs, &self.metadata_dir).await {
+                            warn!("Failed to save persisted peers after NodeJoined: {}", e);
+                        }
+                    } else {
+                        debug!("Node {} already known, ignoring duplicate join", node_info.id);
+                    }
+
+                    // NO reciprocal announcements - prevents infinite loops
                     Response::Ok { data: None }
                 }
                 _ => Response::Error {

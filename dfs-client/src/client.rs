@@ -228,63 +228,79 @@ impl DfsClient {
         info!("Reading {} chunks: {} cached, {} to fetch",
               chunk_ids.len(), cache_hits, cache_misses);
 
-        // Fetch missing chunks sequentially with connection pooling
-        // FUSE typically requests 128KB at a time, which usually maps to 1 chunk,
-        // so parallelism within read_data() doesn't help much
-        let mut fetched_chunks = Vec::new();
+        // Fetch missing chunks IN PARALLEL with intelligent replica selection
+        // Different chunks can be fetched from different replica nodes simultaneously,
+        // maximizing network bandwidth and reducing latency
         let nodes = self.cluster_nodes.read().await.clone();
 
-        for (idx, chunk_id) in chunks_to_fetch.iter() {
+        // Create parallel fetch tasks
+        let fetch_tasks: Vec<_> = chunks_to_fetch.iter().map(|(idx, chunk_id)| {
             let idx = *idx;
             let chunk_id = *chunk_id;
+            let client = self.clone();
+            let nodes = nodes.clone();
 
-            // Get replica locations for this chunk (with fallback to all nodes)
-            let replicas = match self.get_chunk_replicas(chunk_id).await {
-                Ok(r) => {
-                    debug!("Found {} replicas for chunk {}", r.len(), chunk_id);
-                    r
-                }
-                Err(e) => {
-                    // Fallback to trying all nodes if query fails
-                    debug!("Failed to get replicas for {}: {}, trying all nodes", chunk_id, e);
-                    nodes.clone()
-                }
-            };
-
-            // Select one replica using round-robin load balancing
-            let selected_replica = self.select_replica(&replicas)
-                .context("No replicas available")?;
-
-            debug!("Selected replica {} for chunk {} (round-robin)", selected_replica, chunk_id);
-
-            // Try selected replica first, then fallback to others
-            let mut last_error = None;
-            let mut data = None;
-
-            for (i, node_addr) in std::iter::once(&selected_replica)
-                .chain(replicas.iter().filter(|&n| n != &selected_replica))
-                .enumerate()
-            {
-                match self.read_chunk_from_server(*node_addr, chunk_id).await {
-                    Ok(chunk_data) => {
-                        if i > 0 {
-                            debug!("Fetched chunk {} from fallback replica {}", chunk_id, node_addr);
-                        }
-                        data = Some(chunk_data);
-                        break;
+            tokio::spawn(async move {
+                // Get replica locations for this chunk (with fallback to all nodes)
+                let replicas = match client.get_chunk_replicas(chunk_id).await {
+                    Ok(r) => {
+                        debug!("Found {} replicas for chunk {}", r.len(), chunk_id);
+                        r
                     }
                     Err(e) => {
-                        last_error = Some(e);
-                        continue;
+                        // Fallback to trying all nodes if query fails
+                        debug!("Failed to get replicas for {}: {}, trying all nodes", chunk_id, e);
+                        nodes.clone()
+                    }
+                };
+
+                // Select one replica using round-robin load balancing
+                // This ensures different chunks are likely fetched from different nodes
+                let selected_replica = client.select_replica(&replicas)
+                    .context("No replicas available")?;
+
+                debug!("Selected replica {} for chunk {} (round-robin)", selected_replica, chunk_id);
+
+                // Try selected replica first, then fallback to others
+                let mut last_error = None;
+                let mut data = None;
+
+                for (i, node_addr) in std::iter::once(&selected_replica)
+                    .chain(replicas.iter().filter(|&n| n != &selected_replica))
+                    .enumerate()
+                {
+                    match client.read_chunk_from_server(*node_addr, chunk_id).await {
+                        Ok(chunk_data) => {
+                            if i > 0 {
+                                debug!("Fetched chunk {} from fallback replica {}", chunk_id, node_addr);
+                            }
+                            data = Some(chunk_data);
+                            break;
+                        }
+                        Err(e) => {
+                            last_error = Some(e);
+                            continue;
+                        }
                     }
                 }
-            }
 
-            let chunk_data = data.ok_or_else(|| {
-                last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed for chunk"))
-            })?;
+                let chunk_data = data.ok_or_else(|| {
+                    last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed for chunk"))
+                })?;
 
-            let data_arc = Arc::new(chunk_data);
+                Ok::<_, anyhow::Error>((idx, chunk_id, Arc::new(chunk_data)))
+            })
+        }).collect();
+
+        // Wait for all fetches to complete
+        let fetch_results = futures::future::join_all(fetch_tasks).await;
+
+        // Process results and update cache
+        let mut fetched_chunks = Vec::new();
+        for result in fetch_results {
+            let (idx, chunk_id, data_arc) = result
+                .context("Fetch task panicked")?
+                .context("Failed to fetch chunk")?;
 
             // Add to cache
             {

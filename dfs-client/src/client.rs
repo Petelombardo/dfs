@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use blake3;
 use dfs_common::{ChunkId, FileMetadata, Message, MessageEnvelope, Request, RequestId, Response};
 use lru::LruCache;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ use tracing::{debug, info, warn};
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Client for communicating with DFS cluster
+#[derive(Clone)]
 pub struct DfsClient {
     /// List of cluster nodes
     cluster_nodes: Arc<RwLock<Vec<SocketAddr>>>,
@@ -24,6 +26,12 @@ pub struct DfsClient {
     /// LRU cache for chunks (ChunkId -> data)
     /// Cache up to 256 chunks (~1GB at 4MB/chunk)
     chunk_cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
+
+    /// TCP connection pool - maintains one persistent connection per server
+    connection_pool: Arc<Mutex<HashMap<SocketAddr, TcpStream>>>,
+
+    /// Track chunks currently being prefetched to avoid duplicates
+    prefetch_in_flight: Arc<Mutex<HashSet<ChunkId>>>,
 }
 
 impl DfsClient {
@@ -40,6 +48,8 @@ impl DfsClient {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes)),
             current_node: Arc::new(RwLock::new(0)),
             chunk_cache: Arc::new(Mutex::new(cache)),
+            connection_pool: Arc::new(Mutex::new(HashMap::new())),
+            prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -194,38 +204,38 @@ impl DfsClient {
         info!("Reading {} chunks: {} cached, {} to fetch",
               chunk_ids.len(), cache_hits, cache_misses);
 
-        // Fetch missing chunks in parallel
-        let mut tasks = Vec::new();
+        // Fetch missing chunks sequentially with connection pooling
+        // FUSE typically requests 128KB at a time, which usually maps to 1 chunk,
+        // so parallelism within read_data() doesn't help much
+        let mut fetched_chunks = Vec::new();
+        let nodes = self.cluster_nodes.read().await.clone();
+
         for (idx, chunk_id) in chunks_to_fetch.iter() {
             let idx = *idx;
             let chunk_id = *chunk_id;
-            let nodes = self.cluster_nodes.read().await.clone();
 
-            let task = tokio::spawn(async move {
-                // Try all nodes for this chunk
-                let mut last_error = None;
+            // Try all nodes for this chunk
+            let mut last_error = None;
+            let mut data = None;
 
-                for node_addr in &nodes {
-                    match Self::read_chunk_from_server(*node_addr, chunk_id).await {
-                        Ok(data) => return Ok::<(usize, ChunkId, Vec<u8>), anyhow::Error>((idx, chunk_id, data)),
-                        Err(e) => {
-                            last_error = Some(e);
-                            continue;
-                        }
+            for node_addr in &nodes {
+                match self.read_chunk_from_server(*node_addr, chunk_id).await {
+                    Ok(chunk_data) => {
+                        data = Some(chunk_data);
+                        break;
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        continue;
                     }
                 }
+            }
 
-                Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed")))
-            });
+            let chunk_data = data.ok_or_else(|| {
+                last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed for chunk"))
+            })?;
 
-            tasks.push(task);
-        }
-
-        // Wait for fetched chunks and add to cache
-        let mut fetched_chunks = Vec::new();
-        for task in tasks {
-            let (idx, chunk_id, data) = task.await??;
-            let data_arc = Arc::new(data);
+            let data_arc = Arc::new(chunk_data);
 
             // Add to cache
             {
@@ -244,6 +254,9 @@ impl DfsClient {
         // Sort by index to maintain chunk order
         all_chunks.sort_by_key(|(idx, _)| *idx);
 
+        // Find the highest index we accessed (before consuming all_chunks)
+        let last_requested_idx = all_chunks.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
+
         // Concatenate all chunks
         let mut all_data = Vec::new();
         for (_, data) in all_chunks {
@@ -255,44 +268,157 @@ impl DfsClient {
         info!("Read complete: {} bytes from {} chunks in {:?} ({:.2} MB/s) - cache: {}/{} hits",
               all_data.len(), chunk_ids.len(), elapsed, throughput, cache_hits, chunk_ids.len());
 
+        // Read-ahead: prefetch next 2 chunks for sequential access patterns
+        if !chunk_ids.is_empty() && cache_misses > 0 {
+            let max_idx = chunk_ids.len() - 1;
+
+            // Prefetch next 2 chunks if they exist
+            for prefetch_offset in 1..=2 {
+                let prefetch_idx = last_requested_idx + prefetch_offset;
+                if prefetch_idx > max_idx {
+                    break; // Beyond end of file
+                }
+
+                let prefetch_chunk_id = chunk_ids[prefetch_idx];
+
+                // Check if already cached or being prefetched
+                let should_prefetch = {
+                    let cache = self.chunk_cache.lock().await;
+                    let mut in_flight = self.prefetch_in_flight.lock().await;
+
+                    if cache.peek(&prefetch_chunk_id).is_some() || in_flight.contains(&prefetch_chunk_id) {
+                        false // Already have it or fetching it
+                    } else {
+                        in_flight.insert(prefetch_chunk_id);
+                        true
+                    }
+                };
+
+                if should_prefetch {
+                    // Spawn background prefetch task
+                    let client = self.clone();
+                    let nodes = nodes.clone();
+
+                    tokio::spawn(async move {
+                        debug!("Prefetching chunk {} (read-ahead)", prefetch_chunk_id);
+
+                        // Try to fetch from any node
+                        for node_addr in &nodes {
+                            match client.read_chunk_from_server(*node_addr, prefetch_chunk_id).await {
+                                Ok(data) => {
+                                    // Add to cache
+                                    let data_arc = Arc::new(data);
+                                    {
+                                        let mut cache = client.chunk_cache.lock().await;
+                                        cache.put(prefetch_chunk_id, data_arc);
+                                    }
+                                    debug!("Prefetch complete: {}", prefetch_chunk_id);
+                                    break;
+                                }
+                                Err(e) => {
+                                    debug!("Prefetch failed from {}: {}", node_addr, e);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Remove from in-flight tracker
+                        {
+                            let mut in_flight = client.prefetch_in_flight.lock().await;
+                            in_flight.remove(&prefetch_chunk_id);
+                        }
+                    });
+                }
+            }
+        }
+
         Ok(all_data)
     }
 
-    /// Read a single chunk from a specific server
-    async fn read_chunk_from_server(server_addr: SocketAddr, chunk_id: ChunkId) -> Result<Vec<u8>> {
+    /// Read a single chunk from a specific server using connection pooling
+    async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId) -> Result<Vec<u8>> {
         let request = Request::ReadChunk { chunk_id };
 
-        let mut stream = TcpStream::connect(server_addr)
-            .await
-            .context("Failed to connect to server")?;
+        // Try using pooled connection first, with fallback to new connection
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
 
-        let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
-        let envelope = MessageEnvelope::new(request_id, Message::Request(request));
-        let encoded = envelope.to_bytes().context("Failed to serialize message")?;
+            // Get or create connection
+            let stream = {
+                let mut pool = self.connection_pool.lock().await;
+                pool.remove(&server_addr)
+            };
 
-        // Send request
-        let len = encoded.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&encoded).await?;
-        stream.flush().await?;
+            let mut stream = match stream {
+                Some(s) => {
+                    debug!("Reusing pooled connection to {}", server_addr);
+                    s
+                }
+                None => {
+                    debug!("Creating new connection to {}", server_addr);
+                    TcpStream::connect(server_addr)
+                        .await
+                        .context("Failed to connect to server")?
+                }
+            };
 
-        // Read response
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
+            let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+            let envelope = MessageEnvelope::new(request_id, Message::Request(request.clone()));
+            let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
-        let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
+            // Send request and read response
+            let result = async {
+                // Send request
+                let len = encoded.len() as u32;
+                stream.write_all(&len.to_be_bytes()).await?;
+                stream.write_all(&encoded).await?;
+                stream.flush().await?;
 
-        let response_envelope = MessageEnvelope::from_bytes(&buf)
-            .context("Failed to deserialize response")?;
+                // Read response
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
 
-        match response_envelope.message {
-            Message::Response(Response::ChunkData { data, .. }) => Ok(data),
-            Message::Response(Response::Error { message, .. }) => {
-                anyhow::bail!("Server error: {}", message);
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await?;
+
+                Ok::<(TcpStream, Vec<u8>), std::io::Error>((stream, buf))
+            }.await;
+
+            match result {
+                Ok((stream, buf)) => {
+                    // Return connection to pool
+                    {
+                        let mut pool = self.connection_pool.lock().await;
+                        pool.insert(server_addr, stream);
+                    }
+
+                    // Deserialize response
+                    let response_envelope = MessageEnvelope::from_bytes(&buf)
+                        .context("Failed to deserialize response")?;
+
+                    match response_envelope.message {
+                        Message::Response(Response::ChunkData { data, .. }) => return Ok(data),
+                        Message::Response(Response::Error { message, .. }) => {
+                            anyhow::bail!("Server error: {}", message);
+                        }
+                        _ => anyhow::bail!("Unexpected response type"),
+                    }
+                }
+                Err(e) => {
+                    // Connection failed - don't return to pool
+                    warn!("Connection to {} failed (attempt {}): {}", server_addr, attempt, e);
+
+                    // Retry once with new connection if this was a pooled connection
+                    if attempt == 1 {
+                        debug!("Retrying with new connection to {}", server_addr);
+                        continue;
+                    } else {
+                        return Err(e).context("Failed to read chunk after retry");
+                    }
+                }
             }
-            _ => anyhow::bail!("Unexpected response type"),
         }
     }
 

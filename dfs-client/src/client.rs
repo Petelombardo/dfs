@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use blake3;
-use dfs_common::{ChunkId, FileMetadata, Message, MessageEnvelope, Request, RequestId, Response};
+use dfs_common::{ChunkId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
 use lru::LruCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +32,13 @@ pub struct DfsClient {
 
     /// Track chunks currently being prefetched to avoid duplicates
     prefetch_in_flight: Arc<Mutex<HashSet<ChunkId>>>,
+
+    /// Track recent read positions per file to detect sequential patterns
+    /// Maps file_id (first chunk) -> VecDeque of last 4 read positions
+    read_history: Arc<Mutex<HashMap<ChunkId, VecDeque<usize>>>>,
+
+    /// Round-robin counter for replica selection (for load balancing)
+    replica_selector: Arc<AtomicU64>,
 }
 
 impl DfsClient {
@@ -50,6 +57,8 @@ impl DfsClient {
             chunk_cache: Arc::new(Mutex::new(cache)),
             connection_pool: Arc::new(Mutex::new(HashMap::new())),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            read_history: Arc::new(Mutex::new(HashMap::new())),
+            replica_selector: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -140,22 +149,35 @@ impl DfsClient {
         }
     }
 
-    /// Get file metadata from cluster
-    pub async fn get_file_metadata(&self, path: &str) -> Result<Option<FileMetadata>> {
+    /// Get file metadata from cluster with optional conditional fetch
+    /// Returns Ok(Some(metadata)) if found and modified, Ok(None) if not found, Err if error
+    /// If if_modified_since is provided and metadata hasn't changed, returns Ok(None) with NotModified indicator
+    pub async fn get_file_metadata_conditional(&self, path: &str, if_modified_since: Option<u64>) -> Result<Option<FileMetadata>> {
         let request = Request::GetFileMetadataByPath {
             path: path.to_string(),
+            if_modified_since,
         };
 
         let response = self.send_request_with_retry(request).await?;
 
         match response {
             Response::FileMetadata { metadata } => Ok(Some(metadata)),
+            Response::NotModified => {
+                // Metadata hasn't changed, return None to signal cache is valid
+                debug!("Metadata not modified for {}", path);
+                Ok(None)
+            }
             Response::Error { code, .. } if code == dfs_common::ErrorCode::NotFound => Ok(None),
             Response::Error { message, .. } => {
                 anyhow::bail!("Server error: {}", message);
             }
             _ => anyhow::bail!("Unexpected response type"),
         }
+    }
+
+    /// Get file metadata from cluster (unconditional)
+    pub async fn get_file_metadata(&self, path: &str) -> Result<Option<FileMetadata>> {
+        self.get_file_metadata_conditional(path, None).await
     }
 
     /// List directory contents
@@ -176,7 +198,9 @@ impl DfsClient {
     }
 
     /// Read data from cluster by chunk IDs - parallelized with caching
-    pub async fn read_data(&self, chunk_ids: &[ChunkId]) -> Result<Vec<u8>> {
+    /// all_file_chunks: Complete list of chunk IDs for the file (for prefetch - can be same as chunk_ids)
+    /// start_chunk_idx: Index in all_file_chunks where chunk_ids[0] is located
+    pub async fn read_data(&self, chunk_ids: &[ChunkId], all_file_chunks: &[ChunkId], start_chunk_idx: usize) -> Result<Vec<u8>> {
         if chunk_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -214,13 +238,38 @@ impl DfsClient {
             let idx = *idx;
             let chunk_id = *chunk_id;
 
-            // Try all nodes for this chunk
+            // Get replica locations for this chunk (with fallback to all nodes)
+            let replicas = match self.get_chunk_replicas(chunk_id).await {
+                Ok(r) => {
+                    debug!("Found {} replicas for chunk {}", r.len(), chunk_id);
+                    r
+                }
+                Err(e) => {
+                    // Fallback to trying all nodes if query fails
+                    debug!("Failed to get replicas for {}: {}, trying all nodes", chunk_id, e);
+                    nodes.clone()
+                }
+            };
+
+            // Select one replica using round-robin load balancing
+            let selected_replica = self.select_replica(&replicas)
+                .context("No replicas available")?;
+
+            debug!("Selected replica {} for chunk {} (round-robin)", selected_replica, chunk_id);
+
+            // Try selected replica first, then fallback to others
             let mut last_error = None;
             let mut data = None;
 
-            for node_addr in &nodes {
+            for (i, node_addr) in std::iter::once(&selected_replica)
+                .chain(replicas.iter().filter(|&n| n != &selected_replica))
+                .enumerate()
+            {
                 match self.read_chunk_from_server(*node_addr, chunk_id).await {
                     Ok(chunk_data) => {
+                        if i > 0 {
+                            debug!("Fetched chunk {} from fallback replica {}", chunk_id, node_addr);
+                        }
                         data = Some(chunk_data);
                         break;
                     }
@@ -254,8 +303,8 @@ impl DfsClient {
         // Sort by index to maintain chunk order
         all_chunks.sort_by_key(|(idx, _)| *idx);
 
-        // Find the highest index we accessed (before consuming all_chunks)
-        let last_requested_idx = all_chunks.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
+        // Find the highest index we accessed (within the local array)
+        let last_local_idx = all_chunks.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
 
         // Concatenate all chunks
         let mut all_data = Vec::new();
@@ -268,18 +317,53 @@ impl DfsClient {
         info!("Read complete: {} bytes from {} chunks in {:?} ({:.2} MB/s) - cache: {}/{} hits",
               all_data.len(), chunk_ids.len(), elapsed, throughput, cache_hits, chunk_ids.len());
 
-        // Read-ahead: prefetch next 2 chunks for sequential access patterns
-        if !chunk_ids.is_empty() && cache_misses > 0 {
-            let max_idx = chunk_ids.len() - 1;
+        // Detect sequential access patterns and prefetch aggressively only when sequential
+        if !chunk_ids.is_empty() && !all_file_chunks.is_empty() && cache_misses > 0 {
+            let last_file_chunk_idx = start_chunk_idx + last_local_idx;
+            let file_id = all_file_chunks[0]; // Use first chunk as file identifier
 
-            // Prefetch next 2 chunks if they exist
-            for prefetch_offset in 1..=2 {
-                let prefetch_idx = last_requested_idx + prefetch_offset;
-                if prefetch_idx > max_idx {
-                    break; // Beyond end of file
+            // Track read history and detect sequential patterns
+            let mut history = self.read_history.lock().await;
+            let read_positions = history.entry(file_id).or_insert_with(|| VecDeque::with_capacity(4));
+
+            // Add current read position
+            read_positions.push_back(last_file_chunk_idx);
+            if read_positions.len() > 4 {
+                read_positions.pop_front();
+            }
+
+            // Detect if we have sequential momentum (2+ consecutive sequential reads)
+            let is_sequential = if read_positions.len() >= 2 {
+                let mut sequential_count = 0;
+                for i in 1..read_positions.len() {
+                    let prev = read_positions[i - 1];
+                    let curr = read_positions[i];
+                    // Consider sequential if within 2 chunks forward
+                    if curr > prev && curr <= prev + 2 {
+                        sequential_count += 1;
+                    }
                 }
+                sequential_count >= 1 // Need at least 1 sequential step
+            } else {
+                false // Not enough history yet
+            };
 
-                let prefetch_chunk_id = chunk_ids[prefetch_idx];
+            drop(history); // Release lock before spawning tasks
+
+            if is_sequential {
+                info!("Prefetch: detected sequential pattern at chunk {}, prefetching next 8 chunks",
+                      last_file_chunk_idx);
+
+                // Prefetch next 8 chunks for aggressive sequential read-ahead
+                for prefetch_offset in 1..=8 {
+                    let prefetch_file_idx = last_file_chunk_idx + prefetch_offset;
+
+                    // Check if this chunk exists in the file
+                    if prefetch_file_idx >= all_file_chunks.len() {
+                        break; // Beyond end of file
+                    }
+
+                    let prefetch_chunk_id = all_file_chunks[prefetch_file_idx];
 
                 // Check if already cached or being prefetched
                 let should_prefetch = {
@@ -300,10 +384,27 @@ impl DfsClient {
                     let nodes = nodes.clone();
 
                     tokio::spawn(async move {
-                        debug!("Prefetching chunk {} (read-ahead)", prefetch_chunk_id);
+                        info!("Prefetching chunk {} (read-ahead)", prefetch_chunk_id);
 
-                        // Try to fetch from any node
-                        for node_addr in &nodes {
+                        // Get replica locations for load balancing
+                        let replicas = match client.get_chunk_replicas(prefetch_chunk_id).await {
+                            Ok(r) => r,
+                            Err(_) => nodes.clone(), // Fallback to all nodes
+                        };
+
+                        // Select replica using round-robin
+                        let selected_replica = client.select_replica(&replicas);
+
+                        // Try selected replica first, then fallback to others
+                        let try_nodes: Vec<SocketAddr> = if let Some(selected) = selected_replica {
+                            std::iter::once(selected)
+                                .chain(replicas.iter().filter(|&n| *n != selected).copied())
+                                .collect()
+                        } else {
+                            replicas
+                        };
+
+                        for node_addr in &try_nodes {
                             match client.read_chunk_from_server(*node_addr, prefetch_chunk_id).await {
                                 Ok(data) => {
                                     // Add to cache
@@ -312,7 +413,7 @@ impl DfsClient {
                                         let mut cache = client.chunk_cache.lock().await;
                                         cache.put(prefetch_chunk_id, data_arc);
                                     }
-                                    debug!("Prefetch complete: {}", prefetch_chunk_id);
+                                    info!("Prefetch complete: {}", prefetch_chunk_id);
                                     break;
                                 }
                                 Err(e) => {
@@ -330,9 +431,51 @@ impl DfsClient {
                     });
                 }
             }
+            } else {
+                info!("Skipping prefetch: random/non-sequential access detected at chunk {}",
+                       last_file_chunk_idx);
+            }
         }
 
         Ok(all_data)
+    }
+
+    /// Query cluster for chunk replica locations (returns node addresses that have this chunk)
+    async fn get_chunk_replicas(&self, chunk_id: ChunkId) -> Result<Vec<SocketAddr>> {
+        let request = Request::GetChunkReplicas { chunk_id };
+        let nodes = self.cluster_nodes.read().await;
+
+        // Query any node for replica locations
+        let query_node = nodes.first().context("No cluster nodes available")?;
+
+        let response = self.send_request(*query_node, request).await?;
+
+        match response {
+            Response::ChunkReplicas { nodes: replica_node_ids, .. } => {
+                // Convert NodeIds to SocketAddrs using cluster node list
+                // For now, use all nodes as potential replicas if we can't map NodeId
+                // In production, you'd maintain a NodeId->SocketAddr mapping
+                if !replica_node_ids.is_empty() {
+                    Ok(nodes.clone())
+                } else {
+                    anyhow::bail!("No replicas found for chunk")
+                }
+            }
+            Response::Error { message, .. } => {
+                anyhow::bail!("Failed to get chunk replicas: {}", message)
+            }
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    /// Select one replica from a list using round-robin for load balancing
+    fn select_replica(&self, replicas: &[SocketAddr]) -> Option<SocketAddr> {
+        if replicas.is_empty() {
+            return None;
+        }
+
+        let idx = self.replica_selector.fetch_add(1, Ordering::Relaxed) as usize % replicas.len();
+        Some(replicas[idx])
     }
 
     /// Read a single chunk from a specific server using connection pooling

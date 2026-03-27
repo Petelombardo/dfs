@@ -48,8 +48,22 @@ impl DfsClient {
             anyhow::bail!("No cluster nodes provided");
         }
 
-        // Create LRU cache for 256 chunks (~1GB at 4MB/chunk)
-        let cache = LruCache::new(NonZeroUsize::new(256).unwrap());
+        // Initialize LRU cache with dynamic sizing based on available system memory
+        // Target: 15% of available RAM (slightly higher than server since client is single-purpose)
+        // min 50 chunks (~200MB), max 1000 chunks (~4GB)
+        // This prevents OOM on memory-constrained SBCs while maximizing cache on larger systems
+        let cache_capacity = dfs_common::calculate_cache_capacity(
+            4 * 1024 * 1024, // 4MB chunk size
+            15,   // 15% of available memory (higher than server since client-focused)
+            50,   // min 50 chunks (~200MB)
+            1000, // max 1000 chunks (~4GB)
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to calculate cache capacity: {}, using default of 256 chunks", e);
+            NonZeroUsize::new(256).unwrap()
+        });
+
+        let cache = LruCache::new(cache_capacity);
 
         Ok(Self {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes)),

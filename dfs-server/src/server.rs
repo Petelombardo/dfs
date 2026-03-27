@@ -55,9 +55,20 @@ impl Server {
         replication_factor: usize,
         metadata_dir: PathBuf,
     ) -> Self {
-        // Initialize LRU cache with 100 chunks (~400MB for 4MB chunks)
-        // This keeps frequently accessed chunks in RAM to reduce disk I/O
-        let cache_capacity = NonZeroUsize::new(100).unwrap();
+        // Initialize LRU cache with dynamic sizing based on available system memory
+        // Target: 10% of available RAM, min 20 chunks (~80MB), max 500 chunks (~2GB)
+        // This prevents OOM on memory-constrained SBCs while maximizing cache on larger systems
+        let cache_capacity = dfs_common::calculate_cache_capacity(
+            chunk_size,
+            10,  // 10% of available memory
+            20,  // min 20 chunks (~80MB for 4MB chunks)
+            500, // max 500 chunks (~2GB for 4MB chunks)
+        )
+        .unwrap_or_else(|e| {
+            warn!("Failed to calculate cache capacity: {}, using default of 100 chunks", e);
+            NonZeroUsize::new(100).unwrap()
+        });
+
         let chunk_cache = Arc::new(Mutex::new(LruCache::new(cache_capacity)));
 
         Self {

@@ -2,6 +2,7 @@ pub mod config;
 pub mod types;
 pub mod protocol;
 pub mod hash;
+pub mod memory;
 
 // Re-export commonly used types
 pub use config::Config;
@@ -13,3 +14,4 @@ pub use protocol::{
     Response,
 };
 pub use hash::{compute_chunk_hash, verify_chunk_hash, ConsistentHashRing};
+pub use memory::{calculate_cache_capacity, get_available_memory};

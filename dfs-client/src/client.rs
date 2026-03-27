@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use blake3;
 use dfs_common::{ChunkId, FileMetadata, Message, MessageEnvelope, Request, RequestId, Response};
+use lru::LruCache;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -18,6 +20,10 @@ pub struct DfsClient {
 
     /// Current node index (for round-robin)
     current_node: Arc<RwLock<usize>>,
+
+    /// LRU cache for chunks (ChunkId -> data)
+    /// Cache up to 256 chunks (~1GB at 4MB/chunk)
+    chunk_cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
 }
 
 impl DfsClient {
@@ -27,9 +33,13 @@ impl DfsClient {
             anyhow::bail!("No cluster nodes provided");
         }
 
+        // Create LRU cache for 256 chunks (~1GB at 4MB/chunk)
+        let cache = LruCache::new(NonZeroUsize::new(256).unwrap());
+
         Ok(Self {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes)),
             current_node: Arc::new(RwLock::new(0)),
+            chunk_cache: Arc::new(Mutex::new(cache)),
         })
     }
 
@@ -155,23 +165,40 @@ impl DfsClient {
         }
     }
 
-    /// Read data from cluster by chunk IDs - parallelized for performance
+    /// Read data from cluster by chunk IDs - parallelized with caching
     pub async fn read_data(&self, chunk_ids: &[ChunkId]) -> Result<Vec<u8>> {
         if chunk_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let start = std::time::Instant::now();
-        info!("Reading {} chunks in parallel", chunk_ids.len());
 
-        // Read all chunks in parallel
+        // Check cache first and identify missing chunks
+        let mut cached_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
+        let mut chunks_to_fetch: Vec<(usize, ChunkId)> = Vec::new();
+
+        {
+            let mut cache = self.chunk_cache.lock().await;
+            for (idx, chunk_id) in chunk_ids.iter().enumerate() {
+                if let Some(data) = cache.get(chunk_id) {
+                    cached_chunks.push((idx, Arc::clone(data)));
+                } else {
+                    chunks_to_fetch.push((idx, *chunk_id));
+                }
+            }
+        }
+
+        let cache_hits = cached_chunks.len();
+        let cache_misses = chunks_to_fetch.len();
+
+        info!("Reading {} chunks: {} cached, {} to fetch",
+              chunk_ids.len(), cache_hits, cache_misses);
+
+        // Fetch missing chunks in parallel
         let mut tasks = Vec::new();
-
-        for (idx, chunk_id) in chunk_ids.iter().enumerate() {
+        for (idx, chunk_id) in chunks_to_fetch.iter() {
+            let idx = *idx;
             let chunk_id = *chunk_id;
-            let request = Request::ReadChunk { chunk_id };
-
-            // Clone self for the async task
             let nodes = self.cluster_nodes.read().await.clone();
 
             let task = tokio::spawn(async move {
@@ -180,7 +207,7 @@ impl DfsClient {
 
                 for node_addr in &nodes {
                     match Self::read_chunk_from_server(*node_addr, chunk_id).await {
-                        Ok(data) => return Ok::<(usize, Vec<u8>), anyhow::Error>((idx, data)),
+                        Ok(data) => return Ok::<(usize, ChunkId, Vec<u8>), anyhow::Error>((idx, chunk_id, data)),
                         Err(e) => {
                             last_error = Some(e);
                             continue;
@@ -194,26 +221,39 @@ impl DfsClient {
             tasks.push(task);
         }
 
-        // Wait for all chunks and reassemble in order
-        let mut chunks_with_index = Vec::new();
+        // Wait for fetched chunks and add to cache
+        let mut fetched_chunks = Vec::new();
         for task in tasks {
-            let (idx, data) = task.await??;
-            chunks_with_index.push((idx, data));
+            let (idx, chunk_id, data) = task.await??;
+            let data_arc = Arc::new(data);
+
+            // Add to cache
+            {
+                let mut cache = self.chunk_cache.lock().await;
+                cache.put(chunk_id, Arc::clone(&data_arc));
+            }
+
+            fetched_chunks.push((idx, data_arc));
         }
 
+        // Combine cached and fetched chunks
+        let mut all_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
+        all_chunks.extend(cached_chunks);
+        all_chunks.extend(fetched_chunks);
+
         // Sort by index to maintain chunk order
-        chunks_with_index.sort_by_key(|(idx, _)| *idx);
+        all_chunks.sort_by_key(|(idx, _)| *idx);
 
         // Concatenate all chunks
         let mut all_data = Vec::new();
-        for (_, data) in chunks_with_index {
+        for (_, data) in all_chunks {
             all_data.extend_from_slice(&data);
         }
 
         let elapsed = start.elapsed();
         let throughput = (all_data.len() as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
-        info!("Read complete: {} bytes from {} chunks in {:?} ({:.2} MB/s)",
-              all_data.len(), chunk_ids.len(), elapsed, throughput);
+        info!("Read complete: {} bytes from {} chunks in {:?} ({:.2} MB/s) - cache: {}/{} hits",
+              all_data.len(), chunk_ids.len(), elapsed, throughput, cache_hits, chunk_ids.len());
 
         Ok(all_data)
     }

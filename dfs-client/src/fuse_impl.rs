@@ -268,38 +268,48 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
-        // Check cache first
-        {
+        // Check cache first and validate freshness
+        let cached_modified_at = {
             let path_map = self.path_to_inode.read().unwrap();
             if let Some(&ino) = path_map.get(&path) {
                 let cache = self.metadata_cache.read().unwrap();
-                if let Some(metadata) = cache.get(&ino) {
-                    let attr = self.metadata_to_attr(ino, metadata);
-                    reply.entry(&Duration::from_secs(300), &attr, 0); // 5 minutes
-                    return;
-                }
+                cache.get(&ino).map(|m| m.modified_at)
+            } else {
+                None
             }
-        }
+        };
 
-        // Fetch from cluster
+        // Fetch from cluster with conditional GET if we have cached metadata
         let client = self.client.clone();
         let result = self.block_on(async {
-            client.get_file_metadata(&path).await
+            client.get_file_metadata_conditional(&path, cached_modified_at).await
         });
 
         match result {
             Ok(Some(metadata)) => {
-                // Allocate inode
+                // Metadata was modified or first fetch - update cache
                 let ino = self.get_or_create_inode(&path);
-
-                // Cache metadata
                 self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
 
-                // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
                 reply.entry(&Duration::from_secs(3600), &attr, 0);
             }
             Ok(None) => {
+                // Either file not found OR metadata not modified (cache still valid)
+                if cached_modified_at.is_some() {
+                    // Cache is valid, use cached metadata
+                    let path_map = self.path_to_inode.read().unwrap();
+                    if let Some(&ino) = path_map.get(&path) {
+                        let cache = self.metadata_cache.read().unwrap();
+                        if let Some(metadata) = cache.get(&ino) {
+                            debug!("Using cached metadata for {} (not modified)", path);
+                            let attr = self.metadata_to_attr(ino, metadata);
+                            reply.entry(&Duration::from_secs(3600), &attr, 0);
+                            return;
+                        }
+                    }
+                }
+                // File not found
                 reply.error(libc::ENOENT);
             }
             Err(e) => {
@@ -422,9 +432,13 @@ impl Filesystem for DfsFilesystem {
             .map(|(idx, _, _)| metadata.chunks[*idx])
             .collect();
 
+        // Get the file chunk index of the first chunk we're reading (for prefetch tracking)
+        let start_chunk_idx = chunks_to_read.first().map(|(idx, _, _)| *idx).unwrap_or(0);
+
         let client = self.client.clone();
+        let all_chunks = metadata.chunks.clone();
         let result = self.block_on(async {
-            client.read_data(&chunk_ids).await
+            client.read_data(&chunk_ids, &all_chunks, start_chunk_idx).await
         });
 
         let all_data = match result {
@@ -728,7 +742,8 @@ impl Filesystem for DfsFilesystem {
             let existing_data = if !metadata.chunks.is_empty() {
                 let chunk_ids = metadata.chunks.clone();
                 match self.block_on(async {
-                    client.read_data(&chunk_ids).await
+                    // Reading entire file, so start_chunk_idx=0
+                    client.read_data(&chunk_ids, &chunk_ids, 0).await
                 }) {
                     Ok(data) => data,
                     Err(e) => {
@@ -1189,7 +1204,8 @@ impl Filesystem for DfsFilesystem {
                 let existing_data = if !metadata.chunks.is_empty() {
                     let chunk_ids = metadata.chunks.clone();
                     match self.block_on(async {
-                        client.read_data(&chunk_ids).await
+                        // Reading entire file for truncate, start_chunk_idx=0
+                        client.read_data(&chunk_ids, &chunk_ids, 0).await
                     }) {
                         Ok(data) => data,
                         Err(e) => {

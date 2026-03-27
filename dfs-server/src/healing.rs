@@ -96,6 +96,7 @@ impl HealingManager {
     /// Run periodic healing checker
     async fn run_healing_checker(&self) {
         let mut check_interval = interval(Duration::from_secs(60)); // Check every minute
+        let mut cleanup_counter = 0;
 
         loop {
             check_interval.tick().await;
@@ -103,7 +104,54 @@ impl HealingManager {
             if let Err(e) = self.check_and_heal().await {
                 warn!("Healing check error: {}", e);
             }
+
+            // Periodic cleanup of stale pending_healing entries (every 10 minutes)
+            cleanup_counter += 1;
+            if cleanup_counter >= 10 {
+                cleanup_counter = 0;
+                if let Err(e) = self.cleanup_stale_pending().await {
+                    warn!("Pending healing cleanup error: {}", e);
+                }
+            }
         }
+    }
+
+    /// Cleanup stale entries from pending_healing map
+    /// Removes chunks that no longer exist or have been pending for too long
+    async fn cleanup_stale_pending(&self) -> Result<()> {
+        let mut pending = self.pending_healing.write().await;
+        let max_pending_time = Duration::from_secs(self.healing_delay_secs * 20); // 20x healing delay
+
+        let mut to_remove = Vec::new();
+
+        for (chunk_id, detected_at) in pending.iter() {
+            // Remove if pending for too long (likely deleted or unrecoverable)
+            if detected_at.elapsed() > max_pending_time {
+                debug!("Removing stale pending healing entry for chunk {} (pending for {}s)",
+                       chunk_id, detected_at.elapsed().as_secs());
+                to_remove.push(*chunk_id);
+                continue;
+            }
+
+            // Remove if chunk no longer exists in local storage or metadata
+            if !self.storage.has_chunk(chunk_id) {
+                if self.metadata.get_chunk_location(chunk_id).ok().flatten().is_none() {
+                    debug!("Removing pending healing entry for non-existent chunk {}", chunk_id);
+                    to_remove.push(*chunk_id);
+                }
+            }
+        }
+
+        let removed_count = to_remove.len();
+        for chunk_id in to_remove {
+            pending.remove(&chunk_id);
+        }
+
+        if removed_count > 0 {
+            info!("Cleaned up {} stale pending healing entries", removed_count);
+        }
+
+        Ok(())
     }
 
     /// Run periodic scrubber

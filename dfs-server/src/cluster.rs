@@ -249,6 +249,7 @@ impl ClusterManager {
     /// Start background task to check for failed nodes
     pub async fn start_failure_detector(self: Arc<Self>) {
         let mut check_interval = interval(Duration::from_secs(self.heartbeat_interval));
+        let mut cleanup_counter = 0;
 
         tokio::spawn(async move {
             loop {
@@ -256,6 +257,15 @@ impl ClusterManager {
 
                 if let Err(e) = self.check_failed_nodes().await {
                     warn!("Error checking for failed nodes: {}", e);
+                }
+
+                // Periodic cleanup of stale capacity data (every 10 checks = ~100 seconds)
+                cleanup_counter += 1;
+                if cleanup_counter >= 10 {
+                    cleanup_counter = 0;
+                    if let Err(e) = self.cleanup_stale_capacities().await {
+                        warn!("Error cleaning up stale capacities: {}", e);
+                    }
                 }
             }
         });
@@ -319,6 +329,10 @@ impl ClusterManager {
     async fn check_failed_nodes(&self) -> Result<()> {
         let mut nodes = self.nodes.write().await;
         let mut failed_nodes = Vec::new();
+        let mut nodes_to_purge = Vec::new();
+
+        // Threshold for purging: failed for 24 hours
+        let purge_threshold = self.failure_timeout * 24 * 3600 / self.failure_timeout;
 
         for (node_id, node_info) in nodes.iter_mut() {
             // Skip local node
@@ -331,6 +345,11 @@ impl ClusterManager {
                     warn!("Node {} has failed (no heartbeat)", node_id);
                     node_info.status = NodeStatus::Failed;
                     failed_nodes.push(*node_id);
+                } else {
+                    // Already failed - check if we should purge it (failed for too long)
+                    if node_info.is_failed(purge_threshold) {
+                        nodes_to_purge.push(*node_id);
+                    }
                 }
             }
         }
@@ -342,6 +361,39 @@ impl ClusterManager {
                 info!("Removing failed node {} from hash ring", node_id);
                 ring.remove_node(&node_id);
             }
+        }
+
+        // Purge long-failed nodes from nodes HashMap to prevent memory leak
+        if !nodes_to_purge.is_empty() {
+            info!("Purging {} long-failed nodes from memory", nodes_to_purge.len());
+            for node_id in nodes_to_purge {
+                nodes.remove(&node_id);
+                debug!("Purged node {} (failed for >24h)", node_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cleanup stale node capacity data
+    /// Called periodically to remove capacity info for nodes that no longer exist
+    async fn cleanup_stale_capacities(&self) -> Result<()> {
+        let nodes = self.nodes.read().await;
+        let mut capacities = self.node_capacities.write().await;
+
+        let valid_node_ids: std::collections::HashSet<_> = nodes.keys().cloned().collect();
+        let capacity_node_ids: Vec<_> = capacities.keys().cloned().collect();
+
+        let mut removed = 0;
+        for node_id in capacity_node_ids {
+            if !valid_node_ids.contains(&node_id) {
+                capacities.remove(&node_id);
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            info!("Cleaned up capacity data for {} removed nodes", removed);
         }
 
         Ok(())

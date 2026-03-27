@@ -47,6 +47,9 @@ pub enum Request {
     /// Get file metadata by path (for FUSE client)
     GetFileMetadataByPath {
         path: String,
+        /// Optional timestamp for conditional fetch (HTTP-style If-Modified-Since)
+        /// If provided and metadata hasn't changed, returns NotModified
+        if_modified_since: Option<u64>,
     },
 
     /// Update file metadata
@@ -142,6 +145,9 @@ pub enum Response {
     FileMetadata {
         metadata: FileMetadata,
     },
+
+    /// Metadata not modified (conditional GET returned 304)
+    NotModified,
 
     /// Success with directory listing
     DirectoryListing {

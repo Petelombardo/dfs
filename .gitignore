@@ -42,3 +42,4 @@ config.example.toml
 # Private deployment scripts (network-specific)
 scripts/deploy-all.sh
 build.sh
+deploy-build

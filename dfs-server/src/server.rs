@@ -88,8 +88,8 @@ impl Server {
             Request::ReplicateMetadata { metadata } => {
                 self.handle_replicate_metadata(metadata).await
             }
-            Request::GetFileMetadataByPath { path } => {
-                self.handle_get_file_metadata_by_path(path).await
+            Request::GetFileMetadataByPath { path, if_modified_since } => {
+                self.handle_get_file_metadata_by_path(path, if_modified_since).await
             }
             Request::PutFileMetadata { metadata } => {
                 self.handle_put_file_metadata(metadata).await
@@ -508,12 +508,22 @@ impl Server {
     }
 
     /// Handle get file metadata by path request
-    async fn handle_get_file_metadata_by_path(&self, path: String) -> Response {
-        debug!("Handling get file metadata by path: {}", path);
+    async fn handle_get_file_metadata_by_path(&self, path: String, if_modified_since: Option<u64>) -> Response {
+        debug!("Handling get file metadata by path: {} (if_modified_since: {:?})", path, if_modified_since);
 
         // Try local first
         match self.metadata.get_file_by_path(&path) {
-            Ok(Some(metadata)) => Response::FileMetadata { metadata },
+            Ok(Some(metadata)) => {
+                // Check if client has provided if_modified_since timestamp
+                if let Some(cached_timestamp) = if_modified_since {
+                    // Return NotModified if metadata hasn't changed
+                    if metadata.modified_at <= cached_timestamp {
+                        debug!("Metadata not modified for {}: {} <= {}", path, metadata.modified_at, cached_timestamp);
+                        return Response::NotModified;
+                    }
+                }
+                Response::FileMetadata { metadata }
+            }
             Ok(None) => {
                 // Not found locally - with metadata replication, this means file doesn't exist
                 // Don't query other nodes for performance (replication ensures consistency)

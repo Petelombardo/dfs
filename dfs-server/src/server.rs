@@ -8,12 +8,9 @@ use dfs_common::{
     compute_chunk_hash, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileMetadata, Message,
     NodeId, NodeInfo, Request, Response,
 };
-use lru::LruCache;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 /// Main server context holding all components
@@ -39,10 +36,6 @@ pub struct Server {
 
     /// Metadata directory path for persisting peer list
     metadata_dir: PathBuf,
-
-    /// LRU cache for recently-read chunks (reduces disk I/O)
-    /// Keeps chunks in memory after reading from disk
-    chunk_cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
 }
 
 impl Server {
@@ -55,22 +48,6 @@ impl Server {
         replication_factor: usize,
         metadata_dir: PathBuf,
     ) -> Self {
-        // Initialize LRU cache with dynamic sizing based on available system memory
-        // Target: 10% of available RAM, min 20 chunks (~80MB), max 500 chunks (~2GB)
-        // This prevents OOM on memory-constrained SBCs while maximizing cache on larger systems
-        let cache_capacity = dfs_common::calculate_cache_capacity(
-            chunk_size,
-            10,  // 10% of available memory
-            20,  // min 20 chunks (~80MB for 4MB chunks)
-            500, // max 500 chunks (~2GB for 4MB chunks)
-        )
-        .unwrap_or_else(|e| {
-            warn!("Failed to calculate cache capacity: {}, using default of 100 chunks", e);
-            NonZeroUsize::new(100).unwrap()
-        });
-
-        let chunk_cache = Arc::new(Mutex::new(LruCache::new(cache_capacity)));
-
         Self {
             storage,
             metadata,
@@ -79,7 +56,6 @@ impl Server {
             client: Arc::new(NetworkClient::new()),
             replication_factor,
             metadata_dir,
-            chunk_cache,
         }
     }
 
@@ -466,26 +442,9 @@ impl Server {
 
     /// Read a single chunk from the cluster
     async fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Vec<u8>> {
-        // Check cache first (fastest path - in-memory lookup)
-        {
-            let mut cache = self.chunk_cache.lock().await;
-            if let Some(cached_data) = cache.get(chunk_id) {
-                debug!("Read chunk {} from cache (hit)", chunk_id);
-                return Ok((**cached_data).clone());
-            }
-        }
-
-        // Try reading from local storage
+        // Try reading from local storage (OS page cache handles caching automatically)
         if let Ok(data) = self.storage.read_chunk(chunk_id) {
-            debug!("Read chunk {} from local disk", chunk_id);
-
-            // Add to cache for future reads
-            let data_arc = Arc::new(data.clone());
-            {
-                let mut cache = self.chunk_cache.lock().await;
-                cache.put(*chunk_id, data_arc);
-            }
-
+            debug!("Read chunk {} from local storage", chunk_id);
             return Ok(data);
         }
 
@@ -515,14 +474,6 @@ impl Server {
                     Ok(response) => match response.message {
                         Message::Response(Response::ChunkData { data, .. }) => {
                             debug!("Read chunk {} from remote node {}", chunk_id, node_id);
-
-                            // Add to cache for future reads
-                            let data_arc = Arc::new(data.clone());
-                            {
-                                let mut cache = self.chunk_cache.lock().await;
-                                cache.put(*chunk_id, data_arc);
-                            }
-
                             return Ok(data);
                         }
                         _ => continue,

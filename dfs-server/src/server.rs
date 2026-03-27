@@ -96,6 +96,7 @@ impl Server {
             }
             Request::ListDirectory { path } => self.handle_list_directory(path).await,
             Request::WriteFile { data } => self.handle_write_file(data).await,
+            Request::WriteFileLocalOnly { data } => self.handle_write_file_local_only(data).await,
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
 
             // Admin requests
@@ -422,6 +423,65 @@ impl Server {
         Ok(chunk_ids_with_sizes)
     }
 
+    /// Write data locally only (no replication)
+    /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
+    /// Healing creates the 3rd replica in background
+    pub async fn write_data_local_only(&self, data: &[u8]) -> Result<Vec<(ChunkId, u64)>> {
+        let total_start = std::time::Instant::now();
+        info!("Writing {} bytes locally (no replication)", data.len());
+
+        // Chunk the data
+        let chunks = self.chunker.chunk_data(data);
+        info!("Chunked into {} chunks (local write only)", chunks.len());
+
+        // Write all chunks locally in parallel
+        let mut chunk_tasks = Vec::new();
+
+        for (chunk_id, chunk_data) in chunks {
+            let storage = self.storage.clone();
+            let metadata = self.metadata.clone();
+            let local_node_id = self.cluster.local_node_id();
+
+            let task = tokio::spawn(async move {
+                // Write chunk locally
+                storage.write_chunk(&chunk_id, &chunk_data)
+                    .context(format!("Failed to write chunk {} locally", chunk_id))?;
+
+                // Store chunk location metadata (with only local node)
+                let location = ChunkLocation {
+                    chunk_id,
+                    nodes: vec![local_node_id],  // Only local node
+                    size: chunk_data.len(),
+                    checksum: chunk_id.hash,
+                };
+
+                metadata.put_chunk_location(&location)
+                    .context("Failed to store chunk location")?;
+
+                Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
+            });
+
+            chunk_tasks.push(task);
+        }
+
+        // Wait for all chunks to complete
+        let mut chunk_ids_with_sizes = Vec::new();
+        for task in chunk_tasks {
+            match task.await {
+                Ok(Ok(chunk_id_with_size)) => chunk_ids_with_sizes.push(chunk_id_with_size),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => anyhow::bail!("Chunk task panicked: {}", e),
+            }
+        }
+
+        let total_time = total_start.elapsed();
+        let throughput = (data.len() as f64 / 1024.0 / 1024.0) / total_time.as_secs_f64();
+        info!("Local write complete: {} bytes in {:?} ({:.2} MB/s) - {} chunks",
+              data.len(), total_time, throughput, chunk_ids_with_sizes.len());
+
+        Ok(chunk_ids_with_sizes)
+    }
+
     /// Read data from the cluster by chunk IDs
     pub async fn read_data(&self, chunk_ids: &[ChunkId]) -> Result<Vec<u8>> {
         info!("Reading {} chunks from cluster", chunk_ids.len());
@@ -652,6 +712,28 @@ impl Server {
             }
             Err(e) => {
                 warn!("Failed to write file: {}", e);
+                Response::Error {
+                    message: format!("Failed to write file: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle write file request (local only, no replication)
+    /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
+    async fn handle_write_file_local_only(&self, data: Vec<u8>) -> Response {
+        debug!("Handling write file local only: {} bytes", data.len());
+
+        match self.write_data_local_only(&data).await {
+            Ok(chunk_ids_with_sizes) => {
+                let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
+                let chunk_sizes: Vec<u64> = chunk_ids_with_sizes.iter().map(|(_, size)| *size).collect();
+                info!("Wrote {} chunks locally (no replication)", chunk_ids.len());
+                Response::ChunkIds { chunk_ids, chunk_sizes }
+            }
+            Err(e) => {
+                warn!("Failed to write file locally: {}", e);
                 Response::Error {
                     message: format!("Failed to write file: {}", e),
                     code: ErrorCode::InternalError,

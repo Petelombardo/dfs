@@ -595,11 +595,11 @@ impl DfsClient {
         }
     }
 
-    /// Write data to cluster with dual-stream parallelization
-    /// For RF=3: Split data in half, send to 2 servers simultaneously
-    /// Each server replicates to 2 nodes, 3rd replica created in background
+    /// Write data to cluster with optimized dual-stream parallelization
+    /// For RF=3+: Split data in half, send to 2 servers simultaneously (local write only)
+    /// Each server writes locally only, healing creates 3rd replica in background
     pub async fn write_data(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
-        const MIN_PARALLEL_SIZE: usize = 512 * 1024; // 512KB minimum
+        const MIN_PARALLEL_SIZE: usize = 128 * 1024; // 128KB minimum (lowered for better perf)
 
         // For small writes, use single server (less overhead)
         if data.len() < MIN_PARALLEL_SIZE {
@@ -611,22 +611,22 @@ impl DfsClient {
             return self.write_data_single_chunk(data).await;
         }
 
-        info!("Writing {} bytes using dual-stream parallelization", data.len());
+        info!("Writing {} bytes using optimized dual-stream (RF=3+ local-only)", data.len());
 
         // Split data in half for 2 parallel streams
         let mid = data.len() / 2;
         let (chunk1, chunk2) = data.split_at(mid);
 
-        // Send to 2 different servers in parallel
+        // Send to 2 different servers in parallel (local write only)
         let server1 = nodes[0];
         let server2 = nodes[1 % nodes.len()];
 
         let chunk1 = chunk1.to_vec();
         let chunk2 = chunk2.to_vec();
 
-        // Spawn both writes in parallel
-        let task1 = Self::write_chunk_to_server(server1, chunk1);
-        let task2 = Self::write_chunk_to_server(server2, chunk2);
+        // Spawn both writes in parallel using local-only write
+        let task1 = Self::write_chunk_to_server_local_only(server1, chunk1);
+        let task2 = Self::write_chunk_to_server_local_only(server2, chunk2);
 
         let (result1, result2) = tokio::join!(task1, task2);
 
@@ -641,7 +641,8 @@ impl DfsClient {
         all_chunk_sizes.extend(chunk_sizes_1);
         all_chunk_sizes.extend(chunk_sizes_2);
 
-        info!("Completed dual-stream write: {} total chunks", all_chunk_ids.len());
+        info!("Completed optimized dual-stream write: {} total chunks (2 copies, healing creates 3rd)",
+              all_chunk_ids.len());
 
         Ok((all_chunk_ids, all_chunk_sizes))
     }
@@ -693,6 +694,54 @@ impl DfsClient {
         let throughput = (data_len as f64 / 1024.0 / 1024.0) / total_time.as_secs_f64();
         info!("Client write to {}: {} bytes in {:?} ({:.2} MB/s) - connect: {:?}, serialize: {:?}, send: {:?}, recv: {:?}, deserialize: {:?}",
               server_addr, data_len, total_time, throughput, connect_time, serialize_time, send_time, recv_time, deserialize_time);
+
+        match response_envelope.message {
+            Message::Response(Response::ChunkIds { chunk_ids, chunk_sizes }) => Ok((chunk_ids, chunk_sizes)),
+            Message::Response(Response::Error { message, .. }) => {
+                anyhow::bail!("Server error: {}", message);
+            }
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    /// Write a chunk to a specific server (local only, no replication)
+    /// Used for optimized RF=3+ writes
+    async fn write_chunk_to_server_local_only(server_addr: SocketAddr, data: Vec<u8>) -> Result<(Vec<ChunkId>, Vec<u64>)> {
+        let total_start = std::time::Instant::now();
+        let data_len = data.len();
+
+        let request = Request::WriteFileLocalOnly { data };
+
+        // Create connection
+        let mut stream = TcpStream::connect(server_addr)
+            .await
+            .context("Failed to connect to server")?;
+
+        let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let envelope = MessageEnvelope::new(request_id, Message::Request(request));
+        let encoded = envelope.to_bytes().context("Failed to serialize message")?;
+
+        // Send request
+        let len = encoded.len() as u32;
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(&encoded).await?;
+        stream.flush().await?;
+
+        // Read response
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await?;
+
+        let response_envelope = MessageEnvelope::from_bytes(&buf)
+            .context("Failed to deserialize response")?;
+
+        let total_time = total_start.elapsed();
+        let throughput = (data_len as f64 / 1024.0 / 1024.0) / total_time.as_secs_f64();
+        info!("Client LOCAL write to {}: {} bytes in {:?} ({:.2} MB/s)",
+              server_addr, data_len, total_time, throughput);
 
         match response_envelope.message {
             Message::Response(Response::ChunkIds { chunk_ids, chunk_sizes }) => Ok((chunk_ids, chunk_sizes)),

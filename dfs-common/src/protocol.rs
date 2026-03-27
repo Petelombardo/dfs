@@ -72,6 +72,13 @@ pub enum Request {
         data: Vec<u8>,
     },
 
+    /// Write file data locally only (no replication, returns chunk IDs)
+    /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
+    /// and healing creates the 3rd replica in background
+    WriteFileLocalOnly {
+        data: Vec<u8>,
+    },
+
     /// Delete file by path
     DeleteFile {
         path: String,

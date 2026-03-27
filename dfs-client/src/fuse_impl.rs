@@ -165,8 +165,8 @@ impl DfsFilesystem {
             };
 
             // Write buffered data as new chunks (appending)
-            // Use single-chunk write to maintain 4MB chunk alignment for reads
-            let (new_chunk_ids, new_chunk_sizes) = self.client.write_data_single_chunk(&buffer.data).await?;
+            // Use optimized write path for dual-stream parallelization
+            let (new_chunk_ids, new_chunk_sizes) = self.client.write_data(&buffer.data).await?;
 
             info!("Flush complete: {} chunks added, total file size {}",
                   new_chunk_ids.len(), metadata.size);

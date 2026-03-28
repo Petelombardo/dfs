@@ -5,8 +5,8 @@ use crate::network::{MessageHandler, NetworkClient};
 use crate::storage::ChunkStorage;
 use anyhow::{Context, Result};
 use dfs_common::{
-    compute_chunk_hash, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileMetadata, Message,
-    NodeId, NodeInfo, Request, Response,
+    compute_chunk_hash, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
+    Message, NodeId, NodeInfo, Request, Response,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -112,6 +112,11 @@ impl Server {
                 self.handle_get_chunk_replicas(chunk_id).await
             }
             Request::RemoveNode { node_id } => self.handle_remove_node(node_id).await,
+            Request::ListAllFiles => self.handle_list_all_files().await,
+            Request::PurgeFileMetadata { path } => self.handle_purge_file_metadata(path).await,
+            Request::PurgeFileMetadataById { file_id } => {
+                self.handle_purge_file_metadata_by_id(file_id).await
+            }
 
             _ => Response::Error {
                 message: "Request type not yet implemented".to_string(),
@@ -983,6 +988,120 @@ impl Server {
                 warn!("Failed to get chunk replicas: {}", e);
                 Response::Error {
                     message: format!("Failed to get chunk replicas: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle list all files request
+    async fn handle_list_all_files(&self) -> Response {
+        debug!("Handling list all files");
+
+        match self.metadata.list_files() {
+            Ok(files) => {
+                let total_count = files.len();
+                Response::FileList { files, total_count }
+            }
+            Err(e) => {
+                warn!("Failed to list files: {}", e);
+                Response::Error {
+                    message: format!("Failed to list files: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle purge file metadata request
+    async fn handle_purge_file_metadata(&self, path: String) -> Response {
+        info!("Handling purge file metadata: {}", path);
+
+        // Get metadata to find file ID
+        match self.metadata.get_file_by_path(&path) {
+            Ok(Some(metadata)) => {
+                // Delete from metadata store only (not chunks)
+                match self.metadata.delete_file(&metadata.id) {
+                    Ok(_) => {
+                        info!("Purged metadata for file: {}", path);
+                        Response::Ok { data: None }
+                    }
+                    Err(e) => {
+                        warn!("Failed to purge file metadata: {}", e);
+                        Response::Error {
+                            message: format!("Failed to purge file metadata: {}", e),
+                            code: ErrorCode::InternalError,
+                        }
+                    }
+                }
+            }
+            Ok(None) => Response::Error {
+                message: format!("File not found: {}", path),
+                code: ErrorCode::NotFound,
+            },
+            Err(e) => {
+                warn!("Failed to get file metadata: {}", e);
+                Response::Error {
+                    message: format!("Failed to get file metadata: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    async fn handle_purge_file_metadata_by_id(&self, file_id: FileId) -> Response {
+        info!("Handling purge file metadata by ID: {}", file_id);
+
+        // Delete from local node first
+        match self.metadata.delete_file(&file_id) {
+            Ok(_) => {
+                info!("Purged metadata for file ID {} from local node", file_id);
+
+                // Broadcast deletion to all other nodes in the cluster
+                let nodes = self.cluster.get_all_nodes().await;
+                let local_id = self.cluster.local_node_id();
+                let client = self.client.clone();
+
+                let mut success_count = 1; // Local deletion succeeded
+                let total_nodes = nodes.len();
+
+                for node in nodes {
+                    if node.id == local_id {
+                        continue; // Skip local node
+                    }
+
+                    // Send purge request to remote node
+                    match client.send_message(
+                        node.addr,
+                        Message::Request(Request::PurgeFileMetadataById { file_id: file_id.clone() })
+                    ).await {
+                        Ok(envelope) => {
+                            match envelope.message {
+                                Message::Response(Response::Ok { .. }) => {
+                                    info!("Purged metadata for file ID {} from node {}", file_id, node.id);
+                                    success_count += 1;
+                                }
+                                Message::Response(Response::Error { message, .. }) => {
+                                    warn!("Failed to purge from node {}: {}", node.id, message);
+                                }
+                                _ => {
+                                    warn!("Unexpected response from node {} during purge", node.id);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error contacting node {} for purge: {}", node.id, e);
+                        }
+                    }
+                }
+
+                info!("Purged metadata from {}/{} nodes", success_count, total_nodes);
+                Response::Ok { data: None }
+            }
+            Err(e) => {
+                warn!("Failed to purge file metadata by ID: {}", e);
+                Response::Error {
+                    message: format!("Failed to purge file metadata: {}", e),
                     code: ErrorCode::InternalError,
                 }
             }

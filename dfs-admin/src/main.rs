@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dfs_common::{ChunkId, Message, MessageEnvelope, Request, RequestId, Response};
+use dfs_common::{ChunkId, FileId, Message, MessageEnvelope, Request, RequestId, Response};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,6 +93,24 @@ enum FileCommands {
     Replicas {
         /// Chunk ID (hex string)
         chunk_id: String,
+    },
+    /// List all files in metadata database
+    List,
+    /// Purge file metadata from database (without deleting chunks)
+    Purge {
+        /// File path to purge
+        path: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Purge file metadata by ID (for corrupted path indexes)
+    PurgeById {
+        /// File ID (hex string)
+        file_id: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -594,6 +612,132 @@ async fn handle_file_command(
                 }
             }
         }
+        FileCommands::List => {
+            let response = send_request(cluster_addrs[0], Request::ListAllFiles).await?;
+
+            match response {
+                Response::FileList { files, total_count } => {
+                    if json_output {
+                        let output = serde_json::json!({
+                            "total_count": total_count,
+                            "files": files.iter().map(|f| {
+                                serde_json::json!({
+                                    "id": f.id.to_string(),
+                                    "path": f.path,
+                                    "size": f.size,
+                                    "chunks": f.chunks.len(),
+                                    "created": f.created_at,
+                                    "modified": f.modified_at,
+                                })
+                            }).collect::<Vec<_>>()
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else {
+                        println!("All Files in Metadata Database");
+                        println!("==============================");
+                        println!("Total Files: {}", total_count);
+                        println!();
+                        println!("{:<38} {:<40} {:<12} {:<8} {}", "File ID", "Path", "Size", "Chunks", "Modified");
+                        println!("{}", "-".repeat(140));
+
+                        for file in files {
+                            let size_str = format_size(file.size);
+                            println!("{:<38} {:<40} {:<12} {:<8} {}",
+                                file.id.to_string(),
+                                truncate_path(&file.path, 40),
+                                size_str,
+                                file.chunks.len(),
+                                file.modified_at
+                            );
+                        }
+                    }
+                }
+                Response::Error { message, .. } => {
+                    error!("Error: {}", message);
+                    anyhow::bail!("Command failed: {}", message);
+                }
+                _ => {
+                    anyhow::bail!("Unexpected response type");
+                }
+            }
+        }
+        FileCommands::Purge { path, yes } => {
+            if !yes {
+                print!("Are you sure you want to purge metadata for '{}'? This will NOT delete chunks. [y/N]: ", path);
+                std::io::Write::flush(&mut std::io::stdout())?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            let response = send_request(
+                cluster_addrs[0],
+                Request::PurgeFileMetadata { path: path.clone() },
+            ).await?;
+
+            match response {
+                Response::Ok { .. } => {
+                    println!("Successfully purged metadata for: {}", path);
+                    println!();
+                    println!("Note: Chunks are still stored on disk.");
+                    println!("Run 'dfs-admin healing trigger' to clean up orphaned chunks.");
+                }
+                Response::Error { message, code } => {
+                    error!("Error: {}", message);
+                    if code == dfs_common::ErrorCode::NotFound {
+                        anyhow::bail!("File not found: {}", path);
+                    } else {
+                        anyhow::bail!("Command failed: {}", message);
+                    }
+                }
+                _ => {
+                    anyhow::bail!("Unexpected response type");
+                }
+            }
+        }
+
+        FileCommands::PurgeById { file_id, yes } => {
+            // Parse the file ID from hex string
+            let parsed_file_id = parse_file_id(&file_id)?;
+
+            if !yes {
+                print!("Are you sure you want to purge metadata for file ID '{}'? This will NOT delete chunks. [y/N]: ", file_id);
+                std::io::Write::flush(&mut std::io::stdout())?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            let response = send_request(
+                cluster_addrs[0],
+                Request::PurgeFileMetadataById {
+                    file_id: parsed_file_id,
+                },
+            )
+            .await?;
+
+            match response {
+                Response::Ok { .. } => {
+                    println!("Successfully purged metadata for file ID: {}", file_id);
+                    println!();
+                    println!("Note: Chunks are still stored on disk.");
+                    println!("Run 'dfs-admin healing trigger' to clean up orphaned chunks.");
+                }
+                Response::Error { message, .. } => {
+                    error!("Error: {}", message);
+                    anyhow::bail!("Command failed: {}", message);
+                }
+                _ => {
+                    anyhow::bail!("Unexpected response type");
+                }
+            }
+        }
     }
 
     Ok(())
@@ -610,6 +754,13 @@ fn parse_chunk_id(s: &str) -> Result<ChunkId> {
         }
     }
     Ok(ChunkId::from_hash(hash))
+}
+
+fn parse_file_id(s: &str) -> Result<FileId> {
+    // Parse UUID from string (supports both hyphenated and non-hyphenated formats)
+    let uuid = uuid::Uuid::parse_str(s)
+        .context("Invalid file ID format - expected UUID")?;
+    Ok(FileId(uuid))
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -659,5 +810,32 @@ async fn send_request(addr: SocketAddr, request: Request) -> Result<Response> {
     match response_envelope.message {
         Message::Response(response) => Ok(response),
         _ => anyhow::bail!("Expected Response message"),
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_index])
+    }
+}
+
+fn truncate_path(path: &str, max_len: usize) -> String {
+    if path.len() <= max_len {
+        path.to_string()
+    } else {
+        let start = &path[..max_len/2 - 2];
+        let end = &path[path.len() - (max_len/2 - 1)..];
+        format!("{}...{}", start, end)
     }
 }

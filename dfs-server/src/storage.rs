@@ -30,8 +30,13 @@ impl ChunkStorage {
 
         // Verify checksum before writing
         let checksum_start = std::time::Instant::now();
-        if !verify_chunk_hash(data, &chunk_id.hash) {
-            anyhow::bail!("Checksum mismatch: data does not match chunk ID");
+        let computed_hash = compute_chunk_hash(data);
+        if computed_hash != chunk_id.hash {
+            let expected_hex: String = chunk_id.hash.iter().map(|b| format!("{:02x}", b)).collect();
+            let computed_hex: String = computed_hash.iter().map(|b| format!("{:02x}", b)).collect();
+            warn!("Checksum mismatch for chunk {}: expected {}, computed {} (data len: {})",
+                  chunk_id, expected_hex, computed_hex, data.len());
+            anyhow::bail!("Checksum mismatch: expected {}, got {}", expected_hex, computed_hex);
         }
         let checksum_time = checksum_start.elapsed();
 

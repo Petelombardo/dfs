@@ -132,6 +132,19 @@ pub enum Request {
     RemoveNode {
         node_id: NodeId,
     },
+
+    /// List all files in metadata database (admin operation)
+    ListAllFiles,
+
+    /// Purge file metadata from database without deleting chunks (admin operation for fixing corruption)
+    PurgeFileMetadata {
+        path: String,
+    },
+
+    /// Purge file metadata by ID (for corrupted path indexes)
+    PurgeFileMetadataById {
+        file_id: FileId,
+    },
 }
 
 /// Response types
@@ -210,6 +223,12 @@ pub enum Response {
     ChunkReplicas {
         chunk_id: ChunkId,
         nodes: Vec<NodeId>,
+    },
+
+    /// File list response (admin operation)
+    FileList {
+        files: Vec<FileMetadata>,
+        total_count: usize,
     },
 
     /// Error response

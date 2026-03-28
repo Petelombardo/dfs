@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::client::DfsClient;
 
@@ -736,32 +736,55 @@ impl Filesystem for DfsFilesystem {
             let mut padded = vec![0u8; offset - current_size];
             padded.extend_from_slice(data);
             padded
+        } else if offset + data.len() >= current_size {
+            // Writing near end of file (overlaps with current end)
+            // Treat as append to avoid expensive read-modify-write
+            // This handles DVR recordings and other streaming writes where
+            // small timing variations might cause writes slightly behind the end
+            debug!("Write at offset {} overlaps with end at {}, treating as append",
+                   offset, current_size);
+            data.to_vec()
         } else {
             // Random write in middle of file - need read-modify-write
             // This is slow but necessary for correctness
-            let existing_data = if !metadata.chunks.is_empty() {
-                let chunk_ids = metadata.chunks.clone();
-                match self.block_on(async {
-                    // Reading entire file, so start_chunk_idx=0
-                    client.read_data(&chunk_ids, &chunk_ids, 0).await
-                }) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        error!("Failed to read existing data: {}", e);
-                        reply.error(libc::EIO);
-                        return;
-                    }
-                }
-            } else {
-                Vec::new()
-            };
+            // For large files being actively written (like DVR recordings),
+            // avoid full file read-modify-write
+            let file_is_large = current_size > 10 * 1024 * 1024; // 10 MB threshold
+            let write_near_end = (current_size - offset) < 4 * 1024 * 1024; // Within 4 MB of end
 
-            let mut merged = existing_data;
-            if offset + data.len() > merged.len() {
-                merged.resize(offset + data.len(), 0);
+            if file_is_large && write_near_end {
+                // For large files with writes near the end, treat as append
+                // to avoid reading entire file. This is a heuristic for streaming writes.
+                warn!("Large file write at offset {} (size {}), treating as near-append to avoid full read",
+                      offset, current_size);
+                data.to_vec()
+            } else {
+                // True random write - need full read-modify-write
+                let existing_data = if !metadata.chunks.is_empty() {
+                    let chunk_ids = metadata.chunks.clone();
+                    match self.block_on(async {
+                        // Reading entire file, so start_chunk_idx=0
+                        client.read_data(&chunk_ids, &chunk_ids, 0).await
+                    }) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            error!("Failed to read existing data for random write at offset {} (file size {}): {}",
+                                   offset, current_size, e);
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                let mut merged = existing_data;
+                if offset + data.len() > merged.len() {
+                    merged.resize(offset + data.len(), 0);
+                }
+                merged[offset..offset + data.len()].copy_from_slice(data);
+                merged
             }
-            merged[offset..offset + data.len()].copy_from_slice(data);
-            merged
         };
 
         // Write to cluster (only new/modified data for appends)

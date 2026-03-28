@@ -36,6 +36,14 @@ enum Commands {
         /// Enable write-behind buffering for better performance (may lose unflushed data on crash)
         #[arg(long)]
         write_buffer: bool,
+
+        /// Allow all users to access the mounted filesystem (requires user_allow_other in /etc/fuse.conf)
+        #[arg(long)]
+        allow_other: bool,
+
+        /// Log file path (default: stderr in foreground, /var/log/dfs-client.log in daemon mode)
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
 
     /// Unmount the DFS filesystem
@@ -44,15 +52,43 @@ enum Commands {
         #[arg(value_name = "MOUNTPOINT")]
         mountpoint: PathBuf,
     },
+
+    /// Install and enable systemd service
+    SystemdInstall {
+        /// Mount point (local directory)
+        #[arg(value_name = "MOUNTPOINT")]
+        mountpoint: PathBuf,
+
+        /// Cluster nodes (comma-separated, e.g., 192.168.1.10:8900,192.168.1.11:8900)
+        #[arg(short, long, value_delimiter = ',')]
+        cluster: Vec<String>,
+
+        /// Enable write-behind buffering for better performance (may lose unflushed data on crash)
+        #[arg(long)]
+        write_buffer: bool,
+
+        /// Allow all users to access the mounted filesystem (requires user_allow_other in /etc/fuse.conf)
+        #[arg(long)]
+        allow_other: bool,
+
+        /// Log file path (default: /var/log/dfs-client.log)
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+
+        /// Service name (default: dfs-client)
+        #[arg(long, default_value = "dfs-client")]
+        service_name: String,
+    },
+
+    /// Uninstall systemd service
+    SystemdUninstall {
+        /// Service name (default: dfs-client)
+        #[arg(long, default_value = "dfs-client")]
+        service_name: String,
+    },
 }
 
 fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
 
     match cli.command {
@@ -61,13 +97,47 @@ fn main() -> Result<()> {
             cluster,
             foreground,
             write_buffer,
+            allow_other,
+            log_file,
         } => {
-            mount_filesystem(mountpoint, cluster, foreground, write_buffer)?;
+            // Set up logging before anything else
+            setup_logging(foreground, log_file.as_deref())?;
+            mount_filesystem(mountpoint, cluster, foreground, write_buffer, allow_other)?;
         }
         Commands::Unmount { mountpoint } => {
-            // For unmount, we can use a temporary runtime
+            // Initialize basic logging for unmount
+            tracing_subscriber::fmt()
+                .with_max_level(Level::INFO)
+                .with_target(false)
+                .init();
+
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(unmount_filesystem(mountpoint))?;
+        }
+        Commands::SystemdInstall {
+            mountpoint,
+            cluster,
+            write_buffer,
+            allow_other,
+            log_file,
+            service_name,
+        } => {
+            // Initialize basic logging
+            tracing_subscriber::fmt()
+                .with_max_level(Level::INFO)
+                .with_target(false)
+                .init();
+
+            systemd_install(mountpoint, cluster, write_buffer, allow_other, log_file, &service_name)?;
+        }
+        Commands::SystemdUninstall { service_name } => {
+            // Initialize basic logging
+            tracing_subscriber::fmt()
+                .with_max_level(Level::INFO)
+                .with_target(false)
+                .init();
+
+            systemd_uninstall(&service_name)?;
         }
     }
 
@@ -79,6 +149,7 @@ fn mount_filesystem(
     cluster_nodes: Vec<String>,
     foreground: bool,
     write_buffer: bool,
+    allow_other: bool,
 ) -> Result<()> {
     info!("Mounting DFS at {:?}", mountpoint);
 
@@ -141,12 +212,15 @@ fn mount_filesystem(
         fuser::MountOption::AutoUnmount,
         // Enable write-back caching for better performance
         fuser::MountOption::Async,
-        // Allow root to access (needed for write-back caching)
-        fuser::MountOption::AllowRoot,
     ];
 
-    if foreground {
+    // Note: AllowRoot and AllowOther are mutually exclusive
+    if allow_other {
+        info!("Enabling AllowOther - all users can access the mount");
         options.push(fuser::MountOption::AllowOther);
+    } else {
+        // Allow root to access (needed for write-back caching)
+        options.push(fuser::MountOption::AllowRoot);
     }
 
     info!("Mounting filesystem at {:?}", mountpoint);
@@ -272,4 +346,232 @@ fn discover_cluster_nodes(seed_addrs: &[SocketAddr]) -> Result<Vec<SocketAddr>> 
     }
 
     anyhow::bail!("Failed to discover cluster: all seed nodes unreachable")
+}
+
+/// Set up logging to file or console
+fn setup_logging(foreground: bool, log_file: Option<&std::path::Path>) -> Result<()> {
+    use std::fs::OpenOptions;
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+
+    // Determine log file path
+    let log_path = if let Some(path) = log_file {
+        path.to_path_buf()
+    } else if !foreground {
+        PathBuf::from("/var/log/dfs-client.log")
+    } else {
+        // Foreground mode with no log file - use stderr
+        tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_target(false)
+            .init();
+        return Ok(());
+    };
+
+    // Open log file in append mode
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to open log file: {:?}", log_path))?;
+
+    // Set up file logging
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_target(false)
+        .with_writer(file.and(std::io::stderr))
+        .init();
+
+    info!("Logging to: {:?}", log_path);
+
+    Ok(())
+}
+
+/// Install systemd service for DFS client
+fn systemd_install(
+    mountpoint: PathBuf,
+    cluster: Vec<String>,
+    write_buffer: bool,
+    allow_other: bool,
+    log_file: Option<PathBuf>,
+    service_name: &str,
+) -> Result<()> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    // Get current binary path
+    let binary_path = std::env::current_exe()
+        .context("Failed to get current executable path")?;
+
+    // Ensure mount point exists
+    if !mountpoint.exists() {
+        fs::create_dir_all(&mountpoint)
+            .with_context(|| format!("Failed to create mount point: {:?}", mountpoint))?;
+        info!("Created mount point: {:?}", mountpoint);
+    }
+
+    // Build command line
+    let cluster_arg = cluster.join(",");
+    let log_arg = log_file
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/var/log/dfs-client.log".to_string());
+
+    let mut exec_start = format!(
+        "{} mount {:?} --cluster {}",
+        binary_path.display(),
+        mountpoint,
+        cluster_arg
+    );
+
+    if write_buffer {
+        exec_start.push_str(" --write-buffer");
+    }
+
+    if allow_other {
+        exec_start.push_str(" --allow-other");
+    }
+
+    exec_start.push_str(&format!(" --log-file {}", log_arg));
+
+    // Generate systemd service file
+    let service_content = format!(
+        r#"[Unit]
+Description=DFS FUSE Client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={}
+Restart=on-failure
+RestartSec=5
+# FUSE requires these capabilities
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+# Allow clean unmount on stop
+ExecStop=/bin/fusermount -u {:?}
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        exec_start, mountpoint
+    );
+
+    // Write service file
+    let service_file = format!("/etc/systemd/system/{}.service", service_name);
+    fs::write(&service_file, service_content)
+        .with_context(|| format!("Failed to write service file: {}", service_file))?;
+
+    info!("Created systemd service file: {}", service_file);
+
+    // Reload systemd daemon
+    let output = Command::new("systemctl")
+        .arg("daemon-reload")
+        .output()
+        .context("Failed to reload systemd daemon")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to reload systemd daemon: {}", stderr);
+    }
+
+    // Enable service
+    let output = Command::new("systemctl")
+        .arg("enable")
+        .arg(&service_name)
+        .output()
+        .with_context(|| format!("Failed to enable service: {}", service_name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to enable service: {}", stderr);
+    }
+
+    info!("Enabled systemd service: {}", service_name);
+
+    // Start service
+    let output = Command::new("systemctl")
+        .arg("start")
+        .arg(&service_name)
+        .output()
+        .with_context(|| format!("Failed to start service: {}", service_name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to start service: {}", stderr);
+    }
+
+    info!("Started systemd service: {}", service_name);
+    info!("");
+    info!("DFS client installed and started!");
+    info!("  Service: {}", service_name);
+    info!("  Mount point: {:?}", mountpoint);
+    info!("  Log file: {}", log_arg);
+    info!("");
+    info!("Useful commands:");
+    info!("  systemctl status {}", service_name);
+    info!("  systemctl stop {}", service_name);
+    info!("  systemctl start {}", service_name);
+    info!("  journalctl -u {} -f", service_name);
+    info!("  tail -f {}", log_arg);
+
+    Ok(())
+}
+
+/// Uninstall systemd service
+fn systemd_uninstall(service_name: &str) -> Result<()> {
+    use std::fs;
+    use std::process::Command;
+
+    let service_file = format!("/etc/systemd/system/{}.service", service_name);
+
+    // Stop service
+    info!("Stopping service: {}", service_name);
+    let output = Command::new("systemctl")
+        .arg("stop")
+        .arg(&service_name)
+        .output()
+        .context("Failed to stop service")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        info!("Warning: Failed to stop service: {}", stderr);
+    }
+
+    // Disable service
+    info!("Disabling service: {}", service_name);
+    let output = Command::new("systemctl")
+        .arg("disable")
+        .arg(&service_name)
+        .output()
+        .context("Failed to disable service")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        info!("Warning: Failed to disable service: {}", stderr);
+    }
+
+    // Remove service file
+    if std::path::Path::new(&service_file).exists() {
+        fs::remove_file(&service_file)
+            .with_context(|| format!("Failed to remove service file: {}", service_file))?;
+        info!("Removed service file: {}", service_file);
+    }
+
+    // Reload systemd daemon
+    let output = Command::new("systemctl")
+        .arg("daemon-reload")
+        .output()
+        .context("Failed to reload systemd daemon")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to reload systemd daemon: {}", stderr);
+    }
+
+    info!("Systemd service uninstalled: {}", service_name);
+
+    Ok(())
 }

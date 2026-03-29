@@ -586,11 +586,28 @@ impl Filesystem for DfsFilesystem {
                     // Get or allocate inode
                     let entry_ino = self.get_or_create_inode(&entry.path);
 
-                    // Cache metadata
-                    self.metadata_cache
-                        .write()
-                        .unwrap()
-                        .insert(entry_ino, entry.clone());
+                    // Cache metadata, but DON'T overwrite if there's an active write buffer
+                    // (the buffer has more up-to-date size information than the server)
+                    if self.write_buffer_enabled {
+                        let has_buffer = self.runtime.block_on(async {
+                            let buffers = self.write_buffers.lock().await;
+                            buffers.contains_key(&entry_ino)
+                        });
+
+                        if !has_buffer {
+                            self.metadata_cache
+                                .write()
+                                .unwrap()
+                                .insert(entry_ino, entry.clone());
+                        } else {
+                            debug!("Skipping metadata update for ino={} (has active write buffer)", entry_ino);
+                        }
+                    } else {
+                        self.metadata_cache
+                            .write()
+                            .unwrap()
+                            .insert(entry_ino, entry.clone());
+                    }
 
                     let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
                     if reply.add(entry_ino, next_offset, kind, file_name) {
@@ -740,6 +757,15 @@ impl Filesystem for DfsFilesystem {
                             last_modified: SystemTime::now(),
                             start_offset: current_size as u64,
                         });
+
+                        // Safety check: if buffer is already way too large, something is wrong
+                        // This can happen if writes backed up during lock contention
+                        const MAX_BUFFER_SIZE: usize = BUFFER_FLUSH_THRESHOLD * 3; // 12MB absolute max
+                        if buffer.data.len() > MAX_BUFFER_SIZE {
+                            error!("Buffer overflow detected for inode {}: {} bytes (max {}), refusing to buffer more data",
+                                   ino, buffer.data.len(), MAX_BUFFER_SIZE);
+                            return Err(anyhow::anyhow!("Buffer overflow"));
+                        }
 
                         // Append data to buffer
                         buffer.data.extend_from_slice(data_slice);

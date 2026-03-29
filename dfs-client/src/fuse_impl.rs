@@ -888,16 +888,18 @@ impl Filesystem for DfsFilesystem {
             };
 
             // Write to cluster (only new/modified data for appends)
+            // Use write_data_with_cache to populate byte-range cache for immediate read-back
             let write_start = std::time::Instant::now();
             let result = if offset == current_size {
                 // Append: write just the new data as new chunks
                 runtime.block_on(async {
-                    client.write_data(&new_data).await
+                    // Pass file offset for cache population (write-through caching)
+                    client.write_data_with_cache(&new_data, ino, current_size as u64).await
                 })
             } else {
-                // Rewrite: write entire file
+                // Rewrite: write entire file starting at offset 0
                 runtime.block_on(async {
-                    client.write_data(&new_data).await
+                    client.write_data_with_cache(&new_data, ino, 0).await
                 })
             };
             let write_elapsed = write_start.elapsed();

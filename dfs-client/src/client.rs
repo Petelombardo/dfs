@@ -698,7 +698,15 @@ impl DfsClient {
     /// Write data to cluster with optimized dual-stream parallelization
     /// For RF=3+: Split data in half, send to 2 servers simultaneously (local write only)
     /// Each server writes locally only, healing creates 3rd replica in background
+    ///
+    /// Optionally populates byte-range cache if inode and file_offset are provided
     pub async fn write_data(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
+        self.write_data_with_cache(data, 0, 0).await
+    }
+
+    /// Write data and populate byte-range cache for immediate read-back
+    /// This enables zero-latency reads of just-written data (DVR use case)
+    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<(Vec<ChunkId>, Vec<u64>)> {
         const MIN_PARALLEL_SIZE: usize = 128 * 1024; // 128KB minimum (lowered for better perf)
 
         // For small writes, use single server (less overhead)
@@ -743,6 +751,33 @@ impl DfsClient {
 
         info!("Completed optimized dual-stream write: {} total chunks (2 copies, healing creates 3rd)",
               all_chunk_ids.len());
+
+        // Populate byte-range cache with written data for immediate read-back
+        if inode > 0 && file_offset > 0 {
+            let mut byte_cache = self.byte_range_cache.lock().await;
+            let mut current_offset = file_offset;
+
+            // Cache each chunk by its file offset
+            for (idx, &chunk_size) in all_chunk_sizes.iter().enumerate() {
+                // Reconstruct chunk data from original write
+                let chunk_start = if idx == 0 { 0 } else { all_chunk_sizes[..idx].iter().sum::<u64>() as usize };
+                let chunk_end = chunk_start + chunk_size as usize;
+                let chunk_data = data[chunk_start..chunk_end].to_vec();
+
+                let key = ByteRangeCacheKey {
+                    inode,
+                    file_offset: current_offset,
+                };
+                let cached = CachedChunk {
+                    data: Arc::new(chunk_data),
+                    chunk_size: chunk_size as usize,
+                };
+                byte_cache.put(key, cached);
+                info!("Write-through cached: inode={} offset={} ({} bytes)", inode, current_offset, chunk_size);
+
+                current_offset += chunk_size;
+            }
+        }
 
         Ok((all_chunk_ids, all_chunk_sizes))
     }

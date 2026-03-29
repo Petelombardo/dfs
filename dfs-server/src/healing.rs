@@ -39,6 +39,9 @@ pub struct HealingManager {
     /// Auto-healing enabled
     auto_heal: bool,
 
+    /// Maximum number of chunks to heal per check cycle
+    max_heal_per_cycle: usize,
+
     /// Chunks pending healing (chunk_id -> failure_detected_at)
     pending_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
 }
@@ -55,6 +58,10 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
     ) -> Self {
+        // Default to healing 100 chunks per cycle to prevent resource exhaustion
+        // Can be adjusted based on cluster size and performance requirements
+        let max_heal_per_cycle = 100;
+
         Self {
             storage,
             metadata,
@@ -64,6 +71,7 @@ impl HealingManager {
             healing_delay_secs,
             scrub_interval_hours,
             auto_heal,
+            max_heal_per_cycle,
             pending_healing: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -76,8 +84,8 @@ impl HealingManager {
         }
 
         info!(
-            "Starting healing manager (delay: {}s, scrub: {}h)",
-            self.healing_delay_secs, self.scrub_interval_hours
+            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {})",
+            self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle
         );
 
         // Start healing checker (runs every minute)
@@ -178,8 +186,15 @@ impl HealingManager {
 
         let mut healed_count = 0;
         let mut pending_count = 0;
+        let mut skipped_count = 0;
 
         for chunk_id in local_chunks {
+            // Enforce healing window: stop if we've healed enough chunks this cycle
+            if healed_count >= self.max_heal_per_cycle {
+                skipped_count += 1;
+                continue;
+            }
+
             match self.check_chunk_replication(&chunk_id).await {
                 Ok(status) => match status {
                     ReplicationStatus::UnderReplicated => {
@@ -210,10 +225,10 @@ impl HealingManager {
             }
         }
 
-        if healed_count > 0 || pending_count > 0 {
+        if healed_count > 0 || pending_count > 0 || skipped_count > 0 {
             info!(
-                "Healing check complete: healed={}, pending={}",
-                healed_count, pending_count
+                "Healing check complete: healed={}, pending={}, deferred={}",
+                healed_count, pending_count, skipped_count
             );
         }
 

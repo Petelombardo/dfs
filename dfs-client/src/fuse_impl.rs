@@ -355,6 +355,8 @@ impl Filesystem for DfsFilesystem {
         // Clone Arc-wrapped fields for async task
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
+        let write_buffers = self.write_buffers.clone();
+        let write_buffer_enabled = self.write_buffer_enabled;
 
         // Spawn async read operation on tokio runtime
         self.runtime.spawn(async move {
@@ -379,6 +381,31 @@ impl Filesystem for DfsFilesystem {
 
             let offset = offset as usize;
             let size = size as usize;
+
+            // Check write buffer first if write-behind buffering is enabled
+            // This enables "live rewind" - reading while writing without waiting for backend
+            if write_buffer_enabled {
+                let write_buffers_lock = write_buffers.lock().await;
+                if let Some(buffer) = write_buffers_lock.get(&ino) {
+                    let buffer_size = buffer.data.len();
+
+                    // Check if read is entirely within the write buffer
+                    if offset < buffer_size {
+                        let end_offset = std::cmp::min(offset + size, buffer_size);
+                        let data = buffer.data[offset..end_offset].to_vec();
+
+                        info!("FUSE read from write buffer: ino={}, offset={}, size={}, buffer_hit={} bytes",
+                              ino, offset, size, data.len());
+
+                        let elapsed = start.elapsed();
+                        info!("FUSE read COMPLETE (write buffer): ino={}, offset={}, size={}, took {:?}",
+                              ino, offset, size, elapsed);
+
+                        reply.data(&data);
+                        return;
+                    }
+                }
+            }
 
             // Early return for out of bounds
             if offset >= metadata.size as usize {

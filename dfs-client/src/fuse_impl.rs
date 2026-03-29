@@ -169,11 +169,11 @@ impl DfsFilesystem {
         let has_active_write = has_buffer || has_counter;
 
         if has_active_write {
-            info!("SKIPPING metadata update for ino={}: has_buffer={}, has_counter={}, cached_size={}, server_size={}",
+            debug!("SKIPPING metadata update for ino={}: has_buffer={}, has_counter={}, cached_size={}, server_size={}",
                   ino, has_buffer, has_counter, current_size, metadata.size);
             false
         } else {
-            info!("UPDATING metadata for ino={}: cached_size={}, server_size={}",
+            debug!("UPDATING metadata for ino={}: cached_size={}, server_size={}",
                   ino, current_size, metadata.size);
             self.metadata_cache.write().unwrap().insert(ino, metadata);
             true

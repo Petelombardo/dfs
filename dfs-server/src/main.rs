@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use dfs_common::Config;
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Level};
 use tracing_subscriber;
 
 #[derive(Parser)]
@@ -43,6 +43,10 @@ enum Commands {
         /// Configuration file path
         #[arg(long, default_value = "/etc/dfs/config.toml")]
         config: PathBuf,
+
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
     },
 
     /// Show server status and statistics
@@ -55,9 +59,6 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
 
     match cli.command {
@@ -66,12 +67,41 @@ async fn main() -> Result<()> {
             meta_dir,
             config,
         } => {
+            // Initialize basic logging for init
+            tracing_subscriber::fmt()
+                .with_max_level(Level::INFO)
+                .with_target(false)
+                .init();
             init_node(data_dir, meta_dir, config)?;
         }
-        Commands::Start { config } => {
+        Commands::Start { config, log_level } => {
+            // Initialize tracing with specified log level
+            let level = match log_level.to_lowercase().as_str() {
+                "trace" => Level::TRACE,
+                "debug" => Level::DEBUG,
+                "info" => Level::INFO,
+                "warn" => Level::WARN,
+                "error" => Level::ERROR,
+                _ => {
+                    eprintln!("Invalid log level '{}', using 'info'", log_level);
+                    Level::INFO
+                }
+            };
+
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_target(false)
+                .init();
+
+            info!("Starting DFS server with log level: {}", log_level);
             start_server(config).await?;
         }
         Commands::Status { config } => {
+            // Initialize basic logging for status
+            tracing_subscriber::fmt()
+                .with_max_level(Level::INFO)
+                .with_target(false)
+                .init();
             show_status(config)?;
         }
     }

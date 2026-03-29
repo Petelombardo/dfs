@@ -44,6 +44,10 @@ enum Commands {
         /// Log file path (default: stderr in foreground, /var/log/dfs-client.log in daemon mode)
         #[arg(long)]
         log_file: Option<PathBuf>,
+
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
     },
 
     /// Unmount the DFS filesystem
@@ -75,6 +79,10 @@ enum Commands {
         #[arg(long)]
         log_file: Option<PathBuf>,
 
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+
         /// Service name (default: dfs-client)
         #[arg(long, default_value = "dfs-client")]
         service_name: String,
@@ -99,9 +107,10 @@ fn main() -> Result<()> {
             write_buffer,
             allow_other,
             log_file,
+            log_level,
         } => {
             // Set up logging before anything else
-            setup_logging(foreground, log_file.as_deref())?;
+            setup_logging(foreground, log_file.as_deref(), &log_level)?;
             mount_filesystem(mountpoint, cluster, foreground, write_buffer, allow_other)?;
         }
         Commands::Unmount { mountpoint } => {
@@ -120,6 +129,7 @@ fn main() -> Result<()> {
             write_buffer,
             allow_other,
             log_file,
+            log_level,
             service_name,
         } => {
             // Initialize basic logging
@@ -128,7 +138,7 @@ fn main() -> Result<()> {
                 .with_target(false)
                 .init();
 
-            systemd_install(mountpoint, cluster, write_buffer, allow_other, log_file, &service_name)?;
+            systemd_install(mountpoint, cluster, write_buffer, allow_other, log_file, &log_level, &service_name)?;
         }
         Commands::SystemdUninstall { service_name } => {
             // Initialize basic logging
@@ -349,9 +359,22 @@ fn discover_cluster_nodes(seed_addrs: &[SocketAddr]) -> Result<Vec<SocketAddr>> 
 }
 
 /// Set up logging to file or console
-fn setup_logging(foreground: bool, log_file: Option<&std::path::Path>) -> Result<()> {
+fn setup_logging(foreground: bool, log_file: Option<&std::path::Path>, log_level: &str) -> Result<()> {
     use std::fs::OpenOptions;
     use tracing_subscriber::fmt::writer::MakeWriterExt;
+
+    // Parse log level
+    let level = match log_level.to_lowercase().as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "info" => Level::INFO,
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => {
+            eprintln!("Invalid log level '{}', using 'info'", log_level);
+            Level::INFO
+        }
+    };
 
     // Determine log file path
     let log_path = if let Some(path) = log_file {
@@ -361,7 +384,7 @@ fn setup_logging(foreground: bool, log_file: Option<&std::path::Path>) -> Result
     } else {
         // Foreground mode with no log file - use stderr
         tracing_subscriber::fmt()
-            .with_max_level(Level::INFO)
+            .with_max_level(level)
             .with_target(false)
             .init();
         return Ok(());
@@ -376,12 +399,12 @@ fn setup_logging(foreground: bool, log_file: Option<&std::path::Path>) -> Result
 
     // Set up file logging
     tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
+        .with_max_level(level)
         .with_target(false)
         .with_writer(file.and(std::io::stderr))
         .init();
 
-    info!("Logging to: {:?}", log_path);
+    info!("Logging to: {:?} at level: {}", log_path, log_level);
 
     Ok(())
 }
@@ -393,6 +416,7 @@ fn systemd_install(
     write_buffer: bool,
     allow_other: bool,
     log_file: Option<PathBuf>,
+    log_level: &str,
     service_name: &str,
 ) -> Result<()> {
     use std::fs;
@@ -433,6 +457,7 @@ fn systemd_install(
     }
 
     exec_start.push_str(&format!(" --log-file {}", log_arg));
+    exec_start.push_str(&format!(" --log-level {}", log_level));
 
     // Generate systemd service file
     let service_content = format!(

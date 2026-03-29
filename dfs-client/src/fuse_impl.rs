@@ -142,6 +142,44 @@ impl DfsFilesystem {
         self.runtime.block_on(future)
     }
 
+    /// Safely update metadata cache, checking if there's an active write in progress
+    /// Returns true if the metadata was updated, false if skipped due to active write
+    fn safe_metadata_update(&self, ino: u64, metadata: FileMetadata) -> bool {
+        // Check if there's an active write - either buffered or in-progress
+        let (has_buffer, has_counter, current_size) = self.runtime.block_on(async {
+            // Check for write buffer
+            let has_buf = if self.write_buffer_enabled {
+                let buffers = self.write_buffers.lock().await;
+                buffers.contains_key(&ino)
+            } else {
+                false
+            };
+
+            // Check write counter (indicates recent writes)
+            let counters = self.write_counters.read().unwrap();
+            let has_cnt = counters.contains_key(&ino);
+
+            // Get current cached size
+            let cache = self.metadata_cache.read().unwrap();
+            let cur_size = cache.get(&ino).map(|m| m.size).unwrap_or(0);
+
+            (has_buf, has_cnt, cur_size)
+        });
+
+        let has_active_write = has_buffer || has_counter;
+
+        if has_active_write {
+            info!("SKIPPING metadata update for ino={}: has_buffer={}, has_counter={}, cached_size={}, server_size={}",
+                  ino, has_buffer, has_counter, current_size, metadata.size);
+            false
+        } else {
+            info!("UPDATING metadata for ino={}: cached_size={}, server_size={}",
+                  ino, current_size, metadata.size);
+            self.metadata_cache.write().unwrap().insert(ino, metadata);
+            true
+        }
+    }
+
     /// Flush buffered writes for a specific inode to the cluster
     async fn flush_buffer_async(&self, ino: u64) -> Result<()> {
         // Get and remove buffer for this inode
@@ -296,7 +334,7 @@ impl Filesystem for DfsFilesystem {
             Ok(Some(metadata)) => {
                 // Metadata was modified or first fetch - update cache
                 let ino = self.get_or_create_inode(&path);
-                self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
+                self.safe_metadata_update(ino, metadata.clone());
 
                 let attr = self.metadata_to_attr(ino, &metadata);
                 reply.entry(&Duration::from_secs(3600), &attr, 0);
@@ -586,28 +624,9 @@ impl Filesystem for DfsFilesystem {
                     // Get or allocate inode
                     let entry_ino = self.get_or_create_inode(&entry.path);
 
-                    // Cache metadata, but DON'T overwrite if there's an active write buffer
-                    // (the buffer has more up-to-date size information than the server)
-                    if self.write_buffer_enabled {
-                        let has_buffer = self.runtime.block_on(async {
-                            let buffers = self.write_buffers.lock().await;
-                            buffers.contains_key(&entry_ino)
-                        });
-
-                        if !has_buffer {
-                            self.metadata_cache
-                                .write()
-                                .unwrap()
-                                .insert(entry_ino, entry.clone());
-                        } else {
-                            debug!("Skipping metadata update for ino={} (has active write buffer)", entry_ino);
-                        }
-                    } else {
-                        self.metadata_cache
-                            .write()
-                            .unwrap()
-                            .insert(entry_ino, entry.clone());
-                    }
+                    // Cache metadata, but DON'T overwrite if there's an active write
+                    // Use safe_metadata_update to check both buffers and write counters
+                    self.safe_metadata_update(entry_ino, entry.clone());
 
                     let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
                     if reply.add(entry_ino, next_offset, kind, file_name) {
@@ -784,6 +803,13 @@ impl Filesystem for DfsFilesystem {
                                 .unwrap()
                                 .as_secs();
                             metadata_cache.write().unwrap().insert(ino, metadata);
+
+                            // Update write counter to protect metadata from stale server fetches
+                            {
+                                let mut counters = write_counters.write().unwrap();
+                                let c = counters.entry(ino).or_insert(0);
+                                *c += 1;
+                            }
 
                             // Flush if buffer is too large (BLOCKING to avoid gaps)
                             if flush_now {

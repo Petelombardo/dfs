@@ -441,8 +441,14 @@ impl Filesystem for DfsFilesystem {
             // Get the file chunk index of the first chunk we're reading (for prefetch tracking)
             let start_chunk_idx = chunks_to_read.first().map(|(idx, _, _)| *idx).unwrap_or(0);
 
+            // Build chunk file offsets for byte-range caching
+            let chunk_file_offsets: Vec<u64> = chunks_to_read
+                .iter()
+                .map(|(_, chunk_start, _)| *chunk_start as u64)
+                .collect();
+
             let all_chunks = metadata.chunks.clone();
-            let result = client.read_data(&chunk_ids, &all_chunks, start_chunk_idx).await;
+            let result = client.read_data(&chunk_ids, &all_chunks, start_chunk_idx, ino, &chunk_file_offsets).await;
 
             let all_data = match result {
                 Ok(data) => data,
@@ -830,7 +836,8 @@ impl Filesystem for DfsFilesystem {
                         let chunk_ids = metadata.chunks.clone();
                         match runtime.block_on(async {
                             // Reading entire file, so start_chunk_idx=0
-                            client.read_data(&chunk_ids, &chunk_ids, 0).await
+                            // No byte-range caching for read-modify-write (inode=0)
+                            client.read_data(&chunk_ids, &chunk_ids, 0, 0, &[]).await
                         }) {
                             Ok(data) => data,
                             Err(e) => {
@@ -1343,43 +1350,54 @@ impl Filesystem for DfsFilesystem {
             if new_size != metadata.size {
                 let client = self.client.clone();
 
-                // Read existing data
-                let existing_data = if !metadata.chunks.is_empty() {
-                    let chunk_ids = metadata.chunks.clone();
-                    match self.block_on(async {
-                        // Reading entire file for truncate, start_chunk_idx=0
-                        client.read_data(&chunk_ids, &chunk_ids, 0).await
-                    }) {
-                        Ok(data) => data,
+                // Optimization: truncate to zero doesn't need to read old data
+                // This fixes overwrite scenarios (dd, DVR recording restart) where old chunks
+                // may be unavailable due to garbage collection or incomplete replication
+                if new_size == 0 {
+                    // Just clear the metadata - no need to read old chunks
+                    metadata.chunks = Vec::new();
+                    metadata.chunk_sizes = Vec::new();
+                    metadata.size = 0;
+                } else {
+                    // Read existing data for partial truncate
+                    let existing_data = if !metadata.chunks.is_empty() {
+                        let chunk_ids = metadata.chunks.clone();
+                        match self.block_on(async {
+                            // Reading entire file for truncate, start_chunk_idx=0
+                            // No byte-range caching for truncate (inode=0)
+                            client.read_data(&chunk_ids, &chunk_ids, 0, 0, &[]).await
+                        }) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                error!("Failed to read existing data for truncate: {}", e);
+                                reply.error(libc::EIO);
+                                return;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Resize data
+                    let mut new_data = existing_data;
+                    new_data.resize(new_size as usize, 0);
+
+                    // Write back
+                    let result = self.block_on(async {
+                        client.write_data(&new_data).await
+                    });
+
+                    match result {
+                        Ok((chunk_ids, chunk_sizes)) => {
+                            metadata.chunks = chunk_ids;
+                            metadata.chunk_sizes = chunk_sizes;
+                            metadata.size = new_size;
+                        }
                         Err(e) => {
-                            error!("Failed to read existing data for truncate: {}", e);
+                            error!("Failed to write truncated data: {}", e);
                             reply.error(libc::EIO);
                             return;
                         }
-                    }
-                } else {
-                    Vec::new()
-                };
-
-                // Resize data
-                let mut new_data = existing_data;
-                new_data.resize(new_size as usize, 0);
-
-                // Write back
-                let result = self.block_on(async {
-                    client.write_data(&new_data).await
-                });
-
-                match result {
-                    Ok((chunk_ids, chunk_sizes)) => {
-                        metadata.chunks = chunk_ids;
-                        metadata.chunk_sizes = chunk_sizes;
-                        metadata.size = new_size;
-                    }
-                    Err(e) => {
-                        error!("Failed to write truncated data: {}", e);
-                        reply.error(libc::EIO);
-                        return;
                     }
                 }
             }

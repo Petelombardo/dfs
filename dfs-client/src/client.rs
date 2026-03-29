@@ -12,6 +12,20 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+/// Cache key for byte-range caching: (inode, file_byte_offset)
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+struct ByteRangeCacheKey {
+    inode: u64,
+    file_offset: u64,
+}
+
+/// Cached chunk data with metadata
+#[derive(Debug, Clone)]
+struct CachedChunk {
+    data: Arc<Vec<u8>>,
+    chunk_size: usize,
+}
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Client for communicating with DFS cluster
@@ -26,6 +40,11 @@ pub struct DfsClient {
     /// LRU cache for chunks (ChunkId -> data)
     /// Cache up to 256 chunks (~1GB at 4MB/chunk)
     chunk_cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
+
+    /// Byte-range cache for recently-accessed chunks (inode, offset) -> chunk data
+    /// This solves the problem of content-addressed chunks changing during live DVR recording
+    /// Even if chunk hashes change, we can still cache by file position
+    byte_range_cache: Arc<Mutex<LruCache<ByteRangeCacheKey, CachedChunk>>>,
 
     /// TCP connection pool - maintains one persistent connection per server
     connection_pool: Arc<Mutex<HashMap<SocketAddr, TcpStream>>>,
@@ -65,10 +84,14 @@ impl DfsClient {
 
         let cache = LruCache::new(cache_capacity);
 
+        // Byte-range cache uses same capacity as chunk cache
+        let byte_range_cache = LruCache::new(cache_capacity);
+
         Ok(Self {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes)),
             current_node: Arc::new(RwLock::new(0)),
             chunk_cache: Arc::new(Mutex::new(cache)),
+            byte_range_cache: Arc::new(Mutex::new(byte_range_cache)),
             connection_pool: Arc::new(Mutex::new(HashMap::new())),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(Mutex::new(HashMap::new())),
@@ -214,24 +237,80 @@ impl DfsClient {
     /// Read data from cluster by chunk IDs - parallelized with caching
     /// all_file_chunks: Complete list of chunk IDs for the file (for prefetch - can be same as chunk_ids)
     /// start_chunk_idx: Index in all_file_chunks where chunk_ids[0] is located
-    pub async fn read_data(&self, chunk_ids: &[ChunkId], all_file_chunks: &[ChunkId], start_chunk_idx: usize) -> Result<Vec<u8>> {
+    /// inode: File inode for byte-range caching (optional, 0 to disable)
+    /// chunk_offsets: File byte offset for each chunk in chunk_ids (for byte-range caching)
+    pub async fn read_data(
+        &self,
+        chunk_ids: &[ChunkId],
+        all_file_chunks: &[ChunkId],
+        start_chunk_idx: usize,
+        inode: u64,
+        chunk_offsets: &[u64],
+    ) -> Result<Vec<u8>> {
         if chunk_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let start = std::time::Instant::now();
 
-        // Check cache first and identify missing chunks
+        // Check byte-range cache first (for live DVR files), then chunk cache
         let mut cached_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
-        let mut chunks_to_fetch: Vec<(usize, ChunkId)> = Vec::new();
+        let mut chunks_to_fetch: Vec<(usize, ChunkId, u64)> = Vec::new(); // (idx, chunk_id, file_offset)
 
         {
-            let mut cache = self.chunk_cache.lock().await;
+            let mut byte_cache = self.byte_range_cache.lock().await;
+            let mut chunk_cache = self.chunk_cache.lock().await;
+
             for (idx, chunk_id) in chunk_ids.iter().enumerate() {
-                if let Some(data) = cache.get(chunk_id) {
-                    cached_chunks.push((idx, Arc::clone(data)));
-                } else {
-                    chunks_to_fetch.push((idx, *chunk_id));
+                let mut found = false;
+
+                // Try byte-range cache first if we have inode + offset
+                // We need to check if this chunk's offset range overlaps with any cached chunk
+                if inode > 0 && idx < chunk_offsets.len() {
+                    let requested_offset = chunk_offsets[idx];
+
+                    // Iterate through all cached chunks for this inode to find range overlap
+                    // LRU cache doesn't support range queries, so we need to check all keys
+                    let mut matching_cached_chunk: Option<(ByteRangeCacheKey, Arc<Vec<u8>>)> = None;
+
+                    // Peek at cache entries without modifying LRU order yet
+                    for (key, cached) in byte_cache.iter() {
+                        if key.inode == inode {
+                            let cached_start = key.file_offset;
+                            let cached_end = cached_start + cached.chunk_size as u64;
+
+                            // Check if requested offset falls within this cached chunk
+                            if requested_offset >= cached_start && requested_offset < cached_end {
+                                matching_cached_chunk = Some((*key, Arc::clone(&cached.data)));
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some((key, data)) = matching_cached_chunk {
+                        // Now actually get it to update LRU order
+                        byte_cache.get(&key);
+                        info!("Byte-range cache HIT for inode={} offset={} (found in cached chunk at offset={})",
+                              inode, requested_offset, key.file_offset);
+                        cached_chunks.push((idx, data));
+                        found = true;
+                    }
+                }
+
+                // Fall back to chunk ID cache
+                if !found {
+                    if let Some(data) = chunk_cache.get(chunk_id) {
+                        debug!("Chunk cache HIT for chunk {}", chunk_id);
+                        cached_chunks.push((idx, Arc::clone(data)));
+                        found = true;
+                    }
+                }
+
+                // Need to fetch
+                if !found {
+                    let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
+                    info!("Cache MISS for chunk {} (inode={}, offset={}) - will fetch", chunk_id, inode, file_offset);
+                    chunks_to_fetch.push((idx, *chunk_id, file_offset));
                 }
             }
         }
@@ -239,8 +318,8 @@ impl DfsClient {
         let cache_hits = cached_chunks.len();
         let cache_misses = chunks_to_fetch.len();
 
-        info!("Reading {} chunks: {} cached, {} to fetch",
-              chunk_ids.len(), cache_hits, cache_misses);
+        info!("Reading {} chunks: {} cached, {} to fetch (chunk_ids: {:?})",
+              chunk_ids.len(), cache_hits, cache_misses, chunk_ids);
 
         // Fetch missing chunks IN PARALLEL with intelligent replica selection
         // Different chunks can be fetched from different replica nodes simultaneously,
@@ -248,9 +327,10 @@ impl DfsClient {
         let nodes = self.cluster_nodes.read().await.clone();
 
         // Create parallel fetch tasks
-        let fetch_tasks: Vec<_> = chunks_to_fetch.iter().map(|(idx, chunk_id)| {
+        let fetch_tasks: Vec<_> = chunks_to_fetch.iter().map(|(idx, chunk_id, file_offset)| {
             let idx = *idx;
             let chunk_id = *chunk_id;
+            let file_offset = *file_offset;
             let client = self.clone();
             let nodes = nodes.clone();
 
@@ -302,24 +382,40 @@ impl DfsClient {
                     last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed for chunk"))
                 })?;
 
-                Ok::<_, anyhow::Error>((idx, chunk_id, Arc::new(chunk_data)))
+                Ok::<_, anyhow::Error>((idx, chunk_id, file_offset, Arc::new(chunk_data)))
             })
         }).collect();
 
         // Wait for all fetches to complete
         let fetch_results = futures::future::join_all(fetch_tasks).await;
 
-        // Process results and update cache
+        // Process results and update both caches
         let mut fetched_chunks = Vec::new();
         for result in fetch_results {
-            let (idx, chunk_id, data_arc) = result
+            let (idx, chunk_id, file_offset, data_arc) = result
                 .context("Fetch task panicked")?
                 .context("Failed to fetch chunk")?;
 
-            // Add to cache
+            // Add to both chunk cache and byte-range cache
             {
-                let mut cache = self.chunk_cache.lock().await;
-                cache.put(chunk_id, Arc::clone(&data_arc));
+                let mut chunk_cache = self.chunk_cache.lock().await;
+                chunk_cache.put(chunk_id, Arc::clone(&data_arc));
+                debug!("Cached chunk {} ({} bytes)", chunk_id, data_arc.len());
+            }
+
+            // Add to byte-range cache if we have inode
+            if inode > 0 && file_offset > 0 {
+                let mut byte_cache = self.byte_range_cache.lock().await;
+                let key = ByteRangeCacheKey {
+                    inode,
+                    file_offset,
+                };
+                let cached = CachedChunk {
+                    data: Arc::clone(&data_arc),
+                    chunk_size: data_arc.len(),
+                };
+                byte_cache.put(key, cached);
+                info!("Byte-range cached: inode={} offset={} ({} bytes)", inode, file_offset, data_arc.len());
             }
 
             fetched_chunks.push((idx, data_arc));
@@ -380,11 +476,15 @@ impl DfsClient {
 
             drop(history); // Release lock before spawning tasks
 
+            // Enable aggressive prefetching for sequential reads (DVR playback)
+            // With tiny variable-sized chunks (MPEG-TS packets), caching can't help much
+            // Prefetching is essential for smooth playback
             if is_sequential {
                 info!("Prefetch: detected sequential pattern at chunk {}, prefetching next 8 chunks",
                       last_file_chunk_idx);
 
-                // Prefetch next 8 chunks for aggressive sequential read-ahead
+                // Prefetch next 8 chunks (chunks are tiny ~2-4KB, so 8 chunks = ~32KB)
+                // Conservative to avoid exhausting file descriptors
                 for prefetch_offset in 1..=8 {
                     let prefetch_file_idx = last_file_chunk_idx + prefetch_offset;
 

@@ -937,10 +937,20 @@ impl Filesystem for DfsFilesystem {
                     // True random write - need full read-modify-write
                     let existing_data = if !metadata.chunks.is_empty() {
                         let chunk_ids = metadata.chunks.clone();
+                        let chunk_sizes = metadata.chunk_sizes.clone();
+
+                        // Build chunk offsets for byte-range caching
+                        let mut chunk_offsets = Vec::with_capacity(chunk_ids.len());
+                        let mut current_offset = 0u64;
+                        for &size in &chunk_sizes {
+                            chunk_offsets.push(current_offset);
+                            current_offset += size;
+                        }
+
                         match runtime.block_on(async {
                             // Reading entire file, so start_chunk_idx=0
-                            // No byte-range caching for read-modify-write (inode=0)
-                            client.read_data(&chunk_ids, &chunk_ids, 0, 0, &[]).await
+                            // Pass actual inode and offsets for proper byte-range caching
+                            client.read_data(&chunk_ids, &chunk_ids, 0, ino, &chunk_offsets).await
                         }) {
                             Ok(data) => data,
                             Err(e) => {
@@ -1471,10 +1481,20 @@ impl Filesystem for DfsFilesystem {
                     // Read existing data for partial truncate
                     let existing_data = if !metadata.chunks.is_empty() {
                         let chunk_ids = metadata.chunks.clone();
+                        let chunk_sizes = metadata.chunk_sizes.clone();
+
+                        // Build chunk offsets for byte-range caching
+                        let mut chunk_offsets = Vec::with_capacity(chunk_ids.len());
+                        let mut current_offset = 0u64;
+                        for &size in &chunk_sizes {
+                            chunk_offsets.push(current_offset);
+                            current_offset += size;
+                        }
+
                         match self.block_on(async {
                             // Reading entire file for truncate, start_chunk_idx=0
-                            // No byte-range caching for truncate (inode=0)
-                            client.read_data(&chunk_ids, &chunk_ids, 0, 0, &[]).await
+                            // Pass actual inode and offsets for proper byte-range caching
+                            client.read_data(&chunk_ids, &chunk_ids, 0, ino, &chunk_offsets).await
                         }) {
                             Ok(data) => data,
                             Err(e) => {

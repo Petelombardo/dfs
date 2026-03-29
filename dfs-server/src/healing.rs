@@ -429,6 +429,10 @@ impl HealingManager {
                     if let Err(e) = self.client.send_message(node.addr, Message::Request(request)).await {
                         warn!("Failed to replicate chunk location to node {}: {}", node.id, e);
                     }
+
+                    // Small delay to avoid overwhelming the system with connection creations
+                    // This prevents file descriptor exhaustion during mass healing
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                 }
             }
 

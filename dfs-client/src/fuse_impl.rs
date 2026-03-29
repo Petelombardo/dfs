@@ -765,14 +765,26 @@ impl Filesystem for DfsFilesystem {
 
                                 // Blocking flush
                                 let flush_result = runtime_clone.block_on(async {
-                                    // Get and remove buffer for this inode
-                                    let buffer_opt = {
+                                    // Clone the buffer data for flushing, but keep buffer for reads
+                                    // This prevents read gaps during the flush operation
+                                    let buffer_data: Option<(Vec<u8>, u64)> = {
                                         let mut buffers = write_buffers.lock().await;
-                                        buffers.remove(&ino)
+                                        if let Some(buffer) = buffers.get_mut(&ino) {
+                                            let data: Vec<u8> = buffer.data.clone();
+                                            let start: u64 = buffer.start_offset;
+                                            // Clear buffer for new writes, update start offset
+                                            let new_start = start + data.len() as u64;
+                                            buffer.data.clear();
+                                            buffer.start_offset = new_start;
+                                            buffer.last_modified = SystemTime::now();
+                                            Some((data, start))
+                                        } else {
+                                            None
+                                        }
                                     };
 
-                                    if let Some(buffer) = buffer_opt {
-                                        info!("Flushing {} bytes for inode {}", buffer.data.len(), ino);
+                                    if let Some((data, buffer_start_offset)) = buffer_data {
+                                        info!("Flushing {} bytes for inode {}", data.len(), ino);
 
                                         // Get current metadata from cache
                                         let mut flush_metadata = {
@@ -786,10 +798,8 @@ impl Filesystem for DfsFilesystem {
                                         };
 
                                         // Write buffered data as new chunks with caching
-                                        // Use the buffer's recorded start offset
-                                        let buffer_start_offset = buffer.start_offset;
                                         let (new_chunk_ids, new_chunk_sizes) = client_clone
-                                            .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
+                                            .write_data_with_cache(&data, ino, buffer_start_offset)
                                             .await?;
 
                                         info!("Flush complete: {} chunks added at offset {}, total file size {}",

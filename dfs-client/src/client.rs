@@ -480,12 +480,24 @@ impl DfsClient {
             // With tiny variable-sized chunks (MPEG-TS packets), caching can't help much
             // Prefetching is essential for smooth playback
             if is_sequential {
-                info!("Prefetch: detected sequential pattern at chunk {}, prefetching next 8 chunks",
-                      last_file_chunk_idx);
+                // Adaptive prefetch distance based on chunk count
+                // More chunks = smaller chunk sizes = need more prefetch
+                // Target: ~256KB of prefetch buffer
+                let prefetch_distance = if all_file_chunks.len() > 500 {
+                    // Many tiny chunks (MPEG-TS): prefetch 64 chunks (~192KB)
+                    64
+                } else if all_file_chunks.len() > 100 {
+                    // Medium chunks: prefetch 32 chunks
+                    32
+                } else {
+                    // Large chunks: prefetch 16 chunks
+                    16
+                };
 
-                // Prefetch next 8 chunks (chunks are tiny ~2-4KB, so 8 chunks = ~32KB)
-                // Conservative to avoid exhausting file descriptors
-                for prefetch_offset in 1..=8 {
+                info!("Prefetch: detected sequential pattern at chunk {}/{}, prefetching next {} chunks",
+                      last_file_chunk_idx, all_file_chunks.len(), prefetch_distance);
+
+                for prefetch_offset in 1..=prefetch_distance {
                     let prefetch_file_idx = last_file_chunk_idx + prefetch_offset;
 
                     // Check if this chunk exists in the file

@@ -102,6 +102,11 @@ pub enum Request {
         path: String,
     },
 
+    /// Replicate chunk location to this node (internal cluster operation)
+    ReplicateChunkLocation {
+        location: ChunkLocation,
+    },
+
     // Admin requests
     /// Get cluster status
     GetClusterStatus,

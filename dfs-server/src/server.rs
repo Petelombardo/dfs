@@ -91,6 +91,9 @@ impl Server {
             Request::DeleteMetadata { file_id, path } => {
                 self.handle_delete_metadata(file_id, path).await
             }
+            Request::ReplicateChunkLocation { location } => {
+                self.handle_replicate_chunk_location(location).await
+            }
             Request::GetFileMetadataByPath { path, if_modified_since } => {
                 self.handle_get_file_metadata_by_path(path, if_modified_since).await
             }
@@ -235,6 +238,26 @@ impl Server {
                 warn!("Failed to delete metadata: {}", e);
                 Response::Error {
                     message: format!("Failed to delete metadata: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle replicate chunk location (internal cluster operation)
+    async fn handle_replicate_chunk_location(&self, location: ChunkLocation) -> Response {
+        debug!("Handling replicate chunk location: {}", location.chunk_id);
+
+        // Update chunk location locally without re-replicating (to avoid loops)
+        match self.metadata.put_chunk_location(&location) {
+            Ok(_) => {
+                debug!("Successfully replicated chunk location for {}", location.chunk_id);
+                Response::Ok { data: None }
+            }
+            Err(e) => {
+                warn!("Failed to replicate chunk location: {}", e);
+                Response::Error {
+                    message: format!("Failed to replicate chunk location: {}", e),
                     code: ErrorCode::InternalError,
                 }
             }

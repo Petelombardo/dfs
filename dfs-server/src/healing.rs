@@ -409,6 +409,27 @@ impl HealingManager {
 
             if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
                 warn!("Failed to update chunk location metadata: {}", e);
+            } else {
+                // Replicate updated chunk location to all nodes
+                info!("Replicating updated chunk location metadata for {} to all nodes", chunk_id);
+
+                let nodes = self.cluster.get_all_nodes().await;
+                let local_id = self.cluster.local_node_id();
+
+                for node in nodes {
+                    // Skip self and offline nodes
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+
+                    let request = Request::ReplicateChunkLocation {
+                        location: updated_location.clone(),
+                    };
+
+                    if let Err(e) = self.client.send_message(node.addr, Message::Request(request)).await {
+                        warn!("Failed to replicate chunk location to node {}: {}", node.id, e);
+                    }
+                }
             }
 
             // Remove from pending

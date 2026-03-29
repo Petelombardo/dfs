@@ -21,6 +21,8 @@ struct WriteBuffer {
     data: Vec<u8>,
     /// When this buffer was last modified
     last_modified: SystemTime,
+    /// File offset where this buffer starts
+    start_offset: u64,
 }
 
 /// FUSE filesystem implementation for DFS
@@ -165,11 +167,16 @@ impl DfsFilesystem {
             };
 
             // Write buffered data as new chunks (appending)
-            // Use optimized write path for dual-stream parallelization
-            let (new_chunk_ids, new_chunk_sizes) = self.client.write_data(&buffer.data).await?;
+            // Use the buffer's recorded start offset
+            let buffer_start_offset = buffer.start_offset;
 
-            info!("Flush complete: {} chunks added, total file size {}",
-                  new_chunk_ids.len(), metadata.size);
+            // Use write-through caching to populate byte-range cache for immediate read-back
+            let (new_chunk_ids, new_chunk_sizes) = self.client
+                .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
+                .await?;
+
+            info!("Flush complete: {} chunks added at offset {}, total file size {}",
+                  new_chunk_ids.len(), buffer_start_offset, metadata.size);
 
             // Append new chunks to existing chunks
             // Size was already updated during buffered writes, don't update again
@@ -387,15 +394,17 @@ impl Filesystem for DfsFilesystem {
             if write_buffer_enabled {
                 let write_buffers_lock = write_buffers.lock().await;
                 if let Some(buffer) = write_buffers_lock.get(&ino) {
-                    let buffer_size = buffer.data.len();
+                    let buffer_start = buffer.start_offset as usize;
+                    let buffer_end = buffer_start + buffer.data.len();
 
-                    // Check if read is entirely within the write buffer
-                    if offset < buffer_size {
-                        let end_offset = std::cmp::min(offset + size, buffer_size);
-                        let data = buffer.data[offset..end_offset].to_vec();
+                    // Check if read is entirely within the write buffer range
+                    if offset >= buffer_start && offset < buffer_end {
+                        let buffer_relative_offset = offset - buffer_start;
+                        let end_offset = std::cmp::min(buffer_relative_offset + size, buffer.data.len());
+                        let data = buffer.data[buffer_relative_offset..end_offset].to_vec();
 
-                        info!("FUSE read from write buffer: ino={}, offset={}, size={}, buffer_hit={} bytes",
-                              ino, offset, size, data.len());
+                        info!("FUSE read from write buffer: ino={}, offset={}, size={}, buffer_hit={} bytes, buffer_range=[{}, {})",
+                              ino, offset, size, data.len(), buffer_start, buffer_end);
 
                         let elapsed = start.elapsed();
                         info!("FUSE read COMPLETE (write buffer): ino={}, offset={}, size={}, took {:?}",
@@ -729,6 +738,7 @@ impl Filesystem for DfsFilesystem {
                         let buffer = buffers.entry(ino).or_insert_with(|| WriteBuffer {
                             data: Vec::new(),
                             last_modified: SystemTime::now(),
+                            start_offset: current_size as u64,
                         });
 
                         // Append data to buffer
@@ -749,11 +759,11 @@ impl Filesystem for DfsFilesystem {
                                 .as_secs();
                             metadata_cache.write().unwrap().insert(ino, metadata);
 
-                            // Flush if buffer is too large
+                            // Flush if buffer is too large (BLOCKING to avoid gaps)
                             if flush_now {
                                 debug!("Buffer threshold reached, flushing inode {}", ino);
 
-                                // Inline flush_buffer_async logic to avoid self reference
+                                // Blocking flush
                                 let flush_result = runtime_clone.block_on(async {
                                     // Get and remove buffer for this inode
                                     let buffer_opt = {
@@ -775,11 +785,15 @@ impl Filesystem for DfsFilesystem {
                                             }
                                         };
 
-                                        // Write buffered data as new chunks
-                                        let (new_chunk_ids, new_chunk_sizes) = client_clone.write_data(&buffer.data).await?;
+                                        // Write buffered data as new chunks with caching
+                                        // Use the buffer's recorded start offset
+                                        let buffer_start_offset = buffer.start_offset;
+                                        let (new_chunk_ids, new_chunk_sizes) = client_clone
+                                            .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
+                                            .await?;
 
-                                        info!("Flush complete: {} chunks added, total file size {}",
-                                              new_chunk_ids.len(), flush_metadata.size);
+                                        info!("Flush complete: {} chunks added at offset {}, total file size {}",
+                                              new_chunk_ids.len(), buffer_start_offset, flush_metadata.size);
 
                                         // Append new chunks to existing chunks
                                         flush_metadata.chunks.extend(new_chunk_ids);
@@ -1018,11 +1032,15 @@ impl Filesystem for DfsFilesystem {
                             }
                         };
 
-                        // Write buffered data as new chunks
-                        let (new_chunk_ids, new_chunk_sizes) = client.write_data(&buffer.data).await?;
+                        // Write buffered data as new chunks with caching
+                        // Use the buffer's recorded start offset
+                        let buffer_start_offset = buffer.start_offset;
+                        let (new_chunk_ids, new_chunk_sizes) = client
+                            .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
+                            .await?;
 
-                        info!("Flush complete: {} chunks added, total file size {}",
-                              new_chunk_ids.len(), flush_metadata.size);
+                        info!("Flush complete: {} chunks added at offset {}, total file size {}",
+                              new_chunk_ids.len(), buffer_start_offset, flush_metadata.size);
 
                         // Append new chunks to existing chunks
                         flush_metadata.chunks.extend(new_chunk_ids);

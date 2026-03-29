@@ -88,6 +88,9 @@ impl Server {
             Request::ReplicateMetadata { metadata } => {
                 self.handle_replicate_metadata(metadata).await
             }
+            Request::DeleteMetadata { file_id, path } => {
+                self.handle_delete_metadata(file_id, path).await
+            }
             Request::GetFileMetadataByPath { path, if_modified_since } => {
                 self.handle_get_file_metadata_by_path(path, if_modified_since).await
             }
@@ -212,6 +215,26 @@ impl Server {
                 warn!("Failed to replicate metadata: {}", e);
                 Response::Error {
                     message: format!("Failed to replicate metadata: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle delete metadata replication (internal cluster operation)
+    async fn handle_delete_metadata(&self, file_id: FileId, path: String) -> Response {
+        debug!("Handling delete metadata: {}", path);
+
+        // Delete metadata locally without re-replicating (to avoid loops)
+        match self.metadata.delete_file(&file_id) {
+            Ok(_) => {
+                debug!("Successfully deleted metadata for {}", path);
+                Response::Ok { data: None }
+            }
+            Err(e) => {
+                warn!("Failed to delete metadata: {}", e);
+                Response::Error {
+                    message: format!("Failed to delete metadata: {}", e),
                     code: ErrorCode::InternalError,
                 }
             }
@@ -760,13 +783,38 @@ impl Server {
                 // Delete the file metadata
                 match self.metadata.delete_file(&metadata.id) {
                     Ok(_) => {
-                        // Delete chunks from all nodes asynchronously
+                        // Replicate metadata deletion to all other nodes asynchronously
                         let cluster = self.cluster.clone();
                         let client = self.client.clone();
                         let storage = self.storage.clone();
                         let metadata_store = self.metadata.clone();
+                        let file_id = metadata.id;
+                        let path_clone = path.clone();
 
                         tokio::spawn(async move {
+                            // First, replicate the metadata deletion to all nodes
+                            let nodes = cluster.get_all_nodes().await;
+                            let local_id = cluster.local_node_id();
+
+                            info!("Replicating metadata deletion for file: {}", path_clone);
+
+                            for node in &nodes {
+                                // Skip self and offline nodes
+                                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                    continue;
+                                }
+
+                                let request = Request::DeleteMetadata {
+                                    file_id,
+                                    path: path_clone.clone(),
+                                };
+
+                                if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
+                                    warn!("Failed to replicate metadata deletion to node {}: {}", node.id, e);
+                                }
+                            }
+
+                            // Then delete chunks from all nodes asynchronously
                             info!("Deleting {} chunks for file: {}", chunk_ids.len(), path);
 
                             for chunk_id in &chunk_ids {

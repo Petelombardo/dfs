@@ -96,6 +96,12 @@ pub enum Request {
         metadata: FileMetadata,
     },
 
+    /// Delete metadata from this node (internal cluster operation)
+    DeleteMetadata {
+        file_id: FileId,
+        path: String,
+    },
+
     // Admin requests
     /// Get cluster status
     GetClusterStatus,

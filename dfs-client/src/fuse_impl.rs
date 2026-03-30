@@ -240,6 +240,11 @@ impl DfsFilesystem {
 
     /// Convert FileMetadata to FUSE FileAttr
     fn metadata_to_attr(&self, ino: u64, metadata: &FileMetadata) -> FileAttr {
+        Self::metadata_to_attr_static(ino, metadata)
+    }
+
+    /// Convert FileMetadata to FUSE FileAttr (static version for async contexts)
+    fn metadata_to_attr_static(ino: u64, metadata: &FileMetadata) -> FileAttr {
         let kind = match metadata.file_type {
             FileType::RegularFile => FuseFileType::RegularFile,
             FileType::Directory => FuseFileType::Directory,
@@ -378,15 +383,39 @@ impl Filesystem for DfsFilesystem {
     fn getattr(&mut self, _req: &FuseRequest, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         debug!("getattr: ino={}", ino);
 
-        let cache = self.metadata_cache.read().unwrap();
-        if let Some(metadata) = cache.get(&ino) {
-            let attr = self.metadata_to_attr(ino, metadata);
-            // 5 minute TTL for kernel page caching
-            // Balances performance vs. freshness for multi-client scenarios
-            reply.attr(&Duration::from_secs(300), &attr);
-        } else {
-            reply.error(libc::ENOENT);
-        }
+        // Clone what we need for async operation
+        let client = self.client.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let runtime = self.runtime.clone();
+
+        // Spawn async task to potentially refresh metadata
+        runtime.spawn(async move {
+            let metadata = {
+                let cache = metadata_cache.read().unwrap();
+                cache.get(&ino).cloned()
+            };
+
+            if let Some(mut metadata) = metadata {
+                // For regular files, try to refresh metadata if it might be stale
+                // This allows players to see files growing in real-time
+                if metadata.file_type == FileType::RegularFile {
+                    // Try to get fresh metadata from server
+                    if let Ok(Some(fresh)) = client.get_file_metadata(&metadata.path).await {
+                        if fresh.size != metadata.size {
+                            debug!("getattr: file grew from {} to {} bytes", metadata.size, fresh.size);
+                            metadata_cache.write().unwrap().insert(ino, fresh.clone());
+                            metadata = fresh;
+                        }
+                    }
+                }
+
+                let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
+                // Use very short TTL (1 second) so kernel asks us frequently for growing files
+                reply.attr(&Duration::from_secs(1), &attr);
+            } else {
+                reply.error(libc::ENOENT);
+            }
+        });
     }
 
     fn read(
@@ -411,7 +440,7 @@ impl Filesystem for DfsFilesystem {
             let start = std::time::Instant::now();
             info!("FUSE read START: ino={}, offset={}, size={}", ino, offset, size);
 
-            let metadata = {
+            let mut metadata = {
                 let cache = metadata_cache.read().unwrap();
                 match cache.get(&ino) {
                     Some(m) => m.clone(),
@@ -458,9 +487,41 @@ impl Filesystem for DfsFilesystem {
             }
 
             // Early return for out of bounds
+            // But first, check if file might have grown by refreshing metadata
             if offset >= metadata.size as usize {
-                reply.data(&[]);
-                return;
+                // File might be actively growing (e.g., recording in progress)
+                // Refresh metadata from server to see if more data is available
+                info!("Read at offset {} >= cached size {}, refreshing metadata from server", offset, metadata.size);
+
+                match client.get_file_metadata(&metadata.path).await {
+                    Ok(Some(fresh_metadata)) => {
+                        // Update cache with fresh metadata
+                        metadata_cache.write().unwrap().insert(ino, fresh_metadata.clone());
+
+                        // If file has grown, continue with the read using fresh metadata
+                        if offset < fresh_metadata.size as usize {
+                            info!("File grew from {} to {} bytes, continuing read", metadata.size, fresh_metadata.size);
+                            metadata = fresh_metadata;
+                        } else {
+                            // Still at EOF even after refresh
+                            info!("Still at EOF after refresh: offset {} >= size {}", offset, fresh_metadata.size);
+                            reply.data(&[]);
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        // File was deleted
+                        info!("File not found when refreshing metadata");
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                    Err(e) => {
+                        // Couldn't refresh, assume EOF
+                        info!("Failed to refresh metadata: {}, assuming EOF", e);
+                        reply.data(&[]);
+                        return;
+                    }
+                }
             }
 
             if metadata.chunks.is_empty() {

@@ -61,7 +61,8 @@ pub struct DfsClient {
 
     /// Replica location cache: ChunkId -> Vec<SocketAddr>
     /// Caches which nodes have which chunks to avoid metadata queries on every read
-    /// Cache up to 10000 entries (at 40 bytes each = ~400KB)
+    /// Cache up to 128 entries (3x prefetch window of 32 = 256MB working set at 2MB/chunk)
+    /// Small cache = faster lookups, less memory, better CPU cache utilization
     replica_cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<SocketAddr>>>>>,
 }
 
@@ -92,8 +93,9 @@ impl DfsClient {
         // Byte-range cache uses same capacity as chunk cache
         let byte_range_cache = LruCache::new(cache_capacity);
 
-        // Replica location cache: 10000 entries
-        let replica_cache_capacity = NonZeroUsize::new(10000).unwrap();
+        // Replica location cache: 128 entries (3x prefetch window)
+        // Small cache for fast lookups and minimal lock contention
+        let replica_cache_capacity = NonZeroUsize::new(128).unwrap();
         let replica_cache = LruCache::new(replica_cache_capacity);
 
         Ok(Self {
@@ -645,27 +647,60 @@ impl DfsClient {
         Some(replicas[idx])
     }
 
-    /// Pre-populate replica cache with chunk locations
+    /// Pre-populate replica cache with chunk locations for upcoming reads
     /// This is called when reading file metadata to warm the cache for sequential reads
     /// For now, we use a simple heuristic: all nodes have all chunks (true for RF=2 with 5 nodes)
     /// In the future, this could query the metadata server for actual locations
-    pub async fn warm_replica_cache(&self, chunk_ids: &[ChunkId]) {
+    ///
+    /// Parameters:
+    /// - chunk_ids: All chunks in the file
+    /// - current_offset: Current read position in bytes (optional, for smart warming)
+    /// - chunk_size: Size of each chunk in bytes (for calculating chunk index from offset)
+    pub async fn warm_replica_cache_range(&self, chunk_ids: &[ChunkId], current_offset: Option<u64>, chunk_size: u64) {
         if chunk_ids.is_empty() {
             return;
         }
 
+        // Determine which chunks to warm
+        let (start_idx, end_idx) = if let Some(offset) = current_offset {
+            // Smart warming: only warm chunks ahead of current read position
+            // Warm next 64 chunks (128MB at 2MB/chunk = ~3 seconds at 40MB/s)
+            // This covers the 32-chunk prefetch window + 32 chunks buffer
+            let current_chunk_idx = (offset / chunk_size) as usize;
+            let start = current_chunk_idx.min(chunk_ids.len());
+            let end = (current_chunk_idx + 64).min(chunk_ids.len());
+            (start, end)
+        } else {
+            // No offset provided, warm first 64 chunks (for new file opens)
+            (0, 64.min(chunk_ids.len()))
+        };
+
+        if start_idx >= end_idx {
+            return;
+        }
+
+        let chunks_to_warm = &chunk_ids[start_idx..end_idx];
         let nodes = self.cluster_nodes.read().await.clone();
         let nodes_arc = Arc::new(nodes);
 
         let mut cache = self.replica_cache.lock().await;
-        for chunk_id in chunk_ids {
+        let mut warmed = 0;
+        for chunk_id in chunks_to_warm {
             // Only add if not already in cache
             if !cache.contains(chunk_id) {
                 cache.put(*chunk_id, Arc::clone(&nodes_arc));
+                warmed += 1;
             }
         }
 
-        debug!("Warmed replica cache with {} chunks", chunk_ids.len());
+        debug!("Warmed replica cache: {} new entries (range {}-{} of {} total chunks)",
+               warmed, start_idx, end_idx, chunk_ids.len());
+    }
+
+    /// Legacy wrapper for warming cache without offset info
+    pub async fn warm_replica_cache(&self, chunk_ids: &[ChunkId]) {
+        // Assume 2MB chunks for legacy calls
+        self.warm_replica_cache_range(chunk_ids, None, 2 * 1024 * 1024).await;
     }
 
     /// Read a single chunk from a specific server using connection pooling

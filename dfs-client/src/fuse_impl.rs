@@ -405,8 +405,8 @@ impl Filesystem for DfsFilesystem {
                             debug!("getattr: file grew from {} to {} bytes", metadata.size, fresh.size);
                             metadata_cache.write().unwrap().insert(ino, fresh.clone());
 
-                            // Warm replica cache with chunk locations for sequential reads
-                            client.warm_replica_cache(&fresh.chunks).await;
+                            // Don't warm replica cache here - getattr() is called frequently (every 1s)
+                            // and we don't know the read position. Let read() warm the cache when needed.
 
                             metadata = fresh;
                         }
@@ -503,7 +503,8 @@ impl Filesystem for DfsFilesystem {
                         metadata_cache.write().unwrap().insert(ino, fresh_metadata.clone());
 
                         // Warm replica cache with chunk locations for upcoming reads
-                        client.warm_replica_cache(&fresh_metadata.chunks).await;
+                        // Only warm chunks ahead of current read position (smart warming)
+                        client.warm_replica_cache_range(&fresh_metadata.chunks, Some(offset as u64), 2 * 1024 * 1024).await;
 
                         // If file has grown, continue with the read using fresh metadata
                         if offset < fresh_metadata.size as usize {

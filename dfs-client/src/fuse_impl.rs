@@ -61,6 +61,10 @@ pub struct DfsFilesystem {
     /// Directory listing cache: path -> (entries, timestamp)
     /// Cache directory listings for 5 seconds to avoid repeated scans
     dir_cache: Arc<RwLock<HashMap<String, (Vec<FileMetadata>, std::time::Instant)>>>,
+
+    /// Filesystem stats cache: (total, free, avail, timestamp)
+    /// Cache statfs results for 30 seconds to avoid repeated expensive queries
+    statfs_cache: Arc<RwLock<Option<(u64, u64, u64, std::time::Instant)>>>,
 }
 
 impl DfsFilesystem {
@@ -124,6 +128,7 @@ impl DfsFilesystem {
             write_buffers: Arc::new(Mutex::new(HashMap::new())),
             last_chunk_cache: Arc::new(RwLock::new(None)),
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
+            statfs_cache: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -732,11 +737,9 @@ impl Filesystem for DfsFilesystem {
             // Get or allocate inode
             let entry_ino = self.get_or_create_inode(&entry.path);
 
-            // For directory listings, always use fresh server data without lock contention
-            // safe_metadata_update() acquires write_buffers lock for EVERY file, causing
-            // massive contention during writes. Directory listing should be fast and non-blocking.
-            // The metadata comes directly from the server, so it's already authoritative.
-            self.metadata_cache.write().unwrap().insert(entry_ino, entry.clone());
+            // Cache metadata, but DON'T overwrite if there's an active write
+            // Use safe_metadata_update to check both buffers and write counters
+            self.safe_metadata_update(entry_ino, entry.clone());
 
             let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
             if reply.add(entry_ino, next_offset, kind, file_name) {
@@ -1743,26 +1746,52 @@ impl Filesystem for DfsFilesystem {
     fn statfs(&mut self, _req: &FuseRequest, _ino: u64, reply: ReplyStatfs) {
         debug!("statfs");
 
-        // Query actual storage stats from cluster
-        let client = self.client.clone();
-        let result = self.block_on(async {
-            client.get_storage_stats().await
-        });
-
         const BLOCK_SIZE: u32 = 4096;
+        const CACHE_TTL_SECS: u64 = 30; // Cache for 30 seconds
 
-        let (total_blocks, free_blocks, avail_blocks) = match result {
-            Ok((total_space, free_space, available_space, _replication_factor)) => {
-                // Convert bytes to blocks
-                let total = total_space / BLOCK_SIZE as u64;
-                let free = free_space / BLOCK_SIZE as u64;
-                let avail = available_space / BLOCK_SIZE as u64;
-                (total, free, avail)
-            }
-            Err(e) => {
-                error!("Failed to get storage stats: {}", e);
-                // Return reasonable defaults on error
-                (1_000_000_000, 500_000_000, 500_000_000)
+        // Check cache first
+        let cached = {
+            let cache = self.statfs_cache.read().unwrap();
+            cache.as_ref().and_then(|(total, free, avail, timestamp)| {
+                if timestamp.elapsed().as_secs() < CACHE_TTL_SECS {
+                    debug!("statfs cache HIT (age: {}s)", timestamp.elapsed().as_secs());
+                    Some((*total, *free, *avail))
+                } else {
+                    debug!("statfs cache EXPIRED");
+                    None
+                }
+            })
+        };
+
+        let (total_blocks, free_blocks, avail_blocks) = if let Some((total, free, avail)) = cached {
+            (total, free, avail)
+        } else {
+            // Cache miss - query cluster (this is SLOW!)
+            debug!("statfs cache MISS - querying cluster");
+            let client = self.client.clone();
+            let statfs_cache = self.statfs_cache.clone();
+
+            let result = self.block_on(async {
+                client.get_storage_stats().await
+            });
+
+            match result {
+                Ok((total_space, free_space, available_space, _replication_factor)) => {
+                    // Convert bytes to blocks
+                    let total = total_space / BLOCK_SIZE as u64;
+                    let free = free_space / BLOCK_SIZE as u64;
+                    let avail = available_space / BLOCK_SIZE as u64;
+
+                    // Update cache
+                    *statfs_cache.write().unwrap() = Some((total, free, avail, std::time::Instant::now()));
+
+                    (total, free, avail)
+                }
+                Err(e) => {
+                    error!("Failed to get storage stats: {}", e);
+                    // Return reasonable defaults on error
+                    (1_000_000_000, 500_000_000, 500_000_000)
+                }
             }
         };
 

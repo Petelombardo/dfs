@@ -84,6 +84,12 @@ pub enum Request {
         path: String,
     },
 
+    /// Rename/move file (atomic operation)
+    RenameFile {
+        old_path: String,
+        new_path: String,
+    },
+
     /// Replicate a chunk to this node
     ReplicateChunk {
         chunk_id: ChunkId,

@@ -1051,6 +1051,26 @@ impl DfsClient {
         }
     }
 
+    /// Rename file atomically (server-side atomic operation)
+    /// This is safer than separate put + purge operations as it prevents
+    /// race conditions where the file disappears during rename
+    pub async fn rename_file(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let request = Request::RenameFile {
+            old_path: old_path.to_string(),
+            new_path: new_path.to_string(),
+        };
+
+        let response = self.send_request_with_retry(request).await?;
+
+        match response {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message, .. } => {
+                anyhow::bail!("Failed to rename file: {}", message);
+            }
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
     /// Refresh cluster node list by querying GetClusterStatus
     pub async fn refresh_cluster_nodes(&self) -> Result<()> {
         let nodes = self.cluster_nodes.read().await.clone();

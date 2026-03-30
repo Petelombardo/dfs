@@ -90,6 +90,16 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Delete only the path index entry for a specific path
+    /// Used during rename to remove the old path without touching the file metadata
+    pub fn delete_path_index(&self, path: &str) -> Result<()> {
+        let path_key = self.path_key(path);
+        self.db.remove(path_key)
+            .context("Failed to delete path index")?;
+        debug!("Deleted path index for: {}", path);
+        Ok(())
+    }
+
     /// List all files (iterator for memory efficiency on SBCs)
     pub fn list_files(&self) -> Result<Vec<FileMetadata>> {
         let mut files = Vec::new();

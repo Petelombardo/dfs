@@ -104,6 +104,9 @@ impl Server {
             Request::WriteFile { data } => self.handle_write_file(data).await,
             Request::WriteFileLocalOnly { data } => self.handle_write_file_local_only(data).await,
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
+            Request::RenameFile { old_path, new_path } => {
+                self.handle_rename_file(old_path, new_path).await
+            }
 
             // Admin requests
             Request::GetClusterStatus => self.handle_get_cluster_status().await,
@@ -226,18 +229,25 @@ impl Server {
 
     /// Handle delete metadata replication (internal cluster operation)
     async fn handle_delete_metadata(&self, file_id: FileId, path: String) -> Response {
-        debug!("Handling delete metadata: {}", path);
+        debug!("Handling delete metadata: {} (file_id: {})", path, file_id);
 
-        // Delete metadata locally without re-replicating (to avoid loops)
-        match self.metadata.delete_file(&file_id) {
+        // CRITICAL: Only delete the path index, not the file metadata!
+        // This is used during rename to clean up the old path on replicas
+        // If we use delete_file(&file_id), we'll delete the NEW metadata that was just replicated!
+        // delete_file() would:
+        //   1. Look up metadata by file_id (finds the NEW path in metadata)
+        //   2. Delete path index for the CURRENT path in metadata (NEW path)
+        //   3. Delete the file_id entry (deletes ALL metadata)
+        // Instead, we just delete the specific old path index
+        match self.metadata.delete_path_index(&path) {
             Ok(_) => {
-                debug!("Successfully deleted metadata for {}", path);
+                debug!("Successfully deleted path index for {}", path);
                 Response::Ok { data: None }
             }
             Err(e) => {
-                warn!("Failed to delete metadata: {}", e);
+                warn!("Failed to delete path index: {}", e);
                 Response::Error {
-                    message: format!("Failed to delete metadata: {}", e),
+                    message: format!("Failed to delete path index: {}", e),
                     code: ErrorCode::InternalError,
                 }
             }
@@ -1205,6 +1215,110 @@ impl Server {
                 warn!("Failed to purge file metadata by ID: {}", e);
                 Response::Error {
                     message: format!("Failed to purge file metadata: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle atomic rename file request
+    /// This is critical - must update metadata path AND delete old path atomically
+    /// to prevent file from disappearing during rename
+    async fn handle_rename_file(&self, old_path: String, new_path: String) -> Response {
+        info!("Handling atomic rename: {} -> {}", old_path, new_path);
+
+        // Get existing metadata
+        match self.metadata.get_file_by_path(&old_path) {
+            Ok(Some(mut metadata)) => {
+                let file_id = metadata.id;
+
+                // Update path and timestamp
+                metadata.path = new_path.clone();
+                metadata.modified_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                // Store new metadata locally first
+                match self.metadata.put_file(&metadata) {
+                    Ok(_) => {
+                        // Now replicate to all servers BEFORE deleting old path
+                        // This ensures the new metadata exists everywhere before we delete the old
+                        let nodes = self.cluster.get_all_nodes().await;
+                        let local_id = self.cluster.local_node_id();
+                        let client = self.client.clone();
+                        let metadata_clone = metadata.clone();
+                        let old_path_clone = old_path.clone();
+
+                        // Replicate new metadata synchronously
+                        let mut put_success = true;
+                        for node in &nodes {
+                            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                continue;
+                            }
+
+                            let put_request = Request::ReplicateMetadata {
+                                metadata: metadata_clone.clone(),
+                            };
+
+                            if let Err(e) = client.send_message(node.addr, Message::Request(put_request)).await {
+                                warn!("Failed to replicate new metadata to {}: {}", node.addr, e);
+                                put_success = false;
+                            }
+                        }
+
+                        if !put_success {
+                            warn!("Some replications failed for rename {} -> {}", old_path, new_path);
+                        }
+
+                        // Now delete the OLD path index entry locally
+                        // We use delete_path_index() instead of delete_file() because:
+                        // - put_file() already updated the file_id → metadata entry
+                        // - put_file() already created the new_path → file_id entry
+                        // - We just need to remove the old_path → file_id entry
+                        // - delete_file() would delete EVERYTHING including the new metadata!
+                        if let Err(e) = self.metadata.delete_path_index(&old_path) {
+                            warn!("Failed to delete old path index during rename: {}", e);
+                        }
+
+                        // Replicate deletion of old path to all servers
+                        tokio::spawn(async move {
+                            for node in &nodes {
+                                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                    continue;
+                                }
+
+                                let delete_request = Request::DeleteMetadata {
+                                    file_id,
+                                    path: old_path_clone.clone(),
+                                };
+
+                                if let Err(e) = client.send_message(node.addr, Message::Request(delete_request)).await {
+                                    warn!("Failed to replicate old metadata deletion to {}: {}", node.addr, e);
+                                }
+                            }
+                        });
+
+                        info!("Renamed {} -> {} (file_id: {})", old_path, new_path, file_id);
+                        Response::Ok { data: None }
+                    }
+                    Err(e) => {
+                        warn!("Failed to store new metadata during rename: {}", e);
+                        Response::Error {
+                            message: format!("Failed to rename file: {}", e),
+                            code: ErrorCode::InternalError,
+                        }
+                    }
+                }
+            }
+            Ok(None) => Response::Error {
+                message: format!("File not found: {}", old_path),
+                code: ErrorCode::NotFound,
+            },
+            Err(e) => {
+                warn!("Failed to find file for rename: {}", e);
+                Response::Error {
+                    message: format!("Failed to rename file: {}", e),
                     code: ErrorCode::InternalError,
                 }
             }

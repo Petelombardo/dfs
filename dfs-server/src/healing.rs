@@ -167,6 +167,9 @@ impl HealingManager {
         let scrub_interval = Duration::from_secs(self.scrub_interval_hours * 3600);
         let mut timer = interval(scrub_interval);
 
+        // Skip the immediate first tick - we don't want to scrub on startup
+        timer.tick().await;
+
         loop {
             timer.tick().await;
 
@@ -210,9 +213,11 @@ impl HealingManager {
                         }
                     }
                     ReplicationStatus::OverReplicated => {
-                        if let Err(e) = self.cleanup_excess_replicas(&chunk_id).await {
-                            warn!("Failed to cleanup chunk {}: {}", chunk_id, e);
-                        }
+                        // DISABLED: Cleanup is not implemented and causes massive log spam
+                        // with 100k+ chunks
+                        // if let Err(e) = self.cleanup_excess_replicas(&chunk_id).await {
+                        //     warn!("Failed to cleanup chunk {}: {}", chunk_id, e);
+                        // }
                     }
                     ReplicationStatus::Ok => {
                         // Remove from pending if it was there

@@ -1534,62 +1534,50 @@ impl Filesystem for DfsFilesystem {
         });
 
         match result {
-            Ok(Some(mut metadata)) => {
-                // CRITICAL: Rename must preserve chunks - only update metadata path
-                // The old delete_file() call was DELETING ALL CHUNKS - major data loss bug!
-
-                // Update path and timestamp
-                metadata.path = new_path.clone();
-                metadata.modified_at = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-
-                // Put new metadata (this creates new path index entry)
-                let metadata_clone = metadata.clone();
-                let file_id = metadata.id;
-                let put_result = self.block_on(async {
-                    client.put_file_metadata(&metadata_clone).await
+            Ok(Some(metadata)) => {
+                // Use atomic rename operation - server handles the entire rename atomically
+                // This prevents race conditions where the file disappears during rename
+                let rename_result = self.block_on(async {
+                    client.rename_file(&old_path, &new_path).await
                 });
 
-                match put_result {
+                match rename_result {
                     Ok(_) => {
-                        // Delete ONLY the old metadata entry (purge), NOT the chunks
-                        // Use purge_file_metadata which only removes metadata, not chunks
-                        let delete_result = self.block_on(async {
-                            client.purge_file_metadata(&old_path).await
-                        });
+                        // CRITICAL: Keep the same inode number!
+                        // The kernel's FUSE layer still has references to the old inode
+                        // If we create a new inode, the old one becomes orphaned
+                        let ino = self.path_to_inode.read().unwrap().get(&old_path).copied()
+                            .unwrap_or_else(|| self.get_or_create_inode(&old_path));
 
-                        match delete_result {
-                            Ok(_) => {
-                                // Update local cache
-                                if let Some(&old_ino) = self.path_to_inode.read().unwrap().get(&old_path) {
-                                    self.metadata_cache.write().unwrap().remove(&old_ino);
-                                }
-                                self.path_to_inode.write().unwrap().remove(&old_path);
+                        // Remove old path mapping
+                        self.path_to_inode.write().unwrap().remove(&old_path);
 
-                                let new_ino = self.get_or_create_inode(&new_path);
-                                self.metadata_cache.write().unwrap().insert(new_ino, metadata);
+                        // Add new path mapping with SAME inode
+                        self.path_to_inode.write().unwrap().insert(new_path.clone(), ino);
 
-                                // Invalidate directory cache for both old and new parent directories
-                                let old_parent = old_path.rsplitn(2, '/').nth(1).unwrap_or("/");
-                                let new_parent = new_path.rsplitn(2, '/').nth(1).unwrap_or("/");
-                                self.dir_cache.write().unwrap().remove(old_parent);
-                                if old_parent != new_parent {
-                                    self.dir_cache.write().unwrap().remove(new_parent);
-                                }
+                        // Update metadata in cache with new path (same inode)
+                        let mut new_metadata = metadata.clone();
+                        new_metadata.path = new_path.clone();
+                        new_metadata.modified_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
 
-                                info!("Renamed {} -> {} (preserved {} chunks)", old_path, new_path, metadata_clone.chunks.len());
-                                reply.ok();
-                            }
-                            Err(e) => {
-                                error!("Failed to purge old metadata for {}: {}", old_path, e);
-                                reply.error(libc::EIO);
-                            }
+                        self.metadata_cache.write().unwrap().insert(ino, new_metadata);
+
+                        // Invalidate directory cache for both old and new parent directories
+                        let old_parent = old_path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                        let new_parent = new_path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                        self.dir_cache.write().unwrap().remove(old_parent);
+                        if old_parent != new_parent {
+                            self.dir_cache.write().unwrap().remove(new_parent);
                         }
+
+                        info!("Renamed {} -> {} (inode {} preserved {} chunks)", old_path, new_path, ino, metadata.chunks.len());
+                        reply.ok();
                     }
                     Err(e) => {
-                        error!("Failed to create new file {}: {}", new_path, e);
+                        error!("Failed to rename {} -> {}: {}", old_path, new_path, e);
                         reply.error(libc::EIO);
                     }
                 }

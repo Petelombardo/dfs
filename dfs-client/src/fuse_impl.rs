@@ -732,9 +732,11 @@ impl Filesystem for DfsFilesystem {
             // Get or allocate inode
             let entry_ino = self.get_or_create_inode(&entry.path);
 
-            // Cache metadata, but DON'T overwrite if there's an active write
-            // Use safe_metadata_update to check both buffers and write counters
-            self.safe_metadata_update(entry_ino, entry.clone());
+            // For directory listings, always use fresh server data without lock contention
+            // safe_metadata_update() acquires write_buffers lock for EVERY file, causing
+            // massive contention during writes. Directory listing should be fast and non-blocking.
+            // The metadata comes directly from the server, so it's already authoritative.
+            self.metadata_cache.write().unwrap().insert(entry_ino, entry.clone());
 
             let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
             if reply.add(entry_ino, next_offset, kind, file_name) {

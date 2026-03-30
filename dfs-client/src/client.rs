@@ -993,12 +993,12 @@ impl DfsClient {
         for node_addr in nodes {
             let request = request.clone();
             let task = tokio::spawn(async move {
-                // Wrap entire query with 2s timeout to avoid hanging on offline nodes
-                // (ARM servers are slower, need more generous timeout)
+                // Wrap entire query with 10s timeout to avoid hanging on offline nodes
+                // (ARM servers need generous timeout for reliable stats)
                 let query_future = async {
-                    // Create a temporary client for this request with 1s connect timeout
+                    // Create a temporary client for this request with 5s connect timeout
                     let mut stream = tokio::time::timeout(
-                        std::time::Duration::from_millis(1000),
+                        std::time::Duration::from_millis(5000),
                         tokio::net::TcpStream::connect(node_addr)
                     ).await
                         .map_err(|_| Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")) as Box<dyn std::error::Error + Send + Sync>)?
@@ -1039,8 +1039,8 @@ impl DfsClient {
                     }
                 };
 
-                // Apply overall 2s timeout to entire query
-                tokio::time::timeout(std::time::Duration::from_millis(2000), query_future)
+                // Apply overall 10s timeout to entire query
+                tokio::time::timeout(std::time::Duration::from_millis(10000), query_future)
                     .await
                     .map_err(|_| Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "query timeout")) as Box<dyn std::error::Error + Send + Sync>)?
             });
@@ -1051,20 +1051,26 @@ impl DfsClient {
         // Wait for all queries to complete
         let mut total_raw_space = 0u64;
         let mut node_capacities: Vec<(u64, u64)> = Vec::new(); // (total, available) per node
-        let mut replication_factor = 3; // default
+        let mut replication_factor = None;
 
         for task in tasks {
             if let Ok(Ok(Some((total, free, avail, rf)))) = task.await {
                 total_raw_space += total;
                 node_capacities.push((total, avail));
-                replication_factor = rf;
+                if replication_factor.is_none() {
+                    replication_factor = Some(rf);
+                }
             }
         }
 
-        // If we didn't get any valid stats, return error
+        // If we didn't get any valid stats, return reasonable defaults
+        // This prevents df from hanging when servers are temporarily slow
         if node_capacities.is_empty() {
-            anyhow::bail!("Failed to get storage stats from any node");
+            warn!("Failed to get storage stats from any node, using defaults");
+            return Ok((0, 0, 0, replication_factor.unwrap_or(2)));
         }
+
+        let replication_factor = replication_factor.unwrap_or(2);
 
         // Calculate usable capacity using greedy algorithm:
         // Iteratively select the best RF nodes and add their bottleneck to total capacity

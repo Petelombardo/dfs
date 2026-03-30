@@ -900,17 +900,30 @@ impl Filesystem for DfsFilesystem {
 
             // Optimize for sequential writes (appends)
             let offset = offset as usize;
-            let current_size = metadata.size as usize;
+            // Calculate true current size including any buffered data
+            let current_size = if write_buffer_enabled {
+                let buffer_end = runtime.block_on(async {
+                    let buffers = write_buffers.lock().await;
+                    if let Some(buffer) = buffers.get(&ino) {
+                        (buffer.start_offset + buffer.data.len() as u64) as usize
+                    } else {
+                        metadata.size as usize
+                    }
+                });
+                buffer_end.max(metadata.size as usize)
+            } else {
+                metadata.size as usize
+            };
 
-            let new_data = if offset == current_size {
+            let (new_data, is_append) = if offset == current_size {
                 // Sequential write/append - just write new data
                 // This is the fast path for DVR recordings, dd, etc.
-                data_vec.clone()
+                (data_vec.clone(), true)
             } else if offset > current_size {
                 // Writing past end of file - need to pad with zeros
                 let mut padded = vec![0u8; offset - current_size];
                 padded.extend_from_slice(&data_vec);
-                padded
+                (padded, true)
             } else if offset + data_vec.len() >= current_size {
                 // Writing near end of file (overlaps with current end)
                 // Treat as append to avoid expensive read-modify-write
@@ -918,7 +931,7 @@ impl Filesystem for DfsFilesystem {
                 // small timing variations might cause writes slightly behind the end
                 debug!("Write at offset {} overlaps with end at {}, treating as append",
                        offset, current_size);
-                data_vec.clone()
+                (data_vec.clone(), true)
             } else {
                 // Random write in middle of file - need read-modify-write
                 // This is slow but necessary for correctness
@@ -932,7 +945,7 @@ impl Filesystem for DfsFilesystem {
                     // to avoid reading entire file. This is a heuristic for streaming writes.
                     warn!("Large file write at offset {} (size {}), treating as near-append to avoid full read",
                           offset, current_size);
-                    data_vec.clone()
+                    (data_vec.clone(), true)
                 } else {
                     // True random write - need full read-modify-write
                     let existing_data = if !metadata.chunks.is_empty() {
@@ -969,14 +982,14 @@ impl Filesystem for DfsFilesystem {
                         merged.resize(offset + data_vec.len(), 0);
                     }
                     merged[offset..offset + data_vec.len()].copy_from_slice(&data_vec);
-                    merged
+                    (merged, false)
                 }
             };
 
             // Write to cluster (only new/modified data for appends)
             // Use write_data_with_cache to populate byte-range cache for immediate read-back
             let write_start = std::time::Instant::now();
-            let result = if offset == current_size {
+            let result = if is_append {
                 // Append: write just the new data as new chunks
                 runtime.block_on(async {
                     // Pass file offset for cache population (write-through caching)
@@ -994,7 +1007,7 @@ impl Filesystem for DfsFilesystem {
             match result {
                 Ok((new_chunk_ids, new_chunk_sizes)) => {
                     // Update metadata
-                    if offset == current_size {
+                    if is_append {
                         // Append: add new chunks to existing list
                         metadata.chunks.extend(new_chunk_ids);
                         metadata.chunk_sizes.extend(new_chunk_sizes);

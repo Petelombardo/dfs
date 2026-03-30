@@ -1091,10 +1091,42 @@ impl Server {
         // Get metadata to find file ID
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                // Delete from metadata store only (not chunks)
-                match self.metadata.delete_file(&metadata.id) {
+                let file_id = metadata.id;
+
+                // Delete from local metadata store only (not chunks)
+                match self.metadata.delete_file(&file_id) {
                     Ok(_) => {
-                        info!("Purged metadata for file: {}", path);
+                        info!("Purged local metadata for file: {}", path);
+
+                        // CRITICAL: Replicate metadata deletion to all other nodes
+                        // This ensures rename operations don't leave stale metadata on other servers
+                        let cluster = self.cluster.clone();
+                        let client = self.client.clone();
+                        let path_clone = path.clone();
+
+                        tokio::spawn(async move {
+                            let nodes = cluster.get_all_nodes().await;
+                            let local_id = cluster.local_node_id();
+
+                            info!("Replicating metadata purge for file: {}", path_clone);
+
+                            for node in &nodes {
+                                // Skip self and offline nodes
+                                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                    continue;
+                                }
+
+                                let request = Request::DeleteMetadata {
+                                    file_id,
+                                    path: path_clone.clone(),
+                                };
+
+                                if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
+                                    warn!("Failed to replicate metadata purge to node {}: {}", node.id, e);
+                                }
+                            }
+                        });
+
                         Response::Ok { data: None }
                     }
                     Err(e) => {

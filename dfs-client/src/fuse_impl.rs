@@ -1566,6 +1566,14 @@ impl Filesystem for DfsFilesystem {
                                 let new_ino = self.get_or_create_inode(&new_path);
                                 self.metadata_cache.write().unwrap().insert(new_ino, metadata);
 
+                                // Invalidate directory cache for both old and new parent directories
+                                let old_parent = old_path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                                let new_parent = new_path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                                self.dir_cache.write().unwrap().remove(old_parent);
+                                if old_parent != new_parent {
+                                    self.dir_cache.write().unwrap().remove(new_parent);
+                                }
+
                                 info!("Renamed {} -> {} (preserved {} chunks)", old_path, new_path, metadata_clone.chunks.len());
                                 reply.ok();
                             }

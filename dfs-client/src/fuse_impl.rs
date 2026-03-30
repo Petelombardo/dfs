@@ -404,6 +404,10 @@ impl Filesystem for DfsFilesystem {
                         if fresh.size != metadata.size {
                             debug!("getattr: file grew from {} to {} bytes", metadata.size, fresh.size);
                             metadata_cache.write().unwrap().insert(ino, fresh.clone());
+
+                            // Warm replica cache with chunk locations for sequential reads
+                            client.warm_replica_cache(&fresh.chunks).await;
+
                             metadata = fresh;
                         }
                     }
@@ -497,6 +501,9 @@ impl Filesystem for DfsFilesystem {
                     Ok(Some(fresh_metadata)) => {
                         // Update cache with fresh metadata
                         metadata_cache.write().unwrap().insert(ino, fresh_metadata.clone());
+
+                        // Warm replica cache with chunk locations for upcoming reads
+                        client.warm_replica_cache(&fresh_metadata.chunks).await;
 
                         // If file has grown, continue with the read using fresh metadata
                         if offset < fresh_metadata.size as usize {

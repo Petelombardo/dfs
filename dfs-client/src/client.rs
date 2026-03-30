@@ -58,6 +58,11 @@ pub struct DfsClient {
 
     /// Round-robin counter for replica selection (for load balancing)
     replica_selector: Arc<AtomicU64>,
+
+    /// Replica location cache: ChunkId -> Vec<SocketAddr>
+    /// Caches which nodes have which chunks to avoid metadata queries on every read
+    /// Cache up to 10000 entries (at 40 bytes each = ~400KB)
+    replica_cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<SocketAddr>>>>>,
 }
 
 impl DfsClient {
@@ -87,6 +92,10 @@ impl DfsClient {
         // Byte-range cache uses same capacity as chunk cache
         let byte_range_cache = LruCache::new(cache_capacity);
 
+        // Replica location cache: 10000 entries
+        let replica_cache_capacity = NonZeroUsize::new(10000).unwrap();
+        let replica_cache = LruCache::new(replica_cache_capacity);
+
         Ok(Self {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes)),
             current_node: Arc::new(RwLock::new(0)),
@@ -96,6 +105,7 @@ impl DfsClient {
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(Mutex::new(HashMap::new())),
             replica_selector: Arc::new(AtomicU64::new(0)),
+            replica_cache: Arc::new(Mutex::new(replica_cache)),
         })
     }
 
@@ -335,16 +345,31 @@ impl DfsClient {
             let nodes = nodes.clone();
 
             tokio::spawn(async move {
-                // Get replica locations for this chunk (with fallback to all nodes)
-                let replicas = match client.get_chunk_replicas(chunk_id).await {
-                    Ok(r) => {
-                        debug!("Found {} replicas for chunk {}", r.len(), chunk_id);
-                        r
-                    }
-                    Err(e) => {
-                        // Fallback to trying all nodes if query fails
-                        debug!("Failed to get replicas for {}: {}, trying all nodes", chunk_id, e);
-                        nodes.clone()
+                // Try to get replica locations from cache first
+                let cached_replicas = {
+                    let mut cache = client.replica_cache.lock().await;
+                    cache.get(&chunk_id).cloned()
+                };
+
+                let replicas = if let Some(cached) = cached_replicas {
+                    debug!("Replica cache HIT for chunk {}", chunk_id);
+                    (*cached).clone()
+                } else {
+                    // Cache miss - query metadata server
+                    debug!("Replica cache MISS for chunk {}", chunk_id);
+                    match client.get_chunk_replicas(chunk_id).await {
+                        Ok(r) => {
+                            debug!("Found {} replicas for chunk {}", r.len(), chunk_id);
+                            // Cache the result
+                            let r_arc = Arc::new(r.clone());
+                            client.replica_cache.lock().await.put(chunk_id, r_arc);
+                            r
+                        }
+                        Err(e) => {
+                            // Fallback to trying all nodes if query fails
+                            debug!("Failed to get replicas for {}: {}, trying all nodes", chunk_id, e);
+                            nodes.clone()
+                        }
                     }
                 };
 
@@ -618,6 +643,29 @@ impl DfsClient {
 
         let idx = self.replica_selector.fetch_add(1, Ordering::Relaxed) as usize % replicas.len();
         Some(replicas[idx])
+    }
+
+    /// Pre-populate replica cache with chunk locations
+    /// This is called when reading file metadata to warm the cache for sequential reads
+    /// For now, we use a simple heuristic: all nodes have all chunks (true for RF=2 with 5 nodes)
+    /// In the future, this could query the metadata server for actual locations
+    pub async fn warm_replica_cache(&self, chunk_ids: &[ChunkId]) {
+        if chunk_ids.is_empty() {
+            return;
+        }
+
+        let nodes = self.cluster_nodes.read().await.clone();
+        let nodes_arc = Arc::new(nodes);
+
+        let mut cache = self.replica_cache.lock().await;
+        for chunk_id in chunk_ids {
+            // Only add if not already in cache
+            if !cache.contains(chunk_id) {
+                cache.put(*chunk_id, Arc::clone(&nodes_arc));
+            }
+        }
+
+        debug!("Warmed replica cache with {} chunks", chunk_ids.len());
     }
 
     /// Read a single chunk from a specific server using connection pooling

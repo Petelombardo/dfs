@@ -213,17 +213,20 @@ impl DfsFilesystem {
                 .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
                 .await?;
 
-            info!("Flush complete: {} chunks added at offset {}, total file size {}",
-                  new_chunk_ids.len(), buffer_start_offset, metadata.size);
+            // Append new chunks to existing chunks and update size
+            let num_chunks = new_chunk_ids.len();
+            let new_size = buffer_start_offset + buffer.data.len() as u64;
 
-            // Append new chunks to existing chunks
-            // Size was already updated during buffered writes, don't update again
             metadata.chunks.extend(new_chunk_ids);
             metadata.chunk_sizes.extend(new_chunk_sizes);
+            metadata.size = new_size;
             metadata.modified_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
+
+            info!("Flush complete: {} chunks added at offset {}, total file size {}",
+                  num_chunks, buffer_start_offset, new_size);
 
             // Store updated metadata
             self.client.put_file_metadata(&metadata).await?;
@@ -756,9 +759,40 @@ impl Filesystem for DfsFilesystem {
             // Write-behind buffering: buffer sequential appends in memory
             if write_buffer_enabled {
                 let offset_usize = offset as usize;
-                let current_size = metadata.size as usize;
+                // Calculate true current size including any buffered data
+                // IMPORTANT: Re-read metadata from cache to get latest updates from concurrent writes
+                let current_size = {
+                    let cache_size = {
+                        let cache = metadata_cache.read().unwrap();
+                        cache.get(&ino).map(|m| m.size as usize).unwrap_or(metadata.size as usize)
+                    };
+
+                    let buffers_guard = runtime.block_on(async {
+                        write_buffers.lock().await
+                    });
+                    if let Some(buffer) = buffers_guard.get(&ino) {
+                        ((buffer.start_offset + buffer.data.len() as u64) as usize)
+                            .max(cache_size)
+                    } else {
+                        cache_size
+                    }
+                };
+
+                info!("Buffered write check: offset={}, current_size={}, cache_size={}, buffer_present={}",
+                       offset_usize, current_size,
+                       {let cache = metadata_cache.read().unwrap(); cache.get(&ino).map(|m| m.size).unwrap_or(0)},
+                       {let bg = runtime.block_on(async { write_buffers.lock().await }); bg.get(&ino).is_some()});
 
                 // Only buffer sequential appends
+                if offset_usize != current_size {
+                    info!("Buffered write skipped: offset {} != current_size {} (diff: {})",
+                           offset_usize, current_size,
+                           if offset_usize > current_size {
+                               offset_usize - current_size
+                           } else {
+                               current_size - offset_usize
+                           });
+                }
                 if offset_usize == current_size {
                     // Buffer size threshold: 4MB (same as chunk size)
                     const BUFFER_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
@@ -766,15 +800,32 @@ impl Filesystem for DfsFilesystem {
                     let write_buffers_clone = write_buffers.clone();
                     let client_clone = client.clone();
                     let metadata_cache_clone = metadata_cache.clone();
+                    let metadata_cache_clone2 = metadata_cache.clone();
+                    let metadata_cache_clone3 = metadata_cache.clone();
                     let runtime_clone = runtime.clone();
                     let data_slice = &data_vec[..];
 
                     let should_flush = runtime.block_on(async move {
                         let mut buffers = write_buffers_clone.lock().await;
+
+                        // Recalculate current_size while holding the buffer lock to avoid races
+                        let actual_current_size = {
+                            let cache_size = {
+                                let cache = metadata_cache_clone3.read().unwrap();
+                                cache.get(&ino).map(|m| m.size as u64).unwrap_or(current_size as u64)
+                            };
+
+                            if let Some(existing_buffer) = buffers.get(&ino) {
+                                (existing_buffer.start_offset + existing_buffer.data.len() as u64).max(cache_size)
+                            } else {
+                                cache_size
+                            }
+                        };
+
                         let buffer = buffers.entry(ino).or_insert_with(|| WriteBuffer {
                             data: Vec::new(),
                             last_modified: SystemTime::now(),
-                            start_offset: current_size as u64,
+                            start_offset: actual_current_size,
                         });
 
                         // Safety check: if buffer is already way too large, something is wrong
@@ -796,13 +847,9 @@ impl Filesystem for DfsFilesystem {
 
                     match should_flush {
                         Ok(flush_now) => {
-                            // Update metadata size in cache (but don't persist yet)
-                            metadata.size = (current_size + data_vec.len()) as u64;
-                            metadata.modified_at = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            metadata_cache.write().unwrap().insert(ino, metadata);
+                            // Don't update metadata.size here - it will be updated during flush
+                            // The buffer already contains the data, so current_size calculation
+                            // will account for it via buffer.start_offset + buffer.data.len()
 
                             // Update write counter to protect metadata from stale server fetches
                             {
@@ -854,16 +901,21 @@ impl Filesystem for DfsFilesystem {
                                             .write_data_with_cache(&data, ino, buffer_start_offset)
                                             .await?;
 
-                                        info!("Flush complete: {} chunks added at offset {}, total file size {}",
-                                              new_chunk_ids.len(), buffer_start_offset, flush_metadata.size);
+                                        // Calculate new size before moving chunk data
+                                        let new_size = buffer_start_offset + data.len() as u64;
+                                        let num_chunks = new_chunk_ids.len();
 
-                                        // Append new chunks to existing chunks
+                                        // Append new chunks to existing chunks and update size
                                         flush_metadata.chunks.extend(new_chunk_ids);
                                         flush_metadata.chunk_sizes.extend(new_chunk_sizes);
+                                        flush_metadata.size = new_size;
                                         flush_metadata.modified_at = SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
                                             .unwrap()
                                             .as_secs();
+
+                                        info!("Flush complete: {} chunks added at offset {}, total file size {}",
+                                              num_chunks, buffer_start_offset, new_size);
 
                                         // Store updated metadata
                                         client_clone.put_file_metadata(&flush_metadata).await?;
@@ -901,16 +953,22 @@ impl Filesystem for DfsFilesystem {
             // Optimize for sequential writes (appends)
             let offset = offset as usize;
             // Calculate true current size including any buffered data
+            // IMPORTANT: Re-read metadata from cache to get latest updates
             let current_size = if write_buffer_enabled {
+                let cache_size = {
+                    let cache = metadata_cache.read().unwrap();
+                    cache.get(&ino).map(|m| m.size as usize).unwrap_or(metadata.size as usize)
+                };
+
                 let buffer_end = runtime.block_on(async {
                     let buffers = write_buffers.lock().await;
                     if let Some(buffer) = buffers.get(&ino) {
                         (buffer.start_offset + buffer.data.len() as u64) as usize
                     } else {
-                        metadata.size as usize
+                        cache_size
                     }
                 });
-                buffer_end.max(metadata.size as usize)
+                buffer_end.max(cache_size)
             } else {
                 metadata.size as usize
             };
@@ -935,20 +993,8 @@ impl Filesystem for DfsFilesystem {
             } else {
                 // Random write in middle of file - need read-modify-write
                 // This is slow but necessary for correctness
-                // For large files being actively written (like DVR recordings),
-                // avoid full file read-modify-write
-                let file_is_large = current_size > 10 * 1024 * 1024; // 10 MB threshold
-                let write_near_end = (current_size - offset) < 4 * 1024 * 1024; // Within 4 MB of end
-
-                if file_is_large && write_near_end {
-                    // For large files with writes near the end, treat as append
-                    // to avoid reading entire file. This is a heuristic for streaming writes.
-                    warn!("Large file write at offset {} (size {}), treating as near-append to avoid full read",
-                          offset, current_size);
-                    (data_vec.clone(), true)
-                } else {
-                    // True random write - need full read-modify-write
-                    let existing_data = if !metadata.chunks.is_empty() {
+                // True random write - need full read-modify-write
+                let existing_data = if !metadata.chunks.is_empty() {
                         let chunk_ids = metadata.chunks.clone();
                         let chunk_sizes = metadata.chunk_sizes.clone();
 
@@ -977,13 +1023,12 @@ impl Filesystem for DfsFilesystem {
                         Vec::new()
                     };
 
-                    let mut merged = existing_data;
-                    if offset + data_vec.len() > merged.len() {
-                        merged.resize(offset + data_vec.len(), 0);
-                    }
-                    merged[offset..offset + data_vec.len()].copy_from_slice(&data_vec);
-                    (merged, false)
+                let mut merged = existing_data;
+                if offset + data_vec.len() > merged.len() {
+                    merged.resize(offset + data_vec.len(), 0);
                 }
+                merged[offset..offset + data_vec.len()].copy_from_slice(&data_vec);
+                (merged, false)
             };
 
             // Write to cluster (only new/modified data for appends)
@@ -1124,16 +1169,21 @@ impl Filesystem for DfsFilesystem {
                             .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
                             .await?;
 
-                        info!("Flush complete: {} chunks added at offset {}, total file size {}",
-                              new_chunk_ids.len(), buffer_start_offset, flush_metadata.size);
+                        // Calculate new size and save chunk count before moving
+                        let num_chunks = new_chunk_ids.len();
+                        let new_size = buffer_start_offset + buffer.data.len() as u64;
 
-                        // Append new chunks to existing chunks
+                        // Append new chunks to existing chunks and update size
                         flush_metadata.chunks.extend(new_chunk_ids);
                         flush_metadata.chunk_sizes.extend(new_chunk_sizes);
+                        flush_metadata.size = new_size;
                         flush_metadata.modified_at = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
+
+                        info!("Flush complete: {} chunks added at offset {}, total file size {}",
+                              num_chunks, buffer_start_offset, new_size);
 
                         // Store updated metadata
                         client.put_file_metadata(&flush_metadata).await?;

@@ -105,10 +105,9 @@ impl MetadataStore {
         Ok(files)
     }
 
-    /// List files in a directory (prefix scan)
+    /// List files in a directory (optimized with path prefix scan)
     pub fn list_directory(&self, dir_path: &str) -> Result<Vec<FileMetadata>> {
         let mut files = Vec::new();
-        let all_files = self.list_files()?;
 
         // Normalize directory path
         let dir_path = if dir_path.ends_with('/') {
@@ -117,12 +116,26 @@ impl MetadataStore {
             format!("{}/", dir_path)
         };
 
-        for metadata in all_files {
-            if metadata.path.starts_with(&dir_path) {
-                // Only include direct children, not nested
-                let relative = &metadata.path[dir_path.len()..];
-                if !relative.contains('/') || relative.ends_with('/') {
-                    files.push(metadata);
+        // Use path index prefix scan instead of full table scan
+        // This scans only paths starting with "path:/dir/" instead of all files
+        let prefix = format!("path:{}", dir_path);
+
+        for item in self.db.scan_prefix(prefix.as_bytes()) {
+            let (key, value) = item?;
+
+            // Extract the path from the key
+            let key_str = String::from_utf8_lossy(&key);
+            if let Some(path) = key_str.strip_prefix("path:") {
+                // Check if this is a direct child (not nested subdirectory)
+                let relative = &path[dir_path.len()..];
+                if !relative.is_empty() && (!relative.contains('/') || relative.ends_with('/')) {
+                    // Deserialize the file ID and fetch the metadata
+                    let file_id: FileId = bincode::deserialize(&value)
+                        .context("Failed to deserialize file ID from path index")?;
+
+                    if let Some(metadata) = self.get_file(&file_id)? {
+                        files.push(metadata);
+                    }
                 }
             }
         }

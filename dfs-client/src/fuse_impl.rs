@@ -57,6 +57,10 @@ pub struct DfsFilesystem {
     /// Last read chunk cache: (ino, chunk_index, data)
     /// Prevents re-fetching same 4MB chunk for multiple 128KB FUSE reads
     last_chunk_cache: Arc<RwLock<Option<(u64, usize, Vec<u8>)>>>,
+
+    /// Directory listing cache: path -> (entries, timestamp)
+    /// Cache directory listings for 5 seconds to avoid repeated scans
+    dir_cache: Arc<RwLock<HashMap<String, (Vec<FileMetadata>, std::time::Instant)>>>,
 }
 
 impl DfsFilesystem {
@@ -119,6 +123,7 @@ impl DfsFilesystem {
             write_buffer_enabled,
             write_buffers: Arc::new(Mutex::new(HashMap::new())),
             last_chunk_cache: Arc::new(RwLock::new(None)),
+            dir_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -633,6 +638,7 @@ impl Filesystem for DfsFilesystem {
         mut reply: ReplyDirectory,
     ) {
         debug!("readdir: ino={}, offset={}", ino, offset);
+        let start = std::time::Instant::now();
 
         let path = {
             let cache = self.metadata_cache.read().unwrap();
@@ -651,68 +657,94 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
-        let client = self.client.clone();
-        let result = self.block_on(async {
-            client.list_directory(&path).await
-        });
-
-        match result {
-            Ok(entries) => {
-                let mut entry_offset = 0i64;
-
-                // Add . and ..
-                if offset == 0 {
-                    if reply.add(ino, 1, FuseFileType::Directory, ".") {
-                        reply.ok();
-                        return;
-                    }
-                    entry_offset += 1;
+        // Check directory cache first (5-second TTL)
+        let cached_entries = {
+            let cache = self.dir_cache.read().unwrap();
+            cache.get(&path).and_then(|(entries, timestamp)| {
+                if timestamp.elapsed() < std::time::Duration::from_secs(5) {
+                    debug!("Directory cache HIT for {}", path);
+                    Some(entries.clone())
+                } else {
+                    debug!("Directory cache EXPIRED for {}", path);
+                    None
                 }
-                if offset <= 1 {
-                    if reply.add(ino, 2, FuseFileType::Directory, "..") {
-                        reply.ok();
-                        return;
-                    }
-                    entry_offset += 1;
+            })
+        };
+
+        let entries = if let Some(entries) = cached_entries {
+            entries
+        } else {
+            // Cache miss - fetch from server
+            debug!("Directory cache MISS for {}", path);
+            let client = self.client.clone();
+            let dir_cache = self.dir_cache.clone();
+            let path_clone = path.clone();
+
+            let result = self.block_on(async {
+                client.list_directory(&path_clone).await
+            });
+
+            match result {
+                Ok(entries) => {
+                    // Update cache
+                    dir_cache.write().unwrap().insert(path.clone(), (entries.clone(), std::time::Instant::now()));
+                    entries
                 }
-
-                // Add actual entries
-                let skip_count = if offset > 2 { (offset - 2) as usize } else { 0 };
-                for (i, entry) in entries.iter().enumerate().skip(skip_count) {
-                    let file_name = entry.path.rsplit('/').next().unwrap_or("");
-
-                    // Skip entries with empty filenames (like the root directory "/")
-                    if file_name.is_empty() {
-                        debug!("Skipping entry with empty filename: path={}", entry.path);
-                        continue;
-                    }
-
-                    let kind = match entry.file_type {
-                        FileType::RegularFile => FuseFileType::RegularFile,
-                        FileType::Directory => FuseFileType::Directory,
-                        FileType::Symlink => FuseFileType::Symlink,
-                    };
-
-                    // Get or allocate inode
-                    let entry_ino = self.get_or_create_inode(&entry.path);
-
-                    // Cache metadata, but DON'T overwrite if there's an active write
-                    // Use safe_metadata_update to check both buffers and write counters
-                    self.safe_metadata_update(entry_ino, entry.clone());
-
-                    let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
-                    if reply.add(entry_ino, next_offset, kind, file_name) {
-                        break; // Buffer full
-                    }
+                Err(e) => {
+                    error!("Failed to read directory {}: {}", path, e);
+                    reply.error(libc::EIO);
+                    return;
                 }
-
-                reply.ok();
             }
-            Err(e) => {
-                error!("Failed to read directory {}: {}", path, e);
-                reply.error(libc::EIO);
+        };
+
+        // Add . and ..
+        if offset == 0 {
+            if reply.add(ino, 1, FuseFileType::Directory, ".") {
+                reply.ok();
+                return;
             }
         }
+        if offset <= 1 {
+            if reply.add(ino, 2, FuseFileType::Directory, "..") {
+                reply.ok();
+                return;
+            }
+        }
+
+        // Add actual entries
+        let skip_count = if offset > 2 { (offset - 2) as usize } else { 0 };
+        for (i, entry) in entries.iter().enumerate().skip(skip_count) {
+            let file_name = entry.path.rsplit('/').next().unwrap_or("");
+
+            // Skip entries with empty filenames (like the root directory "/")
+            if file_name.is_empty() {
+                debug!("Skipping entry with empty filename: path={}", entry.path);
+                continue;
+            }
+
+            let kind = match entry.file_type {
+                FileType::RegularFile => FuseFileType::RegularFile,
+                FileType::Directory => FuseFileType::Directory,
+                FileType::Symlink => FuseFileType::Symlink,
+            };
+
+            // Get or allocate inode
+            let entry_ino = self.get_or_create_inode(&entry.path);
+
+            // Cache metadata, but DON'T overwrite if there's an active write
+            // Use safe_metadata_update to check both buffers and write counters
+            self.safe_metadata_update(entry_ino, entry.clone());
+
+            let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
+            if reply.add(entry_ino, next_offset, kind, file_name) {
+                break; // Buffer full
+            }
+        }
+
+        let elapsed = start.elapsed();
+        info!("readdir COMPLETE: {} with {} entries in {:?}", path, entries.len(), elapsed);
+        reply.ok();
     }
 
     fn create(

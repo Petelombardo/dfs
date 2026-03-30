@@ -1530,29 +1530,34 @@ impl Filesystem for DfsFilesystem {
 
         match result {
             Ok(Some(mut metadata)) => {
-                // Update path
+                // CRITICAL: Rename must preserve chunks - only update metadata path
+                // The old delete_file() call was DELETING ALL CHUNKS - major data loss bug!
+
+                // Update path and timestamp
                 metadata.path = new_path.clone();
                 metadata.modified_at = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
 
-                // Put new metadata
+                // Put new metadata (this creates new path index entry)
                 let metadata_clone = metadata.clone();
+                let file_id = metadata.id;
                 let put_result = self.block_on(async {
                     client.put_file_metadata(&metadata_clone).await
                 });
 
                 match put_result {
                     Ok(_) => {
-                        // Delete old metadata
+                        // Delete ONLY the old metadata entry (purge), NOT the chunks
+                        // Use purge_file_metadata which only removes metadata, not chunks
                         let delete_result = self.block_on(async {
-                            client.delete_file(&old_path).await
+                            client.purge_file_metadata(&old_path).await
                         });
 
                         match delete_result {
                             Ok(_) => {
-                                // Update cache
+                                // Update local cache
                                 if let Some(&old_ino) = self.path_to_inode.read().unwrap().get(&old_path) {
                                     self.metadata_cache.write().unwrap().remove(&old_ino);
                                 }
@@ -1561,10 +1566,11 @@ impl Filesystem for DfsFilesystem {
                                 let new_ino = self.get_or_create_inode(&new_path);
                                 self.metadata_cache.write().unwrap().insert(new_ino, metadata);
 
+                                info!("Renamed {} -> {} (preserved {} chunks)", old_path, new_path, metadata_clone.chunks.len());
                                 reply.ok();
                             }
                             Err(e) => {
-                                error!("Failed to delete old file {}: {}", old_path, e);
+                                error!("Failed to purge old metadata for {}: {}", old_path, e);
                                 reply.error(libc::EIO);
                             }
                         }

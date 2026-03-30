@@ -1033,6 +1033,24 @@ impl DfsClient {
         }
     }
 
+    /// Purge file metadata without deleting chunks (for rename operations)
+    /// This only removes the metadata entry, preserving chunk data
+    pub async fn purge_file_metadata(&self, path: &str) -> Result<()> {
+        let request = Request::PurgeFileMetadata {
+            path: path.to_string(),
+        };
+
+        let response = self.send_request_with_retry(request).await?;
+
+        match response {
+            Response::Ok { .. } => Ok(()),
+            Response::Error { message, .. } => {
+                anyhow::bail!("Failed to purge file metadata: {}", message);
+            }
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
     /// Refresh cluster node list by querying GetClusterStatus
     pub async fn refresh_cluster_nodes(&self) -> Result<()> {
         let nodes = self.cluster_nodes.read().await.clone();

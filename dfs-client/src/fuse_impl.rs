@@ -28,10 +28,16 @@ struct WriteBuffer {
 }
 
 impl WriteBuffer {
-    /// Check if this buffer has expired (TTL: 5 seconds for writes)
-    /// Shorter TTL than reads because buffered writes should flush quickly
-    fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > std::time::Duration::from_secs(5)
+    /// Check if this buffer has been idle (no writes) for 5 seconds
+    /// Active buffers (continuous DVR recording) should NOT be flushed
+    fn is_idle(&self) -> bool {
+        // Check time since LAST write, not creation time
+        // This prevents flushing active DVR recordings that write continuously
+        if let Ok(elapsed) = self.last_modified.elapsed() {
+            elapsed > std::time::Duration::from_secs(5)
+        } else {
+            false // If we can't get elapsed time, don't consider it idle
+        }
     }
 }
 
@@ -113,25 +119,26 @@ impl DfsFilesystem {
                 loop {
                     interval.tick().await;
 
-                    // Find expired buffers
-                    let expired_inodes: Vec<u64> = {
+                    // Find idle buffers (no writes for 5+ seconds)
+                    let idle_inodes: Vec<u64> = {
                         let buffers = write_buffers_clone.lock().await;
                         buffers.iter()
-                            .filter(|(_, buf)| buf.is_expired())
+                            .filter(|(_, buf)| buf.is_idle())
                             .map(|(ino, _)| *ino)
                             .collect()
                     };
 
-                    // Flush each expired buffer
-                    for ino in expired_inodes {
+                    // Flush each idle buffer
+                    for ino in idle_inodes {
                         let buffer_opt = {
                             let mut buffers = write_buffers_clone.lock().await;
                             buffers.remove(&ino)
                         };
 
                         if let Some(buffer) = buffer_opt {
-                            info!("Background flush: expired write buffer for inode {} ({} bytes, age: {:?})",
-                                  ino, buffer.data.len(), buffer.created_at.elapsed());
+                            let idle_time = buffer.last_modified.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+                            info!("Background flush: idle write buffer for inode {} ({} bytes, idle: {:?})",
+                                  ino, buffer.data.len(), idle_time);
 
                             // Get metadata
                             let mut metadata = {
@@ -1022,13 +1029,8 @@ impl Filesystem for DfsFilesystem {
                             created_at: std::time::Instant::now(),
                         });
 
-                        // Check if buffer has expired (5 second TTL)
-                        if buffer.is_expired() {
-                            info!("Write buffer expired for inode {} (age: {:?}), forcing flush",
-                                  ino, buffer.created_at.elapsed());
-                            // Don't append new data, just signal flush needed
-                            return Ok::<bool, anyhow::Error>(true);
-                        }
+                        // No need to check idle here - we'll append data first, then check
+                        // This ensures data isn't lost
 
                         // Safety check: if buffer is already way too large, something is wrong
                         // This can happen if writes backed up during lock contention
@@ -1044,8 +1046,9 @@ impl Filesystem for DfsFilesystem {
                         buffer.data.extend_from_slice(data_slice);
                         buffer.last_modified = SystemTime::now();
 
-                        // Check if buffer exceeds threshold or has expired
-                        Ok::<bool, anyhow::Error>(buffer.data.len() >= buffer_flush_threshold || buffer.is_expired())
+                        // Check if buffer exceeds threshold
+                        // Note: Don't check idle here - we just updated last_modified!
+                        Ok::<bool, anyhow::Error>(buffer.data.len() >= buffer_flush_threshold)
                     });
 
                     match should_flush {

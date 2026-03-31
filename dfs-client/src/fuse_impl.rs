@@ -23,6 +23,16 @@ struct WriteBuffer {
     last_modified: SystemTime,
     /// File offset where this buffer starts
     start_offset: u64,
+    /// When this buffer was created
+    created_at: std::time::Instant,
+}
+
+impl WriteBuffer {
+    /// Check if this buffer has expired (TTL: 5 seconds for writes)
+    /// Shorter TTL than reads because buffered writes should flush quickly
+    fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > std::time::Duration::from_secs(5)
+    }
 }
 
 /// FUSE filesystem implementation for DFS
@@ -88,9 +98,82 @@ impl DfsFilesystem {
             }
         });
 
-        let metadata_cache = Arc::new(RwLock::new(HashMap::new()));
-        let path_to_inode = Arc::new(RwLock::new(HashMap::new()));
+        let metadata_cache = Arc::new(RwLock::new(HashMap::<u64, FileMetadata>::new()));
+        let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
+        let write_buffers_for_cleanup = Arc::new(Mutex::new(HashMap::<u64, WriteBuffer>::new()));
+
+        // Start background task to flush expired write buffers (if buffering enabled)
+        if write_buffer_enabled {
+            let write_buffers_clone = write_buffers_for_cleanup.clone();
+            let client_for_cleanup = client.clone();
+            let metadata_cache_for_cleanup = metadata_cache.clone();
+            runtime.spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+                loop {
+                    interval.tick().await;
+
+                    // Find expired buffers
+                    let expired_inodes: Vec<u64> = {
+                        let buffers = write_buffers_clone.lock().await;
+                        buffers.iter()
+                            .filter(|(_, buf)| buf.is_expired())
+                            .map(|(ino, _)| *ino)
+                            .collect()
+                    };
+
+                    // Flush each expired buffer
+                    for ino in expired_inodes {
+                        let buffer_opt = {
+                            let mut buffers = write_buffers_clone.lock().await;
+                            buffers.remove(&ino)
+                        };
+
+                        if let Some(buffer) = buffer_opt {
+                            info!("Background flush: expired write buffer for inode {} ({} bytes, age: {:?})",
+                                  ino, buffer.data.len(), buffer.created_at.elapsed());
+
+                            // Get metadata
+                            let mut metadata = {
+                                let cache = metadata_cache_for_cleanup.read().unwrap();
+                                match cache.get(&ino) {
+                                    Some(m) => m.clone(),
+                                    None => {
+                                        tracing::warn!("Metadata not found for inode {} during background flush", ino);
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            // Write buffered data
+                            match client_for_cleanup.write_data_with_cache(&buffer.data, ino, buffer.start_offset).await {
+                                Ok((new_chunk_ids, new_chunk_sizes)) => {
+                                    let new_size = buffer.start_offset + buffer.data.len() as u64;
+                                    metadata.chunks.extend(new_chunk_ids);
+                                    metadata.chunk_sizes.extend(new_chunk_sizes);
+                                    metadata.size = new_size;
+                                    metadata.modified_at = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs();
+
+                                    // Store updated metadata
+                                    if let Err(e) = client_for_cleanup.put_file_metadata(&metadata).await {
+                                        tracing::error!("Failed to store metadata during background flush for inode {}: {}", ino, e);
+                                    } else {
+                                        metadata_cache_for_cleanup.write().unwrap().insert(ino, metadata);
+                                        info!("Background flush complete for inode {}", ino);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to write data during background flush for inode {}: {}", ino, e);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Create root directory metadata
         let root_metadata = FileMetadata {
@@ -125,7 +208,7 @@ impl DfsFilesystem {
             runtime,
             write_counters: Arc::new(RwLock::new(HashMap::new())),
             write_buffer_enabled,
-            write_buffers: Arc::new(Mutex::new(HashMap::new())),
+            write_buffers: write_buffers_for_cleanup,
             last_chunk_cache: Arc::new(RwLock::new(None)),
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
             statfs_cache: Arc::new(RwLock::new(None)),
@@ -900,8 +983,12 @@ impl Filesystem for DfsFilesystem {
                            });
                 }
                 if offset_usize == current_size {
-                    // Buffer size threshold: 4MB (same as chunk size)
-                    const BUFFER_FLUSH_THRESHOLD: usize = 4 * 1024 * 1024;
+                    // Buffer size threshold: REDUCED from 4MB to 1MB to prevent OOM
+                    // With environment variable override support
+                    let buffer_flush_threshold: usize = std::env::var("DFS_WRITE_BUFFER_SIZE")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(1 * 1024 * 1024); // Conservative default: 1MB
 
                     let write_buffers_clone = write_buffers.clone();
                     let client_clone = client.clone();
@@ -932,14 +1019,24 @@ impl Filesystem for DfsFilesystem {
                             data: Vec::new(),
                             last_modified: SystemTime::now(),
                             start_offset: actual_current_size,
+                            created_at: std::time::Instant::now(),
                         });
+
+                        // Check if buffer has expired (5 second TTL)
+                        if buffer.is_expired() {
+                            info!("Write buffer expired for inode {} (age: {:?}), forcing flush",
+                                  ino, buffer.created_at.elapsed());
+                            // Don't append new data, just signal flush needed
+                            return Ok::<bool, anyhow::Error>(true);
+                        }
 
                         // Safety check: if buffer is already way too large, something is wrong
                         // This can happen if writes backed up during lock contention
-                        const MAX_BUFFER_SIZE: usize = BUFFER_FLUSH_THRESHOLD * 3; // 12MB absolute max
-                        if buffer.data.len() > MAX_BUFFER_SIZE {
+                        // REDUCED from 12MB to 3MB (3x the new 1MB threshold)
+                        let max_buffer_size: usize = buffer_flush_threshold * 3;
+                        if buffer.data.len() > max_buffer_size {
                             error!("Buffer overflow detected for inode {}: {} bytes (max {}), refusing to buffer more data",
-                                   ino, buffer.data.len(), MAX_BUFFER_SIZE);
+                                   ino, buffer.data.len(), max_buffer_size);
                             return Err(anyhow::anyhow!("Buffer overflow"));
                         }
 
@@ -947,8 +1044,8 @@ impl Filesystem for DfsFilesystem {
                         buffer.data.extend_from_slice(data_slice);
                         buffer.last_modified = SystemTime::now();
 
-                        // Check if buffer exceeds threshold
-                        Ok::<bool, anyhow::Error>(buffer.data.len() >= BUFFER_FLUSH_THRESHOLD)
+                        // Check if buffer exceeds threshold or has expired
+                        Ok::<bool, anyhow::Error>(buffer.data.len() >= buffer_flush_threshold || buffer.is_expired())
                     });
 
                     match should_flush {

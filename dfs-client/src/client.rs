@@ -132,9 +132,21 @@ impl DfsClient {
 
         let byte_range_cache = LruCache::new(byte_cache_capacity);
 
-        // Replica location cache: 128 entries (3x prefetch window)
-        // Small cache for fast lookups and minimal lock contention
-        let replica_cache_capacity = NonZeroUsize::new(128).unwrap();
+        // Replica location cache: MUST be large to avoid metadata query storms!
+        // Each entry is just Arc<Vec<SocketAddr>> (~40-80 bytes), so even 2000 entries = ~160KB
+        // CRITICAL: Should be much larger than chunk cache to cache replica locations
+        // for sequential reads of large files (1000+ chunks)
+        // A "replica storm" (100s of metadata queries) occurs when this is too small
+        let replica_cache_capacity = std::env::var("DFS_REPLICA_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(|v| NonZeroUsize::new(v))
+            .unwrap_or_else(|| {
+                // Default: 4x chunk cache capacity (min 512, max 2000)
+                // This ensures we can cache locations for large sequential files
+                let size = (cache_capacity.get() * 4).max(512).min(2000);
+                NonZeroUsize::new(size).unwrap()
+            });
         let replica_cache = LruCache::new(replica_cache_capacity);
 
         Ok(Self {

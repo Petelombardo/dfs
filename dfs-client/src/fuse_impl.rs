@@ -1176,6 +1176,9 @@ impl Filesystem for DfsFilesystem {
                 metadata.size as usize
             };
 
+            // Track affected chunk range for random writes (for metadata splice)
+            let mut affected_chunk_range: Option<(usize, usize)> = None;
+
             let (new_data, is_append) = if offset == current_size {
                 // Sequential write/append - just write new data
                 // This is the fast path for DVR recordings, dd, etc.
@@ -1195,43 +1198,102 @@ impl Filesystem for DfsFilesystem {
                 (data_vec.clone(), true)
             } else {
                 // Random write in middle of file - need read-modify-write
-                // This is slow but necessary for correctness
-                // True random write - need full read-modify-write
-                let existing_data = if !metadata.chunks.is_empty() {
-                        let chunk_ids = metadata.chunks.clone();
-                        let chunk_sizes = metadata.chunk_sizes.clone();
+                // CRITICAL FIX: Only read affected chunks, not entire file!
+                // For a 10GB file with 1KB write, reading entire file causes OOM
 
-                        // Build chunk offsets for byte-range caching
-                        let mut chunk_offsets = Vec::with_capacity(chunk_ids.len());
-                        let mut current_offset = 0u64;
-                        for &size in &chunk_sizes {
-                            chunk_offsets.push(current_offset);
-                            current_offset += size;
-                        }
+                info!("Random write detected: offset={}, size={}, file_size={}",
+                      offset, data_vec.len(), current_size);
 
-                        match runtime.block_on(async {
-                            // Reading entire file, so start_chunk_idx=0
-                            // Pass actual inode and offsets for proper byte-range caching
-                            client.read_data(&chunk_ids, &chunk_ids, 0, ino, &chunk_offsets).await
-                        }) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                error!("Failed to read existing data for random write at offset {} (file size {}): {}",
-                                       offset, current_size, e);
-                                reply.error(libc::EIO);
-                                return;
+                let write_end = offset + data_vec.len();
+
+                // Calculate which chunks are affected by this write
+                let chunk_ids = metadata.chunks.clone();
+                let chunk_sizes = metadata.chunk_sizes.clone();
+
+                if chunk_ids.is_empty() {
+                    // Empty file - just write the data
+                    (data_vec.clone(), false)
+                } else {
+                    // Find chunk range that overlaps with write range [offset, write_end)
+                    let mut chunk_start_offset = 0u64;
+                    let mut first_affected_chunk: Option<usize> = None;
+                    let mut last_affected_chunk: Option<usize> = None;
+
+                    for (idx, &chunk_size) in chunk_sizes.iter().enumerate() {
+                        let chunk_end_offset = chunk_start_offset + chunk_size;
+
+                        // Check if this chunk overlaps with write range
+                        if chunk_end_offset > offset as u64 && chunk_start_offset < write_end as u64 {
+                            if first_affected_chunk.is_none() {
+                                first_affected_chunk = Some(idx);
                             }
+                            last_affected_chunk = Some(idx);
                         }
+
+                        chunk_start_offset = chunk_end_offset;
+                    }
+
+                    // Check if we found affected chunks
+                    if first_affected_chunk.is_none() || last_affected_chunk.is_none() {
+                        // Write is beyond EOF - treat as append
+                        info!("Write beyond EOF, treating as append");
+                        (data_vec.clone(), true)
                     } else {
-                        Vec::new()
+                        let first_idx = first_affected_chunk.unwrap();
+                        let last_idx = last_affected_chunk.unwrap();
+
+                    info!("Random write affects chunks {}-{} (out of {} total)",
+                          first_idx, last_idx, chunk_ids.len());
+
+                    // Store affected range for metadata splice later
+                    affected_chunk_range = Some((first_idx, last_idx));
+
+                    // Read only the affected chunks
+                    let affected_chunk_ids: Vec<_> = chunk_ids[first_idx..=last_idx].to_vec();
+                    let affected_chunk_sizes: Vec<_> = chunk_sizes[first_idx..=last_idx].to_vec();
+
+                    // Calculate file offset of first affected chunk
+                    let first_chunk_file_offset: u64 = chunk_sizes[..first_idx].iter().sum();
+
+                    // Build chunk offsets for affected chunks only
+                    let mut chunk_offsets = Vec::with_capacity(affected_chunk_ids.len());
+                    let mut current_offset = first_chunk_file_offset;
+                    for &size in &affected_chunk_sizes {
+                        chunk_offsets.push(current_offset);
+                        current_offset += size;
+                    }
+
+                    let affected_data = match runtime.block_on(async {
+                        client.read_data(&affected_chunk_ids, &chunk_ids, first_idx, ino, &chunk_offsets).await
+                    }) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            error!("Failed to read affected chunks {}-{}: {}", first_idx, last_idx, e);
+                            reply.error(libc::EIO);
+                            return;
+                        }
                     };
 
-                let mut merged = existing_data;
-                if offset + data_vec.len() > merged.len() {
-                    merged.resize(offset + data_vec.len(), 0);
+                    // Calculate offset within the affected chunk range
+                    let write_offset_in_range = (offset as u64 - first_chunk_file_offset) as usize;
+                    let affected_data_len = affected_data.len();
+
+                    // Merge write data into affected chunks
+                    let mut merged = affected_data;
+                    if write_offset_in_range + data_vec.len() > merged.len() {
+                        merged.resize(write_offset_in_range + data_vec.len(), 0);
+                    }
+                    merged[write_offset_in_range..write_offset_in_range + data_vec.len()]
+                        .copy_from_slice(&data_vec);
+
+                    info!("Random write: read {} bytes from {} chunks, merged to {} bytes",
+                          affected_data_len, affected_chunk_ids.len(), merged.len());
+
+                        // Return merged data and metadata update strategy
+                        // We'll need to splice the new chunks into the metadata
+                        (merged, false)
+                    }
                 }
-                merged[offset..offset + data_vec.len()].copy_from_slice(&data_vec);
-                (merged, false)
             };
 
             // Write to cluster (only new/modified data for appends)
@@ -1244,9 +1306,15 @@ impl Filesystem for DfsFilesystem {
                     client.write_data_with_cache(&new_data, ino, current_size as u64).await
                 })
             } else {
-                // Rewrite: write entire file starting at offset 0
+                // Random write: write only the affected chunks
+                // Calculate file offset of first affected chunk for cache population
+                let write_file_offset = if let Some((first_idx, _)) = affected_chunk_range {
+                    metadata.chunk_sizes[..first_idx].iter().sum::<u64>()
+                } else {
+                    0
+                };
                 runtime.block_on(async {
-                    client.write_data_with_cache(&new_data, ino, 0).await
+                    client.write_data_with_cache(&new_data, ino, write_file_offset).await
                 })
             };
             let write_elapsed = write_start.elapsed();
@@ -1260,8 +1328,40 @@ impl Filesystem for DfsFilesystem {
                         metadata.chunks.extend(new_chunk_ids);
                         metadata.chunk_sizes.extend(new_chunk_sizes);
                         metadata.size = current_size as u64 + new_data.len() as u64;
+                    } else if let Some((first_idx, last_idx)) = affected_chunk_range {
+                        // Random write: splice new chunks into affected range
+                        // Keep chunks before affected range, insert new chunks, keep chunks after
+                        info!("Splicing {} new chunks into range {}-{} (was {} chunks)",
+                              new_chunk_ids.len(), first_idx, last_idx, last_idx - first_idx + 1);
+
+                        let mut updated_chunks = Vec::new();
+                        let mut updated_sizes = Vec::new();
+
+                        // Keep chunks before affected range
+                        updated_chunks.extend_from_slice(&metadata.chunks[..first_idx]);
+                        updated_sizes.extend_from_slice(&metadata.chunk_sizes[..first_idx]);
+
+                        // Insert new chunks
+                        updated_chunks.extend(new_chunk_ids);
+                        updated_sizes.extend(new_chunk_sizes);
+
+                        // Keep chunks after affected range (if any)
+                        if last_idx + 1 < metadata.chunks.len() {
+                            updated_chunks.extend_from_slice(&metadata.chunks[last_idx + 1..]);
+                            updated_sizes.extend_from_slice(&metadata.chunk_sizes[last_idx + 1..]);
+                        }
+
+                        metadata.chunks = updated_chunks;
+                        metadata.chunk_sizes = updated_sizes;
+
+                        // Recalculate total file size
+                        metadata.size = metadata.chunk_sizes.iter().sum();
+
+                        info!("After splice: {} total chunks, {} total bytes",
+                              metadata.chunks.len(), metadata.size);
                     } else {
-                        // Rewrite: replace all chunks
+                        // Full rewrite (shouldn't happen with current logic, but keep as fallback)
+                        warn!("Full file rewrite with {} bytes", new_data.len());
                         metadata.chunks = new_chunk_ids;
                         metadata.chunk_sizes = new_chunk_sizes;
                         metadata.size = new_data.len() as u64;
@@ -1745,55 +1845,94 @@ impl Filesystem for DfsFilesystem {
                     metadata.chunks = Vec::new();
                     metadata.chunk_sizes = Vec::new();
                     metadata.size = 0;
+                } else if new_size > metadata.size {
+                    // Growing file - just update metadata to extend with zeros
+                    // No need to read existing data, just keep existing chunks
+                    info!("Truncate growing: {} -> {} bytes (keeping {} chunks)",
+                          metadata.size, new_size, metadata.chunks.len());
+                    metadata.size = new_size;
+                    // Note: The chunks stay the same, reads beyond will return zeros via FUSE
                 } else {
-                    // Read existing data for partial truncate
-                    let existing_data = if !metadata.chunks.is_empty() {
-                        let chunk_ids = metadata.chunks.clone();
+                    // Shrinking file - only read chunks up to new_size
+                    // CRITICAL FIX: Don't read entire file for truncate!
+                    info!("Truncate shrinking: {} -> {} bytes", metadata.size, new_size);
+
+                    if metadata.chunks.is_empty() {
+                        metadata.size = new_size;
+                    } else {
                         let chunk_sizes = metadata.chunk_sizes.clone();
 
-                        // Build chunk offsets for byte-range caching
-                        let mut chunk_offsets = Vec::with_capacity(chunk_ids.len());
-                        let mut current_offset = 0u64;
-                        for &size in &chunk_sizes {
-                            chunk_offsets.push(current_offset);
-                            current_offset += size;
-                        }
+                        // Find which chunks we need to keep (up to new_size)
+                        let mut cumulative_size = 0u64;
+                        let mut last_chunk_idx = 0;
+                        let mut bytes_in_last_chunk = 0u64;
 
-                        match self.block_on(async {
-                            // Reading entire file for truncate, start_chunk_idx=0
-                            // Pass actual inode and offsets for proper byte-range caching
-                            client.read_data(&chunk_ids, &chunk_ids, 0, ino, &chunk_offsets).await
-                        }) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                error!("Failed to read existing data for truncate: {}", e);
-                                reply.error(libc::EIO);
-                                return;
+                        for (idx, &size) in chunk_sizes.iter().enumerate() {
+                            if cumulative_size + size <= new_size {
+                                // Entire chunk is kept
+                                cumulative_size += size;
+                                last_chunk_idx = idx;
+                            } else if cumulative_size < new_size {
+                                // This chunk is partially kept
+                                bytes_in_last_chunk = new_size - cumulative_size;
+                                last_chunk_idx = idx;
+                                break;
+                            } else {
+                                break;
                             }
                         }
-                    } else {
-                        Vec::new()
-                    };
 
-                    // Resize data
-                    let mut new_data = existing_data;
-                    new_data.resize(new_size as usize, 0);
+                        if bytes_in_last_chunk > 0 {
+                            // Need to read and truncate the last partial chunk
+                            info!("Truncate: keeping {} full chunks, truncating chunk {} to {} bytes",
+                                  last_chunk_idx, last_chunk_idx, bytes_in_last_chunk);
 
-                    // Write back
-                    let result = self.block_on(async {
-                        client.write_data(&new_data).await
-                    });
+                            let chunk_id = metadata.chunks[last_chunk_idx];
+                            let chunk_offset: u64 = chunk_sizes[..last_chunk_idx].iter().sum();
 
-                    match result {
-                        Ok((chunk_ids, chunk_sizes)) => {
-                            metadata.chunks = chunk_ids;
-                            metadata.chunk_sizes = chunk_sizes;
+                            // Read only the last partial chunk
+                            let last_chunk_data = match self.block_on(async {
+                                client.read_data(&[chunk_id], &metadata.chunks, last_chunk_idx, ino, &[chunk_offset]).await
+                            }) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    error!("Failed to read last chunk for truncate: {}", e);
+                                    reply.error(libc::EIO);
+                                    return;
+                                }
+                            };
+
+                            // Truncate the chunk data
+                            let truncated_chunk = &last_chunk_data[..bytes_in_last_chunk as usize];
+
+                            // Write back the truncated chunk
+                            match self.block_on(async {
+                                client.write_data_with_cache(truncated_chunk, ino, chunk_offset).await
+                            }) {
+                                Ok((new_chunk_ids, new_chunk_sizes)) => {
+                                    // Keep chunks before last, add truncated chunk
+                                    let mut new_all_chunks = metadata.chunks[..last_chunk_idx].to_vec();
+                                    new_all_chunks.extend(new_chunk_ids);
+
+                                    let mut new_all_sizes = metadata.chunk_sizes[..last_chunk_idx].to_vec();
+                                    new_all_sizes.extend(new_chunk_sizes);
+
+                                    metadata.chunks = new_all_chunks;
+                                    metadata.chunk_sizes = new_all_sizes;
+                                    metadata.size = new_size;
+                                }
+                                Err(e) => {
+                                    error!("Failed to write truncated chunk: {}", e);
+                                    reply.error(libc::EIO);
+                                    return;
+                                }
+                            }
+                        } else {
+                            // All chunks are complete, just drop the ones after
+                            info!("Truncate: keeping {} full chunks, dropping rest", last_chunk_idx + 1);
+                            metadata.chunks.truncate(last_chunk_idx + 1);
+                            metadata.chunk_sizes.truncate(last_chunk_idx + 1);
                             metadata.size = new_size;
-                        }
-                        Err(e) => {
-                            error!("Failed to write truncated data: {}", e);
-                            reply.error(libc::EIO);
-                            return;
                         }
                     }
                 }

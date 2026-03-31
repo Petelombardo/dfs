@@ -19,11 +19,19 @@ struct ByteRangeCacheKey {
     file_offset: u64,
 }
 
-/// Cached chunk data with metadata
+/// Cached chunk data with metadata and TTL
 #[derive(Debug, Clone)]
 struct CachedChunk {
     data: Arc<Vec<u8>>,
     chunk_size: usize,
+    cached_at: std::time::Instant,
+}
+
+impl CachedChunk {
+    /// Check if this cached chunk has expired (TTL: 30 seconds)
+    fn is_expired(&self) -> bool {
+        self.cached_at.elapsed() > std::time::Duration::from_secs(30)
+    }
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -73,47 +81,53 @@ impl DfsClient {
             anyhow::bail!("No cluster nodes provided");
         }
 
-        // Initialize LRU cache with dynamic sizing based on available system memory
-        // For memory-constrained systems (<2GB), use conservative limits to prevent OOM
-        // Target: 8% of available RAM for chunk cache, 5% for byte-range cache
-        // min 10 chunks (~40MB), max 1000 chunks (~4GB)
+        // Initialize LRU cache with CONSERVATIVE limits to prevent OOM on large sequential reads
+        // CRITICAL: Both chunk_cache and byte_range_cache store the SAME data (doubled memory usage!)
+        // Target: 2-3% of available RAM per cache (~128-256MB total at 4MB chunks)
+        // min 8 chunks (~32MB), max 64 chunks (~256MB) PER CACHE
         let available_mb = dfs_common::get_available_memory()
             .map(|bytes| bytes / (1024 * 1024))
             .unwrap_or(1024);
 
+        // Check for environment variable override
+        let max_chunks = std::env::var("DFS_MAX_CACHE_CHUNKS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(64); // Conservative default: 64 chunks = 256MB per cache
+
         let (chunk_target_pct, byte_target_pct, min_chunks) = if available_mb < 1536 {
             // Low memory systems (<1.5GB available): very conservative
-            // chunk: 8%, byte: 5%, min 10 chunks (40MB + 40MB = 80MB total max)
-            (8, 5, 10)
+            // chunk: 2%, byte: 2%, min 8 chunks (32MB + 32MB = 64MB total)
+            (2, 2, 8)
         } else {
-            // Normal systems: more aggressive caching
-            // chunk: 15%, byte: 15%, min 50 chunks
-            (15, 15, 50)
+            // Normal systems: still conservative to prevent OOM
+            // chunk: 3%, byte: 3%, min 16 chunks
+            (3, 3, 16)
         };
 
         let cache_capacity = dfs_common::calculate_cache_capacity(
             4 * 1024 * 1024, // 4MB chunk size
             chunk_target_pct,
             min_chunks,
-            1000, // max 1000 chunks (~4GB)
+            max_chunks,
         )
         .unwrap_or_else(|e| {
-            tracing::warn!("Failed to calculate cache capacity: {}, using default of 256 chunks", e);
-            NonZeroUsize::new(256).unwrap()
+            tracing::warn!("Failed to calculate cache capacity: {}, using default of 32 chunks", e);
+            NonZeroUsize::new(32).unwrap()
         });
 
         let cache = LruCache::new(cache_capacity);
 
-        // Byte-range cache uses lower percentage on constrained systems
+        // Byte-range cache uses same conservative limits (both caches hold same data!)
         let byte_cache_capacity = dfs_common::calculate_cache_capacity(
             4 * 1024 * 1024, // 4MB chunk size
             byte_target_pct,
             min_chunks,
-            1000,
+            max_chunks,
         )
         .unwrap_or_else(|e| {
             tracing::warn!("Failed to calculate byte-range cache capacity: {}, using default", e);
-            NonZeroUsize::new(min_chunks).unwrap()
+            NonZeroUsize::new(16).unwrap()
         });
 
         let byte_range_cache = LruCache::new(byte_cache_capacity);
@@ -326,11 +340,20 @@ impl DfsClient {
 
                     if let Some((key, data)) = matching_cached_chunk {
                         // Now actually get it to update LRU order
-                        byte_cache.get(&key);
-                        info!("Byte-range cache HIT for inode={} offset={} (found in cached chunk at offset={})",
-                              inode, requested_offset, key.file_offset);
-                        cached_chunks.push((idx, data));
-                        found = true;
+                        if let Some(cached) = byte_cache.get(&key) {
+                            // Check if expired (TTL: 30 seconds)
+                            if cached.is_expired() {
+                                info!("Byte-range cache EXPIRED for inode={} offset={} (age: {:?})",
+                                      inode, requested_offset, cached.cached_at.elapsed());
+                                // Remove expired entry
+                                byte_cache.pop(&key);
+                            } else {
+                                info!("Byte-range cache HIT for inode={} offset={} (found in cached chunk at offset={})",
+                                      inode, requested_offset, key.file_offset);
+                                cached_chunks.push((idx, data));
+                                found = true;
+                            }
+                        }
                     }
                 }
 
@@ -465,6 +488,7 @@ impl DfsClient {
                 let cached = CachedChunk {
                     data: Arc::clone(&data_arc),
                     chunk_size: data_arc.len(),
+                    cached_at: std::time::Instant::now(),
                 };
                 byte_cache.put(key, cached);
                 info!("Byte-range cached: inode={} offset={} ({} bytes)", inode, file_offset, data_arc.len());
@@ -528,22 +552,21 @@ impl DfsClient {
 
             drop(history); // Release lock before spawning tasks
 
-            // Enable aggressive prefetching for sequential reads (DVR playback)
-            // With tiny variable-sized chunks (MPEG-TS packets), caching can't help much
-            // Prefetching is essential for smooth playback
+            // Enable moderate prefetching for sequential reads (DVR playback)
+            // Reduced prefetch to prevent OOM - keep buffer small
+            // Target: ~32-64MB of prefetch buffer (was ~256KB-512MB)
             if is_sequential {
                 // Adaptive prefetch distance based on chunk count
-                // More chunks = smaller chunk sizes = need more prefetch
-                // Target: ~256KB of prefetch buffer
+                // REDUCED from 64/32/16 to 8/4/2 to prevent OOM
                 let prefetch_distance = if all_file_chunks.len() > 500 {
-                    // Many tiny chunks (MPEG-TS): prefetch 64 chunks (~192KB)
-                    64
+                    // Many tiny chunks (MPEG-TS): prefetch 8 chunks (~24KB)
+                    8
                 } else if all_file_chunks.len() > 100 {
-                    // Medium chunks: prefetch 32 chunks
-                    32
+                    // Medium chunks: prefetch 4 chunks
+                    4
                 } else {
-                    // Large chunks: prefetch 16 chunks
-                    16
+                    // Large chunks: prefetch 2 chunks (~8MB)
+                    2
                 };
 
                 info!("Prefetch: detected sequential pattern at chunk {}/{}, prefetching next {} chunks",
@@ -689,15 +712,15 @@ impl DfsClient {
         // Determine which chunks to warm
         let (start_idx, end_idx) = if let Some(offset) = current_offset {
             // Smart warming: only warm chunks ahead of current read position
-            // Warm next 64 chunks (128MB at 2MB/chunk = ~3 seconds at 40MB/s)
-            // This covers the 32-chunk prefetch window + 32 chunks buffer
+            // Warm next 16 chunks (32MB at 2MB/chunk = ~1 second at 32MB/s)
+            // Reduced from 64 to prevent cache thrashing and OOM
             let current_chunk_idx = (offset / chunk_size) as usize;
             let start = current_chunk_idx.min(chunk_ids.len());
-            let end = (current_chunk_idx + 64).min(chunk_ids.len());
+            let end = (current_chunk_idx + 16).min(chunk_ids.len());
             (start, end)
         } else {
-            // No offset provided, warm first 64 chunks (for new file opens)
-            (0, 64.min(chunk_ids.len()))
+            // No offset provided, warm first 16 chunks (for new file opens)
+            (0, 16.min(chunk_ids.len()))
         };
 
         if start_idx >= end_idx {
@@ -891,6 +914,7 @@ impl DfsClient {
                 let cached = CachedChunk {
                     data: Arc::new(chunk_data),
                     chunk_size: chunk_size as usize,
+                    cached_at: std::time::Instant::now(),
                 };
                 byte_cache.put(key, cached);
                 info!("Write-through cached: inode={} offset={} ({} bytes)", inode, current_offset, chunk_size);

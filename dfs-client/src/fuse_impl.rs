@@ -975,11 +975,11 @@ impl Filesystem for DfsFilesystem {
                                     let buffer_data: Option<(Vec<u8>, u64)> = {
                                         let mut buffers = write_buffers.lock().await;
                                         if let Some(buffer) = buffers.get_mut(&ino) {
-                                            let data: Vec<u8> = buffer.data.clone();
+                                            // Use mem::take to move data without cloning (prevents memory leak)
+                                            let data: Vec<u8> = std::mem::take(&mut buffer.data);
                                             let start: u64 = buffer.start_offset;
-                                            // Clear buffer for new writes, update start offset
+                                            // Update start offset for new writes
                                             let new_start = start + data.len() as u64;
-                                            buffer.data.clear();
                                             buffer.start_offset = new_start;
                                             buffer.last_modified = SystemTime::now();
                                             Some((data, start))

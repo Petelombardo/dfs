@@ -11,7 +11,18 @@ use dfs_common::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+/// Cached storage statistics to avoid expensive stat calls
+#[derive(Clone)]
+struct StorageStatsCache {
+    total_chunks: usize,
+    total_space: u64,
+    free_space: u64,
+    available_space: u64,
+    timestamp: std::time::Instant,
+}
 
 /// Main server context holding all components
 /// This is the core of the DFS node
@@ -36,6 +47,9 @@ pub struct Server {
 
     /// Metadata directory path for persisting peer list
     metadata_dir: PathBuf,
+
+    /// Storage stats cache with 10-second TTL
+    storage_stats_cache: Arc<RwLock<Option<StorageStatsCache>>>,
 }
 
 impl Server {
@@ -56,6 +70,7 @@ impl Server {
             client: Arc::new(NetworkClient::new()),
             replication_factor,
             metadata_dir,
+            storage_stats_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -935,42 +950,82 @@ impl Server {
     async fn handle_get_storage_stats(&self) -> Response {
         debug!("Handling get storage stats");
 
-        match self.storage.list_chunks() {
-            Ok(chunks) => {
-                let nodes_count = self.cluster.get_all_nodes().await.len();
+        const CACHE_TTL_SECS: u64 = 10;
 
-                // Get filesystem statistics (fast - just statvfs syscall)
-                let (total_space, free_space, available_space) = self.storage.get_filesystem_stats()
-                    .unwrap_or((0, 0, 0));
+        // Check cache first
+        {
+            let cache_read = self.storage_stats_cache.read().await;
+            if let Some(cached) = cache_read.as_ref() {
+                if cached.timestamp.elapsed().as_secs() < CACHE_TTL_SECS {
+                    debug!("Storage stats cache HIT (age: {}s)", cached.timestamp.elapsed().as_secs());
+                    let nodes_count = self.cluster.get_all_nodes().await.len();
+                    let total_size = cached.total_space.saturating_sub(cached.available_space);
 
-                // Calculate total_size as used space on filesystem
-                // This is much faster than reading every chunk!
-                let total_size = total_space.saturating_sub(available_space);
-
-                // Update local node's capacity for placement decisions
-                self.cluster.update_node_capacity(
-                    self.cluster.local_node_id(),
-                    available_space,
-                    total_space
-                ).await;
-
-                Response::StorageStats {
-                    total_chunks: chunks.len(),
-                    total_size,
-                    replication_factor: self.replication_factor,
-                    nodes_count,
-                    total_space,
-                    free_space,
-                    available_space,
+                    return Response::StorageStats {
+                        total_chunks: cached.total_chunks,
+                        total_size,
+                        replication_factor: self.replication_factor,
+                        nodes_count,
+                        total_space: cached.total_space,
+                        free_space: cached.free_space,
+                        available_space: cached.available_space,
+                    };
                 }
             }
+        }
+
+        // Cache miss - calculate stats
+        debug!("Storage stats cache MISS");
+
+        let nodes_count = self.cluster.get_all_nodes().await.len();
+
+        // Get filesystem statistics (fast - just statvfs syscall)
+        let (total_space, free_space, available_space) = match self.storage.get_filesystem_stats() {
+            Ok(stats) => stats,
             Err(e) => {
                 warn!("Failed to get storage stats: {}", e);
-                Response::Error {
+                return Response::Error {
                     message: format!("Failed to get storage stats: {}", e),
                     code: ErrorCode::InternalError,
-                }
+                };
             }
+        };
+
+        // Calculate total_size as used space on filesystem
+        let total_size = total_space.saturating_sub(available_space);
+
+        // Update local node's capacity for placement decisions
+        self.cluster.update_node_capacity(
+            self.cluster.local_node_id(),
+            available_space,
+            total_space
+        ).await;
+
+        // Estimate chunk count from used space (4MB chunks)
+        // This avoids expensive list_chunks() call for statfs queries
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let total_chunks = (total_size / CHUNK_SIZE) as usize;
+
+        // Update cache
+        {
+            let mut cache_write = self.storage_stats_cache.write().await;
+            *cache_write = Some(StorageStatsCache {
+                total_chunks,
+                total_space,
+                free_space,
+                available_space,
+                timestamp: std::time::Instant::now(),
+            });
+        }
+
+        Response::StorageStats {
+            total_chunks,
+            total_size,
+            replication_factor: self.replication_factor,
+            nodes_count,
+            total_space,
+            free_space,
+            available_space,
         }
     }
 

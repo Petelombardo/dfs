@@ -74,13 +74,27 @@ impl DfsClient {
         }
 
         // Initialize LRU cache with dynamic sizing based on available system memory
-        // Target: 15% of available RAM (slightly higher than server since client is single-purpose)
-        // min 50 chunks (~200MB), max 1000 chunks (~4GB)
-        // This prevents OOM on memory-constrained SBCs while maximizing cache on larger systems
+        // For memory-constrained systems (<2GB), use conservative limits to prevent OOM
+        // Target: 8% of available RAM for chunk cache, 5% for byte-range cache
+        // min 10 chunks (~40MB), max 1000 chunks (~4GB)
+        let available_mb = dfs_common::get_available_memory()
+            .map(|bytes| bytes / (1024 * 1024))
+            .unwrap_or(1024);
+
+        let (chunk_target_pct, byte_target_pct, min_chunks) = if available_mb < 1536 {
+            // Low memory systems (<1.5GB available): very conservative
+            // chunk: 8%, byte: 5%, min 10 chunks (40MB + 40MB = 80MB total max)
+            (8, 5, 10)
+        } else {
+            // Normal systems: more aggressive caching
+            // chunk: 15%, byte: 15%, min 50 chunks
+            (15, 15, 50)
+        };
+
         let cache_capacity = dfs_common::calculate_cache_capacity(
             4 * 1024 * 1024, // 4MB chunk size
-            15,   // 15% of available memory (higher than server since client-focused)
-            50,   // min 50 chunks (~200MB)
+            chunk_target_pct,
+            min_chunks,
             1000, // max 1000 chunks (~4GB)
         )
         .unwrap_or_else(|e| {
@@ -90,8 +104,19 @@ impl DfsClient {
 
         let cache = LruCache::new(cache_capacity);
 
-        // Byte-range cache uses same capacity as chunk cache
-        let byte_range_cache = LruCache::new(cache_capacity);
+        // Byte-range cache uses lower percentage on constrained systems
+        let byte_cache_capacity = dfs_common::calculate_cache_capacity(
+            4 * 1024 * 1024, // 4MB chunk size
+            byte_target_pct,
+            min_chunks,
+            1000,
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to calculate byte-range cache capacity: {}, using default", e);
+            NonZeroUsize::new(min_chunks).unwrap()
+        });
+
+        let byte_range_cache = LruCache::new(byte_cache_capacity);
 
         // Replica location cache: 128 entries (3x prefetch window)
         // Small cache for fast lookups and minimal lock contention
@@ -1169,13 +1194,16 @@ impl DfsClient {
             tasks.push(task);
         }
 
-        // Wait for all queries to complete
+        // Wait for ALL queries to complete in parallel (not sequentially!)
+        // Use join_all to await all futures concurrently
+        let results = futures::future::join_all(tasks).await;
+
         let mut total_raw_space = 0u64;
         let mut node_capacities: Vec<(u64, u64)> = Vec::new(); // (total, available) per node
         let mut replication_factor = None;
 
-        for task in tasks {
-            if let Ok(Ok(Some((total, free, avail, rf)))) = task.await {
+        for result in results {
+            if let Ok(Ok(Some((total, _free, avail, rf)))) = result {
                 total_raw_space += total;
                 node_capacities.push((total, avail));
                 if replication_factor.is_none() {

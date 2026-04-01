@@ -566,26 +566,87 @@ impl Filesystem for DfsFilesystem {
             // Check write buffer first if write-behind buffering is enabled
             // This enables "live rewind" - reading while writing without waiting for backend
             if write_buffer_enabled {
-                let write_buffers_lock = write_buffers.lock().await;
-                if let Some(buffer) = write_buffers_lock.get(&ino) {
-                    let buffer_start = buffer.start_offset as usize;
-                    let buffer_end = buffer_start + buffer.data.len();
+                // Check if read overlaps with write buffer
+                let should_flush_buffer = {
+                    let buffers_lock = write_buffers.lock().await;
+                    if let Some(buffer) = buffers_lock.get(&ino) {
+                        let buffer_start = buffer.start_offset as usize;
+                        let buffer_end = buffer_start + buffer.data.len();
+                        let read_end = offset + size;
 
-                    // Check if read is entirely within the write buffer range
-                    if offset >= buffer_start && offset < buffer_end {
-                        let buffer_relative_offset = offset - buffer_start;
-                        let end_offset = std::cmp::min(buffer_relative_offset + size, buffer.data.len());
-                        let data = buffer.data[buffer_relative_offset..end_offset].to_vec();
+                        // If read is entirely within buffer, serve it directly
+                        if offset >= buffer_start && read_end <= buffer_end {
+                            let buffer_relative_offset = offset - buffer_start;
+                            let data = buffer.data[buffer_relative_offset..buffer_relative_offset + size].to_vec();
 
-                        info!("FUSE read from write buffer: ino={}, offset={}, size={}, buffer_hit={} bytes, buffer_range=[{}, {})",
-                              ino, offset, size, data.len(), buffer_start, buffer_end);
+                            info!("FUSE read from write buffer: ino={}, offset={}, size={}, buffer_range=[{}, {})",
+                                  ino, offset, size, buffer_start, buffer_end);
 
-                        let elapsed = start.elapsed();
-                        info!("FUSE read COMPLETE (write buffer): ino={}, offset={}, size={}, took {:?}",
-                              ino, offset, size, elapsed);
+                            let elapsed = start.elapsed();
+                            info!("FUSE read COMPLETE (write buffer): ino={}, offset={}, size={}, took {:?}",
+                                  ino, offset, size, elapsed);
 
-                        reply.data(&data);
-                        return;
+                            reply.data(&data);
+                            return;
+                        }
+
+                        // If read is CLOSE to end of buffer (within 64KB), flush to avoid short reads
+                        // This prevents garbled video from partial reads when watching live TV
+                        if offset >= buffer_start && offset < buffer_end {
+                            let distance_to_buffer_end = buffer_end - offset;
+                            if distance_to_buffer_end < 65536 {  // Within 64KB of write position
+                                info!("FUSE read near buffer end: ino={}, offset={}, distance={} bytes, buffer_range=[{}, {}), flushing buffer",
+                                      ino, offset, distance_to_buffer_end, buffer_start, buffer_end);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                // Flush buffer if needed (outside the lock to avoid deadlock)
+                if should_flush_buffer {
+                    info!("Flushing write buffer for ino={} due to boundary read", ino);
+                    let buffer_opt = {
+                        let mut buffers = write_buffers.lock().await;
+                        buffers.remove(&ino)
+                    };
+
+                    if let Some(buffer) = buffer_opt {
+                        let buffer_start = buffer.start_offset;
+                        let buffer_size = buffer.data.len();
+
+                        // Write buffered data
+                        match client.write_data_with_cache(&buffer.data, ino, buffer_start).await {
+                            Ok((new_chunk_ids, new_chunk_sizes)) => {
+                                let new_size = buffer_start + buffer_size as u64;
+
+                                // Update metadata
+                                let mut meta = metadata_cache.read().unwrap().get(&ino).cloned();
+                                if let Some(mut m) = meta {
+                                    m.chunks.extend(new_chunk_ids);
+                                    m.chunk_sizes.extend(new_chunk_sizes);
+                                    m.size = new_size;
+                                    m.modified_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+                                    if let Err(e) = client.put_file_metadata(&m).await {
+                                        error!("Failed to update metadata after boundary flush: {}", e);
+                                    } else {
+                                        metadata_cache.write().unwrap().insert(ino, m.clone());
+                                        metadata = m;  // Use updated metadata for read
+                                        info!("Flushed {} bytes at offset {}, new size {}", buffer_size, buffer_start, new_size);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to flush buffer for boundary read: {}", e);
+                            }
+                        }
                     }
                 }
             }

@@ -14,10 +14,23 @@ pub struct MetadataStore {
 impl MetadataStore {
     /// Create a new metadata store
     pub fn new(metadata_dir: PathBuf) -> Result<Self> {
-        let db = sled::open(&metadata_dir)
+        // Configure Sled with memory limits to prevent unbounded cache growth
+        // Default cache can grow to multiple GB even for small databases
+        let cache_capacity_mb = std::env::var("DFS_METADATA_CACHE_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(128); // Default 128MB cache
+
+        let cache_capacity_bytes = cache_capacity_mb * 1024 * 1024;
+
+        let db = sled::Config::new()
+            .path(&metadata_dir)
+            .cache_capacity(cache_capacity_bytes)
+            .flush_every_ms(Some(1000))  // Flush every second for durability
+            .open()
             .with_context(|| format!("Failed to open metadata database at {:?}", metadata_dir))?;
 
-        info!("Initialized metadata store at {:?}", metadata_dir);
+        info!("Initialized metadata store at {:?} (cache: {}MB)", metadata_dir, cache_capacity_mb);
 
         Ok(Self { db })
     }

@@ -1511,14 +1511,28 @@ impl Filesystem for DfsFilesystem {
                         .unwrap()
                         .as_secs();
 
-                    // Batch metadata updates: only update every 10 writes
-                    let count = {
-                        let mut counters = write_counters.write().unwrap();
-                        let c = counters.entry(ino).or_insert(0);
-                        *c += 1;
-                        *c
+                    // Check if this is a SQLite database file - they need immediate metadata updates
+                    let is_sqlite_db = {
+                        let path = &metadata.path;
+                        path.ends_with(".db") || path.ends_with(".sqlite") ||
+                            path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
+                            path.ends_with(".db-journal") || path.ends_with(".db-shm")
                     };
-                    let should_update = count % 10 == 0;
+
+                    // Batch metadata updates for non-SQLite files: only update every 10 writes
+                    // For SQLite files: ALWAYS update immediately to prevent corruption
+                    let (should_update, count) = if is_sqlite_db {
+                        debug!("SQLite database detected - forcing immediate metadata update for ino={}", ino);
+                        (true, 0) // Always update, count doesn't matter
+                    } else {
+                        let count = {
+                            let mut counters = write_counters.write().unwrap();
+                            let c = counters.entry(ino).or_insert(0);
+                            *c += 1;
+                            *c
+                        };
+                        (count % 10 == 0, count)
+                    };
 
                     if should_update {
                         // Store updated metadata
@@ -1528,7 +1542,11 @@ impl Filesystem for DfsFilesystem {
                             client.put_file_metadata(&metadata_clone).await
                         });
                         let metadata_elapsed = metadata_start.elapsed();
-                        debug!("put_file_metadata took {:?} (batched at write #{})", metadata_elapsed, count);
+                        if is_sqlite_db {
+                            debug!("put_file_metadata took {:?} (SQLite immediate update)", metadata_elapsed);
+                        } else {
+                            debug!("put_file_metadata took {:?} (batched at write #{})", metadata_elapsed, count);
+                        }
 
                         match update_result {
                             Ok(_) => {
@@ -1576,6 +1594,7 @@ impl Filesystem for DfsFilesystem {
         let write_buffers = self.write_buffers.clone();
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
+        let write_counters = self.write_counters.clone();
         let runtime = self.runtime.clone();
 
         // Spawn flush operation on tokio's blocking thread pool
@@ -1646,7 +1665,40 @@ impl Filesystem for DfsFilesystem {
                     }
                 }
             } else {
-                reply.ok();
+                // No write buffer, but we still need to flush any pending metadata updates
+                // that were batched by the write() path to ensure data durability
+                let result = runtime.block_on(async {
+                    // Get metadata from cache
+                    let metadata_opt = {
+                        let cache = metadata_cache.read().unwrap();
+                        cache.get(&ino).cloned()
+                    };
+
+                    if let Some(metadata) = metadata_opt {
+                        // Check if there are pending writes
+                        let has_pending = {
+                            let counters = write_counters.read().unwrap();
+                            counters.get(&ino).map(|c| *c > 0).unwrap_or(false)
+                        };
+
+                        if has_pending {
+                            debug!("flush: flushing pending metadata for ino={}", ino);
+                            client.put_file_metadata(&metadata).await?;
+                            // Reset write counter after successful metadata flush
+                            write_counters.write().unwrap().insert(ino, 0);
+                        }
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                });
+
+                match result {
+                    Ok(_) => reply.ok(),
+                    Err(e) => {
+                        error!("Failed to flush metadata for inode {}: {}", ino, e);
+                        reply.error(libc::EIO);
+                    }
+                }
             }
         });
     }
@@ -1689,8 +1741,31 @@ impl Filesystem for DfsFilesystem {
                 }
             }
         } else {
-            // No write buffer, just release locks
+            // No write buffer, but flush any pending metadata updates before releasing locks
+            let client = self.client.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let write_counters = self.write_counters.clone();
+
             let result = self.block_on(async {
+                // Flush pending metadata if any
+                let metadata_opt = {
+                    let cache = metadata_cache.read().unwrap();
+                    cache.get(&ino).cloned()
+                };
+
+                if let Some(metadata) = metadata_opt {
+                    let has_pending = {
+                        let counters = write_counters.read().unwrap();
+                        counters.get(&ino).map(|c| *c > 0).unwrap_or(false)
+                    };
+
+                    if has_pending {
+                        debug!("release: flushing pending metadata for ino={}", ino);
+                        client.put_file_metadata(&metadata).await?;
+                        write_counters.write().unwrap().insert(ino, 0);
+                    }
+                }
+
                 // Release locks if lock_owner is provided
                 if let Some(owner) = lock_owner {
                     lock_manager.release_all(ino, owner).await?;
@@ -1701,7 +1776,7 @@ impl Filesystem for DfsFilesystem {
             match result {
                 Ok(_) => reply.ok(),
                 Err(e) => {
-                    error!("Failed to release locks for inode {}: {}", ino, e);
+                    error!("Failed to flush/release locks for inode {}: {}", ino, e);
                     reply.error(libc::EIO);
                 }
             }
@@ -2236,8 +2311,44 @@ impl Filesystem for DfsFilesystem {
                 }
             }
         } else {
-            // No buffering, data is already synced
-            reply.ok();
+            // No write buffer, but we still need to flush any pending metadata updates
+            // that were batched by the write() path to ensure data durability
+            let client = self.client.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let write_counters = self.write_counters.clone();
+
+            let result = self.block_on(async {
+                // Get metadata from cache
+                let metadata_opt = {
+                    let cache = metadata_cache.read().unwrap();
+                    cache.get(&ino).cloned()
+                };
+
+                if let Some(metadata) = metadata_opt {
+                    // Check if there are pending writes
+                    let has_pending = {
+                        let counters = write_counters.read().unwrap();
+                        counters.get(&ino).map(|c| *c > 0).unwrap_or(false)
+                    };
+
+                    if has_pending {
+                        debug!("fsync: flushing pending metadata for ino={}", ino);
+                        client.put_file_metadata(&metadata).await?;
+                        // Reset write counter after successful metadata flush
+                        write_counters.write().unwrap().insert(ino, 0);
+                    }
+                }
+
+                Ok::<(), anyhow::Error>(())
+            });
+
+            match result {
+                Ok(_) => reply.ok(),
+                Err(e) => {
+                    error!("Failed to flush metadata on fsync for inode {}: {}", ino, e);
+                    reply.error(libc::EIO);
+                }
+            }
         }
     }
 

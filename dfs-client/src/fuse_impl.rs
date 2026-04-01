@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::client::DfsClient;
+use crate::locks::LockManager;
 
 /// Buffered write data for a single file
 #[derive(Clone)]
@@ -81,6 +82,9 @@ pub struct DfsFilesystem {
     /// Filesystem stats cache: (total, free, avail, timestamp)
     /// Cache statfs results for 30 seconds to avoid repeated expensive queries
     statfs_cache: Arc<RwLock<Option<(u64, u64, u64, std::time::Instant)>>>,
+
+    /// Lock manager for byte-range locks
+    lock_manager: Arc<LockManager>,
 }
 
 impl DfsFilesystem {
@@ -219,6 +223,7 @@ impl DfsFilesystem {
             last_chunk_cache: Arc::new(RwLock::new(None)),
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
             statfs_cache: Arc::new(RwLock::new(None)),
+            lock_manager: Arc::new(LockManager::new()),
         })
     }
 
@@ -410,6 +415,27 @@ impl DfsFilesystem {
 }
 
 impl Filesystem for DfsFilesystem {
+    fn init(
+        &mut self,
+        _req: &FuseRequest,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        info!("Initializing DFS filesystem");
+
+        // Enable POSIX file locking - tell kernel to use our setlk/getlk implementations
+        // instead of handling locks in the kernel
+        match config.add_capabilities(fuser::consts::FUSE_POSIX_LOCKS) {
+            Ok(()) => {
+                info!("FUSE_POSIX_LOCKS capability enabled");
+                Ok(())
+            }
+            Err(_) => {
+                error!("Failed to enable FUSE_POSIX_LOCKS capability");
+                Err(libc::EIO)
+            }
+        }
+    }
+
     fn lookup(&mut self, _req: &FuseRequest, parent: u64, name: &OsStr, reply: ReplyEntry) {
         debug!("lookup: parent={}, name={:?}", parent, name);
 
@@ -475,9 +501,32 @@ impl Filesystem for DfsFilesystem {
     fn open(&mut self, _req: &FuseRequest, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         info!("open: ino={}", ino);
 
-        // Return success with file handle 0 and NO direct_io flag
-        // This tells the kernel to use page cache for reads
-        reply.opened(0, fuser::consts::FOPEN_KEEP_CACHE);
+        // Check if this is a SQLite database file by looking up its path
+        let is_sqlite = {
+            let cache = self.metadata_cache.read().unwrap();
+            if let Some(metadata) = cache.get(&ino) {
+                let path = &metadata.path;
+                // SQLite database files need direct I/O to avoid cache coherency issues
+                path.ends_with(".db")
+                    || path.ends_with(".sqlite")
+                    || path.ends_with(".sqlite3")
+                    || path.ends_with(".db-wal")
+                    || path.ends_with(".db-journal")
+                    || path.ends_with(".db-shm")
+            } else {
+                false
+            }
+        };
+
+        if is_sqlite {
+            // For SQLite files: Use direct I/O to bypass page cache
+            // This ensures lock consistency and prevents cache coherency issues
+            info!("open: ino={} - SQLite database detected, using direct I/O", ino);
+            reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
+        } else {
+            // For regular files: Use page cache for better performance
+            reply.opened(0, fuser::consts::FOPEN_KEEP_CACHE);
+        }
     }
 
     fn getattr(&mut self, _req: &FuseRequest, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -754,8 +803,26 @@ impl Filesystem for DfsFilesystem {
                 .map(|(_, chunk_start, _)| *chunk_start as u64)
                 .collect();
 
+            // For SQLite database files, disable caching by passing inode=0
+            // This prevents stale cached data from causing corruption
+            let cache_inode = {
+                let path = &metadata.path;
+                let is_sqlite = path.ends_with(".db")
+                    || path.ends_with(".sqlite")
+                    || path.ends_with(".sqlite3")
+                    || path.ends_with(".db-wal")
+                    || path.ends_with(".db-journal")
+                    || path.ends_with(".db-shm");
+
+                if is_sqlite {
+                    0 // Disable caching for SQLite files
+                } else {
+                    ino // Enable caching for other files
+                }
+            };
+
             let all_chunks = metadata.chunks.clone();
-            let result = client.read_data(&chunk_ids, &all_chunks, start_chunk_idx, ino, &chunk_file_offsets).await;
+            let result = client.read_data(&chunk_ids, &all_chunks, start_chunk_idx, cache_inode, &chunk_file_offsets).await;
 
             let all_data = match result {
                 Ok(data) => data,
@@ -1013,6 +1080,15 @@ impl Filesystem for DfsFilesystem {
                 return;
             }
 
+            // For SQLite database files, disable caching to prevent corruption
+            let is_sqlite = {
+                let path = &metadata.path;
+                path.ends_with(".db") || path.ends_with(".sqlite") ||
+                    path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
+                    path.ends_with(".db-journal") || path.ends_with(".db-shm")
+            };
+            let cache_inode = if is_sqlite { 0 } else { ino };
+
             // Write-behind buffering: buffer sequential appends in memory
             if write_buffer_enabled {
                 let offset_usize = offset as usize;
@@ -1165,7 +1241,7 @@ impl Filesystem for DfsFilesystem {
 
                                         // Write buffered data as new chunks with caching
                                         let (new_chunk_ids, new_chunk_sizes) = client_clone
-                                            .write_data_with_cache(&data, ino, buffer_start_offset)
+                                            .write_data_with_cache(&data, cache_inode, buffer_start_offset)
                                             .await?;
 
                                         // Calculate new size before moving chunk data
@@ -1328,7 +1404,7 @@ impl Filesystem for DfsFilesystem {
                     }
 
                     let affected_data = match runtime.block_on(async {
-                        client.read_data(&affected_chunk_ids, &chunk_ids, first_idx, ino, &chunk_offsets).await
+                        client.read_data(&affected_chunk_ids, &chunk_ids, first_idx, cache_inode, &chunk_offsets).await
                     }) {
                         Ok(data) => data,
                         Err(e) => {
@@ -1367,7 +1443,7 @@ impl Filesystem for DfsFilesystem {
                 // Append: write just the new data as new chunks
                 runtime.block_on(async {
                     // Pass file offset for cache population (write-through caching)
-                    client.write_data_with_cache(&new_data, ino, current_size as u64).await
+                    client.write_data_with_cache(&new_data, cache_inode, current_size as u64).await
                 })
             } else {
                 // Random write: write only the affected chunks
@@ -1378,7 +1454,7 @@ impl Filesystem for DfsFilesystem {
                     0
                 };
                 runtime.block_on(async {
-                    client.write_data_with_cache(&new_data, ino, write_file_offset).await
+                    client.write_data_with_cache(&new_data, cache_inode, write_file_offset).await
                 })
             };
             let write_elapsed = write_start.elapsed();
@@ -1577,29 +1653,58 @@ impl Filesystem for DfsFilesystem {
 
     fn release(
         &mut self,
-        _req: &FuseRequest,
+        req: &FuseRequest,
         ino: u64,
         _fh: u64,
         _flags: i32,
-        _lock_owner: Option<u64>,
+        lock_owner: Option<u64>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!("release: ino={}", ino);
+        let pid = req.pid();
+        debug!("release: ino={}, owner={:?}, pid={}", ino, lock_owner, pid);
+
+        let lock_manager = self.lock_manager.clone();
 
         if self.write_buffer_enabled {
-            // Flush any buffered writes on file close
-            let result = self.block_on(self.flush_buffer_async(ino));
+            // Flush any buffered writes on file close, then release locks
+            let result = self.block_on(async {
+                // First flush writes
+                self.flush_buffer_async(ino).await?;
+
+                // Then release all locks held by this owner (if lock_owner is provided)
+                // lock_owner is only provided if the process held locks
+                if let Some(owner) = lock_owner {
+                    lock_manager.release_all(ino, owner).await?;
+                }
+
+                Ok::<(), anyhow::Error>(())
+            });
 
             match result {
                 Ok(_) => reply.ok(),
                 Err(e) => {
-                    error!("Failed to flush buffer on release for inode {}: {}", ino, e);
+                    error!("Failed to flush/release for inode {}: {}", ino, e);
                     reply.error(libc::EIO);
                 }
             }
         } else {
-            reply.ok();
+            // No write buffer, just release locks
+            let result = self.block_on(async {
+                // Release locks if lock_owner is provided
+                if let Some(owner) = lock_owner {
+                    lock_manager.release_all(ino, owner).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+
+            match result {
+                Ok(_) => reply.ok(),
+                Err(e) => {
+                    error!("Failed to release locks for inode {}: {}", ino, e);
+                    reply.error(libc::EIO);
+                }
+            }
         }
     }
 
@@ -2159,5 +2264,142 @@ impl Filesystem for DfsFilesystem {
             // Return empty list
             reply.data(&[]);
         }
+    }
+
+    fn setlk(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        _fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!(
+            "setlk: ino={}, owner={}, pid={}, type={}, range=[{}, {}), sleep={}",
+            ino, lock_owner, pid, typ, start, end, sleep
+        );
+
+        let lock_manager = self.lock_manager.clone();
+        let runtime = self.runtime.clone();
+
+        runtime.spawn(async move {
+            use crate::locks::LockType;
+
+            // Convert FUSE range to our representation
+            // end=u64::MAX means "to EOF" (len=0)
+            let len = if end == u64::MAX { 0 } else { end.saturating_sub(start) };
+
+            let result = match typ {
+                libc::F_RDLCK => {
+                    // Shared (read) lock
+                    if sleep {
+                        lock_manager.lock_wait(ino, lock_owner, pid, LockType::Shared, start, len).await
+                    } else {
+                        lock_manager.try_lock(ino, lock_owner, pid, LockType::Shared, start, len).await
+                    }
+                }
+                libc::F_WRLCK => {
+                    // Exclusive (write) lock
+                    if sleep {
+                        lock_manager.lock_wait(ino, lock_owner, pid, LockType::Exclusive, start, len).await
+                    } else {
+                        lock_manager.try_lock(ino, lock_owner, pid, LockType::Exclusive, start, len).await
+                    }
+                }
+                libc::F_UNLCK => {
+                    // Unlock
+                    lock_manager.unlock(ino, lock_owner, start, len).await
+                }
+                _ => {
+                    error!("Invalid lock type: {}", typ);
+                    reply.error(libc::EINVAL);
+                    return;
+                }
+            };
+
+            match result {
+                Ok(()) => reply.ok(),
+                Err(e) => {
+                    if sleep {
+                        // Blocking lock failed (should be rare)
+                        error!("Lock acquisition failed: {}", e);
+                        reply.error(libc::EIO);
+                    } else {
+                        // Non-blocking lock would block (conflict detected)
+                        reply.error(libc::EAGAIN);
+                    }
+                }
+            }
+        });
+    }
+
+    fn getlk(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        _fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: fuser::ReplyLock,
+    ) {
+        debug!(
+            "getlk: ino={}, owner={}, pid={}, type={}, range=[{}, {})",
+            ino, lock_owner, pid, typ, start, end
+        );
+
+        let lock_manager = self.lock_manager.clone();
+        let runtime = self.runtime.clone();
+
+        runtime.spawn(async move {
+            use crate::locks::LockType;
+
+            let lock_type = match typ {
+                libc::F_RDLCK => LockType::Shared,
+                libc::F_WRLCK => LockType::Exclusive,
+                _ => {
+                    error!("Invalid lock type for getlk: {}", typ);
+                    reply.error(libc::EINVAL);
+                    return;
+                }
+            };
+
+            let len = if end == u64::MAX { 0 } else { end.saturating_sub(start) };
+
+            match lock_manager.get_conflict(ino, lock_owner, pid, lock_type, start, len).await {
+                Some(conflict) => {
+                    // Return conflicting lock details
+                    let fuse_type = match conflict.lock_type {
+                        LockType::Shared => libc::F_RDLCK,
+                        LockType::Exclusive => libc::F_WRLCK,
+                    };
+
+                    let conflict_end = if conflict.len == 0 {
+                        u64::MAX
+                    } else {
+                        conflict.start.saturating_add(conflict.len)
+                    };
+
+                    debug!(
+                        "getlk: found conflict with owner={} pid={} type={} range=[{}, {})",
+                        conflict.owner, conflict.pid, fuse_type, conflict.start, conflict_end
+                    );
+
+                    reply.locked(conflict.start, conflict_end, fuse_type, conflict.pid);
+                }
+                None => {
+                    // No conflict - return F_UNLCK to indicate lock would succeed
+                    debug!("getlk: no conflict found, lock would succeed");
+                    reply.locked(start, end, libc::F_UNLCK, pid);
+                }
+            }
+        });
     }
 }

@@ -1,5 +1,6 @@
 mod client;
 mod fuse_impl;
+mod locks;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

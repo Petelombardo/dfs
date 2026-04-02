@@ -1057,10 +1057,11 @@ impl Filesystem for DfsFilesystem {
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
         let runtime = self.runtime.clone();
-        let data_vec = data.to_vec(); // Copy data before moving to thread
+        let data_vec = data.to_vec(); // Copy data before moving
 
-        // Spawn write operation on tokio's blocking thread pool
-        runtime.clone().spawn_blocking(move || {
+        // Execute write operation synchronously to preserve write order
+        // Using spawn_blocking causes parallel execution which corrupts SQLite databases
+        {
             let start = std::time::Instant::now();
             debug!("write: ino={}, offset={}, size={}", ino, offset, data_vec.len());
 
@@ -1578,7 +1579,7 @@ impl Filesystem for DfsFilesystem {
                     reply.error(libc::EIO);
                 }
             }
-        });
+        }
     }
 
     fn flush(

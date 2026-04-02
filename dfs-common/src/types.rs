@@ -86,6 +86,18 @@ pub enum NodeStatus {
     Leaving,
 }
 
+/// Compact node health information for gossiping
+/// This is exchanged between nodes to maintain consistent cluster views
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeHealthGossip {
+    /// Node identifier
+    pub node_id: NodeId,
+    /// Unix timestamp when sender last heard from this node
+    pub last_seen: u64,
+    /// Sender's opinion of this node's status
+    pub status: NodeStatus,
+}
+
 /// Unique identifier for a chunk of data
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkId {

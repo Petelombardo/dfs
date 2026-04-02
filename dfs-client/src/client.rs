@@ -36,6 +36,19 @@ impl CachedChunk {
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Maximum number of recent SQLite file writes to track for read-after-write consistency
+const SQLITE_WRITE_TRACKER_SIZE: usize = 256;
+
+/// Get the SQLite consistency window duration in milliseconds
+/// Can be overridden via DFS_SQLITE_CONSISTENCY_WINDOW_MS environment variable
+/// Default: 500ms (conservative, allows time for async replication)
+fn get_sqlite_consistency_window_ms() -> u64 {
+    std::env::var("DFS_SQLITE_CONSISTENCY_WINDOW_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500)
+}
+
 /// Client for communicating with DFS cluster
 #[derive(Clone)]
 pub struct DfsClient {
@@ -72,6 +85,11 @@ pub struct DfsClient {
     /// Cache up to 128 entries (3x prefetch window of 32 = 256MB working set at 2MB/chunk)
     /// Small cache = faster lookups, less memory, better CPU cache utilization
     replica_cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<SocketAddr>>>>>,
+
+    /// Track recent writes to SQLite files for read-after-write consistency
+    /// Maps file path -> (write_node_addr, write_timestamp)
+    /// Prevents reading stale metadata from non-write nodes before async replication completes
+    sqlite_write_tracker: Arc<Mutex<LruCache<String, (SocketAddr, std::time::Instant)>>>,
 }
 
 impl DfsClient {
@@ -149,6 +167,12 @@ impl DfsClient {
             });
         let replica_cache = LruCache::new(replica_cache_capacity);
 
+        // SQLite write tracker: small LRU to prevent unbounded growth
+        // Only tracks SQLite database files for read-after-write consistency
+        let sqlite_write_tracker_capacity = NonZeroUsize::new(SQLITE_WRITE_TRACKER_SIZE)
+            .expect("SQLITE_WRITE_TRACKER_SIZE must be > 0");
+        let sqlite_write_tracker = LruCache::new(sqlite_write_tracker_capacity);
+
         Ok(Self {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes)),
             current_node: Arc::new(RwLock::new(0)),
@@ -159,7 +183,19 @@ impl DfsClient {
             read_history: Arc::new(Mutex::new(HashMap::new())),
             replica_selector: Arc::new(AtomicU64::new(0)),
             replica_cache: Arc::new(Mutex::new(replica_cache)),
+            sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
         })
+    }
+
+    /// Check if a path represents a SQLite database file
+    /// These files require special handling for read-after-write consistency
+    fn is_sqlite_file(path: &str) -> bool {
+        path.ends_with(".db")
+            || path.ends_with(".sqlite")
+            || path.ends_with(".sqlite3")
+            || path.ends_with(".db-wal")
+            || path.ends_with(".db-journal")
+            || path.ends_with(".db-shm")
     }
 
     /// Get next node address (round-robin)
@@ -182,6 +218,35 @@ impl DfsClient {
         for node_addr in &nodes {
             match self.send_request(*node_addr, request.clone()).await {
                 Ok(response) => return Ok(response),
+                Err(e) => {
+                    warn!("Failed to send request to {}: {}", node_addr, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed")))
+    }
+
+    /// Send a request with retry, returning the successful node's address
+    /// This is used for tracking which node handled a write operation
+    async fn send_request_with_retry_tracking(&self, request: Request) -> Result<SocketAddr> {
+        let nodes = self.cluster_nodes.read().await.clone();
+        let mut last_error = None;
+
+        // Try all nodes
+        for node_addr in &nodes {
+            match self.send_request(*node_addr, request.clone()).await {
+                Ok(response) => {
+                    // Check if response indicates success
+                    match response {
+                        Response::Ok { .. } => return Ok(*node_addr),
+                        Response::Error { message, .. } => {
+                            anyhow::bail!("Server returned error: {}", message);
+                        }
+                        _ => anyhow::bail!("Unexpected response type"),
+                    }
+                }
                 Err(e) => {
                     warn!("Failed to send request to {}: {}", node_addr, e);
                     last_error = Some(e);
@@ -277,6 +342,76 @@ impl DfsClient {
 
     /// Get file metadata from cluster (unconditional)
     pub async fn get_file_metadata(&self, path: &str) -> Result<Option<FileMetadata>> {
+        // Check if this is a SQLite file with a recent write
+        // If so, force read from the write node to ensure read-after-write consistency
+        if Self::is_sqlite_file(path) {
+            let write_info = {
+                let mut tracker = self.sqlite_write_tracker.lock().await;
+                tracker.get(path).copied()
+            };
+
+            if let Some((write_node, write_time)) = write_info {
+                let age = write_time.elapsed();
+                let window = std::time::Duration::from_millis(get_sqlite_consistency_window_ms());
+
+                if age < window {
+                    // Within consistency window - force read from write node
+                    info!(
+                        "SQLite read-after-write: forcing read from write node {} (age: {:?}, window: {:?})",
+                        write_node, age, window
+                    );
+                    return self.get_file_metadata_from_node(path, write_node).await;
+                } else {
+                    debug!(
+                        "SQLite consistency window expired for {} (age: {:?} > {:?})",
+                        path, age, window
+                    );
+                }
+            }
+        }
+
+        // Normal path: use retry logic (SQLite files outside window, or non-SQLite files)
+        self.get_file_metadata_conditional(path, None).await
+    }
+
+    /// Get file metadata from a specific node with fallback to retry logic
+    /// Used for SQLite read-after-write consistency to ensure we read from the write node
+    async fn get_file_metadata_from_node(
+        &self,
+        path: &str,
+        node: SocketAddr
+    ) -> Result<Option<FileMetadata>> {
+        let request = Request::GetFileMetadataByPath {
+            path: path.to_string(),
+            if_modified_since: None,
+        };
+
+        // Try the specified node first
+        match self.send_request(node, request.clone()).await {
+            Ok(response) => match response {
+                Response::FileMetadata { metadata } => return Ok(Some(metadata)),
+                Response::NotModified => return Ok(None),
+                Response::Error { code, .. } if code == dfs_common::ErrorCode::NotFound => {
+                    return Ok(None)
+                }
+                Response::Error { message, .. } => {
+                    warn!("Error from write node {}, falling back: {}", node, message);
+                }
+                _ => {
+                    warn!("Unexpected response from {}, falling back", node);
+                }
+            },
+            Err(e) => {
+                // Write node is down - fall back to normal retry logic
+                warn!(
+                    "Failed to read from write node {} ({}), falling back to retry logic",
+                    node, e
+                );
+            }
+        }
+
+        // Fallback: use normal retry logic if write node failed
+        info!("Falling back to normal retry for {}", path);
         self.get_file_metadata_conditional(path, None).await
     }
 
@@ -1066,15 +1201,22 @@ impl DfsClient {
             metadata: metadata.clone(),
         };
 
-        let response = self.send_request_with_retry(request).await?;
+        // Track which node handles the write for read-after-write consistency
+        let write_node = self.send_request_with_retry_tracking(request).await?;
 
-        match response {
-            Response::Ok { .. } => Ok(()),
-            Response::Error { message, .. } => {
-                anyhow::bail!("Failed to put metadata: {}", message);
-            }
-            _ => anyhow::bail!("Unexpected response type"),
+        // If this is a SQLite file, track the write to ensure reads go to this node
+        // within the consistency window (before async replication completes)
+        if Self::is_sqlite_file(&metadata.path) {
+            let mut tracker = self.sqlite_write_tracker.lock().await;
+            tracker.put(metadata.path.clone(), (write_node, std::time::Instant::now()));
+
+            info!(
+                "SQLite write tracked: path={}, node={}, consistency_window={}ms",
+                metadata.path, write_node, get_sqlite_consistency_window_ms()
+            );
         }
+
+        Ok(())
     }
 
     /// Delete file

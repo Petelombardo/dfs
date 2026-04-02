@@ -272,8 +272,11 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterMessage {
     /// Heartbeat to indicate node is alive
+    /// Now includes cluster view for gossip protocol
     Heartbeat {
         node_info: NodeInfo,
+        #[serde(default)]
+        cluster_view: Vec<crate::NodeHealthGossip>,
     },
 
     /// Join cluster request

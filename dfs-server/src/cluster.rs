@@ -129,6 +129,53 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Merge received cluster view gossip with local view
+    /// Conflict resolution: Most recent information wins
+    /// Optimistic bias: If ANY node thinks another is online, mark it online
+    pub async fn merge_cluster_gossip(&self, gossip: Vec<dfs_common::NodeHealthGossip>) -> Result<()> {
+        let mut nodes = self.nodes.write().await;
+
+        for gossip_entry in gossip {
+            // Skip self
+            if gossip_entry.node_id == self.local_node_id {
+                continue;
+            }
+
+            if let Some(local_node) = nodes.get_mut(&gossip_entry.node_id) {
+                // CONFLICT RESOLUTION: Most recent info wins
+                if gossip_entry.last_seen > local_node.last_heartbeat {
+                    debug!(
+                        "Gossip: Updating node {} from gossip (local: {}s ago, gossip: {}s ago)",
+                        gossip_entry.node_id,
+                        dfs_common::types::current_timestamp().saturating_sub(local_node.last_heartbeat),
+                        dfs_common::types::current_timestamp().saturating_sub(gossip_entry.last_seen)
+                    );
+
+                    local_node.last_heartbeat = gossip_entry.last_seen;
+
+                    // OPTIMISTIC BIAS: If ANY node thinks it's online, mark it online
+                    // This prevents false positives from network partitions
+                    if gossip_entry.status == NodeStatus::Online {
+                        // If we thought it was failed, resurrect it
+                        if local_node.status == NodeStatus::Failed {
+                            info!("Gossip: Node {} recovered (via gossip)", gossip_entry.node_id);
+                            local_node.status = NodeStatus::Online;
+
+                            // Add back to hash ring
+                            let mut ring = self.hash_ring.write().await;
+                            ring.add_node(gossip_entry.node_id);
+                        } else if local_node.status == NodeStatus::Suspected {
+                            debug!("Gossip: Node {} no longer suspected (via gossip)", gossip_entry.node_id);
+                            local_node.status = NodeStatus::Online;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get information about a specific node
     pub async fn get_node(&self, node_id: &NodeId) -> Option<NodeInfo> {
         let nodes = self.nodes.read().await;
@@ -289,13 +336,23 @@ impl ClusterManager {
     /// Send heartbeats to all nodes in the cluster
     async fn send_heartbeats(&self) -> Result<()> {
         use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
-        use dfs_common::NodeInfo;
+        use dfs_common::{NodeHealthGossip, NodeInfo};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
 
         let nodes = self.nodes.read().await.clone();
         let local_node_id = self.local_node_id;
         let local_addr = self.local_addr;
+
+        // Build cluster view for gossiping - include our view of all nodes
+        let cluster_view: Vec<NodeHealthGossip> = nodes
+            .values()
+            .map(|node| NodeHealthGossip {
+                node_id: node.id,
+                last_seen: node.last_heartbeat,
+                status: node.status,
+            })
+            .collect();
 
         for (node_id, node_info) in nodes {
             // Skip self
@@ -311,6 +368,7 @@ impl ClusterManager {
             let local_node_info = NodeInfo::new(local_node_id, local_addr, None);
             let heartbeat = ClusterMessage::Heartbeat {
                 node_info: local_node_info,
+                cluster_view: cluster_view.clone(),
             };
 
             // Send heartbeat asynchronously (don't wait for response)
@@ -326,10 +384,15 @@ impl ClusterManager {
     }
 
     /// Check for nodes that have failed (no heartbeat within timeout)
+    /// State machine: Online → Suspected → Failed
+    /// This gives gossip a chance to correct false positives before marking nodes as Failed
     async fn check_failed_nodes(&self) -> Result<()> {
         let mut nodes = self.nodes.write().await;
         let mut failed_nodes = Vec::new();
+        let mut recovered_nodes = Vec::new();
         let mut nodes_to_purge = Vec::new();
+
+        let now = dfs_common::types::current_timestamp();
 
         // Threshold for purging: failed for 24 hours
         let purge_threshold = self.failure_timeout * 24 * 3600 / self.failure_timeout;
@@ -340,16 +403,59 @@ impl ClusterManager {
                 continue;
             }
 
-            if node_info.is_failed(self.failure_timeout) {
-                if node_info.status != NodeStatus::Failed {
-                    warn!("Node {} has failed (no heartbeat)", node_id);
-                    node_info.status = NodeStatus::Failed;
-                    failed_nodes.push(*node_id);
-                } else {
-                    // Already failed - check if we should purge it (failed for too long)
-                    if node_info.is_failed(purge_threshold) {
-                        nodes_to_purge.push(*node_id);
+            let time_since_heartbeat = now.saturating_sub(node_info.last_heartbeat);
+            let is_timed_out = time_since_heartbeat > self.failure_timeout;
+
+            // State machine: Online -> Suspected -> Failed
+            match node_info.status {
+                NodeStatus::Online => {
+                    if is_timed_out {
+                        // FIRST timeout: Mark as Suspected (not Failed)
+                        // Gives gossip a chance to fix false positives
+                        warn!(
+                            "Node {} suspected failed ({}s since heartbeat, threshold={}s)",
+                            node_id, time_since_heartbeat, self.failure_timeout
+                        );
+                        node_info.status = NodeStatus::Suspected;
                     }
+                }
+                NodeStatus::Suspected => {
+                    if is_timed_out {
+                        // SECOND timeout: Now mark as Failed (requires 2x threshold total)
+                        warn!(
+                            "Node {} confirmed failed ({}s since heartbeat)",
+                            node_id, time_since_heartbeat
+                        );
+                        node_info.status = NodeStatus::Failed;
+                        failed_nodes.push(*node_id);
+                    } else {
+                        // Recovered via gossip!
+                        info!(
+                            "Node {} recovered from suspected state ({}s since heartbeat)",
+                            node_id, time_since_heartbeat
+                        );
+                        node_info.status = NodeStatus::Online;
+                        recovered_nodes.push(*node_id);
+                    }
+                }
+                NodeStatus::Failed => {
+                    if !is_timed_out {
+                        // Recovered from failure via gossip
+                        info!(
+                            "Node {} recovered from failed state ({}s since heartbeat)",
+                            node_id, time_since_heartbeat
+                        );
+                        node_info.status = NodeStatus::Online;
+                        recovered_nodes.push(*node_id);
+                    } else {
+                        // Still failed - check if we should purge it (failed for too long)
+                        if node_info.is_failed(purge_threshold) {
+                            nodes_to_purge.push(*node_id);
+                        }
+                    }
+                }
+                NodeStatus::Leaving => {
+                    // Graceful shutdown - leave alone
                 }
             }
         }
@@ -360,6 +466,15 @@ impl ClusterManager {
             for node_id in failed_nodes {
                 info!("Removing failed node {} from hash ring", node_id);
                 ring.remove_node(&node_id);
+            }
+        }
+
+        // Add recovered nodes back to hash ring
+        if !recovered_nodes.is_empty() {
+            let mut ring = self.hash_ring.write().await;
+            for node_id in recovered_nodes {
+                info!("Adding recovered node {} back to hash ring", node_id);
+                ring.add_node(node_id);
             }
         }
 

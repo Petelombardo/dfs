@@ -1536,11 +1536,22 @@ impl MessageHandler for Server {
         Box::pin(async move {
             // Handle cluster messages (heartbeat, join, leave, etc.)
             match message {
-                ClusterMessage::Heartbeat { node_info } => {
-                    debug!("Received heartbeat from {}", node_info.id);
+                ClusterMessage::Heartbeat { node_info, cluster_view } => {
+                    debug!("Received heartbeat from {} with {} gossip entries",
+                           node_info.id, cluster_view.len());
+
+                    // Update sender's heartbeat
                     if let Err(e) = self.cluster.update_heartbeat(&node_info.id).await {
                         warn!("Failed to update heartbeat: {}", e);
                     }
+
+                    // Merge cluster view gossip if present
+                    if !cluster_view.is_empty() {
+                        if let Err(e) = self.cluster.merge_cluster_gossip(cluster_view).await {
+                            warn!("Failed to merge cluster gossip: {}", e);
+                        }
+                    }
+
                     Response::Ok { data: None }
                 }
                 ClusterMessage::Join { node_info } => {

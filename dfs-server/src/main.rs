@@ -88,13 +88,20 @@ async fn main() -> Result<()> {
                 }
             };
 
+            // Set up NON-BLOCKING logging to stderr/systemd journal
+            // This uses a background thread with a bounded channel (default 8192 messages)
+            // If the channel fills up, log messages are DROPPED instead of blocking the process
+            let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stderr());
+
             tracing_subscriber::fmt()
                 .with_max_level(level)
                 .with_target(false)
+                .with_writer(non_blocking)
                 .init();
 
-            info!("Starting DFS server with log level: {}", log_level);
+            info!("Starting DFS server with log level: {} (non-blocking mode)", log_level);
             start_server(config).await?;
+            // _guard is dropped here, flushing remaining logs
         }
         Commands::Status { config } => {
             // Initialize basic logging for status

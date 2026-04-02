@@ -297,12 +297,14 @@ async fn handle_cluster_command(
                                 dfs_common::NodeStatus::Failed => format!("✗ {}", status_str),
                                 dfs_common::NodeStatus::Leaving => format!("← {}", status_str),
                             };
+                            let now = dfs_common::types::current_timestamp();
+                            let seconds_ago = now.saturating_sub(node.last_heartbeat);
                             println!(
                                 "{:<40} {:<20} {:<12} {}s ago",
                                 node.id.to_string(),
                                 node.addr,
                                 status_display,
-                                node.last_heartbeat
+                                seconds_ago
                             );
                         }
                     }

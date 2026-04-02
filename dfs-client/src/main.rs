@@ -111,8 +111,9 @@ fn main() -> Result<()> {
             log_level,
         } => {
             // Set up logging before anything else
-            setup_logging(foreground, log_file.as_deref(), &log_level)?;
+            let _guard = setup_logging(foreground, log_file.as_deref(), &log_level)?;
             mount_filesystem(mountpoint, cluster, foreground, write_buffer, allow_other)?;
+            // _guard is dropped here, flushing remaining logs
         }
         Commands::Unmount { mountpoint } => {
             // Initialize basic logging for unmount
@@ -360,7 +361,12 @@ fn discover_cluster_nodes(seed_addrs: &[SocketAddr]) -> Result<Vec<SocketAddr>> 
 }
 
 /// Set up logging to file or console
-fn setup_logging(foreground: bool, log_file: Option<&std::path::Path>, log_level: &str) -> Result<()> {
+/// Returns a WorkerGuard that must be kept alive for the duration of the program
+fn setup_logging(
+    foreground: bool,
+    log_file: Option<&std::path::Path>,
+    log_level: &str,
+) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     use std::fs::OpenOptions;
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
@@ -383,12 +389,14 @@ fn setup_logging(foreground: bool, log_file: Option<&std::path::Path>, log_level
     } else if !foreground {
         PathBuf::from("/var/log/dfs-client.log")
     } else {
-        // Foreground mode with no log file - use stderr
+        // Foreground mode with no log file - use non-blocking stderr
+        let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
         tracing_subscriber::fmt()
             .with_max_level(level)
             .with_target(false)
+            .with_writer(non_blocking)
             .init();
-        return Ok(());
+        return Ok(Some(guard));
     };
 
     // Open log file in append mode
@@ -398,16 +406,21 @@ fn setup_logging(foreground: bool, log_file: Option<&std::path::Path>, log_level
         .open(&log_path)
         .with_context(|| format!("Failed to open log file: {:?}", log_path))?;
 
-    // Set up file logging
+    // Set up NON-BLOCKING file logging
+    // This uses a background thread with a bounded channel (default 8192 messages)
+    // If the channel fills up, log messages are DROPPED instead of blocking the process
+    // This prevents the entire DFS process from freezing if disk is full or slow
+    let (non_blocking, guard) = tracing_appender::non_blocking(file);
+
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
-        .with_writer(file.and(std::io::stderr))
+        .with_writer(non_blocking)
         .init();
 
-    info!("Logging to: {:?} at level: {}", log_path, log_level);
+    info!("Logging to: {:?} at level: {} (non-blocking mode)", log_path, log_level);
 
-    Ok(())
+    Ok(Some(guard))
 }
 
 /// Install systemd service for DFS client

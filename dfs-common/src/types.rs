@@ -169,10 +169,18 @@ pub struct FileMetadata {
     /// File size in bytes
     pub size: u64,
 
-    /// Chunk IDs that make up this file (in order)
+    /// Chunk locations that make up this file (in order)
+    /// Each chunk tracks which nodes have a copy for direct client access
+    pub chunk_locations: Vec<ChunkLocation>,
+
+    /// DEPRECATED: Legacy chunks field for backward compatibility
+    /// Use chunk_locations instead - this will be removed in future versions
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chunks: Vec<ChunkId>,
 
-    /// Size of each chunk in bytes (parallel to chunks vec)
+    /// DEPRECATED: Legacy chunk sizes field for backward compatibility
+    /// Use chunk_locations[].size instead - this will be removed in future versions
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chunk_sizes: Vec<u64>,
 
     /// Creation timestamp (Unix epoch seconds)
@@ -201,8 +209,9 @@ impl FileMetadata {
             id: FileId::new(),
             path,
             size: 0,
-            chunks: Vec::new(),
-            chunk_sizes: Vec::new(),
+            chunk_locations: Vec::new(),
+            chunks: Vec::new(),  // Deprecated, kept for backward compat
+            chunk_sizes: Vec::new(),  // Deprecated, kept for backward compat
             created_at: now,
             modified_at: now,
             mode: if file_type == FileType::Directory {
@@ -213,6 +222,24 @@ impl FileMetadata {
             uid: 0,
             gid: 0,
             file_type,
+        }
+    }
+
+    /// Helper to get chunks for backward compatibility
+    pub fn get_chunk_ids(&self) -> Vec<ChunkId> {
+        if !self.chunk_locations.is_empty() {
+            self.chunk_locations.iter().map(|loc| loc.chunk_id).collect()
+        } else {
+            self.chunks.clone()
+        }
+    }
+
+    /// Helper to get chunk sizes for backward compatibility
+    pub fn get_chunk_sizes(&self) -> Vec<u64> {
+        if !self.chunk_locations.is_empty() {
+            self.chunk_locations.iter().map(|loc| loc.size as u64).collect()
+        } else {
+            self.chunk_sizes.clone()
         }
     }
 }

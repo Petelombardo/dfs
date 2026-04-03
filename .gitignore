@@ -22,10 +22,17 @@ Thumbs.db
 
 # Test artifacts
 /test_data/
+test_write_detailed.sh
+test_write_now.sh
+test_write_perf.sh
+
+# Benchmarks and profiling
+/benches/
 
 # Documentation and session notes (private)
 CLUSTER-REJOIN-PLAN.md
 PERFORMANCE-INVESTIGATION.md
+PERFORMANCE_ANALYSIS.md
 QUICK-START.md
 TESTING.md
 DEPLOYMENT-RESTARTOS.md
@@ -41,5 +48,7 @@ config.example.toml
 
 # Private deployment scripts (network-specific)
 scripts/deploy-all.sh
+scripts/profile_write.sh
+scripts/run_write_profile.sh
 build.sh
 deploy-build

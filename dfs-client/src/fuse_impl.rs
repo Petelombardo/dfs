@@ -209,7 +209,6 @@ impl DfsFilesystem {
             id: dfs_common::FileId::new(),
             path: "/".to_string(),
             size: 0,
-            chunk_locations: Vec::new(),
             chunks: Vec::new(),
             chunk_sizes: Vec::new(),
             created_at: SystemTime::now()
@@ -1081,7 +1080,6 @@ impl Filesystem for DfsFilesystem {
             id: dfs_common::FileId::new(),
             path: path.clone(),
             size: 0,
-            chunk_locations: Vec::new(),
             chunks: Vec::new(),
             chunk_sizes: Vec::new(),
             created_at: SystemTime::now()
@@ -1949,7 +1947,6 @@ impl Filesystem for DfsFilesystem {
             id: dfs_common::FileId::new(),
             path: path.clone(),
             size: 0,
-            chunk_locations: Vec::new(),
             chunks: Vec::new(),
             chunk_sizes: Vec::new(),
             created_at: SystemTime::now()

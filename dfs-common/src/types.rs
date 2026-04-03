@@ -169,18 +169,14 @@ pub struct FileMetadata {
     /// File size in bytes
     pub size: u64,
 
-    /// Chunk locations that make up this file (in order)
-    /// Each chunk tracks which nodes have a copy for direct client access
-    pub chunk_locations: Vec<ChunkLocation>,
-
     /// DEPRECATED: Legacy chunks field for backward compatibility
     /// Use chunk_locations instead - this will be removed in future versions
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub chunks: Vec<ChunkId>,
 
     /// DEPRECATED: Legacy chunk sizes field for backward compatibility
     /// Use chunk_locations[].size instead - this will be removed in future versions
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub chunk_sizes: Vec<u64>,
 
     /// Creation timestamp (Unix epoch seconds)
@@ -215,7 +211,6 @@ impl FileMetadata {
             id: FileId::new(),
             path,
             size: 0,
-            chunk_locations: Vec::new(),
             chunks: Vec::new(),  // Deprecated, kept for backward compat
             chunk_sizes: Vec::new(),  // Deprecated, kept for backward compat
             created_at: now,
@@ -242,24 +237,6 @@ impl FileMetadata {
     }
 
     /// Get chunk sizes from either chunk_locations or legacy chunk_sizes field
-    pub fn get_chunk_sizes(&self) -> Vec<u64> {
-        if !self.chunk_locations.is_empty() {
-            self.chunk_locations.iter().map(|loc| loc.size as u64).collect()
-        } else {
-            self.chunk_sizes.clone()
-        }
-    }
-
-    /// Helper to get chunks for backward compatibility
-    pub fn get_chunk_ids(&self) -> Vec<ChunkId> {
-        if !self.chunk_locations.is_empty() {
-            self.chunk_locations.iter().map(|loc| loc.chunk_id).collect()
-        } else {
-            self.chunks.clone()
-        }
-    }
-
-    /// Helper to get chunk sizes for backward compatibility
     pub fn get_chunk_sizes(&self) -> Vec<u64> {
         if !self.chunk_locations.is_empty() {
             self.chunk_locations.iter().map(|loc| loc.size as u64).collect()

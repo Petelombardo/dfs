@@ -938,11 +938,13 @@ impl Server {
             .filter(|n| n.status == dfs_common::NodeStatus::Online)
             .count();
         let total_nodes = nodes.len();
+        let chunk_size_mb = self.chunker.chunk_size() / (1024 * 1024);
 
         Response::ClusterStatus {
             nodes,
             total_nodes,
             healthy_nodes,
+            chunk_size_mb,
         }
     }
 

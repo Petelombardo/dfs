@@ -207,6 +207,7 @@ pub enum Response {
         nodes: Vec<NodeInfo>,
         total_nodes: usize,
         healthy_nodes: usize,
+        chunk_size_mb: usize,
     },
 
     /// Storage statistics response

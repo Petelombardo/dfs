@@ -14,6 +14,11 @@ impl Chunker {
         Self { chunk_size }
     }
 
+    /// Get the chunk size in bytes
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
     /// Split data into chunks and return chunk IDs and data
     /// Uses streaming to avoid loading entire file into memory
     pub fn chunk_data(&self, data: &[u8]) -> Vec<(ChunkId, Vec<u8>)> {

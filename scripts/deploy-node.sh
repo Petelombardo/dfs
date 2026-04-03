@@ -65,12 +65,15 @@ echo -e "${YELLOW}Cluster Configuration:${NC}"
 echo ""
 
 prompt IS_SEED "Is this the first/seed node? (yes/no)" "no"
-if [ "$IS_SEED" != "yes" ]; then
+if [ "$IS_SEED" = "yes" ]; then
+    # Seed node: ask for cluster-wide settings
+    prompt REPLICATION_FACTOR "Replication factor" "3"
+    prompt CHUNK_SIZE_MB "Chunk size in MB" "4"
+else
+    # Joining node: will inherit settings from cluster
     prompt SEED_NODE "Seed node address (IP:PORT)" "192.168.1.10:8900"
+    echo -e "${YELLOW}Note: Chunk size and replication factor will be inherited from the cluster${NC}"
 fi
-
-prompt REPLICATION_FACTOR "Replication factor" "3"
-prompt CHUNK_SIZE_MB "Chunk size in MB" "4"
 
 echo ""
 echo -e "${YELLOW}Advanced Configuration:${NC}"
@@ -91,11 +94,12 @@ echo -e "Metadata Directory:  ${GREEN}${META_DIR}${NC}"
 echo -e "Config Directory:    ${GREEN}${CONFIG_DIR}${NC}"
 if [ "$IS_SEED" = "yes" ]; then
     echo -e "Node Type:           ${YELLOW}SEED NODE${NC}"
+    echo -e "Replication Factor:  ${GREEN}${REPLICATION_FACTOR}${NC}"
+    echo -e "Chunk Size:          ${GREEN}${CHUNK_SIZE_MB} MB${NC}"
 else
     echo -e "Seed Node:           ${GREEN}${SEED_NODE}${NC}"
+    echo -e "Config Inheritance:  ${YELLOW}Will inherit from cluster${NC}"
 fi
-echo -e "Replication Factor:  ${GREEN}${REPLICATION_FACTOR}${NC}"
-echo -e "Chunk Size:          ${GREEN}${CHUNK_SIZE_MB} MB${NC}"
 echo ""
 
 read -p "Proceed with deployment? (yes/no): " confirm
@@ -127,11 +131,11 @@ echo -e "${GREEN}→${NC} Configuring node..."
 # Set listen address
 sed -i "s/listen_addr = \"0.0.0.0:8900\"/listen_addr = \"${NODE_IP}:${NODE_PORT}\"/" "$CONFIG_DIR/config.toml"
 
-# Set chunk size
-sed -i "s/chunk_size_mb = [0-9]\\+/chunk_size_mb = ${CHUNK_SIZE_MB}/" "$CONFIG_DIR/config.toml"
-
-# Set replication factor
-sed -i "s/replication_factor = [0-9]\\+/replication_factor = ${REPLICATION_FACTOR}/" "$CONFIG_DIR/config.toml"
+# Set chunk size and replication factor (only for seed node)
+if [ "$IS_SEED" = "yes" ]; then
+    sed -i "s/chunk_size_mb = [0-9]\\+/chunk_size_mb = ${CHUNK_SIZE_MB}/" "$CONFIG_DIR/config.toml"
+    sed -i "s/replication_factor = [0-9]\\+/replication_factor = ${REPLICATION_FACTOR}/" "$CONFIG_DIR/config.toml"
+fi
 
 # Set heartbeat interval
 sed -i "s/heartbeat_interval_secs = [0-9]\\+/heartbeat_interval_secs = ${HEARTBEAT_INTERVAL}/" "$CONFIG_DIR/config.toml"

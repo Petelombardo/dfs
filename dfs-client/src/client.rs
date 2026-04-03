@@ -985,73 +985,96 @@ impl DfsClient {
         }
     }
 
-    /// Write data to cluster with optimized dual-stream parallelization
-    /// For RF=3+: Split data in half, send to 2 servers simultaneously (local write only)
-    /// Each server writes locally only, healing creates 3rd replica in background
-    ///
-    /// Optionally populates byte-range cache if inode and file_offset are provided
+    /// Write data to cluster with synchronous dual-replica replication
+    /// Returns (chunk_ids, chunk_sizes, replica_nodes)
     pub async fn write_data(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
-        self.write_data_with_cache(data, 0, 0).await
+        let (chunk_ids, chunk_sizes, _) = self.write_data_with_cache(data, 0, 0).await?;
+        Ok((chunk_ids, chunk_sizes))
     }
 
-    /// Write data and populate byte-range cache for immediate read-back
-    /// This enables zero-latency reads of just-written data (DVR use case)
-    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<(Vec<ChunkId>, Vec<u64>)> {
-        const MIN_PARALLEL_SIZE: usize = 128 * 1024; // 128KB minimum (lowered for better perf)
-
-        // For small writes, use single server (less overhead)
-        if data.len() < MIN_PARALLEL_SIZE {
-            return self.write_data_single_chunk(data).await;
-        }
-
+    /// Write data with synchronous dual-replica replication
+    /// NEW: Writes each chunk to 2 nodes synchronously (not striped)
+    /// Returns chunk_locations with replica tracking
+    pub async fn write_data_dual_replica(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<Vec<dfs_common::ChunkLocation>> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
-            return self.write_data_single_chunk(data).await;
+            anyhow::bail!("Need at least 2 nodes for dual-replica writes (only {} available)", nodes.len());
         }
 
-        info!("Writing {} bytes using optimized dual-stream (RF=3+ local-only)", data.len());
+        // Select 2 replica nodes (simple round-robin, could use consistent hashing later)
+        let replica1 = nodes[0];
+        let replica2 = nodes[1 % nodes.len()];
 
-        // Split data in half for 2 parallel streams
-        let mid = data.len() / 2;
-        let (chunk1, chunk2) = data.split_at(mid);
+        info!("Writing {} bytes with synchronous dual-replica to {} and {}", data.len(), replica1, replica2);
 
-        // Send to 2 different servers in parallel (local write only)
-        let server1 = nodes[0];
-        let server2 = nodes[1 % nodes.len()];
+        // Write SAME data to both nodes in parallel (local-only, no server-side replication)
+        let data1 = data.to_vec();
+        let data2 = data.to_vec();
 
-        let chunk1 = chunk1.to_vec();
-        let chunk2 = chunk2.to_vec();
+        let request1 = Request::WriteFileLocalOnly { data: data1 };
+        let request2 = Request::WriteFileLocalOnly { data: data2 };
 
-        // Spawn both writes in parallel using local-only write
-        let task1 = Self::write_chunk_to_server_local_only(server1, chunk1);
-        let task2 = Self::write_chunk_to_server_local_only(server2, chunk2);
+        let task1 = self.send_request(replica1, request1);
+        let task2 = self.send_request(replica2, request2);
 
         let (result1, result2) = tokio::join!(task1, task2);
 
-        let (chunk_ids_1, chunk_sizes_1) = result1?;
-        let (chunk_ids_2, chunk_sizes_2) = result2?;
+        // Both must succeed for synchronous replication
+        let response1 = result1?;
+        let response2 = result2?;
 
-        let mut all_chunk_ids = Vec::new();
-        all_chunk_ids.extend(chunk_ids_1);
-        all_chunk_ids.extend(chunk_ids_2);
+        let (chunk_ids_1, chunk_sizes_1) = match response1 {
+            Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes),
+            Response::Error { message, .. } => anyhow::bail!("Replica 1 ({}) failed: {}", replica1, message),
+            _ => anyhow::bail!("Unexpected response from replica 1"),
+        };
 
-        let mut all_chunk_sizes = Vec::new();
-        all_chunk_sizes.extend(chunk_sizes_1);
-        all_chunk_sizes.extend(chunk_sizes_2);
+        let (chunk_ids_2, chunk_sizes_2) = match response2 {
+            Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes),
+            Response::Error { message, .. } => anyhow::bail!("Replica 2 ({}) failed: {}", replica2, message),
+            _ => anyhow::bail!("Unexpected response from replica 2"),
+        };
 
-        info!("Completed optimized dual-stream write: {} total chunks (2 copies, healing creates 3rd)",
-              all_chunk_ids.len());
+        // Verify both nodes produced the same chunks (content-addressable storage)
+        if chunk_ids_1.len() != chunk_ids_2.len() {
+            anyhow::bail!("Replica mismatch: {} chunks vs {} chunks", chunk_ids_1.len(), chunk_ids_2.len());
+        }
 
-        // Populate byte-range cache with written data for immediate read-back
+        // Create ChunkLocation entries with both replica addresses
+        let mut chunk_locations = Vec::new();
+
+        for (idx, chunk_id) in chunk_ids_1.iter().enumerate() {
+            // Verify chunk IDs match (they should since it's the same data)
+            if chunk_id != &chunk_ids_2[idx] {
+                warn!("Chunk ID mismatch at index {}: {} vs {}", idx, chunk_id, chunk_ids_2[idx]);
+            }
+
+            let location = dfs_common::ChunkLocation {
+                chunk_id: *chunk_id,
+                nodes: vec![
+                    Self::node_id_from_addr(replica1),
+                    Self::node_id_from_addr(replica2),
+                ],
+                size: chunk_sizes_1[idx] as usize,
+                checksum: chunk_id.hash,  // ChunkId already is the Blake3 hash
+            };
+
+            chunk_locations.push(location);
+        }
+
+        info!("Dual-replica write complete: {} chunks stored on {} and {}",
+              chunk_locations.len(), replica1, replica2);
+
+        // Populate byte-range cache for immediate read-back
         if inode > 0 && file_offset > 0 {
             let mut byte_cache = self.byte_range_cache.lock().await;
             let mut current_offset = file_offset;
 
-            // Cache each chunk by its file offset
-            for (idx, &chunk_size) in all_chunk_sizes.iter().enumerate() {
-                // Reconstruct chunk data from original write
-                let chunk_start = if idx == 0 { 0 } else { all_chunk_sizes[..idx].iter().sum::<u64>() as usize };
-                let chunk_end = chunk_start + chunk_size as usize;
+            for (idx, location) in chunk_locations.iter().enumerate() {
+                let chunk_start = if idx == 0 { 0 } else {
+                    chunk_locations[..idx].iter().map(|l| l.size as u64).sum::<u64>() as usize
+                };
+                let chunk_end = chunk_start + location.size;
                 let chunk_data = data[chunk_start..chunk_end].to_vec();
 
                 let key = ByteRangeCacheKey {
@@ -1060,17 +1083,90 @@ impl DfsClient {
                 };
                 let cached = CachedChunk {
                     data: Arc::new(chunk_data),
-                    chunk_size: chunk_size as usize,
+                    chunk_size: location.size,
                     cached_at: std::time::Instant::now(),
                 };
                 byte_cache.put(key, cached);
-                info!("Write-through cached: inode={} offset={} ({} bytes)", inode, current_offset, chunk_size);
 
-                current_offset += chunk_size;
+                current_offset += location.size as u64;
             }
         }
 
-        Ok((all_chunk_ids, all_chunk_sizes))
+        Ok(chunk_locations)
+    }
+
+    /// Helper to create a NodeId from SocketAddr
+    /// For now, we create a deterministic UUID from the address
+    /// TODO: Store actual NodeId mappings from cluster discovery
+    fn node_id_from_addr(addr: SocketAddr) -> dfs_common::NodeId {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Create deterministic hash from address
+        let mut hasher = DefaultHasher::new();
+        addr.to_string().hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Convert to UUID bytes (simple approach for now)
+        let uuid_bytes = [
+            (hash >> 56) as u8,
+            (hash >> 48) as u8,
+            (hash >> 40) as u8,
+            (hash >> 32) as u8,
+            (hash >> 24) as u8,
+            (hash >> 16) as u8,
+            (hash >> 8) as u8,
+            hash as u8,
+            0, 0, 0, 0, 0, 0, 0, 0, // Pad to 16 bytes
+        ];
+
+        let uuid = uuid::Uuid::from_bytes(uuid_bytes);
+        dfs_common::NodeId::from_uuid(uuid)
+    }
+
+    /// Write data and populate byte-range cache for immediate read-back
+    /// This enables zero-latency reads of just-written data (DVR use case)
+    /// Returns (chunk_ids, chunk_sizes, chunk_locations) - locations include full replica node tracking
+    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
+        const MIN_PARALLEL_SIZE: usize = 128 * 1024; // 128KB minimum - use dual-replica for writes >= 128KB
+
+        // For small writes, use single server (less overhead)
+        if data.len() < MIN_PARALLEL_SIZE {
+            let (chunk_ids, chunk_sizes) = self.write_data_single_chunk(data).await?;
+            return Ok((chunk_ids, chunk_sizes, None));  // No chunk_locations for single-server writes
+        }
+
+        let nodes = self.cluster_nodes.read().await.clone();
+        if nodes.len() < 2 {
+            let (chunk_ids, chunk_sizes) = self.write_data_single_chunk(data).await?;
+            return Ok((chunk_ids, chunk_sizes, None));  // No chunk_locations for single-server writes
+        }
+
+        info!("Writing {} bytes using synchronous dual-replica", data.len());
+
+        // NEW: Use dual-replica writes instead of striping
+        let (chunk_locations, replica_nodes) = {
+            let chunk_locs = self.write_data_dual_replica(data, inode, file_offset).await?;
+            let replica1 = nodes[0];
+            let replica2 = nodes[1 % nodes.len()];
+            (chunk_locs, (replica1, replica2))
+        };
+
+        // Extract chunk IDs and sizes for backward compatibility
+        let chunk_ids: Vec<ChunkId> = chunk_locations.iter().map(|loc| loc.chunk_id).collect();
+        let chunk_sizes: Vec<u64> = chunk_locations.iter().map(|loc| loc.size as u64).collect();
+
+        info!("Completed synchronous dual-replica write: {} chunks, each stored on 2 nodes",
+              chunk_ids.len());
+
+        // Return chunk_locations for proper metadata tracking
+        Ok((chunk_ids, chunk_sizes, Some(chunk_locations)))
+    }
+
+    /// Write data (original API for backward compatibility)
+    pub async fn write_data_old(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
+        let (chunk_ids, chunk_sizes, _) = self.write_data_with_cache(data, 0, 0).await?;
+        Ok((chunk_ids, chunk_sizes))
     }
 
     /// Write a chunk to a specific server
@@ -1195,8 +1291,111 @@ impl DfsClient {
         }
     }
 
-    /// Create or update file metadata
-    pub async fn put_file_metadata(&self, metadata: &FileMetadata) -> Result<()> {
+    /// Write file metadata with quorum (3-node writes for split-brain prevention)
+    /// Requires at least 2 out of 3 writes to succeed
+    /// Uses the same 2 nodes that received chunk replicas + 1 additional node when possible
+    pub async fn put_file_metadata_with_quorum(
+        &self,
+        metadata: &FileMetadata,
+        replica_nodes: Option<(SocketAddr, SocketAddr)>
+    ) -> Result<()> {
+        let nodes = self.cluster_nodes.read().await.clone();
+
+        // Need at least 3 nodes for quorum, fall back to single-node write otherwise
+        if nodes.len() < 3 {
+            info!("Not enough nodes for quorum ({} < 3), falling back to single-node metadata write", nodes.len());
+            return self.put_file_metadata_single(metadata).await;
+        }
+
+        // Select 3 nodes for metadata writes
+        let (node1, node2, node3) = if let Some((r1, r2)) = replica_nodes {
+            // Use the 2 nodes that got chunk replicas + 1 additional node
+            let mut remaining: Vec<_> = nodes.iter()
+                .filter(|&&n| n != r1 && n != r2)
+                .copied()
+                .collect();
+
+            if remaining.is_empty() {
+                // Edge case: only 2 nodes in cluster, use them + repeat first
+                (r1, r2, r1)
+            } else {
+                // Pick first available 3rd node
+                let node3 = remaining[0];
+                (r1, r2, node3)
+            }
+        } else {
+            // No replica info, just use first 3 nodes
+            (nodes[0], nodes[1], nodes[2 % nodes.len()])
+        };
+
+        info!("Writing metadata with quorum to 3 nodes: {}, {}, {}", node1, node2, node3);
+
+        // Write to all 3 nodes in parallel
+        let request1 = Request::PutFileMetadata { metadata: metadata.clone() };
+        let request2 = Request::PutFileMetadata { metadata: metadata.clone() };
+        let request3 = Request::PutFileMetadata { metadata: metadata.clone() };
+
+        let task1 = self.send_request(node1, request1);
+        let task2 = self.send_request(node2, request2);
+        let task3 = self.send_request(node3, request3);
+
+        let (result1, result2, result3) = tokio::join!(task1, task2, task3);
+
+        // Count successes
+        let mut success_count = 0;
+        let mut success_node: Option<SocketAddr> = None;
+        let mut errors = Vec::new();
+
+        if result1.is_ok() {
+            success_count += 1;
+            success_node = Some(node1);
+        } else if let Err(e) = result1 {
+            errors.push(format!("node1 ({}): {}", node1, e));
+        }
+
+        if result2.is_ok() {
+            success_count += 1;
+            if success_node.is_none() {
+                success_node = Some(node2);
+            }
+        } else if let Err(e) = result2 {
+            errors.push(format!("node2 ({}): {}", node2, e));
+        }
+
+        if result3.is_ok() {
+            success_count += 1;
+            if success_node.is_none() {
+                success_node = Some(node3);
+            }
+        } else if let Err(e) = result3 {
+            errors.push(format!("node3 ({}): {}", node3, e));
+        }
+
+        // Require quorum: at least 2 out of 3 must succeed
+        if success_count < 2 {
+            anyhow::bail!("Metadata quorum write failed: only {}/3 succeeded. Errors: {:?}", success_count, errors);
+        }
+
+        info!("Metadata quorum write succeeded: {}/3 nodes", success_count);
+
+        // Track SQLite writes for read-after-write consistency
+        if Self::is_sqlite_file(&metadata.path) {
+            if let Some(node) = success_node {
+                let mut tracker = self.sqlite_write_tracker.lock().await;
+                tracker.put(metadata.path.clone(), (node, std::time::Instant::now()));
+
+                info!(
+                    "SQLite quorum write tracked: path={}, node={}, consistency_window={}ms",
+                    metadata.path, node, get_sqlite_consistency_window_ms()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create or update file metadata (single node write)
+    async fn put_file_metadata_single(&self, metadata: &FileMetadata) -> Result<()> {
         let request = Request::PutFileMetadata {
             metadata: metadata.clone(),
         };
@@ -1217,6 +1416,13 @@ impl DfsClient {
         }
 
         Ok(())
+    }
+
+    /// Create or update file metadata
+    /// Automatically uses quorum writes when enough nodes are available
+    pub async fn put_file_metadata(&self, metadata: &FileMetadata) -> Result<()> {
+        // Use quorum writes by default (will fall back internally if not enough nodes)
+        self.put_file_metadata_with_quorum(metadata, None).await
     }
 
     /// Delete file
@@ -1423,6 +1629,22 @@ impl DfsClient {
         let usable_free = usable_available;
 
         Ok((usable_total, usable_free, usable_available, replication_factor))
+    }
+
+    /// Get cluster status including chunk size configuration
+    pub async fn get_cluster_chunk_size(&self) -> Result<usize> {
+        let request = Request::GetClusterStatus;
+        let response = self.send_request_with_retry(request).await?;
+
+        match response {
+            Response::ClusterStatus { chunk_size_mb, .. } => {
+                Ok(chunk_size_mb)
+            }
+            Response::Error { message, .. } => {
+                anyhow::bail!("Failed to get cluster status: {}", message);
+            }
+            _ => anyhow::bail!("Unexpected response type"),
+        }
     }
 }
 

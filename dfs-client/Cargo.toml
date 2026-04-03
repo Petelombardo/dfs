@@ -18,5 +18,6 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 clap = { workspace = true }
 blake3 = { workspace = true }
+uuid = { workspace = true }
 lru = "0.12"
 futures = "0.3"

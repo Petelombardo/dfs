@@ -71,6 +71,10 @@ pub struct DfsFilesystem {
     /// Write buffers per inode (only used if write_buffer_enabled)
     write_buffers: Arc<Mutex<HashMap<u64, WriteBuffer>>>,
 
+    /// Last metadata update timestamp per inode for batching
+    /// Prevents excessive metadata updates during continuous writes
+    last_metadata_update: Arc<RwLock<HashMap<u64, std::time::Instant>>>,
+
     /// Last read chunk cache: (ino, chunk_index, data)
     /// Prevents re-fetching same 4MB chunk for multiple 128KB FUSE reads
     last_chunk_cache: Arc<RwLock<Option<(u64, usize, Vec<u8>)>>>,
@@ -85,6 +89,9 @@ pub struct DfsFilesystem {
 
     /// Lock manager for byte-range locks
     lock_manager: Arc<LockManager>,
+
+    /// Write buffer flush threshold in bytes (dynamic, queried from cluster)
+    buffer_flush_threshold: usize,
 }
 
 impl DfsFilesystem {
@@ -95,6 +102,17 @@ impl DfsFilesystem {
         runtime: tokio::runtime::Handle,
     ) -> Result<Self> {
         let client = Arc::new(DfsClient::new(cluster_nodes)?);
+
+        // Query cluster for chunk size configuration
+        let chunk_size_mb = runtime.block_on(async {
+            client.get_cluster_chunk_size().await
+        }).unwrap_or_else(|e| {
+            warn!("Failed to query cluster chunk size, using default 4MB: {}", e);
+            4  // Default to 4MB if query fails
+        });
+        let buffer_flush_threshold = chunk_size_mb * 1024 * 1024;
+        info!("Client configured with buffer_flush_threshold={} bytes ({}MB) from cluster",
+              buffer_flush_threshold, chunk_size_mb);
 
         // Start background task to periodically refresh cluster nodes
         let client_clone = client.clone();
@@ -158,7 +176,7 @@ impl DfsFilesystem {
 
                             // Write buffered data
                             match client_for_cleanup.write_data_with_cache(&buffer.data, ino, buffer.start_offset).await {
-                                Ok((new_chunk_ids, new_chunk_sizes)) => {
+                                Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
                                     let new_size = buffer.start_offset + buffer.data.len() as u64;
                                     metadata.chunks.extend(new_chunk_ids);
                                     metadata.chunk_sizes.extend(new_chunk_sizes);
@@ -206,6 +224,7 @@ impl DfsFilesystem {
             uid: 0,
             gid: 0,
             file_type: FileType::Directory,
+            chunk_locations: Vec::new(),
         };
 
         metadata_cache.write().unwrap().insert(1, root_metadata);
@@ -221,10 +240,12 @@ impl DfsFilesystem {
             write_counters: Arc::new(RwLock::new(HashMap::new())),
             write_buffer_enabled,
             write_buffers: write_buffers_for_cleanup,
+            last_metadata_update: Arc::new(RwLock::new(HashMap::new())),
             last_chunk_cache: Arc::new(RwLock::new(None)),
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
             statfs_cache: Arc::new(RwLock::new(None)),
             lock_manager: Arc::new(LockManager::new()),
+            buffer_flush_threshold,
         })
     }
 
@@ -286,8 +307,38 @@ impl DfsFilesystem {
         }
     }
 
+    /// Check if metadata should be updated based on time-based batching
+    /// Returns true if:
+    /// - force_update is true (e.g., on close/fsync), OR
+    /// - More than 2 seconds have elapsed since last update, OR
+    /// - This is the first update for this inode
+    fn should_update_metadata(&self, ino: u64, force_update: bool) -> bool {
+        if force_update {
+            return true;
+        }
+
+        const METADATA_UPDATE_INTERVAL_SECS: u64 = 2;
+
+        let last_update = self.last_metadata_update.read().unwrap().get(&ino).copied();
+
+        match last_update {
+            None => true,  // First update
+            Some(last) => {
+                let elapsed = last.elapsed();
+                elapsed >= std::time::Duration::from_secs(METADATA_UPDATE_INTERVAL_SECS)
+            }
+        }
+    }
+
+    /// Update the last metadata update timestamp for an inode
+    fn record_metadata_update(&self, ino: u64) {
+        self.last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
+    }
+
     /// Flush buffered writes for a specific inode to the cluster
-    async fn flush_buffer_async(&self, ino: u64) -> Result<()> {
+    /// If force_metadata_update is true, always update metadata (used on close/fsync)
+    /// If false, use time-based batching (update every 2 seconds)
+    async fn flush_buffer_async(&self, ino: u64, force_metadata_update: bool) -> Result<()> {
         // Get and remove buffer for this inode
         let buffer_opt = {
             let mut buffers = self.write_buffers.lock().await;
@@ -315,7 +366,7 @@ impl DfsFilesystem {
             let buffer_start_offset = buffer.start_offset;
 
             // Use write-through caching to populate byte-range cache for immediate read-back
-            let (new_chunk_ids, new_chunk_sizes) = self.client
+            let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = self.client
                 .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
                 .await?;
 
@@ -323,6 +374,11 @@ impl DfsFilesystem {
             let num_chunks = new_chunk_ids.len();
             let new_size = buffer_start_offset + buffer.data.len() as u64;
 
+            // If dual-replica writes provided chunk_locations, use them (preferred)
+            if let Some(chunk_locations) = chunk_locations_opt {
+                metadata.chunk_locations.extend(chunk_locations);
+            }
+            // Always populate legacy fields for backward compatibility
             metadata.chunks.extend(new_chunk_ids);
             metadata.chunk_sizes.extend(new_chunk_sizes);
             metadata.size = new_size;
@@ -334,10 +390,21 @@ impl DfsFilesystem {
             info!("Flush complete: {} chunks added at offset {}, total file size {}",
                   num_chunks, buffer_start_offset, new_size);
 
-            // Store updated metadata
-            self.client.put_file_metadata(&metadata).await?;
+            // Store updated metadata (with time-based batching unless forced)
+            if self.should_update_metadata(ino, force_metadata_update) {
+                debug!("Updating metadata for inode {} (force={}, chunks={})", ino, force_metadata_update, metadata.chunks.len());
+                self.client.put_file_metadata(&metadata).await?;
+                self.record_metadata_update(ino);
+            } else {
+                debug!("Skipping metadata update for inode {} (batched, will update in {} seconds)",
+                      ino,
+                      2 - self.last_metadata_update.read().unwrap()
+                          .get(&ino)
+                          .map(|t| t.elapsed().as_secs())
+                          .unwrap_or(0));
+            }
 
-            // Update cache
+            // Always update cache (local state)
             self.metadata_cache.write().unwrap().insert(ino, metadata);
         }
 
@@ -588,6 +655,7 @@ impl Filesystem for DfsFilesystem {
         let metadata_cache = self.metadata_cache.clone();
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
+        let last_metadata_update = self.last_metadata_update.clone();
 
         // Spawn async read operation on tokio runtime
         self.runtime.spawn(async move {
@@ -673,7 +741,7 @@ impl Filesystem for DfsFilesystem {
 
                         // Write buffered data
                         match client.write_data_with_cache(&buffer.data, ino, buffer_start).await {
-                            Ok((new_chunk_ids, new_chunk_sizes)) => {
+                            Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
                                 let new_size = buffer_start + buffer_size as u64;
 
                                 // Update metadata
@@ -684,12 +752,29 @@ impl Filesystem for DfsFilesystem {
                                     m.size = new_size;
                                     m.modified_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-                                    if let Err(e) = client.put_file_metadata(&m).await {
-                                        error!("Failed to update metadata after boundary flush: {}", e);
+                                    // Boundary flush during read: use time-based batching
+                                    let should_update_meta = {
+                                        let last_update_lock = last_metadata_update.read().unwrap();
+                                        match last_update_lock.get(&ino) {
+                                            None => true,  // First write
+                                            Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
+                                        }
+                                    };
+
+                                    if should_update_meta {
+                                        if let Err(e) = client.put_file_metadata(&m).await {
+                                            error!("Failed to update metadata after boundary flush: {}", e);
+                                        } else {
+                                            last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
+                                            metadata_cache.write().unwrap().insert(ino, m.clone());
+                                            metadata = m;  // Use updated metadata for read
+                                            info!("Flushed {} bytes at offset {}, new size {} (metadata updated)", buffer_size, buffer_start, new_size);
+                                        }
                                     } else {
+                                        // Skip metadata update but still update cache
                                         metadata_cache.write().unwrap().insert(ino, m.clone());
-                                        metadata = m;  // Use updated metadata for read
-                                        info!("Flushed {} bytes at offset {}, new size {}", buffer_size, buffer_start, new_size);
+                                        metadata = m;
+                                        info!("Flushed {} bytes at offset {}, new size {} (metadata batched)", buffer_size, buffer_start, new_size);
                                     }
                                 }
                             }
@@ -1011,6 +1096,7 @@ impl Filesystem for DfsFilesystem {
             uid: _req.uid(),
             gid: _req.gid(),
             file_type: FileType::RegularFile,
+            chunk_locations: Vec::new(),
         };
 
         // Store metadata on cluster
@@ -1059,6 +1145,7 @@ impl Filesystem for DfsFilesystem {
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
         let runtime = self.runtime.clone();
+        let last_metadata_update = self.last_metadata_update.clone();
         let data_vec = data.to_vec(); // Copy data before moving
 
         // Execute write operation synchronously to preserve write order
@@ -1130,12 +1217,13 @@ impl Filesystem for DfsFilesystem {
                            });
                 }
                 if offset_usize == current_size {
-                    // Buffer size threshold: REDUCED from 4MB to 1MB to prevent OOM
+                    // Buffer size threshold: 4MB to match server chunk_size for optimal performance
                     // With environment variable override support
+                    // Use buffer flush threshold from cluster config (or env var override)
                     let buffer_flush_threshold: usize = std::env::var("DFS_WRITE_BUFFER_SIZE")
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok())
-                        .unwrap_or(1 * 1024 * 1024); // Conservative default: 1MB
+                        .unwrap_or(self.buffer_flush_threshold); // Use cluster-configured chunk size
 
                     let write_buffers_clone = write_buffers.clone();
                     let client_clone = client.clone();
@@ -1243,7 +1331,7 @@ impl Filesystem for DfsFilesystem {
                                         };
 
                                         // Write buffered data as new chunks with caching
-                                        let (new_chunk_ids, new_chunk_sizes) = client_clone
+                                        let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = client_clone
                                             .write_data_with_cache(&data, cache_inode, buffer_start_offset)
                                             .await?;
 
@@ -1251,6 +1339,10 @@ impl Filesystem for DfsFilesystem {
                                         let new_size = buffer_start_offset + data.len() as u64;
                                         let num_chunks = new_chunk_ids.len();
 
+                                        // If dual-replica writes provided chunk_locations, use them
+                                        if let Some(chunk_locations) = chunk_locations_opt {
+                                            flush_metadata.chunk_locations.extend(chunk_locations);
+                                        }
                                         // Append new chunks to existing chunks and update size
                                         flush_metadata.chunks.extend(new_chunk_ids);
                                         flush_metadata.chunk_sizes.extend(new_chunk_sizes);
@@ -1263,10 +1355,25 @@ impl Filesystem for DfsFilesystem {
                                         info!("Flush complete: {} chunks added at offset {}, total file size {}",
                                               num_chunks, buffer_start_offset, new_size);
 
-                                        // Store updated metadata
-                                        client_clone.put_file_metadata(&flush_metadata).await?;
+                                        // Store updated metadata (use time-based batching for auto-flush)
+                                        // Check if we should update based on time
+                                        let should_update_meta = {
+                                            let last_update_lock = last_metadata_update.read().unwrap();
+                                            match last_update_lock.get(&ino) {
+                                                None => true,  // First write
+                                                Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
+                                            }
+                                        };
 
-                                        // Update cache
+                                        if should_update_meta {
+                                            debug!("Auto-flush: updating metadata for inode {} (time-based batching)", ino);
+                                            client_clone.put_file_metadata(&flush_metadata).await?;
+                                            last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
+                                        } else {
+                                            debug!("Auto-flush: skipping metadata update for inode {} (batched)", ino);
+                                        }
+
+                                        // Always update cache
                                         metadata_cache_clone.write().unwrap().insert(ino, flush_metadata);
                                     }
 
@@ -1464,10 +1571,13 @@ impl Filesystem for DfsFilesystem {
             debug!("write_data took {:?}", write_elapsed);
 
             match result {
-                Ok((new_chunk_ids, new_chunk_sizes)) => {
+                Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
                     // Update metadata
                     if is_append {
                         // Append: add new chunks to existing list
+                        if let Some(ref chunk_locations) = chunk_locations_opt {
+                            metadata.chunk_locations.extend(chunk_locations.clone());
+                        }
                         metadata.chunks.extend(new_chunk_ids);
                         metadata.chunk_sizes.extend(new_chunk_sizes);
                         metadata.size = current_size as u64 + new_data.len() as u64;
@@ -1479,23 +1589,34 @@ impl Filesystem for DfsFilesystem {
 
                         let mut updated_chunks = Vec::new();
                         let mut updated_sizes = Vec::new();
+                        let mut updated_locations = Vec::new();
 
                         // Keep chunks before affected range
                         updated_chunks.extend_from_slice(&metadata.chunks[..first_idx]);
                         updated_sizes.extend_from_slice(&metadata.chunk_sizes[..first_idx]);
+                        if !metadata.chunk_locations.is_empty() && first_idx <= metadata.chunk_locations.len() {
+                            updated_locations.extend_from_slice(&metadata.chunk_locations[..first_idx]);
+                        }
 
                         // Insert new chunks
                         updated_chunks.extend(new_chunk_ids);
                         updated_sizes.extend(new_chunk_sizes);
+                        if let Some(ref chunk_locations) = chunk_locations_opt {
+                            updated_locations.extend(chunk_locations.clone());
+                        }
 
                         // Keep chunks after affected range (if any)
                         if last_idx + 1 < metadata.chunks.len() {
                             updated_chunks.extend_from_slice(&metadata.chunks[last_idx + 1..]);
                             updated_sizes.extend_from_slice(&metadata.chunk_sizes[last_idx + 1..]);
+                            if !metadata.chunk_locations.is_empty() && last_idx + 1 < metadata.chunk_locations.len() {
+                                updated_locations.extend_from_slice(&metadata.chunk_locations[last_idx + 1..]);
+                            }
                         }
 
                         metadata.chunks = updated_chunks;
                         metadata.chunk_sizes = updated_sizes;
+                        metadata.chunk_locations = updated_locations;
 
                         // Recalculate total file size
                         metadata.size = metadata.chunk_sizes.iter().sum();
@@ -1505,6 +1626,11 @@ impl Filesystem for DfsFilesystem {
                     } else {
                         // Full rewrite (shouldn't happen with current logic, but keep as fallback)
                         warn!("Full file rewrite with {} bytes", new_data.len());
+                        if let Some(chunk_locations) = chunk_locations_opt {
+                            metadata.chunk_locations = chunk_locations;
+                        } else {
+                            metadata.chunk_locations.clear();
+                        }
                         metadata.chunks = new_chunk_ids;
                         metadata.chunk_sizes = new_chunk_sizes;
                         metadata.size = new_data.len() as u64;
@@ -1522,19 +1648,23 @@ impl Filesystem for DfsFilesystem {
                             path.ends_with(".db-journal") || path.ends_with(".db-shm")
                     };
 
-                    // Batch metadata updates for non-SQLite files: only update every 10 writes
+                    // Batch metadata updates for non-SQLite files: time-based (every 2 seconds)
                     // For SQLite files: ALWAYS update immediately to prevent corruption
-                    let (should_update, count) = if is_sqlite_db {
+                    let should_update = if is_sqlite_db {
                         debug!("SQLite database detected - forcing immediate metadata update for ino={}", ino);
-                        (true, 0) // Always update, count doesn't matter
+                        true // Always update for SQLite
                     } else {
-                        let count = {
-                            let mut counters = write_counters.write().unwrap();
-                            let c = counters.entry(ino).or_insert(0);
-                            *c += 1;
-                            *c
+                        // Use time-based batching for regular files
+                        let last_update_lock = last_metadata_update.read().unwrap();
+                        let should = match last_update_lock.get(&ino) {
+                            None => true,  // First write
+                            Some(last) => {
+                                let elapsed = last.elapsed();
+                                elapsed >= std::time::Duration::from_secs(2)
+                            }
                         };
-                        (count % 10 == 0, count)
+                        drop(last_update_lock);
+                        should
                     };
 
                     if should_update {
@@ -1545,10 +1675,14 @@ impl Filesystem for DfsFilesystem {
                             client.put_file_metadata(&metadata_clone).await
                         });
                         let metadata_elapsed = metadata_start.elapsed();
+
+                        // Record metadata update time for batching
+                        last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
+
                         if is_sqlite_db {
                             debug!("put_file_metadata took {:?} (SQLite immediate update)", metadata_elapsed);
                         } else {
-                            debug!("put_file_metadata took {:?} (batched at write #{})", metadata_elapsed, count);
+                            debug!("put_file_metadata took {:?} (time-based batching)", metadata_elapsed);
                         }
 
                         match update_result {
@@ -1630,7 +1764,7 @@ impl Filesystem for DfsFilesystem {
                         // Write buffered data as new chunks with caching
                         // Use the buffer's recorded start offset
                         let buffer_start_offset = buffer.start_offset;
-                        let (new_chunk_ids, new_chunk_sizes) = client
+                        let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = client
                             .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
                             .await?;
 
@@ -1638,6 +1772,10 @@ impl Filesystem for DfsFilesystem {
                         let num_chunks = new_chunk_ids.len();
                         let new_size = buffer_start_offset + buffer.data.len() as u64;
 
+                        // If dual-replica writes provided chunk_locations, use them
+                        if let Some(chunk_locations) = chunk_locations_opt {
+                            flush_metadata.chunk_locations.extend(chunk_locations);
+                        }
                         // Append new chunks to existing chunks and update size
                         flush_metadata.chunks.extend(new_chunk_ids);
                         flush_metadata.chunk_sizes.extend(new_chunk_sizes);
@@ -1650,7 +1788,8 @@ impl Filesystem for DfsFilesystem {
                         info!("Flush complete: {} chunks added at offset {}, total file size {}",
                               num_chunks, buffer_start_offset, new_size);
 
-                        // Store updated metadata
+                        // Store updated metadata (force update on flush())
+                        debug!("Updating metadata for inode {} (force=true, chunks={})", ino, flush_metadata.chunks.len());
                         client.put_file_metadata(&flush_metadata).await?;
 
                         // Update cache
@@ -1724,8 +1863,8 @@ impl Filesystem for DfsFilesystem {
         if self.write_buffer_enabled {
             // Flush any buffered writes on file close, then release locks
             let result = self.block_on(async {
-                // First flush writes
-                self.flush_buffer_async(ino).await?;
+                // First flush writes (force metadata update on close)
+                self.flush_buffer_async(ino, true).await?;
 
                 // Then release all locks held by this owner (if lock_owner is provided)
                 // lock_owner is only provided if the process held locks
@@ -1825,6 +1964,7 @@ impl Filesystem for DfsFilesystem {
             uid: _req.uid(),
             gid: _req.gid(),
             file_type: FileType::Directory,
+            chunk_locations: Vec::new(),
         };
 
         // Store metadata on cluster
@@ -2157,7 +2297,7 @@ impl Filesystem for DfsFilesystem {
                             match self.block_on(async {
                                 client.write_data_with_cache(truncated_chunk, ino, chunk_offset).await
                             }) {
-                                Ok((new_chunk_ids, new_chunk_sizes)) => {
+                                Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
                                     // Keep chunks before last, add truncated chunk
                                     let mut new_all_chunks = metadata.chunks[..last_chunk_idx].to_vec();
                                     new_all_chunks.extend(new_chunk_ids);
@@ -2304,8 +2444,8 @@ impl Filesystem for DfsFilesystem {
         debug!("fsync: ino={}, datasync={}", ino, datasync);
 
         if self.write_buffer_enabled {
-            // Flush any buffered writes
-            let result = self.block_on(self.flush_buffer_async(ino));
+            // Flush any buffered writes (force metadata update on fsync)
+            let result = self.block_on(self.flush_buffer_async(ino, true));
 
             match result {
                 Ok(_) => reply.ok(),

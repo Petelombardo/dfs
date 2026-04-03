@@ -200,6 +200,12 @@ pub struct FileMetadata {
 
     /// File type
     pub file_type: FileType,
+
+    /// Chunk locations with replica node tracking (optional, for dual-replica writes)
+    /// Added at END for bincode backward compatibility
+    /// When present, this takes precedence over chunks/chunk_sizes fields
+    #[serde(default)]
+    pub chunk_locations: Vec<ChunkLocation>,
 }
 
 impl FileMetadata {
@@ -222,6 +228,25 @@ impl FileMetadata {
             uid: 0,
             gid: 0,
             file_type,
+            chunk_locations: Vec::new(),
+        }
+    }
+
+    /// Get chunk IDs from either chunk_locations or legacy chunks field
+    pub fn get_chunk_ids(&self) -> Vec<ChunkId> {
+        if !self.chunk_locations.is_empty() {
+            self.chunk_locations.iter().map(|loc| loc.chunk_id).collect()
+        } else {
+            self.chunks.clone()
+        }
+    }
+
+    /// Get chunk sizes from either chunk_locations or legacy chunk_sizes field
+    pub fn get_chunk_sizes(&self) -> Vec<u64> {
+        if !self.chunk_locations.is_empty() {
+            self.chunk_locations.iter().map(|loc| loc.size as u64).collect()
+        } else {
+            self.chunk_sizes.clone()
         }
     }
 

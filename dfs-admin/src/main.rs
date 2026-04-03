@@ -264,6 +264,7 @@ async fn handle_cluster_command(
                     nodes,
                     total_nodes,
                     healthy_nodes,
+                    ..
                 } => {
                     if json_output {
                         let output = serde_json::json!({
@@ -639,14 +640,14 @@ async fn handle_file_command(
                         println!("==============================");
                         println!("Total Files: {}", total_count);
                         println!();
-                        println!("{:<38} {:<40} {:<12} {:<8} {}", "File ID", "Path", "Size", "Chunks", "Modified");
-                        println!("{}", "-".repeat(140));
+                        println!("{:<38} {:<80} {:<12} {:<8} {}", "File ID", "Path", "Size", "Chunks", "Modified");
+                        println!("{}", "-".repeat(180));
 
                         for file in files {
                             let size_str = format_size(file.size);
-                            println!("{:<38} {:<40} {:<12} {:<8} {}",
+                            println!("{:<38} {:<80} {:<12} {:<8} {}",
                                 file.id.to_string(),
-                                truncate_path(&file.path, 40),
+                                truncate_path(&file.path, 80),
                                 size_str,
                                 file.chunks.len(),
                                 file.modified_at

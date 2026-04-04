@@ -40,6 +40,24 @@ impl WriteBuffer {
             false // If we can't get elapsed time, don't consider it idle
         }
     }
+
+    /// Check if this buffer should be flushed by background cleanup
+    /// Prevents flushing tiny partial buffers from DVR streaming (128KB writes with pauses)
+    /// Only flush if:
+    /// 1. Buffer is reasonably full (>= 50% = 2MB) AND idle (5+ seconds), OR
+    /// 2. Buffer is very idle (30+ seconds) regardless of size (file closed/abandoned)
+    fn should_background_flush(&self, threshold: usize) -> bool {
+        if let Ok(elapsed) = self.last_modified.elapsed() {
+            let is_idle = elapsed > std::time::Duration::from_secs(5);
+            let is_very_idle = elapsed > std::time::Duration::from_secs(30);
+            let is_reasonably_full = self.data.len() >= threshold / 2; // >= 2MB for 4MB threshold
+
+            // Flush if substantially full and idle, OR very idle (abandoned file)
+            (is_reasonably_full && is_idle) || is_very_idle
+        } else {
+            false
+        }
+    }
 }
 
 /// FUSE filesystem implementation for DFS
@@ -136,22 +154,25 @@ impl DfsFilesystem {
             let write_buffers_clone = write_buffers_for_cleanup.clone();
             let client_for_cleanup = client.clone();
             let metadata_cache_for_cleanup = metadata_cache.clone();
+            let flush_threshold = buffer_flush_threshold;
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
                 loop {
                     interval.tick().await;
 
-                    // Find idle buffers (no writes for 5+ seconds)
-                    let idle_inodes: Vec<u64> = {
+                    // Find buffers that should be flushed
+                    // Only flush reasonably full buffers (>= 2MB) OR very idle buffers (30+ seconds)
+                    // This prevents tiny partial buffers from DVR 128KB writes with pauses
+                    let flush_inodes: Vec<u64> = {
                         let buffers = write_buffers_clone.lock().await;
                         buffers.iter()
-                            .filter(|(_, buf)| buf.is_idle())
+                            .filter(|(_, buf)| buf.should_background_flush(flush_threshold))
                             .map(|(ino, _)| *ino)
                             .collect()
                     };
 
-                    // Flush each idle buffer
-                    for ino in idle_inodes {
+                    // Flush each buffer
+                    for ino in flush_inodes {
                         let buffer_opt = {
                             let mut buffers = write_buffers_clone.lock().await;
                             buffers.remove(&ino)
@@ -159,7 +180,7 @@ impl DfsFilesystem {
 
                         if let Some(buffer) = buffer_opt {
                             let idle_time = buffer.last_modified.elapsed().unwrap_or(std::time::Duration::from_secs(0));
-                            info!("Background flush: idle write buffer for inode {} ({} bytes, idle: {:?})",
+                            info!("Background flush: write buffer for inode {} ({} bytes, idle: {:?})",
                                   ino, buffer.data.len(), idle_time);
 
                             // Get metadata

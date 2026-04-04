@@ -503,12 +503,15 @@ impl DfsClient {
         }
 
         // Check byte-range cache first (for live DVR files), then chunk cache
+        // Also track in-flight reads to prevent duplicate concurrent fetches
         let mut cached_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
         let mut chunks_to_fetch: Vec<(usize, ChunkId, u64)> = Vec::new(); // (idx, chunk_id, file_offset)
+        let mut chunks_to_wait_for: Vec<(usize, ChunkId, u64)> = Vec::new(); // chunks being fetched by another request
 
         {
             let mut byte_cache = self.byte_range_cache.lock().await;
             let mut chunk_cache = self.chunk_cache.lock().await;
+            let mut in_flight = self.prefetch_in_flight.lock().await;
 
             for (idx, chunk_id) in chunk_ids.iter().enumerate() {
                 let mut found = false;
@@ -564,11 +567,21 @@ impl DfsClient {
                     }
                 }
 
+                // Check if another request is already fetching this chunk
+                if !found && in_flight.contains(chunk_id) {
+                    let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
+                    info!("Chunk {} already being fetched by another request - will wait", chunk_id);
+                    chunks_to_wait_for.push((idx, *chunk_id, file_offset));
+                    found = true;
+                }
+
                 // Need to fetch
                 if !found {
                     let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
                     info!("Cache MISS for chunk {} (inode={}, offset={}) - will fetch", chunk_id, inode, file_offset);
                     chunks_to_fetch.push((idx, *chunk_id, file_offset));
+                    // Mark as in-flight to prevent other concurrent requests from fetching
+                    in_flight.insert(*chunk_id);
                 }
             }
         }
@@ -588,6 +601,12 @@ impl DfsClient {
         let chunk_loc_map: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
             chunk_locations.iter().map(|loc| (loc.chunk_id, loc)).collect();
 
+        if chunk_locations.is_empty() && !chunk_ids.is_empty() {
+            warn!("No chunk_locations metadata available for {} chunks - will query metadata server for each chunk", chunk_ids.len());
+        } else if !chunk_locations.is_empty() {
+            info!("Using chunk_locations metadata for {} chunks (have {} locations)", chunk_ids.len(), chunk_locations.len());
+        }
+
         // Create parallel fetch tasks
         let fetch_tasks: Vec<_> = chunks_to_fetch.iter().map(|(idx, chunk_id, file_offset)| {
             let idx = *idx;
@@ -596,6 +615,11 @@ impl DfsClient {
             let client = self.clone();
             let nodes = nodes.clone();
             let chunk_location = chunk_loc_map.get(&chunk_id).map(|&loc| loc.clone());
+
+            if chunk_location.is_none() && !chunk_locations.is_empty() {
+                warn!("Chunk {} not found in chunk_locations map (map has {} entries)", chunk_id, chunk_loc_map.len());
+            }
+
             let use_striped = is_sequential == false; // Only stripe for random access
 
             tokio::spawn(async move {
@@ -616,39 +640,12 @@ impl DfsClient {
                 }
 
                 // Fallback to standard single-node read
-                // Try to get replica locations
-                let cached_replicas = {
-                    let mut cache = client.replica_cache.lock().await;
-                    cache.get(&chunk_id).cloned()
-                };
-
-                let mut replicas = if let Some(cached) = cached_replicas {
-                    debug!("Replica cache HIT for chunk {}", chunk_id);
-                    (*cached).clone()
-                } else {
-                    // Cache miss - query metadata server
-                    debug!("Replica cache MISS for chunk {}", chunk_id);
-                    match client.get_chunk_replicas(chunk_id).await {
-                        Ok(r) => {
-                            debug!("Found {} replicas for chunk {}", r.len(), chunk_id);
-                            // Cache the result
-                            let r_arc = Arc::new(r.clone());
-                            client.replica_cache.lock().await.put(chunk_id, r_arc);
-                            r
-                        }
-                        Err(e) => {
-                            // Fallback to trying all nodes if query fails
-                            debug!("Failed to get replicas for {}: {}, trying all nodes", chunk_id, e);
-                            nodes.clone()
-                        }
-                    }
-                };
-
-                // Prefer chunk_locations nodes if available (likely in cache from recent write)
-                if let Some(ref location) = chunk_location {
-                    // Map NodeIds to SocketAddrs
+                // Try chunk_locations FIRST (fast, no network query needed!)
+                let mut replicas = if let Some(ref location) = chunk_location {
+                    // Map NodeIds to SocketAddrs from chunk_locations metadata
                     let node_id_map = client.addr_to_node_id.read().await;
-                    let preferred_addrs: Vec<SocketAddr> = location.nodes.iter()
+
+                    let chunk_addrs: Vec<SocketAddr> = location.nodes.iter()
                         .filter_map(|node_id| {
                             node_id_map.iter()
                                 .find(|(_, &id)| id == *node_id)
@@ -656,30 +653,58 @@ impl DfsClient {
                         })
                         .collect();
 
-                    if !preferred_addrs.is_empty() {
-                        debug!("Preferring {} write nodes for chunk {} (likely cached)",
-                               preferred_addrs.len(), chunk_id);
-                        // Put preferred nodes at the front
-                        let preferred_set: std::collections::HashSet<_> = preferred_addrs.iter().copied().collect();
-                        replicas = preferred_addrs.into_iter()
-                            .chain(replicas.into_iter().filter(|addr| !preferred_set.contains(addr)))
-                            .collect();
+                    if !chunk_addrs.is_empty() {
+                        info!("Using chunk_locations: chunk {} stored on {} specific nodes (skipping metadata query)",
+                               chunk_id, chunk_addrs.len());
+                        chunk_addrs
+                    } else {
+                        warn!("Chunk {} has {} nodes in metadata but none matched node_id_map (map size: {}), falling back to query",
+                              chunk_id, location.nodes.len(), node_id_map.len());
+                        // Fall through to query path below
+                        Vec::new()
                     }
+                } else {
+                    Vec::new()
+                };
+
+                // If chunk_locations didn't give us nodes, fall back to querying or cache
+                if replicas.is_empty() {
+                    let cached_replicas = {
+                        let mut cache = client.replica_cache.lock().await;
+                        cache.get(&chunk_id).cloned()
+                    };
+
+                    replicas = if let Some(cached) = cached_replicas {
+                        debug!("Replica cache HIT for chunk {}", chunk_id);
+                        (*cached).clone()
+                    } else {
+                        // Cache miss - query metadata server
+                        debug!("Replica cache MISS for chunk {}, querying metadata server", chunk_id);
+                        match client.get_chunk_replicas(chunk_id).await {
+                            Ok(r) => {
+                                debug!("Found {} replicas for chunk {}", r.len(), chunk_id);
+                                // Cache the result
+                                let r_arc = Arc::new(r.clone());
+                                client.replica_cache.lock().await.put(chunk_id, r_arc);
+                                r
+                            }
+                            Err(e) => {
+                                // Fallback to trying all nodes if query fails
+                                debug!("Failed to get replicas for {}: {}, trying all nodes", chunk_id, e);
+                                nodes.clone()
+                            }
+                        }
+                    };
                 }
 
                 // Select one replica
-                // For sequential reads, use first replica (sticky) for better HDD sequential performance
-                // For random reads, use round-robin for load balancing
-                let selected_replica = if use_striped {
-                    // Random access: use round-robin
-                    client.select_replica(&replicas)
-                        .context("No replicas available")?
-                } else {
-                    // Sequential access: use first replica (sticky to one server)
-                    replicas.first()
-                        .copied()
-                        .context("No replicas available")?
-                };
+                // ALWAYS use round-robin when we have chunk_locations metadata, because:
+                // - Chunks are written round-robin across nodes, so chunk_locations already has balanced distribution
+                // - Reading from the "first" replica would concentrate reads on same few nodes
+                // - Round-robin across chunk_locations gives optimal load balancing
+                // For random access or when no chunk_locations, use standard round-robin
+                let selected_replica = client.select_replica(&replicas)
+                    .context("No replicas available")?;
 
                 let selection_mode = if use_striped { "round-robin" } else { "sticky" };
                 debug!("Selected replica {} for chunk {} ({})", selected_replica, chunk_id, selection_mode);
@@ -751,6 +776,74 @@ impl DfsClient {
             fetched_chunks.push((idx, data_arc));
         }
 
+        // Remove fetched chunks from in-flight tracker
+        {
+            let mut in_flight = self.prefetch_in_flight.lock().await;
+            for (_, chunk_id, _) in &chunks_to_fetch {
+                in_flight.remove(chunk_id);
+            }
+        }
+
+        // Wait for chunks that were already being fetched by other requests
+        // Poll the cache until they appear (they should be there very soon)
+        if !chunks_to_wait_for.is_empty() {
+            info!("Waiting for {} chunks already being fetched by other requests", chunks_to_wait_for.len());
+
+            for (idx, chunk_id, file_offset) in chunks_to_wait_for {
+                let wait_start = std::time::Instant::now();
+                let mut data_found = false;
+
+                // Poll for up to 10 seconds (generous timeout for network fetches)
+                for attempt in 0..100 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                    // Check chunk cache
+                    let chunk_cache = self.chunk_cache.lock().await;
+                    if let Some(data) = chunk_cache.peek(&chunk_id) {
+                        info!("Waited chunk {} now available after {:?}", chunk_id, wait_start.elapsed());
+                        fetched_chunks.push((idx, Arc::clone(data)));
+                        data_found = true;
+                        break;
+                    }
+                    drop(chunk_cache);
+
+                    if attempt % 10 == 0 {
+                        debug!("Still waiting for chunk {} (attempt {})", chunk_id, attempt);
+                    }
+                }
+
+                if !data_found {
+                    // This shouldn't happen - another request said it was fetching
+                    // But if it does, fall back to fetching ourselves
+                    warn!("Timeout waiting for chunk {} being fetched by another request, fetching ourselves", chunk_id);
+
+                    // Try to fetch it ourselves
+                    let replicas = match self.get_chunk_replicas(chunk_id).await {
+                        Ok(r) => r,
+                        Err(_) => nodes.clone(),
+                    };
+
+                    let selected_replica = self.select_replica(&replicas)
+                        .context("No replicas available for fallback fetch")?;
+
+                    match self.read_chunk_from_server(selected_replica, chunk_id).await {
+                        Ok(data) => {
+                            let data_arc = Arc::new(data);
+
+                            // Cache it
+                            let mut chunk_cache = self.chunk_cache.lock().await;
+                            chunk_cache.put(chunk_id, Arc::clone(&data_arc));
+
+                            fetched_chunks.push((idx, data_arc));
+                        }
+                        Err(e) => {
+                            anyhow::bail!("Failed to fetch chunk {} after timeout: {}", chunk_id, e);
+                        }
+                    }
+                }
+            }
+        }
+
         // Combine cached and fetched chunks
         let mut all_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
         all_chunks.extend(cached_chunks);
@@ -815,19 +908,22 @@ impl DfsClient {
                     .unwrap_or(1024);
 
                 // Base prefetch distance: scale based on available memory
-                // Now more aggressive since we increased cache sizes to support live streaming
+                // Moderate prefetching - enough to stay ahead but not so much we wait for them
+                // With round-robin across 5 servers, we get natural parallelism
                 let (base_large, base_medium, base_tiny) = if available_mb < 256 {
-                    // Extremely low memory: minimal prefetch (16MB ahead)
-                    (4, 6, 12)
+                    // Extremely low memory: minimal prefetch
+                    (8, 12, 16)
                 } else if available_mb < 512 {
-                    // Very low memory: moderate prefetch (24MB ahead for live streaming)
-                    (6, 10, 16)
+                    // Very low memory: moderate prefetch
+                    (12, 16, 20)
                 } else if available_mb < 1024 {
-                    // Low memory: aggressive prefetch (32MB ahead)
-                    (8, 12, 20)
+                    // Low memory: moderate prefetch
+                    (16, 20, 24)
                 } else {
-                    // Normal memory: very aggressive prefetch (48MB ahead)
-                    (12, 16, 24)
+                    // Normal memory: aggressive prefetch (20 chunks = 80MB ahead)
+                    // With 5 servers, that's 4 chunks per server = ~16MB per server
+                    // At ~30-40 MB/s per server, ~0.4-0.5 seconds of prefetch buffer per server
+                    (20, 24, 28)
                 };
 
                 // Adaptive prefetch distance based on chunk count
@@ -921,6 +1017,7 @@ impl DfsClient {
                     });
                 }
             }
+
             } else {
                 info!("Skipping prefetch: random/non-sequential access detected at chunk {}",
                        last_file_chunk_idx);
@@ -1111,6 +1208,8 @@ impl DfsClient {
         }
     }
 
+    /// Send prefetch hint to server (fire-and-forget, non-blocking)
+    /// Server will warm these chunks into its page cache
     /// Read a byte range from a specific server (for striped multi-replica reads)
     async fn read_chunk_range_from_server(
         &self,

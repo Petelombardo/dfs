@@ -499,6 +499,11 @@ impl Filesystem for DfsFilesystem {
     ) -> Result<(), libc::c_int> {
         info!("Initializing DFS filesystem");
 
+        // Enable aggressive kernel read-ahead for sequential reads (DVR streaming)
+        // This tells the kernel to read ahead up to 16MB for sequential access patterns
+        config.set_max_readahead(16 * 1024 * 1024);
+        info!("Set max_readahead to 16MB for sequential streaming");
+
         // Enable POSIX file locking - tell kernel to use our setlk/getlk implementations
         // instead of handling locks in the kernel
         match config.add_capabilities(fuser::consts::FUSE_POSIX_LOCKS) {

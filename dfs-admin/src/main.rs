@@ -271,8 +271,11 @@ async fn handle_cluster_command(
                             "total_nodes": total_nodes,
                             "healthy_nodes": healthy_nodes,
                             "nodes": nodes.iter().map(|n| {
+                                let id_str = n.id.to_string();
+                                let short_id = &id_str[..8.min(id_str.len())];
                                 serde_json::json!({
-                                    "id": n.id.to_string(),
+                                    "id": id_str,
+                                    "short_id": short_id,
                                     "address": n.addr.to_string(),
                                     "status": format!("{:?}", n.status),
                                     "last_heartbeat": n.last_heartbeat,
@@ -287,10 +290,12 @@ async fn handle_cluster_command(
                         println!("Healthy Nodes: {}", healthy_nodes);
                         println!();
                         println!("Nodes:");
-                        println!("{:<40} {:<20} {:<12} {}", "ID", "Address", "Status", "Last Heartbeat");
-                        println!("{}", "-".repeat(95));
+                        println!("{:<10} {:<40} {:<20} {:<12} {}", "Short ID", "ID", "Address", "Status", "Last Heartbeat");
+                        println!("{}", "-".repeat(107));
 
                         for node in nodes {
+                            let id_str = node.id.to_string();
+                            let short_id = &id_str[..8.min(id_str.len())];
                             let status_str = format!("{:?}", node.status);
                             let status_display = match node.status {
                                 dfs_common::NodeStatus::Online => format!("✓ {}", status_str),
@@ -301,8 +306,9 @@ async fn handle_cluster_command(
                             let now = dfs_common::types::current_timestamp();
                             let seconds_ago = now.saturating_sub(node.last_heartbeat);
                             println!(
-                                "{:<40} {:<20} {:<12} {}s ago",
-                                node.id.to_string(),
+                                "{:<10} {:<40} {:<20} {:<12} {}s ago",
+                                short_id,
+                                id_str,
                                 node.addr,
                                 status_display,
                                 seconds_ago

@@ -752,6 +752,28 @@ impl Filesystem for DfsFilesystem {
                             let distance_to_buffer_end = buffer_end - offset;
                             let buffer_size = buffer.data.len();
 
+                            // Calculate current EOF (max of metadata size and buffer end)
+                            let current_eof = (buffer_start + buffer_size).max(metadata.size as usize);
+                            let is_at_eof = buffer_end >= current_eof;
+
+                            // If we're reading at EOF (live edge), serve what's in buffer without flushing
+                            // This prevents hiccups during live TV playback
+                            if is_at_eof {
+                                let buffer_relative_offset = offset - buffer_start;
+                                let available = buffer_end - offset;
+                                let data = buffer.data[buffer_relative_offset..buffer_relative_offset + available].to_vec();
+
+                                info!("FUSE read at EOF (live edge): ino={}, offset={}, requested={}, serving={}, buffer=[{}, {}), eof={}",
+                                      ino, offset, size, available, buffer_start, buffer_end, current_eof);
+
+                                let elapsed = start.elapsed();
+                                info!("FUSE read COMPLETE (EOF): ino={}, offset={}, size={}, took {:?}",
+                                      ino, offset, available, elapsed);
+
+                                reply.data(&data);
+                                return;
+                            }
+
                             // If read is very close to buffer end AND buffer is reasonably full, flush it
                             // Use cluster-configured chunk size as threshold
                             if distance_to_buffer_end < 65536 && buffer_size >= buffer_flush_threshold {

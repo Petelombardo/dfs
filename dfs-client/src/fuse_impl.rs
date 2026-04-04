@@ -48,11 +48,12 @@ impl WriteBuffer {
     /// 2. Buffer is very idle (30+ seconds) regardless of size (file closed/abandoned)
     fn should_background_flush(&self, threshold: usize) -> bool {
         if let Ok(elapsed) = self.last_modified.elapsed() {
-            let is_idle = elapsed > std::time::Duration::from_secs(5);
-            let is_very_idle = elapsed > std::time::Duration::from_secs(30);
+            let is_idle = elapsed > std::time::Duration::from_secs(15);
+            let is_very_idle = elapsed > std::time::Duration::from_secs(60);
             let is_reasonably_full = self.data.len() >= threshold / 2; // >= 2MB for 4MB threshold
 
             // Flush if substantially full and idle, OR very idle (abandoned file)
+            // Idle threshold increased to 15s to accommodate DVR's bursty write pattern (128KB every ~5-10s)
             (is_reasonably_full && is_idle) || is_very_idle
         } else {
             false
@@ -745,15 +746,31 @@ impl Filesystem for DfsFilesystem {
                             return;
                         }
 
-                        // If read is CLOSE to end of buffer (within 64KB), flush to avoid short reads
-                        // This prevents garbled video from partial reads when watching live TV
-                        // MUST ALWAYS FLUSH - skipping causes data loss (buffered data not on backend yet)
-                        if offset >= buffer_start && offset < buffer_end {
+                        // If read extends beyond buffer, either flush or serve partial
+                        if offset >= buffer_start && offset < buffer_end && read_end > buffer_end {
                             let distance_to_buffer_end = buffer_end - offset;
-                            if distance_to_buffer_end < 65536 {  // Within 64KB of write position
-                                info!("FUSE read near buffer end: ino={}, offset={}, distance={} bytes, buffer_range=[{}, {}), flushing buffer",
-                                      ino, offset, distance_to_buffer_end, buffer_start, buffer_end);
+                            let buffer_size = buffer.data.len();
+
+                            // If read is very close to buffer end AND buffer is reasonably full, flush it
+                            if distance_to_buffer_end < 65536 && buffer_size >= 2 * 1024 * 1024 {
+                                info!("FUSE read near buffer end: ino={}, offset={}, distance={} bytes, buffer_size={} bytes, flushing",
+                                      ino, offset, distance_to_buffer_end, buffer_size);
                                 true
+                            } else if distance_to_buffer_end < 65536 {
+                                // Buffer too small to flush - serve partial read to avoid tiny chunks
+                                let buffer_relative_offset = offset - buffer_start;
+                                let available = buffer_end - offset;
+                                let data = buffer.data[buffer_relative_offset..buffer_relative_offset + available].to_vec();
+
+                                info!("FUSE read partial (buffer too small to flush): ino={}, offset={}, requested={}, serving={}, buffer_size={}",
+                                      ino, offset, size, available, buffer_size);
+
+                                let elapsed = start.elapsed();
+                                info!("FUSE read COMPLETE (partial): ino={}, offset={}, size={}, took {:?}",
+                                      ino, offset, available, elapsed);
+
+                                reply.data(&data);
+                                return;
                             } else {
                                 false
                             }

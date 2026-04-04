@@ -36,6 +36,12 @@ pub struct NodeConfig {
     /// Address this node listens on
     pub listen_addr: SocketAddr,
 
+    /// Address this node advertises to other nodes (optional)
+    /// If not set, will auto-detect from incoming connections
+    /// Use this to override auto-detection or when behind NAT
+    #[serde(default)]
+    pub advertise_addr: Option<SocketAddr>,
+
     /// Optional node name (defaults to hostname)
     pub name: Option<String>,
 }
@@ -44,6 +50,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:8900".parse().unwrap(),
+            advertise_addr: None,
             name: None,
         }
     }

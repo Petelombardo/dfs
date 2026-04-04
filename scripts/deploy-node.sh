@@ -42,15 +42,26 @@ prompt() {
 echo -e "${YELLOW}Node Configuration:${NC}"
 echo ""
 
+# Auto-detect primary IP address
+AUTO_IP=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
+if [ -z "$AUTO_IP" ]; then
+    # Fallback: get first non-loopback IPv4
+    AUTO_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+if [ -z "$AUTO_IP" ]; then
+    AUTO_IP="0.0.0.0"
+fi
+
 # Get node address
 while true; do
-    prompt NODE_IP "Node IP address (not hostname)" "0.0.0.0"
+    echo -e "${YELLOW}Auto-detected IP: ${GREEN}${AUTO_IP}${NC}"
+    prompt NODE_IP "Node IP address (or press Enter to use auto-detected)" "$AUTO_IP"
 
     # Validate it's an IP address
-    if [[ "$NODE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [ "$NODE_IP" = "0.0.0.0" ]; then
+    if [[ "$NODE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         break
     else
-        echo -e "${RED}Error: Please enter an IP address (e.g., 192.168.1.10 or 0.0.0.0), not a hostname${NC}"
+        echo -e "${RED}Error: Please enter a valid IP address (e.g., 192.168.1.10)${NC}"
         echo -e "${YELLOW}Tip: Use 'hostname -I' to see your IP addresses${NC}"
     fi
 done

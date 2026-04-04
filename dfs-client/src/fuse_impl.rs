@@ -784,64 +784,70 @@ impl Filesystem for DfsFilesystem {
                     }
                 };
 
-                // Flush buffer if needed (outside the lock to avoid deadlock)
+                // Spawn background flush if needed (don't block read operation)
                 if should_flush_buffer {
-                    info!("Flushing write buffer for ino={} due to boundary read", ino);
+                    info!("Spawning background flush for ino={} due to boundary read (non-blocking)", ino);
                     let buffer_opt = {
                         let mut buffers = write_buffers.lock().await;
                         buffers.remove(&ino)
                     };
 
                     if let Some(buffer) = buffer_opt {
-                        let buffer_start = buffer.start_offset;
-                        let buffer_size = buffer.data.len();
+                        let client_clone = client.clone();
+                        let metadata_cache_clone = metadata_cache.clone();
+                        let last_metadata_update_clone = last_metadata_update.clone();
 
-                        // Write buffered data
-                        match client.write_data_with_cache(&buffer.data, ino, buffer_start).await {
-                            Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
-                                let new_size = buffer_start + buffer_size as u64;
+                        // Spawn flush in background, don't wait for it
+                        tokio::spawn(async move {
+                            let buffer_start = buffer.start_offset;
+                            let buffer_size = buffer.data.len();
 
-                                // Update metadata
-                                let mut meta = metadata_cache.read().unwrap().get(&ino).cloned();
-                                if let Some(mut m) = meta {
-                                    if let Some(chunk_locations) = chunk_locations_opt {
-                                        m.chunk_locations.extend(chunk_locations);
-                                    }
-                                    m.chunks.extend(new_chunk_ids);
-                                    m.chunk_sizes.extend(new_chunk_sizes);
-                                    m.size = new_size;
-                                    m.modified_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            // Write buffered data
+                            match client_clone.write_data_with_cache(&buffer.data, ino, buffer_start).await {
+                                Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
+                                    let new_size = buffer_start + buffer_size as u64;
 
-                                    // Boundary flush during read: use time-based batching
-                                    let should_update_meta = {
-                                        let last_update_lock = last_metadata_update.read().unwrap();
-                                        match last_update_lock.get(&ino) {
-                                            None => true,  // First write
-                                            Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
+                                    // Update metadata
+                                    let mut meta = metadata_cache_clone.read().unwrap().get(&ino).cloned();
+                                    if let Some(mut m) = meta {
+                                        if let Some(chunk_locations) = chunk_locations_opt {
+                                            m.chunk_locations.extend(chunk_locations);
                                         }
-                                    };
+                                        m.chunks.extend(new_chunk_ids);
+                                        m.chunk_sizes.extend(new_chunk_sizes);
+                                        m.size = new_size;
+                                        m.modified_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-                                    if should_update_meta {
-                                        if let Err(e) = client.put_file_metadata(&m).await {
-                                            error!("Failed to update metadata after boundary flush: {}", e);
+                                        // Boundary flush during read: use time-based batching
+                                        let should_update_meta = {
+                                            let last_update_lock = last_metadata_update_clone.read().unwrap();
+                                            match last_update_lock.get(&ino) {
+                                                None => true,  // First write
+                                                Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
+                                            }
+                                        };
+
+                                        if should_update_meta {
+                                            if let Err(e) = client_clone.put_file_metadata(&m).await {
+                                                error!("Failed to update metadata after background flush: {}", e);
+                                            } else {
+                                                last_metadata_update_clone.write().unwrap().insert(ino, std::time::Instant::now());
+                                                metadata_cache_clone.write().unwrap().insert(ino, m.clone());
+                                                info!("Background flush complete: {} bytes at offset {}, new size {} (metadata updated)", buffer_size, buffer_start, new_size);
+                                            }
                                         } else {
-                                            last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
-                                            metadata_cache.write().unwrap().insert(ino, m.clone());
-                                            metadata = m;  // Use updated metadata for read
-                                            info!("Flushed {} bytes at offset {}, new size {} (metadata updated)", buffer_size, buffer_start, new_size);
+                                            // Skip metadata update but still update cache
+                                            metadata_cache_clone.write().unwrap().insert(ino, m.clone());
+                                            info!("Background flush complete: {} bytes at offset {}, new size {} (metadata batched)", buffer_size, buffer_start, new_size);
                                         }
-                                    } else {
-                                        // Skip metadata update but still update cache
-                                        metadata_cache.write().unwrap().insert(ino, m.clone());
-                                        metadata = m;
-                                        info!("Flushed {} bytes at offset {}, new size {} (metadata batched)", buffer_size, buffer_start, new_size);
                                     }
                                 }
+                                Err(e) => {
+                                    error!("Failed to flush buffer in background: {}", e);
+                                }
                             }
-                            Err(e) => {
-                                error!("Failed to flush buffer for boundary read: {}", e);
-                            }
-                        }
+                        });
+                        info!("Background flush spawned for ino={}, continuing with read immediately", ino);
                     }
                 }
             }

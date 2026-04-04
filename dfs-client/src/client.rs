@@ -117,23 +117,28 @@ impl DfsClient {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(64); // Conservative default: 64 chunks = 256MB per cache
 
-        let (chunk_target_pct, byte_target_pct, min_chunks) = if available_mb < 512 {
-            // Very low memory systems (<512MB available): minimal cache
-            // chunk: 1%, byte: 1%, min 2 chunks (8MB + 8MB = 16MB total)
-            // Suitable for embedded ARM devices with <1GB total RAM
-            (1, 1, 2)
+        let (chunk_target_pct, byte_target_pct, min_chunks) = if available_mb < 256 {
+            // Extremely low memory systems (<256MB available): minimal cache
+            // chunk: 4%, byte: 4%, min 2 chunks (~10MB + ~10MB = ~20MB total)
+            // Just enough to avoid OOM on very constrained devices
+            (4, 4, 2)
+        } else if available_mb < 512 {
+            // Very low memory systems (256-512MB available): conservative but usable
+            // chunk: 8%, byte: 8%, min 4 chunks (~20MB + ~20MB = ~40MB total)
+            // Enough for basic live streaming caching on ARM devices
+            (8, 8, 4)
         } else if available_mb < 1024 {
-            // Low memory systems (<1GB available): conservative
-            // chunk: 1%, byte: 1%, min 4 chunks (16MB + 16MB = 32MB total)
-            (1, 1, 4)
+            // Low memory systems (512MB-1GB available): moderate cache
+            // chunk: 10%, byte: 10%, min 6 chunks (~50MB + ~50MB = ~100MB total)
+            (10, 10, 6)
         } else if available_mb < 1536 {
-            // Medium memory systems (<1.5GB available): still conservative
-            // chunk: 2%, byte: 2%, min 6 chunks (24MB + 24MB = 48MB total)
-            (2, 2, 6)
+            // Medium memory systems (1-1.5GB available): good cache
+            // chunk: 12%, byte: 12%, min 8 chunks (~75MB + ~75MB = ~150MB total)
+            (12, 12, 8)
         } else {
-            // Normal systems: moderate cache sizes
-            // chunk: 3%, byte: 3%, min 8 chunks (32MB + 32MB = 64MB total)
-            (3, 3, 8)
+            // Normal systems (>1.5GB available): generous cache sizes
+            // chunk: 15%, byte: 15%, min 12 chunks (~100MB + ~100MB = ~200MB total)
+            (15, 15, 12)
         };
 
         let cache_capacity = dfs_common::calculate_cache_capacity(
@@ -809,16 +814,20 @@ impl DfsClient {
                     .map(|bytes| bytes / (1024 * 1024))
                     .unwrap_or(1024);
 
-                // Base prefetch distance: scale down for low-memory systems
-                let (base_large, base_medium, base_tiny) = if available_mb < 512 {
-                    // Very low memory: minimal prefetch (8MB ahead for 4MB chunks)
-                    (2, 4, 8)
+                // Base prefetch distance: scale based on available memory
+                // Now more aggressive since we increased cache sizes to support live streaming
+                let (base_large, base_medium, base_tiny) = if available_mb < 256 {
+                    // Extremely low memory: minimal prefetch (16MB ahead)
+                    (4, 6, 12)
+                } else if available_mb < 512 {
+                    // Very low memory: moderate prefetch (24MB ahead for live streaming)
+                    (6, 10, 16)
                 } else if available_mb < 1024 {
-                    // Low memory: conservative prefetch (12MB ahead for 4MB chunks)
-                    (3, 6, 12)
+                    // Low memory: aggressive prefetch (32MB ahead)
+                    (8, 12, 20)
                 } else {
-                    // Normal memory: moderate prefetch (16MB ahead for 4MB chunks)
-                    (4, 8, 16)
+                    // Normal memory: very aggressive prefetch (48MB ahead)
+                    (12, 16, 24)
                 };
 
                 // Adaptive prefetch distance based on chunk count

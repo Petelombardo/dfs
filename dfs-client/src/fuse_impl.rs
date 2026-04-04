@@ -1363,12 +1363,29 @@ impl Filesystem for DfsFilesystem {
                                     let buffer_data: Option<(Vec<u8>, u64)> = {
                                         let mut buffers = write_buffers.lock().await;
                                         if let Some(buffer) = buffers.get_mut(&ino) {
-                                            // Use mem::take to move data without cloning (prevents memory leak)
-                                            let data: Vec<u8> = std::mem::take(&mut buffer.data);
+                                            let buffer_size = buffer.data.len();
+
+                                            // Only flush multiples of chunk_size to prevent server from creating tiny overflow chunks
+                                            // If buffer = 4.2MB, flush only 4MB and leave 200KB in buffer
+                                            let flush_size = (buffer_size / buffer_flush_threshold) * buffer_flush_threshold;
+
+                                            if flush_size == 0 {
+                                                // Buffer < threshold, nothing to flush
+                                                return Ok(());
+                                            }
+
+                                            let data: Vec<u8> = if flush_size == buffer_size {
+                                                // Flush entire buffer (it's exactly a multiple of chunk_size)
+                                                std::mem::take(&mut buffer.data)
+                                            } else {
+                                                // Flush only the aligned portion, keep overflow
+                                                let flush_data = buffer.data.drain(..flush_size).collect();
+                                                flush_data
+                                            };
+
                                             let start: u64 = buffer.start_offset;
-                                            // Update start offset for new writes
-                                            let new_start = start + data.len() as u64;
-                                            buffer.start_offset = new_start;
+                                            // Update start offset for flushed data
+                                            buffer.start_offset = start + data.len() as u64;
                                             buffer.last_modified = SystemTime::now();
                                             Some((data, start))
                                         } else {

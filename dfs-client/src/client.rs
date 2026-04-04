@@ -90,6 +90,10 @@ pub struct DfsClient {
     /// Maps file path -> (write_node_addr, write_timestamp)
     /// Prevents reading stale metadata from non-write nodes before async replication completes
     sqlite_write_tracker: Arc<Mutex<LruCache<String, (SocketAddr, std::time::Instant)>>>,
+
+    /// Address to NodeId mapping for chunk_locations metadata
+    /// Maps SocketAddr -> NodeId to use real node IDs instead of synthetic ones
+    addr_to_node_id: Arc<RwLock<HashMap<SocketAddr, dfs_common::NodeId>>>,
 }
 
 impl DfsClient {
@@ -184,6 +188,7 @@ impl DfsClient {
             replica_selector: Arc::new(AtomicU64::new(0)),
             replica_cache: Arc::new(Mutex::new(replica_cache)),
             sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
+            addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -1041,6 +1046,8 @@ impl DfsClient {
         }
 
         // Create ChunkLocation entries with both replica addresses
+        // Use real node IDs from the cluster mapping
+        let node_id_map = self.addr_to_node_id.read().await;
         let mut chunk_locations = Vec::new();
 
         for (idx, chunk_id) in chunk_ids_1.iter().enumerate() {
@@ -1049,18 +1056,33 @@ impl DfsClient {
                 warn!("Chunk ID mismatch at index {}: {} vs {}", idx, chunk_id, chunk_ids_2[idx]);
             }
 
+            // Get real node IDs from mapping, fallback to synthetic if not found
+            let node1_id = node_id_map.get(&replica1)
+                .copied()
+                .unwrap_or_else(|| {
+                    warn!("Node ID not found for replica1 {}, using synthetic ID", replica1);
+                    Self::node_id_from_addr(replica1)
+                });
+            let node2_id = node_id_map.get(&replica2)
+                .copied()
+                .unwrap_or_else(|| {
+                    warn!("Node ID not found for replica2 {}, using synthetic ID", replica2);
+                    Self::node_id_from_addr(replica2)
+                });
+
+            debug!("Creating ChunkLocation with nodes: {} ({}) and {} ({})",
+                   node1_id, replica1, node2_id, replica2);
+
             let location = dfs_common::ChunkLocation {
                 chunk_id: *chunk_id,
-                nodes: vec![
-                    Self::node_id_from_addr(replica1),
-                    Self::node_id_from_addr(replica2),
-                ],
+                nodes: vec![node1_id, node2_id],
                 size: chunk_sizes_1[idx] as usize,
                 checksum: chunk_id.hash,  // ChunkId already is the Blake3 hash
             };
 
             chunk_locations.push(location);
         }
+        drop(node_id_map);  // Release lock
 
         info!("Dual-replica write complete: {} chunks stored on {} and {}",
               chunk_locations.len(), replica1, replica2);
@@ -1490,7 +1512,7 @@ impl DfsClient {
 
             match self.send_request(*node_addr, request).await {
                 Ok(Response::ClusterStatus { nodes: cluster_nodes, .. }) => {
-                    // Extract online node addresses
+                    // Extract online node addresses and populate addr->NodeId mapping
                     let new_addrs: Vec<SocketAddr> = cluster_nodes
                         .iter()
                         .filter(|n| n.status == dfs_common::NodeStatus::Online)
@@ -1498,6 +1520,16 @@ impl DfsClient {
                         .collect();
 
                     if !new_addrs.is_empty() {
+                        // Update address-to-NodeId mapping for chunk_locations metadata
+                        {
+                            let mut mapping = self.addr_to_node_id.write().await;
+                            for node in &cluster_nodes {
+                                if node.status == dfs_common::NodeStatus::Online {
+                                    mapping.insert(node.addr, node.id);
+                                }
+                            }
+                        }
+
                         let mut cluster_nodes = self.cluster_nodes.write().await;
                         *cluster_nodes = new_addrs;
                         info!("Refreshed cluster nodes: {} nodes", cluster_nodes.len());

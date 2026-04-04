@@ -178,6 +178,9 @@ impl DfsFilesystem {
                             match client_for_cleanup.write_data_with_cache(&buffer.data, ino, buffer.start_offset).await {
                                 Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
                                     let new_size = buffer.start_offset + buffer.data.len() as u64;
+                                    if let Some(chunk_locations) = chunk_locations_opt {
+                                        metadata.chunk_locations.extend(chunk_locations);
+                                    }
                                     metadata.chunks.extend(new_chunk_ids);
                                     metadata.chunk_sizes.extend(new_chunk_sizes);
                                     metadata.size = new_size;
@@ -375,7 +378,14 @@ impl DfsFilesystem {
 
             // If dual-replica writes provided chunk_locations, use them (preferred)
             if let Some(chunk_locations) = chunk_locations_opt {
+                debug!("Extending metadata.chunk_locations with {} new locations", chunk_locations.len());
+                for (idx, loc) in chunk_locations.iter().enumerate() {
+                    debug!("  Chunk {} has {} nodes: {:?}", idx, loc.nodes.len(), loc.nodes);
+                }
                 metadata.chunk_locations.extend(chunk_locations);
+                debug!("Total chunk_locations after extend: {}", metadata.chunk_locations.len());
+            } else {
+                debug!("No chunk_locations provided in write result");
             }
             // Always populate legacy fields for backward compatibility
             metadata.chunks.extend(new_chunk_ids);
@@ -746,6 +756,9 @@ impl Filesystem for DfsFilesystem {
                                 // Update metadata
                                 let mut meta = metadata_cache.read().unwrap().get(&ino).cloned();
                                 if let Some(mut m) = meta {
+                                    if let Some(chunk_locations) = chunk_locations_opt {
+                                        m.chunk_locations.extend(chunk_locations);
+                                    }
                                     m.chunks.extend(new_chunk_ids);
                                     m.chunk_sizes.extend(new_chunk_sizes);
                                     m.size = new_size;
@@ -2301,6 +2314,17 @@ impl Filesystem for DfsFilesystem {
 
                                     let mut new_all_sizes = metadata.chunk_sizes[..last_chunk_idx].to_vec();
                                     new_all_sizes.extend(new_chunk_sizes);
+
+                                    // Update chunk_locations if provided
+                                    if let Some(chunk_locations) = chunk_locations_opt {
+                                        let mut new_all_locations = if last_chunk_idx < metadata.chunk_locations.len() {
+                                            metadata.chunk_locations[..last_chunk_idx].to_vec()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        new_all_locations.extend(chunk_locations);
+                                        metadata.chunk_locations = new_all_locations;
+                                    }
 
                                     metadata.chunks = new_all_chunks;
                                     metadata.chunk_sizes = new_all_sizes;

@@ -745,6 +745,7 @@ impl Filesystem for DfsFilesystem {
 
                         // If read is CLOSE to end of buffer (within 64KB), flush to avoid short reads
                         // This prevents garbled video from partial reads when watching live TV
+                        // MUST ALWAYS FLUSH - skipping causes data loss (buffered data not on backend yet)
                         if offset >= buffer_start && offset < buffer_end {
                             let distance_to_buffer_end = buffer_end - offset;
                             if distance_to_buffer_end < 65536 {  // Within 64KB of write position

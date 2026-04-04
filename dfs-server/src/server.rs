@@ -88,6 +88,9 @@ impl Server {
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
             Request::ReadChunk { chunk_id } => self.handle_read_chunk(chunk_id).await,
+            Request::ReadChunkRange { chunk_id, offset, length } => {
+                self.handle_read_chunk_range(chunk_id, offset, length).await
+            }
             Request::WriteChunk {
                 chunk_id,
                 data,
@@ -161,6 +164,41 @@ impl Server {
                 warn!("Failed to read chunk {}: {}", chunk_id, e);
                 Response::Error {
                     message: format!("Failed to read chunk: {}", e),
+                    code: ErrorCode::NotFound,
+                }
+            }
+        }
+    }
+
+    /// Handle read chunk range request (for striped multi-replica reads)
+    async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64) -> Response {
+        debug!("Handling read chunk range: {} offset={} length={}", chunk_id, offset, length);
+
+        match self.read_chunk(&chunk_id).await {
+            Ok(data) => {
+                let start = offset as usize;
+                let end = std::cmp::min(start + length as usize, data.len());
+
+                if start >= data.len() {
+                    return Response::Error {
+                        message: format!("Offset {} beyond chunk size {}", offset, data.len()),
+                        code: ErrorCode::InvalidRequest,
+                    };
+                }
+
+                let range_data = data[start..end].to_vec();
+                debug!("Returning {} bytes from chunk {} (requested {}, offset {})",
+                       range_data.len(), chunk_id, length, offset);
+                Response::ChunkData {
+                    chunk_id,
+                    data: range_data,
+                }
+            }
+            Err(e) => {
+                warn!("Failed to read chunk range {} offset={} length={}: {}",
+                      chunk_id, offset, length, e);
+                Response::Error {
+                    message: format!("Failed to read chunk range: {}", e),
                     code: ErrorCode::NotFound,
                 }
             }

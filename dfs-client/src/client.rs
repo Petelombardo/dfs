@@ -449,12 +449,44 @@ impl DfsClient {
         start_chunk_idx: usize,
         inode: u64,
         chunk_offsets: &[u64],
+        chunk_locations: &[dfs_common::ChunkLocation],
     ) -> Result<Vec<u8>> {
         if chunk_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         let start = std::time::Instant::now();
+
+        // Detect if we're in sequential access mode by checking read history
+        // For sequential reads (DVR streaming), use single-node reads for best HDD performance
+        // For random access, use striped reads for lower latency
+        let is_sequential = if !all_file_chunks.is_empty() {
+            let file_id = all_file_chunks[0];
+            let history = self.read_history.lock().await;
+            if let Some(positions) = history.get(&file_id) {
+                if positions.len() >= 2 {
+                    let mut sequential_count = 0;
+                    for i in 1..positions.len() {
+                        let prev = positions[i - 1];
+                        let curr = positions[i];
+                        if curr > prev && curr <= prev + 2 {
+                            sequential_count += 1;
+                        }
+                    }
+                    sequential_count >= 1
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if is_sequential {
+            info!("Sequential access detected - using single-node reads for optimal HDD performance");
+        }
 
         // Check byte-range cache first (for live DVR files), then chunk cache
         let mut cached_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
@@ -538,6 +570,10 @@ impl DfsClient {
         // maximizing network bandwidth and reducing latency
         let nodes = self.cluster_nodes.read().await.clone();
 
+        // Build chunk_id -> ChunkLocation mapping for fast lookups
+        let chunk_loc_map: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
+            chunk_locations.iter().map(|loc| (loc.chunk_id, loc)).collect();
+
         // Create parallel fetch tasks
         let fetch_tasks: Vec<_> = chunks_to_fetch.iter().map(|(idx, chunk_id, file_offset)| {
             let idx = *idx;
@@ -545,15 +581,34 @@ impl DfsClient {
             let file_offset = *file_offset;
             let client = self.clone();
             let nodes = nodes.clone();
+            let chunk_location = chunk_loc_map.get(&chunk_id).map(|&loc| loc.clone());
+            let use_striped = is_sequential == false; // Only stripe for random access
 
             tokio::spawn(async move {
-                // Try to get replica locations from cache first
+                // Check if we should use striped reading
+                // Skip striped reads for sequential access (better for HDDs)
+                if use_striped {
+                    if let Some(ref location) = chunk_location {
+                        if location.nodes.len() >= 2 && location.size >= 512 * 1024 {
+                            // Use striped multi-replica reading for chunks >= 512KB with 2+ replicas
+                            // Split chunk in half, fetch from both nodes in parallel
+                            info!("Using striped read for chunk {} ({} bytes from {} nodes)",
+                                  chunk_id, location.size, location.nodes.len());
+
+                            return client.read_chunk_striped(chunk_id, location, file_offset).await
+                                .map(|data| (idx, chunk_id, file_offset, Arc::new(data)));
+                        }
+                    }
+                }
+
+                // Fallback to standard single-node read
+                // Try to get replica locations
                 let cached_replicas = {
                     let mut cache = client.replica_cache.lock().await;
                     cache.get(&chunk_id).cloned()
                 };
 
-                let replicas = if let Some(cached) = cached_replicas {
+                let mut replicas = if let Some(cached) = cached_replicas {
                     debug!("Replica cache HIT for chunk {}", chunk_id);
                     (*cached).clone()
                 } else {
@@ -575,12 +630,45 @@ impl DfsClient {
                     }
                 };
 
-                // Select one replica using round-robin load balancing
-                // This ensures different chunks are likely fetched from different nodes
-                let selected_replica = client.select_replica(&replicas)
-                    .context("No replicas available")?;
+                // Prefer chunk_locations nodes if available (likely in cache from recent write)
+                if let Some(ref location) = chunk_location {
+                    // Map NodeIds to SocketAddrs
+                    let node_id_map = client.addr_to_node_id.read().await;
+                    let preferred_addrs: Vec<SocketAddr> = location.nodes.iter()
+                        .filter_map(|node_id| {
+                            node_id_map.iter()
+                                .find(|(_, &id)| id == *node_id)
+                                .map(|(&addr, _)| addr)
+                        })
+                        .collect();
 
-                debug!("Selected replica {} for chunk {} (round-robin)", selected_replica, chunk_id);
+                    if !preferred_addrs.is_empty() {
+                        debug!("Preferring {} write nodes for chunk {} (likely cached)",
+                               preferred_addrs.len(), chunk_id);
+                        // Put preferred nodes at the front
+                        let preferred_set: std::collections::HashSet<_> = preferred_addrs.iter().copied().collect();
+                        replicas = preferred_addrs.into_iter()
+                            .chain(replicas.into_iter().filter(|addr| !preferred_set.contains(addr)))
+                            .collect();
+                    }
+                }
+
+                // Select one replica
+                // For sequential reads, use first replica (sticky) for better HDD sequential performance
+                // For random reads, use round-robin for load balancing
+                let selected_replica = if use_striped {
+                    // Random access: use round-robin
+                    client.select_replica(&replicas)
+                        .context("No replicas available")?
+                } else {
+                    // Sequential access: use first replica (sticky to one server)
+                    replicas.first()
+                        .copied()
+                        .context("No replicas available")?
+                };
+
+                let selection_mode = if use_striped { "round-robin" } else { "sticky" };
+                debug!("Selected replica {} for chunk {} ({})", selected_replica, chunk_id, selection_mode);
 
                 // Try selected replica first, then fallback to others
                 let mut last_error = None;
@@ -704,21 +792,22 @@ impl DfsClient {
 
             drop(history); // Release lock before spawning tasks
 
-            // Enable moderate prefetching for sequential reads (DVR playback)
-            // Reduced prefetch to prevent OOM - keep buffer small
-            // Target: ~32-64MB of prefetch buffer (was ~256KB-512MB)
+            // Enable aggressive prefetching for sequential reads (DVR playback, streaming)
+            // With striped multi-replica reads, we can safely prefetch more aggressively
+            // Target: ~64-128MB prefetch buffer for smooth streaming
             if is_sequential {
                 // Adaptive prefetch distance based on chunk count
-                // REDUCED from 64/32/16 to 8/4/2 to prevent OOM
+                // Increased from 8/4/2 to 16/8/4 with striped reading
                 let prefetch_distance = if all_file_chunks.len() > 500 {
-                    // Many tiny chunks (MPEG-TS): prefetch 8 chunks (~24KB)
-                    8
+                    // Many tiny chunks (MPEG-TS): prefetch 16 chunks (~48KB total)
+                    16
                 } else if all_file_chunks.len() > 100 {
-                    // Medium chunks: prefetch 4 chunks
-                    4
+                    // Medium chunks: prefetch 8 chunks (~16-32MB)
+                    8
                 } else {
-                    // Large chunks: prefetch 2 chunks (~8MB)
-                    2
+                    // Large chunks (4MB): prefetch 4 chunks (~16MB ahead)
+                    // With striped reads, this fills the pipeline efficiently
+                    4
                 };
 
                 info!("Prefetch: detected sequential pattern at chunk {}/{}, prefetching next {} chunks",
@@ -988,6 +1077,122 @@ impl DfsClient {
                 }
             }
         }
+    }
+
+    /// Read a byte range from a specific server (for striped multi-replica reads)
+    async fn read_chunk_range_from_server(
+        &self,
+        server_addr: SocketAddr,
+        chunk_id: ChunkId,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>> {
+        let request = Request::ReadChunkRange { chunk_id, offset, length };
+        let response = self.send_request(server_addr, request).await?;
+
+        match response {
+            Response::ChunkData { data, .. } => Ok(data),
+            Response::Error { message, .. } => {
+                anyhow::bail!("Server {} returned error for byte range: {}", server_addr, message)
+            }
+            _ => anyhow::bail!("Unexpected response from server {}", server_addr),
+        }
+    }
+
+    /// Read chunk using striped multi-replica approach (parallel byte ranges from multiple nodes)
+    async fn read_chunk_striped(
+        &self,
+        chunk_id: ChunkId,
+        location: &dfs_common::ChunkLocation,
+        file_offset: u64,
+    ) -> Result<Vec<u8>> {
+        let chunk_size = location.size;
+
+        // Map NodeIds to SocketAddrs
+        let node_id_map = self.addr_to_node_id.read().await;
+        let node_addrs: Vec<SocketAddr> = location.nodes.iter()
+            .filter_map(|node_id| {
+                node_id_map.iter()
+                    .find(|(_, &id)| id == *node_id)
+                    .map(|(&addr, _)| addr)
+            })
+            .take(2)  // Only use first 2 replicas for striping
+            .collect();
+        drop(node_id_map);
+
+        if node_addrs.is_empty() {
+            // None of the chunk_locations nodes exist in current cluster
+            // Fall back to normal replica discovery path
+            warn!("Striped read requested but none of the chunk_location nodes are in current cluster, using replica discovery");
+
+            let replicas = match self.get_chunk_replicas(chunk_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // Last resort: try all cluster nodes
+                    warn!("Failed to get chunk replicas: {}, trying all cluster nodes", e);
+                    self.cluster_nodes.read().await.clone()
+                }
+            };
+
+            for node_addr in &replicas {
+                match self.read_chunk_from_server(*node_addr, chunk_id).await {
+                    Ok(data) => return Ok(data),
+                    Err(e) => {
+                        debug!("Failed to read chunk from {}: {}", node_addr, e);
+                        continue;
+                    }
+                }
+            }
+
+            anyhow::bail!("Failed to read chunk {} from any node", chunk_id);
+        }
+
+        if node_addrs.len() < 2 {
+            // Only 1 address available, use single-node read
+            warn!("Striped read requested but only 1 address available, falling back to single-node");
+            return self.read_chunk_from_server(node_addrs[0], chunk_id).await;
+        }
+
+        let node1 = node_addrs[0];
+        let node2 = node_addrs[1];
+
+        // Split chunk in half
+        let mid_point = chunk_size / 2;
+        let first_half_size = mid_point;
+        let second_half_size = chunk_size - mid_point;
+
+        debug!("Striped read: chunk {} ({} bytes) from node1={} (0-{}) + node2={} ({}-{})",
+               chunk_id, chunk_size, node1, first_half_size, node2, mid_point, chunk_size);
+
+        // Fetch both halves in parallel
+        let client1 = self.clone();
+        let client2 = self.clone();
+
+        let task1 = tokio::spawn(async move {
+            client1.read_chunk_range_from_server(node1, chunk_id, 0, first_half_size as u64).await
+        });
+
+        let task2 = tokio::spawn(async move {
+            client2.read_chunk_range_from_server(node2, chunk_id, mid_point as u64, second_half_size as u64).await
+        });
+
+        let (result1, result2) = tokio::join!(task1, task2);
+
+        // Handle results
+        let first_half = result1
+            .context("Task1 panicked")??;
+        let second_half = result2
+            .context("Task2 panicked")??;
+
+        // Reassemble data
+        let mut combined = Vec::with_capacity(chunk_size);
+        combined.extend_from_slice(&first_half);
+        combined.extend_from_slice(&second_half);
+
+        debug!("Striped read complete: chunk {} ({} + {} = {} bytes)",
+               chunk_id, first_half.len(), second_half.len(), combined.len());
+
+        Ok(combined)
     }
 
     /// Write data to cluster with synchronous dual-replica replication

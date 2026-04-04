@@ -22,6 +22,13 @@ pub enum Request {
         chunk_id: ChunkId,
     },
 
+    /// Read a byte range from a chunk (for striped multi-replica reads)
+    ReadChunkRange {
+        chunk_id: ChunkId,
+        offset: u64,
+        length: u64,
+    },
+
     /// Write a chunk
     WriteChunk {
         chunk_id: ChunkId,

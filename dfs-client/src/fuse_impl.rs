@@ -920,7 +920,8 @@ impl Filesystem for DfsFilesystem {
             };
 
             let all_chunks = metadata.chunks.clone();
-            let result = client.read_data(&chunk_ids, &all_chunks, start_chunk_idx, cache_inode, &chunk_file_offsets).await;
+            let chunk_locations = metadata.chunk_locations.clone();
+            let result = client.read_data(&chunk_ids, &all_chunks, start_chunk_idx, cache_inode, &chunk_file_offsets, &chunk_locations).await;
 
             let all_data = match result {
                 Ok(data) => data,
@@ -1525,7 +1526,7 @@ impl Filesystem for DfsFilesystem {
                     }
 
                     let affected_data = match runtime.block_on(async {
-                        client.read_data(&affected_chunk_ids, &chunk_ids, first_idx, cache_inode, &chunk_offsets).await
+                        client.read_data(&affected_chunk_ids, &chunk_ids, first_idx, cache_inode, &chunk_offsets, &metadata.chunk_locations).await
                     }) {
                         Ok(data) => data,
                         Err(e) => {
@@ -2290,7 +2291,7 @@ impl Filesystem for DfsFilesystem {
 
                             // Read only the last partial chunk
                             let last_chunk_data = match self.block_on(async {
-                                client.read_data(&[chunk_id], &metadata.chunks, last_chunk_idx, ino, &[chunk_offset]).await
+                                client.read_data(&[chunk_id], &metadata.chunks, last_chunk_idx, ino, &[chunk_offset], &metadata.chunk_locations).await
                             }) {
                                 Ok(data) => data,
                                 Err(e) => {

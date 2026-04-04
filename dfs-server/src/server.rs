@@ -309,12 +309,44 @@ impl Server {
 
     /// Handle replicate chunk location (internal cluster operation)
     async fn handle_replicate_chunk_location(&self, location: ChunkLocation) -> Response {
-        debug!("Handling replicate chunk location: {}", location.chunk_id);
+        info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
 
-        // Update chunk location locally without re-replicating (to avoid loops)
-        match self.metadata.put_chunk_location(&location) {
+        // MERGE chunk location with existing metadata instead of replacing
+        // This ensures all servers know about all replicas
+        let merged_location = match self.metadata.get_chunk_location(&location.chunk_id) {
+            Ok(Some(existing)) => {
+                // Merge node lists - combine and deduplicate
+                let mut merged_nodes = existing.nodes.clone();
+                for node in &location.nodes {
+                    if !merged_nodes.contains(node) {
+                        merged_nodes.push(*node);
+                    }
+                }
+                info!("Merging chunk location: {} existing nodes + {} new nodes = {} total",
+                      existing.nodes.len(), location.nodes.len(), merged_nodes.len());
+
+                ChunkLocation {
+                    chunk_id: location.chunk_id,
+                    nodes: merged_nodes,
+                    size: location.size,
+                    checksum: location.checksum,
+                }
+            }
+            Ok(None) => {
+                info!("Creating new chunk location for {}", location.chunk_id);
+                location.clone()
+            }
+            Err(e) => {
+                warn!("Failed to get existing chunk location: {}, using new location", e);
+                location.clone()
+            }
+        };
+
+        // Store merged location
+        match self.metadata.put_chunk_location(&merged_location) {
             Ok(_) => {
-                debug!("Successfully replicated chunk location for {}", location.chunk_id);
+                info!("Successfully replicated chunk location for {} (total nodes: {})",
+                      merged_location.chunk_id, merged_location.nodes.len());
                 Response::Ok { data: None }
             }
             Err(e) => {
@@ -507,6 +539,40 @@ impl Server {
                     .context("Failed to store chunk location")?;
                 let metadata_time = metadata_start.elapsed();
 
+                // Replicate chunk location metadata to all other nodes asynchronously
+                // This ensures all servers know about chunk locations for consistency
+                let nodes = cluster.get_all_nodes().await;
+                let local_id = cluster.local_node_id();
+
+                info!("Replicating chunk location for {} to {} nodes", chunk_id, nodes.len() - 1);
+
+                for node in nodes {
+                    // Skip self and offline nodes
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+
+                    let client_clone = client.clone();
+                    let location_clone = location.clone();
+                    let node_addr = node.addr;
+                    let node_id = node.id;
+                    let chunk_id_clone = chunk_id;
+
+                    // Fire-and-forget: spawn individual replication tasks
+                    tokio::spawn(async move {
+                        info!("Sending chunk location {} to node {}", chunk_id_clone, node_id);
+                        let request = Request::ReplicateChunkLocation {
+                            location: location_clone,
+                        };
+
+                        if let Err(e) = client_clone.send_message(node_addr, Message::Request(request)).await {
+                            warn!("Failed to replicate chunk location {} to node {}: {}", chunk_id_clone, node_id, e);
+                        } else {
+                            info!("Successfully sent chunk location {} to node {}", chunk_id_clone, node_id);
+                        }
+                    });
+                }
+
                 let chunk_total_time = chunk_total_start.elapsed();
                 info!("Chunk {} complete in {:?} (metadata: {:?})", chunk_id, chunk_total_time, metadata_time);
 
@@ -554,6 +620,8 @@ impl Server {
         for (chunk_id, chunk_data) in chunks {
             let storage = self.storage.clone();
             let metadata = self.metadata.clone();
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
             let local_node_id = self.cluster.local_node_id();
 
             let task = tokio::spawn(async move {
@@ -571,6 +639,39 @@ impl Server {
 
                 metadata.put_chunk_location(&location)
                     .context("Failed to store chunk location")?;
+
+                // Replicate chunk location metadata to all other nodes asynchronously
+                let nodes = cluster.get_all_nodes().await;
+                let local_id = cluster.local_node_id();
+
+                info!("Replicating chunk location for {} to {} nodes", chunk_id, nodes.len() - 1);
+
+                for node in nodes {
+                    // Skip self and offline nodes
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+
+                    let client_clone = client.clone();
+                    let location_clone = location.clone();
+                    let node_addr = node.addr;
+                    let node_id = node.id;
+                    let chunk_id_clone = chunk_id;
+
+                    // Fire-and-forget: spawn individual replication tasks
+                    tokio::spawn(async move {
+                        info!("Sending chunk location {} to node {}", chunk_id_clone, node_id);
+                        let request = Request::ReplicateChunkLocation {
+                            location: location_clone,
+                        };
+
+                        if let Err(e) = client_clone.send_message(node_addr, Message::Request(request)).await {
+                            warn!("Failed to replicate chunk location {} to node {}: {}", chunk_id_clone, node_id, e);
+                        } else {
+                            info!("Successfully sent chunk location {} to node {}", chunk_id_clone, node_id);
+                        }
+                    });
+                }
 
                 Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
             });

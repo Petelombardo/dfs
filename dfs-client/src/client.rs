@@ -117,14 +117,23 @@ impl DfsClient {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(64); // Conservative default: 64 chunks = 256MB per cache
 
-        let (chunk_target_pct, byte_target_pct, min_chunks) = if available_mb < 1536 {
-            // Low memory systems (<1.5GB available): very conservative
-            // chunk: 2%, byte: 2%, min 8 chunks (32MB + 32MB = 64MB total)
-            (2, 2, 8)
+        let (chunk_target_pct, byte_target_pct, min_chunks) = if available_mb < 512 {
+            // Very low memory systems (<512MB available): minimal cache
+            // chunk: 1%, byte: 1%, min 2 chunks (8MB + 8MB = 16MB total)
+            // Suitable for embedded ARM devices with <1GB total RAM
+            (1, 1, 2)
+        } else if available_mb < 1024 {
+            // Low memory systems (<1GB available): conservative
+            // chunk: 1%, byte: 1%, min 4 chunks (16MB + 16MB = 32MB total)
+            (1, 1, 4)
+        } else if available_mb < 1536 {
+            // Medium memory systems (<1.5GB available): still conservative
+            // chunk: 2%, byte: 2%, min 6 chunks (24MB + 24MB = 48MB total)
+            (2, 2, 6)
         } else {
-            // Normal systems: still conservative to prevent OOM
-            // chunk: 3%, byte: 3%, min 16 chunks
-            (3, 3, 16)
+            // Normal systems: moderate cache sizes
+            // chunk: 3%, byte: 3%, min 8 chunks (32MB + 32MB = 64MB total)
+            (3, 3, 8)
         };
 
         let cache_capacity = dfs_common::calculate_cache_capacity(
@@ -793,21 +802,35 @@ impl DfsClient {
             drop(history); // Release lock before spawning tasks
 
             // Enable aggressive prefetching for sequential reads (DVR playback, streaming)
-            // With striped multi-replica reads, we can safely prefetch more aggressively
-            // Target: ~64-128MB prefetch buffer for smooth streaming
+            // Adaptive based on both file chunk count AND available memory
             if is_sequential {
-                // Adaptive prefetch distance based on chunk count
-                // Increased from 8/4/2 to 16/8/4 with striped reading
-                let prefetch_distance = if all_file_chunks.len() > 500 {
-                    // Many tiny chunks (MPEG-TS): prefetch 16 chunks (~48KB total)
-                    16
-                } else if all_file_chunks.len() > 100 {
-                    // Medium chunks: prefetch 8 chunks (~16-32MB)
-                    8
+                // Check available memory to scale prefetch aggressiveness
+                let available_mb = dfs_common::get_available_memory()
+                    .map(|bytes| bytes / (1024 * 1024))
+                    .unwrap_or(1024);
+
+                // Base prefetch distance: scale down for low-memory systems
+                let (base_large, base_medium, base_tiny) = if available_mb < 512 {
+                    // Very low memory: minimal prefetch (8MB ahead for 4MB chunks)
+                    (2, 4, 8)
+                } else if available_mb < 1024 {
+                    // Low memory: conservative prefetch (12MB ahead for 4MB chunks)
+                    (3, 6, 12)
                 } else {
-                    // Large chunks (4MB): prefetch 4 chunks (~16MB ahead)
-                    // With striped reads, this fills the pipeline efficiently
-                    4
+                    // Normal memory: moderate prefetch (16MB ahead for 4MB chunks)
+                    (4, 8, 16)
+                };
+
+                // Adaptive prefetch distance based on chunk count
+                let prefetch_distance = if all_file_chunks.len() > 500 {
+                    // Many tiny chunks (MPEG-TS): use base_tiny
+                    base_tiny
+                } else if all_file_chunks.len() > 100 {
+                    // Medium chunks: use base_medium
+                    base_medium
+                } else {
+                    // Large chunks (4MB): use base_large
+                    base_large
                 };
 
                 info!("Prefetch: detected sequential pattern at chunk {}/{}, prefetching next {} chunks",

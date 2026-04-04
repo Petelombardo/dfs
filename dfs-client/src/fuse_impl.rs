@@ -693,6 +693,7 @@ impl Filesystem for DfsFilesystem {
         let metadata_cache = self.metadata_cache.clone();
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
+        let buffer_flush_threshold = self.buffer_flush_threshold;
         let last_metadata_update = self.last_metadata_update.clone();
 
         // Spawn async read operation on tokio runtime
@@ -752,9 +753,10 @@ impl Filesystem for DfsFilesystem {
                             let buffer_size = buffer.data.len();
 
                             // If read is very close to buffer end AND buffer is reasonably full, flush it
-                            if distance_to_buffer_end < 65536 && buffer_size >= 2 * 1024 * 1024 {
-                                info!("FUSE read near buffer end: ino={}, offset={}, distance={} bytes, buffer_size={} bytes, flushing",
-                                      ino, offset, distance_to_buffer_end, buffer_size);
+                            // Use cluster-configured chunk size as threshold
+                            if distance_to_buffer_end < 65536 && buffer_size >= buffer_flush_threshold {
+                                info!("FUSE read near buffer end: ino={}, offset={}, distance={} bytes, buffer_size={} bytes (threshold={}), flushing",
+                                      ino, offset, distance_to_buffer_end, buffer_size, buffer_flush_threshold);
                                 true
                             } else if distance_to_buffer_end < 65536 {
                                 // Buffer too small to flush - serve partial read to avoid tiny chunks

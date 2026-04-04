@@ -574,7 +574,8 @@ impl Filesystem for DfsFilesystem {
                 self.safe_metadata_update(ino, metadata.clone());
 
                 let attr = self.metadata_to_attr(ino, &metadata);
-                reply.entry(&Duration::from_secs(3600), &attr, 0);
+                // Short TTL (2s) for multi-client coherency
+                reply.entry(&Duration::from_secs(2), &attr, 0);
             }
             Ok(None) => {
                 // Either file not found OR metadata not modified (cache still valid)
@@ -586,7 +587,8 @@ impl Filesystem for DfsFilesystem {
                         if let Some(metadata) = cache.get(&ino) {
                             debug!("Using cached metadata for {} (not modified)", path);
                             let attr = self.metadata_to_attr(ino, metadata);
-                            reply.entry(&Duration::from_secs(3600), &attr, 0);
+                            // Short TTL (2s) for multi-client coherency
+                reply.entry(&Duration::from_secs(2), &attr, 0);
                             return;
                         }
                     }
@@ -2022,7 +2024,8 @@ impl Filesystem for DfsFilesystem {
 
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
-                reply.entry(&Duration::from_secs(3600), &attr, 0);
+                // Short TTL (2s) for multi-client coherency
+                reply.entry(&Duration::from_secs(2), &attr, 0);
             }
             Err(e) => {
                 error!("Failed to create directory {}: {}", path, e);
@@ -2395,7 +2398,8 @@ impl Filesystem for DfsFilesystem {
 
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
-                reply.attr(&Duration::from_secs(3600), &attr);
+                // Short TTL (2s) for multi-client coherency
+                reply.attr(&Duration::from_secs(2), &attr);
             }
             Err(e) => {
                 error!("Failed to update attributes: {}", e);

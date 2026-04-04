@@ -224,9 +224,9 @@ fn mount_filesystem(
         fuser::MountOption::AutoUnmount,
         // Enable write-back caching for better performance
         fuser::MountOption::Async,
-        // Increase max_read to 2MB for better streaming performance
-        // Default is 128KB which causes many small reads and high latency
-        fuser::MountOption::CUSTOM("max_read=2097152".to_string()),
+        // Set max_read to 1MB for optimal parallelism
+        // Smaller reads allow more concurrent FUSE requests, hiding network latency
+        fuser::MountOption::CUSTOM("max_read=1048576".to_string()),
     ];
 
     // Note: AllowRoot and AllowOther are mutually exclusive

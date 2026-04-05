@@ -126,10 +126,21 @@ impl DfsClient {
             .unwrap_or(1024);
 
         // Check for environment variable override
+        // Default max based on available RAM to prevent artificial caps
+        let default_max_chunks = if available_mb < 512 {
+            64   // Low RAM: cap at 256MB per cache
+        } else if available_mb < 2048 {
+            128  // Medium RAM (512MB-2GB): cap at 512MB per cache
+        } else if available_mb < 4096 {
+            256  // Good RAM (2-4GB): cap at 1GB per cache
+        } else {
+            512  // High RAM (4GB+): cap at 2GB per cache
+        };
+
         let max_chunks = std::env::var("DFS_MAX_CACHE_CHUNKS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(64); // Conservative default: 64 chunks = 256MB per cache
+            .unwrap_or(default_max_chunks);
 
         let (chunk_target_pct, byte_target_pct, min_chunks) = if available_mb < 256 {
             // Extremely low memory systems (<256MB available): minimal cache
@@ -143,16 +154,17 @@ impl DfsClient {
             (8, 8, 4)
         } else if available_mb < 1024 {
             // Low memory systems (512MB-1GB available): moderate cache
-            // chunk: 10%, byte: 10%, min 6 chunks (~50MB + ~50MB = ~100MB total)
-            (10, 10, 6)
+            // chunk: 12%, byte: 12%, min 8 chunks (~60MB + ~60MB = ~120MB total)
+            (12, 12, 8)
         } else if available_mb < 1536 {
             // Medium memory systems (1-1.5GB available): good cache
-            // chunk: 12%, byte: 12%, min 8 chunks (~75MB + ~75MB = ~150MB total)
-            (12, 12, 8)
+            // chunk: 15%, byte: 15%, min 12 chunks (~115MB + ~115MB = ~230MB total)
+            (15, 15, 12)
         } else {
             // Normal systems (>1.5GB available): generous cache sizes
-            // chunk: 15%, byte: 15%, min 12 chunks (~100MB + ~100MB = ~200MB total)
-            (15, 15, 12)
+            // chunk: 18%, byte: 18%, min 16 chunks (~140MB + ~140MB = ~280MB total)
+            // Larger cache prevents thrashing during high-speed sequential reads
+            (18, 18, 16)
         };
 
         let cache_capacity = dfs_common::calculate_cache_capacity(
@@ -540,22 +552,21 @@ impl DfsClient {
 
         // Check byte-range cache first (for live DVR files), then chunk cache
         // Also track in-flight reads to prevent duplicate concurrent fetches
+        // CRITICAL: Use separate lock acquisitions to reduce contention on fast CPUs
         let mut cached_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
         let mut chunks_to_fetch: Vec<(usize, ChunkId, u64)> = Vec::new(); // (idx, chunk_id, file_offset)
         let mut chunks_to_wait_for: Vec<(usize, ChunkId, u64)> = Vec::new(); // chunks being fetched by another request
 
-        {
-            let mut byte_cache = self.byte_range_cache.lock().await;
-            let mut chunk_cache = self.chunk_cache.lock().await;
-            let mut in_flight = self.prefetch_in_flight.lock().await;
+        for (idx, chunk_id) in chunk_ids.iter().enumerate() {
+            let mut found = false;
 
-            for (idx, chunk_id) in chunk_ids.iter().enumerate() {
-                let mut found = false;
+            // Try byte-range cache first if we have inode + offset
+            // Lock held ONLY during this check, then released
+            if inode > 0 && idx < chunk_offsets.len() {
+                let requested_offset = chunk_offsets[idx];
 
-                // Try byte-range cache first if we have inode + offset
-                // We need to check if this chunk's offset range overlaps with any cached chunk
-                if inode > 0 && idx < chunk_offsets.len() {
-                    let requested_offset = chunk_offsets[idx];
+                let byte_hit = {
+                    let mut byte_cache = self.byte_range_cache.lock().await;
 
                     // Iterate through all cached chunks for this inode to find range overlap
                     // LRU cache doesn't support range queries, so we need to check all keys
@@ -584,40 +595,73 @@ impl DfsClient {
                                       inode, requested_offset, cached.cached_at.elapsed());
                                 // Remove expired entry
                                 byte_cache.pop(&key);
+                                None
                             } else {
                                 info!("Byte-range cache HIT for inode={} offset={} (found in cached chunk at offset={})",
                                       inode, requested_offset, key.file_offset);
-                                cached_chunks.push((idx, data));
-                                found = true;
+                                Some((idx, data))
                             }
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
-                }
+                    // byte_cache lock released here
+                };
 
-                // Fall back to chunk ID cache
-                if !found {
+                if let Some(cached) = byte_hit {
+                    cached_chunks.push(cached);
+                    found = true;
+                }
+            }
+
+            // Fall back to chunk ID cache - separate lock acquisition
+            if !found {
+                let chunk_hit = {
+                    let mut chunk_cache = self.chunk_cache.lock().await;
                     if let Some(data) = chunk_cache.get(chunk_id) {
                         debug!("Chunk cache HIT for chunk {}", chunk_id);
-                        cached_chunks.push((idx, Arc::clone(data)));
-                        found = true;
+                        Some((idx, Arc::clone(data)))
+                    } else {
+                        None
                     }
-                }
+                    // chunk_cache lock released here
+                };
 
-                // Check if another request is already fetching this chunk
-                if !found && in_flight.contains(chunk_id) {
+                if let Some(cached) = chunk_hit {
+                    cached_chunks.push(cached);
+                    found = true;
+                }
+            }
+
+            // Check if another request is already fetching this chunk - separate lock
+            if !found {
+                let is_in_flight = {
+                    let in_flight = self.prefetch_in_flight.lock().await;
+                    in_flight.contains(chunk_id)
+                    // in_flight lock released here
+                };
+
+                if is_in_flight {
                     let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
                     info!("Chunk {} already being fetched by another request - will wait", chunk_id);
                     chunks_to_wait_for.push((idx, *chunk_id, file_offset));
                     found = true;
                 }
+            }
 
-                // Need to fetch
-                if !found {
-                    let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
-                    info!("Cache MISS for chunk {} (inode={}, offset={}) - will fetch", chunk_id, inode, file_offset);
-                    chunks_to_fetch.push((idx, *chunk_id, file_offset));
-                    // Mark as in-flight to prevent other concurrent requests from fetching
+            // Need to fetch - acquire lock only to mark in-flight
+            if !found {
+                let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
+                info!("Cache MISS for chunk {} (inode={}, offset={}) - will fetch", chunk_id, inode, file_offset);
+                chunks_to_fetch.push((idx, *chunk_id, file_offset));
+
+                // Mark as in-flight to prevent other concurrent requests from fetching
+                {
+                    let mut in_flight = self.prefetch_in_flight.lock().await;
                     in_flight.insert(*chunk_id);
+                    // in_flight lock released here
                 }
             }
         }
@@ -1452,7 +1496,21 @@ impl DfsClient {
                         .context("Failed to deserialize response")?;
 
                     match response_envelope.message {
-                        Message::Response(Response::ChunkData { data, .. }) => return Ok(data),
+                        Message::Response(Response::ChunkData { data, cache_stats, .. }) => {
+                            // Flow control: Check server cache pressure and throttle if needed
+                            if let Some((_, capacity, size)) = cache_stats {
+                                let utilization = (size as f64 / capacity as f64) * 100.0;
+
+                                // If server cache is >90% full, it's thrashing - add backpressure
+                                if utilization > 90.0 {
+                                    let sleep_ms = ((utilization - 90.0) * 2.0) as u64; // 0-20ms sleep
+                                    debug!("Server {} cache pressure: {:.1}% ({}/{}), throttling {}ms",
+                                           server_addr, utilization, size, capacity, sleep_ms);
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
+                                }
+                            }
+                            return Ok(data);
+                        },
                         Message::Response(Response::Error { message, .. }) => {
                             anyhow::bail!("Server error: {}", message);
                         }

@@ -176,7 +176,12 @@ impl Server {
         // Use the internal read_chunk method which tries local first,
         // then forwards to other nodes if needed
         match self.read_chunk(&chunk_id).await {
-            Ok(data) => Response::ChunkData { chunk_id, data },
+            Ok(data) => {
+                // Get cache stats for flow control
+                let (capacity, size) = self.storage.get_cache_stats();
+                let cache_stats = Some((0, capacity, size)); // hits=0 for now, can track later
+                Response::ChunkData { chunk_id, data, cache_stats }
+            },
             Err(e) => {
                 warn!("Failed to read chunk {}: {}", chunk_id, e);
                 Response::Error {
@@ -206,9 +211,15 @@ impl Server {
                 let range_data = data[start..end].to_vec();
                 debug!("Returning {} bytes from chunk {} (requested {}, offset {})",
                        range_data.len(), chunk_id, length, offset);
+
+                // Get cache stats for flow control
+                let (capacity, size) = self.storage.get_cache_stats();
+                let cache_stats = Some((0, capacity, size));
+
                 Response::ChunkData {
                     chunk_id,
                     data: range_data,
+                    cache_stats,
                 }
             }
             Err(e) => {
@@ -871,7 +882,7 @@ impl Server {
 
         // Try local first
         match self.metadata.get_file_by_path(&path) {
-            Ok(Some(metadata)) => {
+            Ok(Some(mut metadata)) => {
                 // Check if client has provided if_modified_since timestamp
                 if let Some(cached_timestamp) = if_modified_since {
                     // Return NotModified if metadata hasn't changed
@@ -880,6 +891,11 @@ impl Server {
                         return Response::NotModified;
                     }
                 }
+
+                // DO NOT backfill chunk_locations here - it causes massive metadata bloat
+                // Instead, let client query chunk locations on-demand or use replica cache
+                // The "No chunk_locations" warnings are expected for legacy files and handled gracefully
+
                 Response::FileMetadata { metadata }
             }
             Ok(None) => {

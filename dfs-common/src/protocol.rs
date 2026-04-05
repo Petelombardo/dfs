@@ -196,6 +196,11 @@ pub enum Response {
     ChunkData {
         chunk_id: ChunkId,
         data: Vec<u8>,
+        /// Cache statistics for flow control
+        /// Format: (cache_hits, cache_capacity, cache_size)
+        /// Client can use this to throttle reads if cache is under pressure
+        #[serde(default)]
+        cache_stats: Option<(usize, usize, usize)>,
     },
 
     /// Success with file metadata

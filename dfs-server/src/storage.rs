@@ -323,6 +323,13 @@ impl ChunkStorage {
         Ok(chunk_ids)
     }
 
+    /// Get cache statistics for flow control
+    /// Returns (cache_capacity, cache_current_size)
+    pub fn get_cache_stats(&self) -> (usize, usize) {
+        let cache = self.cache.lock().unwrap();
+        (self.cache_capacity_chunks, cache.len())
+    }
+
     /// Get filesystem statistics for the data directory
     /// Returns (total_space, free_space, available_space) in bytes
     pub fn get_filesystem_stats(&self) -> Result<(u64, u64, u64)> {

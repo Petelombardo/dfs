@@ -77,6 +77,10 @@ pub struct DfsClient {
     /// Maps file_id (first chunk) -> VecDeque of last 4 read positions
     read_history: Arc<Mutex<HashMap<ChunkId, VecDeque<usize>>>>,
 
+    /// Track last prefetched position per file to avoid duplicate prefetch from parallel reads
+    /// Maps file_id -> last_chunk_idx that triggered prefetch
+    last_prefetch_position: Arc<Mutex<HashMap<ChunkId, usize>>>,
+
     /// Round-robin counter for replica selection (for load balancing)
     replica_selector: Arc<AtomicU64>,
 
@@ -94,6 +98,16 @@ pub struct DfsClient {
     /// Address to NodeId mapping for chunk_locations metadata
     /// Maps SocketAddr -> NodeId to use real node IDs instead of synthetic ones
     addr_to_node_id: Arc<RwLock<HashMap<SocketAddr, dfs_common::NodeId>>>,
+
+    /// Tracks which chunks have been prefetch-hinted to which server nodes
+    /// When reading chunks, prefer these nodes to hit warm server caches
+    /// Maps ChunkId -> (SocketAddr, timestamp) where timestamp is when hint was sent
+    /// Expires after 60 seconds (assume cache eviction after that)
+    warm_cache_map: Arc<Mutex<LruCache<ChunkId, (SocketAddr, std::time::Instant)>>>,
+
+    /// Serialization lock for read operations to prevent parallel reads from racing
+    /// Write operations remain async and don't acquire this lock
+    read_lock: Arc<Mutex<()>>,
 }
 
 impl DfsClient {
@@ -191,6 +205,12 @@ impl DfsClient {
             .expect("SQLITE_WRITE_TRACKER_SIZE must be > 0");
         let sqlite_write_tracker = LruCache::new(sqlite_write_tracker_capacity);
 
+        // Track warm server caches - which chunks we've hinted to which nodes
+        // Cache size matches prefetch window (up to 50 chunks ahead)
+        let warm_cache_capacity = NonZeroUsize::new(128)
+            .expect("warm_cache_capacity must be > 0");
+        let warm_cache_map = LruCache::new(warm_cache_capacity);
+
         Ok(Self {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes)),
             current_node: Arc::new(RwLock::new(0)),
@@ -199,10 +219,13 @@ impl DfsClient {
             connection_pool: Arc::new(Mutex::new(HashMap::new())),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(Mutex::new(HashMap::new())),
+            last_prefetch_position: Arc::new(Mutex::new(HashMap::new())),
             replica_selector: Arc::new(AtomicU64::new(0)),
             replica_cache: Arc::new(Mutex::new(replica_cache)),
             sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
             addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
+            warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
+            read_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -469,6 +492,17 @@ impl DfsClient {
             return Ok(Vec::new());
         }
 
+        // NOTE: We do NOT deduplicate reads at the byte-offset level here
+        // FUSE issues multiple small reads (131KB) within the same 4MB chunk
+        // Each needs to return its own data slice
+        // Deduplication only happens for CHUNK-LEVEL tracking (prefetch/history)
+
+        // Log the read request with byte offsets and chunk IDs for debugging
+        if !chunk_offsets.is_empty() && chunk_offsets[0] > 0 {
+            info!("READ: inode={} byte_offset={} chunk_count={} first_chunk={:?}",
+                  inode, chunk_offsets[0], chunk_ids.len(), chunk_ids.first());
+        }
+
         let start = std::time::Instant::now();
 
         // Detect if we're in sequential access mode by checking read history
@@ -483,7 +517,9 @@ impl DfsClient {
                     for i in 1..positions.len() {
                         let prev = positions[i - 1];
                         let curr = positions[i];
-                        if curr > prev && curr <= prev + 2 {
+                        // Consider sequential if moving forward within 30 chunks
+                        // With DIRECT_IO and large chunks (4MB), FUSE may skip ahead
+                        if curr > prev && curr <= prev + 30 {
                             sequential_count += 1;
                         }
                     }
@@ -697,16 +733,35 @@ impl DfsClient {
                     };
                 }
 
-                // Select one replica
-                // ALWAYS use round-robin when we have chunk_locations metadata, because:
-                // - Chunks are written round-robin across nodes, so chunk_locations already has balanced distribution
-                // - Reading from the "first" replica would concentrate reads on same few nodes
-                // - Round-robin across chunk_locations gives optimal load balancing
-                // For random access or when no chunk_locations, use standard round-robin
-                let selected_replica = client.select_replica(&replicas)
-                    .context("No replicas available")?;
+                // Check if this chunk has a warm server cache (from prefetch hint)
+                let warm_node = {
+                    let mut warm_map = client.warm_cache_map.lock().await;
+                    warm_map.get(&chunk_id).and_then(|(addr, timestamp)| {
+                        // Expire warm cache entries after 60 seconds
+                        if timestamp.elapsed().as_secs() < 60 {
+                            Some(*addr)
+                        } else {
+                            None
+                        }
+                    })
+                };
 
-                let selection_mode = if use_striped { "round-robin" } else { "sticky" };
+                // Select replica: prefer warm cache, fallback to round-robin
+                let selected_replica = if let Some(warm_addr) = warm_node {
+                    // Verify warm node is in replica list
+                    if replicas.contains(&warm_addr) {
+                        debug!("Using WARM cache node {} for chunk {}", warm_addr, chunk_id);
+                        warm_addr
+                    } else {
+                        debug!("Warm node {} not in replica list for {}, using round-robin", warm_addr, chunk_id);
+                        client.select_replica(&replicas).context("No replicas available")?
+                    }
+                } else {
+                    // No warm cache - use standard round-robin
+                    client.select_replica(&replicas).context("No replicas available")?
+                };
+
+                let selection_mode = if warm_node.is_some() { "warm-cache" } else if use_striped { "round-robin" } else { "sticky" };
                 debug!("Selected replica {} for chunk {} ({})", selected_replica, chunk_id, selection_mode);
 
                 // Try selected replica first, then fallback to others
@@ -717,15 +772,28 @@ impl DfsClient {
                     .chain(replicas.iter().filter(|&n| n != &selected_replica))
                     .enumerate()
                 {
+                    let read_start = std::time::Instant::now();
                     match client.read_chunk_from_server(*node_addr, chunk_id).await {
                         Ok(chunk_data) => {
-                            if i > 0 {
-                                debug!("Fetched chunk {} from fallback replica {}", chunk_id, node_addr);
-                            }
+                            let read_time = read_start.elapsed();
+                            let was_warm = warm_node.is_some() && *node_addr == warm_node.unwrap();
+                            let source_desc = if was_warm {
+                                "WARM-CACHE"
+                            } else if i > 0 {
+                                "FALLBACK"
+                            } else {
+                                "PRIMARY"
+                            };
+
+                            info!("✓ Chunk {} from {} ({}) in {:?} - {} bytes",
+                                  chunk_id, node_addr, source_desc, read_time, chunk_data.len());
+
                             data = Some(chunk_data);
                             break;
                         }
                         Err(e) => {
+                            let read_time = read_start.elapsed();
+                            debug!("✗ Chunk {} failed from {} after {:?}: {}", chunk_id, node_addr, read_time, e);
                             last_error = Some(e);
                             continue;
                         }
@@ -776,13 +844,15 @@ impl DfsClient {
             fetched_chunks.push((idx, data_arc));
         }
 
-        // Remove fetched chunks from in-flight tracker
-        {
-            let mut in_flight = self.prefetch_in_flight.lock().await;
-            for (_, chunk_id, _) in &chunks_to_fetch {
-                in_flight.remove(chunk_id);
-            }
-        }
+        // NOTE: We do NOT remove from in-flight here because fetches are async!
+        // Removing before completion causes duplicate fetches
+        // The in_flight set will naturally clean up or we can add timeout-based cleanup later
+        // {
+        //     let mut in_flight = self.prefetch_in_flight.lock().await;
+        //     for (_, chunk_id, _) in &chunks_to_fetch {
+        //         in_flight.remove(chunk_id);
+        //     }
+        // }
 
         // Wait for chunks that were already being fetched by other requests
         // Poll the cache until they appear (they should be there very soon)
@@ -793,14 +863,16 @@ impl DfsClient {
                 let wait_start = std::time::Instant::now();
                 let mut data_found = false;
 
-                // Poll for up to 10 seconds (generous timeout for network fetches)
-                for attempt in 0..100 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // Poll for up to 200ms (20 attempts @ 10ms each)
+                // With server-side caching, subsequent reads should be fast
+                // But don't wait too long - parallel fetches may be faster than waiting
+                for attempt in 0..20 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
                     // Check chunk cache
                     let chunk_cache = self.chunk_cache.lock().await;
                     if let Some(data) = chunk_cache.peek(&chunk_id) {
-                        info!("Waited chunk {} now available after {:?}", chunk_id, wait_start.elapsed());
+                        debug!("Waited chunk {} now available after {:?}", chunk_id, wait_start.elapsed());
                         fetched_chunks.push((idx, Arc::clone(data)));
                         data_found = true;
                         break;
@@ -883,42 +955,62 @@ impl DfsClient {
         info!("Read complete: {} bytes from {} chunks in {:?} ({:.2} MB/s) - cache: {}/{} hits",
               all_data.len(), chunk_ids.len(), elapsed, throughput, cache_hits, chunk_ids.len());
 
-        // Detect sequential access patterns and prefetch aggressively only when sequential
-        if !chunk_ids.is_empty() && !all_file_chunks.is_empty() && cache_misses > 0 {
+        // Detect sequential access patterns and prefetch aggressively
+        // Prefetch on every read to keep the server cache warm ahead of our position
+        if !chunk_ids.is_empty() && !all_file_chunks.is_empty() {
             let last_file_chunk_idx = start_chunk_idx + last_local_idx;
             let file_id = all_file_chunks[0]; // Use first chunk as file identifier
 
-            // Track read history and detect sequential patterns
-            let mut history = self.read_history.lock().await;
-            let read_positions = history.entry(file_id).or_insert_with(|| VecDeque::with_capacity(4));
+            // Acquire read_lock ONLY for the critical section: history + detection
+            // Release it before spawning prefetch tasks to avoid blocking other reads
+            // NOTE: Deduplication already happened at the start of this function
+            let is_sequential = {
+                let _read_guard = self.read_lock.lock().await;
 
-            // Add current read position
-            read_positions.push_back(last_file_chunk_idx);
-            if read_positions.len() > 4 {
-                read_positions.pop_front();
-            }
+                // Track read history and detect sequential patterns
+                let mut history = self.read_history.lock().await;
+                let read_positions = history.entry(file_id).or_insert_with(|| VecDeque::with_capacity(4));
 
-            // Detect if we have sequential momentum (2+ consecutive sequential reads)
-            let is_sequential = if read_positions.len() >= 2 {
-                let mut sequential_count = 0;
-                for i in 1..read_positions.len() {
-                    let prev = read_positions[i - 1];
-                    let curr = read_positions[i];
-                    // Consider sequential if within 2 chunks forward
-                    if curr > prev && curr <= prev + 2 {
-                        sequential_count += 1;
-                    }
+                // Add current read position
+                read_positions.push_back(last_file_chunk_idx);
+                if read_positions.len() > 4 {
+                    read_positions.pop_front();
                 }
-                sequential_count >= 1 // Need at least 1 sequential step
-            } else {
-                false // Not enough history yet
+
+                // Detect if we have sequential momentum (2+ consecutive sequential reads)
+                let result = if read_positions.len() >= 2 {
+                    let mut sequential_count = 0;
+                    for i in 1..read_positions.len() {
+                        let prev = read_positions[i - 1];
+                        let curr = read_positions[i];
+                        // Consider sequential if moving forward within 30 chunks
+                        // With DIRECT_IO and large chunks (4MB), FUSE may skip ahead in 128KB increments
+                        // resulting in gaps of 10-20 chunks during sequential playback
+                        if curr > prev && curr <= prev + 30 {
+                            sequential_count += 1;
+                        }
+                    }
+                    let is_seq = sequential_count >= 1; // Need at least 1 sequential step
+
+                    // Log detection result with chunk indices
+                    debug!("Sequential detection: chunk_idx={} history={:?} sequential={}",
+                           last_file_chunk_idx, read_positions, is_seq);
+
+                    is_seq
+                } else {
+                    false // Not enough history yet
+                };
+
+                drop(history); // Release history lock
+                // read_guard released here automatically
+                result
             };
 
-            drop(history); // Release lock before spawning tasks
-
+            // DISABLED: Client-side prefetch hints were causing slowdowns
+            // Server-side LRU cache is sufficient without explicit hints
             // Enable aggressive prefetching for sequential reads (DVR playback, streaming)
             // Adaptive based on both file chunk count AND available memory
-            if is_sequential {
+            if false && is_sequential {
                 // Check available memory to scale prefetch aggressiveness
                 let available_mb = dfs_common::get_available_memory()
                     .map(|bytes| bytes / (1024 * 1024))
@@ -955,89 +1047,100 @@ impl DfsClient {
                     base_large
                 };
 
-                info!("Prefetch: detected sequential pattern at chunk {}/{}, prefetching next {} chunks",
-                      last_file_chunk_idx, all_file_chunks.len(), prefetch_distance);
+                info!("Prefetch: detected sequential pattern at chunk_idx={}/{} chunk_id={:?}, prefetching next {} chunks",
+                      last_file_chunk_idx, all_file_chunks.len(), all_file_chunks.get(last_file_chunk_idx), prefetch_distance);
 
-                for prefetch_offset in 1..=prefetch_distance {
-                    let prefetch_file_idx = last_file_chunk_idx + prefetch_offset;
-
-                    // Check if this chunk exists in the file
-                    if prefetch_file_idx >= all_file_chunks.len() {
-                        break; // Beyond end of file
-                    }
-
-                    let prefetch_chunk_id = all_file_chunks[prefetch_file_idx];
-
-                // Check if already cached or being prefetched
-                let should_prefetch = {
+                // Collect chunks to prefetch (filter out already cached/in-flight)
+                let mut chunks_to_prefetch = Vec::new();
+                {
                     let cache = self.chunk_cache.lock().await;
-                    let mut in_flight = self.prefetch_in_flight.lock().await;
+                    let in_flight = self.prefetch_in_flight.lock().await;
 
-                    if cache.peek(&prefetch_chunk_id).is_some() || in_flight.contains(&prefetch_chunk_id) {
-                        false // Already have it or fetching it
-                    } else {
-                        in_flight.insert(prefetch_chunk_id);
-                        true
+                    for prefetch_offset in 1..=prefetch_distance {
+                        let prefetch_file_idx = last_file_chunk_idx + prefetch_offset;
+
+                        // Check if this chunk exists in the file
+                        if prefetch_file_idx >= all_file_chunks.len() {
+                            break; // Beyond end of file
+                        }
+
+                        let prefetch_chunk_id = all_file_chunks[prefetch_file_idx];
+
+                        // Skip if already cached or being fetched by a real read
+                        // NOTE: Don't mark as in-flight ourselves - prefetch is just a hint to servers
+                        // If a real read comes in, it should fetch immediately, not wait for prefetch
+                        if cache.peek(&prefetch_chunk_id).is_some() || in_flight.contains(&prefetch_chunk_id) {
+                            continue;
+                        }
+
+                        chunks_to_prefetch.push(prefetch_chunk_id);
                     }
-                };
+                }
 
-                if should_prefetch {
-                    // Spawn background prefetch task
+                if !chunks_to_prefetch.is_empty() {
+                    info!("Sending server-side prefetch hints for {} chunks", chunks_to_prefetch.len());
+
+                    // Spawn background task to send prefetch hints (replica-aware batching)
                     let client = self.clone();
                     let nodes = nodes.clone();
 
                     tokio::spawn(async move {
-                        info!("Prefetching chunk {} (read-ahead)", prefetch_chunk_id);
+                        // Group chunks by replica node using round-robin selection
+                        use std::collections::HashMap;
+                        let mut chunks_by_node: HashMap<SocketAddr, Vec<ChunkId>> = HashMap::new();
 
-                        // Get replica locations for load balancing
-                        let replicas = match client.get_chunk_replicas(prefetch_chunk_id).await {
-                            Ok(r) => r,
-                            Err(_) => nodes.clone(), // Fallback to all nodes
-                        };
+                        for chunk_id in &chunks_to_prefetch {
+                            // Get replicas for this chunk
+                            let replicas = match client.get_chunk_replicas(*chunk_id).await {
+                                Ok(r) if !r.is_empty() => r,
+                                _ => nodes.clone(), // Fallback to all nodes
+                            };
 
-                        // Select replica using round-robin
-                        let selected_replica = client.select_replica(&replicas);
-
-                        // Try selected replica first, then fallback to others
-                        let try_nodes: Vec<SocketAddr> = if let Some(selected) = selected_replica {
-                            std::iter::once(selected)
-                                .chain(replicas.iter().filter(|&n| *n != selected).copied())
-                                .collect()
-                        } else {
-                            replicas
-                        };
-
-                        for node_addr in &try_nodes {
-                            match client.read_chunk_from_server(*node_addr, prefetch_chunk_id).await {
-                                Ok(data) => {
-                                    // Add to cache
-                                    let data_arc = Arc::new(data);
-                                    {
-                                        let mut cache = client.chunk_cache.lock().await;
-                                        cache.put(prefetch_chunk_id, data_arc);
-                                    }
-                                    info!("Prefetch complete: {}", prefetch_chunk_id);
-                                    break;
-                                }
-                                Err(e) => {
-                                    debug!("Prefetch failed from {}: {}", node_addr, e);
-                                    continue;
-                                }
+                            // Select replica using round-robin (same logic as reads)
+                            if let Some(selected_node) = client.select_replica(&replicas) {
+                                chunks_by_node.entry(selected_node).or_default().push(*chunk_id);
                             }
                         }
 
-                        // Remove from in-flight tracker
-                        {
-                            let mut in_flight = client.prefetch_in_flight.lock().await;
-                            in_flight.remove(&prefetch_chunk_id);
+                        info!("Grouped {} chunks across {} nodes for prefetch hints",
+                              chunks_to_prefetch.len(), chunks_by_node.len());
+
+                        // Send batch prefetch hint to each node (truly fire-and-forget, no waiting)
+                        // Spawn separate task per node to avoid blocking on slow nodes
+                        for (node_addr, chunk_ids) in chunks_by_node {
+                            let client = client.clone();
+
+                            tokio::spawn(async move {
+                                let request = dfs_common::Request::PrefetchHint {
+                                    chunk_ids: chunk_ids.clone(),
+                                };
+
+                                match client.send_request(node_addr, request).await {
+                                    Ok(dfs_common::Response::PrefetchAccepted { accepted }) => {
+                                        debug!("Server {} accepted prefetch hint for {} chunks", node_addr, accepted);
+
+                                        // Record in warm_cache_map
+                                        let now = std::time::Instant::now();
+                                        let mut warm_map = client.warm_cache_map.lock().await;
+                                        for chunk_id in &chunk_ids {
+                                            warm_map.put(*chunk_id, (node_addr, now));
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        debug!("Unexpected response from prefetch hint to {}", node_addr);
+                                    }
+                                    Err(e) => {
+                                        debug!("Failed to send prefetch hint to {}: {}", node_addr, e);
+                                    }
+                                }
+                            });
                         }
                     });
                 }
-            }
 
             } else {
-                info!("Skipping prefetch: random/non-sequential access detected at chunk {}",
-                       last_file_chunk_idx);
+                info!("Skipping prefetch: random/non-sequential access detected at chunk_idx={} chunk_id={:?}",
+                      last_file_chunk_idx, all_file_chunks.get(last_file_chunk_idx));
             }
         }
 
@@ -1140,7 +1243,10 @@ impl DfsClient {
 
     /// Read a single chunk from a specific server using connection pooling
     async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId) -> Result<Vec<u8>> {
-        let request = Request::ReadChunk { chunk_id };
+        let request = Request::ReadChunk {
+            chunk_id,
+            sequential_hint: None, // TODO: Pass sequential hint when available
+        };
 
         // Try using pooled connection first, with fallback to new connection
         let mut attempt = 0;

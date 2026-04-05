@@ -20,6 +20,12 @@ pub enum Request {
     /// Read a chunk
     ReadChunk {
         chunk_id: ChunkId,
+        /// Optional hint: this chunk is part of a sequential read pattern
+        /// Format: (current_chunk_index, total_chunks_in_file)
+        /// Server can use this to prefetch subsequent chunks into cache
+        /// This is purely a hint - server may ignore it
+        #[serde(default)]
+        sequential_hint: Option<(u64, u64)>,
     },
 
     /// Read a byte range from a chunk (for striped multi-replica reads)
@@ -118,6 +124,13 @@ pub enum Request {
     /// Replicate chunk location to this node (internal cluster operation)
     ReplicateChunkLocation {
         location: ChunkLocation,
+    },
+
+    /// Hint to server: warm cache with these chunks (best-effort prefetch)
+    /// Client sends this when it detects sequential reads and wants to minimize
+    /// future read latency by having chunks pre-loaded into server's LRU cache
+    PrefetchHint {
+        chunk_ids: Vec<ChunkId>,
     },
 
     // Admin requests
@@ -254,6 +267,12 @@ pub enum Response {
     FileList {
         files: Vec<FileMetadata>,
         total_count: usize,
+    },
+
+    /// Prefetch hint acknowledged (best-effort, no guarantee)
+    PrefetchAccepted {
+        /// Number of chunks that will be prefetched
+        accepted: usize,
     },
 
     /// Error response

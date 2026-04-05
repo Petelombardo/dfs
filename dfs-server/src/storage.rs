@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use dfs_common::{compute_chunk_hash, verify_chunk_hash, ChunkId};
+use lru::LruCache;
 use std::fs;
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Local chunk storage manager
@@ -10,18 +13,92 @@ use tracing::{debug, info, warn};
 pub struct ChunkStorage {
     /// Root directory for chunk storage
     data_dir: PathBuf,
+
+    /// LRU cache for frequently accessed chunks
+    /// Sized based on available RAM (25-50% allocation)
+    /// Cache stores Arc<Vec<u8>> to allow cheap cloning for concurrent readers
+    cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
+
+    /// Cache configuration
+    cache_capacity_chunks: usize,
 }
 
 impl ChunkStorage {
-    /// Create a new chunk storage instance
+    /// Create a new chunk storage instance with auto-sized cache
     pub fn new(data_dir: PathBuf) -> Result<Self> {
         // Create data directory if it doesn't exist
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("Failed to create data directory: {:?}", data_dir))?;
 
-        info!("Initialized chunk storage at {:?}", data_dir);
+        // Auto-size cache based on available RAM
+        let cache_capacity_chunks = Self::calculate_cache_size();
+        let cache = Arc::new(Mutex::new(
+            LruCache::new(NonZeroUsize::new(cache_capacity_chunks).unwrap())
+        ));
 
-        Ok(Self { data_dir })
+        info!(
+            "Initialized chunk storage at {:?} with {}MB cache ({} chunks)",
+            data_dir,
+            cache_capacity_chunks * 4,  // 4MB per chunk
+            cache_capacity_chunks
+        );
+
+        Ok(Self {
+            data_dir,
+            cache,
+            cache_capacity_chunks,
+        })
+    }
+
+    /// Calculate optimal cache size based on available system RAM
+    /// Ensures cache is large enough to hold prefetch window without thrashing
+    ///
+    /// Strategy:
+    /// - Client prefetch window: up to 50 chunks (adaptive, but 50 is max)
+    /// - With 5 servers, each server gets ~10 chunks from prefetch
+    /// - Need 3x buffer to avoid evicting prefetched chunks before they're read
+    /// - Minimum: 64 chunks (256MB) to hold 3x prefetch window per server
+    /// - Maximum: Based on available RAM (25-50% allocation)
+    fn calculate_cache_size() -> usize {
+        const MIN_CACHE_CHUNKS: usize = 64;    // Minimum 256MB - holds 3x prefetch window
+        const MAX_CACHE_CHUNKS: usize = 1024;  // Maximum 4GB cache
+        const CHUNK_SIZE_MB: u64 = 4;
+
+        // Get available memory in MB
+        let available_mb = dfs_common::get_available_memory()
+            .map(|bytes| bytes / (1024 * 1024))
+            .unwrap_or(1024); // Default to 1GB if detection fails
+
+        // Calculate cache size based on available RAM
+        // Use conservative allocation to avoid OOM on storage nodes
+        let cache_mb = if available_mb < 512 {
+            // Very low RAM (< 512MB): 25% allocation, minimum 256MB
+            (available_mb / 4).max(256)
+        } else if available_mb < 2048 {
+            // Low RAM (512MB - 2GB): 33% allocation
+            available_mb / 3
+        } else if available_mb < 8192 {
+            // Medium RAM (2GB - 8GB): 40% allocation
+            (available_mb * 2) / 5
+        } else {
+            // High RAM (> 8GB): 50% allocation, capped at 4GB
+            (available_mb / 2).min(4096)
+        };
+
+        let cache_chunks = (cache_mb / CHUNK_SIZE_MB) as usize;
+
+        // Clamp to reasonable bounds
+        let final_cache = cache_chunks.clamp(MIN_CACHE_CHUNKS, MAX_CACHE_CHUNKS);
+
+        info!(
+            "Cache sizing: available_ram={}MB, cache_allocation={}MB ({} chunks, ~{} prefetch windows)",
+            available_mb,
+            final_cache as u64 * CHUNK_SIZE_MB,
+            final_cache,
+            final_cache / 50  // How many full 50-chunk prefetch windows fit
+        );
+
+        final_cache
     }
 
     /// Write a chunk to local storage with checksum verification
@@ -76,9 +153,24 @@ impl ChunkStorage {
         Ok(())
     }
 
-    /// Read a chunk from local storage
+    /// Read a chunk from local storage (cache-through)
+    /// Checks cache first, then disk, then populates cache
     /// Does NOT verify checksum (for SBC performance) - use verify_chunk() for scrubbing
+    ///
+    /// CRITICAL: Never holds cache lock during disk I/O to prevent blocking other reads
     pub fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Vec<u8>> {
+        // Try cache first - hold lock only for the lookup, then release immediately
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(cached_data) = cache.get(chunk_id) {
+                debug!("Cache HIT for chunk {} ({} bytes)", chunk_id, cached_data.len());
+                return Ok((**cached_data).clone());
+            }
+            // Lock released here BEFORE disk I/O
+        }
+
+        // Cache miss - read from disk WITHOUT holding cache lock
+        debug!("Cache MISS for chunk {}, reading from disk", chunk_id);
         let path = self.get_chunk_path(chunk_id);
 
         let mut file = fs::File::open(&path)
@@ -88,9 +180,57 @@ impl ChunkStorage {
         file.read_to_end(&mut data)
             .context("Failed to read chunk data")?;
 
-        debug!("Read chunk {} ({} bytes)", chunk_id, data.len());
+        debug!("Read chunk {} from disk ({} bytes)", chunk_id, data.len());
+
+        // Populate cache for future reads - re-acquire lock only for insertion
+        let data_arc = Arc::new(data.clone());
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(*chunk_id, data_arc);
+            // Lock released here
+        }
 
         Ok(data)
+    }
+
+    /// Warm the cache with a chunk (prefetch hint handler)
+    /// Reads chunk from disk into cache if not already present
+    /// Returns true if chunk was loaded, false if already in cache or doesn't exist
+    pub fn warm_cache(&self, chunk_id: &ChunkId) -> Result<bool> {
+        // Check if already in cache
+        {
+            let cache = self.cache.lock().unwrap();
+            if cache.peek(chunk_id).is_some() {
+                debug!("Chunk {} already in cache, skipping warm", chunk_id);
+                return Ok(false);
+            }
+        }
+
+        // Check if chunk exists on disk
+        if !self.has_chunk(chunk_id) {
+            debug!("Chunk {} not found on disk, cannot warm cache", chunk_id);
+            anyhow::bail!("Chunk not found");
+        }
+
+        // Read from disk and populate cache
+        let path = self.get_chunk_path(chunk_id);
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("Failed to open chunk file: {:?}", path))?;
+
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .context("Failed to read chunk data")?;
+
+        debug!("Warmed cache with chunk {} ({} bytes)", chunk_id, data.len());
+
+        // Populate cache
+        let data_arc = Arc::new(data);
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(*chunk_id, data_arc);
+        }
+
+        Ok(true)
     }
 
     /// Read and verify a chunk (used during scrubbing or error recovery)

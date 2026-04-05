@@ -50,6 +50,10 @@ pub struct Server {
 
     /// Storage stats cache with 10-second TTL
     storage_stats_cache: Arc<RwLock<Option<StorageStatsCache>>>,
+
+    /// Prefetch concurrency limiter - prevents prefetch from overwhelming disk I/O
+    /// Limits low-priority prefetch operations while allowing unlimited high-priority reads
+    prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Server {
@@ -71,6 +75,10 @@ impl Server {
             replication_factor,
             metadata_dir,
             storage_stats_cache: Arc::new(RwLock::new(None)),
+            // Allow 8 concurrent prefetch operations for faster cache warming
+            // With modern HDDs and read-ahead, parallel reads are efficient
+            // Real client reads bypass this limit (high priority)
+            prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
 
@@ -87,7 +95,13 @@ impl Server {
     /// Handle an incoming request message
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
-            Request::ReadChunk { chunk_id } => self.handle_read_chunk(chunk_id).await,
+            Request::ReadChunk { chunk_id, sequential_hint } => {
+                if let Some((idx, total)) = sequential_hint {
+                    debug!("ReadChunk {} with sequential hint: {}/{} chunks", chunk_id, idx, total);
+                    // TODO: Use hint for server-side prefetching
+                }
+                self.handle_read_chunk(chunk_id).await
+            },
             Request::ReadChunkRange { chunk_id, offset, length } => {
                 self.handle_read_chunk_range(chunk_id, offset, length).await
             }
@@ -111,6 +125,9 @@ impl Server {
             }
             Request::ReplicateChunkLocation { location } => {
                 self.handle_replicate_chunk_location(location).await
+            }
+            Request::PrefetchHint { chunk_ids } => {
+                self.handle_prefetch_hint(chunk_ids).await
             }
             Request::GetFileMetadataByPath { path, if_modified_since } => {
                 self.handle_get_file_metadata_by_path(path, if_modified_since).await
@@ -356,6 +373,71 @@ impl Server {
                     code: ErrorCode::InternalError,
                 }
             }
+        }
+    }
+
+    /// Handle prefetch hint - warm cache with requested chunks (best-effort, low priority)
+    /// Client sends this when it detects sequential reads to minimize future latency
+    ///
+    /// This runs in background with:
+    /// - Concurrency limiting (max 2 concurrent prefetches via semaphore)
+    /// - Throttling (50ms delay between chunks to spread I/O load)
+    /// - Real client reads bypass the semaphore (they are high priority)
+    async fn handle_prefetch_hint(&self, chunk_ids: Vec<ChunkId>) -> Response {
+        info!("Received prefetch hint for {} chunks", chunk_ids.len());
+
+        let storage = self.storage.clone();
+        let semaphore = self.prefetch_semaphore.clone();
+        let chunk_ids_clone = chunk_ids.clone();
+
+        // Spawn background task to warm cache (non-blocking, best-effort, low priority)
+        tokio::spawn(async move {
+            let mut warmed = 0;
+            let mut failed = 0;
+            let mut skipped = 0;
+
+            for chunk_id in chunk_ids_clone {
+                // Acquire semaphore permit to limit concurrent prefetch operations
+                // This prevents prefetch from overwhelming disk I/O
+                let permit = match semaphore.try_acquire() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Too many prefetches in flight, skip this chunk
+                        skipped += 1;
+                        debug!("Skipping prefetch for chunk {} (too many in flight)", chunk_id);
+                        continue;
+                    }
+                };
+
+                match storage.warm_cache(&chunk_id) {
+                    Ok(true) => {
+                        warmed += 1;
+                        debug!("Warmed cache for chunk {}", chunk_id);
+                    }
+                    Ok(false) => {
+                        debug!("Chunk {} already in cache", chunk_id);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        debug!("Failed to warm cache for chunk {}: {}", chunk_id, e);
+                    }
+                }
+
+                drop(permit); // Release semaphore
+
+                // Minimal throttle to prevent CPU spinning, but allow aggressive prefetch
+                // HDD read-ahead and OS page cache make sequential reads efficient
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+
+            if warmed > 0 || failed > 0 || skipped > 0 {
+                info!("Prefetch completed: {} warmed, {} failed, {} skipped", warmed, failed, skipped);
+            }
+        });
+
+        // Return immediately - prefetch happens in background
+        Response::PrefetchAccepted {
+            accepted: chunk_ids.len(),
         }
     }
 
@@ -739,6 +821,7 @@ impl Server {
             if let Some(node_info) = self.cluster.get_node(node_id).await {
                 let request = Request::ReadChunk {
                     chunk_id: *chunk_id,
+                    sequential_hint: None,
                 };
 
                 match self

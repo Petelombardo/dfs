@@ -1006,11 +1006,11 @@ impl DfsClient {
                 result
             };
 
-            // DISABLED: Client-side prefetch hints were causing slowdowns
-            // Server-side LRU cache is sufficient without explicit hints
+            // Re-enabled: Server-side prefetch hints to warm server LRU caches
+            // This reduces disk read latency by pre-loading chunks into server memory
             // Enable aggressive prefetching for sequential reads (DVR playback, streaming)
             // Adaptive based on both file chunk count AND available memory
-            if false && is_sequential {
+            if true && is_sequential {
                 // Check available memory to scale prefetch aggressiveness
                 let available_mb = dfs_common::get_available_memory()
                     .map(|bytes| bytes / (1024 * 1024))
@@ -1141,6 +1141,134 @@ impl DfsClient {
             } else {
                 info!("Skipping prefetch: random/non-sequential access detected at chunk_idx={} chunk_id={:?}",
                       last_file_chunk_idx, all_file_chunks.get(last_file_chunk_idx));
+            }
+
+            // CLIENT-SIDE PREFETCH: Modest aggressive client-side prefetch for sequential reads
+            // Fetch next chunks into client cache in background (non-blocking)
+            // This complements server-side hints by having data ready in client memory
+            // Client prefetch is ~half of server-side prefetch distance for optimal balance
+            if is_sequential && last_file_chunk_idx + 1 < all_file_chunks.len() {
+                // Get available memory to determine prefetch aggressiveness (same logic as server-side)
+                let available_mb = dfs_common::get_available_memory()
+                    .map(|bytes| bytes / (1024 * 1024))
+                    .unwrap_or(1024);
+
+                // Client prefetch is half of server-side prefetch distance
+                let (base_large, base_medium, base_tiny) = if available_mb < 256 {
+                    (4, 6, 8)      // Half of (8, 12, 16)
+                } else if available_mb < 512 {
+                    (6, 8, 10)     // Half of (12, 16, 20)
+                } else if available_mb < 1024 {
+                    (8, 10, 12)    // Half of (16, 20, 24)
+                } else {
+                    (10, 12, 14)   // Half of (20, 24, 28)
+                };
+
+                // Adaptive prefetch distance based on chunk count (same logic as server-side)
+                let client_prefetch_count = if all_file_chunks.len() > 500 {
+                    base_tiny      // Many tiny chunks
+                } else if all_file_chunks.len() > 100 {
+                    base_medium    // Medium chunks
+                } else {
+                    base_large     // Large chunks (4MB)
+                };
+
+                // Collect chunks to client-prefetch (skip already cached)
+                let mut chunks_to_client_prefetch = Vec::new();
+                {
+                    let cache = self.chunk_cache.lock().await;
+                    let in_flight = self.prefetch_in_flight.lock().await;
+
+                    for offset in 1..=client_prefetch_count {
+                        let prefetch_idx = last_file_chunk_idx + offset;
+
+                        if prefetch_idx >= all_file_chunks.len() {
+                            break; // Beyond end of file
+                        }
+
+                        let prefetch_chunk_id = all_file_chunks[prefetch_idx];
+
+                        // Skip if already cached or in-flight
+                        if cache.peek(&prefetch_chunk_id).is_some() || in_flight.contains(&prefetch_chunk_id) {
+                            continue;
+                        }
+
+                        chunks_to_client_prefetch.push((prefetch_idx, prefetch_chunk_id));
+                    }
+                }
+
+                if !chunks_to_client_prefetch.is_empty() {
+                    info!("Client-side prefetch: fetching {} chunks in background", chunks_to_client_prefetch.len());
+
+                    // Spawn background task for client-side prefetch
+                    let client = self.clone();
+                    let nodes = nodes.clone();
+                    let chunk_locations = chunk_locations.to_vec();
+
+                    tokio::spawn(async move {
+                        for (chunk_idx, chunk_id) in chunks_to_client_prefetch {
+                            // Mark as in-flight to prevent duplicates
+                            {
+                                let mut in_flight = client.prefetch_in_flight.lock().await;
+                                if in_flight.contains(&chunk_id) {
+                                    continue; // Already being fetched
+                                }
+                                in_flight.insert(chunk_id);
+                            }
+
+                            // Get chunk location from metadata
+                            let chunk_loc_map: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
+                                chunk_locations.iter().map(|loc| (loc.chunk_id, loc)).collect();
+
+                            let chunk_location = chunk_loc_map.get(&chunk_id).map(|&loc| loc.clone());
+
+                            // Get replicas
+                            let replicas = if let Some(ref location) = chunk_location {
+                                let node_id_map = client.addr_to_node_id.read().await;
+                                let chunk_addrs: Vec<SocketAddr> = location.nodes.iter()
+                                    .filter_map(|node_id| {
+                                        node_id_map.iter()
+                                            .find(|(_, &id)| id == *node_id)
+                                            .map(|(&addr, _)| addr)
+                                    })
+                                    .collect();
+
+                                if !chunk_addrs.is_empty() {
+                                    chunk_addrs
+                                } else {
+                                    nodes.clone()
+                                }
+                            } else {
+                                nodes.clone()
+                            };
+
+                            // Select replica using round-robin
+                            if let Some(selected_node) = client.select_replica(&replicas) {
+                                // Fetch chunk from server
+                                match client.read_chunk_from_server(selected_node, chunk_id).await {
+                                    Ok(data) => {
+                                        debug!("Client prefetch SUCCESS: chunk {} ({} bytes) from {}",
+                                               chunk_id, data.len(), selected_node);
+
+                                        // Add to cache
+                                        let mut cache = client.chunk_cache.lock().await;
+                                        cache.put(chunk_id, Arc::new(data));
+                                    }
+                                    Err(e) => {
+                                        debug!("Client prefetch FAILED: chunk {} from {}: {}",
+                                               chunk_id, selected_node, e);
+                                    }
+                                }
+                            }
+
+                            // Remove from in-flight
+                            {
+                                let mut in_flight = client.prefetch_in_flight.lock().await;
+                                in_flight.remove(&chunk_id);
+                            }
+                        }
+                    });
+                }
             }
         }
 

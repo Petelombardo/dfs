@@ -1364,25 +1364,24 @@ impl DfsClient {
     ///
     /// Parameters:
     /// - chunk_ids: All chunks in the file
-    /// - current_offset: Current read position in bytes (optional, for smart warming)
-    /// - chunk_size: Size of each chunk in bytes (for calculating chunk index from offset)
-    pub async fn warm_replica_cache_range(&self, chunk_ids: &[ChunkId], current_offset: Option<u64>, chunk_size: u64) {
+    /// - current_chunk_idx: Current chunk index (optional, for smart warming)
+    pub async fn warm_replica_cache_by_index(&self, chunk_ids: &[ChunkId], current_chunk_idx: Option<usize>) {
         if chunk_ids.is_empty() {
             return;
         }
 
         // Determine which chunks to warm
-        let (start_idx, end_idx) = if let Some(offset) = current_offset {
-            // Smart warming: only warm chunks ahead of current read position
-            // Warm next 16 chunks (32MB at 2MB/chunk = ~1 second at 32MB/s)
-            // Reduced from 64 to prevent cache thrashing and OOM
-            let current_chunk_idx = (offset / chunk_size) as usize;
-            let start = current_chunk_idx.min(chunk_ids.len());
-            let end = (current_chunk_idx + 16).min(chunk_ids.len());
+        let (start_idx, end_idx) = if let Some(idx) = current_chunk_idx {
+            // Smart warming: sliding window ahead of current read position
+            // Warm next 1000 chunks (~600MB for typical DVR chunks)
+            // This creates a sliding window that prevents metadata query storms
+            // for large sequential files while keeping memory usage low (<100KB)
+            let start = idx.min(chunk_ids.len());
+            let end = (idx + 1000).min(chunk_ids.len());
             (start, end)
         } else {
-            // No offset provided, warm first 16 chunks (for new file opens)
-            (0, 16.min(chunk_ids.len()))
+            // No offset provided, warm first 1000 chunks (for new file opens)
+            (0, 1000.min(chunk_ids.len()))
         };
 
         if start_idx >= end_idx {
@@ -1403,8 +1402,18 @@ impl DfsClient {
             }
         }
 
-        debug!("Warmed replica cache: {} new entries (range {}-{} of {} total chunks)",
-               warmed, start_idx, end_idx, chunk_ids.len());
+        info!("Warmed replica cache: {} new entries (range {}-{} of {} total chunks)",
+              warmed, start_idx, end_idx, chunk_ids.len());
+    }
+
+    /// Pre-populate replica cache with chunk locations for upcoming reads (byte offset version)
+    /// Parameters:
+    /// - chunk_ids: All chunks in the file
+    /// - current_offset: Current read position in bytes (optional, for smart warming)
+    /// - chunk_size: Size of each chunk in bytes (for calculating chunk index from offset)
+    pub async fn warm_replica_cache_range(&self, chunk_ids: &[ChunkId], current_offset: Option<u64>, chunk_size: u64) {
+        let current_chunk_idx = current_offset.map(|offset| (offset / chunk_size) as usize);
+        self.warm_replica_cache_by_index(chunk_ids, current_chunk_idx).await;
     }
 
     /// Legacy wrapper for warming cache without offset info

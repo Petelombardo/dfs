@@ -720,6 +720,30 @@ impl Filesystem for DfsFilesystem {
             let offset = offset as usize;
             let size = size as usize;
 
+            // Warm replica cache with sliding window - but only occasionally to avoid overhead
+            // For files with many small chunks, warming on every read causes significant CPU overhead
+            // Warm when: (1) first read, or (2) we've progressed significantly (every 50MB)
+            static LAST_WARM_OFFSET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let last_warm = LAST_WARM_OFFSET.load(std::sync::atomic::Ordering::Relaxed);
+            let should_warm = offset == 0 || offset.saturating_sub(last_warm as usize) >= 50 * 1024 * 1024;
+
+            if should_warm && !metadata.chunks.is_empty() && !metadata.chunk_sizes.is_empty() {
+                // Find which chunk index corresponds to this byte offset
+                let mut cumulative = 0u64;
+                let mut chunk_idx = 0;
+                for (idx, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
+                    if cumulative + chunk_size > offset as u64 {
+                        chunk_idx = idx;
+                        break;
+                    }
+                    cumulative += chunk_size;
+                }
+
+                // Warm 1000 chunks ahead of current position using actual chunk index
+                client.warm_replica_cache_by_index(&metadata.chunks, Some(chunk_idx)).await;
+                LAST_WARM_OFFSET.store(offset as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Check write buffer first if write-behind buffering is enabled
             // This enables "live rewind" - reading while writing without waiting for backend
             if write_buffer_enabled {

@@ -817,7 +817,7 @@ impl DfsClient {
                     // But if it does, fall back to fetching ourselves
                     warn!("Timeout waiting for chunk {} being fetched by another request, fetching ourselves", chunk_id);
 
-                    // Try to fetch it ourselves
+                    // Try to fetch it ourselves, trying multiple replicas if needed
                     let replicas = match self.get_chunk_replicas(chunk_id).await {
                         Ok(r) => r,
                         Err(_) => nodes.clone(),
@@ -826,19 +826,36 @@ impl DfsClient {
                     let selected_replica = self.select_replica(&replicas)
                         .context("No replicas available for fallback fetch")?;
 
-                    match self.read_chunk_from_server(selected_replica, chunk_id).await {
-                        Ok(data) => {
-                            let data_arc = Arc::new(data);
+                    // Try selected replica first, then fall back to others
+                    let mut fetch_succeeded = false;
+                    for (i, node_addr) in std::iter::once(&selected_replica)
+                        .chain(replicas.iter().filter(|&n| n != &selected_replica))
+                        .enumerate()
+                    {
+                        match self.read_chunk_from_server(*node_addr, chunk_id).await {
+                            Ok(data) => {
+                                if i > 0 {
+                                    debug!("Fetched chunk {} from fallback replica {} after timeout", chunk_id, node_addr);
+                                }
+                                let data_arc = Arc::new(data);
 
-                            // Cache it
-                            let mut chunk_cache = self.chunk_cache.lock().await;
-                            chunk_cache.put(chunk_id, Arc::clone(&data_arc));
+                                // Cache it
+                                let mut chunk_cache = self.chunk_cache.lock().await;
+                                chunk_cache.put(chunk_id, Arc::clone(&data_arc));
 
-                            fetched_chunks.push((idx, data_arc));
+                                fetched_chunks.push((idx, data_arc));
+                                fetch_succeeded = true;
+                                break;
+                            }
+                            Err(e) => {
+                                debug!("Failed to fetch chunk {} from {} after timeout: {}", chunk_id, node_addr, e);
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            anyhow::bail!("Failed to fetch chunk {} after timeout: {}", chunk_id, e);
-                        }
+                    }
+
+                    if !fetch_succeeded {
+                        anyhow::bail!("Failed to fetch chunk {} from any replica after timeout", chunk_id);
                     }
                 }
             }
@@ -1153,8 +1170,8 @@ impl DfsClient {
             let envelope = MessageEnvelope::new(request_id, Message::Request(request.clone()));
             let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
-            // Send request and read response
-            let result = async {
+            // Send request and read response with 3-second timeout
+            let io_future = async {
                 // Send request
                 let len = encoded.len() as u32;
                 stream.write_all(&len.to_be_bytes()).await?;
@@ -1170,7 +1187,23 @@ impl DfsClient {
                 stream.read_exact(&mut buf).await?;
 
                 Ok::<(TcpStream, Vec<u8>), std::io::Error>((stream, buf))
-            }.await;
+            };
+
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(3),
+                io_future
+            ).await;
+
+            let result = match result {
+                Ok(r) => r,
+                Err(_) => {
+                    // Timeout occurred
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("Timeout reading chunk from {}", server_addr)
+                    ))
+                }
+            };
 
             match result {
                 Ok((stream, buf)) => {

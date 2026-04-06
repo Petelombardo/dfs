@@ -34,9 +34,9 @@ enum Commands {
         #[arg(short, long)]
         foreground: bool,
 
-        /// Enable write-behind buffering for better performance (may lose unflushed data on crash)
+        /// Disable write-behind buffering (enabled by default for better performance)
         #[arg(long)]
-        write_buffer: bool,
+        no_write_buffer: bool,
 
         /// Allow all users to access the mounted filesystem (requires user_allow_other in /etc/fuse.conf)
         #[arg(long)]
@@ -68,9 +68,9 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',')]
         cluster: Vec<String>,
 
-        /// Enable write-behind buffering for better performance (may lose unflushed data on crash)
+        /// Disable write-behind buffering (enabled by default for better performance)
         #[arg(long)]
-        write_buffer: bool,
+        no_write_buffer: bool,
 
         /// Allow all users to access the mounted filesystem (requires user_allow_other in /etc/fuse.conf)
         #[arg(long)]
@@ -105,13 +105,15 @@ fn main() -> Result<()> {
             mountpoint,
             cluster,
             foreground,
-            write_buffer,
+            no_write_buffer,
             allow_other,
             log_file,
             log_level,
         } => {
             // Set up logging before anything else
             let _guard = setup_logging(foreground, log_file.as_deref(), &log_level)?;
+            // write_buffer is enabled by default, disabled if no_write_buffer flag is set
+            let write_buffer = !no_write_buffer;
             mount_filesystem(mountpoint, cluster, foreground, write_buffer, allow_other)?;
             // _guard is dropped here, flushing remaining logs
         }
@@ -128,7 +130,7 @@ fn main() -> Result<()> {
         Commands::SystemdInstall {
             mountpoint,
             cluster,
-            write_buffer,
+            no_write_buffer,
             allow_other,
             log_file,
             log_level,
@@ -140,6 +142,8 @@ fn main() -> Result<()> {
                 .with_target(false)
                 .init();
 
+            // write_buffer is enabled by default, disabled if no_write_buffer flag is set
+            let write_buffer = !no_write_buffer;
             systemd_install(mountpoint, cluster, write_buffer, allow_other, log_file, &log_level, &service_name)?;
         }
         Commands::SystemdUninstall { service_name } => {
@@ -185,9 +189,9 @@ fn mount_filesystem(
     info!("Discovered {} cluster nodes: {:?}", addrs.len(), addrs);
 
     if write_buffer {
-        info!("Write-behind buffering ENABLED - better performance, may lose unflushed data on crash");
+        info!("Write-behind buffering ENABLED (default) - better performance, data flushed on file close/fsync");
     } else {
-        info!("Write-behind buffering DISABLED - all writes go through Raft immediately");
+        info!("Write-behind buffering DISABLED - immediate writes with lower performance");
     }
 
     // Create filesystem WITH a tokio runtime running in a background thread
@@ -465,8 +469,9 @@ fn systemd_install(
         cluster_arg
     );
 
-    if write_buffer {
-        exec_start.push_str(" --write-buffer");
+    // write_buffer is now enabled by default, so only add flag if DISABLED
+    if !write_buffer {
+        exec_start.push_str(" --no-write-buffer");
     }
 
     if allow_other {

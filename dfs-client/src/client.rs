@@ -1683,11 +1683,12 @@ impl DfsClient {
         info!("Writing {} bytes with synchronous dual-replica to {} and {}", data.len(), replica1, replica2);
 
         // Write SAME data to both nodes in parallel (local-only, no server-side replication)
-        let data1 = data.to_vec();
-        let data2 = data.to_vec();
+        // Create one Vec and clone it once (instead of calling to_vec() twice on the slice)
+        let data_vec = data.to_vec();
+        let data_clone = data_vec.clone();
 
-        let request1 = Request::WriteFileLocalOnly { data: data1 };
-        let request2 = Request::WriteFileLocalOnly { data: data2 };
+        let request1 = Request::WriteFileLocalOnly { data: data_vec };
+        let request2 = Request::WriteFileLocalOnly { data: data_clone };
 
         let task1 = self.send_request(replica1, request1);
         let task2 = self.send_request(replica2, request2);

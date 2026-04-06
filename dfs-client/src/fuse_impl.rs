@@ -174,16 +174,43 @@ impl DfsFilesystem {
 
                     // Flush each buffer
                     for ino in flush_inodes {
-                        let buffer_opt = {
+                        // Align flush to chunk boundaries (4MB) to prevent tiny chunks
+                        let flush_data_opt = {
                             let mut buffers = write_buffers_clone.lock().await;
-                            buffers.remove(&ino)
+
+                            if let Some(buffer) = buffers.get_mut(&ino) {
+                                let buffer_size = buffer.data.len();
+                                let chunk_size = 4 * 1024 * 1024; // 4MB
+                                let flush_size = (buffer_size / chunk_size) * chunk_size;
+
+                                if flush_size == 0 {
+                                    // Buffer < 4MB, skip background flush (wait for more data or file close)
+                                    None
+                                } else {
+                                    let idle_time = buffer.last_modified.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+                                    info!("Background flush: write buffer for inode {} ({} bytes aligned to {} bytes, idle: {:?})",
+                                          ino, buffer_size, flush_size, idle_time);
+
+                                    // Flush only aligned portion (multiples of 4MB)
+                                    let data: Vec<u8> = if flush_size == buffer_size {
+                                        // Flush entire buffer (it's exactly a multiple of chunk_size)
+                                        std::mem::take(&mut buffer.data)
+                                    } else {
+                                        // Flush only the aligned portion, keep overflow
+                                        buffer.data.drain(..flush_size).collect()
+                                    };
+
+                                    let start_offset = buffer.start_offset;
+                                    buffer.start_offset += data.len() as u64;
+                                    buffer.last_modified = SystemTime::now();
+                                    Some((data, start_offset))
+                                }
+                            } else {
+                                None
+                            }
                         };
 
-                        if let Some(buffer) = buffer_opt {
-                            let idle_time = buffer.last_modified.elapsed().unwrap_or(std::time::Duration::from_secs(0));
-                            info!("Background flush: write buffer for inode {} ({} bytes, idle: {:?})",
-                                  ino, buffer.data.len(), idle_time);
-
+                        if let Some((flush_data, buffer_start_offset)) = flush_data_opt {
                             // Get metadata
                             let mut metadata = {
                                 let cache = metadata_cache_for_cleanup.read().unwrap();
@@ -197,9 +224,9 @@ impl DfsFilesystem {
                             };
 
                             // Write buffered data
-                            match client_for_cleanup.write_data_with_cache(&buffer.data, ino, buffer.start_offset).await {
+                            match client_for_cleanup.write_data_with_cache(&flush_data, ino, buffer_start_offset).await {
                                 Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
-                                    let new_size = buffer.start_offset + buffer.data.len() as u64;
+                                    let new_size = buffer_start_offset + flush_data.len() as u64;
                                     if let Some(chunk_locations) = chunk_locations_opt {
                                         metadata.chunk_locations.extend(chunk_locations);
                                     }
@@ -363,18 +390,55 @@ impl DfsFilesystem {
     /// If force_metadata_update is true, always update metadata (used on close/fsync)
     /// If false, use time-based batching (update every 2 seconds)
     async fn flush_buffer_async(&self, ino: u64, force_metadata_update: bool) -> Result<()> {
-        // Get and remove buffer for this inode
-        let buffer_opt = {
+        // Determine what data to flush (align to chunk boundaries to prevent tiny chunks)
+        let flush_data_opt = {
             let mut buffers = self.write_buffers.lock().await;
-            buffers.remove(&ino)
+
+            if let Some(buffer) = buffers.get_mut(&ino) {
+                let buffer_size = buffer.data.len();
+
+                // Align flush to chunk boundaries (4MB) to prevent server from creating tiny chunks
+                // This is critical for HDHomeRun failover scenarios where DVR closes/reopens files
+                let chunk_size = 4 * 1024 * 1024; // 4MB
+                let flush_size = (buffer_size / chunk_size) * chunk_size;
+
+                if flush_size == 0 {
+                    // Buffer < 4MB, keep it buffered unless force_metadata_update
+                    // On file close (release), we MUST flush everything even if < 4MB
+                    if force_metadata_update && buffer_size > 0 {
+                        // File is closing, flush everything including partial chunk
+                        let data = std::mem::take(&mut buffer.data);
+                        let start_offset = buffer.start_offset;
+                        buffer.start_offset += data.len() as u64;
+                        buffer.last_modified = SystemTime::now();
+                        Some((data, start_offset))
+                    } else {
+                        None
+                    }
+                } else {
+                    // Flush only aligned portion (multiples of 4MB)
+                    let data: Vec<u8> = if flush_size == buffer_size {
+                        // Flush entire buffer (it's exactly a multiple of chunk_size)
+                        std::mem::take(&mut buffer.data)
+                    } else {
+                        // Flush only the aligned portion, keep overflow
+                        buffer.data.drain(..flush_size).collect()
+                    };
+
+                    let start_offset = buffer.start_offset;
+                    buffer.start_offset += data.len() as u64;
+                    buffer.last_modified = SystemTime::now();
+                    Some((data, start_offset))
+                }
+            } else {
+                None
+            }
         };
 
-        if let Some(buffer) = buffer_opt {
-            info!("Flushing {} bytes for inode {}", buffer.data.len(), ino);
+        if let Some((flush_data, buffer_start_offset)) = flush_data_opt {
+            info!("Flushing {} bytes for inode {} (force={})", flush_data.len(), ino, force_metadata_update);
 
             // Get current metadata from cache
-            // NOTE: metadata.size has already been updated by buffered writes
-            // We only need to add the chunks for the buffered data
             let mut metadata = {
                 let cache = self.metadata_cache.read().unwrap();
                 match cache.get(&ino) {
@@ -386,17 +450,14 @@ impl DfsFilesystem {
             };
 
             // Write buffered data as new chunks (appending)
-            // Use the buffer's recorded start offset
-            let buffer_start_offset = buffer.start_offset;
-
             // Use write-through caching to populate byte-range cache for immediate read-back
             let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = self.client
-                .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
+                .write_data_with_cache(&flush_data, ino, buffer_start_offset)
                 .await?;
 
             // Append new chunks to existing chunks and update size
             let num_chunks = new_chunk_ids.len();
-            let new_size = buffer_start_offset + buffer.data.len() as u64;
+            let new_size = buffer_start_offset + flush_data.len() as u64;
 
             // If dual-replica writes provided chunk_locations, use them (preferred)
             if let Some(chunk_locations) = chunk_locations_opt {

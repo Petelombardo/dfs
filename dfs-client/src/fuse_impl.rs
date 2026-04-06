@@ -102,6 +102,11 @@ pub struct DfsFilesystem {
     /// Prevents excessive warming overhead on files with many small chunks
     last_warm_offset: Arc<RwLock<HashMap<u64, u64>>>,
 
+    /// Chunk offset map cache: inode -> Vec<(offset, size)>
+    /// Prevents O(n) iteration through all chunks on every read
+    /// Invalidated when file metadata changes (size/chunks)
+    chunk_offset_cache: Arc<RwLock<HashMap<u64, (u64, Vec<(usize, usize)>)>>>, // (file_size, offsets)
+
     /// Directory listing cache: path -> (entries, timestamp)
     /// Cache directory listings for 5 seconds to avoid repeated scans
     dir_cache: Arc<RwLock<HashMap<String, (Vec<FileMetadata>, std::time::Instant)>>>,
@@ -300,6 +305,7 @@ impl DfsFilesystem {
             last_metadata_update: Arc::new(RwLock::new(HashMap::new())),
             last_chunk_cache: Arc::new(RwLock::new(None)),
             last_warm_offset: Arc::new(RwLock::new(HashMap::new())),
+            chunk_offset_cache: Arc::new(RwLock::new(HashMap::new())),
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
             statfs_cache: Arc::new(RwLock::new(None)),
             lock_manager: Arc::new(LockManager::new()),
@@ -764,6 +770,7 @@ impl Filesystem for DfsFilesystem {
         let buffer_flush_threshold = self.buffer_flush_threshold;
         let last_metadata_update = self.last_metadata_update.clone();
         let last_warm_offset = self.last_warm_offset.clone();
+        let chunk_offset_cache = self.chunk_offset_cache.clone();
 
         // Spawn async read operation on tokio runtime
         self.runtime.spawn(async move {
@@ -987,7 +994,24 @@ impl Filesystem for DfsFilesystem {
 
                         // Warm replica cache with chunk locations for upcoming reads
                         // Only warm chunks ahead of current read position (smart warming)
-                        client.warm_replica_cache_range(&fresh_metadata.chunks, Some(offset as u64), 2 * 1024 * 1024).await;
+                        // CRITICAL: Calculate correct chunk index using actual chunk sizes (variable-sized chunks)
+                        let chunk_idx = if !fresh_metadata.chunk_sizes.is_empty() {
+                            let mut cumulative = 0u64;
+                            let mut idx = 0;
+                            for (i, &size) in fresh_metadata.chunk_sizes.iter().enumerate() {
+                                if cumulative + size as u64 > offset as u64 {
+                                    idx = i;
+                                    break;
+                                }
+                                cumulative += size as u64;
+                                idx = i + 1; // If we don't break, we're past all chunks
+                            }
+                            Some(idx)
+                        } else {
+                            None
+                        };
+
+                        client.warm_replica_cache_by_index(&fresh_metadata.chunks, chunk_idx).await;
 
                         // If file has grown, continue with the read using fresh metadata
                         if offset < fresh_metadata.size as usize {
@@ -1020,14 +1044,40 @@ impl Filesystem for DfsFilesystem {
                 return;
             }
 
-            // Build chunk offset map for efficient lookups using chunk_sizes
-            let mut chunk_offsets = Vec::with_capacity(metadata.chunks.len());
-            let mut current_offset = 0usize;
+            // Build or retrieve cached chunk offset map
+            // CRITICAL: Cache this to avoid O(n) iteration through all chunks on every read
+            // For 3GB files with 750+ chunks, this was a massive performance bottleneck
+            let chunk_offsets = {
+                let cache = chunk_offset_cache.read().unwrap();
+                let cached_result: Option<Vec<(usize, usize)>> = if let Some((cached_size, cached_offsets)) = cache.get(&ino) {
+                    if *cached_size == metadata.size {
+                        // Cache hit with matching size - use it
+                        Some(cached_offsets.clone())
+                    } else {
+                        // Size changed - need to rebuild
+                        None
+                    }
+                } else {
+                    // No cache entry
+                    None
+                };
+                cached_result
+            }.unwrap_or_else(|| {
+                // Cache miss or invalidated - build and cache it
+                let mut offsets = Vec::with_capacity(metadata.chunks.len());
+                let mut current_offset = 0usize;
 
-            for (idx, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
-                chunk_offsets.push((current_offset, chunk_size as usize));
-                current_offset += chunk_size as usize;
-            }
+                for (idx, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
+                    offsets.push((current_offset, chunk_size as usize));
+                    current_offset += chunk_size as usize;
+                }
+
+                // Store in cache
+                let mut cache = chunk_offset_cache.write().unwrap();
+                cache.insert(ino, (metadata.size, offsets.clone()));
+
+                offsets
+            });
 
             // Find which chunks we need to read
             let end_offset = std::cmp::min(offset + size, metadata.size as usize);
@@ -1642,14 +1692,6 @@ impl Filesystem for DfsFilesystem {
                 let mut padded = vec![0u8; offset - current_size];
                 padded.extend_from_slice(&data_vec);
                 (padded, true)
-            } else if offset + data_vec.len() >= current_size {
-                // Writing near end of file (overlaps with current end)
-                // Treat as append to avoid expensive read-modify-write
-                // This handles DVR recordings and other streaming writes where
-                // small timing variations might cause writes slightly behind the end
-                debug!("Write at offset {} overlaps with end at {}, treating as append",
-                       offset, current_size);
-                (data_vec.clone(), true)
             } else {
                 // Random write in middle of file - need read-modify-write
                 // CRITICAL FIX: Only read affected chunks, not entire file!

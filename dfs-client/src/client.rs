@@ -687,7 +687,11 @@ impl DfsClient {
             info!("Using chunk_locations metadata for {} chunks (have {} locations)", chunk_ids.len(), chunk_locations.len());
         }
 
-        // Create parallel fetch tasks
+        // Create parallel fetch tasks with concurrency limit
+        // CRITICAL: Limit concurrent connections to prevent exhausting server file descriptors
+        // With 5 servers and unlimited concurrency, we could open 500+ connections
+        let max_concurrent_fetches = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
+
         let fetch_tasks: Vec<_> = chunks_to_fetch.iter().map(|(idx, chunk_id, file_offset)| {
             let idx = *idx;
             let chunk_id = *chunk_id;
@@ -695,6 +699,7 @@ impl DfsClient {
             let client = self.clone();
             let nodes = nodes.clone();
             let chunk_location = chunk_loc_map.get(&chunk_id).map(|&loc| loc.clone());
+            let semaphore = max_concurrent_fetches.clone();
 
             if chunk_location.is_none() && !chunk_locations.is_empty() {
                 warn!("Chunk {} not found in chunk_locations map (map has {} entries)", chunk_id, chunk_loc_map.len());
@@ -703,6 +708,9 @@ impl DfsClient {
             let use_striped = is_sequential == false; // Only stripe for random access
 
             tokio::spawn(async move {
+                // Acquire semaphore permit to limit concurrency
+                let _permit = semaphore.acquire().await.unwrap();
+
                 // Check if we should use striped reading
                 // Skip striped reads for sequential access (better for HDDs)
                 if use_striped {

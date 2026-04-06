@@ -129,9 +129,11 @@ impl DfsFilesystem {
             warn!("Failed to query cluster chunk size, using default 4MB: {}", e);
             4  // Default to 4MB if query fails
         });
-        let buffer_flush_threshold = chunk_size_mb * 1024 * 1024;
-        info!("Client configured with buffer_flush_threshold={} bytes ({}MB) from cluster",
-              buffer_flush_threshold, chunk_size_mb);
+        // Use 3x chunk size for write buffer threshold to enable pipelined writes
+        // With 4MB chunks, this gives us 12MB buffer = 3 chunks that can be written in parallel
+        let buffer_flush_threshold = chunk_size_mb * 1024 * 1024 * 3;
+        info!("Client configured with buffer_flush_threshold={} bytes ({}MB, 3x cluster chunk size) for pipelined writes",
+              buffer_flush_threshold, buffer_flush_threshold / (1024 * 1024));
 
         // Start background task to periodically refresh cluster nodes
         let client_clone = client.clone();

@@ -98,6 +98,10 @@ pub struct DfsFilesystem {
     /// Prevents re-fetching same 4MB chunk for multiple 128KB FUSE reads
     last_chunk_cache: Arc<RwLock<Option<(u64, usize, Vec<u8>)>>>,
 
+    /// Track last warming offset per inode to throttle replica cache warming
+    /// Prevents excessive warming overhead on files with many small chunks
+    last_warm_offset: Arc<RwLock<HashMap<u64, u64>>>,
+
     /// Directory listing cache: path -> (entries, timestamp)
     /// Cache directory listings for 5 seconds to avoid repeated scans
     dir_cache: Arc<RwLock<HashMap<String, (Vec<FileMetadata>, std::time::Instant)>>>,
@@ -295,6 +299,7 @@ impl DfsFilesystem {
             write_buffers: write_buffers_for_cleanup,
             last_metadata_update: Arc::new(RwLock::new(HashMap::new())),
             last_chunk_cache: Arc::new(RwLock::new(None)),
+            last_warm_offset: Arc::new(RwLock::new(HashMap::new())),
             dir_cache: Arc::new(RwLock::new(HashMap::new())),
             statfs_cache: Arc::new(RwLock::new(None)),
             lock_manager: Arc::new(LockManager::new()),
@@ -758,6 +763,7 @@ impl Filesystem for DfsFilesystem {
         let write_buffer_enabled = self.write_buffer_enabled;
         let buffer_flush_threshold = self.buffer_flush_threshold;
         let last_metadata_update = self.last_metadata_update.clone();
+        let last_warm_offset = self.last_warm_offset.clone();
 
         // Spawn async read operation on tokio runtime
         self.runtime.spawn(async move {
@@ -786,8 +792,11 @@ impl Filesystem for DfsFilesystem {
             // Warm replica cache with sliding window - but only occasionally to avoid overhead
             // For files with many small chunks, warming on every read causes significant CPU overhead
             // Warm when: (1) first read, or (2) we've progressed significantly (every 50MB)
-            static LAST_WARM_OFFSET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let last_warm = LAST_WARM_OFFSET.load(std::sync::atomic::Ordering::Relaxed);
+            // CRITICAL: Track warming per-inode to prevent cross-file interference during seeks
+            let last_warm = {
+                let warm_map = last_warm_offset.read().unwrap();
+                warm_map.get(&ino).copied().unwrap_or(0)
+            };
             let should_warm = offset == 0 || offset.saturating_sub(last_warm as usize) >= 50 * 1024 * 1024;
 
             if should_warm && !metadata.chunks.is_empty() && !metadata.chunk_sizes.is_empty() {
@@ -804,7 +813,10 @@ impl Filesystem for DfsFilesystem {
 
                 // Warm 1000 chunks ahead of current position using actual chunk index
                 client.warm_replica_cache_by_index(&metadata.chunks, Some(chunk_idx)).await;
-                LAST_WARM_OFFSET.store(offset as u64, std::sync::atomic::Ordering::Relaxed);
+
+                // Update per-inode warming tracker
+                let mut warm_map = last_warm_offset.write().unwrap();
+                warm_map.insert(ino, offset as u64);
             }
 
             // Check write buffer first if write-behind buffering is enabled

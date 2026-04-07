@@ -212,7 +212,10 @@ impl DfsFilesystem {
                                     let start_offset = buffer.start_offset;
                                     let data: Vec<u8> = if flush_size == buffer_size {
                                         // Flush entire buffer (it's exactly a multiple of chunk_size)
-                                        std::mem::take(&mut buffer.data)
+                                        let data = std::mem::take(&mut buffer.data);
+                                        // CRITICAL: Update start_offset to point past the flushed data
+                                        buffer.start_offset = start_offset + flush_size as u64;
+                                        data
                                     } else {
                                         // Flush only the aligned portion, keep overflow
                                         // CRITICAL: After drain, buffer.data[0] will correspond to file offset
@@ -440,7 +443,10 @@ impl DfsFilesystem {
                     let start_offset = buffer.start_offset;
                     let data: Vec<u8> = if flush_size == buffer_size {
                         // Flush entire buffer (it's exactly a multiple of chunk_size)
-                        std::mem::take(&mut buffer.data)
+                        let data = std::mem::take(&mut buffer.data);
+                        // CRITICAL: Update start_offset to point past the flushed data
+                        buffer.start_offset = start_offset + flush_size as u64;
+                        data
                     } else {
                         // Flush only the aligned portion, keep overflow
                         // CRITICAL: After drain, buffer.data[0] will correspond to file offset
@@ -1555,14 +1561,16 @@ impl Filesystem for DfsFilesystem {
                                             let start: u64 = buffer.start_offset;
                                             let data: Vec<u8> = if flush_size == buffer_size {
                                                 // Flush entire buffer (it's exactly a multiple of chunk_size)
-                                                std::mem::take(&mut buffer.data)
+                                                let data = std::mem::take(&mut buffer.data);
+                                                // CRITICAL: Update start_offset to point past the flushed data
+                                                // After flush, buffer is empty but future writes start at (old_start + flush_size)
+                                                buffer.start_offset = start + flush_size as u64;
+                                                data
                                             } else {
                                                 // Flush only the aligned portion, keep overflow
                                                 let flush_data = buffer.data.drain(..flush_size).collect();
-                                                // CRITICAL: Don't update start_offset! The remaining data in buffer.data
-                                                // still starts at start_offset. After drain, buffer.data[0] corresponds
-                                                // to file offset (start_offset + flush_size), not start_offset.
-                                                // We must update start_offset to reflect where the remaining data starts.
+                                                // CRITICAL: After drain, buffer.data[0] corresponds to file offset
+                                                // (start_offset + flush_size), so we must update start_offset accordingly
                                                 buffer.start_offset = start + flush_size as u64;
                                                 flush_data
                                             };

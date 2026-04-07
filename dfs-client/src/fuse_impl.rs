@@ -2131,6 +2131,10 @@ impl Filesystem for DfsFilesystem {
                 Ok::<(), anyhow::Error>(())
             });
 
+            // Clean up write buffer entry to prevent memory leak
+            // Even if flush failed, we should remove the buffer entry
+            self.write_buffers.remove(&ino);
+
             match result {
                 Ok(_) => reply.ok(),
                 Err(e) => {
@@ -2268,9 +2272,14 @@ impl Filesystem for DfsFilesystem {
 
         match result {
             Ok(_) => {
-                // Remove from cache
+                // Remove from all caches to prevent memory leaks
                 if let Some(&ino) = self.path_to_inode.read().unwrap().get(&path) {
                     self.metadata_cache.write().unwrap().remove(&ino);
+                    self.write_buffers.remove(&ino); // Clean up write buffer
+                    self.write_counters.write().unwrap().remove(&ino); // Clean up write counter
+                    self.last_metadata_update.write().unwrap().remove(&ino); // Clean up metadata update tracker
+                    self.last_warm_offset.write().unwrap().remove(&ino); // Clean up warm offset tracker
+                    self.chunk_offset_cache.write().unwrap().remove(&ino); // Clean up chunk offset cache
                 }
                 self.path_to_inode.write().unwrap().remove(&path);
 

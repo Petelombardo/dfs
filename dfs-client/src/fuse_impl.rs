@@ -1393,25 +1393,11 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let data_vec = data.to_vec(); // Copy data before moving
 
-        // Check if this is a SQLite file to determine execution mode
-        let is_sqlite = {
-            let cache = metadata_cache.read().unwrap();
-            if let Some(metadata) = cache.get(&ino) {
-                let path = &metadata.path;
-                path.ends_with(".db") || path.ends_with(".sqlite") ||
-                    path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
-                    path.ends_with(".db-journal") || path.ends_with(".db-shm")
-            } else {
-                false
-            }
-        };
-
-        // For SQLite files, execute synchronously to preserve write order and prevent corruption
-        // For normal files, execute asynchronously to allow concurrent operations
-        if is_sqlite {
-            // Synchronous execution for SQLite files
+        // Execute write operation synchronously to preserve write order
+        // This ensures proper sequencing and prevents corruption
+        {
             let start = std::time::Instant::now();
-            debug!("write (sync): ino={}, offset={}, size={}", ino, offset, data_vec.len());
+            debug!("write: ino={}, offset={}, size={}", ino, offset, data_vec.len());
 
             let mut metadata = {
                 let cache = metadata_cache.read().unwrap();
@@ -1429,7 +1415,14 @@ impl Filesystem for DfsFilesystem {
                 return;
             }
 
-            let cache_inode = 0; // Disable caching for SQLite
+            // For SQLite database files, disable caching to prevent corruption
+            let is_sqlite = {
+                let path = &metadata.path;
+                path.ends_with(".db") || path.ends_with(".sqlite") ||
+                    path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
+                    path.ends_with(".db-journal") || path.ends_with(".db-shm")
+            };
+            let cache_inode = if is_sqlite { 0 } else { ino };
 
             // Write-behind buffering: buffer sequential appends in memory
             if write_buffer_enabled {

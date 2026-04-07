@@ -75,11 +75,13 @@ pub struct DfsClient {
 
     /// Track recent read positions per file to detect sequential patterns
     /// Maps file_id (first chunk) -> VecDeque of last 4 read positions
-    read_history: Arc<Mutex<HashMap<ChunkId, VecDeque<usize>>>>,
+    /// Limited to 256 entries to prevent unbounded growth during fast-forward/seeking
+    read_history: Arc<Mutex<LruCache<ChunkId, VecDeque<usize>>>>,
 
     /// Track last prefetched position per file to avoid duplicate prefetch from parallel reads
     /// Maps file_id -> last_chunk_idx that triggered prefetch
-    last_prefetch_position: Arc<Mutex<HashMap<ChunkId, usize>>>,
+    /// Limited to 256 entries to prevent unbounded growth
+    last_prefetch_position: Arc<Mutex<LruCache<ChunkId, usize>>>,
 
     /// Round-robin counter for replica selection (for load balancing)
     replica_selector: Arc<AtomicU64>,
@@ -230,8 +232,8 @@ impl DfsClient {
             byte_range_cache: Arc::new(Mutex::new(byte_range_cache)),
             connection_pool: Arc::new(Mutex::new(HashMap::new())),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
-            read_history: Arc::new(Mutex::new(HashMap::new())),
-            last_prefetch_position: Arc::new(Mutex::new(HashMap::new())),
+            read_history: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            last_prefetch_position: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
             replica_selector: Arc::new(AtomicU64::new(0)),
             replica_cache: Arc::new(Mutex::new(replica_cache)),
             sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
@@ -522,7 +524,7 @@ impl DfsClient {
         // For random access, use striped reads for lower latency
         let is_sequential = if !all_file_chunks.is_empty() {
             let file_id = all_file_chunks[0];
-            let history = self.read_history.lock().await;
+            let mut history = self.read_history.lock().await;
             if let Some(positions) = history.get(&file_id) {
                 if positions.len() >= 2 {
                     let mut sequential_count = 0;
@@ -1021,7 +1023,11 @@ impl DfsClient {
 
                 // Track read history and detect sequential patterns
                 let mut history = self.read_history.lock().await;
-                let read_positions = history.entry(file_id).or_insert_with(|| VecDeque::with_capacity(4));
+                // LRU cache: get existing or create new entry
+                if !history.contains(&file_id) {
+                    history.put(file_id, VecDeque::with_capacity(4));
+                }
+                let read_positions = history.get_mut(&file_id).unwrap();
 
                 // Add current read position
                 read_positions.push_back(last_file_chunk_idx);

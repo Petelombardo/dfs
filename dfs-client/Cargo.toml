@@ -21,3 +21,4 @@ blake3 = { workspace = true }
 uuid = { workspace = true }
 lru = "0.12"
 futures = "0.3"
+dashmap = "6.1"

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use dashmap::DashMap;
 use dfs_common::{ChunkId, FileMetadata, FileType};
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
@@ -87,8 +88,9 @@ pub struct DfsFilesystem {
     /// Enable write-behind buffering
     write_buffer_enabled: bool,
 
-    /// Write buffers per inode (only used if write_buffer_enabled)
-    write_buffers: Arc<Mutex<HashMap<u64, WriteBuffer>>>,
+    /// Write buffers per inode with per-inode locking for concurrent access
+    /// DashMap provides lock-free reads and fine-grained locking per inode
+    write_buffers: Arc<DashMap<u64, Arc<Mutex<WriteBuffer>>>>,
 
     /// Last metadata update timestamp per inode for batching
     /// Prevents excessive metadata updates during continuous writes
@@ -159,7 +161,7 @@ impl DfsFilesystem {
         let metadata_cache = Arc::new(RwLock::new(HashMap::<u64, FileMetadata>::new()));
         let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
-        let write_buffers_for_cleanup = Arc::new(Mutex::new(HashMap::<u64, WriteBuffer>::new()));
+        let write_buffers_for_cleanup = Arc::new(DashMap::<u64, Arc<Mutex<WriteBuffer>>>::new());
 
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
@@ -176,20 +178,24 @@ impl DfsFilesystem {
                     // Only flush reasonably full buffers (>= 2MB) OR very idle buffers (30+ seconds)
                     // This prevents tiny partial buffers from DVR 128KB writes with pauses
                     let flush_inodes: Vec<u64> = {
-                        let buffers = write_buffers_clone.lock().await;
-                        buffers.iter()
-                            .filter(|(_, buf)| buf.should_background_flush(flush_threshold))
-                            .map(|(ino, _)| *ino)
-                            .collect()
+                        let mut inodes_to_flush = Vec::new();
+                        for entry in write_buffers_clone.iter() {
+                            let ino = *entry.key();
+                            let buffer_lock = entry.value();
+                            let buffer = buffer_lock.lock().await;
+                            if buffer.should_background_flush(flush_threshold) {
+                                inodes_to_flush.push(ino);
+                            }
+                        }
+                        inodes_to_flush
                     };
 
                     // Flush each buffer
                     for ino in flush_inodes {
                         // Align flush to chunk boundaries (4MB) to prevent tiny chunks
                         let flush_data_opt = {
-                            let mut buffers = write_buffers_clone.lock().await;
-
-                            if let Some(buffer) = buffers.get_mut(&ino) {
+                            if let Some(buffer_lock) = write_buffers_clone.get(&ino) {
+                                let mut buffer = buffer_lock.lock().await;
                                 let buffer_size = buffer.data.len();
                                 let chunk_size = 4 * 1024 * 1024; // 4MB
                                 let flush_size = (buffer_size / chunk_size) * chunk_size;
@@ -203,16 +209,19 @@ impl DfsFilesystem {
                                           ino, buffer_size, flush_size, idle_time);
 
                                     // Flush only aligned portion (multiples of 4MB)
+                                    let start_offset = buffer.start_offset;
                                     let data: Vec<u8> = if flush_size == buffer_size {
                                         // Flush entire buffer (it's exactly a multiple of chunk_size)
                                         std::mem::take(&mut buffer.data)
                                     } else {
                                         // Flush only the aligned portion, keep overflow
-                                        buffer.data.drain(..flush_size).collect()
+                                        // CRITICAL: After drain, buffer.data[0] will correspond to file offset
+                                        // (start_offset + flush_size), so we must update start_offset accordingly
+                                        let data = buffer.data.drain(..flush_size).collect();
+                                        buffer.start_offset = start_offset + flush_size as u64;
+                                        data
                                     };
 
-                                    let start_offset = buffer.start_offset;
-                                    buffer.start_offset += data.len() as u64;
                                     buffer.last_modified = SystemTime::now();
                                     Some((data, start_offset))
                                 }
@@ -340,8 +349,7 @@ impl DfsFilesystem {
         let (has_buffer, has_counter, current_size) = self.runtime.block_on(async {
             // Check for write buffer
             let has_buf = if self.write_buffer_enabled {
-                let buffers = self.write_buffers.lock().await;
-                buffers.contains_key(&ino)
+                self.write_buffers.contains_key(&ino)
             } else {
                 false
             };
@@ -405,9 +413,8 @@ impl DfsFilesystem {
     async fn flush_buffer_async(&self, ino: u64, force_metadata_update: bool) -> Result<()> {
         // Determine what data to flush (align to chunk boundaries to prevent tiny chunks)
         let flush_data_opt = {
-            let mut buffers = self.write_buffers.lock().await;
-
-            if let Some(buffer) = buffers.get_mut(&ino) {
+            if let Some(buffer_lock) = self.write_buffers.get(&ino) {
+                let mut buffer = buffer_lock.lock().await;
                 let buffer_size = buffer.data.len();
 
                 // Align flush to chunk boundaries (4MB) to prevent server from creating tiny chunks
@@ -430,16 +437,19 @@ impl DfsFilesystem {
                     }
                 } else {
                     // Flush only aligned portion (multiples of 4MB)
+                    let start_offset = buffer.start_offset;
                     let data: Vec<u8> = if flush_size == buffer_size {
                         // Flush entire buffer (it's exactly a multiple of chunk_size)
                         std::mem::take(&mut buffer.data)
                     } else {
                         // Flush only the aligned portion, keep overflow
-                        buffer.data.drain(..flush_size).collect()
+                        // CRITICAL: After drain, buffer.data[0] will correspond to file offset
+                        // (start_offset + flush_size), so we must update start_offset accordingly
+                        let data = buffer.data.drain(..flush_size).collect();
+                        buffer.start_offset = start_offset + flush_size as u64;
+                        data
                     };
 
-                    let start_offset = buffer.start_offset;
-                    buffer.start_offset += data.len() as u64;
                     buffer.last_modified = SystemTime::now();
                     Some((data, start_offset))
                 }
@@ -831,8 +841,8 @@ impl Filesystem for DfsFilesystem {
             if write_buffer_enabled {
                 // Check if read overlaps with write buffer
                 let should_flush_buffer = {
-                    let buffers_lock = write_buffers.lock().await;
-                    if let Some(buffer) = buffers_lock.get(&ino) {
+                    if let Some(buffer_lock) = write_buffers.get(&ino) {
+                        let buffer = buffer_lock.lock().await;
                         let buffer_start = buffer.start_offset as usize;
                         let buffer_end = buffer_start + buffer.data.len();
                         let read_end = offset + size;
@@ -915,12 +925,10 @@ impl Filesystem for DfsFilesystem {
                 // Spawn background flush if needed (don't block read operation)
                 if should_flush_buffer {
                     info!("Spawning background flush for ino={} due to boundary read (non-blocking)", ino);
-                    let buffer_opt = {
-                        let mut buffers = write_buffers.lock().await;
-                        buffers.remove(&ino)
-                    };
+                    let buffer_opt = write_buffers.remove(&ino).map(|(_, v)| v);
 
-                    if let Some(buffer) = buffer_opt {
+                    if let Some(buffer_lock) = buffer_opt {
+                        let buffer = buffer_lock.lock().await.clone();
                         let client_clone = client.clone();
                         let metadata_cache_clone = metadata_cache.clone();
                         let last_metadata_update_clone = last_metadata_update.clone();
@@ -1385,11 +1393,25 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let data_vec = data.to_vec(); // Copy data before moving
 
-        // Execute write operation synchronously to preserve write order
-        // Using spawn_blocking causes parallel execution which corrupts SQLite databases
-        {
+        // Check if this is a SQLite file to determine execution mode
+        let is_sqlite = {
+            let cache = metadata_cache.read().unwrap();
+            if let Some(metadata) = cache.get(&ino) {
+                let path = &metadata.path;
+                path.ends_with(".db") || path.ends_with(".sqlite") ||
+                    path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
+                    path.ends_with(".db-journal") || path.ends_with(".db-shm")
+            } else {
+                false
+            }
+        };
+
+        // For SQLite files, execute synchronously to preserve write order and prevent corruption
+        // For normal files, execute asynchronously to allow concurrent operations
+        if is_sqlite {
+            // Synchronous execution for SQLite files
             let start = std::time::Instant::now();
-            debug!("write: ino={}, offset={}, size={}", ino, offset, data_vec.len());
+            debug!("write (sync): ino={}, offset={}, size={}", ino, offset, data_vec.len());
 
             let mut metadata = {
                 let cache = metadata_cache.read().unwrap();
@@ -1407,14 +1429,7 @@ impl Filesystem for DfsFilesystem {
                 return;
             }
 
-            // For SQLite database files, disable caching to prevent corruption
-            let is_sqlite = {
-                let path = &metadata.path;
-                path.ends_with(".db") || path.ends_with(".sqlite") ||
-                    path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
-                    path.ends_with(".db-journal") || path.ends_with(".db-shm")
-            };
-            let cache_inode = if is_sqlite { 0 } else { ino };
+            let cache_inode = 0; // Disable caching for SQLite
 
             // Write-behind buffering: buffer sequential appends in memory
             if write_buffer_enabled {
@@ -1427,10 +1442,8 @@ impl Filesystem for DfsFilesystem {
                         cache.get(&ino).map(|m| m.size as usize).unwrap_or(metadata.size as usize)
                     };
 
-                    let buffers_guard = runtime.block_on(async {
-                        write_buffers.lock().await
-                    });
-                    if let Some(buffer) = buffers_guard.get(&ino) {
+                    if let Some(buffer_lock) = write_buffers.get(&ino) {
+                        let buffer = runtime.block_on(async { buffer_lock.lock().await });
                         ((buffer.start_offset + buffer.data.len() as u64) as usize)
                             .max(cache_size)
                     } else {
@@ -1441,7 +1454,7 @@ impl Filesystem for DfsFilesystem {
                 info!("Buffered write check: offset={}, current_size={}, cache_size={}, buffer_present={}",
                        offset_usize, current_size,
                        {let cache = metadata_cache.read().unwrap(); cache.get(&ino).map(|m| m.size).unwrap_or(0)},
-                       {let bg = runtime.block_on(async { write_buffers.lock().await }); bg.get(&ino).is_some()});
+                       write_buffers.contains_key(&ino));
 
                 // Only buffer sequential appends
                 if offset_usize != current_size {
@@ -1471,28 +1484,23 @@ impl Filesystem for DfsFilesystem {
                     let data_slice = &data_vec[..];
 
                     let should_flush = runtime.block_on(async move {
-                        let mut buffers = write_buffers_clone.lock().await;
-
-                        // Recalculate current_size while holding the buffer lock to avoid races
-                        let actual_current_size = {
+                        // Get or create buffer lock for this inode
+                        let buffer_lock = write_buffers_clone.entry(ino).or_insert_with(|| {
+                            // Calculate initial size
                             let cache_size = {
                                 let cache = metadata_cache_clone3.read().unwrap();
                                 cache.get(&ino).map(|m| m.size as u64).unwrap_or(current_size as u64)
                             };
 
-                            if let Some(existing_buffer) = buffers.get(&ino) {
-                                (existing_buffer.start_offset + existing_buffer.data.len() as u64).max(cache_size)
-                            } else {
-                                cache_size
-                            }
-                        };
+                            Arc::new(Mutex::new(WriteBuffer {
+                                data: Vec::new(),
+                                last_modified: SystemTime::now(),
+                                start_offset: cache_size,
+                                created_at: std::time::Instant::now(),
+                            }))
+                        }).clone();
 
-                        let buffer = buffers.entry(ino).or_insert_with(|| WriteBuffer {
-                            data: Vec::new(),
-                            last_modified: SystemTime::now(),
-                            start_offset: actual_current_size,
-                            created_at: std::time::Instant::now(),
-                        });
+                        let mut buffer = buffer_lock.lock().await;
 
                         // No need to check idle here - we'll append data first, then check
                         // This ensures data isn't lost
@@ -1538,8 +1546,8 @@ impl Filesystem for DfsFilesystem {
                                     // Clone the buffer data for flushing, but keep buffer for reads
                                     // This prevents read gaps during the flush operation
                                     let buffer_data: Option<(Vec<u8>, u64)> = {
-                                        let mut buffers = write_buffers.lock().await;
-                                        if let Some(buffer) = buffers.get_mut(&ino) {
+                                        if let Some(buffer_lock) = write_buffers.get(&ino) {
+                                            let mut buffer = buffer_lock.lock().await;
                                             let buffer_size = buffer.data.len();
 
                                             // Only flush multiples of chunk_size to prevent server from creating tiny overflow chunks
@@ -1551,18 +1559,21 @@ impl Filesystem for DfsFilesystem {
                                                 return Ok(());
                                             }
 
+                                            let start: u64 = buffer.start_offset;
                                             let data: Vec<u8> = if flush_size == buffer_size {
                                                 // Flush entire buffer (it's exactly a multiple of chunk_size)
                                                 std::mem::take(&mut buffer.data)
                                             } else {
                                                 // Flush only the aligned portion, keep overflow
                                                 let flush_data = buffer.data.drain(..flush_size).collect();
+                                                // CRITICAL: Don't update start_offset! The remaining data in buffer.data
+                                                // still starts at start_offset. After drain, buffer.data[0] corresponds
+                                                // to file offset (start_offset + flush_size), not start_offset.
+                                                // We must update start_offset to reflect where the remaining data starts.
+                                                buffer.start_offset = start + flush_size as u64;
                                                 flush_data
                                             };
 
-                                            let start: u64 = buffer.start_offset;
-                                            // Update start offset for flushed data
-                                            buffer.start_offset = start + data.len() as u64;
                                             buffer.last_modified = SystemTime::now();
                                             Some((data, start))
                                         } else {
@@ -1668,8 +1679,8 @@ impl Filesystem for DfsFilesystem {
                 };
 
                 let buffer_end = runtime.block_on(async {
-                    let buffers = write_buffers.lock().await;
-                    if let Some(buffer) = buffers.get(&ino) {
+                    if let Some(buffer_lock) = write_buffers.get(&ino) {
+                        let buffer = buffer_lock.lock().await;
                         (buffer.start_offset + buffer.data.len() as u64) as usize
                     } else {
                         cache_size
@@ -1988,12 +1999,10 @@ impl Filesystem for DfsFilesystem {
                 // Inline flush_buffer_async logic
                 let result = runtime.block_on(async {
                     // Get and remove buffer for this inode
-                    let buffer_opt = {
-                        let mut buffers = write_buffers.lock().await;
-                        buffers.remove(&ino)
-                    };
+                    let buffer_opt = write_buffers.remove(&ino).map(|(_, v)| v);
 
-                    if let Some(buffer) = buffer_opt {
+                    if let Some(buffer_lock) = buffer_opt {
+                        let buffer = buffer_lock.lock().await.clone();
                         info!("Flushing {} bytes for inode {}", buffer.data.len(), ino);
 
                         // Get current metadata from cache

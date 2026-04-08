@@ -1,0 +1,14 @@
+/home/petelombardo/distributefilesystem/target/release/deps/thiserror-7bf1bca98507355a.d: /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/petelombardo/distributefilesystem/target/release/build/thiserror-42081aea37541d44/out/private.rs
+
+/home/petelombardo/distributefilesystem/target/release/deps/libthiserror-7bf1bca98507355a.rlib: /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/petelombardo/distributefilesystem/target/release/build/thiserror-42081aea37541d44/out/private.rs
+
+/home/petelombardo/distributefilesystem/target/release/deps/libthiserror-7bf1bca98507355a.rmeta: /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /home/petelombardo/distributefilesystem/target/release/build/thiserror-42081aea37541d44/out/private.rs
+
+/home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs:
+/home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs:
+/home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs:
+/home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs:
+/home/petelombardo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs:
+/home/petelombardo/distributefilesystem/target/release/build/thiserror-42081aea37541d44/out/private.rs:
+
+# env-dep:OUT_DIR=/home/petelombardo/distributefilesystem/target/release/build/thiserror-42081aea37541d44/out

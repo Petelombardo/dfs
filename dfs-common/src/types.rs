@@ -288,7 +288,17 @@ pub enum FileType {
     Symlink,
 }
 
-/// Information about where a chunk is stored
+/// Legacy ChunkLocation format (before sparse file support - 4 fields)
+/// This is used to deserialize old metadata from bincode format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkLocationV0 {
+    pub chunk_id: ChunkId,
+    pub nodes: Vec<NodeId>,
+    pub size: usize,
+    pub checksum: [u8; 32],
+}
+
+/// Information about where a chunk is stored (current format - 5 fields)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkLocation {
     /// Chunk identifier
@@ -305,9 +315,59 @@ pub struct ChunkLocation {
 
     /// File offset where this chunk starts (for sparse file support)
     /// If None, chunks are assumed to be sequential (legacy behavior)
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub file_offset: Option<u64>,
+}
+
+impl From<ChunkLocationV0> for ChunkLocation {
+    fn from(v0: ChunkLocationV0) -> Self {
+        ChunkLocation {
+            chunk_id: v0.chunk_id,
+            nodes: v0.nodes,
+            size: v0.size,
+            checksum: v0.checksum,
+            file_offset: None,
+        }
+    }
+}
+
+/// Legacy FileMetadata format (before sparse file support with ChunkLocationV0)
+/// This is used to deserialize old metadata from bincode format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetadataV0 {
+    pub id: FileId,
+    pub path: String,
+    pub size: u64,
+    #[serde(default)]
+    pub chunks: Vec<ChunkId>,
+    #[serde(default)]
+    pub chunk_sizes: Vec<u64>,
+    pub created_at: u64,
+    pub modified_at: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub file_type: FileType,
+    #[serde(default)]
+    pub chunk_locations: Vec<ChunkLocationV0>,
+}
+
+impl From<FileMetadataV0> for FileMetadata {
+    fn from(v0: FileMetadataV0) -> Self {
+        FileMetadata {
+            id: v0.id,
+            path: v0.path,
+            size: v0.size,
+            chunks: v0.chunks,
+            chunk_sizes: v0.chunk_sizes,
+            created_at: v0.created_at,
+            modified_at: v0.modified_at,
+            mode: v0.mode,
+            uid: v0.uid,
+            gid: v0.gid,
+            file_type: v0.file_type,
+            chunk_locations: v0.chunk_locations.into_iter().map(|loc| loc.into()).collect(),
+        }
+    }
 }
 
 /// Get current Unix timestamp in seconds

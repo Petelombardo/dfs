@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use dfs_common::{ChunkLocation, FileId, FileMetadata};
+use dfs_common::{ChunkLocation, FileId, FileMetadata, FileMetadataV0};
 use sled::Db;
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Metadata storage using Sled embedded database
 /// Optimized for SBC environments (memory-efficient, crash-safe)
@@ -58,14 +58,42 @@ impl MetadataStore {
     }
 
     /// Get file metadata by ID
+    ///
+    /// BACKWARD COMPATIBILITY: This method handles both old (FileMetadataV0 with ChunkLocationV0)
+    /// and new (FileMetadata with ChunkLocation) formats for seamless upgrades.
     pub fn get_file(&self, file_id: &FileId) -> Result<Option<FileMetadata>> {
         let key = self.file_key(file_id);
 
         match self.db.get(key)? {
             Some(value) => {
-                let metadata: FileMetadata = bincode::deserialize(&value)
-                    .context("Failed to deserialize file metadata")?;
-                Ok(Some(metadata))
+                // Try to deserialize as new format first
+                match bincode::deserialize::<FileMetadata>(&value) {
+                    Ok(metadata) => Ok(Some(metadata)),
+                    Err(new_err) => {
+                        // If that fails, try old format (bincode can't handle extra fields)
+                        match bincode::deserialize::<FileMetadataV0>(&value) {
+                            Ok(v0_metadata) => {
+                                // Successfully deserialized old format - convert to new
+                                let metadata: FileMetadata = v0_metadata.into();
+
+                                // Auto-migrate by writing back in new format
+                                if let Err(e) = self.put_file(&metadata) {
+                                    warn!("Failed to auto-migrate metadata for {}: {}", file_id, e);
+                                }
+
+                                Ok(Some(metadata))
+                            }
+                            Err(old_err) => {
+                                // Failed both formats - report both errors
+                                Err(anyhow::anyhow!(
+                                    "Failed to deserialize file metadata (tried both formats). \
+                                     New format error: {}. Old format error: {}",
+                                    new_err, old_err
+                                ))
+                            }
+                        }
+                    }
+                }
             }
             None => Ok(None),
         }

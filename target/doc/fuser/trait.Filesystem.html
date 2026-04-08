@@ -1,0 +1,758 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Filesystem trait."><title>Filesystem in fuser - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-77263533.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="fuser" data-themes="" data-resource-suffix="" data-rustdoc-version="1.94.0 (4a4ef493e 2026-03-02)" data-channel="1.94.0" data-search-js="search-9e2438ea.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-c38705f0.js" ><script src="../static.files/storage-e2aeef58.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-7bab91a1.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-ffcac47a.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Filesystem</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../fuser/index.html">fuser</a><span class="version">0.16.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Filesystem</a></h2><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.access" title="access">access</a></li><li><a href="#method.batch_forget" title="batch_forget">batch_forget</a></li><li><a href="#method.bmap" title="bmap">bmap</a></li><li><a href="#method.copy_file_range" title="copy_file_range">copy_file_range</a></li><li><a href="#method.create" title="create">create</a></li><li><a href="#method.destroy" title="destroy">destroy</a></li><li><a href="#method.fallocate" title="fallocate">fallocate</a></li><li><a href="#method.flush" title="flush">flush</a></li><li><a href="#method.forget" title="forget">forget</a></li><li><a href="#method.fsync" title="fsync">fsync</a></li><li><a href="#method.fsyncdir" title="fsyncdir">fsyncdir</a></li><li><a href="#method.getattr" title="getattr">getattr</a></li><li><a href="#method.getlk" title="getlk">getlk</a></li><li><a href="#method.getxattr" title="getxattr">getxattr</a></li><li><a href="#method.init" title="init">init</a></li><li><a href="#method.ioctl" title="ioctl">ioctl</a></li><li><a href="#method.link" title="link">link</a></li><li><a href="#method.listxattr" title="listxattr">listxattr</a></li><li><a href="#method.lookup" title="lookup">lookup</a></li><li><a href="#method.lseek" title="lseek">lseek</a></li><li><a href="#method.mkdir" title="mkdir">mkdir</a></li><li><a href="#method.mknod" title="mknod">mknod</a></li><li><a href="#method.open" title="open">open</a></li><li><a href="#method.opendir" title="opendir">opendir</a></li><li><a href="#method.poll" title="poll">poll</a></li><li><a href="#method.read" title="read">read</a></li><li><a href="#method.readdir" title="readdir">readdir</a></li><li><a href="#method.readdirplus" title="readdirplus">readdirplus</a></li><li><a href="#method.readlink" title="readlink">readlink</a></li><li><a href="#method.release" title="release">release</a></li><li><a href="#method.releasedir" title="releasedir">releasedir</a></li><li><a href="#method.removexattr" title="removexattr">removexattr</a></li><li><a href="#method.rename" title="rename">rename</a></li><li><a href="#method.rmdir" title="rmdir">rmdir</a></li><li><a href="#method.setattr" title="setattr">setattr</a></li><li><a href="#method.setlk" title="setlk">setlk</a></li><li><a href="#method.setxattr" title="setxattr">setxattr</a></li><li><a href="#method.statfs" title="statfs">statfs</a></li><li><a href="#method.symlink" title="symlink">symlink</a></li><li><a href="#method.unlink" title="unlink">unlink</a></li><li><a href="#method.write" title="write">write</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate fuser</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">fuser</a></div><h1>Trait <span class="trait">Filesystem</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/fuser/lib.rs.html#314-949">Source</a> </span></div><pre class="rust item-decl"><code>pub trait Filesystem {
+<details class="toggle type-contents-toggle"><summary class="hideme"><span>Show 41 methods</span></summary>    // Provided methods
+    fn <a href="#method.init" class="fn">init</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        _config: &amp;mut <a class="struct" href="struct.KernelConfig.html" title="struct fuser::KernelConfig">KernelConfig</a>,
+    ) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.unit.html">()</a>, c_int&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.destroy" class="fn">destroy</a>(&amp;mut self) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.lookup" class="fn">lookup</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.forget" class="fn">forget</a>(&amp;mut self, _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>, _nlookup: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.batch_forget" class="fn">batch_forget</a>(&amp;mut self, req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, nodes: &amp;[<a class="struct" href="struct.fuse_forget_one.html" title="struct fuser::fuse_forget_one">fuse_forget_one</a>]) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.getattr" class="fn">getattr</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+        reply: <a class="struct" href="struct.ReplyAttr.html" title="struct fuser::ReplyAttr">ReplyAttr</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.setattr" class="fn">setattr</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        mode: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>&gt;,
+        uid: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>&gt;,
+        gid: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>&gt;,
+        size: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+        _atime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="enum" href="enum.TimeOrNow.html" title="enum fuser::TimeOrNow">TimeOrNow</a>&gt;,
+        _mtime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="enum" href="enum.TimeOrNow.html" title="enum fuser::TimeOrNow">TimeOrNow</a>&gt;,
+        _ctime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>&gt;,
+        fh: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+        _crtime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>&gt;,
+        _chgtime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>&gt;,
+        _bkuptime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>&gt;,
+        flags: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>&gt;,
+        reply: <a class="struct" href="struct.ReplyAttr.html" title="struct fuser::ReplyAttr">ReplyAttr</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.readlink" class="fn">readlink</a>(&amp;mut self, _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>, reply: <a class="struct" href="struct.ReplyData.html" title="struct fuser::ReplyData">ReplyData</a>) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.mknod" class="fn">mknod</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        mode: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        umask: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        rdev: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.mkdir" class="fn">mkdir</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        mode: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        umask: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.unlink" class="fn">unlink</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.rmdir" class="fn">rmdir</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.symlink" class="fn">symlink</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        link_name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        target: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/path/struct.Path.html" title="struct std::path::Path">Path</a>,
+        reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.rename" class="fn">rename</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        newparent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        newname: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.link" class="fn">link</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        newparent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        newname: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.open" class="fn">open</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        _flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        reply: <a class="struct" href="struct.ReplyOpen.html" title="struct fuser::ReplyOpen">ReplyOpen</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.read" class="fn">read</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        size: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        lock_owner: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+        reply: <a class="struct" href="struct.ReplyData.html" title="struct fuser::ReplyData">ReplyData</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.write" class="fn">write</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        data: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u8.html">u8</a>],
+        write_flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        lock_owner: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+        reply: <a class="struct" href="struct.ReplyWrite.html" title="struct fuser::ReplyWrite">ReplyWrite</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.flush" class="fn">flush</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        lock_owner: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.release" class="fn">release</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        _fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        _flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        _lock_owner: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+        _flush: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.bool.html">bool</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.fsync" class="fn">fsync</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        datasync: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.bool.html">bool</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.opendir" class="fn">opendir</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        _flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        reply: <a class="struct" href="struct.ReplyOpen.html" title="struct fuser::ReplyOpen">ReplyOpen</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.readdir" class="fn">readdir</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        reply: <a class="struct" href="struct.ReplyDirectory.html" title="struct fuser::ReplyDirectory">ReplyDirectory</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.readdirplus" class="fn">readdirplus</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        reply: <a class="struct" href="struct.ReplyDirectoryPlus.html" title="struct fuser::ReplyDirectoryPlus">ReplyDirectoryPlus</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.releasedir" class="fn">releasedir</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        _fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        _flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.fsyncdir" class="fn">fsyncdir</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        datasync: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.bool.html">bool</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.statfs" class="fn">statfs</a>(&amp;mut self, _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>, reply: <a class="struct" href="struct.ReplyStatfs.html" title="struct fuser::ReplyStatfs">ReplyStatfs</a>) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.setxattr" class="fn">setxattr</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        _value: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u8.html">u8</a>],
+        flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        position: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.getxattr" class="fn">getxattr</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        size: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyXattr.html" title="struct fuser::ReplyXattr">ReplyXattr</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.listxattr" class="fn">listxattr</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        size: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyXattr.html" title="struct fuser::ReplyXattr">ReplyXattr</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.removexattr" class="fn">removexattr</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.access" class="fn">access</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        mask: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.create" class="fn">create</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+        mode: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        umask: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        reply: <a class="struct" href="struct.ReplyCreate.html" title="struct fuser::ReplyCreate">ReplyCreate</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.getlk" class="fn">getlk</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        lock_owner: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        start: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        end: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        typ: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        pid: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyLock.html" title="struct fuser::ReplyLock">ReplyLock</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.setlk" class="fn">setlk</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        lock_owner: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        start: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        end: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        typ: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        pid: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        sleep: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.bool.html">bool</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.bmap" class="fn">bmap</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        blocksize: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        idx: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        reply: <a class="struct" href="struct.ReplyBmap.html" title="struct fuser::ReplyBmap">ReplyBmap</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.ioctl" class="fn">ioctl</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        cmd: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        in_data: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u8.html">u8</a>],
+        out_size: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyIoctl.html" title="struct fuser::ReplyIoctl">ReplyIoctl</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.poll" class="fn">poll</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        ph: <a class="struct" href="struct.PollHandle.html" title="struct fuser::PollHandle">PollHandle</a>,
+        events: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyPoll.html" title="struct fuser::ReplyPoll">ReplyPoll</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.fallocate" class="fn">fallocate</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        length: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        mode: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.lseek" class="fn">lseek</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        whence: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+        reply: <a class="struct" href="struct.ReplyLseek.html" title="struct fuser::ReplyLseek">ReplyLseek</a>,
+    ) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.copy_file_range" class="fn">copy_file_range</a>(
+        &amp;mut self,
+        _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+        ino_in: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh_in: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        offset_in: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        ino_out: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        fh_out: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        offset_out: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+        len: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+        flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+        reply: <a class="struct" href="struct.ReplyWrite.html" title="struct fuser::ReplyWrite">ReplyWrite</a>,
+    ) { ... }
+</details>}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Filesystem trait.</p>
+<p>This trait must be implemented to provide a userspace filesystem via FUSE.
+These methods correspond to fuse_lowlevel_ops in libfuse. Reasonable default
+implementations are provided here to get a mountable filesystem that does
+nothing.</p>
+</div></details><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.init" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#318-320">Source</a><h4 class="code-header">fn <a href="#method.init" class="fn">init</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    _config: &amp;mut <a class="struct" href="struct.KernelConfig.html" title="struct fuser::KernelConfig">KernelConfig</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.unit.html">()</a>, c_int&gt;</h4></section></summary><div class="docblock"><p>Initialize filesystem.
+Called before any other filesystem method.
+The kernel module connection can be configured using the KernelConfig object</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.destroy" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#324">Source</a><h4 class="code-header">fn <a href="#method.destroy" class="fn">destroy</a>(&amp;mut self)</h4></section></summary><div class="docblock"><p>Clean up filesystem.
+Called on filesystem exit.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.lookup" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#327-330">Source</a><h4 class="code-header">fn <a href="#method.lookup" class="fn">lookup</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+)</h4></section></summary><div class="docblock"><p>Look up a directory entry by name and get its attributes.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.forget" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#339">Source</a><h4 class="code-header">fn <a href="#method.forget" class="fn">forget</a>(&amp;mut self, _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>, _nlookup: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>)</h4></section></summary><div class="docblock"><p>Forget about an inode.
+The nlookup parameter indicates the number of lookups previously performed on
+this inode. If the filesystem implements inode lifetimes, it is recommended that
+inodes acquire a single reference on each lookup, and lose nlookup references on
+each forget. The filesystem may ignore forget calls, if the inodes don’t need to
+have a limited lifetime. On unmount it is not guaranteed, that all referenced
+inodes will receive a forget message.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.batch_forget" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#343-347">Source</a><h4 class="code-header">fn <a href="#method.batch_forget" class="fn">batch_forget</a>(&amp;mut self, req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, nodes: &amp;[<a class="struct" href="struct.fuse_forget_one.html" title="struct fuser::fuse_forget_one">fuse_forget_one</a>])</h4></section></summary><div class="docblock"><p>Like forget, but take multiple forget requests at once for performance. The default
+implementation will fallback to forget.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.getattr" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#350-353">Source</a><h4 class="code-header">fn <a href="#method.getattr" class="fn">getattr</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+    reply: <a class="struct" href="struct.ReplyAttr.html" title="struct fuser::ReplyAttr">ReplyAttr</a>,
+)</h4></section></summary><div class="docblock"><p>Get file attributes.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.setattr" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#356-379">Source</a><h4 class="code-header">fn <a href="#method.setattr" class="fn">setattr</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    mode: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>&gt;,
+    uid: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>&gt;,
+    gid: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>&gt;,
+    size: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+    _atime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="enum" href="enum.TimeOrNow.html" title="enum fuser::TimeOrNow">TimeOrNow</a>&gt;,
+    _mtime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="enum" href="enum.TimeOrNow.html" title="enum fuser::TimeOrNow">TimeOrNow</a>&gt;,
+    _ctime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>&gt;,
+    fh: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+    _crtime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>&gt;,
+    _chgtime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>&gt;,
+    _bkuptime: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>&gt;,
+    flags: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>&gt;,
+    reply: <a class="struct" href="struct.ReplyAttr.html" title="struct fuser::ReplyAttr">ReplyAttr</a>,
+)</h4></section></summary><div class="docblock"><p>Set file attributes.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.readlink" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#382-385">Source</a><h4 class="code-header">fn <a href="#method.readlink" class="fn">readlink</a>(&amp;mut self, _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>, reply: <a class="struct" href="struct.ReplyData.html" title="struct fuser::ReplyData">ReplyData</a>)</h4></section></summary><div class="docblock"><p>Read symbolic link.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.mknod" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#389-404">Source</a><h4 class="code-header">fn <a href="#method.mknod" class="fn">mknod</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    mode: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    umask: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    rdev: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+)</h4></section></summary><div class="docblock"><p>Create file node.
+Create a regular file, character device, block device, fifo or socket node.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.mkdir" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#407-420">Source</a><h4 class="code-header">fn <a href="#method.mkdir" class="fn">mkdir</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    mode: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    umask: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+)</h4></section></summary><div class="docblock"><p>Create a directory.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.unlink" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#423-426">Source</a><h4 class="code-header">fn <a href="#method.unlink" class="fn">unlink</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Remove a file.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.rmdir" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#429-432">Source</a><h4 class="code-header">fn <a href="#method.rmdir" class="fn">rmdir</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Remove a directory.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.symlink" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#435-447">Source</a><h4 class="code-header">fn <a href="#method.symlink" class="fn">symlink</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    link_name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    target: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/path/struct.Path.html" title="struct std::path::Path">Path</a>,
+    reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+)</h4></section></summary><div class="docblock"><p>Create a symbolic link.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.rename" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#450-465">Source</a><h4 class="code-header">fn <a href="#method.rename" class="fn">rename</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    newparent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    newname: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Rename a file.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.link" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#468-480">Source</a><h4 class="code-header">fn <a href="#method.link" class="fn">link</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    newparent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    newname: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    reply: <a class="struct" href="struct.ReplyEntry.html" title="struct fuser::ReplyEntry">ReplyEntry</a>,
+)</h4></section></summary><div class="docblock"><p>Create a hard link.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.open" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#490-492">Source</a><h4 class="code-header">fn <a href="#method.open" class="fn">open</a>(&amp;mut self, _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>, _flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>, reply: <a class="struct" href="struct.ReplyOpen.html" title="struct fuser::ReplyOpen">ReplyOpen</a>)</h4></section></summary><div class="docblock"><p>Open a file.
+Open flags (with the exception of O_CREAT, O_EXCL, O_NOCTTY and O_TRUNC) are
+available in flags. Filesystem may store an arbitrary file handle (pointer, index,
+etc) in fh, and use this in other all other file operations (read, write, flush,
+release, fsync). Filesystem may also implement stateless file I/O and not store
+anything in fh. There are also some flags (direct_io, keep_cache) which the
+filesystem may set, to change the way the file is opened. See fuse_file_info
+structure in &lt;fuse_common.h&gt; for more details.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.read" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#504-520">Source</a><h4 class="code-header">fn <a href="#method.read" class="fn">read</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    size: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    lock_owner: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+    reply: <a class="struct" href="struct.ReplyData.html" title="struct fuser::ReplyData">ReplyData</a>,
+)</h4></section></summary><div class="docblock"><p>Read data.
+Read should send exactly the number of bytes requested except on EOF or error,
+otherwise the rest of the data will be substituted with zeroes. An exception to
+this is when the file has been opened in ‘direct_io’ mode, in which case the
+return value of the read system call will reflect the return value of this
+operation. fh will contain the value set by the open method, or will be undefined
+if the open method didn’t set any value.</p>
+<p>flags: these are the file flags, such as O_SYNC. Only supported with ABI &gt;= 7.9
+lock_owner: only supported with ABI &gt;= 7.9</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.write" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#534-553">Source</a><h4 class="code-header">fn <a href="#method.write" class="fn">write</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    data: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u8.html">u8</a>],
+    write_flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    lock_owner: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+    reply: <a class="struct" href="struct.ReplyWrite.html" title="struct fuser::ReplyWrite">ReplyWrite</a>,
+)</h4></section></summary><div class="docblock"><p>Write data.
+Write should return exactly the number of bytes requested except on error. An
+exception to this is when the file has been opened in ‘direct_io’ mode, in
+which case the return value of the write system call will reflect the return
+value of this operation. fh will contain the value set by the open method, or
+will be undefined if the open method didn’t set any value.</p>
+<p>write_flags: will contain FUSE_WRITE_CACHE, if this write is from the page cache. If set,
+the pid, uid, gid, and fh may not match the value that would have been sent if write cachin
+is disabled
+flags: these are the file flags, such as O_SYNC. Only supported with ABI &gt;= 7.9
+lock_owner: only supported with ABI &gt;= 7.9</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.flush" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#565-568">Source</a><h4 class="code-header">fn <a href="#method.flush" class="fn">flush</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    lock_owner: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Flush method.
+This is called on each close() of the opened file. Since file descriptors can
+be duplicated (dup, dup2, fork), for one open call there may be many flush
+calls. Filesystems shouldn’t assume that flush will always be called after some
+writes, or that if will be called at all. fh will contain the value set by the
+open method, or will be undefined if the open method didn’t set any value.
+NOTE: the name of the method is misleading, since (unlike fsync) the filesystem
+is not forced to flush pending writes. One reason to flush data, is if the
+filesystem wants to return write errors. If the filesystem supports file locking
+operations (setlk, getlk) it should remove all locks belonging to ‘lock_owner’.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.release" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#578-589">Source</a><h4 class="code-header">fn <a href="#method.release" class="fn">release</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    _fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    _flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    _lock_owner: <a class="enum" href="https://doc.rust-lang.org/1.94.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>&gt;,
+    _flush: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.bool.html">bool</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Release an open file.
+Release is called when there are no more references to an open file: all file
+descriptors are closed and all memory mappings are unmapped. For every open
+call there will be exactly one release call. The filesystem may reply with an
+error, but error values are not returned to close() or munmap() which triggered
+the release. fh will contain the value set by the open method, or will be undefined
+if the open method didn’t set any value. flags will contain the same flags as for
+open.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.fsync" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#594-597">Source</a><h4 class="code-header">fn <a href="#method.fsync" class="fn">fsync</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    datasync: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.bool.html">bool</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Synchronize file contents.
+If the datasync parameter is non-zero, then only the user data should be flushed,
+not the meta data.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.opendir" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#606-608">Source</a><h4 class="code-header">fn <a href="#method.opendir" class="fn">opendir</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    _flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    reply: <a class="struct" href="struct.ReplyOpen.html" title="struct fuser::ReplyOpen">ReplyOpen</a>,
+)</h4></section></summary><div class="docblock"><p>Open a directory.
+Filesystem may store an arbitrary file handle (pointer, index, etc) in fh, and
+use this in other all other directory stream operations (readdir, releasedir,
+fsyncdir). Filesystem may also implement stateless directory I/O and not store
+anything in fh, though that makes it impossible to implement standard conforming
+directory stream operations in case the contents of the directory can change
+between opendir and releasedir.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.readdir" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#615-625">Source</a><h4 class="code-header">fn <a href="#method.readdir" class="fn">readdir</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    reply: <a class="struct" href="struct.ReplyDirectory.html" title="struct fuser::ReplyDirectory">ReplyDirectory</a>,
+)</h4></section></summary><div class="docblock"><p>Read directory.
+Send a buffer filled using buffer.fill(), with size not exceeding the
+requested size. Send an empty buffer on end of stream. fh will contain the
+value set by the opendir method, or will be undefined if the opendir method
+didn’t set any value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.readdirplus" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#632-642">Source</a><h4 class="code-header">fn <a href="#method.readdirplus" class="fn">readdirplus</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    reply: <a class="struct" href="struct.ReplyDirectoryPlus.html" title="struct fuser::ReplyDirectoryPlus">ReplyDirectoryPlus</a>,
+)</h4></section></summary><div class="docblock"><p>Read directory.
+Send a buffer filled using buffer.fill(), with size not exceeding the
+requested size. Send an empty buffer on end of stream. fh will contain the
+value set by the opendir method, or will be undefined if the opendir method
+didn’t set any value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.releasedir" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#648-657">Source</a><h4 class="code-header">fn <a href="#method.releasedir" class="fn">releasedir</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    _fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    _flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Release an open directory.
+For every opendir call there will be exactly one releasedir call. fh will
+contain the value set by the opendir method, or will be undefined if the
+opendir method didn’t set any value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.fsyncdir" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#663-673">Source</a><h4 class="code-header">fn <a href="#method.fsyncdir" class="fn">fsyncdir</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    datasync: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.bool.html">bool</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Synchronize directory contents.
+If the datasync parameter is set, then only the directory contents should
+be flushed, not the meta data. fh will contain the value set by the opendir
+method, or will be undefined if the opendir method didn’t set any value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.statfs" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#676-678">Source</a><h4 class="code-header">fn <a href="#method.statfs" class="fn">statfs</a>(&amp;mut self, _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, _ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>, reply: <a class="struct" href="struct.ReplyStatfs.html" title="struct fuser::ReplyStatfs">ReplyStatfs</a>)</h4></section></summary><div class="docblock"><p>Get file system statistics.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.setxattr" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#681-696">Source</a><h4 class="code-header">fn <a href="#method.setxattr" class="fn">setxattr</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    _value: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u8.html">u8</a>],
+    flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    position: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Set an extended attribute.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.getxattr" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#702-712">Source</a><h4 class="code-header">fn <a href="#method.getxattr" class="fn">getxattr</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    size: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyXattr.html" title="struct fuser::ReplyXattr">ReplyXattr</a>,
+)</h4></section></summary><div class="docblock"><p>Get an extended attribute.
+If <code>size</code> is 0, the size of the value should be sent with <code>reply.size()</code>.
+If <code>size</code> is not 0, and the value fits, send it with <code>reply.data()</code>, or
+<code>reply.error(ERANGE)</code> if it doesn’t.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.listxattr" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#718-721">Source</a><h4 class="code-header">fn <a href="#method.listxattr" class="fn">listxattr</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    size: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyXattr.html" title="struct fuser::ReplyXattr">ReplyXattr</a>,
+)</h4></section></summary><div class="docblock"><p>List extended attribute names.
+If <code>size</code> is 0, the size of the value should be sent with <code>reply.size()</code>.
+If <code>size</code> is not 0, and the value fits, send it with <code>reply.data()</code>, or
+<code>reply.error(ERANGE)</code> if it doesn’t.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.removexattr" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#724-727">Source</a><h4 class="code-header">fn <a href="#method.removexattr" class="fn">removexattr</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Remove an extended attribute.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.access" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#733-736">Source</a><h4 class="code-header">fn <a href="#method.access" class="fn">access</a>(&amp;mut self, _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;, ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>, mask: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>, reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>)</h4></section></summary><div class="docblock"><p>Check file access permissions.
+This will be called for the access() system call. If the ‘default_permissions’
+mount option is given, this method is not called. This method is not called
+under Linux kernel versions 2.4.x</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.create" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#748-763">Source</a><h4 class="code-header">fn <a href="#method.create" class="fn">create</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    parent: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    name: &amp;<a class="struct" href="https://doc.rust-lang.org/1.94.0/std/ffi/os_str/struct.OsStr.html" title="struct std::ffi::os_str::OsStr">OsStr</a>,
+    mode: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    umask: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    reply: <a class="struct" href="struct.ReplyCreate.html" title="struct fuser::ReplyCreate">ReplyCreate</a>,
+)</h4></section></summary><div class="docblock"><p>Create and open a file.
+If the file does not exist, first create it with the specified mode, and then
+open it. You can use any open flags in the flags parameter except O_NOCTTY.
+The filesystem can store any type of file handle (such as a pointer or index)
+in fh, which can then be used across all subsequent file operations including
+read, write, flush, release, and fsync. Additionally, the filesystem may set
+certain flags like direct_io and keep_cache to change the way the file is
+opened. See fuse_file_info structure in &lt;fuse_common.h&gt; for more details. If
+this method is not implemented or under Linux kernel versions earlier than
+2.6.15, the mknod() and open() methods will be called instead.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.getlk" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#766-783">Source</a><h4 class="code-header">fn <a href="#method.getlk" class="fn">getlk</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    lock_owner: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    start: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    end: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    typ: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    pid: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyLock.html" title="struct fuser::ReplyLock">ReplyLock</a>,
+)</h4></section></summary><div class="docblock"><p>Test for a POSIX file lock.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.setlk" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#792-810">Source</a><h4 class="code-header">fn <a href="#method.setlk" class="fn">setlk</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    lock_owner: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    start: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    end: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    typ: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    pid: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    sleep: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.bool.html">bool</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Acquire, modify or release a POSIX file lock.
+For POSIX threads (NPTL) there’s a 1-1 relation between pid and owner, but
+otherwise this is not always the case.  For checking lock ownership,
+‘fi-&gt;owner’ must be used. The l_pid field in ‘struct flock’ should only be
+used to fill in this field in getlk(). Note: if the locking methods are not
+implemented, the kernel will still allow file locking to work locally.
+Hence these are only interesting for network filesystems and similar.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.bmap" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#815-818">Source</a><h4 class="code-header">fn <a href="#method.bmap" class="fn">bmap</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    blocksize: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    idx: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    reply: <a class="struct" href="struct.ReplyBmap.html" title="struct fuser::ReplyBmap">ReplyBmap</a>,
+)</h4></section></summary><div class="docblock"><p>Map block index within file to block index within device.
+Note: This makes sense only for block device backed filesystems mounted
+with the ‘blkdev’ option</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.ioctl" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#821-838">Source</a><h4 class="code-header">fn <a href="#method.ioctl" class="fn">ioctl</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    cmd: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    in_data: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u8.html">u8</a>],
+    out_size: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyIoctl.html" title="struct fuser::ReplyIoctl">ReplyIoctl</a>,
+)</h4></section></summary><div class="docblock"><p>control device</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.poll" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#841-856">Source</a><h4 class="code-header">fn <a href="#method.poll" class="fn">poll</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    ph: <a class="struct" href="struct.PollHandle.html" title="struct fuser::PollHandle">PollHandle</a>,
+    events: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyPoll.html" title="struct fuser::ReplyPoll">ReplyPoll</a>,
+)</h4></section></summary><div class="docblock"><p>Poll for events</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.fallocate" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#859-874">Source</a><h4 class="code-header">fn <a href="#method.fallocate" class="fn">fallocate</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    length: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    mode: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    reply: <a class="struct" href="struct.ReplyEmpty.html" title="struct fuser::ReplyEmpty">ReplyEmpty</a>,
+)</h4></section></summary><div class="docblock"><p>Preallocate or deallocate space to a file</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.lseek" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#877-891">Source</a><h4 class="code-header">fn <a href="#method.lseek" class="fn">lseek</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    offset: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    whence: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i32.html">i32</a>,
+    reply: <a class="struct" href="struct.ReplyLseek.html" title="struct fuser::ReplyLseek">ReplyLseek</a>,
+)</h4></section></summary><div class="docblock"><p>Reposition read/write file offset</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.copy_file_range" class="method"><a class="src rightside" href="../src/fuser/lib.rs.html#894-913">Source</a><h4 class="code-header">fn <a href="#method.copy_file_range" class="fn">copy_file_range</a>(
+    &amp;mut self,
+    _req: &amp;<a class="struct" href="struct.Request.html" title="struct fuser::Request">Request</a>&lt;'_&gt;,
+    ino_in: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh_in: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    offset_in: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    ino_out: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    fh_out: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    offset_out: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.i64.html">i64</a>,
+    len: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u64.html">u64</a>,
+    flags: <a class="primitive" href="https://doc.rust-lang.org/1.94.0/std/primitive.u32.html">u32</a>,
+    reply: <a class="struct" href="struct.ReplyWrite.html" title="struct fuser::ReplyWrite">ReplyWrite</a>,
+)</h4></section></summary><div class="docblock"><p>Copy the specified range from the source inode to the destination inode</p>
+</div></details></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../trait.impl/fuser/trait.Filesystem.js" async></script></section></div></main></body></html>

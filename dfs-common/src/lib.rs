@@ -7,8 +7,8 @@ pub mod memory;
 // Re-export commonly used types
 pub use config::Config;
 pub use types::{
-    ChunkId, ChunkLocation, FileId, FileMetadata, FileType, NodeHealthGossip, NodeId, NodeInfo,
-    NodeStatus,
+    ChunkId, ChunkLocation, ChunkLocationV0, FileId, FileMetadata, FileMetadataV0, FileType,
+    NodeHealthGossip, NodeId, NodeInfo, NodeStatus,
 };
 pub use protocol::{
     ClusterMessage, ErrorCode, Message, MessageEnvelope, MetadataOperation, Request, RequestId,

@@ -1,0 +1,47 @@
+# DFS Node Configuration Example
+# Copy this to /etc/dfs/config.toml and customize
+
+[node]
+# Address this node listens on
+listen_addr = "0.0.0.0:8900"
+
+# Optional human-readable node name (defaults to hostname)
+# name = "node1"
+
+[storage]
+# Directory to store data chunks
+data_dir = "/var/lib/dfs/data"
+
+# Directory to store metadata
+metadata_dir = "/var/lib/dfs/metadata"
+
+# Chunk size in megabytes (default: 4MB)
+chunk_size_mb = 4
+
+[cluster]
+# Seed nodes to connect to on startup (for joining existing cluster)
+# Leave empty for first node in cluster
+seed_nodes = [
+    # "192.168.1.10:8900",
+    # "192.168.1.11:8900",
+]
+
+# Heartbeat interval in seconds
+heartbeat_interval_secs = 10
+
+# Node failure detection timeout in seconds
+failure_timeout_secs = 30
+
+[replication]
+# Number of replicas to maintain (recommended: 3)
+replication_factor = 3
+
+# Delay in seconds before starting healing after node failure
+# This accounts for reboots and maintenance windows
+healing_delay_secs = 300
+
+# Enable automatic healing
+auto_heal = true
+
+# Background scrubbing interval in hours (data verification)
+scrub_interval_hours = 24

@@ -68,13 +68,53 @@ impl MetadataStore {
             Some(value) => {
                 // Try to deserialize as new format first
                 match bincode::deserialize::<FileMetadata>(&value) {
-                    Ok(metadata) => Ok(Some(metadata)),
+                    Ok(mut metadata) => {
+                        // MIGRATION FIXUP: Even for new format, populate chunk_locations if empty
+                        // This handles files that were migrated before we added chunk_locations population
+                        if metadata.chunk_locations.is_empty() && !metadata.chunks.is_empty() {
+                            info!("Populating chunk_locations for file {} ({} chunks)",
+                                  file_id, metadata.chunks.len());
+
+                            for (idx, chunk_id) in metadata.chunks.iter().enumerate() {
+                                if let Ok(Some(location)) = self.get_chunk_location(chunk_id) {
+                                    metadata.chunk_locations.push(location);
+                                } else {
+                                    warn!("Failed to find chunk location for chunk {} (idx {}) during fixup",
+                                          chunk_id, idx);
+                                }
+                            }
+
+                            // Write back updated metadata
+                            if let Err(e) = self.put_file(&metadata) {
+                                warn!("Failed to update metadata for {}: {}", file_id, e);
+                            }
+                        }
+
+                        Ok(Some(metadata))
+                    }
                     Err(new_err) => {
                         // If that fails, try old format (bincode can't handle extra fields)
                         match bincode::deserialize::<FileMetadataV0>(&value) {
                             Ok(v0_metadata) => {
                                 // Successfully deserialized old format - convert to new
-                                let metadata: FileMetadata = v0_metadata.into();
+                                let mut metadata: FileMetadata = v0_metadata.into();
+
+                                // CRITICAL: Populate chunk_locations from legacy chunks array
+                                // Old files have empty chunk_locations, which causes slow seeks
+                                // (client has to query metadata server for each chunk individually)
+                                if metadata.chunk_locations.is_empty() && !metadata.chunks.is_empty() {
+                                    info!("Migrating {} legacy chunks to chunk_locations for file {}",
+                                          metadata.chunks.len(), file_id);
+
+                                    for (idx, chunk_id) in metadata.chunks.iter().enumerate() {
+                                        if let Ok(Some(location)) = self.get_chunk_location(chunk_id) {
+                                            metadata.chunk_locations.push(location);
+                                        } else {
+                                            warn!("Failed to find chunk location for chunk {} (idx {}) during migration",
+                                                  chunk_id, idx);
+                                        }
+                                    }
+                                }
 
                                 // Auto-migrate by writing back in new format
                                 if let Err(e) = self.put_file(&metadata) {

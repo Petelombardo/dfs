@@ -2961,8 +2961,13 @@ impl Filesystem for DfsFilesystem {
         debug!("fsync: ino={}, datasync={}", ino, datasync);
 
         if self.write_buffer_enabled {
-            // Flush any buffered writes (force metadata update on fsync)
-            let result = self.block_on(self.flush_buffer_async(ino, true));
+            // Only flush chunk-aligned data (multiples of 4MB) on fsync.
+            // DVR apps call fsync after every 128KB write to confirm durability,
+            // but we must NOT drain the partial buffer — that creates one tiny
+            // chunk per fsync instead of accumulating into 4MB chunks.
+            // force=false: flushes only complete 4MB chunks, leaves partial buffer.
+            // The partial buffer is flushed on file close (release) with force=true.
+            let result = self.block_on(self.flush_buffer_async(ino, false));
 
             match result {
                 Ok(_) => reply.ok(),

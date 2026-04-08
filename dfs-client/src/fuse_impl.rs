@@ -1061,6 +1061,9 @@ impl Filesystem for DfsFilesystem {
             // Build or retrieve cached chunk offset map
             // CRITICAL: Cache this to avoid O(n) iteration through all chunks on every read
             // For 3GB files with 750+ chunks, this was a massive performance bottleneck
+            //
+            // SPARSE FILE SUPPORT: Use chunk_locations with file_offset if available,
+            // otherwise fall back to sequential offset calculation for legacy files
             let chunk_offsets = {
                 let cache = chunk_offset_cache.read().unwrap();
                 let cached_result: Option<Vec<(usize, usize)>> = if let Some((cached_size, cached_offsets)) = cache.get(&ino) {
@@ -1079,11 +1082,21 @@ impl Filesystem for DfsFilesystem {
             }.unwrap_or_else(|| {
                 // Cache miss or invalidated - build and cache it
                 let mut offsets = Vec::with_capacity(metadata.chunks.len());
-                let mut current_offset = 0usize;
 
-                for (idx, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
-                    offsets.push((current_offset, chunk_size as usize));
-                    current_offset += chunk_size as usize;
+                // Check if we have chunk_locations with file_offset (sparse file support)
+                if !metadata.chunk_locations.is_empty() && metadata.chunk_locations[0].file_offset.is_some() {
+                    // SPARSE FILE: Use explicit file_offset from chunk_locations
+                    for location in &metadata.chunk_locations {
+                        let chunk_offset = location.file_offset.unwrap_or(0);
+                        offsets.push((chunk_offset as usize, location.size));
+                    }
+                } else {
+                    // LEGACY FILE: Sequential chunks, calculate offsets
+                    let mut current_offset = 0usize;
+                    for (idx, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
+                        offsets.push((current_offset, chunk_size as usize));
+                        current_offset += chunk_size as usize;
+                    }
                 }
 
                 // Store in cache
@@ -1115,8 +1128,18 @@ impl Filesystem for DfsFilesystem {
                 }
             }
 
+            // SPARSE FILE SUPPORT: If no chunks found in this range, it's a hole!
+            // Return zeros for the requested size (up to file size)
             if chunks_to_read.is_empty() {
-                reply.data(&[]);
+                let bytes_to_read = end_offset.saturating_sub(offset);
+                if bytes_to_read > 0 {
+                    debug!("Reading from hole (unmapped region): offset {} size {} - returning zeros",
+                           offset, bytes_to_read);
+                    let zeros = vec![0u8; bytes_to_read];
+                    reply.data(&zeros);
+                } else {
+                    reply.data(&[]);
+                }
                 return;
             }
 
@@ -1162,7 +1185,7 @@ impl Filesystem for DfsFilesystem {
             let chunk_locations = metadata.chunk_locations.clone();
             let result = client.read_data(&chunk_ids, &all_chunks, start_chunk_idx, cache_inode, &chunk_file_offsets, &chunk_locations).await;
 
-            let all_data = match result {
+            let chunk_data = match result {
                 Ok(data) => data,
                 Err(e) => {
                     error!("Failed to read {} chunks: {}", chunk_ids.len(), e);
@@ -1171,17 +1194,72 @@ impl Filesystem for DfsFilesystem {
                 }
             };
 
-            // Calculate offset within the read data
-            let offset_in_data = offset.saturating_sub(first_chunk_offset);
-            let data_end = std::cmp::min(offset_in_data + size, all_data.len());
+            // SPARSE FILE SUPPORT: Check if we need to handle holes
+            // If chunks are not contiguous, we need to fill holes with zeros
+            let has_holes = if chunks_to_read.len() > 1 {
+                let mut has_gap = false;
+                for i in 0..chunks_to_read.len() - 1 {
+                    let (_, curr_start, curr_size) = chunks_to_read[i];
+                    let (_, next_start, _) = chunks_to_read[i + 1];
+                    if curr_start + curr_size < next_start {
+                        has_gap = true;
+                        break;
+                    }
+                }
+                has_gap
+            } else {
+                false
+            };
 
-            if offset_in_data >= all_data.len() {
-                debug!("Read offset {} beyond data length {}", offset_in_data, all_data.len());
+            let final_data = if has_holes {
+                // SPARSE FILE: Build result buffer with holes filled with zeros
+                debug!("Sparse file read: filling holes with zeros");
+
+                let bytes_needed = end_offset - offset;
+                let mut result_buffer = vec![0u8; bytes_needed];
+
+                let mut chunk_data_offset = 0usize;
+                for (_, chunk_start, chunk_size) in &chunks_to_read {
+                    // Calculate where this chunk's data should go in the result
+                    let chunk_end = chunk_start + chunk_size;
+
+                    // Find overlap between requested range [offset, end_offset) and chunk [chunk_start, chunk_end)
+                    let overlap_start = (*chunk_start).max(offset);
+                    let overlap_end = chunk_end.min(end_offset);
+
+                    if overlap_start < overlap_end {
+                        let result_offset = overlap_start - offset;
+                        let chunk_offset = overlap_start - chunk_start;
+                        let overlap_size = overlap_end - overlap_start;
+
+                        // Copy chunk data to result buffer
+                        result_buffer[result_offset..result_offset + overlap_size]
+                            .copy_from_slice(&chunk_data[chunk_data_offset + chunk_offset..chunk_data_offset + chunk_offset + overlap_size]);
+                    }
+
+                    chunk_data_offset += chunk_size;
+                }
+
+                result_buffer
+            } else {
+                // NON-SPARSE FILE: Use simple offset calculation (existing logic)
+                let offset_in_data = offset.saturating_sub(first_chunk_offset);
+                let data_end = std::cmp::min(offset_in_data + size, chunk_data.len());
+
+                if offset_in_data >= chunk_data.len() {
+                    debug!("Read offset {} beyond data length {}", offset_in_data, chunk_data.len());
+                    Vec::new()
+                } else {
+                    chunk_data[offset_in_data..data_end].to_vec()
+                }
+            };
+
+            if final_data.is_empty() {
                 reply.data(&[]);
             } else {
-                debug!("Returning {} bytes from offset {} (read {} chunks, total {} bytes)",
-                       data_end - offset_in_data, offset, chunk_ids.len(), all_data.len());
-                reply.data(&all_data[offset_in_data..data_end]);
+                debug!("Returning {} bytes from offset {} (read {} chunks, has_holes: {})",
+                       final_data.len(), offset, chunk_ids.len(), has_holes);
+                reply.data(&final_data);
             }
 
             let elapsed = start.elapsed();
@@ -1421,7 +1499,8 @@ impl Filesystem for DfsFilesystem {
                 return;
             }
 
-            // For SQLite database files, disable caching to prevent corruption
+            // For SQLite database files, disable caching AND buffering to prevent corruption
+            // SQLite does read-your-own-writes and needs immediate consistency
             let is_sqlite = {
                 let path = &metadata.path;
                 path.ends_with(".db") || path.ends_with(".sqlite") ||
@@ -1431,7 +1510,8 @@ impl Filesystem for DfsFilesystem {
             let cache_inode = if is_sqlite { 0 } else { ino };
 
             // Write-behind buffering: buffer sequential appends in memory
-            if write_buffer_enabled {
+            // EXCEPT for SQLite files which need immediate write-through for consistency
+            if write_buffer_enabled && !is_sqlite {
                 let offset_usize = offset as usize;
                 // Calculate true current size including any buffered data
                 // IMPORTANT: Re-read metadata from cache to get latest updates from concurrent writes
@@ -1455,17 +1535,73 @@ impl Filesystem for DfsFilesystem {
                        {let cache = metadata_cache.read().unwrap(); cache.get(&ino).map(|m| m.size).unwrap_or(0)},
                        write_buffers.contains_key(&ino));
 
-                // Only buffer sequential appends
-                if offset_usize != current_size {
-                    info!("Buffered write skipped: offset {} != current_size {} (diff: {})",
-                           offset_usize, current_size,
-                           if offset_usize > current_size {
-                               offset_usize - current_size
-                           } else {
-                               current_size - offset_usize
-                           });
+                // Handle different write patterns:
+                // 1. Sequential appends (offset == current_size) → use buffering for performance
+                // 2. Overwrites (offset < current_size) → use buffering for consistency
+                // 3. Sparse writes (offset > current_size) → write directly with hole support
+                let is_sequential_append = offset_usize == current_size;
+                let is_overwrite = offset_usize < current_size;
+                let is_sparse_write = offset_usize > current_size;
+
+                if is_sparse_write {
+                    // SPARSE WRITE: Writing beyond current file size (creates a hole)
+                    info!("Sparse write: offset {} > current_size {} (gap: {} bytes)",
+                           offset_usize, current_size, offset_usize - current_size);
+
+                    // Write directly at the specified offset (no buffering for sparse writes)
+                    let write_result = runtime.block_on(async {
+                        // Write data with file_offset tracking (Phase 1 support)
+                        client.write_data_with_cache(&data_vec, ino, offset as u64).await
+                    });
+
+                    match write_result {
+                        Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
+                            // Update file size to max(current, offset + len) for sparse files
+                            let new_size = (offset_usize + data.len()).max(current_size);
+
+                            // Update metadata with new chunks
+                            let mut metadata = {
+                                let cache = metadata_cache.read().unwrap();
+                                cache.get(&ino).cloned().unwrap_or_else(|| metadata.clone())
+                            };
+
+                            if let Some(chunk_locations) = chunk_locations_opt {
+                                metadata.chunk_locations.extend(chunk_locations);
+                            }
+                            metadata.chunks.extend(new_chunk_ids);
+                            metadata.chunk_sizes.extend(new_chunk_sizes);
+                            metadata.size = new_size as u64;
+                            metadata.modified_at = SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+
+                            // Store updated metadata
+                            if let Err(e) = runtime.block_on(async {
+                                client.put_file_metadata(&metadata).await
+                            }) {
+                                error!("Failed to store metadata after sparse write: {}", e);
+                                reply.error(libc::EIO);
+                                return;
+                            }
+
+                            // Update cache
+                            metadata_cache.write().unwrap().insert(ino, metadata);
+
+                            info!("Sparse write complete: ino={}, offset={}, len={}, new_size={}",
+                                  ino, offset, data.len(), new_size);
+                            reply.written(data.len() as u32);
+                        }
+                        Err(e) => {
+                            error!("Sparse write failed for inode {}: {}", ino, e);
+                            reply.error(libc::EIO);
+                        }
+                    }
+                    return;
                 }
-                if offset_usize == current_size {
+
+                // SEQUENTIAL APPEND (buffered for performance)
+                if is_sequential_append {
                     // Buffer size threshold: 4MB to match server chunk_size for optimal performance
                     // With environment variable override support
                     // Use buffer flush threshold from cluster config (or env var override)

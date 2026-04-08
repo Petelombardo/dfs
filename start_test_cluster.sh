@@ -72,15 +72,6 @@ auto_heal = true
 scrub_interval_hours = 24
 EOF
 
-# Initialize nodes
-echo "Initializing nodes..."
-for i in 1 2 3; do
-    target/release/dfs-server init \
-        --data-dir /tmp/dfs-test/node$i/data \
-        --meta-dir /tmp/dfs-test/node$i/metadata \
-        --config /tmp/dfs-test/node$i/config.toml
-done
-
 # Start servers
 echo "Starting servers..."
 for i in 1 2 3; do

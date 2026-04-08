@@ -2,6 +2,7 @@ mod chunker;
 mod cluster;
 mod healing;
 mod metadata;
+mod metadata_sql;
 mod network;
 mod server;
 mod storage;

@@ -17,6 +17,16 @@ impl NodeId {
     pub fn from_uuid(uuid: Uuid) -> Self {
         Self(uuid)
     }
+
+    /// Get byte representation
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// Create from bytes
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
 }
 
 impl Default for NodeId {
@@ -123,6 +133,22 @@ impl ChunkId {
         let dir2 = &hex[2..4];
         (dir1.to_string(), dir2.to_string(), hex)
     }
+
+    /// Get byte representation for storage
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.hash
+    }
+
+    /// Create from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() == 32 {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(bytes);
+            Some(Self { hash })
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for ChunkId {
@@ -142,6 +168,14 @@ impl FileId {
 
     pub fn from_uuid(uuid: Uuid) -> Self {
         Self(uuid)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
     }
 }
 

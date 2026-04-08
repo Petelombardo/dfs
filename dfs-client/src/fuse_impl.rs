@@ -1244,7 +1244,15 @@ impl Filesystem for DfsFilesystem {
                 let mut result_buffer = vec![0u8; bytes_needed];
 
                 let mut chunk_data_offset = 0usize;
-                for (_, chunk_start, chunk_size) in &chunks_to_read {
+                for (i, (_, chunk_start, chunk_size)) in chunks_to_read.iter().enumerate() {
+                    // Determine how many bytes were actually returned for this chunk.
+                    // Partial reads return only hint.length bytes, not the full chunk_size.
+                    let actual_bytes_returned = if let Some(hint) = read_hints.get(i) {
+                        if hint.full_chunk { *chunk_size } else { hint.length }
+                    } else {
+                        *chunk_size
+                    };
+
                     // Calculate where this chunk's data should go in the result
                     let chunk_end = chunk_start + chunk_size;
 
@@ -1254,21 +1262,44 @@ impl Filesystem for DfsFilesystem {
 
                     if overlap_start < overlap_end {
                         let result_offset = overlap_start - offset;
-                        let chunk_offset = overlap_start - chunk_start;
+                        // For partial reads, data starts at byte 0 of what was returned (the hint's
+                        // offset_in_chunk was already sent to the server as the range start).
+                        let chunk_offset = if let Some(hint) = read_hints.get(i) {
+                            if hint.full_chunk {
+                                overlap_start - chunk_start
+                            } else {
+                                // Data returned starts at hint.offset_in_chunk in the logical chunk,
+                                // but is at byte 0 in the returned buffer slice.
+                                overlap_start.saturating_sub(chunk_start + hint.offset_in_chunk)
+                            }
+                        } else {
+                            overlap_start - chunk_start
+                        };
                         let overlap_size = overlap_end - overlap_start;
 
-                        // Copy chunk data to result buffer
-                        result_buffer[result_offset..result_offset + overlap_size]
-                            .copy_from_slice(&chunk_data[chunk_data_offset + chunk_offset..chunk_data_offset + chunk_offset + overlap_size]);
+                        let src_start = chunk_data_offset + chunk_offset;
+                        let src_end = src_start + overlap_size;
+                        if src_end <= chunk_data.len() {
+                            result_buffer[result_offset..result_offset + overlap_size]
+                                .copy_from_slice(&chunk_data[src_start..src_end]);
+                        } else {
+                            warn!("Sparse read: chunk {} data out of bounds (src {}..{} > buf {}), skipping",
+                                  i, src_start, src_end, chunk_data.len());
+                        }
                     }
 
-                    chunk_data_offset += chunk_size;
+                    chunk_data_offset += actual_bytes_returned;
                 }
 
                 result_buffer
             } else {
                 // NON-SPARSE FILE: Use simple offset calculation (existing logic)
-                let offset_in_data = offset.saturating_sub(first_chunk_offset);
+                // For partial reads, data starts at hint.offset_in_chunk in the logical chunk
+                // but at byte 0 in the returned buffer, so adjust accordingly.
+                let first_hint_offset = read_hints.first()
+                    .map(|h| if h.full_chunk { 0 } else { h.offset_in_chunk })
+                    .unwrap_or(0);
+                let offset_in_data = offset.saturating_sub(first_chunk_offset + first_hint_offset);
                 let data_end = std::cmp::min(offset_in_data + size, chunk_data.len());
 
                 if offset_in_data >= chunk_data.len() {

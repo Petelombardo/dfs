@@ -187,9 +187,18 @@ impl MetadataStore {
         let prefix = b"file:";
 
         for item in self.db.scan_prefix(prefix) {
-            let (_, value) = item?;
-            let metadata: FileMetadata = bincode::deserialize(&value)
-                .context("Failed to deserialize file metadata")?;
+            let (key, value) = item?;
+            // Try new format first, then V0 fallback, skip entries that fail both.
+            let metadata = match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => m,
+                Err(_) => match bincode::deserialize::<FileMetadataV0>(&value) {
+                    Ok(v0) => v0.into(),
+                    Err(e) => {
+                        warn!("Skipping corrupt metadata entry (key={:?}): {}", key, e);
+                        continue;
+                    }
+                },
+            };
             files.push(metadata);
         }
 

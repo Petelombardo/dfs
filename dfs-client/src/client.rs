@@ -335,9 +335,12 @@ impl DfsClient {
     async fn send_request(&self, addr: SocketAddr, request: Request) -> Result<Response> {
         debug!("Sending request to {}: {:?}", addr, request);
 
-        // Connect to node
-        let mut stream = TcpStream::connect(addr)
-            .await
+        // Connect with a short timeout so a dead node doesn't stall the caller
+        let stream = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            TcpStream::connect(addr),
+        ).await
+            .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
             .context("Failed to connect to node")?;
 
         // Create envelope with request ID
@@ -345,46 +348,41 @@ impl DfsClient {
         let envelope = MessageEnvelope::new(request_id, Message::Request(request));
         let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
-        // Send message with length prefix
-        let len = encoded.len() as u32;
-        let send_result = async {
+        // Send and receive with a 30s timeout.  This must cover the full round-trip for large
+        // write payloads (4MB+) on a slow HDD node, but should fail quickly enough that the
+        // caller can fall back to a different node rather than blocking the write pipeline.
+        let io_future = async {
+            let mut stream = stream;
+
+            // Send request
+            let len = encoded.len() as u32;
             stream.write_all(&len.to_be_bytes()).await?;
             stream.write_all(&encoded).await?;
             stream.flush().await?;
-            Ok::<(), std::io::Error>(())
-        }.await;
 
-        if let Err(e) = send_result {
-            // Connection failed, don't return to pool
-            return Err(e).context("Failed to send request");
-        }
-
-        // Read response
-        let mut len_buf = [0u8; 4];
-        let read_result = async {
+            // Read response
+            let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await?;
             let len = u32::from_be_bytes(len_buf) as usize;
 
             let mut buf = vec![0u8; len];
             stream.read_exact(&mut buf).await?;
             Ok::<Vec<u8>, std::io::Error>(buf)
-        }.await;
+        };
 
-        match read_result {
-            Ok(buf) => {
-                // Deserialize response envelope
-                let response_envelope = MessageEnvelope::from_bytes(&buf)
-                    .context("Failed to deserialize response")?;
+        let buf = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            io_future,
+        ).await
+            .map_err(|_| anyhow::anyhow!("Request to {} timed out", addr))?
+            .context("Failed to read response")?;
 
-                match response_envelope.message {
-                    Message::Response(response) => Ok(response),
-                    _ => anyhow::bail!("Expected Response message"),
-                }
-            }
-            Err(e) => {
-                // Connection failed, don't return to pool
-                Err(e).context("Failed to read response")
-            }
+        let response_envelope = MessageEnvelope::from_bytes(&buf)
+            .context("Failed to deserialize response")?;
+
+        match response_envelope.message {
+            Message::Response(response) => Ok(response),
+            _ => anyhow::bail!("Expected Response message"),
         }
     }
 
@@ -1888,15 +1886,19 @@ impl DfsClient {
                 let chunk_vec = chunk_data.to_vec();
                 let chunk_offset = file_offset + (chunk_idx * CHUNK_SIZE) as u64;
 
-                // Select replica nodes (simple round-robin, can improve later)
+                // Select preferred replica nodes (round-robin); write_chunk_to_replicas will
+                // fall back to other nodes automatically if either of these fails.
                 let replica1 = nodes[chunk_idx % nodes.len()];
                 let replica2 = nodes[(chunk_idx + 1) % nodes.len()];
+                let all_nodes = nodes.clone();
 
                 let client = self.clone();
 
                 // Spawn async task for this chunk
                 let handle = tokio::spawn(async move {
-                    let result = client.write_chunk_to_replicas(&chunk_vec, replica1, replica2, inode, chunk_offset).await;
+                    let result = client.write_chunk_to_replicas(
+                        &chunk_vec, replica1, replica2, inode, chunk_offset, &all_nodes,
+                    ).await;
                     result.map(|locs| (chunk_idx, locs))
                 });
 
@@ -1915,28 +1917,23 @@ impl DfsClient {
 
             match result {
                 Ok(Ok((chunk_idx, chunk_locations))) => {
-                    // Success! Store the locations (will need to sort by chunk_idx later)
                     debug!("Chunk {} completed successfully", chunk_idx);
                     all_chunk_locations.push((chunk_idx, chunk_locations));
                 }
                 Ok(Err(e)) => {
-                    // Chunk write failed - stop the pipeline
-                    warn!("Chunk write failed: {}. Stopping pipeline to handle failure.", e);
-
-                    // Wait for all in-flight chunks to complete
+                    // write_chunk_to_replicas already exhausted all available nodes — this is
+                    // a genuine hard failure (cluster has fewer than 2 healthy nodes).
+                    // Drain in-flight tasks so we don't leak, then propagate the error.
+                    tracing::error!("Chunk write failed after trying all nodes: {}", e);
                     let remaining_handles = std::mem::take(&mut in_flight);
                     for handle in remaining_handles {
                         if let Ok(Ok((idx, locs))) = handle.await {
                             all_chunk_locations.push((idx, locs));
                         }
                     }
-
-                    // TODO: Extract failed chunk_idx from error and add retry logic
-                    // For now, just fail the entire operation
                     anyhow::bail!("Pipeline write failed: {}", e);
                 }
                 Err(e) => {
-                    // Task panicked
                     anyhow::bail!("Pipeline task panicked: {}", e);
                 }
             }
@@ -1955,8 +1952,9 @@ impl DfsClient {
         Ok(final_locations)
     }
 
-    /// Write a single chunk to two replica nodes in parallel
-    /// Helper function for pipelined writes
+    /// Write a single chunk to two replica nodes in parallel, with fallback to other nodes.
+    /// Tries replica1+replica2 first; if either fails, substitutes the next available node
+    /// from `all_nodes`. Requires at least 2 successful writes before returning.
     async fn write_chunk_to_replicas(
         &self,
         data: &[u8],
@@ -1964,35 +1962,65 @@ impl DfsClient {
         replica2: SocketAddr,
         inode: u64,
         file_offset: u64,
+        all_nodes: &[SocketAddr],
     ) -> Result<Vec<dfs_common::ChunkLocation>> {
-        debug!("Writing {} bytes to {} and {}", data.len(), replica1, replica2);
+        const WRITE_TIMEOUT_SECS: u64 = 30;
 
-        // Create one Vec and clone it once
-        let data_vec = data.to_vec();
-        let data_clone = data_vec.clone();
+        // Build the ordered list of candidates: preferred pair first, then others as fallbacks.
+        let mut candidates: Vec<SocketAddr> = vec![replica1, replica2];
+        for &n in all_nodes {
+            if n != replica1 && n != replica2 {
+                candidates.push(n);
+            }
+        }
 
-        let request1 = Request::WriteFileLocalOnly { data: data_vec };
-        let request2 = Request::WriteFileLocalOnly { data: data_clone };
+        // We need exactly 2 successful replicas. Try candidates in order, skipping failures.
+        let mut successful: Vec<(SocketAddr, Response)> = Vec::new();
+        let mut candidate_iter = candidates.iter().peekable();
 
-        let task1 = self.send_request(replica1, request1);
-        let task2 = self.send_request(replica2, request2);
+        while successful.len() < 2 {
+            let node = match candidate_iter.next() {
+                Some(n) => *n,
+                None => anyhow::bail!(
+                    "Chunk write failed: could not get 2 replicas after trying all {} nodes",
+                    candidates.len()
+                ),
+            };
 
-        let (result1, result2) = tokio::join!(task1, task2);
+            let request = Request::WriteFileLocalOnly { data: data.to_vec() };
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+                self.send_request(node, request),
+            ).await;
 
-        // Both must succeed for synchronous replication
-        let response1 = result1?;
-        let response2 = result2?;
+            match result {
+                Ok(Ok(response)) => {
+                    debug!("Chunk replica write succeeded to {}", node);
+                    successful.push((node, response));
+                }
+                Ok(Err(e)) => {
+                    warn!("Chunk replica write to {} failed: {}, trying next node", node, e);
+                }
+                Err(_) => {
+                    warn!("Chunk replica write to {} timed out after {}s, trying next node",
+                          node, WRITE_TIMEOUT_SECS);
+                }
+            }
+        }
+
+        let (addr1, response1) = successful.remove(0);
+        let (addr2, response2) = successful.remove(0);
 
         let (chunk_ids_1, chunk_sizes_1) = match response1 {
             Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes),
-            Response::Error { message, .. } => anyhow::bail!("Replica 1 ({}) failed: {}", replica1, message),
-            _ => anyhow::bail!("Unexpected response from replica 1"),
+            Response::Error { message, .. } => anyhow::bail!("Replica 1 ({}) failed: {}", addr1, message),
+            _ => anyhow::bail!("Unexpected response from replica 1 ({})", addr1),
         };
 
-        let (chunk_ids_2, chunk_sizes_2) = match response2 {
+        let (chunk_ids_2, _chunk_sizes_2) = match response2 {
             Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes),
-            Response::Error { message, .. } => anyhow::bail!("Replica 2 ({}) failed: {}", replica2, message),
-            _ => anyhow::bail!("Unexpected response from replica 2"),
+            Response::Error { message, .. } => anyhow::bail!("Replica 2 ({}) failed: {}", addr2, message),
+            _ => anyhow::bail!("Unexpected response from replica 2 ({})", addr2),
         };
 
         // Verify both nodes produced the same chunks
@@ -2011,12 +2039,12 @@ impl DfsClient {
                 warn!("Chunk ID mismatch at index {}: {} vs {}", idx, chunk_id, chunk_ids_2[idx]);
             }
 
-            let node1_id = node_id_map.get(&replica1)
+            let node1_id = node_id_map.get(&addr1)
                 .copied()
-                .unwrap_or_else(|| Self::node_id_from_addr(replica1));
-            let node2_id = node_id_map.get(&replica2)
+                .unwrap_or_else(|| Self::node_id_from_addr(addr1));
+            let node2_id = node_id_map.get(&addr2)
                 .copied()
-                .unwrap_or_else(|| Self::node_id_from_addr(replica2));
+                .unwrap_or_else(|| Self::node_id_from_addr(addr2));
 
             let chunk_size = chunk_sizes_1[idx] as usize;
             let location = dfs_common::ChunkLocation {

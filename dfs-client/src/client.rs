@@ -2128,13 +2128,16 @@ impl DfsClient {
         // For small writes, use single server (less overhead)
         if data.len() < MIN_PARALLEL_SIZE {
             let (chunk_ids, chunk_sizes) = self.write_data_single_chunk(data).await?;
-            return Ok((chunk_ids, chunk_sizes, None));  // No chunk_locations for single-server writes
+            // Still build chunk_locations with file_offset so the chunk offset cache works correctly
+            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset);
+            return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
             let (chunk_ids, chunk_sizes) = self.write_data_single_chunk(data).await?;
-            return Ok((chunk_ids, chunk_sizes, None));  // No chunk_locations for single-server writes
+            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset);
+            return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
         // Use pipelined writes for data >= 8MB (2+ chunks), otherwise use non-pipelined
@@ -2285,6 +2288,29 @@ impl DfsClient {
             }
             _ => anyhow::bail!("Unexpected response type"),
         }
+    }
+
+    /// Build minimal ChunkLocation entries from chunk_ids/sizes with file_offset tracking.
+    /// Used for single-server writes where we don't have full replica node info, but still
+    /// need file_offset populated so the chunk offset cache works correctly.
+    fn build_chunk_locations_from_ids(
+        chunk_ids: &[ChunkId],
+        chunk_sizes: &[u64],
+        file_offset: u64,
+    ) -> Vec<dfs_common::ChunkLocation> {
+        let mut locations = Vec::with_capacity(chunk_ids.len());
+        let mut current_offset = file_offset;
+        for (chunk_id, &size) in chunk_ids.iter().zip(chunk_sizes.iter()) {
+            locations.push(dfs_common::ChunkLocation {
+                chunk_id: *chunk_id,
+                nodes: vec![],  // No node tracking for single-server writes
+                size: size as usize,
+                checksum: chunk_id.hash,
+                file_offset: Some(current_offset),
+            });
+            current_offset += size;
+        }
+        locations
     }
 
     /// Write file metadata with quorum (3-node writes for split-brain prevention)

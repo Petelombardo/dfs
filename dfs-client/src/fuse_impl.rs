@@ -746,13 +746,14 @@ impl Filesystem for DfsFilesystem {
                 if metadata.file_type == FileType::RegularFile {
                     // Try to get fresh metadata from server
                     if let Ok(Some(fresh)) = client.get_file_metadata(&metadata.path).await {
-                        if fresh.size != metadata.size {
-                            debug!("getattr: file grew from {} to {} bytes", metadata.size, fresh.size);
+                        // Always update cache — chunk list may have grown even if size is same
+                        // (e.g. final metadata flush from another writer). This is critical for
+                        // multi-client coherency: theater must see all chunks nanopir3 has flushed.
+                        if fresh.size != metadata.size || fresh.chunks.len() != metadata.chunks.len() {
+                            debug!("getattr: metadata updated: size {} -> {}, chunks {} -> {}",
+                                   metadata.size, fresh.size,
+                                   metadata.chunks.len(), fresh.chunks.len());
                             metadata_cache.write().unwrap().insert(ino, fresh.clone());
-
-                            // Don't warm replica cache here - getattr() is called frequently (every 1s)
-                            // and we don't know the read position. Let read() warm the cache when needed.
-
                             metadata = fresh;
                         }
                     }
@@ -1084,16 +1085,29 @@ impl Filesystem for DfsFilesystem {
                 let mut offsets = Vec::with_capacity(metadata.chunks.len());
 
                 // Check if we have chunk_locations with file_offset (sparse file support)
-                if !metadata.chunk_locations.is_empty() && metadata.chunk_locations[0].file_offset.is_some() {
+                // IMPORTANT: chunk_locations count must match chunks count, otherwise offsets
+                // would be misaligned (e.g., if a small chunk was written without chunk_locations
+                // being populated). Fall back to sequential calculation in that case.
+                let locations_match = !metadata.chunk_locations.is_empty()
+                    && metadata.chunk_locations.len() == metadata.chunks.len()
+                    && metadata.chunk_locations[0].file_offset.is_some();
+
+                if locations_match {
                     // SPARSE FILE: Use explicit file_offset from chunk_locations
                     for location in &metadata.chunk_locations {
                         let chunk_offset = location.file_offset.unwrap_or(0);
                         offsets.push((chunk_offset as usize, location.size));
                     }
                 } else {
-                    // LEGACY FILE: Sequential chunks, calculate offsets
+                    // LEGACY FILE or mismatched chunk_locations: Sequential chunks, calculate offsets
+                    if !metadata.chunk_locations.is_empty()
+                        && metadata.chunk_locations.len() != metadata.chunks.len()
+                    {
+                        warn!("chunk_locations count ({}) != chunks count ({}) for ino={}, using sequential offsets",
+                              metadata.chunk_locations.len(), metadata.chunks.len(), ino);
+                    }
                     let mut current_offset = 0usize;
-                    for (idx, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
+                    for &chunk_size in metadata.chunk_sizes.iter() {
                         offsets.push((current_offset, chunk_size as usize));
                         current_offset += chunk_size as usize;
                     }
@@ -1163,13 +1177,10 @@ impl Filesystem for DfsFilesystem {
                     let offset_in_chunk = read_start_in_file.saturating_sub(*chunk_start);
                     let length_in_chunk = read_end_in_file.saturating_sub(read_start_in_file);
 
-                    // Determine if we should fetch the full chunk or just a partial range
-                    // Use partial reads when:
-                    // 1. We're only reading a portion of the chunk (not the whole thing)
-                    // 2. The portion we need starts significantly into the chunk (> 25% in)
-                    // This optimization helps seeks by avoiding fetching data we won't use
-                    let full_chunk = length_in_chunk == *chunk_size ||
-                                   offset_in_chunk < (*chunk_size / 4);
+                    // Always fetch full chunks for correctness.
+                    // Partial read optimization (ReadChunkRange) was causing incorrect slice
+                    // calculations in the reassembly path and is disabled until that is fixed.
+                    let full_chunk = true;
 
                     crate::client::ChunkReadHint {
                         chunk_idx: *idx,
@@ -2364,16 +2375,11 @@ impl Filesystem for DfsFilesystem {
                 };
 
                 if let Some(metadata) = metadata_opt {
-                    let has_pending = {
-                        let counters = write_counters.read().unwrap();
-                        counters.get(&ino).map(|c| *c > 0).unwrap_or(false)
-                    };
-
-                    if has_pending {
-                        debug!("release: flushing pending metadata for ino={}", ino);
-                        client.put_file_metadata(&metadata).await?;
-                        write_counters.write().unwrap().insert(ino, 0);
-                    }
+                    // Always flush metadata on release for non-buffered writes — the 2-second
+                    // batch window means the final chunks may not have been committed yet.
+                    debug!("release: flushing metadata for ino={} ({} chunks)", ino, metadata.chunks.len());
+                    client.put_file_metadata(&metadata).await?;
+                    write_counters.write().unwrap().insert(ino, 0);
                 }
 
                 // Release locks if lock_owner is provided

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::{ChunkLocation, FileId, FileMetadata, FileMetadataV0};
+use dfs_common::{ChunkLocation, ChunkLocationV0, FileId, FileMetadata, FileMetadataV0};
 use sled::Db;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -262,11 +262,24 @@ impl MetadataStore {
     pub fn get_chunk_location(&self, chunk_id: &dfs_common::ChunkId) -> Result<Option<ChunkLocation>> {
         let key = self.chunk_key(chunk_id);
 
-        match self.db.get(key)? {
+        match self.db.get(&key)? {
             Some(value) => {
-                let location: ChunkLocation = bincode::deserialize(&value)
-                    .context("Failed to deserialize chunk location")?;
-                Ok(Some(location))
+                // Try current format first, fall back to V0 for records written before the
+                // file_offset field was added to ChunkLocation.
+                match bincode::deserialize::<ChunkLocation>(&value) {
+                    Ok(location) => Ok(Some(location)),
+                    Err(_) => match bincode::deserialize::<ChunkLocationV0>(&value) {
+                        Ok(v0) => {
+                            let location = ChunkLocation::from(v0);
+                            // Migrate in place so we don't hit this path again
+                            if let Ok(encoded) = bincode::serialize(&location) {
+                                let _ = self.db.insert(&key, encoded);
+                            }
+                            Ok(Some(location))
+                        }
+                        Err(e) => Err(anyhow::anyhow!("Failed to deserialize chunk location (tried both formats): {}", e)),
+                    },
+                }
             }
             None => Ok(None),
         }

@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dfs_common::{ChunkId, FileId, Message, MessageEnvelope, Request, RequestId, Response};
+use dfs_common::{ChunkId, ChunkLocation, FileId, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{error, Level};
+use tracing::{error, info, warn, Level};
 
 #[derive(Parser)]
 #[command(name = "dfs-admin")]
@@ -108,6 +109,14 @@ enum FileCommands {
     PurgeById {
         /// File ID (hex string)
         file_id: String,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Repack a fragmented file into 4MB chunks for better read performance
+    Repack {
+        /// File path
+        path: String,
         /// Skip confirmation prompt
         #[arg(short, long)]
         yes: bool,
@@ -708,6 +717,10 @@ async fn handle_file_command(
             }
         }
 
+        FileCommands::Repack { path, yes } => {
+            handle_repack(path, yes, cluster_addrs).await?;
+        }
+
         FileCommands::PurgeById { file_id, yes } => {
             // Parse the file ID from hex string
             let parsed_file_id = parse_file_id(&file_id)?;
@@ -748,6 +761,240 @@ async fn handle_file_command(
             }
         }
     }
+
+    Ok(())
+}
+
+async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) -> Result<()> {
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB target chunk size
+
+    // 1. Fetch current metadata
+    let response = send_request(
+        cluster_addrs[0],
+        Request::GetFileInfo { path: path.clone() },
+    ).await?;
+
+    let (metadata, existing_locations) = match response {
+        Response::FileInfo { metadata, chunk_locations } => (metadata, chunk_locations),
+        Response::Error { message, code } => {
+            if code == dfs_common::ErrorCode::NotFound {
+                anyhow::bail!("File not found: {}", path);
+            }
+            anyhow::bail!("Failed to get file info: {}", message);
+        }
+        _ => anyhow::bail!("Unexpected response"),
+    };
+
+    let old_chunk_count = metadata.chunks.len();
+    let file_size = metadata.size;
+
+    // Skip if already well-packed (average chunk size >= 2MB)
+    let avg_chunk_size = if old_chunk_count > 0 { file_size / old_chunk_count as u64 } else { 0 };
+    if avg_chunk_size >= 2 * 1024 * 1024 {
+        println!("File '{}' is already well-packed ({} chunks, avg {:.1} MB each). No repack needed.",
+                 path, old_chunk_count, avg_chunk_size as f64 / (1024.0 * 1024.0));
+        return Ok(());
+    }
+
+    println!("File: {}", path);
+    println!("Size: {} ({:.1} MB)", file_size, file_size as f64 / (1024.0 * 1024.0));
+    println!("Current chunks: {} (avg {:.1} KB each)", old_chunk_count, avg_chunk_size as f64 / 1024.0);
+    println!("Target chunks:  ~{}", (file_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE);
+    println!();
+
+    if !yes {
+        print!("Repack '{}' into 4MB chunks? This rewrites the file on the cluster. [y/N]: ", path);
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Build chunk_id -> node list mapping from existing locations (for smart reads)
+    let mut chunk_node_map: HashMap<ChunkId, Vec<SocketAddr>> = HashMap::new();
+    // Build node_id -> addr mapping from cluster status
+    let mut node_id_to_addr: HashMap<String, SocketAddr> = HashMap::new();
+
+    if let Ok(Response::ClusterStatus { nodes, .. }) = send_request(cluster_addrs[0], Request::GetClusterStatus).await {
+        for node in &nodes {
+            let id_str = node.id.to_string();
+            node_id_to_addr.insert(id_str, node.addr);
+        }
+    }
+
+    for loc in &existing_locations {
+        let addrs: Vec<SocketAddr> = loc.nodes.iter()
+            .filter_map(|nid| node_id_to_addr.get(&nid.to_string()).copied())
+            .collect();
+        if !addrs.is_empty() {
+            chunk_node_map.insert(loc.chunk_id, addrs);
+        }
+    }
+
+    // Choose 2 nodes for writing new chunks (round-robin from cluster)
+    let all_nodes: Vec<SocketAddr> = if let Ok(Response::ClusterStatus { nodes, .. }) =
+        send_request(cluster_addrs[0], Request::GetClusterStatus).await
+    {
+        nodes.iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online)
+            .map(|n| n.addr)
+            .collect()
+    } else {
+        cluster_addrs.to_vec()
+    };
+
+    if all_nodes.len() < 2 {
+        anyhow::bail!("Need at least 2 online nodes for repack");
+    }
+
+    println!("Reading and repacking {} chunks...", old_chunk_count);
+
+    let mut new_chunk_locations: Vec<ChunkLocation> = Vec::new();
+    let mut buffer: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
+    let mut file_offset: u64 = 0;
+    let mut chunks_read = 0usize;
+    let mut write_node_idx = 0usize;
+
+    // Helper closure to write a buffer to 2 nodes and return ChunkLocations
+    // We'll do this inline in the loop below
+
+    for (i, chunk_id) in metadata.chunks.iter().enumerate() {
+        // Pick the best node to read from
+        let read_addr = chunk_node_map.get(chunk_id)
+            .and_then(|addrs| addrs.first().copied())
+            .unwrap_or(cluster_addrs[0]);
+
+        let chunk_data = match send_request(read_addr, Request::ReadChunk {
+            chunk_id: *chunk_id,
+            sequential_hint: Some((i as u64, old_chunk_count as u64)),
+        }).await? {
+            Response::ChunkData { data, .. } => data,
+            Response::Error { message, .. } => {
+                // Try fallback nodes
+                let mut data_opt = None;
+                for &node in cluster_addrs {
+                    if node == read_addr { continue; }
+                    if let Ok(Response::ChunkData { data, .. }) = send_request(node, Request::ReadChunk {
+                        chunk_id: *chunk_id,
+                        sequential_hint: None,
+                    }).await {
+                        data_opt = Some(data);
+                        break;
+                    }
+                }
+                match data_opt {
+                    Some(d) => d,
+                    None => anyhow::bail!("Failed to read chunk {} (idx {}): {}", chunk_id, i, message),
+                }
+            }
+            _ => anyhow::bail!("Unexpected response reading chunk {}", chunk_id),
+        };
+
+        buffer.extend_from_slice(&chunk_data);
+        chunks_read += 1;
+
+        // Flush when buffer reaches 4MB or this is the last chunk
+        let is_last = i + 1 == old_chunk_count;
+        while buffer.len() >= CHUNK_SIZE || (is_last && !buffer.is_empty()) {
+            let flush_size = buffer.len().min(CHUNK_SIZE);
+            let flush_data: Vec<u8> = buffer.drain(..flush_size).collect();
+
+            // Write to 2 nodes
+            let node1 = all_nodes[write_node_idx % all_nodes.len()];
+            let node2 = all_nodes[(write_node_idx + 1) % all_nodes.len()];
+            write_node_idx += 2;
+
+            let (ids1, sizes1, addr1) = match send_request(node1, Request::WriteFileLocalOnly {
+                data: flush_data.clone(),
+            }).await? {
+                Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes, node1),
+                Response::Error { message, .. } => anyhow::bail!("Write to {} failed: {}", node1, message),
+                _ => anyhow::bail!("Unexpected write response from {}", node1),
+            };
+
+            let (ids2, _sizes2, addr2) = match send_request(node2, Request::WriteFileLocalOnly {
+                data: flush_data,
+            }).await? {
+                Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes, node2),
+                Response::Error { message, .. } => anyhow::bail!("Write to {} failed: {}", node2, message),
+                _ => anyhow::bail!("Unexpected write response from {}", node2),
+            };
+
+            // Build ChunkLocation for each new chunk
+            // Get node IDs from the addr->node mapping
+            let node_id_map: HashMap<SocketAddr, NodeId> = node_id_to_addr.iter()
+                .filter_map(|(id_str, &addr)| {
+                    uuid::Uuid::parse_str(id_str).ok()
+                        .map(|uuid| (addr, NodeId::from_uuid(uuid)))
+                })
+                .collect();
+
+            let node1_id = node_id_map.get(&addr1)
+                .copied()
+                .unwrap_or_else(|| NodeId::from_uuid(uuid::Uuid::new_v4()));
+            let node2_id = node_id_map.get(&addr2)
+                .copied()
+                .unwrap_or_else(|| NodeId::from_uuid(uuid::Uuid::new_v4()));
+
+            let mut current_offset = file_offset;
+            for (chunk_id, &chunk_size) in ids1.iter().zip(sizes1.iter()) {
+                new_chunk_locations.push(ChunkLocation {
+                    chunk_id: *chunk_id,
+                    nodes: vec![node1_id, node2_id],
+                    size: chunk_size as usize,
+                    checksum: chunk_id.hash,
+                    file_offset: Some(current_offset),
+                });
+                current_offset += chunk_size;
+            }
+            file_offset = current_offset;
+
+            if !buffer.is_empty() && buffer.len() < CHUNK_SIZE && !is_last {
+                // Remaining data < 4MB and more chunks to come; keep accumulating
+                break;
+            }
+        }
+
+        if chunks_read % 500 == 0 {
+            println!("  Progress: {}/{} chunks read, {} new chunks written so far",
+                     chunks_read, old_chunk_count, new_chunk_locations.len());
+        }
+    }
+
+    let new_chunk_count = new_chunk_locations.len();
+    println!("Repack complete: {} chunks → {} chunks", old_chunk_count, new_chunk_count);
+
+    // Build updated metadata
+    let mut new_metadata = metadata.clone();
+    new_metadata.chunks = new_chunk_locations.iter().map(|l| l.chunk_id).collect();
+    new_metadata.chunk_sizes = new_chunk_locations.iter().map(|l| l.size as u64).collect();
+    new_metadata.chunk_locations = new_chunk_locations;
+    new_metadata.modified_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Write updated metadata to all nodes
+    println!("Updating metadata on {} nodes...", all_nodes.len());
+    let mut metadata_ok = 0;
+    for &node in &all_nodes {
+        match send_request(node, Request::PutFileMetadata { metadata: new_metadata.clone() }).await {
+            Ok(Response::Ok { .. }) => { metadata_ok += 1; }
+            Ok(Response::Error { message, .. }) => { warn!("Metadata update failed on {}: {}", node, message); }
+            Err(e) => { warn!("Failed to reach {} for metadata update: {}", node, e); }
+            _ => {}
+        }
+    }
+
+    if metadata_ok == 0 {
+        anyhow::bail!("Failed to update metadata on any node — repack data written but metadata not updated!");
+    }
+
+    println!("Metadata updated on {}/{} nodes.", metadata_ok, all_nodes.len());
+    println!("Done. Run 'dfs-admin healing trigger' to clean up the old {} chunks.", old_chunk_count);
 
     Ok(())
 }

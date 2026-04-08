@@ -1735,6 +1735,8 @@ impl DfsClient {
         let node_id_map = self.addr_to_node_id.read().await;
         let mut chunk_locations = Vec::new();
 
+        // Calculate file offset for each chunk
+        let mut current_offset = file_offset;
         for (idx, chunk_id) in chunk_ids_1.iter().enumerate() {
             // Verify chunk IDs match (they should since it's the same data)
             if chunk_id != &chunk_ids_2[idx] {
@@ -1758,14 +1760,17 @@ impl DfsClient {
             debug!("Creating ChunkLocation with nodes: {} ({}) and {} ({})",
                    node1_id, replica1, node2_id, replica2);
 
+            let chunk_size = chunk_sizes_1[idx] as usize;
             let location = dfs_common::ChunkLocation {
                 chunk_id: *chunk_id,
                 nodes: vec![node1_id, node2_id],
-                size: chunk_sizes_1[idx] as usize,
+                size: chunk_size,
                 checksum: chunk_id.hash,  // ChunkId already is the Blake3 hash
+                file_offset: Some(current_offset),  // Track where in file this chunk belongs
             };
 
             chunk_locations.push(location);
+            current_offset += chunk_size as u64;
         }
         drop(node_id_map);  // Release lock
 
@@ -1952,6 +1957,8 @@ impl DfsClient {
         let node_id_map = self.addr_to_node_id.read().await;
         let mut chunk_locations = Vec::new();
 
+        // Calculate file offset for each chunk
+        let mut current_offset = file_offset;
         for (idx, chunk_id) in chunk_ids_1.iter().enumerate() {
             if chunk_id != &chunk_ids_2[idx] {
                 warn!("Chunk ID mismatch at index {}: {} vs {}", idx, chunk_id, chunk_ids_2[idx]);
@@ -1964,14 +1971,17 @@ impl DfsClient {
                 .copied()
                 .unwrap_or_else(|| Self::node_id_from_addr(replica2));
 
+            let chunk_size = chunk_sizes_1[idx] as usize;
             let location = dfs_common::ChunkLocation {
                 chunk_id: *chunk_id,
                 nodes: vec![node1_id, node2_id],
-                size: chunk_sizes_1[idx] as usize,
+                size: chunk_size,
                 checksum: chunk_id.hash,
+                file_offset: Some(current_offset),  // Track where in file this chunk belongs
             };
 
             chunk_locations.push(location);
+            current_offset += chunk_size as u64;
         }
         drop(node_id_map);
 

@@ -425,6 +425,7 @@ impl HealingManager {
                 nodes: updated_nodes,
                 size: location.size,
                 checksum: location.checksum,
+                file_offset: location.file_offset,  // Preserve existing file offset
             };
 
             if let Err(e) = self.metadata.put_chunk_location(&updated_location) {

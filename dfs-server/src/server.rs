@@ -358,6 +358,7 @@ impl Server {
                     nodes: merged_nodes,
                     size: location.size,
                     checksum: location.checksum,
+                    file_offset: location.file_offset,  // Preserve existing offset
                 }
             }
             Ok(None) => {
@@ -624,6 +625,7 @@ impl Server {
                     nodes: target_nodes.clone(),
                     size: chunk_data.len(),
                     checksum: chunk_id.hash,
+                    file_offset: None,  // Server-side replication doesn't track file offsets
                 };
 
                 let metadata_start = std::time::Instant::now();
@@ -728,6 +730,7 @@ impl Server {
                     nodes: vec![local_node_id],  // Only local node
                     size: chunk_data.len(),
                     checksum: chunk_id.hash,
+                    file_offset: None,  // Server-side local-only writes don't track file offsets
                 };
 
                 metadata.put_chunk_location(&location)
@@ -872,6 +875,7 @@ impl Server {
                 nodes: Vec::new(),
                 size,
                 checksum: chunk_id.hash,
+                file_offset: None,  // Legacy fallback when metadata not found
             })
         }
     }

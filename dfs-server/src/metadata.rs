@@ -319,6 +319,7 @@ mod tests {
             nodes: vec![NodeId::new(), NodeId::new()],
             size: 4096,
             checksum: [2u8; 32],
+            file_offset: None,  // Test data doesn't need file offsets
         };
 
         store.put_chunk_location(&location).unwrap();

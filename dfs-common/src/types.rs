@@ -268,6 +268,12 @@ pub struct ChunkLocation {
 
     /// Checksum for verification
     pub checksum: [u8; 32],
+
+    /// File offset where this chunk starts (for sparse file support)
+    /// If None, chunks are assumed to be sequential (legacy behavior)
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_offset: Option<u64>,
 }
 
 /// Get current Unix timestamp in seconds

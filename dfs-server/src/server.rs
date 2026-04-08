@@ -152,6 +152,7 @@ impl Server {
             Request::DisableHealing => self.handle_disable_healing().await,
             Request::TriggerHealing => self.handle_trigger_healing().await,
             Request::GetFileInfo { path } => self.handle_get_file_info(path).await,
+            Request::GetFileInfoById { file_id } => self.handle_get_file_info_by_id(file_id).await,
             Request::GetChunkReplicas { chunk_id } => {
                 self.handle_get_chunk_replicas(chunk_id).await
             }
@@ -1345,6 +1346,38 @@ impl Server {
                 warn!("Failed to get file info: {}", e);
                 Response::Error {
                     message: format!("Failed to get file info: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle get file info by ID request
+    async fn handle_get_file_info_by_id(&self, file_id: dfs_common::FileId) -> Response {
+        debug!("Handling get file info by id: {}", file_id);
+
+        match self.metadata.get_file(&file_id) {
+            Ok(Some(metadata)) => {
+                let mut chunk_locations = Vec::new();
+                for chunk_id in &metadata.chunks {
+                    if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
+                        chunk_locations.push(location);
+                    }
+                }
+
+                Response::FileInfo {
+                    metadata,
+                    chunk_locations,
+                }
+            }
+            Ok(None) => Response::Error {
+                message: format!("File not found by ID: {}", file_id),
+                code: ErrorCode::NotFound,
+            },
+            Err(e) => {
+                warn!("Failed to get file info by id: {}", e);
+                Response::Error {
+                    message: format!("Failed to get file info by id: {}", e),
                     code: ErrorCode::InternalError,
                 }
             }

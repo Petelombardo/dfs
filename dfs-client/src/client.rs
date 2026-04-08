@@ -12,11 +12,14 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-/// Cache key for byte-range caching: (inode, file_byte_offset)
+/// Cache key for byte-range caching: (inode, file_byte_offset, chunk_id)
+/// chunk_id is included to prevent stale hits when a file is deleted and recreated
+/// at the same inode (same offset but different content).
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 struct ByteRangeCacheKey {
     inode: u64,
     file_offset: u64,
+    chunk_id: ChunkId,
 }
 
 /// Cached chunk data with metadata and TTL
@@ -590,41 +593,25 @@ impl DfsClient {
                 let byte_hit = {
                     let mut byte_cache = self.byte_range_cache.lock().await;
 
-                    // Iterate through all cached chunks for this inode to find range overlap
-                    // LRU cache doesn't support range queries, so we need to check all keys
-                    let mut matching_cached_chunk: Option<(ByteRangeCacheKey, Arc<Vec<u8>>)> = None;
+                    // Direct lookup by (inode, file_offset, chunk_id) — O(1) and collision-free.
+                    // Including chunk_id prevents stale hits when a file is deleted and recreated
+                    // at the same inode: same offset but different chunk = different key.
+                    let key = ByteRangeCacheKey {
+                        inode,
+                        file_offset: requested_offset,
+                        chunk_id: *chunk_id,
+                    };
 
-                    // Peek at cache entries without modifying LRU order yet
-                    for (key, cached) in byte_cache.iter() {
-                        if key.inode == inode {
-                            let cached_start = key.file_offset;
-                            let cached_end = cached_start + cached.chunk_size as u64;
-
-                            // Check if requested offset falls within this cached chunk
-                            if requested_offset >= cached_start && requested_offset < cached_end {
-                                matching_cached_chunk = Some((*key, Arc::clone(&cached.data)));
-                                break;
-                            }
-                        }
-                    }
-
-                    if let Some((key, data)) = matching_cached_chunk {
-                        // Now actually get it to update LRU order
-                        if let Some(cached) = byte_cache.get(&key) {
-                            // Check if expired (TTL: 30 seconds)
-                            if cached.is_expired() {
-                                info!("Byte-range cache EXPIRED for inode={} offset={} (age: {:?})",
-                                      inode, requested_offset, cached.cached_at.elapsed());
-                                // Remove expired entry
-                                byte_cache.pop(&key);
-                                None
-                            } else {
-                                info!("Byte-range cache HIT for inode={} offset={} (found in cached chunk at offset={})",
-                                      inode, requested_offset, key.file_offset);
-                                Some((idx, data))
-                            }
-                        } else {
+                    if let Some(cached) = byte_cache.get(&key) {
+                        // Check if expired (TTL: 30 seconds)
+                        if cached.is_expired() {
+                            info!("Byte-range cache EXPIRED for inode={} offset={} (age: {:?})",
+                                  inode, requested_offset, cached.cached_at.elapsed());
+                            byte_cache.pop(&key);
                             None
+                        } else {
+                            info!("Byte-range cache HIT for inode={} offset={}", inode, requested_offset);
+                            Some((idx, Arc::clone(&cached.data)))
                         }
                     } else {
                         None
@@ -930,6 +917,7 @@ impl DfsClient {
                 let key = ByteRangeCacheKey {
                     inode,
                     file_offset,
+                    chunk_id,
                 };
                 let cached = CachedChunk {
                     data: Arc::clone(&data_arc),
@@ -1837,6 +1825,7 @@ impl DfsClient {
                 let key = ByteRangeCacheKey {
                     inode,
                     file_offset: current_offset,
+                    chunk_id: location.chunk_id,
                 };
                 let cached = CachedChunk {
                     data: Arc::new(chunk_data),
@@ -2075,6 +2064,7 @@ impl DfsClient {
                 let key = ByteRangeCacheKey {
                     inode,
                     file_offset: current_offset,
+                    chunk_id: location.chunk_id,
                 };
                 let cached = CachedChunk {
                     data: Arc::new(chunk_data),

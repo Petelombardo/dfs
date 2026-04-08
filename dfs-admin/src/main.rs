@@ -511,7 +511,15 @@ async fn handle_file_command(
 ) -> Result<()> {
     match cmd {
         FileCommands::Info { path } => {
-            let response = send_request(cluster_addrs[0], Request::GetFileInfo { path: path.clone() }).await?;
+            // Detect whether the argument is a UUID (file ID) or a file path
+            let request = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
+                let file_id = dfs_common::FileId::from_uuid(uuid);
+                Request::GetFileInfoById { file_id }
+            } else {
+                Request::GetFileInfo { path: path.clone() }
+            };
+
+            let response = send_request(cluster_addrs[0], request).await?;
 
             match response {
                 Response::FileInfo {
@@ -539,7 +547,7 @@ async fn handle_file_command(
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
-                        println!("File Information: {}", path);
+                        println!("File Information: {}", metadata.path);
                         println!("==================");
                         println!("Path:       {}", metadata.path);
                         println!("Size:       {} bytes", metadata.size);

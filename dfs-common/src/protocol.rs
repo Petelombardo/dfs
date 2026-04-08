@@ -182,6 +182,11 @@ pub enum Request {
     PurgeFileMetadataById {
         file_id: FileId,
     },
+
+    /// Get file information by file ID (UUID)
+    GetFileInfoById {
+        file_id: FileId,
+    },
 }
 
 /// Response types

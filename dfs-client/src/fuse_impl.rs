@@ -107,7 +107,7 @@ pub struct DfsFilesystem {
     /// Chunk offset map cache: inode -> Vec<(offset, size)>
     /// Prevents O(n) iteration through all chunks on every read
     /// Invalidated when file metadata changes (size/chunks)
-    chunk_offset_cache: Arc<RwLock<HashMap<u64, (u64, Vec<(usize, usize)>)>>>, // (file_size, offsets)
+    chunk_offset_cache: Arc<RwLock<HashMap<u64, (u64, usize, Vec<(usize, usize)>)>>>, // (file_size, chunk_count, offsets)
 
     /// Directory listing cache: path -> (entries, timestamp)
     /// Cache directory listings for 5 seconds to avoid repeated scans
@@ -1067,12 +1067,12 @@ impl Filesystem for DfsFilesystem {
             // otherwise fall back to sequential offset calculation for legacy files
             let chunk_offsets = {
                 let cache = chunk_offset_cache.read().unwrap();
-                let cached_result: Option<Vec<(usize, usize)>> = if let Some((cached_size, cached_offsets)) = cache.get(&ino) {
-                    if *cached_size == metadata.size {
-                        // Cache hit with matching size - use it
+                let cached_result: Option<Vec<(usize, usize)>> = if let Some((cached_size, cached_chunk_count, cached_offsets)) = cache.get(&ino) {
+                    if *cached_size == metadata.size && *cached_chunk_count == metadata.chunks.len() {
+                        // Cache hit with matching size and chunk count - use it
                         Some(cached_offsets.clone())
                     } else {
-                        // Size changed - need to rebuild
+                        // Size or chunk count changed (e.g. repack) - need to rebuild
                         None
                     }
                 } else {
@@ -1115,7 +1115,7 @@ impl Filesystem for DfsFilesystem {
 
                 // Store in cache
                 let mut cache = chunk_offset_cache.write().unwrap();
-                cache.insert(ino, (metadata.size, offsets.clone()));
+                cache.insert(ino, (metadata.size, metadata.chunks.len(), offsets.clone()));
 
                 offsets
             });
@@ -1310,8 +1310,21 @@ impl Filesystem for DfsFilesystem {
                 // NON-SPARSE FILE: Use simple offset calculation (existing logic)
                 // For partial reads, data starts at hint.offset_in_chunk in the logical chunk
                 // but at byte 0 in the returned buffer, so adjust accordingly.
+                //
+                // IMPORTANT: If the hint requested a partial read but the cache served a full
+                // chunk (chunk_data.len() > hint.length), treat it as a full-chunk result so
+                // we index from the chunk start rather than the partial-read offset.
                 let first_hint_offset = read_hints.first()
-                    .map(|h| if h.full_chunk { 0 } else { h.offset_in_chunk })
+                    .map(|h| {
+                        if h.full_chunk {
+                            0
+                        } else if chunk_data.len() > h.length {
+                            // Cache served a larger (full) chunk despite partial hint — index from chunk start
+                            0
+                        } else {
+                            h.offset_in_chunk
+                        }
+                    })
                     .unwrap_or(0);
                 let offset_in_data = offset.saturating_sub(first_chunk_offset + first_hint_offset);
                 let data_end = std::cmp::min(offset_in_data + size, chunk_data.len());

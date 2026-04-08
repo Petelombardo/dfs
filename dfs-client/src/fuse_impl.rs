@@ -1551,7 +1551,9 @@ impl Filesystem for DfsFilesystem {
 
                                             // Only flush multiples of chunk_size to prevent server from creating tiny overflow chunks
                                             // If buffer = 4.2MB, flush only 4MB and leave 200KB in buffer
-                                            let flush_size = (buffer_size / buffer_flush_threshold) * buffer_flush_threshold;
+                                            // CRITICAL: Must align to chunk_size (4MB), NOT buffer_flush_threshold (12MB)!
+                                            let chunk_size = 4 * 1024 * 1024; // 4MB - must match server chunk size
+                                            let flush_size = (buffer_size / chunk_size) * chunk_size;
 
                                             if flush_size == 0 {
                                                 // Buffer < threshold, nothing to flush

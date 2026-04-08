@@ -1443,6 +1443,11 @@ impl Filesystem for DfsFilesystem {
                 // Cache metadata
                 self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
 
+                // CRITICAL: Invalidate parent directory cache so 'ls' shows new file immediately
+                let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                self.dir_cache.write().unwrap().remove(parent_path);
+                debug!("Invalidated directory cache for parent: {}", parent_path);
+
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
                 // ReplyCreate expects: ttl, attr, generation, fh, flags
@@ -2379,6 +2384,11 @@ impl Filesystem for DfsFilesystem {
                 // Cache metadata
                 self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
 
+                // CRITICAL: Invalidate parent directory cache so 'ls' shows new directory immediately
+                let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                self.dir_cache.write().unwrap().remove(parent_path);
+                debug!("Invalidated directory cache for parent: {}", parent_path);
+
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
                 // Short TTL (2s) for multi-client coherency
@@ -2420,6 +2430,11 @@ impl Filesystem for DfsFilesystem {
                     self.chunk_offset_cache.write().unwrap().remove(&ino); // Clean up chunk offset cache
                 }
                 self.path_to_inode.write().unwrap().remove(&path);
+
+                // CRITICAL: Invalidate parent directory cache so 'ls' shows deletion immediately
+                let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                self.dir_cache.write().unwrap().remove(parent_path);
+                debug!("Invalidated directory cache for parent: {}", parent_path);
 
                 reply.ok();
             }
@@ -2467,6 +2482,11 @@ impl Filesystem for DfsFilesystem {
                             self.metadata_cache.write().unwrap().remove(&ino);
                         }
                         self.path_to_inode.write().unwrap().remove(&path);
+
+                        // CRITICAL: Invalidate parent directory cache so 'ls' shows deletion immediately
+                        let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                        self.dir_cache.write().unwrap().remove(parent_path);
+                        debug!("Invalidated directory cache for parent: {}", parent_path);
 
                         reply.ok();
                     }

@@ -34,6 +34,24 @@ impl CachedChunk {
     }
 }
 
+/// Hint for how to read a chunk - full or partial
+/// Used to optimize seeks by only fetching needed portions of chunks
+#[derive(Debug, Clone)]
+pub struct ChunkReadHint {
+    /// Index of chunk in the file's chunk array
+    pub chunk_idx: usize,
+    /// The chunk ID to read
+    pub chunk_id: ChunkId,
+    /// Whether to fetch the full chunk (true) or just a partial range (false)
+    pub full_chunk: bool,
+    /// If partial read: byte offset within the chunk to start reading from
+    pub offset_in_chunk: usize,
+    /// If partial read: number of bytes to read from the chunk
+    pub length: usize,
+    /// File offset where this chunk starts (for caching)
+    pub file_offset: u64,
+}
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum number of recent SQLite file writes to track for read-after-write consistency
@@ -495,14 +513,12 @@ impl DfsClient {
     /// chunk_offsets: File byte offset for each chunk in chunk_ids (for byte-range caching)
     pub async fn read_data(
         &self,
-        chunk_ids: &[ChunkId],
+        read_hints: &[ChunkReadHint],
         all_file_chunks: &[ChunkId],
-        start_chunk_idx: usize,
         inode: u64,
-        chunk_offsets: &[u64],
         chunk_locations: &[dfs_common::ChunkLocation],
     ) -> Result<Vec<u8>> {
-        if chunk_ids.is_empty() {
+        if read_hints.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -511,10 +527,16 @@ impl DfsClient {
         // Each needs to return its own data slice
         // Deduplication only happens for CHUNK-LEVEL tracking (prefetch/history)
 
+        // Extract chunk_ids and offsets for compatibility with existing code
+        let chunk_ids: Vec<ChunkId> = read_hints.iter().map(|h| h.chunk_id).collect();
+        let chunk_offsets: Vec<u64> = read_hints.iter().map(|h| h.file_offset).collect();
+        let start_chunk_idx = read_hints.first().map(|h| h.chunk_idx).unwrap_or(0);
+
         // Log the read request with byte offsets and chunk IDs for debugging
         if !chunk_offsets.is_empty() && chunk_offsets[0] > 0 {
-            info!("READ: inode={} byte_offset={} chunk_count={} first_chunk={:?}",
-                  inode, chunk_offsets[0], chunk_ids.len(), chunk_ids.first());
+            info!("READ: inode={} byte_offset={} chunk_count={} first_chunk={:?} partial_reads={}",
+                  inode, chunk_offsets[0], chunk_ids.len(), chunk_ids.first(),
+                  read_hints.iter().filter(|h| !h.full_chunk).count());
         }
 
         let start = std::time::Instant::now();
@@ -703,6 +725,9 @@ impl DfsClient {
             let chunk_location = chunk_loc_map.get(&chunk_id).map(|&loc| loc.clone());
             let semaphore = max_concurrent_fetches.clone();
 
+            // Get the read hint for this chunk to determine if we should do a partial read
+            let read_hint = read_hints.iter().find(|h| h.chunk_id == chunk_id).cloned();
+
             if chunk_location.is_none() && !chunk_locations.is_empty() {
                 warn!("Chunk {} not found in chunk_locations map (map has {} entries)", chunk_id, chunk_loc_map.len());
             }
@@ -827,7 +852,28 @@ impl DfsClient {
                     .enumerate()
                 {
                     let read_start = std::time::Instant::now();
-                    match client.read_chunk_from_server(*node_addr, chunk_id).await {
+
+                    // Determine if we should use partial read (ReadChunkRange) or full chunk read
+                    // Use partial read ONLY for non-sequential access where we need latter portion of chunk
+                    let use_partial_read = if let Some(ref hint) = read_hint {
+                        !hint.full_chunk && !is_sequential && hint.offset_in_chunk > 0
+                    } else {
+                        false
+                    };
+
+                    let result = if use_partial_read {
+                        let hint = read_hint.as_ref().unwrap();
+                        info!("PARTIAL READ: chunk {} offset={} length={} (saving {} bytes)",
+                              chunk_id, hint.offset_in_chunk, hint.length,
+                              hint.offset_in_chunk);
+                        client.read_chunk_range_from_server(*node_addr, chunk_id,
+                                                            hint.offset_in_chunk as u64,
+                                                            hint.length as u64).await
+                    } else {
+                        client.read_chunk_from_server(*node_addr, chunk_id).await
+                    };
+
+                    match result {
                         Ok(chunk_data) => {
                             let read_time = read_start.elapsed();
                             let was_warm = warm_node.is_some() && *node_addr == warm_node.unwrap();
@@ -838,9 +884,10 @@ impl DfsClient {
                             } else {
                                 "PRIMARY"
                             };
+                            let read_type = if use_partial_read { "PARTIAL" } else { "FULL" };
 
-                            info!("✓ Chunk {} from {} ({}) in {:?} - {} bytes",
-                                  chunk_id, node_addr, source_desc, read_time, chunk_data.len());
+                            info!("✓ Chunk {} from {} ({}/{}) in {:?} - {} bytes",
+                                  chunk_id, node_addr, source_desc, read_type, read_time, chunk_data.len());
 
                             data = Some(chunk_data);
                             break;

@@ -1148,20 +1148,45 @@ impl Filesystem for DfsFilesystem {
                    chunks_to_read.iter().map(|(idx, _, _)| idx).collect::<Vec<_>>(),
                    offset, size);
 
-            // Read only the needed chunks in one batch
-            let chunk_ids: Vec<ChunkId> = chunks_to_read
+            // Build ChunkReadHints to tell the client how to read each chunk
+            // For seeks (non-sequential reads), we can optimize by only fetching needed portions
+            let read_hints: Vec<crate::client::ChunkReadHint> = chunks_to_read
                 .iter()
-                .map(|(idx, _, _)| metadata.chunks[*idx])
+                .map(|(idx, chunk_start, chunk_size)| {
+                    let chunk_end = chunk_start + chunk_size;
+
+                    // Calculate the overlap between requested range and this chunk
+                    let read_start_in_file = offset.max(*chunk_start);
+                    let read_end_in_file = end_offset.min(chunk_end);
+
+                    // Calculate offset and length within the chunk
+                    let offset_in_chunk = read_start_in_file.saturating_sub(*chunk_start);
+                    let length_in_chunk = read_end_in_file.saturating_sub(read_start_in_file);
+
+                    // Determine if we should fetch the full chunk or just a partial range
+                    // Use partial reads when:
+                    // 1. We're only reading a portion of the chunk (not the whole thing)
+                    // 2. The portion we need starts significantly into the chunk (> 25% in)
+                    // This optimization helps seeks by avoiding fetching data we won't use
+                    let full_chunk = length_in_chunk == *chunk_size ||
+                                   offset_in_chunk < (*chunk_size / 4);
+
+                    crate::client::ChunkReadHint {
+                        chunk_idx: *idx,
+                        chunk_id: metadata.chunks[*idx],
+                        full_chunk,
+                        offset_in_chunk,
+                        length: length_in_chunk,
+                        file_offset: *chunk_start as u64,
+                    }
+                })
                 .collect();
 
-            // Get the file chunk index of the first chunk we're reading (for prefetch tracking)
-            let start_chunk_idx = chunks_to_read.first().map(|(idx, _, _)| *idx).unwrap_or(0);
-
-            // Build chunk file offsets for byte-range caching
-            let chunk_file_offsets: Vec<u64> = chunks_to_read
-                .iter()
-                .map(|(_, chunk_start, _)| *chunk_start as u64)
-                .collect();
+            let partial_reads = read_hints.iter().filter(|h| !h.full_chunk).count();
+            if partial_reads > 0 {
+                info!("Optimizing seek: {} partial chunk reads out of {}",
+                      partial_reads, read_hints.len());
+            }
 
             // For SQLite database files, disable caching by passing inode=0
             // This prevents stale cached data from causing corruption
@@ -1183,12 +1208,12 @@ impl Filesystem for DfsFilesystem {
 
             let all_chunks = metadata.chunks.clone();
             let chunk_locations = metadata.chunk_locations.clone();
-            let result = client.read_data(&chunk_ids, &all_chunks, start_chunk_idx, cache_inode, &chunk_file_offsets, &chunk_locations).await;
+            let result = client.read_data(&read_hints, &all_chunks, cache_inode, &chunk_locations).await;
 
             let chunk_data = match result {
                 Ok(data) => data,
                 Err(e) => {
-                    error!("Failed to read {} chunks: {}", chunk_ids.len(), e);
+                    error!("Failed to read {} chunks: {}", read_hints.len(), e);
                     reply.error(libc::EIO);
                     return;
                 }
@@ -1258,7 +1283,7 @@ impl Filesystem for DfsFilesystem {
                 reply.data(&[]);
             } else {
                 debug!("Returning {} bytes from offset {} (read {} chunks, has_holes: {})",
-                       final_data.len(), offset, chunk_ids.len(), has_holes);
+                       final_data.len(), offset, read_hints.len(), has_holes);
                 reply.data(&final_data);
             }
 
@@ -1907,15 +1932,24 @@ impl Filesystem for DfsFilesystem {
                     let first_chunk_file_offset: u64 = chunk_sizes[..first_idx].iter().sum();
 
                     // Build chunk offsets for affected chunks only
-                    let mut chunk_offsets = Vec::with_capacity(affected_chunk_ids.len());
+                    // Build read hints for affected chunks (full chunk reads for read-modify-write)
+                    let mut read_hints = Vec::with_capacity(affected_chunk_ids.len());
                     let mut current_offset = first_chunk_file_offset;
-                    for &size in &affected_chunk_sizes {
-                        chunk_offsets.push(current_offset);
-                        current_offset += size;
+                    for (i, &chunk_id) in affected_chunk_ids.iter().enumerate() {
+                        let chunk_size = affected_chunk_sizes[i] as usize;
+                        read_hints.push(crate::client::ChunkReadHint {
+                            chunk_idx: first_idx + i,
+                            chunk_id,
+                            full_chunk: true,  // Always read full chunks for read-modify-write
+                            offset_in_chunk: 0,
+                            length: chunk_size,
+                            file_offset: current_offset,
+                        });
+                        current_offset += chunk_size as u64;
                     }
 
                     let affected_data = match runtime.block_on(async {
-                        client.read_data(&affected_chunk_ids, &chunk_ids, first_idx, cache_inode, &chunk_offsets, &metadata.chunk_locations).await
+                        client.read_data(&read_hints, &chunk_ids, cache_inode, &metadata.chunk_locations).await
                     }) {
                         Ok(data) => data,
                         Err(e) => {
@@ -2700,10 +2734,21 @@ impl Filesystem for DfsFilesystem {
 
                             let chunk_id = metadata.chunks[last_chunk_idx];
                             let chunk_offset: u64 = chunk_sizes[..last_chunk_idx].iter().sum();
+                            let chunk_size = chunk_sizes[last_chunk_idx] as usize;
+
+                            // Build read hint for the last partial chunk (full chunk read for truncate)
+                            let read_hint = vec![crate::client::ChunkReadHint {
+                                chunk_idx: last_chunk_idx,
+                                chunk_id,
+                                full_chunk: true,  // Read full chunk for truncate operation
+                                offset_in_chunk: 0,
+                                length: chunk_size,
+                                file_offset: chunk_offset,
+                            }];
 
                             // Read only the last partial chunk
                             let last_chunk_data = match self.block_on(async {
-                                client.read_data(&[chunk_id], &metadata.chunks, last_chunk_idx, ino, &[chunk_offset], &metadata.chunk_locations).await
+                                client.read_data(&read_hint, &metadata.chunks, ino, &metadata.chunk_locations).await
                             }) {
                                 Ok(data) => data,
                                 Err(e) => {

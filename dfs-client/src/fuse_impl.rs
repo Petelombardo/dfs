@@ -1177,10 +1177,13 @@ impl Filesystem for DfsFilesystem {
                     let offset_in_chunk = read_start_in_file.saturating_sub(*chunk_start);
                     let length_in_chunk = read_end_in_file.saturating_sub(read_start_in_file);
 
-                    // Always fetch full chunks for correctness.
-                    // Partial read optimization (ReadChunkRange) was causing incorrect slice
-                    // calculations in the reassembly path and is disabled until that is fixed.
-                    let full_chunk = true;
+                    // Use partial reads when the request covers only a small fraction of the chunk.
+                    // This is critical for Kodi seeks: it probes random offsets to detect duration,
+                    // and fetching a full 4MB chunk over a 20Mbit link takes ~1.6s per probe.
+                    // Only use partial reads when reading < 25% of the chunk to avoid overhead
+                    // of multiple round trips for sequential streaming.
+                    let full_chunk = length_in_chunk >= (*chunk_size as usize / 4)
+                        || length_in_chunk == 0;
 
                     crate::client::ChunkReadHint {
                         chunk_idx: *idx,

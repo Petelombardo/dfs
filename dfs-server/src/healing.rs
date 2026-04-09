@@ -63,9 +63,10 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
     ) -> Self {
-        // Default to healing 100 chunks per cycle to prevent resource exhaustion
-        // Can be adjusted based on cluster size and performance requirements
-        let max_heal_per_cycle = 100;
+        // Heal at most 10 chunks per cycle to avoid connection storms.
+        // At 60s intervals this is 10 heals/min — sufficient for gradual recovery
+        // without flooding the leader with PushChunkTo connections.
+        let max_heal_per_cycle = 10;
 
         Self {
             storage,
@@ -234,6 +235,9 @@ impl HealingManager {
                                 warn!("Failed to heal chunk {}: {}", chunk_id, e);
                             } else {
                                 healed_count += 1;
+                                // Brief pause between heals so connections drain back to the pool
+                                // and the cluster isn't flooded with simultaneous PushChunkTo ops.
+                                tokio::time::sleep(Duration::from_millis(200)).await;
                             }
                         } else {
                             pending_count += 1;

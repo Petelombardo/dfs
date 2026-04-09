@@ -91,6 +91,70 @@ impl WriteBuffer {
     }
 }
 
+/// Flush a write buffer for the given inode using Arc-cloned state.
+/// Used when a random/overwrite write needs the buffer committed before read-modify-write.
+async fn flush_buffer_standalone(
+    ino: u64,
+    client: &Arc<DfsClient>,
+    metadata_cache: &Arc<RwLock<HashMap<u64, FileMetadata>>>,
+    write_buffers: &Arc<DashMap<u64, Arc<Mutex<WriteBuffer>>>>,
+    last_metadata_update: &Arc<RwLock<HashMap<u64, std::time::Instant>>>,
+    write_counters: &Arc<RwLock<HashMap<u64, usize>>>,
+    _buffer_flush_threshold: usize,
+    force: bool,
+) -> Result<()> {
+    let flush_data_opt = {
+        if let Some(buffer_lock) = write_buffers.get(&ino) {
+            let mut buffer = buffer_lock.lock().await;
+            if force && !buffer.data.is_empty() {
+                let data = std::mem::take(&mut buffer.data);
+                let start_offset = buffer.start_offset;
+                buffer.start_offset += data.len() as u64;
+                buffer.last_modified = SystemTime::now();
+                Some((data, start_offset))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some((flush_data, buffer_start_offset)) = flush_data_opt {
+        info!("flush_buffer_standalone: flushing {} bytes for inode {} at offset {}",
+              flush_data.len(), ino, buffer_start_offset);
+
+        let mut metadata = {
+            let cache = metadata_cache.read().unwrap();
+            match cache.get(&ino) {
+                Some(m) => m.clone(),
+                None => anyhow::bail!("Metadata not found for inode {}", ino),
+            }
+        };
+
+        let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) =
+            client.write_data_with_cache(&flush_data, ino, buffer_start_offset).await?;
+
+        if let Some(chunk_locations) = chunk_locations_opt {
+            metadata.chunk_locations.extend(chunk_locations);
+        }
+        metadata.chunks.extend(new_chunk_ids);
+        metadata.chunk_sizes.extend(new_chunk_sizes);
+        metadata.size = buffer_start_offset + flush_data.len() as u64;
+        metadata.modified_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        client.put_file_metadata(&metadata).await?;
+        last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
+        write_counters.write().unwrap().insert(ino, 0);
+        metadata_cache.write().unwrap().insert(ino, metadata);
+    }
+
+    Ok(())
+}
+
 /// FUSE filesystem implementation for DFS
 pub struct DfsFilesystem {
     /// Client for communicating with DFS cluster
@@ -1712,11 +1776,43 @@ impl Filesystem for DfsFilesystem {
 
                 // Handle different write patterns:
                 // 1. Sequential appends (offset == current_size) → use buffering for performance
-                // 2. Overwrites (offset < current_size) → use buffering for consistency
+                // 2. Overwrites (offset < current_size) → flush buffer first, then fall through to RMW
                 // 3. Sparse writes (offset > current_size) → write directly with hole support
                 let is_sequential_append = offset_usize == current_size;
                 let is_overwrite = offset_usize < current_size;
                 let is_sparse_write = offset_usize > current_size;
+
+                if is_overwrite && write_buffers.contains_key(&ino) {
+                    // OVERWRITE with pending buffer: flush the buffer first so the read-modify-write
+                    // below sees the complete committed file. Without this, the splice recalculates
+                    // metadata.size = sum(flushed chunks) which discards the buffered tail → file truncation.
+                    info!("Overwrite at offset={} with buffered data (current_size={}): flushing buffer first",
+                          offset_usize, current_size);
+                    // Build a temporary flush helper with the same Arc-cloned state
+                    let flush_client = client.clone();
+                    let flush_metadata_cache = metadata_cache.clone();
+                    let flush_write_buffers = write_buffers.clone();
+                    let flush_last_meta = last_metadata_update.clone();
+                    let flush_threshold = self.buffer_flush_threshold;
+                    let flush_counters = write_counters.clone();
+                    if let Err(e) = runtime.block_on(async move {
+                        flush_buffer_standalone(
+                            ino,
+                            &flush_client,
+                            &flush_metadata_cache,
+                            &flush_write_buffers,
+                            &flush_last_meta,
+                            &flush_counters,
+                            flush_threshold,
+                            true,
+                        ).await
+                    }) {
+                        error!("Failed to flush buffer before overwrite for inode {}: {}", ino, e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                    // Fall through to the direct random-write path below (no buffering)
+                }
 
                 if is_sparse_write {
                     // SPARSE WRITE: Writing beyond current file size (creates a hole)

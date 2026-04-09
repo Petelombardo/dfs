@@ -244,9 +244,15 @@ impl HealingManager {
                         }
                     }
                     ReplicationStatus::OverReplicated => {
+                        if healed_count >= self.max_heal_per_cycle {
+                            skipped_count += 1;
+                            continue;
+                        }
                         if let Err(e) = self.cleanup_excess_replicas(&chunk_id).await {
                             warn!("Failed to cleanup over-replicated chunk {}: {}", chunk_id, e);
                         }
+                        healed_count += 1;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                     ReplicationStatus::Ok => {
                         // Remove from pending if it was there

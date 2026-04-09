@@ -2057,9 +2057,12 @@ impl MessageHandler for Server {
                     debug!("Received heartbeat from {} with {} gossip entries",
                            node_info.id, cluster_view.len());
 
-                    // Update sender's heartbeat
-                    if let Err(e) = self.cluster.update_heartbeat(&node_info.id).await {
-                        warn!("Failed to update heartbeat: {}", e);
+                    // Re-add the sender unconditionally. This handles nodes that were
+                    // purged after a long failure — update_heartbeat silently no-ops when
+                    // the node isn't in the map, causing permanent split-brain.
+                    // add_node is idempotent: it updates existing entries and inserts new ones.
+                    if let Err(e) = self.cluster.add_node(node_info).await {
+                        warn!("Failed to add/update heartbeat node: {}", e);
                     }
 
                     // Merge cluster view gossip if present

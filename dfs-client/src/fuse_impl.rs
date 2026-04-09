@@ -814,12 +814,11 @@ impl Filesystem for DfsFilesystem {
     fn getattr(&mut self, _req: &FuseRequest, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         debug!("getattr: ino={}", ino);
 
-        // Clone what we need for async operation
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
+        let last_metadata_update = self.last_metadata_update.clone();
         let runtime = self.runtime.clone();
 
-        // Spawn async task to potentially refresh metadata
         runtime.spawn(async move {
             let metadata = {
                 let cache = metadata_cache.read().unwrap();
@@ -827,32 +826,41 @@ impl Filesystem for DfsFilesystem {
             };
 
             if let Some(mut metadata) = metadata {
-                // For regular files, try to refresh metadata if it might be stale
-                // This allows players to see files growing in real-time
                 if metadata.file_type == FileType::RegularFile {
-                    // Try to get fresh metadata from server
-                    if let Ok(Some(fresh)) = client.get_file_metadata(&metadata.path).await {
-                        // Only update cache if the server version is newer (higher modified_at or
-                        // more chunks). This prevents a getattr racing with an in-progress write
-                        // from overwriting freshly-spliced metadata with a stale server snapshot.
-                        // modified_at is second-precision, so also guard on chunk count and size.
-                        let server_is_newer = fresh.modified_at > metadata.modified_at
-                            || (fresh.modified_at == metadata.modified_at
-                                && (fresh.size > metadata.size
-                                    || fresh.chunks.len() > metadata.chunks.len()));
-                        if server_is_newer {
-                            debug!("getattr: metadata updated: size {} -> {}, chunks {} -> {}",
-                                   metadata.size, fresh.size,
-                                   metadata.chunks.len(), fresh.chunks.len());
-                            metadata_cache.write().unwrap().insert(ino, fresh.clone());
-                            metadata = fresh;
+                    // Only hit the server if the cached metadata is more than 5 seconds old.
+                    // getattr is called every 1s by the kernel for open files; querying the
+                    // server on every call generates a connection storm under playback.
+                    // 5s is fast enough to notice a file growing (live DVR) without flooding.
+                    let should_refresh = {
+                        let last = last_metadata_update.read().unwrap();
+                        match last.get(&ino) {
+                            None => true,
+                            Some(t) => t.elapsed() >= std::time::Duration::from_secs(5),
                         }
+                    };
+
+                    if should_refresh {
+                        if let Ok(Some(fresh)) = client.get_file_metadata(&metadata.path).await {
+                            let server_is_newer = fresh.modified_at > metadata.modified_at
+                                || (fresh.modified_at == metadata.modified_at
+                                    && (fresh.size > metadata.size
+                                        || fresh.chunks.len() > metadata.chunks.len()));
+                            if server_is_newer {
+                                debug!("getattr: metadata updated: size {} -> {}, chunks {} -> {}",
+                                       metadata.size, fresh.size,
+                                       metadata.chunks.len(), fresh.chunks.len());
+                                metadata_cache.write().unwrap().insert(ino, fresh.clone());
+                                metadata = fresh;
+                            }
+                        }
+                        last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
                     }
                 }
 
                 let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
-                // Use very short TTL (1 second) so kernel asks us frequently for growing files
-                reply.attr(&Duration::from_secs(1), &attr);
+                // 5s TTL matches our server refresh rate — no point asking the kernel
+                // to call us more often than we actually refresh from the server.
+                reply.attr(&Duration::from_secs(5), &attr);
             } else {
                 reply.error(libc::ENOENT);
             }

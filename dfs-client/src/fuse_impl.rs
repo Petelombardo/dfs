@@ -1003,7 +1003,28 @@ impl Filesystem for DfsFilesystem {
                 info!("Read at offset {} >= cached size {}, refreshing metadata from server", offset, metadata.size);
 
                 match client.get_file_metadata(&metadata.path).await {
-                    Ok(Some(fresh_metadata)) => {
+                    Ok(Some(mut fresh_metadata)) => {
+                        // If file has grown, also refresh the chunk map from the leader so we
+                        // have accurate replica locations for the new chunks before reading them.
+                        // We compare modified_at: if it changed, the leader has new chunk entries.
+                        let prev_modified_at = metadata.modified_at;
+                        if fresh_metadata.modified_at != prev_modified_at || fresh_metadata.chunk_locations.is_empty() {
+                            match client.get_file_chunk_map(fresh_metadata.id).await {
+                                Ok((locations, _map_modified_at)) => {
+                                    if !locations.is_empty() {
+                                        info!("Refreshed chunk map from leader: {} locations for file {}",
+                                              locations.len(), fresh_metadata.path);
+                                        fresh_metadata.chunk_locations = locations;
+                                        // Invalidate chunk offset cache so it rebuilds with new offsets
+                                        chunk_offset_cache.write().unwrap().remove(&ino);
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Could not refresh chunk map from leader at EOF ({}), using metadata chunk_locations", e);
+                                }
+                            }
+                        }
+
                         // Update cache with fresh metadata
                         metadata_cache.write().unwrap().insert(ino, fresh_metadata.clone());
 
@@ -1221,7 +1242,30 @@ impl Filesystem for DfsFilesystem {
             };
 
             let all_chunks = metadata.chunks.clone();
-            let chunk_locations = metadata.chunk_locations.clone();
+            // If metadata has no chunk_locations (legacy file or first read), fetch the full
+            // chunk map from the leader in one round-trip instead of per-chunk fallback queries.
+            let chunk_locations = if metadata.chunk_locations.is_empty() && !all_chunks.is_empty() {
+                match client.get_file_chunk_map(metadata.id).await {
+                    Ok((locations, _)) if !locations.is_empty() => {
+                        info!("Fetched chunk map from leader: {} locations for {}", locations.len(), metadata.path);
+                        // Cache the locations in metadata so subsequent reads skip this query
+                        let mut updated = metadata.clone();
+                        updated.chunk_locations = locations.clone();
+                        metadata_cache.write().unwrap().insert(ino, updated);
+                        locations
+                    }
+                    Ok(_) => {
+                        debug!("Leader returned empty chunk map for {}, using per-chunk fallback", metadata.path);
+                        metadata.chunk_locations.clone()
+                    }
+                    Err(e) => {
+                        debug!("Could not fetch chunk map from leader for {} ({}), using per-chunk fallback", metadata.path, e);
+                        metadata.chunk_locations.clone()
+                    }
+                }
+            } else {
+                metadata.chunk_locations.clone()
+            };
             let result = client.read_data(&read_hints, &all_chunks, cache_inode, &chunk_locations).await;
 
             let chunk_data = match result {

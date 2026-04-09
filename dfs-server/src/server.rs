@@ -8,6 +8,7 @@ use dfs_common::{
     compute_chunk_hash, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
     Message, NodeId, NodeInfo, Request, Response,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,6 +55,12 @@ pub struct Server {
     /// Prefetch concurrency limiter - prevents prefetch from overwhelming disk I/O
     /// Limits low-priority prefetch operations while allowing unlimited high-priority reads
     prefetch_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// Leader-maintained in-memory chunk map: FileId -> Vec<ChunkLocation>.
+    /// Only the leader serves GetFileChunkMap requests from this map.
+    /// All nodes keep it up-to-date so leadership transitions are seamless.
+    /// Updated on every write, heal, and chunk-location replication.
+    chunk_map: Arc<RwLock<HashMap<FileId, (Vec<ChunkLocation>, u64)>>>,
 }
 
 impl Server {
@@ -66,9 +73,9 @@ impl Server {
         replication_factor: usize,
         metadata_dir: PathBuf,
     ) -> Self {
-        Self {
+        let server = Self {
             storage,
-            metadata,
+            metadata: metadata.clone(),
             chunker: Arc::new(Chunker::new(chunk_size)),
             cluster,
             client: Arc::new(NetworkClient::new()),
@@ -79,7 +86,114 @@ impl Server {
             // With modern HDDs and read-ahead, parallel reads are efficient
             // Real client reads bypass this limit (high priority)
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            chunk_map: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        // Build the in-memory chunk map from persistent metadata on startup
+        server.rebuild_chunk_map_from_metadata();
+
+        server
+    }
+
+    /// Rebuild the in-memory chunk map by scanning all file metadata.
+    /// Called once at startup; incremental updates happen via chunk_map_update().
+    fn rebuild_chunk_map_from_metadata(&self) {
+        let files = match self.metadata.list_files() {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Failed to list files for chunk map build: {}", e);
+                return;
+            }
+        };
+
+        let chunk_map = self.chunk_map.clone();
+        let metadata = self.metadata.clone();
+
+        tokio::spawn(async move {
+            let mut map = chunk_map.write().await;
+            let mut built = 0usize;
+
+            for file in &files {
+                if file.chunk_locations.is_empty() {
+                    // Legacy file: load chunk locations from individual chunk records
+                    let mut locations = Vec::new();
+                    let mut file_offset = 0u64;
+                    let mut ok = true;
+                    for (&chunk_id, &size) in file.chunks.iter().zip(file.chunk_sizes.iter()) {
+                        match metadata.get_chunk_location(&chunk_id) {
+                            Ok(Some(loc)) => {
+                                let mut loc = loc;
+                                if loc.file_offset.is_none() {
+                                    loc.file_offset = Some(file_offset);
+                                }
+                                file_offset += loc.size as u64;
+                                locations.push(loc);
+                            }
+                            _ => { ok = false; break; }
+                        }
+                        let _ = size; // suppress unused warning
+                    }
+                    if ok && !locations.is_empty() {
+                        map.insert(file.id, (locations, file.modified_at));
+                        built += 1;
+                    }
+                } else {
+                    map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
+                    built += 1;
+                }
+            }
+
+            info!("Chunk map built: {} / {} files indexed", built, files.len());
+        });
+    }
+
+    /// Update the chunk map for a single file — called after every metadata write or heal.
+    async fn chunk_map_update(&self, metadata: &FileMetadata) {
+        let locations = if !metadata.chunk_locations.is_empty() {
+            metadata.chunk_locations.clone()
+        } else {
+            // Legacy path: resolve locations from chunk records
+            let mut locations = Vec::new();
+            let mut file_offset = 0u64;
+            for &chunk_id in &metadata.chunks {
+                match self.metadata.get_chunk_location(&chunk_id) {
+                    Ok(Some(mut loc)) => {
+                        if loc.file_offset.is_none() {
+                            loc.file_offset = Some(file_offset);
+                        }
+                        file_offset += loc.size as u64;
+                        locations.push(loc);
+                    }
+                    _ => break,
+                }
+            }
+            locations
+        };
+
+        if !locations.is_empty() {
+            let mut map = self.chunk_map.write().await;
+            map.insert(metadata.id, (locations, metadata.modified_at));
         }
+    }
+
+    /// Update a single chunk location within the chunk map (used during healing).
+    /// Finds all files that reference this chunk and patches the location in place.
+    async fn chunk_map_update_location(&self, location: &ChunkLocation) {
+        let mut map = self.chunk_map.write().await;
+        for (_, (locs, _)) in map.iter_mut() {
+            for loc in locs.iter_mut() {
+                if loc.chunk_id == location.chunk_id {
+                    *loc = location.clone();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Remove a file from the chunk map (on deletion).
+    async fn chunk_map_remove(&self, file_id: &FileId) {
+        let mut map = self.chunk_map.write().await;
+        map.remove(file_id);
     }
 
     /// Get reference to cluster manager
@@ -167,6 +281,9 @@ impl Server {
             Request::PurgeFileMetadata { path } => self.handle_purge_file_metadata(path).await,
             Request::PurgeFileMetadataById { file_id } => {
                 self.handle_purge_file_metadata_by_id(file_id).await
+            }
+            Request::GetFileChunkMap { file_id } => {
+                self.handle_get_file_chunk_map(file_id).await
             }
 
             _ => Response::Error {
@@ -386,6 +503,8 @@ impl Server {
         // Store metadata locally without re-replicating (to avoid loops)
         match self.metadata.put_file(&metadata) {
             Ok(_) => {
+                // Keep chunk map in sync on all nodes for seamless leader failover
+                self.chunk_map_update(&metadata).await;
                 debug!("Successfully replicated metadata for {}", metadata.path);
                 Response::Ok { data: None }
             }
@@ -465,6 +584,8 @@ impl Server {
         // Store merged location
         match self.metadata.put_chunk_location(&merged_location) {
             Ok(_) => {
+                // Patch the in-memory chunk map so GetFileChunkMap always reflects current replica state
+                self.chunk_map_update_location(&merged_location).await;
                 info!("Successfully replicated chunk location for {} (total nodes: {})",
                       merged_location.chunk_id, merged_location.nodes.len());
                 Response::Ok { data: None }
@@ -1018,6 +1139,9 @@ impl Server {
         // Store metadata locally first
         match self.metadata.put_file(&metadata) {
             Ok(_) => {
+                // Update in-memory chunk map
+                self.chunk_map_update(&metadata).await;
+
                 // Replicate metadata to all other nodes asynchronously with timeout
                 let cluster = self.cluster.clone();
                 let client = self.client.clone();
@@ -1164,6 +1288,9 @@ impl Server {
                 // Delete the file metadata
                 match self.metadata.delete_file(&metadata.id) {
                     Ok(_) => {
+                        // Remove from chunk map
+                        self.chunk_map_remove(&metadata.id).await;
+
                         // Replicate metadata deletion to all other nodes asynchronously
                         let cluster = self.cluster.clone();
                         let client = self.client.clone();
@@ -1272,12 +1399,18 @@ impl Server {
             .count();
         let total_nodes = nodes.len();
         let chunk_size_mb = self.chunker.chunk_size() / (1024 * 1024);
+        let leader_node_id = nodes
+            .iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online)
+            .map(|n| n.id)
+            .min();
 
         Response::ClusterStatus {
             nodes,
             total_nodes,
             healthy_nodes,
             chunk_size_mb,
+            leader_node_id,
         }
     }
 
@@ -1471,6 +1604,23 @@ impl Server {
                     code: ErrorCode::InternalError,
                 }
             }
+        }
+    }
+
+    /// Handle GetFileChunkMap — returns the full chunk location map for a file.
+    /// Served from the in-memory chunk map maintained by all nodes (leader-authoritative).
+    async fn handle_get_file_chunk_map(&self, file_id: FileId) -> Response {
+        let map = self.chunk_map.read().await;
+        match map.get(&file_id) {
+            Some((locations, modified_at)) => Response::FileChunkMap {
+                file_id,
+                locations: locations.clone(),
+                modified_at: *modified_at,
+            },
+            None => Response::Error {
+                message: format!("No chunk map entry for file {}", file_id),
+                code: ErrorCode::NotFound,
+            },
         }
     }
 

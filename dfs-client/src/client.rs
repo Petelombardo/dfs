@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use blake3;
-use dfs_common::{ChunkId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
+use dfs_common::{ChunkId, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -131,6 +131,10 @@ pub struct DfsClient {
     /// Serialization lock for read operations to prevent parallel reads from racing
     /// Write operations remain async and don't acquire this lock
     read_lock: Arc<Mutex<()>>,
+
+    /// Address of the current cluster leader, used to route GetFileChunkMap requests.
+    /// Updated during refresh_cluster_nodes(). Falls back to any node if unknown.
+    leader_addr: Arc<RwLock<Option<SocketAddr>>>,
 }
 
 impl DfsClient {
@@ -261,6 +265,7 @@ impl DfsClient {
             addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
             read_lock: Arc::new(Mutex::new(())),
+            leader_addr: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1364,6 +1369,49 @@ impl DfsClient {
         }
 
         Ok(all_data)
+    }
+
+    /// Query the leader for the full chunk location map of a file.
+    /// Returns (locations, modified_at). Falls back to any node if leader is unknown.
+    pub async fn get_file_chunk_map(&self, file_id: FileId) -> Result<(Vec<dfs_common::ChunkLocation>, u64)> {
+        let target = {
+            let leader = self.leader_addr.read().await;
+            match *leader {
+                Some(addr) => addr,
+                None => {
+                    let nodes = self.cluster_nodes.read().await;
+                    *nodes.first().context("No cluster nodes available")?
+                }
+            }
+        };
+
+        let request = Request::GetFileChunkMap { file_id };
+        let response = self.send_request(target, request).await;
+
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                // Leader may have changed — fall back to first available node
+                warn!("GetFileChunkMap to leader failed ({}), retrying any node", e);
+                let nodes = self.cluster_nodes.read().await.clone();
+                let mut last_err = e;
+                let mut found = None;
+                for addr in &nodes {
+                    if *addr == target { continue; }
+                    match self.send_request(*addr, Request::GetFileChunkMap { file_id }).await {
+                        Ok(r) => { found = Some(r); break; }
+                        Err(e) => { last_err = e; }
+                    }
+                }
+                found.ok_or(last_err)?
+            }
+        };
+
+        match response {
+            Response::FileChunkMap { locations, modified_at, .. } => Ok((locations, modified_at)),
+            Response::Error { message, .. } => anyhow::bail!("GetFileChunkMap error: {}", message),
+            _ => anyhow::bail!("Unexpected response to GetFileChunkMap"),
+        }
     }
 
     /// Query cluster for chunk replica locations (returns node addresses that have this chunk)
@@ -2501,7 +2549,7 @@ impl DfsClient {
             let request = Request::GetClusterStatus;
 
             match self.send_request(*node_addr, request).await {
-                Ok(Response::ClusterStatus { nodes: cluster_nodes, .. }) => {
+                Ok(Response::ClusterStatus { nodes: cluster_nodes, leader_node_id, .. }) => {
                     // Extract online node addresses and populate addr->NodeId mapping
                     let new_addrs: Vec<SocketAddr> = cluster_nodes
                         .iter()
@@ -2517,6 +2565,17 @@ impl DfsClient {
                                 if node.status == dfs_common::NodeStatus::Online {
                                     mapping.insert(node.addr, node.id);
                                 }
+                            }
+                        }
+
+                        // Track the leader address for chunk map queries
+                        if let Some(leader_id) = leader_node_id {
+                            let leader = cluster_nodes.iter()
+                                .find(|n| n.id == leader_id && n.status == dfs_common::NodeStatus::Online)
+                                .map(|n| n.addr);
+                            *self.leader_addr.write().await = leader;
+                            if let Some(addr) = leader {
+                                info!("Leader node: {} ({})", leader_id, addr);
                             }
                         }
 

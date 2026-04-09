@@ -206,6 +206,12 @@ pub enum Request {
     GetFileInfoById {
         file_id: FileId,
     },
+
+    /// Get the full chunk location map for a file from the leader.
+    /// Only the leader maintains this in-memory map; followers serve chunk data.
+    GetFileChunkMap {
+        file_id: FileId,
+    },
 }
 
 /// Response types
@@ -257,6 +263,9 @@ pub enum Response {
         total_nodes: usize,
         healthy_nodes: usize,
         chunk_size_mb: usize,
+        /// NodeId of the current cluster leader (min NodeId among online nodes)
+        #[serde(default)]
+        leader_node_id: Option<NodeId>,
     },
 
     /// Storage statistics response
@@ -296,6 +305,15 @@ pub enum Response {
     FileList {
         files: Vec<FileMetadata>,
         total_count: usize,
+    },
+
+    /// Full chunk location map for a file (leader-served)
+    FileChunkMap {
+        file_id: FileId,
+        /// All chunk locations for the file, in order
+        locations: Vec<ChunkLocation>,
+        /// Server-side modified_at timestamp so client can detect changes
+        modified_at: u64,
     },
 
     /// Prefetch hint acknowledged (best-effort, no guarantee)

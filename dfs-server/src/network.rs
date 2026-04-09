@@ -112,10 +112,24 @@ async fn handle_connection<H: MessageHandler>(
 ) -> Result<()> {
     let mut read_buf = BytesMut::with_capacity(8192); // 8KB buffer (SBC-friendly)
 
+    // Close idle connections after 30s of inactivity so pooled connections from
+    // peers don't accumulate indefinitely on the leader (which receives all healing ops).
+    const IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
     loop {
-        // Read message from stream
-        match read_message(&mut stream, &mut read_buf).await {
-            Ok(Some(envelope)) => {
+        // Read message from stream, with idle timeout
+        let read_result = tokio::time::timeout(
+            IDLE_TIMEOUT,
+            read_message(&mut stream, &mut read_buf),
+        ).await;
+
+        match read_result {
+            Err(_) => {
+                // Idle timeout — close connection to free the fd
+                debug!("Connection from {} idle for {}s, closing", peer_addr, IDLE_TIMEOUT.as_secs());
+                break;
+            }
+            Ok(Ok(Some(envelope))) => {
                 debug!(
                     "Received message from {}: request_id={}",
                     peer_addr, envelope.request_id.0
@@ -130,12 +144,12 @@ async fn handle_connection<H: MessageHandler>(
                     break;
                 }
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 // Connection closed gracefully
                 debug!("Connection closed by {}", peer_addr);
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Error reading from {}: {}", peer_addr, e);
                 break;
             }

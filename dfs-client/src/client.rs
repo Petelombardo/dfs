@@ -739,7 +739,7 @@ impl DfsClient {
                                   chunk_id, location.size, location.nodes.len());
 
                             return client.read_chunk_striped(chunk_id, location, file_offset).await
-                                .map(|data| (idx, chunk_id, file_offset, Arc::new(data)));
+                                .map(|data| (idx, chunk_id, file_offset, Arc::new(data), false));
                         }
                     }
                 }
@@ -837,19 +837,19 @@ impl DfsClient {
                 let mut last_error = None;
                 let mut data = None;
 
+                // Determine if we should use partial read (ReadChunkRange) or full chunk read.
+                // Hoisted out of the retry loop so it's accessible after the loop for caching.
+                let use_partial_read = if let Some(ref hint) = read_hint {
+                    !hint.full_chunk && !is_sequential && hint.offset_in_chunk > 0
+                } else {
+                    false
+                };
+
                 for (i, node_addr) in std::iter::once(&selected_replica)
                     .chain(replicas.iter().filter(|&n| n != &selected_replica))
                     .enumerate()
                 {
                     let read_start = std::time::Instant::now();
-
-                    // Determine if we should use partial read (ReadChunkRange) or full chunk read
-                    // Use partial read ONLY for non-sequential access where we need latter portion of chunk
-                    let use_partial_read = if let Some(ref hint) = read_hint {
-                        !hint.full_chunk && !is_sequential && hint.offset_in_chunk > 0
-                    } else {
-                        false
-                    };
 
                     let result = if use_partial_read {
                         let hint = read_hint.as_ref().unwrap();
@@ -895,7 +895,7 @@ impl DfsClient {
                     last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed for chunk"))
                 })?;
 
-                Ok::<_, anyhow::Error>((idx, chunk_id, file_offset, Arc::new(chunk_data)))
+                Ok::<_, anyhow::Error>((idx, chunk_id, file_offset, Arc::new(chunk_data), use_partial_read))
             })
         }).collect();
 
@@ -905,12 +905,17 @@ impl DfsClient {
         // Process results and update both caches
         let mut fetched_chunks = Vec::new();
         for result in fetch_results {
-            let (idx, chunk_id, file_offset, data_arc) = result
+            let (idx, chunk_id, file_offset, data_arc, was_partial) = result
                 .context("Fetch task panicked")?
                 .context("Failed to fetch chunk")?;
 
-            // Add to both chunk cache and byte-range cache
-            {
+            // Only store FULL chunks in the chunk cache keyed by chunk_id.
+            // A partial read (ReadChunkRange) fetches only a byte slice of the chunk.
+            // Caching that slice under the full chunk ID would corrupt any subsequent
+            // read that expects the complete chunk (e.g. read-modify-write splice).
+            // Partial results are still stored in the byte-range cache below, which
+            // is keyed by (inode, offset) and is safe for partial use.
+            if !was_partial {
                 let mut chunk_cache = self.chunk_cache.lock().await;
                 chunk_cache.put(chunk_id, Arc::clone(&data_arc));
                 debug!("Cached chunk {} ({} bytes)", chunk_id, data_arc.len());

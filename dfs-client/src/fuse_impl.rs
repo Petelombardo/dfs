@@ -702,13 +702,13 @@ impl Filesystem for DfsFilesystem {
             let cache = self.metadata_cache.read().unwrap();
             if let Some(metadata) = cache.get(&ino) {
                 let path = &metadata.path;
-                // SQLite database files need direct I/O to avoid cache coherency issues
+                // .db-shm must NOT use direct I/O: SQLite mmaps it (MAP_SHARED)
+                // for WAL index coordination; FOPEN_DIRECT_IO → ENODEV on mmap.
                 path.ends_with(".db")
                     || path.ends_with(".sqlite")
                     || path.ends_with(".sqlite3")
                     || path.ends_with(".db-wal")
                     || path.ends_with(".db-journal")
-                    || path.ends_with(".db-shm")
             } else {
                 false
             }
@@ -746,10 +746,15 @@ impl Filesystem for DfsFilesystem {
                 if metadata.file_type == FileType::RegularFile {
                     // Try to get fresh metadata from server
                     if let Ok(Some(fresh)) = client.get_file_metadata(&metadata.path).await {
-                        // Always update cache — chunk list may have grown even if size is same
-                        // (e.g. final metadata flush from another writer). This is critical for
-                        // multi-client coherency: theater must see all chunks nanopir3 has flushed.
-                        if fresh.size != metadata.size || fresh.chunks.len() != metadata.chunks.len() {
+                        // Only update cache if the server version is newer (higher modified_at or
+                        // more chunks). This prevents a getattr racing with an in-progress write
+                        // from overwriting freshly-spliced metadata with a stale server snapshot.
+                        // modified_at is second-precision, so also guard on chunk count and size.
+                        let server_is_newer = fresh.modified_at > metadata.modified_at
+                            || (fresh.modified_at == metadata.modified_at
+                                && (fresh.size > metadata.size
+                                    || fresh.chunks.len() > metadata.chunks.len()));
+                        if server_is_newer {
                             debug!("getattr: metadata updated: size {} -> {}, chunks {} -> {}",
                                    metadata.size, fresh.size,
                                    metadata.chunks.len(), fresh.chunks.len());
@@ -1278,20 +1283,33 @@ impl Filesystem for DfsFilesystem {
             };
 
             // SPARSE FILE SUPPORT: Check if we need to handle holes
-            // If chunks are not contiguous, we need to fill holes with zeros
-            let has_holes = if chunks_to_read.len() > 1 {
-                let mut has_gap = false;
-                for i in 0..chunks_to_read.len() - 1 {
-                    let (_, curr_start, curr_size) = chunks_to_read[i];
-                    let (_, next_start, _) = chunks_to_read[i + 1];
-                    if curr_start + curr_size < next_start {
-                        has_gap = true;
-                        break;
+            // Holes can appear: (a) between chunks, (b) before the first chunk
+            // (e.g. shm file truncated to N bytes then written at higher offsets)
+            let has_holes = {
+                // Check for leading hole: first chunk doesn't start at requested offset
+                let leading_hole = if let Some(&(_, first_start, _)) = chunks_to_read.first() {
+                    first_start > offset
+                } else {
+                    false
+                };
+
+                // Check for gaps between consecutive chunks
+                let inter_chunk_gap = if chunks_to_read.len() > 1 {
+                    let mut has_gap = false;
+                    for i in 0..chunks_to_read.len() - 1 {
+                        let (_, curr_start, curr_size) = chunks_to_read[i];
+                        let (_, next_start, _) = chunks_to_read[i + 1];
+                        if curr_start + curr_size < next_start {
+                            has_gap = true;
+                            break;
+                        }
                     }
-                }
-                has_gap
-            } else {
-                false
+                    has_gap
+                } else {
+                    false
+                };
+
+                leading_hole || inter_chunk_gap
             };
 
             let final_data = if has_holes {
@@ -1577,8 +1595,27 @@ impl Filesystem for DfsFilesystem {
 
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
+
+                // For SQLite files: use direct I/O to bypass page cache.
+                // This ensures reads see fresh data (no stale page cache).
+                // EXCEPTION: .db-shm must NOT use direct I/O — SQLite mmaps it
+                // (MAP_SHARED) for WAL index coordination. FOPEN_DIRECT_IO would
+                // cause mmap to return ENODEV → SQLITE_IOERR.
+                // SQLite pre-initializes the shm with sparse writes before mmap,
+                // so the page cache will have valid data when mmap is called.
+                let open_flags = if path.ends_with(".db-wal")
+                    || path.ends_with(".db-journal")
+                    || path.ends_with(".db")
+                    || path.ends_with(".sqlite")
+                    || path.ends_with(".sqlite3")
+                {
+                    fuser::consts::FOPEN_DIRECT_IO
+                } else {
+                    0
+                };
+
                 // ReplyCreate expects: ttl, attr, generation, fh, flags
-                reply.created(&Duration::from_secs(300), &attr, 0, 0, 0); // 5 minutes
+                reply.created(&Duration::from_secs(300), &attr, 0, 0, open_flags);
             }
             Err(e) => {
                 error!("Failed to create file {}: {}", path, e);
@@ -1633,11 +1670,12 @@ impl Filesystem for DfsFilesystem {
 
             // For SQLite database files, disable caching AND buffering to prevent corruption
             // SQLite does read-your-own-writes and needs immediate consistency
+            // .db-shm is excluded: it's mmapped by SQLite and managed via page cache
             let is_sqlite = {
                 let path = &metadata.path;
                 path.ends_with(".db") || path.ends_with(".sqlite") ||
                     path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
-                    path.ends_with(".db-journal") || path.ends_with(".db-shm")
+                    path.ends_with(".db-journal")
             };
             let cache_inode = if is_sqlite { 0 } else { ino };
 
@@ -2182,7 +2220,7 @@ impl Filesystem for DfsFilesystem {
                         let path = &metadata.path;
                         path.ends_with(".db") || path.ends_with(".sqlite") ||
                             path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
-                            path.ends_with(".db-journal") || path.ends_with(".db-shm")
+                            path.ends_with(".db-journal")
                     };
 
                     // Batch metadata updates for non-SQLite files: time-based (every 2 seconds)

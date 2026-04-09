@@ -88,8 +88,9 @@ pub struct DfsClient {
     /// Even if chunk hashes change, we can still cache by file position
     byte_range_cache: Arc<Mutex<LruCache<ByteRangeCacheKey, CachedChunk>>>,
 
-    /// TCP connection pool - maintains one persistent connection per server
-    connection_pool: Arc<Mutex<HashMap<SocketAddr, TcpStream>>>,
+    /// TCP connection pool - maintains up to N idle connections per server
+    /// VecDeque allows concurrent callers to each get their own connection
+    connection_pool: Arc<Mutex<HashMap<SocketAddr, std::collections::VecDeque<TcpStream>>>>,
 
     /// Track chunks currently being prefetched to avoid duplicates
     prefetch_in_flight: Arc<Mutex<HashSet<ChunkId>>>,
@@ -1539,10 +1540,10 @@ impl DfsClient {
         loop {
             attempt += 1;
 
-            // Get or create connection
+            // Get or create connection (pop from per-server VecDeque)
             let stream = {
                 let mut pool = self.connection_pool.lock().await;
-                pool.remove(&server_addr)
+                pool.get_mut(&server_addr).and_then(|q| q.pop_front())
             };
 
             let mut stream = match stream {
@@ -1599,10 +1600,14 @@ impl DfsClient {
 
             match result {
                 Ok((stream, buf)) => {
-                    // Return connection to pool
+                    // Return connection to pool (cap per-server queue at 8 idle connections)
                     {
                         let mut pool = self.connection_pool.lock().await;
-                        pool.insert(server_addr, stream);
+                        let queue = pool.entry(server_addr).or_insert_with(std::collections::VecDeque::new);
+                        if queue.len() < 8 {
+                            queue.push_back(stream);
+                        }
+                        // If queue is full, stream drops here and TCP connection closes
                     }
 
                     // Deserialize response

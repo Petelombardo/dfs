@@ -516,8 +516,12 @@ impl HealingManager {
             return Ok(());
         }
 
-        // Remove the last node in alive order — one per cycle, safe and predictable.
-        let (excess_id, excess_addr) = *alive.last().unwrap();
+        // Remove the replica from the most-utilized node — this naturally rebalances
+        // the cluster over time rather than always shedding from an arbitrary node.
+        let alive_ids: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
+        let excess_id = self.cluster.most_utilized_node(&alive_ids).await
+            .unwrap_or_else(|| alive_ids[alive_ids.len() - 1]);
+        let (_, excess_addr) = *alive.iter().find(|(id, _)| *id == excess_id).unwrap();
 
         info!(
             "Chunk {} over-replicated ({} alive, RF={}): leader instructing node {} to delete excess copy",

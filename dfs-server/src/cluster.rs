@@ -305,6 +305,36 @@ impl ClusterManager {
             .collect()
     }
 
+    /// From a given set of node IDs, return the one with the least available space
+    /// (i.e. most utilized). Used by the leader to pick which excess replica to remove
+    /// during over-replication cleanup — shedding from the fullest node naturally
+    /// rebalances the cluster over time.
+    ///
+    /// Falls back to the last node in the input slice if capacity data is unavailable.
+    pub async fn most_utilized_node(&self, node_ids: &[NodeId]) -> Option<NodeId> {
+        if node_ids.is_empty() {
+            return None;
+        }
+
+        let capacities = self.node_capacities.read().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Pick the node with the smallest available space (most utilized).
+        // Nodes with stale or missing capacity data are treated as moderately utilized.
+        node_ids.iter().copied().min_by_key(|node_id| {
+            if let Some(cap) = capacities.get(node_id) {
+                if cap.total > 0 && now - cap.last_updated < 60 {
+                    return cap.available;
+                }
+            }
+            // No fresh data — assume moderate (sort to middle)
+            u64::MAX / 2
+        })
+    }
+
     /// Update capacity information for a node
     pub async fn update_node_capacity(&self, node_id: NodeId, available: u64, total: u64) {
         let now = SystemTime::now()

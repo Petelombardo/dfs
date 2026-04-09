@@ -345,36 +345,39 @@ impl DfsClient {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed")))
     }
 
-    /// Send a request to a specific node
+    /// Send a request to a specific node, reusing a pooled connection when available.
     async fn send_request(&self, addr: SocketAddr, request: Request) -> Result<Response> {
         debug!("Sending request to {}: {:?}", addr, request);
 
-        // Connect with a short timeout so a dead node doesn't stall the caller
-        let stream = tokio::time::timeout(
-            tokio::time::Duration::from_secs(5),
-            TcpStream::connect(addr),
-        ).await
-            .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
-            .context("Failed to connect to node")?;
-
-        // Create envelope with request ID
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
         let envelope = MessageEnvelope::new(request_id, Message::Request(request));
         let encoded = envelope.to_bytes().context("Failed to serialize message")?;
+
+        // Try pooled connection first; on failure (stale) fall back to a fresh one.
+        let pooled = {
+            let mut pool = self.connection_pool.lock().await;
+            pool.get_mut(&addr).and_then(|q| q.pop_front())
+        };
+
+        let mut stream = match pooled {
+            Some(s) => s,
+            None => tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                TcpStream::connect(addr),
+            ).await
+                .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
+                .context("Failed to connect to node")?,
+        };
 
         // Send and receive with a 30s timeout.  This must cover the full round-trip for large
         // write payloads (4MB+) on a slow HDD node, but should fail quickly enough that the
         // caller can fall back to a different node rather than blocking the write pipeline.
         let io_future = async {
-            let mut stream = stream;
-
-            // Send request
             let len = encoded.len() as u32;
             stream.write_all(&len.to_be_bytes()).await?;
             stream.write_all(&encoded).await?;
             stream.flush().await?;
 
-            // Read response
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await?;
             let len = u32::from_be_bytes(len_buf) as usize;
@@ -384,12 +387,41 @@ impl DfsClient {
             Ok::<Vec<u8>, std::io::Error>(buf)
         };
 
-        let buf = tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            io_future,
-        ).await
-            .map_err(|_| anyhow::anyhow!("Request to {} timed out", addr))?
-            .context("Failed to read response")?;
+        let buf = match tokio::time::timeout(tokio::time::Duration::from_secs(30), io_future).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(_)) | Err(_) => {
+                // Stale pooled connection or timeout — retry once with a fresh connection
+                let mut fresh = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await
+                    .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
+                    .context("Failed to connect to node")?;
+
+                // Reuse the same serialized envelope (idempotent for reads; acceptable for writes)
+                let len = encoded.len() as u32;
+                fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
+                fresh.write_all(&encoded).await.context("write body")?;
+                fresh.flush().await.context("flush")?;
+
+                let mut len_buf = [0u8; 4];
+                fresh.read_exact(&mut len_buf).await.context("read len")?;
+                let rlen = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; rlen];
+                fresh.read_exact(&mut buf).await.context("read body")?;
+                stream = fresh;
+                buf
+            }
+        };
+
+        // Return connection to pool
+        {
+            let mut pool = self.connection_pool.lock().await;
+            let queue = pool.entry(addr).or_insert_with(std::collections::VecDeque::new);
+            if queue.len() < 8 {
+                queue.push_back(stream);
+            }
+        }
 
         let response_envelope = MessageEnvelope::from_bytes(&buf)
             .context("Failed to deserialize response")?;

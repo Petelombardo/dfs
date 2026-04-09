@@ -117,6 +117,12 @@ impl Server {
                 data,
                 checksum,
             } => self.handle_replicate_chunk(chunk_id, data, checksum).await,
+            Request::PushChunkTo { chunk_id, target_addr, leader_id } => {
+                self.handle_push_chunk_to(chunk_id, target_addr, leader_id).await
+            }
+            Request::DeleteChunkReplica { chunk_id, leader_id } => {
+                self.handle_delete_chunk_replica(chunk_id, leader_id).await
+            }
             Request::ReplicateMetadata { metadata } => {
                 self.handle_replicate_metadata(metadata).await
             }
@@ -287,6 +293,90 @@ impl Server {
 
         // Same as write, but this is a replication request
         self.handle_write_chunk(chunk_id, data, checksum).await
+    }
+
+    /// Validate that the given node_id is actually the current leader per our gossip view.
+    /// Returns an error response if validation fails.
+    async fn validate_leader(&self, claimed_leader_id: dfs_common::NodeId) -> Option<Response> {
+        if !self.cluster.is_leader_id(claimed_leader_id).await {
+            let msg = format!(
+                "Rejected: sender {} is not the current leader per this node's cluster view",
+                claimed_leader_id
+            );
+            warn!("{}", msg);
+            Some(Response::Error {
+                message: msg,
+                code: ErrorCode::InvalidRequest,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Handle push-chunk-to request: read chunk locally and send it to target_addr.
+    /// Called by the leader during healing — the leader never touches the data itself.
+    async fn handle_push_chunk_to(&self, chunk_id: ChunkId, target_addr: std::net::SocketAddr, leader_id: dfs_common::NodeId) -> Response {
+        if let Some(err) = self.validate_leader(leader_id).await {
+            return err;
+        }
+        info!("PushChunkTo: pushing chunk {} to {}", chunk_id, target_addr);
+
+        let data = match self.storage.read_chunk(&chunk_id) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("PushChunkTo: chunk {} not found locally: {}", chunk_id, e);
+                return Response::Error {
+                    message: format!("Chunk not found locally: {}", e),
+                    code: ErrorCode::NotFound,
+                };
+            }
+        };
+
+        let request = Request::ReplicateChunk {
+            chunk_id,
+            data,
+            checksum: chunk_id.hash,
+        };
+
+        match self.client.send_message(target_addr, Message::Request(request)).await {
+            Ok(envelope) => {
+                if matches!(envelope.message, Message::Response(Response::Ok { .. })) {
+                    info!("PushChunkTo: chunk {} successfully pushed to {}", chunk_id, target_addr);
+                    Response::Ok { data: None }
+                } else {
+                    warn!("PushChunkTo: target {} rejected chunk {}", target_addr, chunk_id);
+                    Response::Error {
+                        message: format!("Target rejected chunk: {:?}", envelope.message),
+                        code: ErrorCode::IOError,
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("PushChunkTo: failed to push chunk {} to {}: {}", chunk_id, target_addr, e);
+                Response::Error {
+                    message: format!("Failed to push chunk to target: {}", e),
+                    code: ErrorCode::IOError,
+                }
+            }
+        }
+    }
+
+    /// Handle delete-chunk-replica request: leader-initiated excess replica cleanup.
+    async fn handle_delete_chunk_replica(&self, chunk_id: ChunkId, leader_id: dfs_common::NodeId) -> Response {
+        if let Some(err) = self.validate_leader(leader_id).await {
+            return err;
+        }
+        info!("DeleteChunkReplica: deleting excess replica of {} on this node", chunk_id);
+        match self.storage.delete_chunk(&chunk_id) {
+            Ok(_) => Response::Ok { data: None },
+            Err(e) => {
+                warn!("DeleteChunkReplica: failed to delete {}: {}", chunk_id, e);
+                Response::Error {
+                    message: format!("Failed to delete chunk: {}", e),
+                    code: ErrorCode::IOError,
+                }
+            }
+        }
     }
 
     /// Handle replicate metadata request (metadata replication from another node)

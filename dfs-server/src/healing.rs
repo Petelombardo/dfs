@@ -44,6 +44,11 @@ pub struct HealingManager {
 
     /// Chunks pending healing (chunk_id -> failure_detected_at)
     pending_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
+
+    /// Chunks currently being healed by this node — prevents double-healing when
+    /// multiple nodes run the healer concurrently for the same chunk.
+    /// A chunk is inserted before replication begins and removed on completion.
+    in_flight_healing: Arc<RwLock<HashSet<ChunkId>>>,
 }
 
 impl HealingManager {
@@ -73,6 +78,7 @@ impl HealingManager {
             auto_heal,
             max_heal_per_cycle,
             pending_healing: Arc::new(RwLock::new(HashMap::new())),
+            in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -101,19 +107,39 @@ impl HealingManager {
         });
     }
 
-    /// Run periodic healing checker
+    /// Run periodic healing checker — only executes on the cluster leader.
+    ///
+    /// Leadership is derived from the gossip cluster view: the online node with
+    /// the minimum NodeId is the leader. All nodes compute this identically so
+    /// no election protocol is needed. When the leader goes offline the next
+    /// lowest-ID node takes over on its next interval tick.
     async fn run_healing_checker(&self) {
-        let mut check_interval = interval(Duration::from_secs(60)); // Check every minute
+        let mut check_interval = interval(Duration::from_secs(60));
         let mut cleanup_counter = 0;
+        let mut was_leader = false;
 
         loop {
             check_interval.tick().await;
+
+            let is_leader = self.cluster.is_leader().await;
+
+            if is_leader != was_leader {
+                if is_leader {
+                    info!("This node is now the cluster leader — taking over healing coordination");
+                } else {
+                    info!("This node is no longer the cluster leader — yielding healing to new leader");
+                }
+                was_leader = is_leader;
+            }
+
+            if !is_leader {
+                continue;
+            }
 
             if let Err(e) = self.check_and_heal().await {
                 warn!("Healing check error: {}", e);
             }
 
-            // Periodic cleanup of stale pending_healing entries (every 10 minutes)
             cleanup_counter += 1;
             if cleanup_counter >= 10 {
                 cleanup_counter = 0;
@@ -180,18 +206,19 @@ impl HealingManager {
         }
     }
 
-    /// Check all chunks and heal under-replicated ones
+    /// Check all chunks and heal under-replicated ones.
+    /// As leader, iterates over ALL chunk IDs known in metadata — not just local
+    /// ones — so it can coordinate healing regardless of where the data lives.
     async fn check_and_heal(&self) -> Result<()> {
         debug!("Running healing check");
 
-        // Get all local chunks
-        let local_chunks = self.storage.list_chunks()?;
+        let all_chunks = self.metadata.list_all_chunk_ids()?;
 
         let mut healed_count = 0;
         let mut pending_count = 0;
         let mut skipped_count = 0;
 
-        for chunk_id in local_chunks {
+        for chunk_id in all_chunks {
             // Enforce healing window: stop if we've healed enough chunks this cycle
             if healed_count >= self.max_heal_per_cycle {
                 skipped_count += 1;
@@ -213,11 +240,9 @@ impl HealingManager {
                         }
                     }
                     ReplicationStatus::OverReplicated => {
-                        // DISABLED: Cleanup is not implemented and causes massive log spam
-                        // with 100k+ chunks
-                        // if let Err(e) = self.cleanup_excess_replicas(&chunk_id).await {
-                        //     warn!("Failed to cleanup chunk {}: {}", chunk_id, e);
-                        // }
+                        if let Err(e) = self.cleanup_excess_replicas(&chunk_id).await {
+                            warn!("Failed to cleanup over-replicated chunk {}: {}", chunk_id, e);
+                        }
                     }
                     ReplicationStatus::Ok => {
                         // Remove from pending if it was there
@@ -316,186 +341,224 @@ impl HealingManager {
         }
     }
 
-    /// Heal an under-replicated chunk
+    /// Heal an under-replicated chunk.
+    ///
+    /// Only called on the leader node. The leader coordinates the repair by
+    /// instructing a source node (one that already holds the chunk) to push
+    /// a copy directly to the target node — the leader never proxies the data.
     async fn heal_chunk(&self, chunk_id: &ChunkId) -> Result<()> {
-        info!("Healing under-replicated chunk: {}", chunk_id);
+        // In-flight guard: prevents re-entrant healing within this leader's process
+        // (shouldn't happen given the sequential loop, but cheap insurance).
+        {
+            let mut in_flight = self.in_flight_healing.write().await;
+            if in_flight.contains(chunk_id) {
+                debug!("Chunk {} heal already in-flight, skipping", chunk_id);
+                return Ok(());
+            }
+            in_flight.insert(*chunk_id);
+        }
 
-        // Get current location
+        let result = self.do_heal_chunk(chunk_id).await;
+        self.in_flight_healing.write().await.remove(chunk_id);
+        result
+    }
+
+    async fn do_heal_chunk(&self, chunk_id: &ChunkId) -> Result<()> {
+        info!("Leader healing under-replicated chunk: {}", chunk_id);
+
         let location = self
             .metadata
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
-        // Find alive nodes
-        let mut alive_nodes = Vec::new();
+        // Build alive node list with their addresses
+        let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
         for node_id in &location.nodes {
-            if let Some(node_info) = self.cluster.get_node(node_id).await {
-                if node_info.status == dfs_common::NodeStatus::Online {
-                    alive_nodes.push(*node_id);
+            if let Some(info) = self.cluster.get_node(node_id).await {
+                if info.status == dfs_common::NodeStatus::Online {
+                    alive.push((*node_id, info.addr));
                 }
             }
         }
 
-        if alive_nodes.is_empty() {
+        if alive.is_empty() {
             anyhow::bail!("No alive nodes have chunk {}", chunk_id);
         }
 
-        // Read chunk data (from local or remote)
-        let chunk_data = if self.storage.has_chunk(chunk_id) {
-            self.storage.read_chunk(chunk_id)?
-        } else {
-            // Would need to fetch from remote - for now bail
-            anyhow::bail!("Chunk not available locally for healing");
-        };
-
-        // Determine target nodes for additional replicas
-        let needed_replicas = self.replication_factor.saturating_sub(alive_nodes.len());
-
-        if needed_replicas == 0 {
-            // Already have enough replicas
+        let needed = self.replication_factor.saturating_sub(alive.len());
+        if needed == 0 {
             self.pending_healing.write().await.remove(chunk_id);
             return Ok(());
         }
 
-        // Get candidate nodes using capacity-aware placement
-        // This matches how writes work, so healing won't fight against placement decisions
-        let candidate_nodes = self
+        // Select target nodes: capacity-aware candidates that don't already hold the chunk
+        let alive_ids: HashSet<NodeId> = alive.iter().map(|(id, _)| *id).collect();
+        let candidates = self
             .cluster
-            .get_nodes_with_capacity_awareness(chunk_id, self.replication_factor + needed_replicas)
+            .get_nodes_with_capacity_awareness(chunk_id, self.replication_factor + needed)
             .await;
-
-        // Find nodes that don't have the chunk yet
-        let alive_set: HashSet<_> = alive_nodes.iter().copied().collect();
-        let new_targets: Vec<_> = candidate_nodes
+        let targets: Vec<NodeId> = candidates
             .into_iter()
-            .filter(|n| !alive_set.contains(n))
-            .take(needed_replicas)
+            .filter(|n| !alive_ids.contains(n))
+            .take(needed)
             .collect();
 
-        if new_targets.is_empty() {
-            warn!("No suitable nodes found for re-replication of {}", chunk_id);
+        if targets.is_empty() {
+            warn!("No suitable target nodes for healing chunk {}", chunk_id);
             return Ok(());
         }
 
-        // Replicate to new nodes
-        let mut replicated_count = 0;
+        // Pick the source node: prefer local node (no network hop for the read),
+        // otherwise use the first alive node.
+        let local_id = self.cluster.local_node_id();
+        let source = if alive_ids.contains(&local_id) {
+            alive.iter().find(|(id, _)| *id == local_id).copied()
+        } else {
+            alive.first().copied()
+        };
+        let (source_id, source_addr) = source.ok_or_else(|| anyhow::anyhow!("No source node"))?;
 
-        for node_id in &new_targets {
-            if let Some(node_info) = self.cluster.get_node(node_id).await {
+        let mut replicated = Vec::new();
+
+        for target_id in &targets {
+            if let Some(target_info) = self.cluster.get_node(target_id).await {
                 info!(
-                    "Replicating chunk {} to node {} ({})",
-                    chunk_id, node_id, node_info.addr
+                    "Healing chunk {}: instructing node {} to push to node {} ({})",
+                    chunk_id, source_id, target_id, target_info.addr
                 );
 
-                // Send replication request
-                let request = Request::ReplicateChunk {
+                let request = Request::PushChunkTo {
                     chunk_id: *chunk_id,
-                    data: chunk_data.clone(),
-                    checksum: chunk_id.hash,
+                    target_addr: target_info.addr,
+                    leader_id: local_id,
                 };
 
-                match self.client.send_message(node_info.addr, Message::Request(request)).await {
-                    Ok(response) => {
-                        if matches!(response.message, Message::Response(Response::Ok { .. })) {
-                            replicated_count += 1;
-                            info!("Successfully replicated chunk {} to node {}", chunk_id, node_id);
-                        } else {
-                            warn!("Failed to replicate chunk {} to node {}: unexpected response", chunk_id, node_id);
-                        }
+                match self.client.send_message(source_addr, Message::Request(request)).await {
+                    Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
+                        info!("Chunk {} successfully pushed from {} to {}", chunk_id, source_id, target_id);
+                        replicated.push(*target_id);
+                    }
+                    Ok(envelope) => {
+                        warn!("Chunk {} push from {} to {} failed: {:?}", chunk_id, source_id, target_id, envelope.message);
                     }
                     Err(e) => {
-                        warn!("Failed to replicate chunk {} to node {}: {}", chunk_id, node_id, e);
+                        warn!("Chunk {} push from {} to {} error: {}", chunk_id, source_id, target_id, e);
                     }
                 }
             }
         }
 
-        if replicated_count > 0 {
-            info!(
-                "Healed chunk {}: added {} replicas",
-                chunk_id, replicated_count
-            );
+        if !replicated.is_empty() {
+            info!("Healed chunk {}: added {} replicas", chunk_id, replicated.len());
 
-            // Update metadata with new node list
-            let mut updated_nodes = alive_nodes.clone();
-            updated_nodes.extend(new_targets.iter().take(replicated_count));
+            let mut updated_nodes: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
+            updated_nodes.extend(replicated);
 
             let updated_location = ChunkLocation {
                 chunk_id: *chunk_id,
                 nodes: updated_nodes,
                 size: location.size,
                 checksum: location.checksum,
-                file_offset: location.file_offset,  // Preserve existing file offset
+                file_offset: location.file_offset,
             };
 
             if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
-                warn!("Failed to update chunk location metadata: {}", e);
+                warn!("Failed to update chunk location after healing {}: {}", chunk_id, e);
             } else {
-                // Replicate updated chunk location to all nodes
-                info!("Replicating updated chunk location metadata for {} to all nodes", chunk_id);
-
-                let nodes = self.cluster.get_all_nodes().await;
-                let local_id = self.cluster.local_node_id();
-
-                for node in nodes {
-                    // Skip self and offline nodes
-                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                        continue;
-                    }
-
-                    let request = Request::ReplicateChunkLocation {
-                        location: updated_location.clone(),
-                    };
-
-                    if let Err(e) = self.client.send_message(node.addr, Message::Request(request)).await {
-                        warn!("Failed to replicate chunk location to node {}: {}", node.id, e);
-                    }
-
-                    // Small delay to avoid overwhelming the system with connection creations
-                    // This prevents file descriptor exhaustion during mass healing
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                }
+                self.broadcast_chunk_location(&updated_location).await;
             }
 
-            // Remove from pending
             self.pending_healing.write().await.remove(chunk_id);
         }
 
         Ok(())
     }
 
-    /// Cleanup excess replicas
-    async fn cleanup_excess_replicas(&self, chunk_id: &ChunkId) -> Result<()> {
-        debug!("Cleaning up over-replicated chunk: {}", chunk_id);
+    /// Broadcast an updated chunk location to all online peers.
+    async fn broadcast_chunk_location(&self, location: &ChunkLocation) {
+        let nodes = self.cluster.get_all_nodes().await;
+        let local_id = self.cluster.local_node_id();
+        for node in nodes {
+            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+            let request = Request::ReplicateChunkLocation { location: location.clone() };
+            if let Err(e) = self.client.send_message(node.addr, Message::Request(request)).await {
+                warn!("Failed to broadcast chunk location {} to node {}: {}", location.chunk_id, node.id, e);
+            }
+        }
+    }
 
+    /// Remove one excess replica per cycle.
+    ///
+    /// Only called on the leader. The leader picks the last node in the alive list
+    /// as the one to remove — one per cycle, so over-replication of N drains in N
+    /// cycles. The leader sends a DeleteChunk to the excess node and then updates
+    /// and broadcasts the new chunk location metadata.
+    async fn cleanup_excess_replicas(&self, chunk_id: &ChunkId) -> Result<()> {
         let location = self
             .metadata
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
-        // Count alive replicas
-        let mut alive_nodes = Vec::new();
+        // Collect alive nodes in stable (location.nodes) order
+        let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
         for node_id in &location.nodes {
-            if let Some(node_info) = self.cluster.get_node(node_id).await {
-                if node_info.status == dfs_common::NodeStatus::Online {
-                    alive_nodes.push(*node_id);
+            if let Some(info) = self.cluster.get_node(node_id).await {
+                if info.status == dfs_common::NodeStatus::Online {
+                    alive.push((*node_id, info.addr));
                 }
             }
         }
 
-        let excess = alive_nodes.len().saturating_sub(self.replication_factor);
+        let excess = alive.len().saturating_sub(self.replication_factor);
+        if excess == 0 {
+            return Ok(());
+        }
 
-        if excess > 0 {
-            info!(
-                "Chunk {} has {} excess replicas, cleaning up",
-                chunk_id, excess
-            );
+        // Remove the last node in alive order — one per cycle, safe and predictable.
+        let (excess_id, excess_addr) = *alive.last().unwrap();
 
-            // Remove excess replicas (keep the first N)
-            for node_id in alive_nodes.iter().skip(self.replication_factor) {
-                debug!("Would remove chunk {} from node {}", chunk_id, node_id);
-                // Actual deletion would use NetworkClient
+        info!(
+            "Chunk {} over-replicated ({} alive, RF={}): leader instructing node {} to delete excess copy",
+            chunk_id, alive.len(), self.replication_factor, excess_id
+        );
+
+        let local_id = self.cluster.local_node_id();
+        let request = Request::DeleteChunkReplica { chunk_id: *chunk_id, leader_id: local_id };
+        match self.client.send_message(excess_addr, Message::Request(request)).await {
+            Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
+                info!("Node {} deleted excess copy of chunk {}", excess_id, chunk_id);
             }
+            Ok(envelope) => {
+                warn!("Node {} failed to delete chunk {}: {:?}", excess_id, chunk_id, envelope.message);
+                return Ok(()); // Don't update metadata if delete failed
+            }
+            Err(e) => {
+                warn!("Failed to contact node {} for chunk {} deletion: {}", excess_id, chunk_id, e);
+                return Ok(());
+            }
+        }
+
+        // Update metadata: remove the excess node
+        let updated_nodes: Vec<NodeId> = alive.iter()
+            .map(|(id, _)| *id)
+            .filter(|id| *id != excess_id)
+            .collect();
+
+        let updated_location = ChunkLocation {
+            chunk_id: *chunk_id,
+            nodes: updated_nodes,
+            size: location.size,
+            checksum: location.checksum,
+            file_offset: location.file_offset,
+        };
+
+        if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
+            warn!("Failed to update chunk location after cleanup of {}: {}", chunk_id, e);
+        } else {
+            self.broadcast_chunk_location(&updated_location).await;
+            info!("Excess replica cleanup complete for chunk {}", chunk_id);
         }
 
         Ok(())

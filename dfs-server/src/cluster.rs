@@ -188,6 +188,36 @@ impl ClusterManager {
         nodes.values().cloned().collect()
     }
 
+    /// Returns true if this node is the current cluster leader.
+    ///
+    /// Leader = the online node with the minimum NodeId. Every node computes this
+    /// independently from its gossip view — no election protocol needed. Leadership
+    /// transfers automatically when the current leader goes offline.
+    ///
+    /// The leader is the sole node responsible for healing and cleanup decisions.
+    pub async fn is_leader(&self) -> bool {
+        let nodes = self.nodes.read().await;
+        let leader_id = nodes
+            .values()
+            .filter(|n| n.status == NodeStatus::Online)
+            .map(|n| n.id)
+            .min();
+        leader_id == Some(self.local_node_id)
+    }
+
+    /// Returns true if the given node_id is the current leader per this node's gossip view.
+    /// Used to validate incoming healing instructions — if the sender claims to be leader
+    /// but our view disagrees, we reject the instruction to prevent split-brain execution.
+    pub async fn is_leader_id(&self, node_id: NodeId) -> bool {
+        let nodes = self.nodes.read().await;
+        let leader_id = nodes
+            .values()
+            .filter(|n| n.status == NodeStatus::Online)
+            .map(|n| n.id)
+            .min();
+        leader_id == Some(node_id)
+    }
+
     /// Get online nodes count
     pub async fn online_node_count(&self) -> usize {
         let nodes = self.nodes.read().await;

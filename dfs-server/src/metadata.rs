@@ -258,6 +258,21 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// List all chunk IDs known in metadata (for leader-coordinated healing).
+    /// Returns every chunk ID that has a location record, regardless of which
+    /// node holds it locally.
+    pub fn list_all_chunk_ids(&self) -> Result<Vec<dfs_common::ChunkId>> {
+        let prefix = b"chunk:";
+        let mut ids = Vec::new();
+        for item in self.db.scan_prefix(prefix) {
+            let (_, value) = item?;
+            if let Ok(location) = bincode::deserialize::<ChunkLocation>(&value) {
+                ids.push(location.chunk_id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// Get chunk location information
     pub fn get_chunk_location(&self, chunk_id: &dfs_common::ChunkId) -> Result<Option<ChunkLocation>> {
         let key = self.chunk_key(chunk_id);

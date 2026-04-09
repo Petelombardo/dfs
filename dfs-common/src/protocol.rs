@@ -47,6 +47,14 @@ pub enum Request {
         chunk_id: ChunkId,
     },
 
+    /// Delete an excess chunk replica — leader-coordinated cleanup only.
+    /// leader_id: the NodeId of the node issuing this instruction — recipient
+    /// validates that the sender is actually the current leader before executing.
+    DeleteChunkReplica {
+        chunk_id: ChunkId,
+        leader_id: NodeId,
+    },
+
     /// Check if a chunk exists
     HasChunk {
         chunk_id: ChunkId,
@@ -108,6 +116,17 @@ pub enum Request {
         chunk_id: ChunkId,
         data: Vec<u8>,
         checksum: [u8; 32],
+    },
+
+    /// Instruct this node to push a chunk it holds to a target node.
+    /// Used by the leader to coordinate healing without proxying data through itself.
+    /// The receiving node reads the chunk locally and sends ReplicateChunk to target_addr.
+    /// leader_id: the NodeId of the node issuing this instruction — recipient validates
+    /// that the sender is actually the current leader before executing.
+    PushChunkTo {
+        chunk_id: ChunkId,
+        target_addr: std::net::SocketAddr,
+        leader_id: NodeId,
     },
 
     /// Replicate metadata to this node (internal cluster operation)

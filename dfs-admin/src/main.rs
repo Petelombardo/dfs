@@ -293,14 +293,24 @@ async fn handle_cluster_command(
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
+                        // Leader = online node with minimum NodeId (same logic as server)
+                        let leader_id = nodes.iter()
+                            .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                            .map(|n| n.id)
+                            .min();
+
                         println!("DFS Cluster Status");
                         println!("==================");
                         println!("Total Nodes:   {}", total_nodes);
                         println!("Healthy Nodes: {}", healthy_nodes);
+                        if let Some(lid) = leader_id {
+                            let lid_str = lid.to_string();
+                            println!("Leader:        {}", &lid_str[..8.min(lid_str.len())]);
+                        }
                         println!();
                         println!("Nodes:");
-                        println!("{:<10} {:<40} {:<20} {:<12} {}", "Short ID", "ID", "Address", "Status", "Last Heartbeat");
-                        println!("{}", "-".repeat(107));
+                        println!("{:<10} {:<40} {:<20} {:<12} {:<8} {}", "Short ID", "ID", "Address", "Status", "Role", "Last Heartbeat");
+                        println!("{}", "-".repeat(115));
 
                         for node in nodes {
                             let id_str = node.id.to_string();
@@ -312,14 +322,16 @@ async fn handle_cluster_command(
                                 dfs_common::NodeStatus::Failed => format!("✗ {}", status_str),
                                 dfs_common::NodeStatus::Leaving => format!("← {}", status_str),
                             };
+                            let role = if Some(node.id) == leader_id { "LEADER" } else { "follower" };
                             let now = dfs_common::types::current_timestamp();
                             let seconds_ago = now.saturating_sub(node.last_heartbeat);
                             println!(
-                                "{:<10} {:<40} {:<20} {:<12} {}s ago",
+                                "{:<10} {:<40} {:<20} {:<12} {:<8} {}s ago",
                                 short_id,
                                 id_str,
                                 node.addr,
                                 status_display,
+                                role,
                                 seconds_ago
                             );
                         }

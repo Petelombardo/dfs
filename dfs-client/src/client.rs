@@ -270,7 +270,9 @@ impl DfsClient {
     }
 
     /// Check if a path represents a SQLite database file
-    /// These files require special handling for read-after-write consistency
+    /// These files require special handling for read-after-write consistency.
+    /// Matches .db, .sqlite, .sqlite3 and their WAL/journal/shm sidecars,
+    /// plus SQLite temp files like gravity.db_temp (pihole pattern).
     fn is_sqlite_file(path: &str) -> bool {
         path.ends_with(".db")
             || path.ends_with(".sqlite")
@@ -278,6 +280,9 @@ impl DfsClient {
             || path.ends_with(".db-wal")
             || path.ends_with(".db-journal")
             || path.ends_with(".db-shm")
+            || path.ends_with(".db_temp")
+            || path.ends_with(".sqlite_temp")
+            || path.ends_with(".sqlite3_temp")
     }
 
     /// Get next node address (round-robin)

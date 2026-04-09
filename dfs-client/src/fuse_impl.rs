@@ -16,6 +16,35 @@ use tracing::{debug, error, info, warn};
 use crate::client::DfsClient;
 use crate::locks::LockManager;
 
+/// Returns true if the path is a SQLite database or one of its sidecar/temp files.
+/// Used to decide: direct I/O mode, write buffering bypass, immediate metadata flush.
+/// Matches .db/.sqlite/.sqlite3 and their -wal/-journal/-shm sidecars,
+/// plus _temp variants (e.g. gravity.db_temp used by pihole during gravity updates).
+fn is_sqlite_path(path: &str) -> bool {
+    path.ends_with(".db")
+        || path.ends_with(".sqlite")
+        || path.ends_with(".sqlite3")
+        || path.ends_with(".db-wal")
+        || path.ends_with(".db-journal")
+        || path.ends_with(".db-shm")
+        || path.ends_with(".db_temp")
+        || path.ends_with(".sqlite_temp")
+        || path.ends_with(".sqlite3_temp")
+}
+
+/// Same as is_sqlite_path but excludes .db-shm, which must NOT use FOPEN_DIRECT_IO
+/// because SQLite mmaps it (MAP_SHARED) for WAL index coordination.
+fn is_sqlite_direct_io(path: &str) -> bool {
+    path.ends_with(".db")
+        || path.ends_with(".sqlite")
+        || path.ends_with(".sqlite3")
+        || path.ends_with(".db-wal")
+        || path.ends_with(".db-journal")
+        || path.ends_with(".db_temp")
+        || path.ends_with(".sqlite_temp")
+        || path.ends_with(".sqlite3_temp")
+}
+
 /// Buffered write data for a single file
 #[derive(Clone)]
 struct WriteBuffer {
@@ -701,14 +730,7 @@ impl Filesystem for DfsFilesystem {
         let is_sqlite = {
             let cache = self.metadata_cache.read().unwrap();
             if let Some(metadata) = cache.get(&ino) {
-                let path = &metadata.path;
-                // .db-shm must NOT use direct I/O: SQLite mmaps it (MAP_SHARED)
-                // for WAL index coordination; FOPEN_DIRECT_IO → ENODEV on mmap.
-                path.ends_with(".db")
-                    || path.ends_with(".sqlite")
-                    || path.ends_with(".sqlite3")
-                    || path.ends_with(".db-wal")
-                    || path.ends_with(".db-journal")
+                is_sqlite_direct_io(&metadata.path)
             } else {
                 false
             }
@@ -1232,14 +1254,7 @@ impl Filesystem for DfsFilesystem {
             // This prevents stale cached data from causing corruption
             let cache_inode = {
                 let path = &metadata.path;
-                let is_sqlite = path.ends_with(".db")
-                    || path.ends_with(".sqlite")
-                    || path.ends_with(".sqlite3")
-                    || path.ends_with(".db-wal")
-                    || path.ends_with(".db-journal")
-                    || path.ends_with(".db-shm");
-
-                if is_sqlite {
+                if is_sqlite_path(path) {
                     0 // Disable caching for SQLite files
                 } else {
                     ino // Enable caching for other files
@@ -1603,12 +1618,7 @@ impl Filesystem for DfsFilesystem {
                 // cause mmap to return ENODEV → SQLITE_IOERR.
                 // SQLite pre-initializes the shm with sparse writes before mmap,
                 // so the page cache will have valid data when mmap is called.
-                let open_flags = if path.ends_with(".db-wal")
-                    || path.ends_with(".db-journal")
-                    || path.ends_with(".db")
-                    || path.ends_with(".sqlite")
-                    || path.ends_with(".sqlite3")
-                {
+                let open_flags = if is_sqlite_direct_io(&path) {
                     fuser::consts::FOPEN_DIRECT_IO
                 } else {
                     0
@@ -1671,12 +1681,7 @@ impl Filesystem for DfsFilesystem {
             // For SQLite database files, disable caching AND buffering to prevent corruption
             // SQLite does read-your-own-writes and needs immediate consistency
             // .db-shm is excluded: it's mmapped by SQLite and managed via page cache
-            let is_sqlite = {
-                let path = &metadata.path;
-                path.ends_with(".db") || path.ends_with(".sqlite") ||
-                    path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
-                    path.ends_with(".db-journal")
-            };
+            let is_sqlite = is_sqlite_path(&metadata.path);
             let cache_inode = if is_sqlite { 0 } else { ino };
 
             // Write-behind buffering: buffer sequential appends in memory
@@ -2216,12 +2221,7 @@ impl Filesystem for DfsFilesystem {
                         .as_secs();
 
                     // Check if this is a SQLite database file - they need immediate metadata updates
-                    let is_sqlite_db = {
-                        let path = &metadata.path;
-                        path.ends_with(".db") || path.ends_with(".sqlite") ||
-                            path.ends_with(".sqlite3") || path.ends_with(".db-wal") ||
-                            path.ends_with(".db-journal")
-                    };
+                    let is_sqlite_db = is_sqlite_path(&metadata.path);
 
                     // Batch metadata updates for non-SQLite files: time-based (every 2 seconds)
                     // For SQLite files: ALWAYS update immediately to prevent corruption

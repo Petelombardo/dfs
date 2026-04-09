@@ -700,16 +700,10 @@ async fn send_heartbeat_message(
     stream.write_all(&encoded).await?;
     stream.flush().await?;
 
-    // Read and discard the response so the server-side handle_connection loop sees the
-    // exchange complete and can close cleanly. Without this the accepted socket on the
-    // remote end sits open until the 30s idle timeout, accumulating thousands of fds.
-    let mut len_buf = [0u8; 4];
-    let _ = stream.read_exact(&mut len_buf).await;
-    let resp_len = u32::from_be_bytes(len_buf) as usize;
-    if resp_len < 1024 * 1024 {  // sanity cap
-        let mut resp_buf = vec![0u8; resp_len];
-        let _ = stream.read_exact(&mut resp_buf).await;
-    }
+    // Shut down the write half so the server sees EOF immediately and exits
+    // handle_connection without waiting for the idle timeout. We don't need
+    // the response — heartbeats are fire-and-forget.
+    let _ = stream.shutdown().await;
 
     Ok(())
 }

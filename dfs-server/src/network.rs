@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use bytes::{Buf, BytesMut};
 use dfs_common::{Message, MessageEnvelope, Request, RequestId, Response, ErrorCode, ClusterMessage};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 /// Handler trait for processing messages
@@ -227,10 +228,13 @@ async fn process_message<H: MessageHandler>(
 }
 
 /// Network client for sending requests to other nodes
-/// Maintains connection pool for efficiency
+/// Maintains a per-peer connection pool to avoid opening a new TCP connection
+/// for every request (which exhausts file descriptors under heavy healing/replication load).
 pub struct NetworkClient {
     /// Request ID counter
     next_request_id: Arc<AtomicU64>,
+    /// Idle connection pool: peer addr -> queue of reusable TcpStreams (cap 4 per peer)
+    pool: Arc<Mutex<HashMap<SocketAddr, VecDeque<TcpStream>>>>,
 }
 
 impl NetworkClient {
@@ -238,6 +242,7 @@ impl NetworkClient {
     pub fn new() -> Self {
         Self {
             next_request_id: Arc::new(AtomicU64::new(1)),
+            pool: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -250,15 +255,36 @@ impl NetworkClient {
         let request_id = self.next_request_id();
         let envelope = MessageEnvelope::new(request_id, message);
 
-        // Connect to target
-        let mut stream = TcpStream::connect(target)
-            .await
-            .with_context(|| format!("Failed to connect to {}", target))?;
+        // Try a pooled connection first; fall back to a fresh one if the pool is empty
+        // or the connection has gone stale (detected by write/read failure).
+        let stream = {
+            let mut pool = self.pool.lock().await;
+            pool.get_mut(&target).and_then(|q| q.pop_front())
+        };
 
-        debug!("Connected to {}, sending message", target);
+        let mut stream = match stream {
+            Some(s) => {
+                debug!("Reusing pooled connection to {}", target);
+                s
+            }
+            None => {
+                debug!("Connecting to {}", target);
+                TcpStream::connect(target)
+                    .await
+                    .with_context(|| format!("Failed to connect to {}", target))?
+            }
+        };
 
         // Send message
-        write_message(&mut stream, &envelope).await?;
+        if let Err(e) = write_message(&mut stream, &envelope).await {
+            // Stale pooled connection — open a fresh one and retry once
+            debug!("Pooled connection to {} failed ({}), retrying with new connection", target, e);
+            let mut fresh = TcpStream::connect(target)
+                .await
+                .with_context(|| format!("Failed to reconnect to {}", target))?;
+            write_message(&mut fresh, &envelope).await?;
+            stream = fresh;
+        }
 
         // Read response
         let mut read_buf = BytesMut::with_capacity(8192);
@@ -267,6 +293,15 @@ impl NetworkClient {
             .context("Connection closed before receiving response")?;
 
         debug!("Received response from {}", target);
+
+        // Return connection to pool (cap 4 idle per peer)
+        {
+            let mut pool = self.pool.lock().await;
+            let queue = pool.entry(target).or_insert_with(VecDeque::new);
+            if queue.len() < 4 {
+                queue.push_back(stream);
+            }
+        }
 
         Ok(response)
     }

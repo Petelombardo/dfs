@@ -8,7 +8,7 @@ A high-performance distributed file system written in Rust with FUSE support. De
 - **Configurable replication** (default RF=3) with automatic healing
 - **Leader-coordinated healing** — a single elected leader coordinates all replica repair and cleanup, eliminating duplicate work and split-brain corruption
 - **FUSE mount** — appears as a normal directory to any application
-- **SQLite-aware I/O** — disables direct I/O for `.db-shm` files so SQLite shared-memory mmap works correctly
+- **SQLite-aware I/O** — enables direct I/O for `.db` / `.sqlite` files to bypass the page cache; `.db-shm` is excluded so SQLite's shared-memory mmap works correctly
 - **Write-behind buffer** — sequential writes (e.g. DVR recording) are buffered and flushed as full 4MB chunks for HDD efficiency
 - **Seek optimization** — partial-chunk reads on seek so video players don't wait for a full 4MB chunk before playing
 - **Connection pooling** — per-peer TCP connection pools on both client and server; bounded with 5s connect timeouts to prevent fd exhaustion under load

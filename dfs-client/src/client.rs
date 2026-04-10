@@ -1585,8 +1585,11 @@ impl DfsClient {
                 }
                 None => {
                     debug!("Creating new connection to {}", server_addr);
-                    TcpStream::connect(server_addr)
-                        .await
+                    tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        TcpStream::connect(server_addr),
+                    ).await
+                        .map_err(|_| anyhow::anyhow!("Connect timeout to {}", server_addr))?
                         .context("Failed to connect to server")?
                 }
             };
@@ -2262,8 +2265,11 @@ impl DfsClient {
 
         // Create connection
         let connect_start = std::time::Instant::now();
-        let mut stream = TcpStream::connect(server_addr)
-            .await
+        let mut stream = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            TcpStream::connect(server_addr),
+        ).await
+            .map_err(|_| anyhow::anyhow!("Connect timeout to {}", server_addr))?
             .context("Failed to connect to server")?;
         let connect_time = connect_start.elapsed();
 
@@ -2319,8 +2325,11 @@ impl DfsClient {
         let request = Request::WriteFileLocalOnly { data };
 
         // Create connection
-        let mut stream = TcpStream::connect(server_addr)
-            .await
+        let mut stream = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            TcpStream::connect(server_addr),
+        ).await
+            .map_err(|_| anyhow::anyhow!("Connect timeout to {}", server_addr))?
             .context("Failed to connect to server")?;
 
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));

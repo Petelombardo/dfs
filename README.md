@@ -1,174 +1,228 @@
-# DFS - Distributed File System
+# DFS — Distributed File System
 
-A high-performance distributed file system written in Rust with FUSE support, designed for reliability, scalability, and performance.
+A high-performance distributed file system written in Rust with FUSE support. Designed for reliability and speed on real hardware — currently running a 5-node ARM64 cluster serving a live HDHomeRun DVR.
 
 ## Features
 
-- **Distributed Storage**: Data is automatically distributed across multiple nodes using consistent hashing
-- **Replication**: Configurable replication factor (default RF=3) ensures data durability
-- **FUSE Mount**: Standard filesystem interface - mount as a regular directory
-- **Self-Healing**: Automatic data repair and rebalancing on node failures
-- **Cluster Resilience**: Persistent peer discovery allows nodes to rejoin after restart
-- **Chunk-based Storage**: Files are split into 4MB chunks with BLAKE3 hashing for integrity
-- **Performance**: Optimized read/write with caching and parallel operations
+- **Distributed storage** across N nodes via consistent hashing
+- **Configurable replication** (default RF=3) with automatic healing
+- **Leader-coordinated healing** — a single elected leader coordinates all replica repair and cleanup, eliminating duplicate work and split-brain corruption
+- **FUSE mount** — appears as a normal directory to any application
+- **SQLite-aware I/O** — disables direct I/O for `.db-shm` files so SQLite shared-memory mmap works correctly
+- **Write-behind buffer** — sequential writes (e.g. DVR recording) are buffered and flushed as full 4MB chunks for HDD efficiency
+- **Seek optimization** — partial-chunk reads on seek so video players don't wait for a full 4MB chunk before playing
+- **Connection pooling** — per-peer TCP connection pools on both client and server; bounded with 5s connect timeouts to prevent fd exhaustion under load
+- **Chunk-level cache warming** — sliding window of 1000 chunks ahead of current read position pre-cached in memory
+- **Permanent missing-chunk blocklist** — unrecoverable chunks are detected after one failed round-trip to all online nodes and never retried, preventing connection storms
+- **Capacity-aware placement** — new chunks go to the nodes with the most free space
+- **Gossip-based failure detection** — heartbeats carry cluster-wide health gossip for fast convergence after rolling restarts
 
 ## Architecture
 
-### Components
+```
+┌─────────────────────────────────────────────────────────┐
+│                    dfs-client (FUSE)                     │
+│  - Presents a normal filesystem via /mnt/...             │
+│  - Chunks files into 4MB pieces on write                 │
+│  - Fetches chunk map from leader on open                 │
+│  - Reads: parallel fetches with shared 20-slot semaphore │
+│  - Writes: buffered → flush on full chunk or close       │
+└────────────────────────┬────────────────────────────────┘
+                         │ TCP :8900
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+   ┌──────────┐    ┌──────────┐    ┌──────────┐
+   │ dfs-server│   │dfs-server│   │dfs-server│  ...up to N nodes
+   │ (leader) │    │          │   │          │
+   └──────────┘    └──────────┘   └──────────┘
+        │
+        │  Leader responsibilities (min-NodeId wins):
+        │  • Serves GetFileChunkMap to clients
+        │  • Coordinates healing (under/over replication)
+        │  • Issues DeleteChunkReplica for cleanup
+        │
+        └── All nodes: store chunks, serve reads,
+            heartbeat every 10s with gossip payload
+```
 
-- **dfs-server**: Storage node daemon that stores and serves chunks
-- **dfs-client**: FUSE client for mounting the filesystem
-- **dfs-admin**: Administrative CLI for cluster management
-- **dfs-common**: Shared library with protocols and data structures
+### Leader Election
 
-### Key Technologies
+Leadership requires no external coordination. Every node independently computes:
 
-- Rust for memory safety and performance
-- Tokio async runtime for concurrent operations
-- FUSE for filesystem integration
-- Sled embedded database for metadata
-- BLAKE3 for cryptographic hashing
-- Bincode for efficient serialization
+> **leader = online node with the minimum NodeId**
 
-## Quick Start
+NodeIds are stable UUIDs persisted to disk — they survive restarts. On every heartbeat, each node re-adds the sender to its cluster view (`add_node` is idempotent), ensuring purged or failed nodes are re-discovered as soon as they come back online. With 5s heartbeats and a 30s failure timeout, leadership converges within one heartbeat cycle after any topology change.
 
-### Prerequisites
+### Healing
 
-- Rust 1.70+ (`cargo` and `rustc`)
-- Linux with FUSE support
+The leader runs a healing check every 60 seconds, capped at **10 operations per cycle** with a **200ms pause between each** to avoid connection storms. Both under-replication (add a replica) and over-replication (remove a replica) are throttled by the same budget. Failed heal attempts count toward the budget too, so a permanently-missing chunk can't spin the loop.
 
-### Build
+### Chunk Storage
+
+- Files are split into 4MB chunks, each identified by a BLAKE3 hash of its content
+- Chunk locations are stored in a per-node Sled embedded database
+- The leader maintains an in-memory `FileId → Vec<ChunkLocation>` map for fast `GetFileChunkMap` responses; all nodes keep it current so leadership handoff is seamless
+- Chunks are stored as flat files under `data_dir/`
+
+## Staging Cluster
+
+```
+Storage nodes (dfs-server):
+  node1  192.168.1.10:8900   (leader — lowest NodeId)
+  node2  192.168.1.11:8900
+  node3  192.168.1.12:8900
+  node4  192.168.1.13:8900
+  node5  192.168.1.14:8900
+
+Client nodes (dfs-client, FUSE mount at /mnt/test):
+  client1     192.168.1.20
+  client2     192.168.1.21
+  client3     192.168.1.22
+
+Data/config path on each storage node: /mnt/dfs/
+Active workload: HDHomeRun DVR via Kodi/Emby at /mnt/test/podman/dvr/
+```
+
+## Building
 
 ```bash
 cargo build --release
 ```
 
-### Initialize a Node
+Binaries are output to `target/release/`: `dfs-server`, `dfs-client`, `dfs-admin`.
+
+## Deploying
+
+### Deploy to existing nodes
 
 ```bash
-# Initialize storage directories and config
-sudo dfs-server init \
-  --data-dir /var/lib/dfs/data \
-  --meta-dir /var/lib/dfs/metadata \
-  --config /etc/dfs/config.toml
-
-# Edit config to set:
-# - listen_addr (e.g., "0.0.0.0:8900")
-# - seed_nodes (addresses of existing cluster nodes)
+# Rebuild and push to all 5 storage nodes + all client nodes
+./deploy-build
 ```
 
-### Start Server
+### Add a new storage node
 
 ```bash
-sudo dfs-server start --config /etc/dfs/config.toml
+# First node (new cluster)
+./deploy-node.sh 192.168.1.10
+
+# Additional node joining an existing cluster
+./deploy-node.sh 192.168.1.15 192.168.1.10
 ```
 
-### Mount Client
+`deploy-node.sh` will:
+1. Copy `dfs-server` and `dfs-admin` binaries to the node
+2. Create the data/metadata/config directory layout under `/mnt/dfs/`
+3. Write `config.toml` with the node's IP and seed node address
+4. Install and enable the systemd unit with `LimitNOFILE=65536`
+5. Start the service and verify it's active
 
-```bash
-# Mount on a directory
-dfs-client mount /mnt/dfs --cluster 10.0.1.10:8900
+The new node will contact the seed, exchange heartbeats with the full cluster, and begin receiving chunk replicas automatically.
 
-# Use the filesystem
-cd /mnt/dfs
-echo "Hello DFS" > test.txt
-cat test.txt
+### Add a new client node
+
+1. Copy `dfs-client` to `/usr/bin/dfs-client` on the client machine
+2. Install the systemd unit:
+
+```ini
+[Unit]
+Description=DFS FUSE Client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/dfs-client mount /mnt/test \
+    --cluster 192.168.1.10 \
+    --log-level info \
+    --allow-other \
+    --log-file /var/log/dfs-client.log
+Restart=on-failure
+RestartSec=5
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+ExecStop=/bin/fusermount -u /mnt/test
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-## Configuration
+The `--cluster` flag accepts any storage node address; the client will discover the rest of the cluster automatically.
 
-Example `/etc/dfs/config.toml`:
+## Configuration Reference
+
+`/mnt/dfs/config/config.toml`:
 
 ```toml
 [node]
-listen_addr = "0.0.0.0:8900"
+listen_addr = "192.168.1.10:8900"   # this node's IP:port
 
 [storage]
-data_dir = "/var/lib/dfs/data"
-metadata_dir = "/var/lib/dfs/metadata"
+data_dir      = "/mnt/dfs/data"
+metadata_dir  = "/mnt/dfs/metadata"
 chunk_size_mb = 4
 
-[replication]
-replication_factor = 3
-auto_heal = true
-healing_delay_secs = 30
-scrub_interval_hours = 24
-
 [cluster]
+seed_nodes             = ["192.168.1.11:8900"]  # any existing node; empty for first node
 heartbeat_interval_secs = 10
-failure_timeout_secs = 30
-seed_nodes = [
-    "10.0.1.10:8900",
-    "10.0.1.11:8900",
-    "10.0.1.12:8900"
-]
+failure_timeout_secs    = 30
+
+[replication]
+replication_factor  = 3
+healing_delay_secs  = 300   # wait 5min before healing to let transient failures resolve
+auto_heal           = true
+scrub_interval_hours = 24
 ```
 
-## Cluster Management
+## Local Development
+
+Run a 3-node cluster on your dev machine:
 
 ```bash
-# View cluster status
-dfs-admin cluster status --config /etc/dfs/config.toml
-
-# List all nodes
-dfs-admin cluster nodes --config /etc/dfs/config.toml
-
-# Trigger healing check
-dfs-admin heal check --config /etc/dfs/config.toml
-
-# View storage statistics
-dfs-server status --config /etc/dfs/config.toml
+cargo build --release
+./start_local_cluster.sh      # starts nodes on :8900, :8901, :8902
+./mount_local_cluster.sh /tmp/dfs-mount
 ```
 
-## Development Status
+Logs go to `/mnt/storage/dfs{1,2,3}/server.log`.
 
-✅ **Completed Features**:
-- Core distributed storage engine
-- Consistent hashing for data placement
-- Chunk replication with quorum writes
-- FUSE filesystem interface
-- Heartbeat-based failure detection
-- Automatic healing and rebalancing
-- Persistent peer discovery
-- Read/write caching
+## Administration
 
-🚧 **In Progress**:
-- Performance optimizations (write throughput)
-- Admin CLI enhancements
-- Graceful node removal
+```bash
+# Cluster health
+dfs-admin -c 192.168.1.10:8900 cluster status
 
-📋 **Planned**:
-- Encryption at rest and in transit
-- Authentication and authorization
-- Compression support
-- Web dashboard for monitoring
-- Metrics and alerting integration
+# List all files
+dfs-admin -c 192.168.1.10:8900 file list
+
+# Inspect a file's chunk locations
+dfs-admin -c 192.168.1.10:8900 file info '/podman/dvr/recordings/Today/Today.mpg'
+
+# Trigger a healing pass (leader only)
+dfs-admin -c 192.168.1.10:8900 healing trigger
+
+# Purge corrupt file metadata (leaves chunk data intact)
+dfs-admin -c 192.168.1.10:8900 file purge '/podman/dvr/recordings/Today/Today.mpg'
+```
 
 ## Performance
 
-Current benchmarks with 3-node ARM64 cluster:
-- **Servers**: 3x Odroid M1S with NVME backend storage
-- **Client**: NanoPi R3 (FUSE mount)
+5-node ARM64 cluster, spinning HDD backend:
 
-Performance:
-- **Read**: 23 MB/s (with chunk caching)
-- **Write**: 14-15 MB/s (investigating optimizations)
+| Operation | Throughput |
+|-----------|-----------|
+| Sequential read (DVR playback) | ~90 MB/s |
+| Sequential write (DVR recording) | ~45 MB/s |
+| Random read (seek / fast-forward) | ~25 MB/s |
 
-## Documentation
+## Known Limitations
 
-- [Cluster Rejoin Plan](CLUSTER-REJOIN-PLAN.md)
-- [Performance Investigation](PERFORMANCE-INVESTIGATION.md)
-- [Quick Start Guide](QUICK-START.md)
-- [Testing Guide](TESTING.md)
-
-## Contributing
-
-Contributions welcome! This is an experimental project for learning distributed systems concepts.
+- No encryption at rest or in transit
+- No authentication — trust your network
+- Chunk blocklist is in-memory only; clears on restart (by design — lets recovered nodes be re-checked)
+- Graceful node removal (draining replicas before shutdown) not yet implemented
 
 ## License
 
 MIT
-
-## Author
-
-Built with assistance from Claude Code.

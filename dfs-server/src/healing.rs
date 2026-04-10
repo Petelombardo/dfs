@@ -120,12 +120,14 @@ impl HealingManager {
     /// no election protocol is needed. When the leader goes offline the next
     /// lowest-ID node takes over on its next interval tick.
     async fn run_healing_checker(&self) {
-        let mut check_interval = interval(Duration::from_secs(60));
         let mut cleanup_counter = 0;
         let mut was_leader = false;
 
         loop {
-            check_interval.tick().await;
+            // Sleep first so startup doesn't immediately trigger a heal cycle.
+            // Using sleep-after-completion rather than a fixed interval ensures
+            // we never queue a second cycle before the first one finishes.
+            tokio::time::sleep(Duration::from_secs(60)).await;
 
             let is_leader = self.cluster.is_leader().await;
 

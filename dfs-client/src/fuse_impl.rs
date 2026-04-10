@@ -1,5 +1,6 @@
 use anyhow::Result;
 use dashmap::DashMap;
+use libc;
 use dfs_common::{ChunkId, FileMetadata, FileType};
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
@@ -230,6 +231,11 @@ pub struct DfsFilesystem {
 
     /// Write buffer flush threshold in bytes (dynamic, queried from cluster)
     buffer_flush_threshold: usize,
+
+    /// Count of write-mode open file handles per inode.
+    /// Used to guard the write buffer in flush(): a flush() triggered by a read-only
+    /// close must not touch the write buffer of a concurrently writing fd.
+    write_open_counts: Arc<DashMap<u64, usize>>,
 }
 
 impl DfsFilesystem {
@@ -441,6 +447,7 @@ impl DfsFilesystem {
             statfs_cache: Arc::new(RwLock::new(None)),
             lock_manager: Arc::new(LockManager::new()),
             buffer_flush_threshold,
+            write_open_counts: Arc::new(DashMap::new()),
         })
     }
 
@@ -825,8 +832,15 @@ impl Filesystem for DfsFilesystem {
         }
     }
 
-    fn open(&mut self, _req: &FuseRequest, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+    fn open(&mut self, _req: &FuseRequest, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
         info!("open: ino={}", ino);
+
+        // Track write-mode opens so flush() can skip the write buffer for read-only closes.
+        // O_RDONLY == 0; any flag with the low two bits set (O_WRONLY=1, O_RDWR=2) is a write open.
+        let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
+        if is_write {
+            *self.write_open_counts.entry(ino).or_insert(0) += 1;
+        }
 
         // Check if this is a SQLite database file by looking up its path
         let is_sqlite = {
@@ -1718,6 +1732,9 @@ impl Filesystem for DfsFilesystem {
                 self.dir_cache.write().unwrap().remove(parent_path);
                 debug!("Invalidated directory cache for parent: {}", parent_path);
 
+                // create() always opens for writing — count it
+                *self.write_open_counts.entry(ino).or_insert(0) += 1;
+
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
 
@@ -1828,11 +1845,28 @@ impl Filesystem for DfsFilesystem {
                 let is_overwrite = offset_usize < current_size;
                 let is_sparse_write = offset_usize > current_size;
 
-                if is_overwrite && write_buffers.contains_key(&ino) {
-                    // OVERWRITE with pending buffer: flush the buffer first so the read-modify-write
-                    // below sees the complete committed file. Without this, the splice recalculates
-                    // metadata.size = sum(flushed chunks) which discards the buffered tail → file truncation.
-                    info!("Overwrite at offset={} with buffered data (current_size={}): flushing buffer first",
+                // Only flush the append buffer before an overwrite if the write actually
+                // overlaps with the buffered region. A Kodi-style metadata write at offset 0
+                // while the DVR is recording at offset 200MB does NOT overlap — flushing in
+                // that case produces a mis-aligned partial chunk and disrupts the recording.
+                let overwrite_overlaps_buffer = if is_overwrite {
+                    if let Some(buffer_lock) = write_buffers.get(&ino) {
+                        let buffer = runtime.block_on(async { buffer_lock.lock().await });
+                        let write_end = offset_usize + data.len();
+                        write_end > buffer.start_offset as usize
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if is_overwrite && write_buffers.contains_key(&ino) && overwrite_overlaps_buffer {
+                    // OVERWRITE overlaps buffered region: flush the buffer first so the
+                    // read-modify-write below sees the complete committed file. Without this,
+                    // the splice recalculates metadata.size = sum(flushed chunks) which
+                    // discards the buffered tail → file truncation.
+                    info!("Overwrite at offset={} overlaps buffer (current_size={}): flushing buffer first",
                           offset_usize, current_size);
                     // Build a temporary flush helper with the same Arc-cloned state
                     let flush_client = client.clone();
@@ -2613,6 +2647,18 @@ impl Filesystem for DfsFilesystem {
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
+        // flush() is called for every close() — including read-only fds.
+        // If there are no write-mode handles open for this inode, skip touching the
+        // write buffer entirely. Otherwise a reader closing its fd would steal and
+        // prematurely flush the DVR's write buffer, producing a mis-sized chunk and
+        // resetting the write state mid-recording.
+        let has_writers = self.write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
+        if !has_writers {
+            debug!("flush: ino={} - no writers, skipping buffer flush for read-only close", ino);
+            reply.ok();
+            return;
+        }
+
         // Clone Arc-wrapped fields for thread pool
         let write_buffer_enabled = self.write_buffer_enabled;
         let write_buffers = self.write_buffers.clone();
@@ -2747,13 +2793,24 @@ impl Filesystem for DfsFilesystem {
         req: &FuseRequest,
         ino: u64,
         _fh: u64,
-        _flags: i32,
+        flags: i32,
         lock_owner: Option<u64>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
         let pid = req.pid();
         debug!("release: ino={}, owner={:?}, pid={}", ino, lock_owner, pid);
+
+        // Decrement write-mode open count when a write-mode fd is closed
+        let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
+        if is_write {
+            let mut remove = false;
+            if let Some(mut count) = self.write_open_counts.get_mut(&ino) {
+                if *count > 0 { *count -= 1; }
+                if *count == 0 { remove = true; }
+            }
+            if remove { self.write_open_counts.remove(&ino); }
+        }
 
         let lock_manager = self.lock_manager.clone();
 

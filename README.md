@@ -55,7 +55,7 @@ NodeIds are stable UUIDs persisted to disk — they survive restarts. On every h
 
 ### Healing
 
-The leader runs a healing check every 60 seconds, capped at **10 operations per cycle** with a **200ms pause between each** to avoid connection storms. Both under-replication (add a replica) and over-replication (remove a replica) are throttled by the same budget. Failed heal attempts count toward the budget too, so a permanently-missing chunk can't spin the loop.
+The leader runs a healing check every 60 seconds, processing up to **1000 chunks per cycle** with up to **10 ops running concurrently**, each followed by a **200ms cooldown**. This means a 100-chunk file can be fully healed in a single cycle. Both under-replication (add a replica) and over-replication (remove a replica) share the same concurrency budget. Failed heal attempts count toward the budget too, so a permanently-missing chunk can't spin the loop.
 
 ### Chunk Storage
 

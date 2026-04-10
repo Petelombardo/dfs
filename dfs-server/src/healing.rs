@@ -39,8 +39,11 @@ pub struct HealingManager {
     /// Auto-healing enabled
     auto_heal: bool,
 
-    /// Maximum number of chunks to heal per check cycle
+    /// Maximum number of chunks to process per check cycle (queue depth)
     max_heal_per_cycle: usize,
+
+    /// Maximum number of heal/cleanup ops to run concurrently within a cycle
+    max_concurrent_heals: usize,
 
     /// Chunks pending healing (chunk_id -> failure_detected_at)
     pending_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
@@ -63,10 +66,11 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
     ) -> Self {
-        // Heal at most 10 chunks per cycle to avoid connection storms.
-        // At 60s intervals this is 10 heals/min — sufficient for gradual recovery
-        // without flooding the leader with PushChunkTo connections.
-        let max_heal_per_cycle = 10;
+        // Process up to 1000 chunks per cycle (queue depth). The 200ms throttle
+        // between ops and a concurrency cap of 10 prevent connection storms while
+        // still recovering large files (100+ chunks) within a single cycle.
+        let max_heal_per_cycle = 1000;
+        let max_concurrent_heals = 10;
 
         Self {
             storage,
@@ -78,6 +82,7 @@ impl HealingManager {
             scrub_interval_hours,
             auto_heal,
             max_heal_per_cycle,
+            max_concurrent_heals,
             pending_healing: Arc::new(RwLock::new(HashMap::new())),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
         }
@@ -91,8 +96,8 @@ impl HealingManager {
         }
 
         info!(
-            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {})",
-            self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle
+            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, concurrency: {})",
+            self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle, self.max_concurrent_heals
         );
 
         // Start healing checker (runs every minute)
@@ -210,64 +215,111 @@ impl HealingManager {
     /// Check all chunks and heal under-replicated ones.
     /// As leader, iterates over ALL chunk IDs known in metadata — not just local
     /// ones — so it can coordinate healing regardless of where the data lives.
+    ///
+    /// Up to `max_heal_per_cycle` chunks are queued per cycle; up to
+    /// `max_concurrent_heals` ops run in parallel, each throttled by 200ms after
+    /// completion to avoid connection storms.
     async fn check_and_heal(&self) -> Result<()> {
         debug!("Running healing check");
 
         let all_chunks = self.metadata.list_all_chunk_ids()?;
 
-        let mut healed_count = 0;
+        // First pass: collect the work to do this cycle (respects queue cap)
+        let mut work: Vec<(ChunkId, ReplicationStatus)> = Vec::new();
         let mut pending_count = 0;
         let mut skipped_count = 0;
 
         for chunk_id in all_chunks {
-            // Enforce healing window: stop if we've healed enough chunks this cycle
-            if healed_count >= self.max_heal_per_cycle {
+            if work.len() >= self.max_heal_per_cycle {
                 skipped_count += 1;
                 continue;
             }
 
             match self.check_chunk_replication(&chunk_id).await {
-                Ok(status) => match status {
-                    ReplicationStatus::UnderReplicated => {
-                        // Check if enough time has passed since failure detection
-                        if self.should_heal(&chunk_id).await {
-                            if let Err(e) = self.heal_chunk(&chunk_id).await {
-                                warn!("Failed to heal chunk {}: {}", chunk_id, e);
-                            }
-                            // Throttle regardless of success/failure — a chunk that can't be
-                            // sourced from any node would otherwise spin at full speed.
-                            healed_count += 1;
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        } else {
-                            pending_count += 1;
-                        }
+                Ok(ReplicationStatus::UnderReplicated) => {
+                    if self.should_heal(&chunk_id).await {
+                        work.push((chunk_id, ReplicationStatus::UnderReplicated));
+                    } else {
+                        pending_count += 1;
                     }
-                    ReplicationStatus::OverReplicated => {
-                        if healed_count >= self.max_heal_per_cycle {
-                            skipped_count += 1;
-                            continue;
-                        }
-                        if let Err(e) = self.cleanup_excess_replicas(&chunk_id).await {
-                            warn!("Failed to cleanup over-replicated chunk {}: {}", chunk_id, e);
-                        }
-                        healed_count += 1;
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    ReplicationStatus::Ok => {
-                        // Remove from pending if it was there
-                        self.pending_healing.write().await.remove(&chunk_id);
-                    }
-                },
+                }
+                Ok(ReplicationStatus::OverReplicated) => {
+                    work.push((chunk_id, ReplicationStatus::OverReplicated));
+                }
+                Ok(ReplicationStatus::Ok) => {
+                    self.pending_healing.write().await.remove(&chunk_id);
+                }
                 Err(e) => {
                     debug!("Error checking chunk {}: {}", chunk_id, e);
                 }
             }
         }
 
-        if healed_count > 0 || pending_count > 0 || skipped_count > 0 {
+        if work.is_empty() {
+            if pending_count > 0 {
+                debug!("Healing check: {} chunks pending delay", pending_count);
+            }
+            return Ok(());
+        }
+
+        // Second pass: execute with bounded concurrency.
+        // We need an Arc<Self> to share across tasks; callers already hold one
+        // (start() takes Arc<Self>), but check_and_heal takes &self. We reconstruct
+        // the Arc from the fields we already Arc-wrapped — storage/metadata/cluster
+        // are all Arc'd, so we just need a way to share self. The cleanest approach
+        // is to pass the fields directly rather than the whole struct.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent_heals));
+        let healed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for (chunk_id, status) in work {
+            let sem = semaphore.clone();
+            let healed = healed_count.clone();
+            // Clone the Arc fields needed per-op so tasks are Send + 'static
+            let storage = self.storage.clone();
+            let metadata = self.metadata.clone();
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            let pending_healing = self.pending_healing.clone();
+            let in_flight_healing = self.in_flight_healing.clone();
+            let replication_factor = self.replication_factor;
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                match status {
+                    ReplicationStatus::UnderReplicated => {
+                        if let Err(e) = HealingManager::do_heal_chunk_shared(
+                            &chunk_id, &storage, &metadata, &cluster, &client,
+                            &pending_healing, &in_flight_healing, replication_factor,
+                        ).await {
+                            warn!("Failed to heal chunk {}: {}", chunk_id, e);
+                        }
+                    }
+                    ReplicationStatus::OverReplicated => {
+                        if let Err(e) = HealingManager::do_cleanup_excess_shared(
+                            &chunk_id, &metadata, &cluster, &client, replication_factor,
+                        ).await {
+                            warn!("Failed to cleanup over-replicated chunk {}: {}", chunk_id, e);
+                        }
+                    }
+                    ReplicationStatus::Ok => {}
+                }
+                healed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Throttle after each op to avoid connection storms
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        let healed = healed_count.load(std::sync::atomic::Ordering::Relaxed);
+        if healed > 0 || pending_count > 0 || skipped_count > 0 {
             info!(
                 "Healing check complete: healed={}, pending={}, deferred={}",
-                healed_count, pending_count, skipped_count
+                healed, pending_count, skipped_count
             );
         }
 
@@ -350,16 +402,28 @@ impl HealingManager {
         }
     }
 
-    /// Heal an under-replicated chunk.
-    ///
-    /// Only called on the leader node. The leader coordinates the repair by
-    /// instructing a source node (one that already holds the chunk) to push
-    /// a copy directly to the target node — the leader never proxies the data.
+    /// Heal an under-replicated chunk (instance method — delegates to shared static).
     async fn heal_chunk(&self, chunk_id: &ChunkId) -> Result<()> {
-        // In-flight guard: prevents re-entrant healing within this leader's process
-        // (shouldn't happen given the sequential loop, but cheap insurance).
+        Self::do_heal_chunk_shared(
+            chunk_id, &self.storage, &self.metadata, &self.cluster, &self.client,
+            &self.pending_healing, &self.in_flight_healing, self.replication_factor,
+        ).await
+    }
+
+    /// Static heal implementation — callable from both instance methods and spawned tasks.
+    async fn do_heal_chunk_shared(
+        chunk_id: &ChunkId,
+        storage: &Arc<ChunkStorage>,
+        metadata: &Arc<MetadataStore>,
+        cluster: &Arc<ClusterManager>,
+        client: &Arc<NetworkClient>,
+        pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
+        in_flight_healing: &Arc<RwLock<HashSet<ChunkId>>>,
+        replication_factor: usize,
+    ) -> Result<()> {
+        // In-flight guard: prevents two concurrent tasks healing the same chunk.
         {
-            let mut in_flight = self.in_flight_healing.write().await;
+            let mut in_flight = in_flight_healing.write().await;
             if in_flight.contains(chunk_id) {
                 debug!("Chunk {} heal already in-flight, skipping", chunk_id);
                 return Ok(());
@@ -367,23 +431,32 @@ impl HealingManager {
             in_flight.insert(*chunk_id);
         }
 
-        let result = self.do_heal_chunk(chunk_id).await;
-        self.in_flight_healing.write().await.remove(chunk_id);
+        let result = Self::do_heal_chunk_inner(
+            chunk_id, storage, metadata, cluster, client, pending_healing, replication_factor,
+        ).await;
+        in_flight_healing.write().await.remove(chunk_id);
         result
     }
 
-    async fn do_heal_chunk(&self, chunk_id: &ChunkId) -> Result<()> {
+    async fn do_heal_chunk_inner(
+        chunk_id: &ChunkId,
+        _storage: &Arc<ChunkStorage>,
+        metadata: &Arc<MetadataStore>,
+        cluster: &Arc<ClusterManager>,
+        client: &Arc<NetworkClient>,
+        pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
+        replication_factor: usize,
+    ) -> Result<()> {
         info!("Leader healing under-replicated chunk: {}", chunk_id);
 
-        let location = self
-            .metadata
+        let location = metadata
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
         // Build alive node list with their addresses
         let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
         for node_id in &location.nodes {
-            if let Some(info) = self.cluster.get_node(node_id).await {
+            if let Some(info) = cluster.get_node(node_id).await {
                 if info.status == dfs_common::NodeStatus::Online {
                     alive.push((*node_id, info.addr));
                 }
@@ -394,17 +467,16 @@ impl HealingManager {
             anyhow::bail!("No alive nodes have chunk {}", chunk_id);
         }
 
-        let needed = self.replication_factor.saturating_sub(alive.len());
+        let needed = replication_factor.saturating_sub(alive.len());
         if needed == 0 {
-            self.pending_healing.write().await.remove(chunk_id);
+            pending_healing.write().await.remove(chunk_id);
             return Ok(());
         }
 
         // Select target nodes: capacity-aware candidates that don't already hold the chunk
         let alive_ids: HashSet<NodeId> = alive.iter().map(|(id, _)| *id).collect();
-        let candidates = self
-            .cluster
-            .get_nodes_with_capacity_awareness(chunk_id, self.replication_factor + needed)
+        let candidates = cluster
+            .get_nodes_with_capacity_awareness(chunk_id, replication_factor + needed)
             .await;
         let targets: Vec<NodeId> = candidates
             .into_iter()
@@ -419,7 +491,7 @@ impl HealingManager {
 
         // Pick the source node: prefer local node (no network hop for the read),
         // otherwise use the first alive node.
-        let local_id = self.cluster.local_node_id();
+        let local_id = cluster.local_node_id();
         let source = if alive_ids.contains(&local_id) {
             alive.iter().find(|(id, _)| *id == local_id).copied()
         } else {
@@ -430,7 +502,7 @@ impl HealingManager {
         let mut replicated = Vec::new();
 
         for target_id in &targets {
-            if let Some(target_info) = self.cluster.get_node(target_id).await {
+            if let Some(target_info) = cluster.get_node(target_id).await {
                 info!(
                     "Healing chunk {}: instructing node {} to push to node {} ({})",
                     chunk_id, source_id, target_id, target_info.addr
@@ -442,7 +514,7 @@ impl HealingManager {
                     leader_id: local_id,
                 };
 
-                match self.client.send_message(source_addr, Message::Request(request)).await {
+                match client.send_message(source_addr, Message::Request(request)).await {
                     Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
                         info!("Chunk {} successfully pushed from {} to {}", chunk_id, source_id, target_id);
                         replicated.push(*target_id);
@@ -471,13 +543,13 @@ impl HealingManager {
                 file_offset: location.file_offset,
             };
 
-            if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
+            if let Err(e) = metadata.put_chunk_location(&updated_location) {
                 warn!("Failed to update chunk location after healing {}: {}", chunk_id, e);
             } else {
-                self.broadcast_chunk_location(&updated_location).await;
+                Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
             }
 
-            self.pending_healing.write().await.remove(chunk_id);
+            pending_healing.write().await.remove(chunk_id);
         }
 
         Ok(())
@@ -485,42 +557,57 @@ impl HealingManager {
 
     /// Broadcast an updated chunk location to all online peers.
     async fn broadcast_chunk_location(&self, location: &ChunkLocation) {
-        let nodes = self.cluster.get_all_nodes().await;
-        let local_id = self.cluster.local_node_id();
+        Self::broadcast_chunk_location_shared(location, &self.cluster, &self.client).await;
+    }
+
+    async fn broadcast_chunk_location_shared(
+        location: &ChunkLocation,
+        cluster: &Arc<ClusterManager>,
+        client: &Arc<NetworkClient>,
+    ) {
+        let nodes = cluster.get_all_nodes().await;
+        let local_id = cluster.local_node_id();
         for node in nodes {
             if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                 continue;
             }
             let request = Request::ReplicateChunkLocation { location: location.clone() };
-            if let Err(e) = self.client.send_message(node.addr, Message::Request(request)).await {
+            if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
                 warn!("Failed to broadcast chunk location {} to node {}: {}", location.chunk_id, node.id, e);
             }
         }
     }
 
-    /// Remove one excess replica per cycle.
-    ///
-    /// Only called on the leader. The leader picks the last node in the alive list
-    /// as the one to remove — one per cycle, so over-replication of N drains in N
-    /// cycles. The leader sends a DeleteChunk to the excess node and then updates
-    /// and broadcasts the new chunk location metadata.
+    /// Remove one excess replica (instance method — delegates to shared static).
     async fn cleanup_excess_replicas(&self, chunk_id: &ChunkId) -> Result<()> {
-        let location = self
-            .metadata
+        Self::do_cleanup_excess_shared(
+            chunk_id, &self.metadata, &self.cluster, &self.client, self.replication_factor,
+        ).await
+    }
+
+    /// Static cleanup implementation — callable from both instance methods and spawned tasks.
+    async fn do_cleanup_excess_shared(
+        chunk_id: &ChunkId,
+        metadata: &Arc<MetadataStore>,
+        cluster: &Arc<ClusterManager>,
+        client: &Arc<NetworkClient>,
+        replication_factor: usize,
+    ) -> Result<()> {
+        let location = metadata
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
         // Collect alive nodes in stable (location.nodes) order
         let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
         for node_id in &location.nodes {
-            if let Some(info) = self.cluster.get_node(node_id).await {
+            if let Some(info) = cluster.get_node(node_id).await {
                 if info.status == dfs_common::NodeStatus::Online {
                     alive.push((*node_id, info.addr));
                 }
             }
         }
 
-        let excess = alive.len().saturating_sub(self.replication_factor);
+        let excess = alive.len().saturating_sub(replication_factor);
         if excess == 0 {
             return Ok(());
         }
@@ -528,18 +615,18 @@ impl HealingManager {
         // Remove the replica from the most-utilized node — this naturally rebalances
         // the cluster over time rather than always shedding from an arbitrary node.
         let alive_ids: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
-        let excess_id = self.cluster.most_utilized_node(&alive_ids).await
+        let excess_id = cluster.most_utilized_node(&alive_ids).await
             .unwrap_or_else(|| alive_ids[alive_ids.len() - 1]);
         let (_, excess_addr) = *alive.iter().find(|(id, _)| *id == excess_id).unwrap();
 
         info!(
             "Chunk {} over-replicated ({} alive, RF={}): leader instructing node {} to delete excess copy",
-            chunk_id, alive.len(), self.replication_factor, excess_id
+            chunk_id, alive.len(), replication_factor, excess_id
         );
 
-        let local_id = self.cluster.local_node_id();
+        let local_id = cluster.local_node_id();
         let request = Request::DeleteChunkReplica { chunk_id: *chunk_id, leader_id: local_id };
-        match self.client.send_message(excess_addr, Message::Request(request)).await {
+        match client.send_message(excess_addr, Message::Request(request)).await {
             Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
                 info!("Node {} deleted excess copy of chunk {}", excess_id, chunk_id);
             }
@@ -567,10 +654,10 @@ impl HealingManager {
             file_offset: location.file_offset,
         };
 
-        if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
+        if let Err(e) = metadata.put_chunk_location(&updated_location) {
             warn!("Failed to update chunk location after cleanup of {}: {}", chunk_id, e);
         } else {
-            self.broadcast_chunk_location(&updated_location).await;
+            Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
             info!("Excess replica cleanup complete for chunk {}", chunk_id);
         }
 

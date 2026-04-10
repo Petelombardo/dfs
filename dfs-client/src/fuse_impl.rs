@@ -1861,9 +1861,123 @@ impl Filesystem for DfsFilesystem {
                 }
 
                 if is_sparse_write {
-                    // SPARSE WRITE: Writing beyond current file size (creates a hole)
+                    let gap = offset_usize - current_size;
+
+                    // Small gaps (< 64KB) are DVR/MPEG-TS packet padding — absorb into the
+                    // write buffer by zero-filling the gap so buffering stays intact.
+                    // Large gaps are genuine sparse writes and bypass buffering as before.
+                    const SMALL_GAP_THRESHOLD: usize = 64 * 1024;
+                    if gap < SMALL_GAP_THRESHOLD {
+                        info!("Near-sequential write: offset={} current_size={} gap={} bytes — zero-filling into buffer",
+                              offset_usize, current_size, gap);
+                        // Build padded data: zeros for the gap + the actual write data
+                        let mut padded = vec![0u8; gap];
+                        padded.extend_from_slice(&data_vec);
+                        // Re-route through the sequential append path by adjusting data_vec
+                        // and treating offset as current_size (now effectively sequential).
+                        // We do this by appending to the write buffer directly.
+                        let write_buffers_clone2 = write_buffers.clone();
+                        let client_clone3 = client.clone();
+                        let metadata_cache_clone4 = metadata_cache.clone();
+                        let metadata_cache_clone5 = metadata_cache.clone();
+                        let metadata_cache_clone6 = metadata_cache.clone();
+                        let last_metadata_update2 = last_metadata_update.clone();
+                        let write_counters2 = write_counters.clone();
+                        let runtime2 = runtime.clone();
+                        let padded_len = padded.len();
+                        let buffer_flush_threshold2 = self.buffer_flush_threshold;
+
+                        let gap_result = runtime.block_on(async move {
+                            let buffer_lock = write_buffers_clone2.entry(ino).or_insert_with(|| {
+                                let cache_size = {
+                                    let cache = metadata_cache_clone6.read().unwrap();
+                                    cache.get(&ino).map(|m| m.size as u64).unwrap_or(current_size as u64)
+                                };
+                                Arc::new(Mutex::new(WriteBuffer {
+                                    data: Vec::new(),
+                                    last_modified: SystemTime::now(),
+                                    start_offset: cache_size,
+                                    created_at: std::time::Instant::now(),
+                                    drop_trailing_chunks_on_flush: 0,
+                                }))
+                            }).clone();
+
+                            let mut buffer = buffer_lock.lock().await;
+
+                            // Re-alignment check (same as sequential path)
+                            const CHUNK_SIZE_ALIGN2: u64 = 4 * 1024 * 1024;
+                            if buffer.data.is_empty() {
+                                let partial_bytes = buffer.start_offset % CHUNK_SIZE_ALIGN2;
+                                if partial_bytes != 0 {
+                                    let aligned_offset = buffer.start_offset - partial_bytes;
+                                    let last_chunk_info = {
+                                        let cache = metadata_cache_clone5.read().unwrap();
+                                        cache.get(&ino).and_then(|m| {
+                                            m.chunk_locations.last().map(|loc| (loc.chunk_id, loc.nodes.clone()))
+                                        })
+                                    };
+                                    if let Some((last_chunk_id, node_ids)) = last_chunk_info {
+                                        match client_clone3.read_chunk_by_id(last_chunk_id, &node_ids).await {
+                                            Ok(chunk_data) => {
+                                                info!("Re-aligning (gap path) for inode {}: pre-seeding from partial chunk", ino);
+                                                buffer.data = chunk_data;
+                                                buffer.start_offset = aligned_offset;
+                                                buffer.drop_trailing_chunks_on_flush = 1;
+                                            }
+                                            Err(e) => {
+                                                warn!("Re-alignment (gap path): failed to read last chunk for inode {}: {}", ino, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            buffer.data.extend_from_slice(&padded);
+                            buffer.last_modified = SystemTime::now();
+                            let should_flush = buffer.data.len() >= buffer_flush_threshold2;
+                            Ok::<(bool, usize), anyhow::Error>((should_flush, padded_len))
+                        });
+
+                        match gap_result {
+                            Ok((flush_now, _)) => {
+                                {
+                                    let mut counters = write_counters2.write().unwrap();
+                                    let c = counters.entry(ino).or_insert(0);
+                                    *c += 1;
+                                }
+                                if flush_now {
+                                    let flush_threshold_gap = self.buffer_flush_threshold;
+                                    if let Err(e) = runtime2.block_on(async {
+                                        flush_buffer_standalone(
+                                            ino,
+                                            &client,
+                                            &metadata_cache,
+                                            &write_buffers,
+                                            &last_metadata_update2,
+                                            &write_counters2,
+                                            flush_threshold_gap,
+                                            false,
+                                        ).await
+                                    }) {
+                                        error!("Failed to flush after gap-fill for inode {}: {}", ino, e);
+                                        reply.error(libc::EIO);
+                                        return;
+                                    }
+                                }
+                                reply.written(data_vec.len() as u32);
+                                return;
+                            }
+                            Err(e) => {
+                                error!("Failed to buffer gap-fill write for inode {}: {}", ino, e);
+                                reply.error(libc::EIO);
+                                return;
+                            }
+                        }
+                    }
+
+                    // TRUE SPARSE WRITE: Large gap, write directly (hole support)
                     info!("Sparse write: offset {} > current_size {} (gap: {} bytes)",
-                           offset_usize, current_size, offset_usize - current_size);
+                           offset_usize, current_size, gap);
 
                     // Write directly at the specified offset (no buffering for sparse writes)
                     let write_result = runtime.block_on(async {

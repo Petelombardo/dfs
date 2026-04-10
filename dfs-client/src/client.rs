@@ -988,15 +988,15 @@ impl DfsClient {
             fetched_chunks.push((idx, data_arc));
         }
 
-        // NOTE: We do NOT remove from in-flight here because fetches are async!
-        // Removing before completion causes duplicate fetches
-        // The in_flight set will naturally clean up or we can add timeout-based cleanup later
-        // {
-        //     let mut in_flight = self.prefetch_in_flight.lock().await;
-        //     for (_, chunk_id, _) in &chunks_to_fetch {
-        //         in_flight.remove(chunk_id);
-        //     }
-        // }
+        // Fetches are fully complete at this point (join_all above awaited all tasks).
+        // Remove from in-flight now so subsequent reads don't spin-wait 200ms for a
+        // chunk that already landed in cache (or failed and will never arrive).
+        {
+            let mut in_flight = self.prefetch_in_flight.lock().await;
+            for (_, chunk_id, _) in &chunks_to_fetch {
+                in_flight.remove(chunk_id);
+            }
+        }
 
         // Wait for chunks that were already being fetched by other requests
         // Poll the cache until they appear (they should be there very soon)

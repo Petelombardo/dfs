@@ -181,7 +181,16 @@ impl Server {
         if !locations.is_empty() {
             let mut map = self.chunk_map.write().await;
             map.insert(metadata.id, (locations, metadata.modified_at));
+        } else if !metadata.chunks.is_empty() {
+            // The file has chunks but we couldn't resolve their locations — this node
+            // may not yet have received the chunk-location replication for this write
+            // (metadata arrived before chunk locations in the async replication pipeline).
+            // Do NOT overwrite an existing valid entry with nothing; preserve whatever
+            // we already have so reads can still route correctly.
+            debug!("chunk_map_update: could not resolve locations for {} ({} chunks), preserving existing map entry",
+                   metadata.path, metadata.chunks.len());
         }
+        // If the file has no chunks yet (new empty file), no map entry is needed.
     }
 
     /// Update a single chunk location within the chunk map (used during healing).

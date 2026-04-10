@@ -66,11 +66,11 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
     ) -> Self {
-        // Process up to 1000 chunks per cycle (queue depth). The 200ms throttle
-        // between ops and a concurrency cap of 10 prevent connection storms while
-        // still recovering large files (100+ chunks) within a single cycle.
+        // Process up to 1000 chunks per cycle (queue depth). 2 concurrent heals
+        // with a 50ms cooldown keeps healing gentle on gigabit — at most 2 connections
+        // competing with client I/O at any moment, yielding every 50ms.
         let max_heal_per_cycle = 1000;
-        let max_concurrent_heals = 10;
+        let max_concurrent_heals = 2;
 
         Self {
             storage,
@@ -305,8 +305,9 @@ impl HealingManager {
                     ReplicationStatus::Ok => {}
                 }
                 healed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Throttle after each op to avoid connection storms
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Throttle after each op — 50ms on gigabit yields frequently
+                // without significantly slowing recovery (4MB transfer ~33ms).
+                tokio::time::sleep(Duration::from_millis(50)).await;
             });
             handles.push(handle);
         }

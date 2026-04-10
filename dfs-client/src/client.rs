@@ -1814,6 +1814,37 @@ impl DfsClient {
         Ok(combined)
     }
 
+    /// Read a single chunk by ID, resolving node IDs to addresses.
+    /// Used to re-read the partial last chunk when re-aligning a write buffer after an interrupted append.
+    pub async fn read_chunk_by_id(&self, chunk_id: ChunkId, node_ids: &[dfs_common::NodeId]) -> Result<Vec<u8>> {
+        // Resolve NodeIds to SocketAddrs
+        let node_id_map = self.addr_to_node_id.read().await;
+        let mut node_addrs: Vec<SocketAddr> = node_ids.iter()
+            .filter_map(|node_id| {
+                node_id_map.iter()
+                    .find(|(_, &id)| id == *node_id)
+                    .map(|(&addr, _)| addr)
+            })
+            .collect();
+        drop(node_id_map);
+
+        if node_addrs.is_empty() {
+            node_addrs = match self.get_chunk_replicas(chunk_id).await {
+                Ok(r) => r,
+                Err(_) => self.cluster_nodes.read().await.clone(),
+            };
+        }
+
+        for addr in &node_addrs {
+            match self.read_chunk_from_server(*addr, chunk_id).await {
+                Ok(data) => return Ok(data),
+                Err(e) => debug!("read_chunk_by_id: failed from {}: {}", addr, e),
+            }
+        }
+
+        anyhow::bail!("read_chunk_by_id: failed to read chunk {} from any node", chunk_id)
+    }
+
     /// Write data to cluster with synchronous dual-replica replication
     /// Returns (chunk_ids, chunk_sizes, replica_nodes)
     pub async fn write_data(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {

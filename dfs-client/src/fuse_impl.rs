@@ -56,6 +56,10 @@ struct WriteBuffer {
     start_offset: u64,
     /// When this buffer was created
     created_at: std::time::Instant,
+    /// Number of trailing chunks to drop from metadata on the first flush.
+    /// Set to 1 when the buffer is pre-seeded with a partial last chunk so
+    /// the old partial chunk is replaced (not duplicated) by the new flush.
+    drop_trailing_chunks_on_flush: usize,
 }
 
 impl WriteBuffer {
@@ -109,9 +113,10 @@ async fn flush_buffer_standalone(
             if force && !buffer.data.is_empty() {
                 let data = std::mem::take(&mut buffer.data);
                 let start_offset = buffer.start_offset;
+                let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
                 buffer.start_offset += data.len() as u64;
                 buffer.last_modified = SystemTime::now();
-                Some((data, start_offset))
+                Some((data, start_offset, drop_trailing))
             } else {
                 None
             }
@@ -120,7 +125,7 @@ async fn flush_buffer_standalone(
         }
     };
 
-    if let Some((flush_data, buffer_start_offset)) = flush_data_opt {
+    if let Some((flush_data, buffer_start_offset, drop_trailing)) = flush_data_opt {
         info!("flush_buffer_standalone: flushing {} bytes for inode {} at offset {}",
               flush_data.len(), ino, buffer_start_offset);
 
@@ -131,6 +136,16 @@ async fn flush_buffer_standalone(
                 None => anyhow::bail!("Metadata not found for inode {}", ino),
             }
         };
+
+        // If the buffer was pre-seeded with a partial last chunk, drop that chunk
+        // from metadata before extending — it will be replaced by the new flush.
+        if drop_trailing > 0 {
+            let keep = metadata.chunk_locations.len().saturating_sub(drop_trailing);
+            metadata.chunk_locations.truncate(keep);
+            let keep_legacy = metadata.chunks.len().saturating_sub(drop_trailing);
+            metadata.chunks.truncate(keep_legacy);
+            metadata.chunk_sizes.truncate(keep_legacy);
+        }
 
         let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) =
             client.write_data_with_cache(&flush_data, ino, buffer_start_offset).await?;
@@ -303,6 +318,7 @@ impl DfsFilesystem {
 
                                     // Flush only aligned portion (multiples of 4MB)
                                     let start_offset = buffer.start_offset;
+                                    let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
                                     let data: Vec<u8> = if flush_size == buffer_size {
                                         // Flush entire buffer (it's exactly a multiple of chunk_size)
                                         let data = std::mem::take(&mut buffer.data);
@@ -319,14 +335,14 @@ impl DfsFilesystem {
                                     };
 
                                     buffer.last_modified = SystemTime::now();
-                                    Some((data, start_offset))
+                                    Some((data, start_offset, drop_trailing))
                                 }
                             } else {
                                 None
                             }
                         };
 
-                        if let Some((flush_data, buffer_start_offset)) = flush_data_opt {
+                        if let Some((flush_data, buffer_start_offset, drop_trailing)) = flush_data_opt {
                             // Get metadata
                             let mut metadata = {
                                 let cache = metadata_cache_for_cleanup.read().unwrap();
@@ -338,6 +354,16 @@ impl DfsFilesystem {
                                     }
                                 }
                             };
+
+                            // If the buffer was pre-seeded with a partial last chunk, drop that
+                            // chunk from metadata before extending — it will be replaced.
+                            if drop_trailing > 0 {
+                                let keep = metadata.chunk_locations.len().saturating_sub(drop_trailing);
+                                metadata.chunk_locations.truncate(keep);
+                                let keep_legacy = metadata.chunks.len().saturating_sub(drop_trailing);
+                                metadata.chunks.truncate(keep_legacy);
+                                metadata.chunk_sizes.truncate(keep_legacy);
+                            }
 
                             // Write buffered data
                             match client_for_cleanup.write_data_with_cache(&flush_data, ino, buffer_start_offset).await {
@@ -525,15 +551,17 @@ impl DfsFilesystem {
                         // File is closing, flush everything including partial chunk
                         let data = std::mem::take(&mut buffer.data);
                         let start_offset = buffer.start_offset;
+                        let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
                         buffer.start_offset += data.len() as u64;
                         buffer.last_modified = SystemTime::now();
-                        Some((data, start_offset))
+                        Some((data, start_offset, drop_trailing))
                     } else {
                         None
                     }
                 } else {
                     // Flush only aligned portion (multiples of 4MB)
                     let start_offset = buffer.start_offset;
+                    let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
                     let data: Vec<u8> = if flush_size == buffer_size {
                         // Flush entire buffer (it's exactly a multiple of chunk_size)
                         let data = std::mem::take(&mut buffer.data);
@@ -550,14 +578,14 @@ impl DfsFilesystem {
                     };
 
                     buffer.last_modified = SystemTime::now();
-                    Some((data, start_offset))
+                    Some((data, start_offset, drop_trailing))
                 }
             } else {
                 None
             }
         };
 
-        if let Some((flush_data, buffer_start_offset)) = flush_data_opt {
+        if let Some((flush_data, buffer_start_offset, drop_trailing)) = flush_data_opt {
             info!("Flushing {} bytes for inode {} (force={})", flush_data.len(), ino, force_metadata_update);
 
             // Get current metadata from cache
@@ -570,6 +598,16 @@ impl DfsFilesystem {
                     }
                 }
             };
+
+            // If the buffer was pre-seeded with a partial last chunk, drop that chunk
+            // from metadata before extending — it will be replaced by the new flush.
+            if drop_trailing > 0 {
+                let keep = metadata.chunk_locations.len().saturating_sub(drop_trailing);
+                metadata.chunk_locations.truncate(keep);
+                let keep_legacy = metadata.chunks.len().saturating_sub(drop_trailing);
+                metadata.chunks.truncate(keep_legacy);
+                metadata.chunk_sizes.truncate(keep_legacy);
+            }
 
             // Write buffered data as new chunks (appending)
             // Use write-through caching to populate byte-range cache for immediate read-back
@@ -1891,6 +1929,7 @@ impl Filesystem for DfsFilesystem {
 
                     let write_buffers_clone = write_buffers.clone();
                     let client_clone = client.clone();
+                    let client_clone2 = client.clone(); // for threshold flush after should_flush async move
                     let metadata_cache_clone = metadata_cache.clone();
                     let metadata_cache_clone2 = metadata_cache.clone();
                     let metadata_cache_clone3 = metadata_cache.clone();
@@ -1911,10 +1950,54 @@ impl Filesystem for DfsFilesystem {
                                 last_modified: SystemTime::now(),
                                 start_offset: cache_size,
                                 created_at: std::time::Instant::now(),
+                                drop_trailing_chunks_on_flush: 0,
                             }))
                         }).clone();
 
                         let mut buffer = buffer_lock.lock().await;
+
+                        // Re-alignment: if we just created an empty buffer whose start_offset
+                        // is not 4MB-aligned (e.g. a recording resumed after being interrupted
+                        // mid-chunk), read the partial last chunk back and pre-seed the buffer
+                        // so that the first flush writes a complete 4MB-aligned chunk.
+                        const CHUNK_SIZE_ALIGN: u64 = 4 * 1024 * 1024;
+                        if buffer.data.is_empty() {
+                            let partial_bytes = buffer.start_offset % CHUNK_SIZE_ALIGN;
+                            if partial_bytes != 0 {
+                                let aligned_offset = buffer.start_offset - partial_bytes;
+                                // Find the last chunk in metadata that covers this aligned_offset
+                                let last_chunk_info = {
+                                    let cache = metadata_cache_clone2.read().unwrap();
+                                    cache.get(&ino).and_then(|m| {
+                                        // chunk_locations has the last chunk we need
+                                        m.chunk_locations.last().map(|loc| (loc.chunk_id, loc.nodes.clone()))
+                                    })
+                                };
+                                if let Some((last_chunk_id, node_ids)) = last_chunk_info {
+                                    match client_clone.read_chunk_by_id(last_chunk_id, &node_ids).await {
+                                        Ok(chunk_data) => {
+                                            // Pre-seed buffer with the partial tail data so the
+                                            // combined (partial + new) flush lands at CHUNK_SIZE alignment.
+                                            // Mark that the old partial chunk must be dropped from metadata
+                                            // on the first flush so it is replaced, not duplicated.
+                                            info!("Re-aligning write buffer for inode {}: start_offset={} \
+                                                   is not 4MB-aligned (partial={} bytes), pre-seeding buffer \
+                                                   from chunk {:?}",
+                                                  ino, buffer.start_offset, partial_bytes, last_chunk_id);
+                                            buffer.data = chunk_data;
+                                            buffer.start_offset = aligned_offset;
+                                            buffer.drop_trailing_chunks_on_flush = 1;
+                                        }
+                                        Err(e) => {
+                                            // Non-fatal: log and continue without realignment.
+                                            // The recording will still work, just with small chunks.
+                                            warn!("Re-alignment: failed to read last chunk {:?} for inode {}: {}",
+                                                  last_chunk_id, ino, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // No need to check idle here - we'll append data first, then check
                         // This ensures data isn't lost
@@ -1959,7 +2042,7 @@ impl Filesystem for DfsFilesystem {
                                 let flush_result = runtime_clone.block_on(async {
                                     // Clone the buffer data for flushing, but keep buffer for reads
                                     // This prevents read gaps during the flush operation
-                                    let buffer_data: Option<(Vec<u8>, u64)> = {
+                                    let buffer_data: Option<(Vec<u8>, u64, usize)> = {
                                         if let Some(buffer_lock) = write_buffers.get(&ino) {
                                             let mut buffer = buffer_lock.lock().await;
                                             let buffer_size = buffer.data.len();
@@ -1976,6 +2059,7 @@ impl Filesystem for DfsFilesystem {
                                             }
 
                                             let start: u64 = buffer.start_offset;
+                                            let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
                                             let data: Vec<u8> = if flush_size == buffer_size {
                                                 // Flush entire buffer (it's exactly a multiple of chunk_size)
                                                 let data = std::mem::take(&mut buffer.data);
@@ -1993,13 +2077,13 @@ impl Filesystem for DfsFilesystem {
                                             };
 
                                             buffer.last_modified = SystemTime::now();
-                                            Some((data, start))
+                                            Some((data, start, drop_trailing))
                                         } else {
                                             None
                                         }
                                     };
 
-                                    if let Some((data, buffer_start_offset)) = buffer_data {
+                                    if let Some((data, buffer_start_offset, drop_trailing)) = buffer_data {
                                         info!("Flushing {} bytes for inode {}", data.len(), ino);
 
                                         // Get current metadata from cache
@@ -2013,8 +2097,18 @@ impl Filesystem for DfsFilesystem {
                                             }
                                         };
 
+                                        // If the buffer was pre-seeded with a partial last chunk,
+                                        // drop that chunk before extending — it will be replaced.
+                                        if drop_trailing > 0 {
+                                            let keep = flush_metadata.chunk_locations.len().saturating_sub(drop_trailing);
+                                            flush_metadata.chunk_locations.truncate(keep);
+                                            let keep_legacy = flush_metadata.chunks.len().saturating_sub(drop_trailing);
+                                            flush_metadata.chunks.truncate(keep_legacy);
+                                            flush_metadata.chunk_sizes.truncate(keep_legacy);
+                                        }
+
                                         // Write buffered data as new chunks with caching
-                                        let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = client_clone
+                                        let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = client_clone2
                                             .write_data_with_cache(&data, cache_inode, buffer_start_offset)
                                             .await?;
 
@@ -2050,7 +2144,7 @@ impl Filesystem for DfsFilesystem {
 
                                         if should_update_meta {
                                             debug!("Auto-flush: updating metadata for inode {} (time-based batching)", ino);
-                                            client_clone.put_file_metadata(&flush_metadata).await?;
+                                            client_clone2.put_file_metadata(&flush_metadata).await?;
                                             last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
                                         } else {
                                             debug!("Auto-flush: skipping metadata update for inode {} (batched)", ino);
@@ -2437,6 +2531,18 @@ impl Filesystem for DfsFilesystem {
                                 }
                             }
                         };
+
+                        // If the buffer was pre-seeded with a partial last chunk, drop that
+                        // chunk from metadata before extending — it will be replaced.
+                        if buffer.drop_trailing_chunks_on_flush > 0 {
+                            let keep = flush_metadata.chunk_locations.len()
+                                .saturating_sub(buffer.drop_trailing_chunks_on_flush);
+                            flush_metadata.chunk_locations.truncate(keep);
+                            let keep_legacy = flush_metadata.chunks.len()
+                                .saturating_sub(buffer.drop_trailing_chunks_on_flush);
+                            flush_metadata.chunks.truncate(keep_legacy);
+                            flush_metadata.chunk_sizes.truncate(keep_legacy);
+                        }
 
                         // Write buffered data as new chunks with caching
                         // Use the buffer's recorded start offset

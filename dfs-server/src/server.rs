@@ -61,6 +61,13 @@ pub struct Server {
     /// All nodes keep it up-to-date so leadership transitions are seamless.
     /// Updated on every write, heal, and chunk-location replication.
     chunk_map: Arc<RwLock<HashMap<FileId, (Vec<ChunkLocation>, u64)>>>,
+
+    /// Permanently-missing chunk blocklist.
+    /// A chunk is added here when ALL nodes listed in its location record are online
+    /// but none of them actually has the data — meaning it's unrecoverable.
+    /// Once blocklisted, read_chunk returns NotFound immediately without opening
+    /// any connections, preventing the connection storm caused by repeated retries.
+    missing_chunks: Arc<RwLock<std::collections::HashSet<ChunkId>>>,
 }
 
 impl Server {
@@ -87,6 +94,7 @@ impl Server {
             // Real client reads bypass this limit (high priority)
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             chunk_map: Arc::new(RwLock::new(HashMap::new())),
+            missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
         };
 
         // Build the in-memory chunk map from persistent metadata on startup
@@ -1031,6 +1039,11 @@ impl Server {
             return Ok(data);
         }
 
+        // Fast path: chunk is permanently missing, don't open any connections
+        if self.missing_chunks.read().await.contains(chunk_id) {
+            anyhow::bail!("Chunk {} is permanently missing (blocklisted)", chunk_id);
+        }
+
         // Get chunk location from metadata
         let location = self
             .metadata
@@ -1039,12 +1052,20 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
         // Try reading from remote nodes
+        let mut online_nodes_tried = 0;
+        let mut online_nodes_total = 0;
+
         for node_id in &location.nodes {
             if node_id == &self.cluster.local_node_id() {
                 continue; // Already tried local
             }
 
             if let Some(node_info) = self.cluster.get_node(node_id).await {
+                if node_info.status != dfs_common::NodeStatus::Online {
+                    continue;
+                }
+                online_nodes_total += 1;
+
                 let request = Request::ReadChunk {
                     chunk_id: *chunk_id,
                     sequential_hint: None,
@@ -1060,14 +1081,23 @@ impl Server {
                             debug!("Read chunk {} from remote node {}", chunk_id, node_id);
                             return Ok(data);
                         }
-                        _ => continue,
+                        _ => { online_nodes_tried += 1; continue; }
                     },
                     Err(e) => {
                         warn!("Failed to read from node {}: {}", node_id, e);
+                        online_nodes_tried += 1;
                         continue;
                     }
                 }
             }
+        }
+
+        // If every online node we tried failed, this chunk is unrecoverable — blocklist it
+        // so future requests don't open connections trying to fetch it.
+        if online_nodes_tried > 0 && online_nodes_tried >= online_nodes_total {
+            warn!("Chunk {} is permanently missing — blocklisting (tried {}/{} online nodes)",
+                  chunk_id, online_nodes_tried, online_nodes_total);
+            self.missing_chunks.write().await.insert(*chunk_id);
         }
 
         anyhow::bail!("Failed to read chunk {} from any node", chunk_id)

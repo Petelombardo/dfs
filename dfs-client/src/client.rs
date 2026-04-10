@@ -2187,6 +2187,22 @@ impl DfsClient {
         }
         drop(node_id_map);
 
+        // Broadcast the full ChunkLocation (with both node IDs) back to both replica nodes.
+        // Without this, each node only records itself in its chunk location DB, so
+        // dfs-admin file info shows single-node entries even though both replicas exist.
+        for location in &chunk_locations {
+            let req = Request::ReplicateChunkLocation { location: location.clone() };
+            for &addr in &[addr1, addr2] {
+                let client = self.clone();
+                let req = req.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client.send_request(addr, req).await {
+                        debug!("Failed to replicate chunk location to {}: {}", addr, e);
+                    }
+                });
+            }
+        }
+
         // Populate byte-range cache for immediate read-back
         if inode > 0 && file_offset > 0 {
             let mut byte_cache = self.byte_range_cache.lock().await;

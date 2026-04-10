@@ -1948,12 +1948,14 @@ impl DfsClient {
         info!("Dual-replica write complete: {} chunks stored on {} and {}",
               chunk_locations.len(), replica1, replica2);
 
-        // Broadcast the full ChunkLocation (with both node IDs) back to both replica nodes.
-        // Without this, each node only records itself in its chunk location DB, so
-        // dfs-admin file info shows single-node entries even though both replicas exist.
+        // Broadcast the full ChunkLocation (with both node IDs) to ALL cluster nodes.
+        // Without this, nodes that didn't receive data only learn about replicas they
+        // stored themselves — dfs-admin file info shows single-node entries and the
+        // healing engine can't see the full replica set.
+        let all_nodes = self.cluster_nodes.read().await.clone();
         for location in &chunk_locations {
             let req = Request::ReplicateChunkLocation { location: location.clone() };
-            for &addr in &[replica1, replica2] {
+            for &addr in &all_nodes {
                 let client = self.clone();
                 let req = req.clone();
                 tokio::spawn(async move {
@@ -2203,12 +2205,14 @@ impl DfsClient {
         }
         drop(node_id_map);
 
-        // Broadcast the full ChunkLocation (with both node IDs) back to both replica nodes.
-        // Without this, each node only records itself in its chunk location DB, so
-        // dfs-admin file info shows single-node entries even though both replicas exist.
+        // Broadcast the full ChunkLocation (with both node IDs) to ALL cluster nodes.
+        // Without this, nodes that didn't receive data only learn about replicas they
+        // stored themselves — dfs-admin file info shows single-node entries and the
+        // healing engine can't see the full replica set.
+        let all_nodes_snapshot = all_nodes.to_vec();
         for location in &chunk_locations {
             let req = Request::ReplicateChunkLocation { location: location.clone() };
-            for &addr in &[addr1, addr2] {
+            for &addr in &all_nodes_snapshot {
                 let client = self.clone();
                 let req = req.clone();
                 tokio::spawn(async move {

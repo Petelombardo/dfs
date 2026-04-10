@@ -687,7 +687,14 @@ impl Server {
         debug!("Handling delete chunk: {}", chunk_id);
 
         match self.storage.delete_chunk(&chunk_id) {
-            Ok(_) => Response::Ok { data: None },
+            Ok(_) => {
+                // Also remove the chunk location record from metadata so the healer
+                // doesn't try to re-replicate deleted chunks indefinitely.
+                if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
+                    warn!("Failed to delete chunk location record for {}: {}", chunk_id, e);
+                }
+                Response::Ok { data: None }
+            }
             Err(e) => {
                 warn!("Failed to delete chunk {}: {}", chunk_id, e);
                 Response::Error {
@@ -1318,11 +1325,19 @@ impl Server {
     async fn handle_delete_file(&self, path: String) -> Response {
         debug!("Handling delete file: {}", path);
 
-        // Get file metadata first to find chunks
+        // Get file metadata first to find chunks and their locations before anything is deleted
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                // Get chunk IDs before deleting metadata
-                let chunk_ids = metadata.chunks.clone();
+                // Collect chunk locations NOW, before deleting metadata.
+                // Prefer inline chunk_locations (new format); fall back to querying
+                // individual chunk: records for legacy files.
+                let chunk_locations: Vec<_> = if !metadata.chunk_locations.is_empty() {
+                    metadata.chunk_locations.clone()
+                } else {
+                    metadata.chunks.iter().filter_map(|chunk_id| {
+                        self.metadata.get_chunk_location(chunk_id).ok().flatten()
+                    }).collect()
+                };
 
                 // Delete the file metadata
                 match self.metadata.delete_file(&metadata.id) {
@@ -1330,7 +1345,16 @@ impl Server {
                         // Remove from chunk map
                         self.chunk_map_remove(&metadata.id).await;
 
-                        // Replicate metadata deletion to all other nodes asynchronously
+                        // Delete chunk location records from local metadata DB immediately.
+                        // This is the critical step that was missing — without it, chunk: keys
+                        // accumulate forever and the healer spins on thousands of ghost chunks.
+                        for loc in &chunk_locations {
+                            if let Err(e) = self.metadata.delete_chunk_location(&loc.chunk_id) {
+                                warn!("Failed to delete chunk location record {}: {}", loc.chunk_id, e);
+                            }
+                        }
+
+                        // Replicate metadata deletion and chunk cleanup to all other nodes asynchronously
                         let cluster = self.cluster.clone();
                         let client = self.client.clone();
                         let storage = self.storage.clone();
@@ -1361,45 +1385,54 @@ impl Server {
                                 }
                             }
 
-                            // Then delete chunks from all nodes asynchronously
-                            info!("Deleting {} chunks for file: {}", chunk_ids.len(), path);
+                            // Then delete the actual chunk data from all nodes
+                            info!("Deleting {} chunks for file: {}", chunk_locations.len(), path_clone);
 
-                            for chunk_id in &chunk_ids {
-                                // Get chunk location
-                                let location = match metadata_store.get_chunk_location(chunk_id) {
-                                    Ok(Some(loc)) => loc,
-                                    _ => continue,
-                                };
+                            for loc in &chunk_locations {
+                                let chunk_id = &loc.chunk_id;
 
-                                // Delete from all nodes that have it
-                                for node_id in &location.nodes {
-                                    if *node_id == cluster.local_node_id() {
-                                        // Delete locally
+                                // Delete chunk location record on all peers
+                                for node in &nodes {
+                                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                        continue;
+                                    }
+                                    // Peers handle chunk location cleanup via DeleteMetadata;
+                                    // chunk data deletion below covers the actual bytes.
+                                }
+
+                                // Delete chunk data from every node that holds it
+                                for node_id in &loc.nodes {
+                                    if *node_id == local_id {
                                         if let Err(e) = storage.delete_chunk(chunk_id) {
                                             warn!("Failed to delete local chunk {}: {}", chunk_id, e);
                                         }
+                                        // Also clean up local chunk location record on peers
+                                        // (DeleteMetadata handler on peers takes care of this)
                                     } else {
-                                        // Delete from remote node
                                         if let Some(node_info) = cluster.get_node(node_id).await {
-                                            let request = Request::DeleteChunk {
-                                                chunk_id: *chunk_id,
-                                            };
-
-                                            if let Err(e) = client
-                                                .send_message(node_info.addr, Message::Request(request))
-                                                .await
-                                            {
-                                                warn!(
-                                                    "Failed to delete chunk {} from node {}: {}",
-                                                    chunk_id, node_id, e
-                                                );
+                                            if node_info.status == dfs_common::NodeStatus::Online {
+                                                let request = Request::DeleteChunk {
+                                                    chunk_id: *chunk_id,
+                                                };
+                                                if let Err(e) = client
+                                                    .send_message(node_info.addr, Message::Request(request))
+                                                    .await
+                                                {
+                                                    warn!("Failed to delete chunk {} from node {}: {}",
+                                                          chunk_id, node_id, e);
+                                                }
                                             }
                                         }
                                     }
                                 }
+
+                                // Remove chunk location record from local metadata DB on peers
+                                // via the existing DeleteMetadata path (peers call delete_chunk_location
+                                // in handle_delete_metadata — ensured below)
+                                let _ = metadata_store.delete_chunk_location(chunk_id);
                             }
 
-                            info!("Chunk deletion complete for file: {}", path);
+                            info!("Chunk deletion complete for file: {}", path_clone);
                         });
 
                         Response::Ok { data: None }
@@ -1587,13 +1620,39 @@ impl Server {
 
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                // Get chunk locations
-                let mut chunk_locations = Vec::new();
-                for chunk_id in &metadata.chunks {
-                    if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
-                        chunk_locations.push(location);
+                // Build chunk locations: prefer inline chunk_locations in FileMetadata (most
+                // accurate — written by the client with both replica node IDs), falling back
+                // to the per-chunk sled DB for any chunks not covered by the inline map.
+                let chunk_locations = if !metadata.chunk_locations.is_empty()
+                    && metadata.chunk_locations.len() == metadata.chunks.len()
+                {
+                    // Inline locations are complete — use them directly, but merge with sled
+                    // to pick up any extra nodes added by ReplicateChunkLocation since the
+                    // file was written.
+                    metadata.chunk_locations.iter().map(|inline| {
+                        if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
+                            // Merge: union of both node lists
+                            let mut merged_nodes = inline.nodes.clone();
+                            for node in &sled_loc.nodes {
+                                if !merged_nodes.contains(node) {
+                                    merged_nodes.push(*node);
+                                }
+                            }
+                            ChunkLocation { nodes: merged_nodes, ..inline.clone() }
+                        } else {
+                            inline.clone()
+                        }
+                    }).collect()
+                } else {
+                    // Inline locations absent or mismatched — fall back to sled DB
+                    let mut locs = Vec::new();
+                    for chunk_id in &metadata.chunks {
+                        if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
+                            locs.push(location);
+                        }
                     }
-                }
+                    locs
+                };
 
                 Response::FileInfo {
                     metadata,
@@ -1620,12 +1679,31 @@ impl Server {
 
         match self.metadata.get_file(&file_id) {
             Ok(Some(metadata)) => {
-                let mut chunk_locations = Vec::new();
-                for chunk_id in &metadata.chunks {
-                    if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
-                        chunk_locations.push(location);
+                let chunk_locations = if !metadata.chunk_locations.is_empty()
+                    && metadata.chunk_locations.len() == metadata.chunks.len()
+                {
+                    metadata.chunk_locations.iter().map(|inline| {
+                        if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
+                            let mut merged_nodes = inline.nodes.clone();
+                            for node in &sled_loc.nodes {
+                                if !merged_nodes.contains(node) {
+                                    merged_nodes.push(*node);
+                                }
+                            }
+                            ChunkLocation { nodes: merged_nodes, ..inline.clone() }
+                        } else {
+                            inline.clone()
+                        }
+                    }).collect()
+                } else {
+                    let mut locs = Vec::new();
+                    for chunk_id in &metadata.chunks {
+                        if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
+                            locs.push(location);
+                        }
                     }
-                }
+                    locs
+                };
 
                 Response::FileInfo {
                     metadata,

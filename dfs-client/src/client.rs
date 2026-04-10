@@ -136,6 +136,12 @@ pub struct DfsClient {
     /// Address of the current cluster leader, used to route GetFileChunkMap requests.
     /// Updated during refresh_cluster_nodes(). Falls back to any node if unknown.
     leader_addr: Arc<RwLock<Option<SocketAddr>>>,
+
+    /// Global semaphore capping total concurrent chunk fetches across ALL simultaneous
+    /// read_data calls. Without this, a seek causes N parallel FUSE reads each spawning
+    /// their own 20-slot semaphore, producing N*20 simultaneous connections and
+    /// exhausting server file descriptors.
+    fetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl DfsClient {
@@ -267,6 +273,7 @@ impl DfsClient {
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
             read_lock: Arc::new(Mutex::new(())),
             leader_addr: Arc::new(RwLock::new(None)),
+            fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
         })
     }
 
@@ -740,9 +747,11 @@ impl DfsClient {
         }
 
         // Create parallel fetch tasks with concurrency limit
-        // CRITICAL: Limit concurrent connections to prevent exhausting server file descriptors
-        // With 5 servers and unlimited concurrency, we could open 500+ connections
-        let max_concurrent_fetches = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
+        // CRITICAL: Use a SHARED semaphore (stored on self) so concurrent read_data calls
+        // from parallel FUSE reads don't each get their own 20-slot budget. Without sharing,
+        // a seek with N parallel FUSE reads opens N*20 simultaneous connections and exhausts
+        // server file descriptors.
+        let max_concurrent_fetches = self.fetch_semaphore.clone();
 
         let fetch_tasks: Vec<_> = chunks_to_fetch.iter().map(|(idx, chunk_id, file_offset)| {
             let idx = *idx;

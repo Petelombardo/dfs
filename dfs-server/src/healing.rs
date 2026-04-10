@@ -233,12 +233,11 @@ impl HealingManager {
                         if self.should_heal(&chunk_id).await {
                             if let Err(e) = self.heal_chunk(&chunk_id).await {
                                 warn!("Failed to heal chunk {}: {}", chunk_id, e);
-                            } else {
-                                healed_count += 1;
-                                // Brief pause between heals so connections drain back to the pool
-                                // and the cluster isn't flooded with simultaneous PushChunkTo ops.
-                                tokio::time::sleep(Duration::from_millis(200)).await;
                             }
+                            // Throttle regardless of success/failure — a chunk that can't be
+                            // sourced from any node would otherwise spin at full speed.
+                            healed_count += 1;
+                            tokio::time::sleep(Duration::from_millis(200)).await;
                         } else {
                             pending_count += 1;
                         }

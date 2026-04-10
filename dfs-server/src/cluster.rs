@@ -687,8 +687,12 @@ async fn send_heartbeat_message(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    // Connect to target node
-    let mut stream = TcpStream::connect(target_addr).await?;
+    // Connect to target node (5s timeout to prevent fd leaks when peers are overloaded)
+    let mut stream = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        TcpStream::connect(target_addr),
+    ).await
+        .map_err(|_| anyhow::anyhow!("Heartbeat connect timeout to {}", target_addr))??;
 
     // Create message envelope
     let request_id = RequestId::new(0); // Heartbeats don't need tracking

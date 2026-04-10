@@ -283,8 +283,11 @@ impl NetworkClient {
             }
             None => {
                 debug!("Connecting to {}", target);
-                TcpStream::connect(target)
-                    .await
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(target),
+                ).await
+                    .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
                     .with_context(|| format!("Failed to connect to {}", target))?
             }
         };
@@ -293,8 +296,11 @@ impl NetworkClient {
         if let Err(e) = write_message(&mut stream, &envelope).await {
             // Stale pooled connection — open a fresh one and retry once
             debug!("Pooled connection to {} failed ({}), retrying with new connection", target, e);
-            let mut fresh = TcpStream::connect(target)
-                .await
+            let mut fresh = tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                TcpStream::connect(target),
+            ).await
+                .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
                 .with_context(|| format!("Failed to reconnect to {}", target))?;
             write_message(&mut fresh, &envelope).await?;
             stream = fresh;

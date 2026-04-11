@@ -218,6 +218,25 @@ impl ClusterManager {
         leader_id == Some(node_id)
     }
 
+    /// Returns true if a strict majority of known nodes are online.
+    ///
+    /// Quorum = floor(total / 2) + 1, e.g. 3-of-5, 2-of-3.
+    /// The leader must have quorum before taking any destructive / irreversible
+    /// action (orphan purge, over-replication cleanup). This prevents a partitioned
+    /// leader from deleting data that the majority partition still considers live.
+    /// Non-destructive healing (adding replicas) is NOT gated on quorum — it is
+    /// always safe to create more copies.
+    pub async fn has_quorum(&self) -> bool {
+        let nodes = self.nodes.read().await;
+        let total = nodes.len();
+        let online = nodes
+            .values()
+            .filter(|n| n.status == NodeStatus::Online)
+            .count();
+        let quorum = total / 2 + 1;
+        online >= quorum
+    }
+
     /// Get online nodes count
     pub async fn online_node_count(&self) -> usize {
         let nodes = self.nodes.read().await;
@@ -381,20 +400,31 @@ impl ClusterManager {
     /// Start background task to send heartbeats to all nodes
     pub async fn start_heartbeat_sender(self: Arc<Self>) {
         let mut heartbeat_interval = interval(Duration::from_secs(self.heartbeat_interval));
+        let mut probe_counter = 0u32;
 
         tokio::spawn(async move {
             loop {
                 heartbeat_interval.tick().await;
+                probe_counter += 1;
 
-                if let Err(e) = self.send_heartbeats().await {
+                // Probe failed nodes every 6 intervals (~60s at default 10s heartbeat).
+                // This breaks the mutual-silence deadlock that occurs when both sides
+                // mark each other Failed and stop sending heartbeats — probing lets a
+                // recovered node announce itself without requiring a manual restart.
+                let probe_failed = probe_counter % 6 == 0;
+
+                if let Err(e) = self.send_heartbeats(probe_failed).await {
                     warn!("Error sending heartbeats: {}", e);
                 }
             }
         });
     }
 
-    /// Send heartbeats to all nodes in the cluster
-    async fn send_heartbeats(&self) -> Result<()> {
+    /// Send heartbeats to all nodes in the cluster.
+    ///
+    /// When `probe_failed` is true, also sends to Failed nodes so they can
+    /// recover after a reboot or network partition without manual intervention.
+    async fn send_heartbeats(&self, probe_failed: bool) -> Result<()> {
         use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
         use dfs_common::{NodeHealthGossip, NodeInfo};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -420,8 +450,8 @@ impl ClusterManager {
                 continue;
             }
 
-            // Skip failed nodes
-            if node_info.status == NodeStatus::Failed {
+            // Skip failed nodes unless this is a recovery probe cycle
+            if node_info.status == NodeStatus::Failed && !probe_failed {
                 continue;
             }
 
@@ -433,9 +463,16 @@ impl ClusterManager {
 
             // Send heartbeat asynchronously (don't wait for response)
             let target_addr = node_info.addr;
+            let is_probe = node_info.status == NodeStatus::Failed;
             tokio::spawn(async move {
                 if let Err(e) = send_heartbeat_message(target_addr, heartbeat).await {
-                    debug!("Failed to send heartbeat to {}: {}", target_addr, e);
+                    if is_probe {
+                        debug!("Recovery probe to failed node {} unreachable: {}", target_addr, e);
+                    } else {
+                        debug!("Failed to send heartbeat to {}: {}", target_addr, e);
+                    }
+                } else if is_probe {
+                    debug!("Recovery probe sent to failed node {}", target_addr);
                 }
             });
         }

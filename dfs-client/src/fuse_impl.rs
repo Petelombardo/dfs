@@ -260,14 +260,22 @@ impl DfsFilesystem {
         info!("Client configured with buffer_flush_threshold={} bytes ({}MB, 3x cluster chunk size) for pipelined writes",
               buffer_flush_threshold, buffer_flush_threshold / (1024 * 1024));
 
-        // Start background task to periodically refresh cluster nodes
+        // Start background task to periodically refresh cluster nodes.
+        // Uses exponential backoff on failure: 30s → 60s → 120s → 240s (cap),
+        // resetting to 30s on the next success. This prevents hammering the network
+        // when all nodes are temporarily unreachable (e.g. cluster restart).
         let client_clone = client.clone();
         runtime.spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            const BASE_INTERVAL: u64 = 30;
+            const MAX_INTERVAL: u64 = 240;
+            let mut interval_secs = BASE_INTERVAL;
             loop {
-                interval.tick().await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
                 if let Err(e) = client_clone.refresh_cluster_nodes().await {
-                    tracing::debug!("Failed to refresh cluster nodes: {}", e);
+                    interval_secs = (interval_secs * 2).min(MAX_INTERVAL);
+                    tracing::warn!("Failed to refresh cluster nodes (retrying in {}s): {}", interval_secs, e);
+                } else {
+                    interval_secs = BASE_INTERVAL;
                 }
             }
         });

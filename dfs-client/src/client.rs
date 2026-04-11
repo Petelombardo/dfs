@@ -4,6 +4,7 @@ use dfs_common::{ChunkId, FileId, FileMetadata, Message, MessageEnvelope, NodeId
 use lru::LruCache;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -73,8 +74,13 @@ fn get_sqlite_consistency_window_ms() -> u64 {
 /// Client for communicating with DFS cluster
 #[derive(Clone)]
 pub struct DfsClient {
-    /// List of cluster nodes
+    /// List of cluster nodes (updated by refresh_cluster_nodes)
     cluster_nodes: Arc<RwLock<Vec<SocketAddr>>>,
+
+    /// Original seed addresses provided at startup.
+    /// Never mutated — used as a fallback when all cluster_nodes are unreachable
+    /// so we can re-bootstrap cluster membership from scratch.
+    seed_nodes: Vec<SocketAddr>,
 
     /// Current node index (for round-robin)
     current_node: Arc<RwLock<usize>>,
@@ -258,7 +264,8 @@ impl DfsClient {
         let warm_cache_map = LruCache::new(warm_cache_capacity);
 
         Ok(Self {
-            cluster_nodes: Arc::new(RwLock::new(cluster_nodes)),
+            cluster_nodes: Arc::new(RwLock::new(cluster_nodes.clone())),
+            seed_nodes: cluster_nodes,
             current_node: Arc::new(RwLock::new(0)),
             chunk_cache: Arc::new(Mutex::new(cache)),
             byte_range_cache: Arc::new(Mutex::new(byte_range_cache)),
@@ -304,18 +311,48 @@ impl DfsClient {
         addr
     }
 
-    /// Send a request to a cluster node with retry
+    /// Send a request to a cluster node with retry.
+    ///
+    /// Tries every known node in order. If all fail, waits briefly then re-bootstraps
+    /// from the seed list and tries once more. A small inter-node delay (100ms) prevents
+    /// hammering the network when nodes are refusing connections quickly.
     async fn send_request_with_retry(&self, request: Request) -> Result<Response> {
         let nodes = self.cluster_nodes.read().await.clone();
         let mut last_error = None;
 
-        // Try all nodes
-        for node_addr in &nodes {
+        for (i, node_addr) in nodes.iter().enumerate() {
+            if i > 0 {
+                // Brief pause between node attempts — avoids a connection storm when
+                // multiple nodes are down and each refuses immediately.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             match self.send_request(*node_addr, request.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     warn!("Failed to send request to {}: {}", node_addr, e);
                     last_error = Some(e);
+                }
+            }
+        }
+
+        // All known nodes failed — wait briefly, then re-bootstrap from seed list and retry once.
+        warn!("All cluster nodes unreachable, re-bootstrapping from seed list");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        if let Err(e) = self.refresh_cluster_nodes().await {
+            warn!("Re-bootstrap failed: {}", e);
+        } else {
+            let refreshed = self.cluster_nodes.read().await.clone();
+            for (i, node_addr) in refreshed.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                match self.send_request(*node_addr, request.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(e) => {
+                        warn!("Post-refresh: failed to send request to {}: {}", node_addr, e);
+                        last_error = Some(e);
+                    }
                 }
             }
         }
@@ -2672,17 +2709,24 @@ impl DfsClient {
         }
     }
 
-    /// Refresh cluster node list by querying GetClusterStatus
+    /// Refresh cluster node list by querying GetClusterStatus.
+    /// Tries all currently-known nodes first, then falls back to the original seed
+    /// addresses so the client can re-bootstrap after a complete node-list refresh failure.
     pub async fn refresh_cluster_nodes(&self) -> Result<()> {
-        let nodes = self.cluster_nodes.read().await.clone();
+        // Build a deduplicated candidate list: current nodes first, seeds as fallback.
+        let current = self.cluster_nodes.read().await.clone();
+        let mut candidates = current.clone();
+        for seed in &self.seed_nodes {
+            if !candidates.contains(seed) {
+                candidates.push(*seed);
+            }
+        }
 
-        // Try to get cluster status from any node
-        for node_addr in &nodes {
+        for node_addr in &candidates {
             let request = Request::GetClusterStatus;
 
             match self.send_request(*node_addr, request).await {
                 Ok(Response::ClusterStatus { nodes: cluster_nodes, leader_node_id, .. }) => {
-                    // Extract online node addresses and populate addr->NodeId mapping
                     let new_addrs: Vec<SocketAddr> = cluster_nodes
                         .iter()
                         .filter(|n| n.status == dfs_common::NodeStatus::Online)
@@ -2690,7 +2734,6 @@ impl DfsClient {
                         .collect();
 
                     if !new_addrs.is_empty() {
-                        // Update address-to-NodeId mapping for chunk_locations metadata
                         {
                             let mut mapping = self.addr_to_node_id.write().await;
                             for node in &cluster_nodes {
@@ -2700,7 +2743,6 @@ impl DfsClient {
                             }
                         }
 
-                        // Track the leader address for chunk map queries
                         if let Some(leader_id) = leader_node_id {
                             let leader = cluster_nodes.iter()
                                 .find(|n| n.id == leader_id && n.status == dfs_common::NodeStatus::Online)
@@ -2711,9 +2753,9 @@ impl DfsClient {
                             }
                         }
 
-                        let mut cluster_nodes = self.cluster_nodes.write().await;
-                        *cluster_nodes = new_addrs;
-                        info!("Refreshed cluster nodes: {} nodes", cluster_nodes.len());
+                        let mut nodes_lock = self.cluster_nodes.write().await;
+                        *nodes_lock = new_addrs;
+                        info!("Refreshed cluster nodes: {} nodes (via {})", nodes_lock.len(), node_addr);
                         return Ok(());
                     }
                 }
@@ -2721,7 +2763,7 @@ impl DfsClient {
             }
         }
 
-        Err(anyhow::anyhow!("Failed to refresh cluster nodes from any server"))
+        Err(anyhow::anyhow!("Failed to refresh cluster nodes from any server (tried {} candidates)", candidates.len()))
     }
 
     /// Get storage statistics from all nodes and aggregate them

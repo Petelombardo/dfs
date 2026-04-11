@@ -50,52 +50,54 @@ impl ChunkStorage {
         })
     }
 
-    /// Calculate optimal cache size based on available system RAM
-    /// Ensures cache is large enough to hold prefetch window without thrashing
+    /// Calculate optimal cache size based on available system RAM.
     ///
-    /// Strategy:
-    /// - Client prefetch window: up to 50 chunks (adaptive, but 50 is max)
-    /// - With 5 servers, each server gets ~10 chunks from prefetch
-    /// - Need 3x buffer to avoid evicting prefetched chunks before they're read
-    /// - Minimum: 64 chunks (256MB) to hold 3x prefetch window per server
-    /// - Maximum: Based on available RAM (25-50% allocation)
+    /// The server-side chunk cache is used primarily for healing reads (a chunk
+    /// that was just written is likely to be re-read by the healer shortly after).
+    /// The client maintains its own much larger LRU for read serving, so the server
+    /// cache does not need to be large.
+    ///
+    /// Sizing is conservative and based on *total* RAM rather than *available* RAM
+    /// at startup. Available RAM is an unreliable signal: it doesn't account for the
+    /// process's own working memory (chunk_map, metadata DB, sled cache, OS slab)
+    /// which all grow after startup, and can be transiently high before those
+    /// structures are populated.
+    ///
+    /// Budget per node (4GB class):
+    ///   chunk cache:     128 MB  (32 chunks × 4MB)
+    ///   sled metadata:   128 MB  (configured separately)
+    ///   chunk_map/RSS:   ~200 MB (working set, grows with file count)
+    ///   OS slab:         ~300 MB (dentry/inode/page cache under DVR load)
+    ///   headroom:        ~200 MB (kernel OOM reserve via min_free_kbytes)
+    ///   ─────────────────────────
+    ///   total:           ~956 MB  ← well within 4 GB
     fn calculate_cache_size() -> usize {
-        const MIN_CACHE_CHUNKS: usize = 64;    // Minimum 256MB - holds 3x prefetch window
-        const MAX_CACHE_CHUNKS: usize = 1024;  // Maximum 4GB cache
         const CHUNK_SIZE_MB: u64 = 4;
 
-        // Get available memory in MB
-        let available_mb = dfs_common::get_available_memory()
+        // Get total RAM (stable, unlike MemAvailable which fluctuates)
+        let total_mb = dfs_common::get_total_memory()
             .map(|bytes| bytes / (1024 * 1024))
-            .unwrap_or(1024); // Default to 1GB if detection fails
+            .unwrap_or(4096);
 
-        // Calculate cache size based on available RAM
-        // Use conservative allocation to avoid OOM on storage nodes
-        let cache_mb = if available_mb < 512 {
-            // Very low RAM (< 512MB): 25% allocation, minimum 256MB
-            (available_mb / 4).max(256)
-        } else if available_mb < 2048 {
-            // Low RAM (512MB - 2GB): 33% allocation
-            available_mb / 3
-        } else if available_mb < 8192 {
-            // Medium RAM (2GB - 8GB): 40% allocation
-            (available_mb * 2) / 5
+        // Scale conservatively off total RAM:
+        //   ≤ 2 GB  →  32 chunks (128 MB)  — SBC / low-memory nodes
+        //   ≤ 8 GB  →  64 chunks (256 MB)  — typical server nodes
+        //   > 8 GB  → 128 chunks (512 MB)  — high-memory nodes
+        //
+        // These are intentionally small; the client cache handles read amplification.
+        let cache_mb: u64 = if total_mb <= 2048 {
+            128
+        } else if total_mb <= 8192 {
+            256
         } else {
-            // High RAM (> 8GB): 50% allocation, capped at 4GB
-            (available_mb / 2).min(4096)
+            512
         };
 
-        let cache_chunks = (cache_mb / CHUNK_SIZE_MB) as usize;
-
-        // Clamp to reasonable bounds
-        let final_cache = cache_chunks.clamp(MIN_CACHE_CHUNKS, MAX_CACHE_CHUNKS);
+        let final_cache = (cache_mb / CHUNK_SIZE_MB) as usize;
 
         info!(
-            "Cache sizing: available_ram={}MB, cache_allocation={}MB ({} chunks, ~{} prefetch windows)",
-            available_mb,
-            final_cache as u64 * CHUNK_SIZE_MB,
-            final_cache,
-            final_cache / 50  // How many full 50-chunk prefetch windows fit
+            "Cache sizing: total_ram={}MB, chunk_cache={}MB ({} chunks)",
+            total_mb, cache_mb, final_cache,
         );
 
         final_cache

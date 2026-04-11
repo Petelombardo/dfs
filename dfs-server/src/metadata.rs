@@ -273,6 +273,34 @@ impl MetadataStore {
         Ok(ids)
     }
 
+    /// Build the set of chunk IDs referenced by any live file in metadata.
+    /// Used by the healer to identify orphaned chunk: records (chunks whose
+    /// file metadata was deleted but whose chunk: record was not cleaned up).
+    /// Scanning file records is cheaper than a reverse index for our file counts.
+    pub fn live_chunk_ids(&self) -> Result<std::collections::HashSet<dfs_common::ChunkId>> {
+        let mut live = std::collections::HashSet::new();
+        let prefix = b"file:";
+        for item in self.db.scan_prefix(prefix) {
+            let (_, value) = item?;
+            // Fast path: try new format (has chunk_locations inline)
+            if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&value) {
+                for loc in &metadata.chunk_locations {
+                    live.insert(loc.chunk_id);
+                }
+                // Also cover chunks vec for files not yet migrated to chunk_locations
+                for &chunk_id in &metadata.chunks {
+                    live.insert(chunk_id);
+                }
+            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
+                let metadata: FileMetadata = v0.into();
+                for &chunk_id in &metadata.chunks {
+                    live.insert(chunk_id);
+                }
+            }
+        }
+        Ok(live)
+    }
+
     /// Get chunk location information
     pub fn get_chunk_location(&self, chunk_id: &dfs_common::ChunkId) -> Result<Option<ChunkLocation>> {
         let key = self.chunk_key(chunk_id);

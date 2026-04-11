@@ -2,6 +2,9 @@
 debug_sqlite.sh
 test_sqlite_sync.sh
 
+# Deployment scripts (contain staging hostnames/paths)
+deploy-build
+
 # Log files
 *.log
 /tmp/

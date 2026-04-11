@@ -424,6 +424,19 @@ async fn handle_storage_command(
     Ok(())
 }
 
+/// Resolve the leader's socket address by querying GetClusterStatus.
+/// Falls back to cluster_addrs[0] if the leader can't be determined.
+async fn find_leader_addr(cluster_addrs: &[SocketAddr]) -> SocketAddr {
+    if let Ok(Response::ClusterStatus { nodes, leader_node_id: Some(leader_id), .. }) =
+        send_request(cluster_addrs[0], Request::GetClusterStatus).await
+    {
+        if let Some(node) = nodes.iter().find(|n| n.id == leader_id) {
+            return node.addr;
+        }
+    }
+    cluster_addrs[0]
+}
+
 async fn handle_healing_command(
     cmd: HealingCommands,
     cluster_addrs: &[SocketAddr],
@@ -431,7 +444,8 @@ async fn handle_healing_command(
 ) -> Result<()> {
     match cmd {
         HealingCommands::Status => {
-            let response = send_request(cluster_addrs[0], Request::GetHealingStatus).await?;
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, Request::GetHealingStatus).await?;
 
             match response {
                 Response::HealingStatus {
@@ -447,7 +461,7 @@ async fn handle_healing_command(
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
-                        println!("DFS Healing Status");
+                        println!("DFS Healing Status (leader: {})", leader);
                         println!("==================");
                         println!("Enabled:       {}", if enabled { "Yes" } else { "No" });
                         println!("Pending Count: {}", pending_count);
@@ -464,7 +478,8 @@ async fn handle_healing_command(
             }
         }
         HealingCommands::Enable => {
-            let response = send_request(cluster_addrs[0], Request::EnableHealing).await?;
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, Request::EnableHealing).await?;
 
             match response {
                 Response::Ok { .. } => {
@@ -480,7 +495,8 @@ async fn handle_healing_command(
             }
         }
         HealingCommands::Disable => {
-            let response = send_request(cluster_addrs[0], Request::DisableHealing).await?;
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, Request::DisableHealing).await?;
 
             match response {
                 Response::Ok { .. } => {
@@ -496,11 +512,12 @@ async fn handle_healing_command(
             }
         }
         HealingCommands::Trigger => {
-            let response = send_request(cluster_addrs[0], Request::TriggerHealing).await?;
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, Request::TriggerHealing).await?;
 
             match response {
                 Response::Ok { .. } => {
-                    println!("Healing triggered successfully");
+                    println!("Healing triggered on leader ({})", leader);
                 }
                 Response::Error { message, .. } => {
                     error!("Error: {}", message);

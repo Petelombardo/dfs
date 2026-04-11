@@ -60,6 +60,12 @@ pub enum Request {
         chunk_id: ChunkId,
     },
 
+    /// Check if multiple chunks exist — single round trip for efficient healing scans.
+    /// Returns a parallel Vec<bool> with one entry per chunk_id.
+    HasChunks {
+        chunk_ids: Vec<ChunkId>,
+    },
+
     /// Get file metadata by file ID
     GetFileMetadata {
         file_id: FileId,
@@ -249,6 +255,11 @@ pub enum Response {
     /// Boolean response (for HasChunk, etc.)
     Bool {
         value: bool,
+    },
+
+    /// Parallel boolean response (for HasChunks) — one entry per requested chunk_id.
+    BoolVec {
+        values: Vec<bool>,
     },
 
     /// Chunk IDs response (for WriteFile)

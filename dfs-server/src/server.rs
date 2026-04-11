@@ -1,5 +1,6 @@
 use crate::chunker::Chunker;
 use crate::cluster::ClusterManager;
+use crate::healing::HealingManager;
 use crate::metadata::MetadataStore;
 use crate::network::{MessageHandler, NetworkClient};
 use crate::storage::ChunkStorage;
@@ -68,6 +69,10 @@ pub struct Server {
     /// Once blocklisted, read_chunk returns NotFound immediately without opening
     /// any connections, preventing the connection storm caused by repeated retries.
     missing_chunks: Arc<RwLock<std::collections::HashSet<ChunkId>>>,
+
+    /// Reference to the healing manager — set after construction via set_healing_manager().
+    /// Used by admin handlers to query status and trigger immediate heal cycles.
+    healing: Arc<RwLock<Option<Arc<HealingManager>>>>,
 }
 
 impl Server {
@@ -95,6 +100,7 @@ impl Server {
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             chunk_map: Arc::new(RwLock::new(HashMap::new())),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            healing: Arc::new(RwLock::new(None)),
         };
 
         // Build the in-memory chunk map from persistent metadata on startup
@@ -223,6 +229,12 @@ impl Server {
         self.client.clone()
     }
 
+    /// Wire in the healing manager after construction.
+    /// Called from main() once both Server and HealingManager are created.
+    pub async fn set_healing_manager(&self, healing: Arc<HealingManager>) {
+        *self.healing.write().await = Some(healing);
+    }
+
     /// Handle an incoming request message
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
@@ -243,6 +255,7 @@ impl Server {
             } => self.handle_write_chunk(chunk_id, data, checksum).await,
             Request::DeleteChunk { chunk_id } => self.handle_delete_chunk(chunk_id).await,
             Request::HasChunk { chunk_id } => self.handle_has_chunk(chunk_id).await,
+            Request::HasChunks { chunk_ids } => self.handle_has_chunks(chunk_ids).await,
             Request::ReplicateChunk {
                 chunk_id,
                 data,
@@ -709,6 +722,11 @@ impl Server {
     async fn handle_has_chunk(&self, chunk_id: ChunkId) -> Response {
         let exists = self.storage.has_chunk(&chunk_id);
         Response::Bool { value: exists }
+    }
+
+    async fn handle_has_chunks(&self, chunk_ids: Vec<ChunkId>) -> Response {
+        let values = chunk_ids.iter().map(|id| self.storage.has_chunk(id)).collect();
+        Response::BoolVec { values }
     }
 
     /// Write data to the cluster with replication
@@ -1571,47 +1589,61 @@ impl Server {
 
     /// Handle get healing status request
     async fn handle_get_healing_status(&self) -> Response {
-        debug!("Handling get healing status");
-
-        // TODO: This requires access to HealingManager
-        // For now, return basic response
-        Response::HealingStatus {
-            enabled: true,
-            pending_count: 0,
-            last_check: 0,
+        let healing_guard = self.healing.read().await;
+        match healing_guard.as_ref() {
+            Some(healing) => {
+                let stats = healing.get_stats().await;
+                Response::HealingStatus {
+                    enabled: stats.auto_heal_enabled,
+                    pending_count: stats.pending_healing,
+                    last_check: 0,
+                }
+            }
+            None => Response::HealingStatus {
+                enabled: false,
+                pending_count: 0,
+                last_check: 0,
+            },
         }
     }
 
     /// Handle trigger scrub request
     async fn handle_trigger_scrub(&self) -> Response {
-        debug!("Handling trigger scrub");
-
-        // TODO: Implement scrub trigger
+        // Scrubber runs on its own interval loop; no immediate trigger implemented yet.
         Response::Ok { data: None }
     }
 
     /// Handle enable healing request
     async fn handle_enable_healing(&self) -> Response {
-        debug!("Handling enable healing");
-
-        // TODO: Implement healing enable
+        // Auto-heal flag is set at startup from config; runtime toggling not yet supported.
         Response::Ok { data: None }
     }
 
     /// Handle disable healing request
     async fn handle_disable_healing(&self) -> Response {
-        debug!("Handling disable healing");
-
-        // TODO: Implement healing disable
+        // Auto-heal flag is set at startup from config; runtime toggling not yet supported.
         Response::Ok { data: None }
     }
 
-    /// Handle trigger healing request
+    /// Handle trigger healing request — runs an immediate heal cycle on the leader.
     async fn handle_trigger_healing(&self) -> Response {
-        debug!("Handling trigger healing");
-
-        // TODO: Implement healing trigger
-        Response::Ok { data: None }
+        let healing_guard = self.healing.read().await;
+        match healing_guard.as_ref() {
+            Some(healing) => {
+                let healing = healing.clone();
+                drop(healing_guard);
+                tokio::spawn(async move {
+                    if let Err(e) = healing.trigger_heal_now().await {
+                        warn!("Manual heal cycle error: {}", e);
+                    }
+                });
+                Response::Ok { data: None }
+            }
+            None => Response::Error {
+                message: "Healing manager not available".to_string(),
+                code: dfs_common::ErrorCode::InternalError,
+            },
+        }
     }
 
     /// Handle get file info request

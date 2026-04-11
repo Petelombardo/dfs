@@ -4,24 +4,35 @@ use std::num::NonZeroUsize;
 
 /// Get available system memory in bytes by reading /proc/meminfo
 pub fn get_available_memory() -> Result<u64> {
+    read_meminfo_field("MemAvailable")
+}
+
+/// Get total system memory in bytes by reading /proc/meminfo.
+/// Unlike MemAvailable, this is stable across the process lifetime and is the
+/// right basis for sizing caches that will be populated gradually after startup.
+pub fn get_total_memory() -> Result<u64> {
+    read_meminfo_field("MemTotal")
+}
+
+fn read_meminfo_field(field: &str) -> Result<u64> {
     let meminfo = fs::read_to_string("/proc/meminfo")
         .context("Failed to read /proc/meminfo")?;
 
-    // Parse MemAvailable (best indicator of memory we can use without swapping)
     // Format: "MemAvailable:    1234567 kB"
+    let prefix = format!("{}:", field);
     for line in meminfo.lines() {
-        if line.starts_with("MemAvailable:") {
+        if line.starts_with(&prefix) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
                 let kb: u64 = parts[1]
                     .parse()
-                    .context("Failed to parse MemAvailable value")?;
+                    .with_context(|| format!("Failed to parse {} value", field))?;
                 return Ok(kb * 1024); // Convert to bytes
             }
         }
     }
 
-    anyhow::bail!("MemAvailable not found in /proc/meminfo")
+    anyhow::bail!("{} not found in /proc/meminfo", field)
 }
 
 /// Calculate optimal LRU cache capacity based on available system memory

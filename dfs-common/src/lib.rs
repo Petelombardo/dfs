@@ -15,4 +15,4 @@ pub use protocol::{
     Response,
 };
 pub use hash::{compute_chunk_hash, verify_chunk_hash, ConsistentHashRing};
-pub use memory::{calculate_cache_capacity, get_available_memory};
+pub use memory::{calculate_cache_capacity, get_available_memory, get_total_memory};

@@ -214,6 +214,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config.replication.auto_heal,
     ));
     healing.clone().start().await;
+    server.set_healing_manager(healing.clone()).await;
     info!("✓ Healing manager started");
 
     // Start network server

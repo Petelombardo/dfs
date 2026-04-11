@@ -1664,7 +1664,7 @@ impl DfsClient {
             };
 
             let result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(3),
+                tokio::time::Duration::from_secs(1),
                 io_future
             ).await;
 
@@ -1744,7 +1744,12 @@ impl DfsClient {
         length: u64,
     ) -> Result<Vec<u8>> {
         let request = Request::ReadChunkRange { chunk_id, offset, length };
-        let response = self.send_request(server_addr, request).await?;
+        let response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            self.send_request(server_addr, request),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout reading chunk range from {}", server_addr))??;
 
         match response {
             Response::ChunkData { data, .. } => Ok(data),

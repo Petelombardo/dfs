@@ -66,12 +66,12 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
     ) -> Self {
-        // Process up to 500 chunks per cycle (queue depth). 2 concurrent heals
-        // keeps memory pressure low on SBC leader nodes — each heal holds a 4MB
-        // chunk in memory during the push. Scan concurrency is also bounded (see
-        // SCAN_CONCURRENCY below) so we never have more than that many HasChunk
-        // connections open at once.
-        let max_heal_per_cycle = 500;
+        // Heal up to 2000 chunks per cycle. The bulk HasChunks RPC makes scanning
+        // cheap regardless of chunk count (O(nodes) connections not O(chunks)).
+        // Keep concurrent heals at 2 — each holds a 4MB chunk in memory on both
+        // the source and target node. SBC nodes have 3.8GB RAM with no swap so
+        // we stay conservative on peak memory pressure.
+        let max_heal_per_cycle = 2000;
         let max_concurrent_heals = 2;
 
         Self {
@@ -614,7 +614,7 @@ impl HealingManager {
 
     async fn do_heal_chunk_inner(
         chunk_id: &ChunkId,
-        _storage: &Arc<ChunkStorage>,
+        storage: &Arc<ChunkStorage>,
         metadata: &Arc<MetadataStore>,
         cluster: &Arc<ClusterManager>,
         client: &Arc<NetworkClient>,
@@ -627,12 +627,40 @@ impl HealingManager {
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
-        // Build alive node list with their addresses
+        // Build alive node list with their addresses from metadata.
         let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
         for node_id in &location.nodes {
             if let Some(info) = cluster.get_node(node_id).await {
                 if info.status == dfs_common::NodeStatus::Online {
                     alive.push((*node_id, info.addr));
+                }
+            }
+        }
+
+        // Also check local storage directly — the chunk may exist here even if our
+        // node ID was incorrectly pruned from the metadata by a previous healer bug.
+        let local_id = cluster.local_node_id();
+        if !alive.iter().any(|(id, _)| *id == local_id) && storage.has_chunk(chunk_id) {
+            if let Some(info) = cluster.get_node(&local_id).await {
+                warn!(
+                    "Chunk {} found in local storage but missing from metadata node list — adding as source",
+                    chunk_id
+                );
+                alive.push((local_id, info.addr));
+                // Repair the metadata to include this node
+                let mut repaired_nodes = location.nodes.clone();
+                repaired_nodes.push(local_id);
+                let repaired = ChunkLocation {
+                    chunk_id: *chunk_id,
+                    nodes: repaired_nodes,
+                    size: location.size,
+                    checksum: location.checksum,
+                    file_offset: location.file_offset,
+                };
+                if let Err(e) = metadata.put_chunk_location(&repaired) {
+                    warn!("Failed to repair chunk {} metadata: {}", chunk_id, e);
+                } else {
+                    Self::broadcast_chunk_location_shared(&repaired, cluster, client).await;
                 }
             }
         }
@@ -665,7 +693,6 @@ impl HealingManager {
 
         // Pick the source node: prefer local node (no network hop for the read),
         // otherwise use the first alive node.
-        let local_id = cluster.local_node_id();
         let source = if alive_ids.contains(&local_id) {
             alive.iter().find(|(id, _)| *id == local_id).copied()
         } else {

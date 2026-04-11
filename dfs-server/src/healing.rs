@@ -235,27 +235,16 @@ impl HealingManager {
             warn!("Leader does not have quorum — skipping destructive healing operations (orphan purge, over-replication cleanup)");
         }
 
-        let all_chunks = self.metadata.list_all_chunk_ids()?;
-
-        // Build the set of chunk IDs referenced by live files. Any chunk: record
-        // NOT in this set is a candidate orphan — its file was deleted but the
-        // chunk: record was not cleaned up (e.g. delete happened while a node was
-        // offline, or the old cleanup bug).
-        //
-        // Safety vs split-brain: we only purge if the chunk is absent from THIS
-        // node's file metadata. If we're partitioned and the file still exists on
-        // other nodes, it will also still exist in our local metadata (DeleteMetadata
-        // replication only runs after a confirmed delete). So orphan detection is
-        // safe: if the file is gone from our DB, the delete was committed.
-        //
-        // Safety vs metadata replication lag: a node that just became leader may not
-        // yet have received all file metadata from peers (replication is async). To
-        // avoid purging chunk: records whose file: records are still in flight, we
-        // require a chunk to be seen as unreferenced for two consecutive heal cycles
-        // before purging — reusing pending_healing as the "seen before" marker.
-        // With a 60s heal interval, this gives ~60s for metadata to replicate, which
-        // is far more than the typical replication latency.
-        let live_chunks = self.metadata.live_chunk_ids()?;
+        // Both list_all_chunk_ids and live_chunk_ids iterate large RocksDB datasets
+        // synchronously. Running them on a Tokio worker thread blocks the async
+        // executor — starving the network accept loop and causing visible latency on
+        // `dfs-admin` commands. Offload to the blocking thread pool instead.
+        let metadata = self.metadata.clone();
+        let (all_chunks, live_chunks) = tokio::task::spawn_blocking(move || {
+            let all = metadata.list_all_chunk_ids()?;
+            let live = metadata.live_chunk_ids()?;
+            Ok::<_, anyhow::Error>((all, live))
+        }).await.context("spawn_blocking for chunk scan panicked")??;
 
         // First pass: classify all chunks.
         //
@@ -355,7 +344,15 @@ impl HealingManager {
         }
 
         // Now classify each chunk locally using the presence maps — no more network I/O.
+        // Yield to the Tokio scheduler every 100 chunks so the network accept loop
+        // isn't starved by the synchronous RocksDB reads in get_chunk_location.
+        let mut classify_count = 0usize;
         for chunk_id in chunks_to_check {
+            classify_count += 1;
+            if classify_count % 100 == 0 {
+                tokio::task::yield_now().await;
+            }
+
             if work.len() >= self.max_heal_per_cycle {
                 skipped_count += 1;
                 continue;

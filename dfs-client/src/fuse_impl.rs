@@ -2695,6 +2695,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let write_counters = self.write_counters.clone();
+        let last_metadata_update = self.last_metadata_update.clone();
         let runtime = self.runtime.clone();
 
         // Spawn flush operation on tokio's blocking thread pool
@@ -2702,83 +2703,26 @@ impl Filesystem for DfsFilesystem {
             debug!("flush: ino={}", ino);
 
             if write_buffer_enabled {
-                // Inline flush_buffer_async logic
-                let result = runtime.block_on(async {
-                    // Get and remove buffer for this inode
-                    let buffer_opt = write_buffers.remove(&ino).map(|(_, v)| v);
-
-                    if let Some(buffer_lock) = buffer_opt {
-                        let buffer = buffer_lock.lock().await.clone();
-                        info!("Flushing {} bytes for inode {}", buffer.data.len(), ino);
-
-                        // Get current metadata from cache
-                        let mut flush_metadata = {
-                            let cache = metadata_cache.read().unwrap();
-                            match cache.get(&ino) {
-                                Some(m) => m.clone(),
-                                None => {
-                                    return Err(anyhow::anyhow!("Metadata not found for inode {}", ino));
-                                }
-                            }
-                        };
-
-                        // If the buffer was pre-seeded with a partial last chunk, drop that
-                        // chunk from metadata before extending — it will be replaced.
-                        if buffer.drop_trailing_chunks_on_flush > 0 {
-                            let keep = flush_metadata.chunk_locations.len()
-                                .saturating_sub(buffer.drop_trailing_chunks_on_flush);
-                            flush_metadata.chunk_locations.truncate(keep);
-                            let keep_legacy = flush_metadata.chunks.len()
-                                .saturating_sub(buffer.drop_trailing_chunks_on_flush);
-                            flush_metadata.chunks.truncate(keep_legacy);
-                            flush_metadata.chunk_sizes.truncate(keep_legacy);
-                        }
-
-                        // Write buffered data as new chunks with caching
-                        // Use the buffer's recorded start offset
-                        let buffer_start_offset = buffer.start_offset;
-                        let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = client
-                            .write_data_with_cache(&buffer.data, ino, buffer_start_offset)
-                            .await?;
-
-                        // Calculate new size and save chunk count before moving
-                        let num_chunks = new_chunk_ids.len();
-                        let new_size = buffer_start_offset + buffer.data.len() as u64;
-
-                        // If dual-replica writes provided chunk_locations, use them
-                        if let Some(chunk_locations) = chunk_locations_opt {
-                            flush_metadata.chunk_locations.extend(chunk_locations);
-                        }
-                        // Append new chunks to existing chunks and update size
-                        flush_metadata.chunks.extend(new_chunk_ids);
-                        flush_metadata.chunk_sizes.extend(new_chunk_sizes);
-                        flush_metadata.size = new_size;
-                        flush_metadata.modified_at = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-
-                        info!("Flush complete: {} chunks added at offset {}, total file size {}",
-                              num_chunks, buffer_start_offset, new_size);
-
-                        // Store updated metadata (force update on flush())
-                        debug!("Updating metadata for inode {} (force=true, chunks={})", ino, flush_metadata.chunks.len());
-                        client.put_file_metadata(&flush_metadata).await?;
-
-                        // Update cache
-                        metadata_cache.write().unwrap().insert(ino, flush_metadata);
-                    }
-
-                    Ok::<(), anyhow::Error>(())
-                });
-
-                match result {
-                    Ok(_) => reply.ok(),
-                    Err(e) => {
-                        error!("Failed to flush buffer for inode {}: {}", ino, e);
-                        reply.error(libc::EIO);
-                    }
-                }
+                // When write-buffering is enabled, flush() must NOT drain the write buffer.
+                //
+                // flush() fires on every close() — including read-only fds (e.g. Kodi seeking
+                // while the DVR is still recording) and the DVR's own file descriptor between
+                // individual write calls. Draining the buffer here causes two problems:
+                //   1. A partial (sub-4MB) buffer gets emitted as a tiny chunk, destroying
+                //      4MB alignment and causing all subsequent chunks to be tiny.
+                //   2. The re-alignment pre-seed (partial last-chunk read-back on DVR restart)
+                //      is discarded before enough new data has accumulated to fill a full chunk.
+                //
+                // The write buffer is already flushed correctly by:
+                //   - The periodic background flusher (every 2s, aligned 4MB chunks only)
+                //   - fsync() (aligned chunks only, same as background flusher)
+                //   - release() with a write-mode fd (force=true, flushes everything including
+                //     the partial tail on genuine close)
+                //
+                // So flush() just needs to acknowledge without touching the buffer.
+                debug!("flush: ino={} - write buffer active, deferring to background flusher / release", ino);
+                reply.ok();
+                return;
             } else {
                 // No write buffer, but we still need to flush any pending metadata updates
                 // that were batched by the write() path to ensure data durability

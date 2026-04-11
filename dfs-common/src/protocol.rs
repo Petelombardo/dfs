@@ -266,6 +266,10 @@ pub enum Response {
     ChunkIds {
         chunk_ids: Vec<ChunkId>,
         chunk_sizes: Vec<u64>,
+        /// All NodeIds that received replicas of the written chunks.
+        /// One entry per chunk_id (same ordering). Empty means unknown (legacy).
+        #[serde(default)]
+        replica_nodes_per_chunk: Vec<Vec<crate::NodeId>>,
     },
 
     /// Cluster status response

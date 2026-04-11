@@ -1922,13 +1922,13 @@ impl DfsClient {
         let response2 = result2?;
 
         let (chunk_ids_1, chunk_sizes_1) = match response1 {
-            Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes),
+            Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes),
             Response::Error { message, .. } => anyhow::bail!("Replica 1 ({}) failed: {}", replica1, message),
             _ => anyhow::bail!("Unexpected response from replica 1"),
         };
 
         let (chunk_ids_2, chunk_sizes_2) = match response2 {
-            Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes),
+            Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes),
             Response::Error { message, .. } => anyhow::bail!("Replica 2 ({}) failed: {}", replica2, message),
             _ => anyhow::bail!("Unexpected response from replica 2"),
         };
@@ -2194,13 +2194,13 @@ impl DfsClient {
         let (addr2, response2) = successful.remove(0);
 
         let (chunk_ids_1, chunk_sizes_1) = match response1 {
-            Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes),
+            Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes),
             Response::Error { message, .. } => anyhow::bail!("Replica 1 ({}) failed: {}", addr1, message),
             _ => anyhow::bail!("Unexpected response from replica 1 ({})", addr1),
         };
 
         let (chunk_ids_2, _chunk_sizes_2) = match response2 {
-            Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes),
+            Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes),
             Response::Error { message, .. } => anyhow::bail!("Replica 2 ({}) failed: {}", addr2, message),
             _ => anyhow::bail!("Unexpected response from replica 2 ({})", addr2),
         };
@@ -2326,18 +2326,18 @@ impl DfsClient {
     pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
         const MIN_PARALLEL_SIZE: usize = 128 * 1024; // 128KB minimum - use dual-replica for writes >= 128KB
 
-        // For small writes, use single server (less overhead)
+        // For small writes, use single server (less overhead).
+        // Use the tracked variant to capture replica node info from the server response.
         if data.len() < MIN_PARALLEL_SIZE {
-            let (chunk_ids, chunk_sizes) = self.write_data_single_chunk(data).await?;
-            // Still build chunk_locations with file_offset so the chunk offset cache works correctly
-            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset);
+            let (chunk_ids, chunk_sizes, replica_nodes_per_chunk) = self.write_data_single_chunk_tracked(data).await?;
+            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk);
             return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
-            let (chunk_ids, chunk_sizes) = self.write_data_single_chunk(data).await?;
-            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset);
+            let (chunk_ids, chunk_sizes, replica_nodes_per_chunk) = self.write_data_single_chunk_tracked(data).await?;
+            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk);
             return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
@@ -2421,7 +2421,7 @@ impl DfsClient {
               server_addr, data_len, total_time, throughput, connect_time, serialize_time, send_time, recv_time, deserialize_time);
 
         match response_envelope.message {
-            Message::Response(Response::ChunkIds { chunk_ids, chunk_sizes }) => Ok((chunk_ids, chunk_sizes)),
+            Message::Response(Response::ChunkIds { chunk_ids, chunk_sizes, .. }) => Ok((chunk_ids, chunk_sizes)),
             Message::Response(Response::Error { message, .. }) => {
                 anyhow::bail!("Server error: {}", message);
             }
@@ -2472,7 +2472,7 @@ impl DfsClient {
               server_addr, data_len, total_time, throughput);
 
         match response_envelope.message {
-            Message::Response(Response::ChunkIds { chunk_ids, chunk_sizes }) => Ok((chunk_ids, chunk_sizes)),
+            Message::Response(Response::ChunkIds { chunk_ids, chunk_sizes, .. }) => Ok((chunk_ids, chunk_sizes)),
             Message::Response(Response::Error { message, .. }) => {
                 anyhow::bail!("Server error: {}", message);
             }
@@ -2482,35 +2482,58 @@ impl DfsClient {
 
     /// Write small data via single server (old path)
     pub async fn write_data_single_chunk(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
+        let (chunk_ids, chunk_sizes, _) = self.write_data_single_chunk_tracked(data).await?;
+        Ok((chunk_ids, chunk_sizes))
+    }
+
+    /// Like write_data_single_chunk but also returns per-chunk replica node lists.
+    /// The server includes all replica NodeIds in the ChunkIds response.
+    async fn write_data_single_chunk_tracked(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>, Vec<Vec<NodeId>>)> {
         let request = Request::WriteFile {
             data: data.to_vec(),
         };
 
-        let response = self.send_request_with_retry(request).await?;
+        let nodes = self.cluster_nodes.read().await.clone();
+        let mut last_error = None;
 
-        match response {
-            Response::ChunkIds { chunk_ids, chunk_sizes } => Ok((chunk_ids, chunk_sizes)),
-            Response::Error { message, .. } => {
-                anyhow::bail!("Failed to write data: {}", message);
+        for (i, node_addr) in nodes.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            _ => anyhow::bail!("Unexpected response type"),
+            match self.send_request(*node_addr, request.clone()).await {
+                Ok(Response::ChunkIds { chunk_ids, chunk_sizes, replica_nodes_per_chunk }) => {
+                    return Ok((chunk_ids, chunk_sizes, replica_nodes_per_chunk));
+                }
+                Ok(Response::Error { message, .. }) => {
+                    anyhow::bail!("Failed to write data: {}", message);
+                }
+                Ok(_) => anyhow::bail!("Unexpected response type"),
+                Err(e) => {
+                    warn!("Failed to write to {}: {}", node_addr, e);
+                    last_error = Some(e);
+                }
+            }
         }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed for single-chunk write")))
     }
 
-    /// Build minimal ChunkLocation entries from chunk_ids/sizes with file_offset tracking.
-    /// Used for single-server writes where we don't have full replica node info, but still
-    /// need file_offset populated so the chunk offset cache works correctly.
+    /// Build ChunkLocation entries from chunk_ids/sizes with file_offset tracking.
+    /// replica_nodes_per_chunk provides the actual node list for each chunk (from server response).
+    /// If empty or mismatched, falls back to empty node list (healing will repair later).
     fn build_chunk_locations_from_ids(
         chunk_ids: &[ChunkId],
         chunk_sizes: &[u64],
         file_offset: u64,
+        replica_nodes_per_chunk: Vec<Vec<NodeId>>,
     ) -> Vec<dfs_common::ChunkLocation> {
         let mut locations = Vec::with_capacity(chunk_ids.len());
         let mut current_offset = file_offset;
-        for (chunk_id, &size) in chunk_ids.iter().zip(chunk_sizes.iter()) {
+        for (idx, (chunk_id, &size)) in chunk_ids.iter().zip(chunk_sizes.iter()).enumerate() {
+            let nodes = replica_nodes_per_chunk.get(idx).cloned().unwrap_or_default();
             locations.push(dfs_common::ChunkLocation {
                 chunk_id: *chunk_id,
-                nodes: vec![],  // No node tracking for single-server writes
+                nodes,
                 size: size as usize,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),

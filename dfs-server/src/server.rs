@@ -730,7 +730,7 @@ impl Server {
     }
 
     /// Write data to the cluster with replication
-    pub async fn write_data(&self, data: &[u8]) -> Result<Vec<(ChunkId, u64)>> {
+    pub async fn write_data(&self, data: &[u8]) -> Result<Vec<(ChunkId, u64, Vec<dfs_common::NodeId>)>> {
         let total_start = std::time::Instant::now();
         info!("Writing {} bytes to cluster", data.len());
 
@@ -925,7 +925,7 @@ impl Server {
                 let chunk_total_time = chunk_total_start.elapsed();
                 info!("Chunk {} complete in {:?} (metadata: {:?})", chunk_id, chunk_total_time, metadata_time);
 
-                Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
+                Ok::<(ChunkId, u64, Vec<dfs_common::NodeId>), anyhow::Error>((chunk_id, chunk_data.len() as u64, target_nodes))
             });
 
             chunk_tasks.push(task);
@@ -936,7 +936,7 @@ impl Server {
         let mut chunk_ids_with_sizes = Vec::new();
         for task in chunk_tasks {
             match task.await {
-                Ok(Ok(chunk_id_with_size)) => chunk_ids_with_sizes.push(chunk_id_with_size),
+                Ok(Ok(chunk_id_with_size_and_nodes)) => chunk_ids_with_sizes.push(chunk_id_with_size_and_nodes),
                 Ok(Err(e)) => return Err(e),
                 Err(e) => anyhow::bail!("Chunk task panicked: {}", e),
             }
@@ -1301,11 +1301,11 @@ impl Server {
         debug!("Handling write file: {} bytes", data.len());
 
         match self.write_data(&data).await {
-            Ok(chunk_ids_with_sizes) => {
-                // Separate chunk IDs from sizes
-                let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
-                let chunk_sizes: Vec<u64> = chunk_ids_with_sizes.iter().map(|(_, size)| *size).collect();
-                Response::ChunkIds { chunk_ids, chunk_sizes }
+            Ok(chunk_ids_with_sizes_and_nodes) => {
+                let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes_and_nodes.iter().map(|(id, _, _)| *id).collect();
+                let chunk_sizes: Vec<u64> = chunk_ids_with_sizes_and_nodes.iter().map(|(_, size, _)| *size).collect();
+                let replica_nodes_per_chunk: Vec<Vec<dfs_common::NodeId>> = chunk_ids_with_sizes_and_nodes.iter().map(|(_, _, nodes)| nodes.clone()).collect();
+                Response::ChunkIds { chunk_ids, chunk_sizes, replica_nodes_per_chunk }
             }
             Err(e) => {
                 warn!("Failed to write file: {}", e);
@@ -1322,12 +1322,15 @@ impl Server {
     async fn handle_write_file_local_only(&self, data: Vec<u8>) -> Response {
         debug!("Handling write file local only: {} bytes", data.len());
 
+        let local_node_id = self.cluster.local_node_id();
         match self.write_data_local_only(&data).await {
             Ok(chunk_ids_with_sizes) => {
                 let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
                 let chunk_sizes: Vec<u64> = chunk_ids_with_sizes.iter().map(|(_, size)| *size).collect();
+                // Local-only: this node holds the chunk (caller sends to 2 nodes in parallel)
+                let replica_nodes_per_chunk: Vec<Vec<dfs_common::NodeId>> = chunk_ids.iter().map(|_| vec![local_node_id]).collect();
                 info!("Wrote {} chunks locally (no replication)", chunk_ids.len());
-                Response::ChunkIds { chunk_ids, chunk_sizes }
+                Response::ChunkIds { chunk_ids, chunk_sizes, replica_nodes_per_chunk }
             }
             Err(e) => {
                 warn!("Failed to write file locally: {}", e);
@@ -2101,7 +2104,7 @@ mod tests {
         assert!(!chunk_ids_with_sizes.is_empty());
 
         // Read data back
-        let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
+        let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _, _)| *id).collect();
         let read_data = server.read_data(&chunk_ids).await.unwrap();
         assert_eq!(data.as_slice(), read_data.as_slice());
     }

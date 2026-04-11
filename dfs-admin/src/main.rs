@@ -947,7 +947,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
             let (ids1, sizes1, addr1) = match send_request(node1, Request::WriteFileLocalOnly {
                 data: flush_data.clone(),
             }).await? {
-                Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes, node1),
+                Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes, node1),
                 Response::Error { message, .. } => anyhow::bail!("Write to {} failed: {}", node1, message),
                 _ => anyhow::bail!("Unexpected write response from {}", node1),
             };
@@ -955,7 +955,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
             let (ids2, _sizes2, addr2) = match send_request(node2, Request::WriteFileLocalOnly {
                 data: flush_data,
             }).await? {
-                Response::ChunkIds { chunk_ids, chunk_sizes } => (chunk_ids, chunk_sizes, node2),
+                Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes, node2),
                 Response::Error { message, .. } => anyhow::bail!("Write to {} failed: {}", node2, message),
                 _ => anyhow::bail!("Unexpected write response from {}", node2),
             };

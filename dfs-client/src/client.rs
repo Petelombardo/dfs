@@ -431,7 +431,7 @@ impl DfsClient {
             Ok::<Vec<u8>, std::io::Error>(buf)
         };
 
-        let buf = match tokio::time::timeout(tokio::time::Duration::from_secs(30), io_future).await {
+        let buf = match tokio::time::timeout(tokio::time::Duration::from_secs(3), io_future).await {
             Ok(Ok(buf)) => buf,
             Ok(Err(_)) | Err(_) => {
                 // Stale pooled connection or timeout — retry once with a fresh connection

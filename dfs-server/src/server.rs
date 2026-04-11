@@ -1160,8 +1160,20 @@ impl Server {
     async fn handle_get_file_metadata_by_path(&self, path: String, if_modified_since: Option<u64>) -> Response {
         debug!("Handling get file metadata by path: {} (if_modified_since: {:?})", path, if_modified_since);
 
-        // Try local first
-        match self.metadata.get_file_by_path(&path) {
+        // Offload synchronous RocksDB read to blocking thread pool.
+        let metadata = self.metadata.clone();
+        let path_clone = path.clone();
+        let lookup = tokio::task::spawn_blocking(move || metadata.get_file_by_path(&path_clone)).await;
+
+        match lookup {
+            Err(e) => {
+                warn!("spawn_blocking panicked in get_file_metadata_by_path: {}", e);
+                return Response::Error {
+                    message: "Internal error fetching metadata".to_string(),
+                    code: ErrorCode::InternalError,
+                };
+            }
+            Ok(result) => match result {
             Ok(Some(mut metadata)) => {
                 // Check if client has provided if_modified_since timestamp
                 if let Some(cached_timestamp) = if_modified_since {
@@ -1193,7 +1205,8 @@ impl Server {
                     code: ErrorCode::InternalError,
                 }
             }
-        }
+        } // end inner match result
+        } // end outer match lookup
     }
 
     /// Handle put file metadata request
@@ -1282,14 +1295,25 @@ impl Server {
     async fn handle_list_directory(&self, path: String) -> Response {
         debug!("Handling list directory: {}", path);
 
-        // ALWAYS return local only for performance
-        // Metadata replication ensures all nodes have the same data
-        match self.metadata.list_directory(&path) {
-            Ok(entries) => Response::DirectoryListing { entries },
-            Err(e) => {
+        // Offload synchronous RocksDB scan to blocking thread pool so we don't
+        // starve the async executor (same pattern as heal scan).
+        let metadata = self.metadata.clone();
+        let result = tokio::task::spawn_blocking(move || metadata.list_directory(&path))
+            .await;
+
+        match result {
+            Ok(Ok(entries)) => Response::DirectoryListing { entries },
+            Ok(Err(e)) => {
                 warn!("Failed to list directory: {}", e);
                 Response::Error {
                     message: format!("Failed to list directory: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+            Err(e) => {
+                warn!("spawn_blocking panicked in list_directory: {}", e);
+                Response::Error {
+                    message: "Internal error listing directory".to_string(),
                     code: ErrorCode::InternalError,
                 }
             }

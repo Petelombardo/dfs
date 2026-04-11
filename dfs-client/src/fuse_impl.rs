@@ -1667,6 +1667,11 @@ impl Filesystem for DfsFilesystem {
             // Use safe_metadata_update to check both buffers and write counters
             self.safe_metadata_update(entry_ino, entry.clone());
 
+            // Mark metadata as just-refreshed so getattr skips the per-file server
+            // round-trip on the immediately following `ls -alh`. Without this, each
+            // of the 25 getattr calls would hit the server serially (~130ms each).
+            self.last_metadata_update.write().unwrap().insert(entry_ino, std::time::Instant::now());
+
             let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
             if reply.add(entry_ino, next_offset, kind, file_name) {
                 break; // Buffer full

@@ -343,8 +343,13 @@ impl HealingManager {
                     }
                 }
                 Err(e) => {
-                    warn!("HasChunks RPC failed for node {} ({}): treating as empty", node_info.id, e);
-                    node_chunk_presence.insert(node_info.id, HashSet::new());
+                    // Don't insert anything for this node — we can't distinguish "node has
+                    // no chunks" from "node is unreachable". Leaving it absent from
+                    // node_chunk_presence means we won't count it as a confirmed replica,
+                    // but we also won't declare chunks unrecoverable just because this RPC
+                    // failed. The unrecoverable check requires all metadata nodes to be
+                    // reachable before writing off a chunk as permanently lost.
+                    warn!("HasChunks RPC failed for node {} ({}): skipping node for this scan cycle", node_info.id, e);
                 }
             }
         }
@@ -416,14 +421,13 @@ impl HealingManager {
             let replication_factor = self.replication_factor;
 
             // Detect unrecoverable chunks: actual_replicas == 0 and every node listed in
-            // metadata is online (so no offline node could be hiding a surviving copy).
-            // These chunks are permanently lost — skip them from the heal work queue so
-            // they don't consume throttle slots every cycle. Leave the location metadata
-            // intact as an audit record. Remove from pending_healing so the count reflects
-            // only chunks that can actually be healed.
-            let all_metadata_nodes_online = location.nodes.iter()
-                .all(|n| online_nodes.iter().any(|o| o.id == *n));
-            if actual_replicas == 0 && all_metadata_nodes_online && !location.nodes.is_empty() {
+            // metadata was successfully queried (reachable) and confirmed it doesn't have
+            // the chunk. We require reachability — not just gossip-online — so a transient
+            // RPC failure can't cause us to write off a chunk that a temporarily-unreachable
+            // node still holds.
+            let all_metadata_nodes_reachable = location.nodes.iter()
+                .all(|n| node_chunk_presence.contains_key(n));
+            if actual_replicas == 0 && all_metadata_nodes_reachable && !location.nodes.is_empty() {
                 self.pending_healing.write().await.remove(&chunk_id);
                 continue;
             }

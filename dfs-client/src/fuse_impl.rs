@@ -894,6 +894,8 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let last_metadata_update = self.last_metadata_update.clone();
+        let write_buffers = self.write_buffers.clone();
+        let write_buffer_enabled = self.write_buffer_enabled;
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
@@ -932,12 +934,35 @@ impl Filesystem for DfsFilesystem {
                         }
                         last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
                     }
+
+                    // For files with an active write buffer, the true EOF is further ahead
+                    // than the last committed flush position in metadata.size. Report the
+                    // buffer's logical end so that Kodi/players seeking in a live recording
+                    // see the correct (current) file size instead of a stale flushed size.
+                    // Without this, a seek to the "end" of a live file may land beyond what
+                    // getattr reports, causing the player to stall waiting for the file to
+                    // appear to grow.
+                    if write_buffer_enabled {
+                        if let Some(buffer_lock) = write_buffers.get(&ino) {
+                            let buffer = buffer_lock.lock().await;
+                            let buffer_end = buffer.start_offset + buffer.data.len() as u64;
+                            if buffer_end > metadata.size {
+                                metadata.size = buffer_end;
+                            }
+                        }
+                    }
                 }
 
                 let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
-                // 5s TTL matches our server refresh rate — no point asking the kernel
-                // to call us more often than we actually refresh from the server.
-                reply.attr(&Duration::from_secs(5), &attr);
+                // Use a short TTL for files with an active write buffer (live recordings)
+                // so the kernel re-asks us promptly as the file grows. For static files,
+                // 5s is fine — it matches our server refresh rate.
+                let ttl = if write_buffer_enabled && write_buffers.contains_key(&ino) {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(5)
+                };
+                reply.attr(&ttl, &attr);
             } else {
                 reply.error(libc::ENOENT);
             }

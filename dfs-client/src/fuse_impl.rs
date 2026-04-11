@@ -108,15 +108,17 @@ async fn flush_buffer_standalone(
     _buffer_flush_threshold: usize,
     force: bool,
 ) -> Result<()> {
+    // Snapshot the buffer data without advancing start_offset yet.
+    // We only commit the advance once the write to the cluster succeeds — this
+    // ensures the buffer still holds the data if the write fails, so we can
+    // retry rather than silently losing unflushed bytes.
     let flush_data_opt = {
         if let Some(buffer_lock) = write_buffers.get(&ino) {
-            let mut buffer = buffer_lock.lock().await;
+            let buffer = buffer_lock.lock().await;
             if force && !buffer.data.is_empty() {
-                let data = std::mem::take(&mut buffer.data);
+                let data = buffer.data.clone();
                 let start_offset = buffer.start_offset;
-                let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
-                buffer.start_offset += data.len() as u64;
-                buffer.last_modified = SystemTime::now();
+                let drop_trailing = buffer.drop_trailing_chunks_on_flush;
                 Some((data, start_offset, drop_trailing))
             } else {
                 None
@@ -150,6 +152,20 @@ async fn flush_buffer_standalone(
 
         let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) =
             client.write_data_with_cache(&flush_data, ino, buffer_start_offset).await?;
+
+        // Write succeeded — now commit the buffer advance and update metadata.
+        if let Some(buffer_lock) = write_buffers.get(&ino) {
+            let mut buffer = buffer_lock.lock().await;
+            // Only advance if the buffer hasn't been superseded by a concurrent write
+            // (i.e. start_offset still matches what we snapshotted).
+            if buffer.start_offset == buffer_start_offset {
+                let drain_len = flush_data.len().min(buffer.data.len());
+                buffer.data.drain(..drain_len);
+                buffer.start_offset += flush_data.len() as u64;
+                buffer.drop_trailing_chunks_on_flush = 0;
+                buffer.last_modified = SystemTime::now();
+            }
+        }
 
         if let Some(chunk_locations) = chunk_locations_opt {
             metadata.chunk_locations.extend(chunk_locations);
@@ -548,10 +564,13 @@ impl DfsFilesystem {
     /// If force_metadata_update is true, always update metadata (used on close/fsync)
     /// If false, use time-based batching (update every 2 seconds)
     async fn flush_buffer_async(&self, ino: u64, force_metadata_update: bool) -> Result<()> {
-        // Determine what data to flush (align to chunk boundaries to prevent tiny chunks)
+        // Snapshot the data we intend to flush WITHOUT advancing start_offset yet.
+        // We commit the buffer advance only after the cluster write succeeds, so that
+        // a quorum failure leaves the buffer intact and retryable rather than silently
+        // dropping data.
         let flush_data_opt = {
             if let Some(buffer_lock) = self.write_buffers.get(&ino) {
-                let mut buffer = buffer_lock.lock().await;
+                let buffer = buffer_lock.lock().await;
                 let buffer_size = buffer.data.len();
 
                 // Align flush to chunk boundaries (4MB) to prevent server from creating tiny chunks
@@ -564,43 +583,26 @@ impl DfsFilesystem {
                     // On file close (release), we MUST flush everything even if < 4MB
                     if force_metadata_update && buffer_size > 0 {
                         // File is closing, flush everything including partial chunk
-                        let data = std::mem::take(&mut buffer.data);
+                        let data = buffer.data.clone();
                         let start_offset = buffer.start_offset;
-                        let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
-                        buffer.start_offset += data.len() as u64;
-                        buffer.last_modified = SystemTime::now();
-                        Some((data, start_offset, drop_trailing))
+                        let drop_trailing = buffer.drop_trailing_chunks_on_flush;
+                        Some((data, start_offset, drop_trailing, buffer_size))
                     } else {
                         None
                     }
                 } else {
-                    // Flush only aligned portion (multiples of 4MB)
+                    // Snapshot only the aligned portion — remainder stays in buffer
                     let start_offset = buffer.start_offset;
-                    let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
-                    let data: Vec<u8> = if flush_size == buffer_size {
-                        // Flush entire buffer (it's exactly a multiple of chunk_size)
-                        let data = std::mem::take(&mut buffer.data);
-                        // CRITICAL: Update start_offset to point past the flushed data
-                        buffer.start_offset = start_offset + flush_size as u64;
-                        data
-                    } else {
-                        // Flush only the aligned portion, keep overflow
-                        // CRITICAL: After drain, buffer.data[0] will correspond to file offset
-                        // (start_offset + flush_size), so we must update start_offset accordingly
-                        let data = buffer.data.drain(..flush_size).collect();
-                        buffer.start_offset = start_offset + flush_size as u64;
-                        data
-                    };
-
-                    buffer.last_modified = SystemTime::now();
-                    Some((data, start_offset, drop_trailing))
+                    let drop_trailing = buffer.drop_trailing_chunks_on_flush;
+                    let data: Vec<u8> = buffer.data[..flush_size].to_vec();
+                    Some((data, start_offset, drop_trailing, flush_size))
                 }
             } else {
                 None
             }
         };
 
-        if let Some((flush_data, buffer_start_offset, drop_trailing)) = flush_data_opt {
+        if let Some((flush_data, buffer_start_offset, drop_trailing, flush_size)) = flush_data_opt {
             info!("Flushing {} bytes for inode {} (force={})", flush_data.len(), ino, force_metadata_update);
 
             // Get current metadata from cache
@@ -629,6 +631,21 @@ impl DfsFilesystem {
             let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = self.client
                 .write_data_with_cache(&flush_data, ino, buffer_start_offset)
                 .await?;
+
+            // Cluster write succeeded — now commit the buffer advance.
+            // Doing this after the write means a quorum failure leaves the buffer
+            // intact so the caller (or a retry) can flush it again safely.
+            if let Some(buffer_lock) = self.write_buffers.get(&ino) {
+                let mut buffer = buffer_lock.lock().await;
+                // Only touch the buffer if it hasn't been superseded by a concurrent write.
+                if buffer.start_offset == buffer_start_offset {
+                    let drain_len = flush_size.min(buffer.data.len());
+                    buffer.data.drain(..drain_len);
+                    buffer.start_offset += flush_size as u64;
+                    buffer.drop_trailing_chunks_on_flush = 0;
+                    buffer.last_modified = SystemTime::now();
+                }
+            }
 
             // Append new chunks to existing chunks and update size
             let num_chunks = new_chunk_ids.len();
@@ -2828,30 +2845,45 @@ impl Filesystem for DfsFilesystem {
         let lock_manager = self.lock_manager.clone();
 
         if self.write_buffer_enabled {
-            // Flush any buffered writes on file close, then release locks
-            let result = self.block_on(async {
-                // First flush writes (force metadata update on close)
-                self.flush_buffer_async(ino, true).await?;
+            // Only flush the write buffer when a write-mode fd is being closed.
+            // Read-only releases (e.g. Kodi closing a playback fd before a seek) must NOT
+            // touch the write buffer — doing so causes a synchronous multi-MB cluster write
+            // that stalls the FUSE thread for ~1.4 seconds and disrupts live-recording reads.
+            // The write buffer is owned by the writer; readers can serve from it but should
+            // not flush or remove it when they close.
+            if is_write {
+                let result = self.block_on(async {
+                    // First flush writes (force metadata update on close)
+                    self.flush_buffer_async(ino, true).await?;
 
-                // Then release all locks held by this owner (if lock_owner is provided)
-                // lock_owner is only provided if the process held locks
+                    // Then release all locks held by this owner (if lock_owner is provided)
+                    if let Some(owner) = lock_owner {
+                        lock_manager.release_all(ino, owner).await?;
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                });
+
+                // Clean up write buffer entry to prevent memory leak
+                // Even if flush failed, we should remove the buffer entry
+                self.write_buffers.remove(&ino);
+
+                match result {
+                    Ok(_) => reply.ok(),
+                    Err(e) => {
+                        error!("Failed to flush/release for inode {}: {}", ino, e);
+                        reply.error(libc::EIO);
+                    }
+                }
+            } else {
+                // Read-only close: release locks if needed, leave write buffer untouched.
                 if let Some(owner) = lock_owner {
-                    lock_manager.release_all(ino, owner).await?;
+                    let result = self.block_on(lock_manager.release_all(ino, owner));
+                    if let Err(e) = result {
+                        error!("Failed to release locks for inode {}: {}", ino, e);
+                    }
                 }
-
-                Ok::<(), anyhow::Error>(())
-            });
-
-            // Clean up write buffer entry to prevent memory leak
-            // Even if flush failed, we should remove the buffer entry
-            self.write_buffers.remove(&ino);
-
-            match result {
-                Ok(_) => reply.ok(),
-                Err(e) => {
-                    error!("Failed to flush/release for inode {}: {}", ino, e);
-                    reply.error(libc::EIO);
-                }
+                reply.ok();
             }
         } else {
             // No write buffer, but flush any pending metadata updates before releasing locks

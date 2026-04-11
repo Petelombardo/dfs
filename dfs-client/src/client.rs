@@ -13,6 +13,112 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+/// Per-node health state used by NodeHealthTracker.
+///
+/// A node is "penalized" after PENALTY_THRESHOLD consecutive timeouts/errors.
+/// While penalized it is sorted to the back of candidate lists so healthy nodes
+/// get first crack.  After PROBE_INTERVAL the penalty is lifted and the node is
+/// tried normally again; a single success clears all state.
+#[derive(Debug)]
+struct NodeHealth {
+    /// Consecutive timeout/error count since last success.
+    consecutive_failures: u32,
+    /// When the current penalty period expires and we try the node again normally.
+    /// None means the node is not penalized.
+    penalized_until: Option<std::time::Instant>,
+    /// Exponential back-off level (capped).  Each new failure while already
+    /// penalized doubles the probe interval up to MAX_PROBE_SECS.
+    backoff_level: u32,
+}
+
+impl NodeHealth {
+    fn new() -> Self {
+        Self { consecutive_failures: 0, penalized_until: None, backoff_level: 0 }
+    }
+
+    fn is_penalized(&self) -> bool {
+        self.penalized_until.map(|t| t > std::time::Instant::now()).unwrap_or(false)
+    }
+}
+
+/// Tracks per-node health across reads and writes.
+///
+/// Thread-safe; cheaply cloneable via Arc.
+#[derive(Clone, Debug)]
+pub struct NodeHealthTracker {
+    inner: Arc<Mutex<HashMap<SocketAddr, NodeHealth>>>,
+}
+
+impl NodeHealthTracker {
+    /// Number of consecutive failures before a node is penalized.
+    const PENALTY_THRESHOLD: u32 = 2;
+    /// Base probe interval (seconds) — doubles on each repeated failure.
+    const BASE_PROBE_SECS: u64 = 30;
+    /// Maximum probe interval (seconds).
+    const MAX_PROBE_SECS: u64 = 300;
+
+    fn new() -> Self {
+        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    /// Record a successful response from `addr`.  Clears all penalty state.
+    pub async fn record_success(&self, addr: SocketAddr) {
+        let mut map = self.inner.lock().await;
+        if let Some(h) = map.get_mut(&addr) {
+            if h.consecutive_failures > 0 || h.penalized_until.is_some() {
+                info!("Node {} health recovered (was {} consecutive failures)", addr, h.consecutive_failures);
+            }
+            h.consecutive_failures = 0;
+            h.penalized_until = None;
+            h.backoff_level = 0;
+        }
+    }
+
+    /// Record a timeout or connection error from `addr`.
+    /// Penalizes the node when the failure count crosses the threshold.
+    pub async fn record_failure(&self, addr: SocketAddr) {
+        let mut map = self.inner.lock().await;
+        let h = map.entry(addr).or_insert_with(NodeHealth::new);
+        h.consecutive_failures += 1;
+
+        if h.consecutive_failures >= Self::PENALTY_THRESHOLD {
+            let secs = (Self::BASE_PROBE_SECS << h.backoff_level).min(Self::MAX_PROBE_SECS);
+            h.penalized_until = Some(std::time::Instant::now() + Duration::from_secs(secs));
+            // Increase backoff level for next penalty, capped so we don't overflow the shift.
+            if h.backoff_level < 8 {
+                h.backoff_level += 1;
+            }
+            warn!(
+                "Node {} penalized for {}s after {} consecutive failures",
+                addr, secs, h.consecutive_failures
+            );
+        }
+    }
+
+    /// Returns true if `addr` is currently in a penalty period.
+    pub async fn is_penalized(&self, addr: SocketAddr) -> bool {
+        let map = self.inner.lock().await;
+        map.get(&addr).map(|h| h.is_penalized()).unwrap_or(false)
+    }
+
+    /// Sort a slice of addresses so healthy nodes come first, penalized nodes last.
+    /// Within each group the original order (round-robin, warm-cache preference, etc.) is preserved.
+    pub async fn sort_by_health(&self, addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+        let map = self.inner.lock().await;
+        let mut healthy = Vec::new();
+        let mut penalized = Vec::new();
+        for &addr in addrs {
+            if map.get(&addr).map(|h| h.is_penalized()).unwrap_or(false) {
+                penalized.push(addr);
+            } else {
+                healthy.push(addr);
+            }
+        }
+        healthy.extend(penalized);
+        healthy
+    }
+}
+
 /// Cache key for byte-range caching: (inode, file_byte_offset, chunk_id)
 /// chunk_id is included to prevent stale hits when a file is deleted and recreated
 /// at the same inode (same offset but different content).
@@ -148,6 +254,10 @@ pub struct DfsClient {
     /// their own 20-slot semaphore, producing N*20 simultaneous connections and
     /// exhausting server file descriptors.
     fetch_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// Per-node health tracker.  Penalizes nodes that time out repeatedly and
+    /// automatically re-admits them after a back-off period.
+    node_health: NodeHealthTracker,
 }
 
 impl DfsClient {
@@ -281,6 +391,7 @@ impl DfsClient {
             read_lock: Arc::new(Mutex::new(())),
             leader_addr: Arc::new(RwLock::new(None)),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
+            node_health: NodeHealthTracker::new(),
         })
     }
 
@@ -433,28 +544,54 @@ impl DfsClient {
 
         let buf = match tokio::time::timeout(tokio::time::Duration::from_secs(3), io_future).await {
             Ok(Ok(buf)) => buf,
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(e)) => {
+                self.node_health.record_failure(addr).await;
+                return Err(anyhow::anyhow!("I/O error talking to {}: {}", addr, e));
+            }
+            Err(_) => {
                 // Stale pooled connection or timeout — retry once with a fresh connection
-                let mut fresh = tokio::time::timeout(
+                let mut fresh = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(5),
                     TcpStream::connect(addr),
-                ).await
-                    .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
-                    .context("Failed to connect to node")?;
+                ).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node {}: {}", addr, e));
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
+                    }
+                };
 
                 // Reuse the same serialized envelope (idempotent for reads; acceptable for writes)
                 let len = encoded.len() as u32;
-                fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
-                fresh.write_all(&encoded).await.context("write body")?;
-                fresh.flush().await.context("flush")?;
-
-                let mut len_buf = [0u8; 4];
-                fresh.read_exact(&mut len_buf).await.context("read len")?;
-                let rlen = u32::from_be_bytes(len_buf) as usize;
-                let mut buf = vec![0u8; rlen];
-                fresh.read_exact(&mut buf).await.context("read body")?;
-                stream = fresh;
-                buf
+                let retry_result = async {
+                    fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
+                    fresh.write_all(&encoded).await.context("write body")?;
+                    fresh.flush().await.context("flush")?;
+                    let mut len_buf = [0u8; 4];
+                    fresh.read_exact(&mut len_buf).await.context("read len")?;
+                    let rlen = u32::from_be_bytes(len_buf) as usize;
+                    let mut buf = vec![0u8; rlen];
+                    fresh.read_exact(&mut buf).await.context("read body")?;
+                    Ok::<Vec<u8>, anyhow::Error>(buf)
+                };
+                match tokio::time::timeout(tokio::time::Duration::from_secs(3), retry_result).await {
+                    Ok(Ok(buf)) => {
+                        stream = fresh;
+                        buf
+                    }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Timeout reading chunk from {}", addr));
+                    }
+                }
             }
         };
 
@@ -471,7 +608,10 @@ impl DfsClient {
             .context("Failed to deserialize response")?;
 
         match response_envelope.message {
-            Message::Response(response) => Ok(response),
+            Message::Response(response) => {
+                self.node_health.record_success(addr).await;
+                Ok(response)
+            }
             _ => anyhow::bail!("Expected Response message"),
         }
     }
@@ -907,11 +1047,11 @@ impl DfsClient {
                         warm_addr
                     } else {
                         debug!("Warm node {} not in replica list for {}, using round-robin", warm_addr, chunk_id);
-                        client.select_replica(&replicas).context("No replicas available")?
+                        client.select_replica(&replicas).await.context("No replicas available")?
                     }
                 } else {
                     // No warm cache - use standard round-robin
-                    client.select_replica(&replicas).context("No replicas available")?
+                    client.select_replica(&replicas).await.context("No replicas available")?
                 };
 
                 let selection_mode = if warm_node.is_some() { "warm-cache" } else if use_striped { "round-robin" } else { "sticky" };
@@ -924,7 +1064,11 @@ impl DfsClient {
                 // Determine if we should use partial read (ReadChunkRange) or full chunk read.
                 // Hoisted out of the retry loop so it's accessible after the loop for caching.
                 let use_partial_read = if let Some(ref hint) = read_hint {
-                    !hint.full_chunk && !is_sequential && hint.offset_in_chunk > 0
+                    // Use partial read when hint says partial AND not sequential.
+                    // Removed the old `offset_in_chunk > 0` guard: a seek that lands exactly
+                    // on a chunk boundary (offset_in_chunk == 0) but only reads a small slice
+                    // should still use ReadChunkRange rather than fetching the full 4MB chunk.
+                    !hint.full_chunk && !is_sequential
                 } else {
                     false
                 };
@@ -1005,8 +1149,9 @@ impl DfsClient {
                 debug!("Cached chunk {} ({} bytes)", chunk_id, data_arc.len());
             }
 
-            // Add to byte-range cache if we have inode
-            if inode > 0 && file_offset > 0 {
+            // Add to byte-range cache if we have inode.
+            // Note: file_offset == 0 is valid (first chunk of file) and should be cached.
+            if inode > 0 {
                 let mut byte_cache = self.byte_range_cache.lock().await;
                 let key = ByteRangeCacheKey {
                     inode,
@@ -1076,7 +1221,7 @@ impl DfsClient {
                         Err(_) => nodes.clone(),
                     };
 
-                    let selected_replica = self.select_replica(&replicas)
+                    let selected_replica = self.select_replica(&replicas).await
                         .context("No replicas available for fallback fetch")?;
 
                     // Try selected replica first, then fall back to others
@@ -1282,7 +1427,7 @@ impl DfsClient {
                             };
 
                             // Select replica using round-robin (same logic as reads)
-                            if let Some(selected_node) = client.select_replica(&replicas) {
+                            if let Some(selected_node) = client.select_replica(&replicas).await {
                                 chunks_by_node.entry(selected_node).or_default().push(*chunk_id);
                             }
                         }
@@ -1428,7 +1573,7 @@ impl DfsClient {
                             };
 
                             // Select replica using round-robin
-                            if let Some(selected_node) = client.select_replica(&replicas) {
+                            if let Some(selected_node) = client.select_replica(&replicas).await {
                                 // Fetch chunk from server
                                 match client.read_chunk_from_server(selected_node, chunk_id).await {
                                     Ok(data) => {
@@ -1531,14 +1676,15 @@ impl DfsClient {
         }
     }
 
-    /// Select one replica from a list using round-robin for load balancing
-    fn select_replica(&self, replicas: &[SocketAddr]) -> Option<SocketAddr> {
+    /// Select one replica from a list using round-robin for load balancing.
+    /// Penalized nodes are moved to the back so healthy nodes are preferred.
+    async fn select_replica(&self, replicas: &[SocketAddr]) -> Option<SocketAddr> {
         if replicas.is_empty() {
             return None;
         }
-
-        let idx = self.replica_selector.fetch_add(1, Ordering::Relaxed) as usize % replicas.len();
-        Some(replicas[idx])
+        let ordered = self.node_health.sort_by_health(replicas).await;
+        let idx = self.replica_selector.fetch_add(1, Ordering::Relaxed) as usize % ordered.len();
+        Some(ordered[idx])
     }
 
     /// Pre-populate replica cache with chunk locations for upcoming reads
@@ -2009,7 +2155,7 @@ impl DfsClient {
         }
 
         // Populate byte-range cache for immediate read-back
-        if inode > 0 && file_offset > 0 {
+        if inode > 0 {
             let mut byte_cache = self.byte_range_cache.lock().await;
             let mut current_offset = file_offset;
 
@@ -2154,12 +2300,15 @@ impl DfsClient {
         const WRITE_TIMEOUT_SECS: u64 = 30;
 
         // Build the ordered list of candidates: preferred pair first, then others as fallbacks.
-        let mut candidates: Vec<SocketAddr> = vec![replica1, replica2];
-        for &n in all_nodes {
-            if n != replica1 && n != replica2 {
-                candidates.push(n);
-            }
-        }
+        // Sort so penalized nodes are tried last — healthy nodes get first crack at quorum.
+        let preferred: Vec<SocketAddr> = vec![replica1, replica2];
+        let mut rest: Vec<SocketAddr> = all_nodes.iter().copied()
+            .filter(|&n| n != replica1 && n != replica2)
+            .collect();
+
+        let mut candidates = self.node_health.sort_by_health(&preferred).await;
+        rest = self.node_health.sort_by_health(&rest).await;
+        candidates.extend(rest);
 
         // We need exactly 2 successful replicas. Try candidates in order, skipping failures.
         let mut successful: Vec<(SocketAddr, Response)> = Vec::new();
@@ -2266,7 +2415,7 @@ impl DfsClient {
         }
 
         // Populate byte-range cache for immediate read-back
-        if inode > 0 && file_offset > 0 {
+        if inode > 0 {
             let mut byte_cache = self.byte_range_cache.lock().await;
             let mut current_offset = file_offset;
 
@@ -2329,18 +2478,9 @@ impl DfsClient {
     /// This enables zero-latency reads of just-written data (DVR use case)
     /// Returns (chunk_ids, chunk_sizes, chunk_locations) - locations include full replica node tracking
     pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
-        const MIN_PARALLEL_SIZE: usize = 128 * 1024; // 128KB minimum - use dual-replica for writes >= 128KB
-
-        // For small writes, use single server (less overhead).
-        // Use the tracked variant to capture replica node info from the server response.
-        if data.len() < MIN_PARALLEL_SIZE {
-            let (chunk_ids, chunk_sizes, replica_nodes_per_chunk) = self.write_data_single_chunk_tracked(data).await?;
-            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk);
-            return Ok((chunk_ids, chunk_sizes, Some(locations)));
-        }
-
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
+            // Single-node cluster: fall back to server-side replication
             let (chunk_ids, chunk_sizes, replica_nodes_per_chunk) = self.write_data_single_chunk_tracked(data).await?;
             let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk);
             return Ok((chunk_ids, chunk_sizes, Some(locations)));

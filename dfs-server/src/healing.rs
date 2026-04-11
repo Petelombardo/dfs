@@ -420,14 +420,27 @@ impl HealingManager {
 
             let replication_factor = self.replication_factor;
 
-            // Detect unrecoverable chunks: actual_replicas == 0 and every node listed in
-            // metadata was successfully queried (reachable) and confirmed it doesn't have
-            // the chunk. We require reachability — not just gossip-online — so a transient
-            // RPC failure can't cause us to write off a chunk that a temporarily-unreachable
-            // node still holds.
+            // Detect unrecoverable chunks: actual_replicas == 0 and either:
+            //  (a) the metadata node list is empty (nodes were already pruned — no record
+            //      of where the chunk ever lived), OR
+            //  (b) every node listed in metadata was successfully queried (reachable) and
+            //      confirmed it doesn't have the chunk.
+            // We require reachability for case (b) so a transient RPC failure can't cause
+            // us to write off a chunk that a temporarily-unreachable node still holds.
+            //
+            // When confirmed unrecoverable, delete the chunk location metadata so the stale
+            // record doesn't keep re-entering the scan every cycle. The data is already gone —
+            // leaving the metadata makes the file appear to have chunks it doesn't have.
             let all_metadata_nodes_reachable = location.nodes.iter()
                 .all(|n| node_chunk_presence.contains_key(n));
-            if actual_replicas == 0 && all_metadata_nodes_reachable && !location.nodes.is_empty() {
+            if actual_replicas == 0 && (location.nodes.is_empty() || all_metadata_nodes_reachable) {
+                warn!(
+                    "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
+                    chunk_id, location.nodes.len()
+                );
+                if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
+                    warn!("Failed to purge unrecoverable chunk {} metadata: {}", chunk_id, e);
+                }
                 self.pending_healing.write().await.remove(&chunk_id);
                 continue;
             }

@@ -378,7 +378,14 @@ impl HealingManager {
 
             // Prune ghost nodes: metadata lists a node as holding the chunk but it
             // doesn't actually have it (stale metadata from a failed write push).
-            if !nodes_without_chunk.is_empty() {
+            //
+            // Safety guard: only prune if at least one replica survives. If actual_replicas
+            // is zero, every online node that was supposed to hold the chunk is missing it —
+            // this means the chunk files were lost (e.g. OOM crash mid-write). Pruning in
+            // that case would destroy the last record of which nodes *should* have had the
+            // data, making recovery impossible and turning a "lost chunk" into a silent gap.
+            // Leave the metadata intact so the unrecoverable loss is visible and auditable.
+            if !nodes_without_chunk.is_empty() && actual_replicas > 0 {
                 warn!(
                     "Chunk {} metadata lists {} online node(s) that don't hold the data — pruning: {:?}",
                     chunk_id, nodes_without_chunk.len(), nodes_without_chunk
@@ -399,9 +406,28 @@ impl HealingManager {
                 } else {
                     HealingManager::broadcast_chunk_location_shared(&updated_location, &self.cluster, &self.client).await;
                 }
+            } else if !nodes_without_chunk.is_empty() && actual_replicas == 0 {
+                warn!(
+                    "Chunk {} is unrecoverable — lost from all {} online node(s) that metadata lists: {:?}",
+                    chunk_id, nodes_without_chunk.len(), nodes_without_chunk
+                );
             }
 
             let replication_factor = self.replication_factor;
+
+            // Detect unrecoverable chunks: actual_replicas == 0 and every node listed in
+            // metadata is online (so no offline node could be hiding a surviving copy).
+            // These chunks are permanently lost — skip them from the heal work queue so
+            // they don't consume throttle slots every cycle. Leave the location metadata
+            // intact as an audit record. Remove from pending_healing so the count reflects
+            // only chunks that can actually be healed.
+            let all_metadata_nodes_online = location.nodes.iter()
+                .all(|n| online_nodes.iter().any(|o| o.id == *n));
+            if actual_replicas == 0 && all_metadata_nodes_online && !location.nodes.is_empty() {
+                self.pending_healing.write().await.remove(&chunk_id);
+                continue;
+            }
+
             let status = if actual_replicas < replication_factor {
                 ReplicationStatus::UnderReplicated
             } else if actual_replicas > replication_factor {

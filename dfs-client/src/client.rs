@@ -2710,12 +2710,20 @@ impl DfsClient {
     }
 
     /// Refresh cluster node list by querying GetClusterStatus.
-    /// Tries all currently-known nodes first, then falls back to the original seed
-    /// addresses so the client can re-bootstrap after a complete node-list refresh failure.
+    /// Tries the known leader first (most authoritative source of cluster membership),
+    /// then all currently-known nodes, then the original seed addresses as a last resort.
     pub async fn refresh_cluster_nodes(&self) -> Result<()> {
-        // Build a deduplicated candidate list: current nodes first, seeds as fallback.
+        // Build a deduplicated candidate list: leader first, then current nodes, then seeds.
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        if let Some(leader) = *self.leader_addr.read().await {
+            candidates.push(leader);
+        }
         let current = self.cluster_nodes.read().await.clone();
-        let mut candidates = current.clone();
+        for addr in &current {
+            if !candidates.contains(addr) {
+                candidates.push(*addr);
+            }
+        }
         for seed in &self.seed_nodes {
             if !candidates.contains(seed) {
                 candidates.push(*seed);

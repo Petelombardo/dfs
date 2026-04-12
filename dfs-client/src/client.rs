@@ -302,15 +302,17 @@ impl DfsClient {
             .unwrap_or(1024);
 
         // Check for environment variable override
-        // Default max based on available RAM to prevent artificial caps
+        // Default max based on available RAM. On write-heavy low-RAM clients (e.g. nanopir3
+        // 1.9GB) the write buffer + in-flight pipeline data consumes 50-100MB during writes,
+        // so cache sizes must leave headroom. Cap byte_range_cache tightly on < 2GB systems.
         let default_max_chunks = if available_mb < 512 {
-            64   // Low RAM: cap at 256MB per cache
+            8    // Very low RAM: 32MB per cache
         } else if available_mb < 2048 {
-            128  // Medium RAM (512MB-2GB): cap at 512MB per cache
+            8    // Low-to-medium RAM (< 2GB): 32MB per cache — write buffer needs the headroom
         } else if available_mb < 4096 {
-            256  // Good RAM (2-4GB): cap at 1GB per cache
+            64   // Good RAM (2-4GB): 256MB per cache
         } else {
-            512  // High RAM (4GB+): cap at 2GB per cache
+            128  // High RAM (4GB+): 512MB per cache
         };
 
         let max_chunks = std::env::var("DFS_MAX_CACHE_CHUNKS")
@@ -2503,44 +2505,66 @@ impl DfsClient {
         let nodes = self.cluster_nodes.read().await.clone();
         let sorted = self.node_health.sort_by_health(&nodes).await;
 
-        // Use preferred primary if it's healthy (not penalized), otherwise fall back
-        // to the healthiest available node.
-        let primary = if let Some(preferred) = preferred_primary {
-            if sorted.first() == Some(&preferred) || sorted.iter().take(2).any(|n| *n == preferred) {
-                preferred
-            } else {
-                sorted.into_iter().next()
-                    .context("No cluster nodes available for AppendFile")?
+        // Build candidate list: preferred primary first (if healthy), then rest in health order.
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        if let Some(preferred) = preferred_primary {
+            if sorted.iter().take(2).any(|n| *n == preferred) {
+                candidates.push(preferred);
             }
-        } else {
-            sorted.into_iter().next()
-                .context("No cluster nodes available for AppendFile")?
-        };
-
-        let request = Request::AppendFile { file_id, data, expected_offset };
-
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.send_request(primary, request),
-        ).await
-        .map_err(|_| anyhow::anyhow!("AppendFile timeout after 30s"))??;
-
-        match response {
-            Response::AppendFileResult { metadata, remaining_in_chunk } => {
-                self.node_health.record_success(primary).await;
-                // Return the primary we actually used so the caller can pin to it
-                // until the chunk seals (remaining_in_chunk == 0).
-                Ok((metadata, remaining_in_chunk, primary))
-            }
-            Response::Error { message, code: ErrorCode::OffsetMismatch } => {
-                anyhow::bail!("OffsetMismatch: {}", message)
-            }
-            Response::Error { message, .. } => {
-                self.node_health.record_failure(primary).await;
-                anyhow::bail!("AppendFile failed: {}", message)
-            }
-            other => anyhow::bail!("Unexpected response from AppendFile: {:?}", other),
         }
+        for n in &sorted {
+            if !candidates.contains(n) {
+                candidates.push(*n);
+            }
+        }
+        if candidates.is_empty() {
+            anyhow::bail!("No cluster nodes available for AppendFile");
+        }
+
+        let mut last_err = anyhow::anyhow!("AppendFile: no candidates tried");
+
+        for primary in candidates {
+            let request = Request::AppendFile { file_id, data: data.clone(), expected_offset };
+
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.send_request(primary, request),
+            ).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    self.node_health.record_failure(primary).await;
+                    last_err = anyhow::anyhow!("AppendFile send failed on {}: {}", primary, e);
+                    warn!("AppendFile: node {} failed (send error), trying next: {}", primary, last_err);
+                    continue;
+                }
+                Err(_) => {
+                    self.node_health.record_failure(primary).await;
+                    last_err = anyhow::anyhow!("AppendFile timeout on {}", primary);
+                    warn!("AppendFile: node {} timed out, trying next", primary);
+                    continue;
+                }
+            };
+
+            match response {
+                Response::AppendFileResult { metadata, remaining_in_chunk } => {
+                    self.node_health.record_success(primary).await;
+                    return Ok((metadata, remaining_in_chunk, primary));
+                }
+                Response::Error { message, code: ErrorCode::OffsetMismatch } => {
+                    // CAS mismatch — no point retrying other nodes, caller must re-fetch
+                    anyhow::bail!("OffsetMismatch: {}", message);
+                }
+                Response::Error { message, .. } => {
+                    self.node_health.record_failure(primary).await;
+                    last_err = anyhow::anyhow!("AppendFile server error on {}: {}", primary, message);
+                    warn!("AppendFile: node {} returned error, trying next: {}", primary, last_err);
+                    // continue to next candidate
+                }
+                other => anyhow::bail!("Unexpected response from AppendFile: {:?}", other),
+            }
+        }
+
+        Err(last_err)
     }
 
     /// Write data and populate byte-range cache for immediate read-back

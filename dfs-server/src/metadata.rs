@@ -42,14 +42,14 @@ impl MetadataStore {
             .context("Failed to serialize file metadata")?;
 
         self.db
-            .insert(key, value)
+            .insert(key, value.clone())
             .context("Failed to insert file metadata")?;
 
-        // Also index by path for lookups
+        // Also index by path for lookups — store full metadata so list_directory
+        // is a single prefix scan with no per-entry secondary lookups.
         let path_key = self.path_key(&metadata.path);
-        let id_bytes = bincode::serialize(&metadata.id)?;
         self.db
-            .insert(path_key, id_bytes)
+            .insert(path_key, value)
             .context("Failed to insert path index")?;
 
         debug!("Stored metadata for file: {} ({})", metadata.path, metadata.id);
@@ -143,11 +143,21 @@ impl MetadataStore {
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
         let path_key = self.path_key(path);
 
-        match self.db.get(path_key)? {
-            Some(id_bytes) => {
-                let file_id: FileId = bincode::deserialize(&id_bytes)
+        match self.db.get(&path_key)? {
+            Some(bytes) => {
+                // New format: full FileMetadata stored in path index
+                if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&bytes) {
+                    return Ok(Some(metadata));
+                }
+                // Legacy format: FileId stored, requires second lookup
+                let file_id: FileId = bincode::deserialize(&bytes)
                     .context("Failed to deserialize file ID")?;
-                self.get_file(&file_id)
+                let result = self.get_file(&file_id)?;
+                // Rewrite in new format so next access is fast
+                if let Some(ref metadata) = result {
+                    let _ = self.db.insert(path_key, bincode::serialize(metadata)?);
+                }
+                Ok(result)
             }
             None => Ok(None),
         }
@@ -229,12 +239,18 @@ impl MetadataStore {
                 // Check if this is a direct child (not nested subdirectory)
                 let relative = &path[dir_path.len()..];
                 if !relative.is_empty() && (!relative.contains('/') || relative.ends_with('/')) {
-                    // Deserialize the file ID and fetch the metadata
-                    let file_id: FileId = bincode::deserialize(&value)
-                        .context("Failed to deserialize file ID from path index")?;
-
-                    if let Some(metadata) = self.get_file(&file_id)? {
+                    // New format: path index stores full FileMetadata — no secondary lookup.
+                    // Old format: path index stores FileId — fall back to get_file().
+                    if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&value) {
                         files.push(metadata);
+                    } else if let Ok(file_id) = bincode::deserialize::<FileId>(&value) {
+                        // Legacy entry — fetch metadata and rewrite index in new format
+                        if let Some(metadata) = self.get_file(&file_id)? {
+                            let _ = self.db.insert(key, bincode::serialize(&metadata)?);
+                            files.push(metadata);
+                        }
+                    } else {
+                        warn!("list_directory: could not deserialize path index entry for {}", path);
                     }
                 }
             }

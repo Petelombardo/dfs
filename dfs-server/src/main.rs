@@ -284,6 +284,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     server_handle.abort();
 
+    // Clean up addr file so dfs-admin auto-discovery doesn't see a stale entry
+    let _ = std::fs::remove_file(&addr_file);
+
     Ok(())
 }
 

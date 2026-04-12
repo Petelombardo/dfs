@@ -2486,20 +2486,36 @@ impl DfsClient {
     /// The server handles chunk alignment: it reads back the partial last chunk if
     /// needed, writes complete chunks + new partial tail, and returns updated metadata.
     ///
-    /// `expected_offset` is a CAS guard — if the server's file.size doesn't match,
-    /// it returns an OffsetMismatch error so the caller can retry with a fresh offset.
+    /// `preferred_primary`: if Some, try this node first (for write load distribution —
+    /// caller rotates the primary when remaining_in_chunk hits 0).
+    ///
+    /// Returns (updated_metadata, remaining_in_chunk). When remaining_in_chunk == 0
+    /// the chunk boundary was just crossed — caller should pick a new primary.
     pub async fn append_file(
         &self,
         file_id: dfs_common::FileId,
         data: Vec<u8>,
         expected_offset: u64,
-    ) -> Result<dfs_common::FileMetadata> {
+        preferred_primary: Option<SocketAddr>,
+    ) -> Result<(dfs_common::FileMetadata, u64)> {
         use dfs_common::protocol::{ErrorCode, Request, Response};
 
         let nodes = self.cluster_nodes.read().await.clone();
         let sorted = self.node_health.sort_by_health(&nodes).await;
-        let primary = sorted.into_iter().next()
-            .context("No cluster nodes available for AppendFile")?;
+
+        // Use preferred primary if it's healthy (not penalized), otherwise fall back
+        // to the healthiest available node.
+        let primary = if let Some(preferred) = preferred_primary {
+            if sorted.first() == Some(&preferred) || sorted.iter().take(2).any(|n| *n == preferred) {
+                preferred
+            } else {
+                sorted.into_iter().next()
+                    .context("No cluster nodes available for AppendFile")?
+            }
+        } else {
+            sorted.into_iter().next()
+                .context("No cluster nodes available for AppendFile")?
+        };
 
         let request = Request::AppendFile { file_id, data, expected_offset };
 
@@ -2510,9 +2526,9 @@ impl DfsClient {
         .map_err(|_| anyhow::anyhow!("AppendFile timeout after 30s"))??;
 
         match response {
-            Response::AppendFileResult { metadata } => {
+            Response::AppendFileResult { metadata, remaining_in_chunk } => {
                 self.node_health.record_success(primary).await;
-                Ok(metadata)
+                Ok((metadata, remaining_in_chunk))
             }
             Response::Error { message, code: ErrorCode::OffsetMismatch } => {
                 anyhow::bail!("OffsetMismatch: {}", message)

@@ -57,6 +57,10 @@ struct WriteBuffer {
     start_offset: u64,
     /// When this buffer was created
     created_at: std::time::Instant,
+    /// Preferred primary node for the next AppendFile call.
+    /// Set on buffer creation, rotated when the server signals remaining_in_chunk == 0
+    /// (chunk boundary crossed). None means pick by health on next flush.
+    preferred_primary: Option<std::net::SocketAddr>,
 }
 
 impl WriteBuffer {
@@ -235,7 +239,7 @@ impl DfsFilesystem {
                             if let Some(buf_lock) = write_buffers_clone.get(&ino) {
                                 let buffer = buf_lock.lock().await;
                                 if !buffer.data.is_empty() {
-                                    Some((buffer.data.clone(), buffer.start_offset))
+                                    Some((buffer.data.clone(), buffer.start_offset, buffer.preferred_primary))
                                 } else {
                                     None
                                 }
@@ -244,7 +248,7 @@ impl DfsFilesystem {
                             }
                         };
 
-                        let (flush_data, expected_offset) = match flush_data_opt {
+                        let (flush_data, expected_offset, preferred_primary) = match flush_data_opt {
                             Some(v) => v,
                             None => continue,
                         };
@@ -260,12 +264,13 @@ impl DfsFilesystem {
                             }
                         };
 
-                        info!("Background flush: {} bytes for inode {} at offset {}", flush_data.len(), ino, expected_offset);
+                        info!("Background flush: {} bytes for inode {} at offset {} (primary={:?})",
+                              flush_data.len(), ino, expected_offset, preferred_primary);
 
-                        match client_for_cleanup.append_file(file_id, flush_data.clone(), expected_offset).await {
-                            Ok(updated_metadata) => {
+                        match client_for_cleanup.append_file(file_id, flush_data.clone(), expected_offset, preferred_primary).await {
+                            Ok((updated_metadata, remaining_in_chunk)) => {
                                 let flushed = flush_data.len();
-                                // Commit buffer drain
+                                // Commit buffer drain and rotate primary if chunk sealed
                                 if let Some(buf_lock) = write_buffers_clone.get(&ino) {
                                     let mut buffer = buf_lock.lock().await;
                                     if buffer.start_offset == expected_offset {
@@ -273,10 +278,13 @@ impl DfsFilesystem {
                                         buffer.data.drain(..drain);
                                         buffer.start_offset += drain as u64;
                                         buffer.last_modified = SystemTime::now();
+                                        if remaining_in_chunk == 0 {
+                                            buffer.preferred_primary = None; // rotate on chunk seal
+                                        }
                                     }
                                 }
                                 metadata_cache_for_cleanup.write().unwrap().insert(ino, updated_metadata);
-                                info!("Background flush complete for inode {}", ino);
+                                info!("Background flush complete for inode {} (remaining_in_chunk={})", ino, remaining_in_chunk);
                             }
                             Err(e) if e.to_string().contains("OffsetMismatch") => {
                                 // Re-fetch metadata and update buffer start_offset for next tick
@@ -284,6 +292,7 @@ impl DfsFilesystem {
                                     if let Some(buf_lock) = write_buffers_clone.get(&ino) {
                                         let mut buffer = buf_lock.lock().await;
                                         buffer.start_offset = fresh.size;
+                                        buffer.preferred_primary = None;
                                     }
                                     metadata_cache_for_cleanup.write().unwrap().insert(ino, fresh);
                                 }
@@ -429,20 +438,21 @@ impl DfsFilesystem {
         self.last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
     }
 
-    /// Flush buffered writes for a specific inode to the cluster
-    /// If force_metadata_update is true, always update metadata (used on close/fsync)
-    /// If false, use time-based batching (update every 2 seconds)
     /// Flush the write buffer for `ino` using the server-side AppendFile RPC.
     ///
     /// The server handles chunk alignment — we just send whatever bytes are buffered.
     /// `force`: if true, flushes even if the buffer is small (used by fsync/close).
+    ///
+    /// Primary rotation: each WriteBuffer tracks a preferred primary node. When the
+    /// server signals remaining_in_chunk == 0 (chunk boundary sealed), we pick a new
+    /// primary so that write load is distributed across nodes per chunk.
     async fn flush_buffer_async(&self, ino: u64, force: bool) -> Result<()> {
         // Snapshot buffer state without holding the lock during the network call
         let flush_data_opt = {
             if let Some(buffer_lock) = self.write_buffers.get(&ino) {
                 let buffer = buffer_lock.lock().await;
                 if (force || buffer.should_background_flush()) && !buffer.data.is_empty() {
-                    Some((buffer.data.clone(), buffer.start_offset))
+                    Some((buffer.data.clone(), buffer.start_offset, buffer.preferred_primary))
                 } else {
                     None
                 }
@@ -451,13 +461,13 @@ impl DfsFilesystem {
             }
         };
 
-        let (flush_data, expected_offset) = match flush_data_opt {
+        let (flush_data, expected_offset, preferred_primary) = match flush_data_opt {
             Some(v) => v,
             None => return Ok(()),
         };
 
-        info!("flush_buffer_async: flushing {} bytes for inode {} at offset {} (force={})",
-              flush_data.len(), ino, expected_offset, force);
+        info!("flush_buffer_async: flushing {} bytes for inode {} at offset {} (force={}, primary={:?})",
+              flush_data.len(), ino, expected_offset, force, preferred_primary);
 
         // Get file_id and path from metadata cache
         let (file_id, path) = {
@@ -469,27 +479,30 @@ impl DfsFilesystem {
         };
 
         // Call server-side AppendFile. On OffsetMismatch, re-fetch metadata and retry once.
-        let updated_metadata = match self.client.append_file(file_id, flush_data.clone(), expected_offset).await {
-            Ok(m) => m,
+        let (updated_metadata, remaining_in_chunk) = match self.client
+            .append_file(file_id, flush_data.clone(), expected_offset, preferred_primary)
+            .await
+        {
+            Ok(result) => result,
             Err(e) if e.to_string().contains("OffsetMismatch") => {
                 warn!("flush_buffer_async: OffsetMismatch for inode {}, re-fetching metadata and retrying", ino);
                 let fresh = self.client.get_file_metadata(&path).await?
                     .ok_or_else(|| anyhow::anyhow!("File disappeared during flush retry: {}", path))?;
                 let new_offset = fresh.size;
                 self.metadata_cache.write().unwrap().insert(ino, fresh.clone());
-                // Update buffer start_offset to match reality
                 if let Some(buffer_lock) = self.write_buffers.get(&ino) {
                     let mut buffer = buffer_lock.lock().await;
                     buffer.start_offset = new_offset;
+                    buffer.preferred_primary = None; // reset primary on mismatch
                 }
-                self.client.append_file(file_id, flush_data.clone(), new_offset).await?
+                self.client.append_file(file_id, flush_data.clone(), new_offset, None).await?
             }
             Err(e) => return Err(e),
         };
 
         let flushed_len = flush_data.len();
 
-        // Commit the buffer drain — only if start_offset hasn't been moved by a concurrent write
+        // Commit the buffer drain and rotate primary if chunk boundary was just crossed
         if let Some(buffer_lock) = self.write_buffers.get(&ino) {
             let mut buffer = buffer_lock.lock().await;
             if buffer.start_offset == expected_offset {
@@ -497,6 +510,16 @@ impl DfsFilesystem {
                 buffer.data.drain(..drain);
                 buffer.start_offset += drain as u64;
                 buffer.last_modified = SystemTime::now();
+
+                if remaining_in_chunk == 0 {
+                    // Chunk boundary sealed — clear preferred primary so next flush
+                    // picks a fresh node via health-sorted selection, distributing
+                    // write load across the cluster one chunk at a time.
+                    debug!("Chunk boundary sealed for inode {} — rotating primary node", ino);
+                    buffer.preferred_primary = None;
+                }
+                // If remaining > 0, keep the same primary so the partial chunk
+                // continues accumulating on the same server until it seals.
             }
         }
 
@@ -1780,6 +1803,7 @@ impl Filesystem for DfsFilesystem {
                                     last_modified: SystemTime::now(),
                                     start_offset: cache_size,
                                     created_at: std::time::Instant::now(),
+                                    preferred_primary: None,
                                 }))
                             }).clone();
 
@@ -1922,6 +1946,7 @@ impl Filesystem for DfsFilesystem {
                                 last_modified: SystemTime::now(),
                                 start_offset: cache_size,
                                 created_at: std::time::Instant::now(),
+                                preferred_primary: None,
                             }))
                         }).clone();
 

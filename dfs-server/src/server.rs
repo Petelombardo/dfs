@@ -1372,7 +1372,8 @@ impl Server {
         let chunks = self.chunker.chunk_data(&write_data);
         if chunks.is_empty() {
             // Nothing to write — return current metadata unchanged
-            return Response::AppendFileResult { metadata };
+            let remaining = chunk_size - (metadata.size % chunk_size);
+            return Response::AppendFileResult { metadata, remaining_in_chunk: remaining };
         }
 
         // Base file offset for the new chunks: where the chunk-aligned region starts
@@ -1550,8 +1551,17 @@ impl Server {
             });
         }
 
-        info!("AppendFile: complete for file_id={}, new size={}", file_id, metadata.size);
-        Response::AppendFileResult { metadata }
+        // Tell the client how many bytes remain before this chunk seals.
+        // When remaining_in_chunk == 0 the chunk is exactly full and the client
+        // should rotate to a different primary for the next call.
+        let remaining_in_chunk = {
+            let partial = metadata.size % chunk_size;
+            if partial == 0 { 0 } else { chunk_size - partial }
+        };
+
+        info!("AppendFile: complete for file_id={}, new size={}, remaining_in_chunk={}",
+              file_id, metadata.size, remaining_in_chunk);
+        Response::AppendFileResult { metadata, remaining_in_chunk }
     }
 
     /// Handle list directory request

@@ -348,6 +348,10 @@ pub enum Response {
     /// FileMetadata so the client doesn't need a follow-up GetFileMetadata call.
     AppendFileResult {
         metadata: FileMetadata,
+        /// Bytes remaining in the current partial chunk before the next chunk boundary.
+        /// When this reaches 0, the chunk is sealed and the client should rotate to a
+        /// different primary node for the next AppendFile call to distribute write load.
+        remaining_in_chunk: u64,
     },
 
     /// Prefetch hint acknowledged (best-effort, no guarantee)

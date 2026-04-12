@@ -2482,6 +2482,49 @@ impl DfsClient {
         dfs_common::NodeId::from_uuid(uuid)
     }
 
+    /// Append data to a file using the server-side AppendFile RPC.
+    /// The server handles chunk alignment: it reads back the partial last chunk if
+    /// needed, writes complete chunks + new partial tail, and returns updated metadata.
+    ///
+    /// `expected_offset` is a CAS guard — if the server's file.size doesn't match,
+    /// it returns an OffsetMismatch error so the caller can retry with a fresh offset.
+    pub async fn append_file(
+        &self,
+        file_id: dfs_common::FileId,
+        data: Vec<u8>,
+        expected_offset: u64,
+    ) -> Result<dfs_common::FileMetadata> {
+        use dfs_common::protocol::{ErrorCode, Request, Response};
+
+        let nodes = self.cluster_nodes.read().await.clone();
+        let sorted = self.node_health.sort_by_health(&nodes).await;
+        let primary = sorted.into_iter().next()
+            .context("No cluster nodes available for AppendFile")?;
+
+        let request = Request::AppendFile { file_id, data, expected_offset };
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.send_request(primary, request),
+        ).await
+        .map_err(|_| anyhow::anyhow!("AppendFile timeout after 30s"))??;
+
+        match response {
+            Response::AppendFileResult { metadata } => {
+                self.node_health.record_success(primary).await;
+                Ok(metadata)
+            }
+            Response::Error { message, code: ErrorCode::OffsetMismatch } => {
+                anyhow::bail!("OffsetMismatch: {}", message)
+            }
+            Response::Error { message, .. } => {
+                self.node_health.record_failure(primary).await;
+                anyhow::bail!("AppendFile failed: {}", message)
+            }
+            other => anyhow::bail!("Unexpected response from AppendFile: {:?}", other),
+        }
+    }
+
     /// Write data and populate byte-range cache for immediate read-back
     /// This enables zero-latency reads of just-written data (DVR use case)
     /// Returns (chunk_ids, chunk_sizes, chunk_locations) - locations include full replica node tracking

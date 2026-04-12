@@ -277,8 +277,19 @@ impl ClusterManager {
         let all_nodes: Vec<NodeId> = ring.nodes().to_vec();
         drop(ring);
 
+        // Use first 8 bytes of chunk_id hash as a per-chunk rotation seed.
+        // This ensures that when we take the top 'count' nodes, different chunks
+        // land on different node pairs — distributing write load across the cluster.
+        let seed = u64::from_le_bytes(chunk_id.hash[..8].try_into().unwrap_or([0u8; 8]));
+
         if all_nodes.len() <= count {
-            return all_nodes;
+            // All nodes are included — but rotate the list so that taking the first
+            // 'immediate_replicas' subset picks a different pair per chunk.
+            let n = all_nodes.len();
+            let offset = (seed % n as u64) as usize;
+            let mut rotated = all_nodes[offset..].to_vec();
+            rotated.extend_from_slice(&all_nodes[..offset]);
+            return rotated;
         }
 
         // Get capacity information
@@ -305,22 +316,44 @@ impl ClusterManager {
             node_capacities_vec.push((*node_id, available));
         }
 
-        // SMART REPLICA SET SELECTION (Greedy Algorithm):
-        // Sort nodes by available capacity descending and take top 'count' nodes
-        // This is the replica set with the highest minimum capacity
+        // SMART REPLICA SET SELECTION (Greedy Algorithm with tiebreak by chunk hash):
+        // Sort nodes by available capacity descending and take top 'count' nodes.
+        // When capacities are equal, use the chunk_id hash to break ties differently
+        // per chunk — this distributes chunks evenly across nodes without sacrificing
+        // capacity-awareness.
+        //
+        // Example: RF=2, 3 nodes all equal (100G each)
+        //   chunk hash rotates the starting position → chunks spread across all 3 nodes
         //
         // Example: RF=3, nodes (100G, 100G, 100G, 10G)
-        //   Top 3: (100G, 100G, 100G) - min=100G ← BEST choice
-        //   Avoids picking (100G, 100G, 10G) which has min=10G
-        //
-        // This greedy choice maximizes the bottleneck node in each replica set,
-        // which maximizes total usable cluster capacity
-        node_capacities_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        //   capacity sort still excludes the 10G node; hash only breaks ties within
+        //   the top-capacity group → min=100G is still guaranteed
 
-        node_capacities_vec
+        let n = node_capacities_vec.len() as u64;
+
+        // Assign each node a stable index (by current position), then compute its
+        // rotated rank using the chunk seed.
+        let mut indexed: Vec<(usize, NodeId, u64)> = node_capacities_vec
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, cap))| (i, id, cap))
+            .collect();
+
+        indexed.sort_by_key(|(i, _, cap)| {
+            // Primary: higher capacity is better (sort ascending by negated capacity).
+            // Secondary: rotate node index by seed so equal-capacity nodes appear in
+            //            a different order for each chunk.
+            let rotated_rank = (*i as u64 + seed) % n;
+            // Pack into a u128: high bits = inverse capacity (so more cap = lower key),
+            // low bits = rotated rank.
+            let inv_cap = u64::MAX - cap;
+            (inv_cap as u128) << 64 | rotated_rank as u128
+        });
+
+        indexed
             .into_iter()
             .take(count)
-            .map(|(node_id, _)| node_id)
+            .map(|(_, node_id, _)| node_id)
             .collect()
     }
 

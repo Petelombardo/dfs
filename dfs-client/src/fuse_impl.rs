@@ -101,7 +101,7 @@ impl WriteBuffer {
 struct FlushHandle {
     client: Arc<DfsClient>,
     write_buffers: Arc<DashMap<u64, Arc<Mutex<WriteBuffer>>>>,
-    metadata_cache: Arc<RwLock<HashMap<u64, FileMetadata>>>,
+    metadata_cache: Arc<DashMap<u64, FileMetadata>>,
     flush_in_flight: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>>,
 }
 
@@ -132,8 +132,7 @@ impl FlushHandle {
         };
 
         let (file_id, path) = {
-            let cache = self.metadata_cache.read().unwrap();
-            match cache.get(&ino) {
+            match self.metadata_cache.get(&ino) {
                 Some(m) => (m.id, m.path.clone()),
                 None => anyhow::bail!("Metadata not found for inode {}", ino),
             }
@@ -160,8 +159,7 @@ impl FlushHandle {
             }
 
             if let Some(locations) = locations_opt {
-                let mut cache = self.metadata_cache.write().unwrap();
-                if let Some(meta) = cache.get_mut(&ino) {
+                if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
                     for loc in &locations {
                         if !meta.chunks.contains(&loc.chunk_id) {
                             meta.chunks.push(loc.chunk_id);
@@ -176,13 +174,12 @@ impl FlushHandle {
                         .as_secs();
                 }
             } else {
-                let mut cache = self.metadata_cache.write().unwrap();
-                if let Some(meta) = cache.get_mut(&ino) {
+                if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
                     meta.size = start_offset + aligned_len as u64;
                 }
             }
 
-            let meta_to_persist = { self.metadata_cache.read().unwrap().get(&ino).cloned() };
+            let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
             if let Some(meta) = meta_to_persist {
                 let _ = self.client.put_file_metadata(&meta).await;
             }
@@ -229,7 +226,7 @@ impl FlushHandle {
                     let fresh = self.client.get_file_metadata(&path).await?
                         .ok_or_else(|| anyhow::anyhow!("File not found during tail flush retry: {}", path))?;
                     let new_offset = fresh.size;
-                    self.metadata_cache.write().unwrap().insert(ino, fresh);
+                    self.metadata_cache.insert(ino, fresh);
                     if let Some(buffer_lock) = self.write_buffers.get(&ino) {
                         let mut buffer = buffer_lock.lock().await;
                         buffer.start_offset = new_offset;
@@ -247,7 +244,7 @@ impl FlushHandle {
                 buffer.last_modified = SystemTime::now();
             }
 
-            self.metadata_cache.write().unwrap().insert(ino, updated_metadata);
+            self.metadata_cache.insert(ino, updated_metadata);
         }
 
         Ok(())
@@ -260,7 +257,7 @@ pub struct DfsFilesystem {
     client: Arc<DfsClient>,
 
     /// Metadata cache: inode -> FileMetadata
-    metadata_cache: Arc<RwLock<HashMap<u64, FileMetadata>>>,
+    metadata_cache: Arc<DashMap<u64, FileMetadata>>,
 
     /// Path to inode mapping
     path_to_inode: Arc<RwLock<HashMap<String, u64>>>,
@@ -286,7 +283,7 @@ pub struct DfsFilesystem {
 
     /// Last metadata update timestamp per inode for batching
     /// Prevents excessive metadata updates during continuous writes
-    last_metadata_update: Arc<RwLock<HashMap<u64, std::time::Instant>>>,
+    last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
 
     /// Last read chunk cache: (ino, chunk_index, data)
     /// Prevents re-fetching same 4MB chunk for multiple 128KB FUSE reads
@@ -294,16 +291,16 @@ pub struct DfsFilesystem {
 
     /// Track last warming offset per inode to throttle replica cache warming
     /// Prevents excessive warming overhead on files with many small chunks
-    last_warm_offset: Arc<RwLock<HashMap<u64, u64>>>,
+    last_warm_offset: Arc<DashMap<u64, u64>>,
 
     /// Chunk offset map cache: inode -> Vec<(offset, size)>
     /// Prevents O(n) iteration through all chunks on every read
     /// Invalidated when file metadata changes (size/chunks)
-    chunk_offset_cache: Arc<RwLock<HashMap<u64, (u64, usize, Vec<(usize, usize)>)>>>, // (file_size, chunk_count, offsets)
+    chunk_offset_cache: Arc<DashMap<u64, (u64, usize, Vec<(usize, usize)>)>>, // (file_size, chunk_count, offsets)
 
     /// Directory listing cache: path -> (entries, timestamp)
     /// Cache directory listings for 5 seconds to avoid repeated scans
-    dir_cache: Arc<RwLock<HashMap<String, (Vec<FileMetadata>, std::time::Instant)>>>,
+    dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
 
     /// Filesystem stats cache: (total, free, avail, timestamp)
     /// Cache statfs results for 30 seconds to avoid repeated expensive queries
@@ -372,7 +369,7 @@ impl DfsFilesystem {
             }
         });
 
-        let metadata_cache = Arc::new(RwLock::new(HashMap::<u64, FileMetadata>::new()));
+        let metadata_cache = Arc::new(DashMap::<u64, FileMetadata>::new());
         let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
         let write_buffers_for_cleanup = Arc::new(DashMap::<u64, Arc<Mutex<WriteBuffer>>>::new());
@@ -465,9 +462,8 @@ impl DfsFilesystem {
                                     // Update metadata cache with new chunk locations + size,
                                     // then persist. Drop the write guard before the await.
                                     if let Some(locations) = locations_opt {
-                                        let meta_to_persist = {
-                                            let mut cache = metadata_cache_task.write().unwrap();
-                                            if let Some(meta) = cache.get_mut(&ino) {
+                                        {
+                                            if let Some(mut meta) = metadata_cache_task.get_mut(&ino) {
                                                 for loc in &locations {
                                                     if !meta.chunks.contains(&loc.chunk_id) {
                                                         meta.chunks.push(loc.chunk_id);
@@ -480,9 +476,8 @@ impl DfsFilesystem {
                                                     .duration_since(std::time::UNIX_EPOCH)
                                                     .unwrap_or_default().as_secs();
                                             }
-                                            cache.get(&ino).cloned()
-                                            // write guard dropped here
-                                        };
+                                        }
+                                        let meta_to_persist = metadata_cache_task.get(&ino).map(|m| m.clone());
                                         if let Some(meta) = meta_to_persist {
                                             let _ = tokio::time::timeout(
                                                 tokio::time::Duration::from_secs(5),
@@ -526,7 +521,7 @@ impl DfsFilesystem {
             chunk_locations: Vec::new(),
         };
 
-        metadata_cache.write().unwrap().insert(1, root_metadata);
+        metadata_cache.insert(1, root_metadata);
         path_to_inode.write().unwrap().insert("/".to_string(), 1);
 
         // Build FlushHandle before moving fields into the struct
@@ -547,11 +542,11 @@ impl DfsFilesystem {
             write_counters: Arc::new(RwLock::new(HashMap::new())),
             write_buffer_enabled,
             write_buffers: write_buffers_for_cleanup,
-            last_metadata_update: Arc::new(RwLock::new(HashMap::new())),
+            last_metadata_update: Arc::new(DashMap::new()),
             last_chunk_cache: Arc::new(RwLock::new(None)),
-            last_warm_offset: Arc::new(RwLock::new(HashMap::new())),
-            chunk_offset_cache: Arc::new(RwLock::new(HashMap::new())),
-            dir_cache: Arc::new(RwLock::new(HashMap::new())),
+            last_warm_offset: Arc::new(DashMap::new()),
+            chunk_offset_cache: Arc::new(DashMap::new()),
+            dir_cache: Arc::new(DashMap::new()),
             statfs_cache: Arc::new(RwLock::new(None)),
             lock_manager: Arc::new(LockManager::new()),
             buffer_flush_threshold,
@@ -598,8 +593,7 @@ impl DfsFilesystem {
             let has_cnt = counters.contains_key(&ino);
 
             // Get current cached size
-            let cache = self.metadata_cache.read().unwrap();
-            let cur_size = cache.get(&ino).map(|m| m.size).unwrap_or(0);
+            let cur_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0);
 
             (has_buf, has_cnt, cur_size)
         });
@@ -613,7 +607,7 @@ impl DfsFilesystem {
         } else {
             debug!("UPDATING metadata for ino={}: cached_size={}, server_size={}",
                   ino, current_size, metadata.size);
-            self.metadata_cache.write().unwrap().insert(ino, metadata);
+            self.metadata_cache.insert(ino, metadata);
             true
         }
     }
@@ -630,9 +624,7 @@ impl DfsFilesystem {
 
         const METADATA_UPDATE_INTERVAL_SECS: u64 = 2;
 
-        let last_update = self.last_metadata_update.read().unwrap().get(&ino).copied();
-
-        match last_update {
+        match self.last_metadata_update.get(&ino) {
             None => true,  // First update
             Some(last) => {
                 let elapsed = last.elapsed();
@@ -643,7 +635,7 @@ impl DfsFilesystem {
 
     /// Update the last metadata update timestamp for an inode
     fn record_metadata_update(&self, ino: u64) {
-        self.last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
+        self.last_metadata_update.insert(ino, std::time::Instant::now());
     }
 
     /// Flush the write buffer for `ino`.
@@ -690,8 +682,7 @@ impl DfsFilesystem {
         };
 
         let (file_id, path) = {
-            let cache = self.metadata_cache.read().unwrap();
-            match cache.get(&ino) {
+            match self.metadata_cache.get(&ino) {
                 Some(m) => (m.id, m.path.clone()),
                 None => anyhow::bail!("Metadata not found for inode {}", ino),
             }
@@ -720,8 +711,7 @@ impl DfsFilesystem {
 
             // Update metadata cache with new chunk locations
             if let Some(locations) = locations_opt {
-                let mut cache = self.metadata_cache.write().unwrap();
-                if let Some(meta) = cache.get_mut(&ino) {
+                if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
                     for loc in &locations {
                         if !meta.chunks.contains(&loc.chunk_id) {
                             meta.chunks.push(loc.chunk_id);
@@ -737,14 +727,13 @@ impl DfsFilesystem {
                 }
             } else {
                 // Fallback: update size only
-                let mut cache = self.metadata_cache.write().unwrap();
-                if let Some(meta) = cache.get_mut(&ino) {
+                if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
                     meta.size = start_offset + aligned_len as u64;
                 }
             }
 
             // Persist metadata to server
-            let meta_to_persist = { self.metadata_cache.read().unwrap().get(&ino).cloned() };
+            let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
             if let Some(meta) = meta_to_persist {
                 let _ = self.client.put_file_metadata(&meta).await;
             }
@@ -793,7 +782,7 @@ impl DfsFilesystem {
                     let fresh = self.client.get_file_metadata(&path).await?
                         .ok_or_else(|| anyhow::anyhow!("File not found during tail flush retry: {}", path))?;
                     let new_offset = fresh.size;
-                    self.metadata_cache.write().unwrap().insert(ino, fresh);
+                    self.metadata_cache.insert(ino, fresh);
                     if let Some(buffer_lock) = self.write_buffers.get(&ino) {
                         let mut buffer = buffer_lock.lock().await;
                         buffer.start_offset = new_offset;
@@ -812,7 +801,7 @@ impl DfsFilesystem {
                 buffer.last_modified = SystemTime::now();
             }
 
-            self.metadata_cache.write().unwrap().insert(ino, updated_metadata);
+            self.metadata_cache.insert(ino, updated_metadata);
         }
 
         Ok(())
@@ -874,8 +863,7 @@ impl DfsFilesystem {
 
     /// Get path from parent inode and name
     fn get_path_from_parent(&self, parent: u64, name: &OsStr) -> Option<String> {
-        let cache = self.metadata_cache.read().unwrap();
-        let parent_metadata = cache.get(&parent)?;
+        let parent_metadata = self.metadata_cache.get(&parent)?;
         let name_str = name.to_str()?;
 
         let parent_path = &parent_metadata.path;
@@ -934,13 +922,11 @@ impl Filesystem for DfsFilesystem {
         let cached = {
             let path_map = self.path_to_inode.read().unwrap();
             if let Some(&ino) = path_map.get(&path) {
-                let last = self.last_metadata_update.read().unwrap();
-                let fresh = last.get(&ino)
+                let fresh = self.last_metadata_update.get(&ino)
                     .map(|t| t.elapsed() < std::time::Duration::from_secs(30))
                     .unwrap_or(false);
                 if fresh {
-                    let cache = self.metadata_cache.read().unwrap();
-                    cache.get(&ino).cloned().map(|m| (ino, m))
+                    self.metadata_cache.get(&ino).map(|m| (ino, m.clone()))
                 } else {
                     None
                 }
@@ -959,8 +945,7 @@ impl Filesystem for DfsFilesystem {
         let cached_modified_at = {
             let path_map = self.path_to_inode.read().unwrap();
             if let Some(&ino) = path_map.get(&path) {
-                let cache = self.metadata_cache.read().unwrap();
-                cache.get(&ino).map(|m| m.modified_at)
+                self.metadata_cache.get(&ino).map(|m| m.modified_at)
             } else {
                 None
             }
@@ -986,10 +971,9 @@ impl Filesystem for DfsFilesystem {
                     // Cache is valid, use cached metadata
                     let path_map = self.path_to_inode.read().unwrap();
                     if let Some(&ino) = path_map.get(&path) {
-                        let cache = self.metadata_cache.read().unwrap();
-                        if let Some(metadata) = cache.get(&ino) {
+                        if let Some(metadata) = self.metadata_cache.get(&ino) {
                             debug!("Using cached metadata for {} (not modified)", path);
-                            let attr = self.metadata_to_attr(ino, metadata);
+                            let attr = self.metadata_to_attr(ino, &*metadata);
                             reply.entry(&Duration::from_secs(30), &attr, 0);
                             return;
                         }
@@ -1016,14 +1000,9 @@ impl Filesystem for DfsFilesystem {
         }
 
         // Check if this is a SQLite database file by looking up its path
-        let is_sqlite = {
-            let cache = self.metadata_cache.read().unwrap();
-            if let Some(metadata) = cache.get(&ino) {
-                is_sqlite_direct_io(&metadata.path)
-            } else {
-                false
-            }
-        };
+        let is_sqlite = self.metadata_cache.get(&ino)
+            .map(|m| is_sqlite_direct_io(&m.path))
+            .unwrap_or(false);
 
         if is_sqlite {
             // For SQLite files: Use direct I/O to bypass page cache
@@ -1047,10 +1026,7 @@ impl Filesystem for DfsFilesystem {
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
-            let metadata = {
-                let cache = metadata_cache.read().unwrap();
-                cache.get(&ino).cloned()
-            };
+            let metadata = metadata_cache.get(&ino).map(|m| m.clone());
 
             if let Some(mut metadata) = metadata {
                 if metadata.file_type == FileType::RegularFile {
@@ -1058,12 +1034,9 @@ impl Filesystem for DfsFilesystem {
                     // getattr is called every 1s by the kernel for open files; querying the
                     // server on every call generates a connection storm under playback.
                     // 5s is fast enough to notice a file growing (live DVR) without flooding.
-                    let should_refresh = {
-                        let last = last_metadata_update.read().unwrap();
-                        match last.get(&ino) {
-                            None => true,
-                            Some(t) => t.elapsed() >= std::time::Duration::from_secs(5),
-                        }
+                    let should_refresh = match last_metadata_update.get(&ino) {
+                        None => true,
+                        Some(t) => t.elapsed() >= std::time::Duration::from_secs(5),
                     };
 
                     if should_refresh {
@@ -1076,11 +1049,11 @@ impl Filesystem for DfsFilesystem {
                                 debug!("getattr: metadata updated: size {} -> {}, chunks {} -> {}",
                                        metadata.size, fresh.size,
                                        metadata.chunks.len(), fresh.chunks.len());
-                                metadata_cache.write().unwrap().insert(ino, fresh.clone());
+                                metadata_cache.insert(ino, fresh.clone());
                                 metadata = fresh;
                             }
                         }
-                        last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
+                        last_metadata_update.insert(ino, std::time::Instant::now());
                     }
 
                     // For files with an active write buffer, the true EOF is further ahead
@@ -1144,14 +1117,11 @@ impl Filesystem for DfsFilesystem {
             let start = std::time::Instant::now();
             info!("FUSE read START: ino={}, offset={}, size={}", ino, offset, size);
 
-            let mut metadata = {
-                let cache = metadata_cache.read().unwrap();
-                match cache.get(&ino) {
-                    Some(m) => m.clone(),
-                    None => {
-                        reply.error(libc::ENOENT);
-                        return;
-                    }
+            let mut metadata = match metadata_cache.get(&ino) {
+                Some(m) => m.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
                 }
             };
 
@@ -1167,10 +1137,7 @@ impl Filesystem for DfsFilesystem {
             // For files with many small chunks, warming on every read causes significant CPU overhead
             // Warm when: (1) first read, or (2) we've progressed significantly (every 50MB)
             // CRITICAL: Track warming per-inode to prevent cross-file interference during seeks
-            let last_warm = {
-                let warm_map = last_warm_offset.read().unwrap();
-                warm_map.get(&ino).copied().unwrap_or(0)
-            };
+            let last_warm = last_warm_offset.get(&ino).map(|v| *v).unwrap_or(0);
             let should_warm = offset == 0 || offset.saturating_sub(last_warm as usize) >= 50 * 1024 * 1024;
 
             if should_warm && !metadata.chunks.is_empty() && !metadata.chunk_sizes.is_empty() {
@@ -1189,8 +1156,7 @@ impl Filesystem for DfsFilesystem {
                 client.warm_replica_cache_by_index(&metadata.chunks, Some(chunk_idx)).await;
 
                 // Update per-inode warming tracker
-                let mut warm_map = last_warm_offset.write().unwrap();
-                warm_map.insert(ino, offset as u64);
+                last_warm_offset.insert(ino, offset as u64);
             }
 
             // Check write buffer first if write-behind buffering is enabled
@@ -1323,7 +1289,7 @@ impl Filesystem for DfsFilesystem {
                                     let new_size = buffer_start + buffer_size as u64;
 
                                     // Update metadata
-                                    let mut meta = metadata_cache_clone.read().unwrap().get(&ino).cloned();
+                                    let mut meta = metadata_cache_clone.get(&ino).map(|m| m.clone());
                                     if let Some(mut m) = meta {
                                         if let Some(chunk_locations) = chunk_locations_opt {
                                             m.chunk_locations.extend(chunk_locations);
@@ -1334,25 +1300,22 @@ impl Filesystem for DfsFilesystem {
                                         m.modified_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
                                         // Boundary flush during read: use time-based batching
-                                        let should_update_meta = {
-                                            let last_update_lock = last_metadata_update_clone.read().unwrap();
-                                            match last_update_lock.get(&ino) {
-                                                None => true,  // First write
-                                                Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
-                                            }
+                                        let should_update_meta = match last_metadata_update_clone.get(&ino) {
+                                            None => true,
+                                            Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
                                         };
 
                                         if should_update_meta {
                                             if let Err(e) = client_clone.put_file_metadata(&m).await {
                                                 error!("Failed to update metadata after background flush: {}", e);
                                             } else {
-                                                last_metadata_update_clone.write().unwrap().insert(ino, std::time::Instant::now());
-                                                metadata_cache_clone.write().unwrap().insert(ino, m.clone());
+                                                last_metadata_update_clone.insert(ino, std::time::Instant::now());
+                                                metadata_cache_clone.insert(ino, m.clone());
                                                 info!("Background flush complete: {} bytes at offset {}, new size {} (metadata updated)", buffer_size, buffer_start, new_size);
                                             }
                                         } else {
                                             // Skip metadata update but still update cache
-                                            metadata_cache_clone.write().unwrap().insert(ino, m.clone());
+                                            metadata_cache_clone.insert(ino, m.clone());
                                             info!("Background flush complete: {} bytes at offset {}, new size {} (metadata batched)", buffer_size, buffer_start, new_size);
                                         }
                                     }
@@ -1388,7 +1351,7 @@ impl Filesystem for DfsFilesystem {
                                               locations.len(), fresh_metadata.path);
                                         fresh_metadata.chunk_locations = locations;
                                         // Invalidate chunk offset cache so it rebuilds with new offsets
-                                        chunk_offset_cache.write().unwrap().remove(&ino);
+                                        chunk_offset_cache.remove(&ino);
                                     }
                                 }
                                 Err(e) => {
@@ -1398,7 +1361,7 @@ impl Filesystem for DfsFilesystem {
                         }
 
                         // Update cache with fresh metadata
-                        metadata_cache.write().unwrap().insert(ino, fresh_metadata.clone());
+                        metadata_cache.insert(ino, fresh_metadata.clone());
 
                         // Warm replica cache with chunk locations for upcoming reads
                         // Only warm chunks ahead of current read position (smart warming)
@@ -1459,59 +1422,57 @@ impl Filesystem for DfsFilesystem {
             // SPARSE FILE SUPPORT: Use chunk_locations with file_offset if available,
             // otherwise fall back to sequential offset calculation for legacy files
             let chunk_offsets = {
-                let cache = chunk_offset_cache.read().unwrap();
-                let cached_result: Option<Vec<(usize, usize)>> = if let Some((cached_size, cached_chunk_count, cached_offsets)) = cache.get(&ino) {
-                    if *cached_size == metadata.size && *cached_chunk_count == metadata.chunks.len() {
-                        // Cache hit with matching size and chunk count - use it
+                // Check cache without holding a ref across the potential insert
+                let cached = chunk_offset_cache.get(&ino).and_then(|entry| {
+                    let (cached_size, cached_chunk_count, ref cached_offsets) = *entry;
+                    if cached_size == metadata.size && cached_chunk_count == metadata.chunks.len() {
                         Some(cached_offsets.clone())
                     } else {
-                        // Size or chunk count changed (e.g. repack) - need to rebuild
                         None
                     }
-                } else {
-                    // No cache entry
-                    None
-                };
-                cached_result
-            }.unwrap_or_else(|| {
-                // Cache miss or invalidated - build and cache it
-                let mut offsets = Vec::with_capacity(metadata.chunks.len());
+                });
 
-                // Check if we have chunk_locations with file_offset (sparse file support)
-                // IMPORTANT: chunk_locations count must match chunks count, otherwise offsets
-                // would be misaligned (e.g., if a small chunk was written without chunk_locations
-                // being populated). Fall back to sequential calculation in that case.
-                let locations_match = !metadata.chunk_locations.is_empty()
-                    && metadata.chunk_locations.len() == metadata.chunks.len()
-                    && metadata.chunk_locations[0].file_offset.is_some();
-
-                if locations_match {
-                    // SPARSE FILE: Use explicit file_offset from chunk_locations
-                    for location in &metadata.chunk_locations {
-                        let chunk_offset = location.file_offset.unwrap_or(0);
-                        offsets.push((chunk_offset as usize, location.size));
-                    }
+                if let Some(offsets) = cached {
+                    offsets
                 } else {
-                    // LEGACY FILE or mismatched chunk_locations: Sequential chunks, calculate offsets
-                    if !metadata.chunk_locations.is_empty()
-                        && metadata.chunk_locations.len() != metadata.chunks.len()
-                    {
-                        warn!("chunk_locations count ({}) != chunks count ({}) for ino={}, using sequential offsets",
-                              metadata.chunk_locations.len(), metadata.chunks.len(), ino);
+                    // Cache miss or invalidated - build and cache it
+                    let mut offsets = Vec::with_capacity(metadata.chunks.len());
+
+                    // Check if we have chunk_locations with file_offset (sparse file support)
+                    // IMPORTANT: chunk_locations count must match chunks count, otherwise offsets
+                    // would be misaligned (e.g., if a small chunk was written without chunk_locations
+                    // being populated). Fall back to sequential calculation in that case.
+                    let locations_match = !metadata.chunk_locations.is_empty()
+                        && metadata.chunk_locations.len() == metadata.chunks.len()
+                        && metadata.chunk_locations[0].file_offset.is_some();
+
+                    if locations_match {
+                        // SPARSE FILE: Use explicit file_offset from chunk_locations
+                        for location in &metadata.chunk_locations {
+                            let chunk_offset = location.file_offset.unwrap_or(0);
+                            offsets.push((chunk_offset as usize, location.size));
+                        }
+                    } else {
+                        // LEGACY FILE or mismatched chunk_locations: Sequential chunks, calculate offsets
+                        if !metadata.chunk_locations.is_empty()
+                            && metadata.chunk_locations.len() != metadata.chunks.len()
+                        {
+                            warn!("chunk_locations count ({}) != chunks count ({}) for ino={}, using sequential offsets",
+                                  metadata.chunk_locations.len(), metadata.chunks.len(), ino);
+                        }
+                        let mut current_offset = 0usize;
+                        for &chunk_size in metadata.chunk_sizes.iter() {
+                            offsets.push((current_offset, chunk_size as usize));
+                            current_offset += chunk_size as usize;
+                        }
                     }
-                    let mut current_offset = 0usize;
-                    for &chunk_size in metadata.chunk_sizes.iter() {
-                        offsets.push((current_offset, chunk_size as usize));
-                        current_offset += chunk_size as usize;
-                    }
+
+                    // Store in cache
+                    chunk_offset_cache.insert(ino, (metadata.size, metadata.chunks.len(), offsets.clone()));
+
+                    offsets
                 }
-
-                // Store in cache
-                let mut cache = chunk_offset_cache.write().unwrap();
-                cache.insert(ino, (metadata.size, metadata.chunks.len(), offsets.clone()));
-
-                offsets
-            });
+            };
 
             // Find which chunks we need to read
             let end_offset = std::cmp::min(offset + size, metadata.size as usize);
@@ -1616,7 +1577,7 @@ impl Filesystem for DfsFilesystem {
                         // Cache the locations in metadata so subsequent reads skip this query
                         let mut updated = metadata.clone();
                         updated.chunk_locations = locations.clone();
-                        metadata_cache.write().unwrap().insert(ino, updated);
+                        metadata_cache.insert(ino, updated);
                         locations
                     }
                     Ok(_) => {
@@ -1785,8 +1746,7 @@ impl Filesystem for DfsFilesystem {
         let start = std::time::Instant::now();
 
         let path = {
-            let cache = self.metadata_cache.read().unwrap();
-            match cache.get(&ino) {
+            match self.metadata_cache.get(&ino) {
                 Some(metadata) => {
                     if metadata.file_type != FileType::Directory {
                         reply.error(libc::ENOTDIR);
@@ -1801,19 +1761,17 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
-        // Check directory cache first (5-second TTL)
-        let cached_entries = {
-            let cache = self.dir_cache.read().unwrap();
-            cache.get(&path).and_then(|(entries, timestamp)| {
-                if timestamp.elapsed() < std::time::Duration::from_secs(30) {
-                    debug!("Directory cache HIT for {}", path);
-                    Some(entries.clone())
-                } else {
-                    debug!("Directory cache EXPIRED for {}", path);
-                    None
-                }
-            })
-        };
+        // Check directory cache first (30-second TTL)
+        let cached_entries = self.dir_cache.get(&path).and_then(|entry| {
+            let (entries, timestamp) = &*entry;
+            if timestamp.elapsed() < std::time::Duration::from_secs(30) {
+                debug!("Directory cache HIT for {}", path);
+                Some(entries.clone())
+            } else {
+                debug!("Directory cache EXPIRED for {}", path);
+                None
+            }
+        });
 
         let entries = if let Some(entries) = cached_entries {
             entries
@@ -1831,7 +1789,7 @@ impl Filesystem for DfsFilesystem {
             match result {
                 Ok(entries) => {
                     // Update cache
-                    dir_cache.write().unwrap().insert(path.clone(), (entries.clone(), std::time::Instant::now()));
+                    dir_cache.insert(path.clone(), (entries.clone(), std::time::Instant::now()));
                     entries
                 }
                 Err(e) => {
@@ -1883,7 +1841,7 @@ impl Filesystem for DfsFilesystem {
             // Mark metadata as just-refreshed so getattr skips the per-file server
             // round-trip on the immediately following `ls -alh`. Without this, each
             // of the 25 getattr calls would hit the server serially (~130ms each).
-            self.last_metadata_update.write().unwrap().insert(entry_ino, std::time::Instant::now());
+            self.last_metadata_update.insert(entry_ino, std::time::Instant::now());
 
             let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
             if reply.add(entry_ino, next_offset, kind, file_name) {
@@ -1922,9 +1880,8 @@ impl Filesystem for DfsFilesystem {
                     async move {
                         // Skip if already cached and fresh
                         {
-                            let cache = dir_cache.read().unwrap();
-                            if let Some((_, ts)) = cache.get(&subdir) {
-                                if ts.elapsed() < std::time::Duration::from_secs(29) {
+                            if let Some(entry) = dir_cache.get(&subdir) {
+                                if entry.1.elapsed() < std::time::Duration::from_secs(29) {
                                     return;
                                 }
                             }
@@ -1936,18 +1893,16 @@ impl Filesystem for DfsFilesystem {
                             // (e.g. a concurrent create/unlink in that directory); reinserting
                             // stale prefetch results would hide the new file from the next
                             // readdir until the 30-second TTL expires.
-                            let mut cache = dir_cache.write().unwrap();
-                            let still_valid = match cache.get(&subdir) {
-                                Some((_, ts)) => *ts < fetch_start, // entry predates our fetch
+                            let still_valid = match dir_cache.get(&subdir) {
+                                Some(entry) => entry.1 < fetch_start, // entry predates our fetch
                                 None => false, // was invalidated — do not reinsert
                             };
                             if still_valid {
-                                cache.insert(
+                                dir_cache.insert(
                                     subdir.clone(),
                                     (sub_entries.clone(), std::time::Instant::now()),
                                 );
                             }
-                            drop(cache);
                             // Cache metadata for each entry so getattr is instant too
                             let now = std::time::Instant::now();
                             for entry in &sub_entries {
@@ -1963,8 +1918,8 @@ impl Filesystem for DfsFilesystem {
                                         ino
                                     }
                                 };
-                                metadata_cache.write().unwrap().insert(ino, entry.clone());
-                                last_metadata_update.write().unwrap().insert(ino, now);
+                                metadata_cache.insert(ino, entry.clone());
+                                last_metadata_update.insert(ino, now);
                             }
                             debug!("Prefetched {} entries for {}", sub_entries.len(), subdir);
                         }
@@ -2030,11 +1985,11 @@ impl Filesystem for DfsFilesystem {
                 let ino = self.get_or_create_inode(&path);
 
                 // Cache metadata
-                self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
+                self.metadata_cache.insert(ino, metadata.clone());
 
                 // CRITICAL: Invalidate parent directory cache so 'ls' shows new file immediately
                 let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
-                self.dir_cache.write().unwrap().remove(parent_path);
+                self.dir_cache.remove(parent_path);
                 debug!("Invalidated directory cache for parent: {}", parent_path);
 
                 // create() always opens for writing — count it
@@ -2094,14 +2049,11 @@ impl Filesystem for DfsFilesystem {
             let start = std::time::Instant::now();
             debug!("write: ino={}, offset={}, size={}", ino, offset, data_vec.len());
 
-            let mut metadata = {
-                let cache = metadata_cache.read().unwrap();
-                match cache.get(&ino) {
-                    Some(m) => m.clone(),
-                    None => {
-                        reply.error(libc::ENOENT);
-                        return;
-                    }
+            let mut metadata = match metadata_cache.get(&ino) {
+                Some(m) => m.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
                 }
             };
 
@@ -2123,10 +2075,9 @@ impl Filesystem for DfsFilesystem {
                 // Calculate true current size including any buffered data
                 // IMPORTANT: Re-read metadata from cache to get latest updates from concurrent writes
                 let current_size = {
-                    let cache_size = {
-                        let cache = metadata_cache.read().unwrap();
-                        cache.get(&ino).map(|m| m.size as usize).unwrap_or(metadata.size as usize)
-                    };
+                    let cache_size = metadata_cache.get(&ino)
+                        .map(|m| m.size as usize)
+                        .unwrap_or(metadata.size as usize);
 
                     if let Some(buffer_lock) = write_buffers.get(&ino) {
                         let buffer = runtime.block_on(async { buffer_lock.lock().await });
@@ -2139,7 +2090,7 @@ impl Filesystem for DfsFilesystem {
 
                 info!("Buffered write check: offset={}, current_size={}, cache_size={}, buffer_present={}",
                        offset_usize, current_size,
-                       {let cache = metadata_cache.read().unwrap(); cache.get(&ino).map(|m| m.size).unwrap_or(0)},
+                       metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0),
                        write_buffers.contains_key(&ino));
 
                 // Handle different write patterns:
@@ -2211,8 +2162,7 @@ impl Filesystem for DfsFilesystem {
                         let gap_result = runtime.block_on(async move {
                             let buffer_lock = write_buffers_clone2.entry(ino).or_insert_with(|| {
                                 let cache_size = {
-                                    let cache = metadata_cache_clone6.read().unwrap();
-                                    cache.get(&ino).map(|m| m.size as u64).unwrap_or(current_size as u64)
+                                    metadata_cache_clone6.get(&ino).map(|m| m.size as u64).unwrap_or(current_size as u64)
                                 };
                                 Arc::new(Mutex::new(WriteBuffer {
                                     data: Vec::new(),
@@ -2267,10 +2217,7 @@ impl Filesystem for DfsFilesystem {
                             let new_size = (offset_usize + data.len()).max(current_size);
 
                             // Update metadata with new chunks
-                            let mut metadata = {
-                                let cache = metadata_cache.read().unwrap();
-                                cache.get(&ino).cloned().unwrap_or_else(|| metadata.clone())
-                            };
+                            let mut metadata = metadata_cache.get(&ino).map(|m| m.clone()).unwrap_or_else(|| metadata.clone());
 
                             if let Some(chunk_locations) = chunk_locations_opt {
                                 metadata.chunk_locations.extend(chunk_locations);
@@ -2293,7 +2240,7 @@ impl Filesystem for DfsFilesystem {
                             }
 
                             // Update cache
-                            metadata_cache.write().unwrap().insert(ino, metadata);
+                            metadata_cache.insert(ino, metadata);
 
                             info!("Sparse write complete: ino={}, offset={}, len={}, new_size={}",
                                   ino, offset, data.len(), new_size);
@@ -2354,10 +2301,8 @@ impl Filesystem for DfsFilesystem {
                         // Get or create buffer lock for this inode
                         let buffer_lock = write_buffers_clone.entry(ino).or_insert_with(|| {
                             // Calculate initial size
-                            let cache_size = {
-                                let cache = metadata_cache_clone3.read().unwrap();
-                                cache.get(&ino).map(|m| m.size as u64).unwrap_or(current_size as u64)
-                            };
+                            let cache_size = metadata_cache_clone3.get(&ino)
+                                .map(|m| m.size as u64).unwrap_or(current_size as u64);
 
                             Arc::new(Mutex::new(WriteBuffer {
                                 data: Vec::new(),
@@ -2419,10 +2364,8 @@ impl Filesystem for DfsFilesystem {
             // Calculate true current size including any buffered data
             // IMPORTANT: Re-read metadata from cache to get latest updates
             let current_size = if write_buffer_enabled {
-                let cache_size = {
-                    let cache = metadata_cache.read().unwrap();
-                    cache.get(&ino).map(|m| m.size as usize).unwrap_or(metadata.size as usize)
-                };
+                let cache_size = metadata_cache.get(&ino)
+                    .map(|m| m.size as usize).unwrap_or(metadata.size as usize);
 
                 let buffer_end = runtime.block_on(async {
                     if let Some(buffer_lock) = write_buffers.get(&ino) {
@@ -2662,16 +2605,10 @@ impl Filesystem for DfsFilesystem {
                         true // Always update for SQLite
                     } else {
                         // Use time-based batching for regular files
-                        let last_update_lock = last_metadata_update.read().unwrap();
-                        let should = match last_update_lock.get(&ino) {
-                            None => true,  // First write
-                            Some(last) => {
-                                let elapsed = last.elapsed();
-                                elapsed >= std::time::Duration::from_secs(2)
-                            }
-                        };
-                        drop(last_update_lock);
-                        should
+                        match last_metadata_update.get(&ino) {
+                            None => true,
+                            Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
+                        }
                     };
 
                     if should_update {
@@ -2684,7 +2621,7 @@ impl Filesystem for DfsFilesystem {
                         let metadata_elapsed = metadata_start.elapsed();
 
                         // Record metadata update time for batching
-                        last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
+                        last_metadata_update.insert(ino, std::time::Instant::now());
 
                         if is_sqlite_db {
                             debug!("put_file_metadata took {:?} (SQLite immediate update)", metadata_elapsed);
@@ -2695,7 +2632,7 @@ impl Filesystem for DfsFilesystem {
                         match update_result {
                             Ok(_) => {
                                 // Update cache
-                                metadata_cache.write().unwrap().insert(ino, metadata);
+                                metadata_cache.insert(ino, metadata);
                                 let total_elapsed = start.elapsed();
                                 debug!("TOTAL write() took {:?} for {} bytes ({:.2} MB/s)",
                                     total_elapsed, data_vec.len(),
@@ -2709,7 +2646,7 @@ impl Filesystem for DfsFilesystem {
                         }
                     } else {
                         // Skip metadata update for this write, just cache locally
-                        metadata_cache.write().unwrap().insert(ino, metadata);
+                        metadata_cache.insert(ino, metadata);
                         let total_elapsed = start.elapsed();
                         debug!("TOTAL write() took {:?} for {} bytes (metadata skipped) ({:.2} MB/s)",
                             total_elapsed, data_vec.len(),
@@ -2784,10 +2721,7 @@ impl Filesystem for DfsFilesystem {
                 // that were batched by the write() path to ensure data durability
                 let result = runtime.block_on(async {
                     // Get metadata from cache
-                    let metadata_opt = {
-                        let cache = metadata_cache.read().unwrap();
-                        cache.get(&ino).cloned()
-                    };
+                    let metadata_opt = metadata_cache.get(&ino).map(|m| m.clone());
 
                     if let Some(metadata) = metadata_opt {
                         // Check if there are pending writes
@@ -2893,10 +2827,7 @@ impl Filesystem for DfsFilesystem {
 
             let result = self.block_on(async {
                 // Flush pending metadata if any
-                let metadata_opt = {
-                    let cache = metadata_cache.read().unwrap();
-                    cache.get(&ino).cloned()
-                };
+                let metadata_opt = metadata_cache.get(&ino).map(|m| m.clone());
 
                 if let Some(metadata) = metadata_opt {
                     // Always flush metadata on release for non-buffered writes — the 2-second
@@ -2977,11 +2908,11 @@ impl Filesystem for DfsFilesystem {
                 let ino = self.get_or_create_inode(&path);
 
                 // Cache metadata
-                self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
+                self.metadata_cache.insert(ino, metadata.clone());
 
                 // CRITICAL: Invalidate parent directory cache so 'ls' shows new directory immediately
                 let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
-                self.dir_cache.write().unwrap().remove(parent_path);
+                self.dir_cache.remove(parent_path);
                 debug!("Invalidated directory cache for parent: {}", parent_path);
 
                 // Convert to FUSE attr
@@ -3016,18 +2947,18 @@ impl Filesystem for DfsFilesystem {
             Ok(_) => {
                 // Remove from all caches to prevent memory leaks
                 if let Some(&ino) = self.path_to_inode.read().unwrap().get(&path) {
-                    self.metadata_cache.write().unwrap().remove(&ino);
+                    self.metadata_cache.remove(&ino);
                     self.write_buffers.remove(&ino); // Clean up write buffer
                     self.write_counters.write().unwrap().remove(&ino); // Clean up write counter
-                    self.last_metadata_update.write().unwrap().remove(&ino); // Clean up metadata update tracker
-                    self.last_warm_offset.write().unwrap().remove(&ino); // Clean up warm offset tracker
-                    self.chunk_offset_cache.write().unwrap().remove(&ino); // Clean up chunk offset cache
+                    self.last_metadata_update.remove(&ino); // Clean up metadata update tracker
+                    self.last_warm_offset.remove(&ino); // Clean up warm offset tracker
+                    self.chunk_offset_cache.remove(&ino); // Clean up chunk offset cache
                 }
                 self.path_to_inode.write().unwrap().remove(&path);
 
                 // CRITICAL: Invalidate parent directory cache so 'ls' shows deletion immediately
                 let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
-                self.dir_cache.write().unwrap().remove(parent_path);
+                self.dir_cache.remove(parent_path);
                 debug!("Invalidated directory cache for parent: {}", parent_path);
 
                 reply.ok();
@@ -3073,13 +3004,13 @@ impl Filesystem for DfsFilesystem {
                     Ok(_) => {
                         // Remove from cache
                         if let Some(&ino) = self.path_to_inode.read().unwrap().get(&path) {
-                            self.metadata_cache.write().unwrap().remove(&ino);
+                            self.metadata_cache.remove(&ino);
                         }
                         self.path_to_inode.write().unwrap().remove(&path);
 
                         // CRITICAL: Invalidate parent directory cache so 'ls' shows deletion immediately
                         let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
-                        self.dir_cache.write().unwrap().remove(parent_path);
+                        self.dir_cache.remove(parent_path);
                         debug!("Invalidated directory cache for parent: {}", parent_path);
 
                         reply.ok();
@@ -3165,14 +3096,14 @@ impl Filesystem for DfsFilesystem {
                             .unwrap()
                             .as_secs();
 
-                        self.metadata_cache.write().unwrap().insert(ino, new_metadata);
+                        self.metadata_cache.insert(ino, new_metadata);
 
                         // Invalidate directory cache for both old and new parent directories
                         let old_parent = old_path.rsplitn(2, '/').nth(1).unwrap_or("/");
                         let new_parent = new_path.rsplitn(2, '/').nth(1).unwrap_or("/");
-                        self.dir_cache.write().unwrap().remove(old_parent);
+                        self.dir_cache.remove(old_parent);
                         if old_parent != new_parent {
-                            self.dir_cache.write().unwrap().remove(new_parent);
+                            self.dir_cache.remove(new_parent);
                         }
 
                         info!("Renamed {} -> {} (inode {} preserved {} chunks)", old_path, new_path, ino, metadata.chunks.len());
@@ -3215,14 +3146,11 @@ impl Filesystem for DfsFilesystem {
         debug!("setattr: ino={}, mode={:?}, uid={:?}, gid={:?}, size={:?}",
                ino, mode, uid, gid, size);
 
-        let mut metadata = {
-            let cache = self.metadata_cache.read().unwrap();
-            match cache.get(&ino) {
-                Some(m) => m.clone(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let mut metadata = match self.metadata_cache.get(&ino) {
+            Some(m) => m.clone(),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -3381,7 +3309,7 @@ impl Filesystem for DfsFilesystem {
         match result {
             Ok(_) => {
                 // Update cache
-                self.metadata_cache.write().unwrap().insert(ino, metadata.clone());
+                self.metadata_cache.insert(ino, metadata.clone());
 
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
@@ -3463,8 +3391,7 @@ impl Filesystem for DfsFilesystem {
         debug!("access: ino={}, mask={}", ino, mask);
 
         // Check if inode exists
-        let cache = self.metadata_cache.read().unwrap();
-        if cache.get(&ino).is_some() {
+        if self.metadata_cache.contains_key(&ino) {
             // For simplicity, allow all access
             // A real implementation would check permissions based on mask
             reply.ok();
@@ -3528,10 +3455,7 @@ impl Filesystem for DfsFilesystem {
 
             let result = self.block_on(async {
                 // Get metadata from cache
-                let metadata_opt = {
-                    let cache = metadata_cache.read().unwrap();
-                    cache.get(&ino).cloned()
-                };
+                let metadata_opt = metadata_cache.get(&ino).map(|m| m.clone());
 
                 if let Some(metadata) = metadata_opt {
                     // Check if there are pending writes

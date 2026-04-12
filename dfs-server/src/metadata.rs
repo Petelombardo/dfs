@@ -26,7 +26,7 @@ impl MetadataStore {
         let db = sled::Config::new()
             .path(&metadata_dir)
             .cache_capacity(cache_capacity_bytes)
-            .flush_every_ms(Some(1000))  // Flush every second for durability
+            .flush_every_ms(Some(250))  // Flush every 250ms — reduces metadata write stalls for sequential workloads
             .open()
             .with_context(|| format!("Failed to open metadata database at {:?}", metadata_dir))?;
 

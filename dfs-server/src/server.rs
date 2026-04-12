@@ -9,6 +9,7 @@ use dfs_common::{
     compute_chunk_hash, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
     Message, NodeId, NodeInfo, Request, Response,
 };
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -61,7 +62,7 @@ pub struct Server {
     /// Only the leader serves GetFileChunkMap requests from this map.
     /// All nodes keep it up-to-date so leadership transitions are seamless.
     /// Updated on every write, heal, and chunk-location replication.
-    chunk_map: Arc<RwLock<HashMap<FileId, (Vec<ChunkLocation>, u64)>>>,
+    chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
 
     /// Permanently-missing chunk blocklist.
     /// A chunk is added here when ALL nodes listed in its location record are online
@@ -98,7 +99,7 @@ impl Server {
             // With modern HDDs and read-ahead, parallel reads are efficient
             // Real client reads bypass this limit (high priority)
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
-            chunk_map: Arc::new(RwLock::new(HashMap::new())),
+            chunk_map: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
             healing: Arc::new(RwLock::new(None)),
         };
@@ -124,7 +125,6 @@ impl Server {
         let metadata = self.metadata.clone();
 
         tokio::spawn(async move {
-            let mut map = chunk_map.write().await;
             let mut built = 0usize;
 
             for file in &files {
@@ -148,11 +148,11 @@ impl Server {
                         let _ = size; // suppress unused warning
                     }
                     if ok && !locations.is_empty() {
-                        map.insert(file.id, (locations, file.modified_at));
+                        chunk_map.insert(file.id, (locations, file.modified_at));
                         built += 1;
                     }
                 } else {
-                    map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
+                    chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
                     built += 1;
                 }
             }
@@ -185,8 +185,7 @@ impl Server {
         };
 
         if !locations.is_empty() {
-            let mut map = self.chunk_map.write().await;
-            map.insert(metadata.id, (locations, metadata.modified_at));
+            self.chunk_map.insert(metadata.id, (locations, metadata.modified_at));
         } else if !metadata.chunks.is_empty() {
             // The file has chunks but we couldn't resolve their locations — this node
             // may not yet have received the chunk-location replication for this write
@@ -202,8 +201,8 @@ impl Server {
     /// Update a single chunk location within the chunk map (used during healing).
     /// Finds all files that reference this chunk and patches the location in place.
     async fn chunk_map_update_location(&self, location: &ChunkLocation) {
-        let mut map = self.chunk_map.write().await;
-        for (_, (locs, _)) in map.iter_mut() {
+        for mut entry in self.chunk_map.iter_mut() {
+            let (locs, _) = entry.value_mut();
             for loc in locs.iter_mut() {
                 if loc.chunk_id == location.chunk_id {
                     *loc = location.clone();
@@ -215,8 +214,7 @@ impl Server {
 
     /// Remove a file from the chunk map (on deletion).
     async fn chunk_map_remove(&self, file_id: &FileId) {
-        let mut map = self.chunk_map.write().await;
-        map.remove(file_id);
+        self.chunk_map.remove(file_id);
     }
 
     /// Get reference to cluster manager
@@ -2059,13 +2057,15 @@ impl Server {
     /// Handle GetFileChunkMap — returns the full chunk location map for a file.
     /// Served from the in-memory chunk map maintained by all nodes (leader-authoritative).
     async fn handle_get_file_chunk_map(&self, file_id: FileId) -> Response {
-        let map = self.chunk_map.read().await;
-        match map.get(&file_id) {
-            Some((locations, modified_at)) => Response::FileChunkMap {
-                file_id,
-                locations: locations.clone(),
-                modified_at: *modified_at,
-            },
+        match self.chunk_map.get(&file_id) {
+            Some(entry) => {
+                let (locations, modified_at) = entry.value();
+                Response::FileChunkMap {
+                    file_id,
+                    locations: locations.clone(),
+                    modified_at: *modified_at,
+                }
+            }
             None => Response::Error {
                 message: format!("No chunk map entry for file {}", file_id),
                 code: ErrorCode::NotFound,

@@ -200,7 +200,12 @@ fn mount_filesystem(
     use std::sync::Arc;
     use std::thread;
 
-    let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()?
+    );
     let runtime_clone = runtime.clone();
 
     // Spawn a thread to keep the runtime alive

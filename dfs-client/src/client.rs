@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use blake3;
+use dashmap::DashMap;
 use dfs_common::{ChunkId, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -228,7 +229,7 @@ pub struct DfsClient {
 
     /// TCP connection pool - maintains up to N idle connections per server
     /// VecDeque allows concurrent callers to each get their own connection
-    connection_pool: Arc<Mutex<HashMap<SocketAddr, std::collections::VecDeque<TcpStream>>>>,
+    connection_pool: Arc<DashMap<SocketAddr, Mutex<std::collections::VecDeque<TcpStream>>>>,
 
     /// Track chunks currently being prefetched to avoid duplicates
     prefetch_in_flight: Arc<Mutex<HashSet<ChunkId>>>,
@@ -267,11 +268,7 @@ pub struct DfsClient {
     /// Expires after 60 seconds (assume cache eviction after that)
     warm_cache_map: Arc<Mutex<LruCache<ChunkId, (SocketAddr, std::time::Instant)>>>,
 
-    /// Serialization lock for read operations to prevent parallel reads from racing
-    /// Write operations remain async and don't acquire this lock
-    read_lock: Arc<Mutex<()>>,
-
-    /// Address of the current cluster leader, used to route GetFileChunkMap requests.
+/// Address of the current cluster leader, used to route GetFileChunkMap requests.
     /// Updated during refresh_cluster_nodes(). Falls back to any node if unknown.
     leader_addr: Arc<RwLock<Option<SocketAddr>>>,
 
@@ -407,7 +404,7 @@ impl DfsClient {
             current_node: Arc::new(RwLock::new(0)),
             chunk_cache: Arc::new(Mutex::new(cache)),
             byte_range_cache: Arc::new(Mutex::new(byte_range_cache)),
-            connection_pool: Arc::new(Mutex::new(HashMap::new())),
+            connection_pool: Arc::new(DashMap::new()),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
             last_prefetch_position: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
@@ -416,8 +413,7 @@ impl DfsClient {
             sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
             addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
-            read_lock: Arc::new(Mutex::new(())),
-            leader_addr: Arc::new(RwLock::new(None)),
+leader_addr: Arc::new(RwLock::new(None)),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
             node_health: NodeHealthTracker::new(),
         })
@@ -537,9 +533,10 @@ impl DfsClient {
         let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
         // Try pooled connection first; on failure (stale) fall back to a fresh one.
-        let pooled = {
-            let mut pool = self.connection_pool.lock().await;
-            pool.get_mut(&addr).and_then(|q| q.pop_front())
+        let pooled = if let Some(entry) = self.connection_pool.get(&addr) {
+            entry.lock().await.pop_front()
+        } else {
+            None
         };
 
         let mut stream = match pooled {
@@ -672,8 +669,10 @@ impl DfsClient {
 
         // Return connection to pool
         {
-            let mut pool = self.connection_pool.lock().await;
-            let queue = pool.entry(addr).or_insert_with(std::collections::VecDeque::new);
+            let entry = self.connection_pool
+                .entry(addr)
+                .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
+            let mut queue = entry.lock().await;
             if queue.len() < 8 {
                 queue.push_back(stream);
             }
@@ -1362,12 +1361,9 @@ impl DfsClient {
             let last_file_chunk_idx = start_chunk_idx + last_local_idx;
             let file_id = all_file_chunks[0]; // Use first chunk as file identifier
 
-            // Acquire read_lock ONLY for the critical section: history + detection
-            // Release it before spawning prefetch tasks to avoid blocking other reads
-            // NOTE: Deduplication already happened at the start of this function
+            // Detect sequential access patterns for prefetch decisions
+            // read_history has its own Mutex, no outer lock needed
             let is_sequential = {
-                let _read_guard = self.read_lock.lock().await;
-
                 // Track read history and detect sequential patterns
                 let mut history = self.read_history.lock().await;
                 // LRU cache: get existing or create new entry
@@ -1840,9 +1836,10 @@ impl DfsClient {
             attempt += 1;
 
             // Get or create connection (pop from per-server VecDeque)
-            let stream = {
-                let mut pool = self.connection_pool.lock().await;
-                pool.get_mut(&server_addr).and_then(|q| q.pop_front())
+            let stream = if let Some(entry) = self.connection_pool.get(&server_addr) {
+                entry.lock().await.pop_front()
+            } else {
+                None
             };
 
             let mut stream = match stream {
@@ -1904,8 +1901,10 @@ impl DfsClient {
                 Ok((stream, buf)) => {
                     // Return connection to pool (cap per-server queue at 8 idle connections)
                     {
-                        let mut pool = self.connection_pool.lock().await;
-                        let queue = pool.entry(server_addr).or_insert_with(std::collections::VecDeque::new);
+                        let entry = self.connection_pool
+                            .entry(server_addr)
+                            .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
+                        let mut queue = entry.lock().await;
                         if queue.len() < 8 {
                             queue.push_back(stream);
                         }

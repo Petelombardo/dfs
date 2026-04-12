@@ -22,6 +22,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 clap = { workspace = true }
 nix = { version = "0.29", features = ["fs"] }
+dashmap = "6.1"
 lru = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 

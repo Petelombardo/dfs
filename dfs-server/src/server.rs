@@ -992,38 +992,12 @@ impl Server {
                 metadata.put_chunk_location(&location)
                     .context("Failed to store chunk location")?;
 
-                // Replicate chunk location metadata to all other nodes asynchronously
-                let nodes = cluster.get_all_nodes().await;
-                let local_id = cluster.local_node_id();
-
-                info!("Replicating chunk location for {} to {} nodes", chunk_id, nodes.len() - 1);
-
-                for node in nodes {
-                    // Skip self and offline nodes
-                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                        continue;
-                    }
-
-                    let client_clone = client.clone();
-                    let location_clone = location.clone();
-                    let node_addr = node.addr;
-                    let node_id = node.id;
-                    let chunk_id_clone = chunk_id;
-
-                    // Fire-and-forget: spawn individual replication tasks
-                    tokio::spawn(async move {
-                        info!("Sending chunk location {} to node {}", chunk_id_clone, node_id);
-                        let request = Request::ReplicateChunkLocation {
-                            location: location_clone,
-                        };
-
-                        if let Err(e) = client_clone.send_message(node_addr, Message::Request(request)).await {
-                            warn!("Failed to replicate chunk location {} to node {}: {}", chunk_id_clone, node_id, e);
-                        } else {
-                            info!("Successfully sent chunk location {} to node {}", chunk_id_clone, node_id);
-                        }
-                    });
-                }
+                // Do NOT broadcast a single-node location here. The client is the authoritative
+                // source for the complete replica set — it knows all nodes it wrote to and
+                // broadcasts a full ChunkLocation (e.g. {nodes: [A, B]}) after both parallel
+                // writes succeed. Broadcasting a single-node record here races with that broadcast
+                // and causes the healer to see under-replicated chunks before the client has
+                // finished, triggering premature healing and resulting in 5× over-replication.
 
                 Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
             });

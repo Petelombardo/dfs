@@ -76,22 +76,20 @@ impl WriteBuffer {
         }
     }
 
-    /// Check if this buffer should be flushed by background flusher.
-    /// With server-side alignment, any amount of data can be sent — the server
-    /// handles chunk boundaries. Flush when we have 1MB+ (a reasonable network
-    /// payload) or after 100ms of idle time (minimize write latency).
+    /// Check if this buffer has enough data for a background flush.
+    /// Background flushes only send chunk-aligned data (multiples of 4MB) via the
+    /// fast dual-parallel client write path. Partial tails are held until fsync/close,
+    /// where AppendFile handles the final delta cheaply (server reads partial tail
+    /// locally, no re-transmission from client).
     fn should_background_flush(&self) -> bool {
-        const COALESCE_SIZE: usize = 1 * 1024 * 1024; // 1MB
-        const COALESCE_AGE_MS: u128 = 100;            // 100ms
+        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+        self.data.len() >= CHUNK_SIZE
+    }
 
-        if self.data.len() >= COALESCE_SIZE {
-            return true;
-        }
-        if let Ok(elapsed) = self.last_modified.elapsed() {
-            !self.data.is_empty() && elapsed.as_millis() >= COALESCE_AGE_MS
-        } else {
-            false
-        }
+    /// How many bytes of this buffer are chunk-aligned (safe for dual-parallel write).
+    fn aligned_flush_len(&self) -> usize {
+        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+        (self.data.len() / CHUNK_SIZE) * CHUNK_SIZE
     }
 }
 
@@ -161,6 +159,12 @@ pub struct DfsFilesystem {
     /// Used to guard the write buffer in flush(): a flush() triggered by a read-only
     /// close must not touch the write buffer of a concurrently writing fd.
     write_open_counts: Arc<DashMap<u64, usize>>,
+
+    /// Shared reference to the background flusher's in-flight set.
+    /// Set by the background flusher task after spawn; flush_buffer_async (fsync/close)
+    /// waits for any in-flight background flush to complete before sending its own flush
+    /// to avoid concurrent flushes that would produce OffsetMismatch.
+    flush_in_flight: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>>,
 }
 
 impl DfsFilesystem {
@@ -209,98 +213,118 @@ impl DfsFilesystem {
         let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
         let write_buffers_for_cleanup = Arc::new(DashMap::<u64, Arc<Mutex<WriteBuffer>>>::new());
+        let flush_in_flight_shared: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>> =
+            Arc::new(RwLock::new(None));
 
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
             let write_buffers_clone = write_buffers_for_cleanup.clone();
             let client_for_cleanup = client.clone();
             let metadata_cache_for_cleanup = metadata_cache.clone();
+            // in_flight: tracks inodes with an active background flush task.
+            // Prevents launching a second flush while the first is still in flight,
+            // which would produce OffsetMismatch. Also used by flush_buffer_async
+            // (fsync/close) to wait for any in-flight background flush to complete.
+            let in_flight: Arc<dashmap::DashSet<u64>> = Arc::new(dashmap::DashSet::new());
+            // Share the in_flight set with flush_buffer_async via the struct field
+            *flush_in_flight_shared.write().unwrap() = Some(in_flight.clone());
+
             runtime.spawn(async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
                 loop {
                     interval.tick().await;
 
-                    // Find inodes whose buffers are ready to flush
+                    // Find inodes with at least one full 4MB chunk ready
                     let flush_inodes: Vec<u64> = {
-                        let mut inodes_to_flush = Vec::new();
+                        let mut ready = Vec::new();
                         for entry in write_buffers_clone.iter() {
                             let ino = *entry.key();
+                            if in_flight.contains(&ino) { continue; }
                             let buffer = entry.value().lock().await;
                             if buffer.should_background_flush() {
-                                inodes_to_flush.push(ino);
+                                ready.push(ino);
                             }
                         }
-                        inodes_to_flush
+                        ready
                     };
 
                     for ino in flush_inodes {
-                        // Snapshot buffer without holding lock during network I/O
-                        let flush_data_opt = {
+                        // Snapshot the aligned portion only
+                        let flush_opt = {
                             if let Some(buf_lock) = write_buffers_clone.get(&ino) {
                                 let buffer = buf_lock.lock().await;
-                                if !buffer.data.is_empty() {
-                                    Some((buffer.data.clone(), buffer.start_offset, buffer.preferred_primary))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
+                                let aligned = buffer.aligned_flush_len();
+                                if aligned == 0 { continue; }
+                                let file_offset = buffer.start_offset;
+                                Some((buffer.data[..aligned].to_vec(), file_offset))
+                            } else { None }
                         };
-
-                        let (flush_data, expected_offset, preferred_primary) = match flush_data_opt {
+                        let (flush_data, file_offset) = match flush_opt {
                             Some(v) => v,
                             None => continue,
                         };
 
-                        let (file_id, path) = {
-                            let cache = metadata_cache_for_cleanup.read().unwrap();
-                            match cache.get(&ino) {
-                                Some(m) => (m.id, m.path.clone()),
-                                None => {
-                                    tracing::warn!("Background flusher: no metadata for inode {}", ino);
-                                    continue;
-                                }
-                            }
-                        };
+                        info!("Background flush: {} bytes ({} chunks) for inode {} at offset {}",
+                              flush_data.len(), flush_data.len() / CHUNK_SIZE, ino, file_offset);
 
-                        info!("Background flush: {} bytes for inode {} at offset {} (primary={:?})",
-                              flush_data.len(), ino, expected_offset, preferred_primary);
+                        in_flight.insert(ino);
+                        let client_task = client_for_cleanup.clone();
+                        let write_buffers_task = write_buffers_clone.clone();
+                        let metadata_cache_task = metadata_cache_for_cleanup.clone();
+                        let in_flight_task = in_flight.clone();
 
-                        match client_for_cleanup.append_file(file_id, flush_data.clone(), expected_offset, preferred_primary).await {
-                            Ok((updated_metadata, remaining_in_chunk)) => {
-                                let flushed = flush_data.len();
-                                // Commit buffer drain and rotate primary if chunk sealed
-                                if let Some(buf_lock) = write_buffers_clone.get(&ino) {
-                                    let mut buffer = buf_lock.lock().await;
-                                    if buffer.start_offset == expected_offset {
-                                        let drain = flushed.min(buffer.data.len());
-                                        buffer.data.drain(..drain);
-                                        buffer.start_offset += drain as u64;
-                                        buffer.last_modified = SystemTime::now();
-                                        if remaining_in_chunk == 0 {
-                                            buffer.preferred_primary = None; // rotate on chunk seal
+                        tokio::spawn(async move {
+                            let flushed = flush_data.len();
+                            match client_task.write_data_with_cache(&flush_data, ino, file_offset).await {
+                                Ok((_chunk_ids, _chunk_sizes, locations_opt)) => {
+                                    // Drain flushed bytes from buffer
+                                    if let Some(buf_lock) = write_buffers_task.get(&ino) {
+                                        let mut buffer = buf_lock.lock().await;
+                                        if buffer.start_offset == file_offset {
+                                            let drain = flushed.min(buffer.data.len());
+                                            buffer.data.drain(..drain);
+                                            buffer.start_offset += drain as u64;
+                                            buffer.last_modified = SystemTime::now();
                                         }
                                     }
-                                }
-                                metadata_cache_for_cleanup.write().unwrap().insert(ino, updated_metadata);
-                                info!("Background flush complete for inode {} (remaining_in_chunk={})", ino, remaining_in_chunk);
-                            }
-                            Err(e) if e.to_string().contains("OffsetMismatch") => {
-                                // Re-fetch metadata and update buffer start_offset for next tick
-                                if let Ok(Some(fresh)) = client_for_cleanup.get_file_metadata(&path).await {
-                                    if let Some(buf_lock) = write_buffers_clone.get(&ino) {
-                                        let mut buffer = buf_lock.lock().await;
-                                        buffer.start_offset = fresh.size;
-                                        buffer.preferred_primary = None;
+                                    // Update metadata cache with new chunk locations + size,
+                                    // then persist. Drop the write guard before the await.
+                                    if let Some(locations) = locations_opt {
+                                        let meta_to_persist = {
+                                            let mut cache = metadata_cache_task.write().unwrap();
+                                            if let Some(meta) = cache.get_mut(&ino) {
+                                                for loc in &locations {
+                                                    if !meta.chunks.contains(&loc.chunk_id) {
+                                                        meta.chunks.push(loc.chunk_id);
+                                                        meta.chunk_sizes.push(loc.size as u64);
+                                                        meta.chunk_locations.push(loc.clone());
+                                                    }
+                                                }
+                                                meta.size = file_offset + flushed as u64;
+                                                meta.modified_at = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default().as_secs();
+                                            }
+                                            cache.get(&ino).cloned()
+                                            // write guard dropped here
+                                        };
+                                        if let Some(meta) = meta_to_persist {
+                                            let _ = tokio::time::timeout(
+                                                tokio::time::Duration::from_secs(5),
+                                                client_task.put_file_metadata(&meta),
+                                            ).await;
+                                        }
                                     }
-                                    metadata_cache_for_cleanup.write().unwrap().insert(ino, fresh);
+                                    info!("Background flush complete for inode {}: {} bytes at offset {}",
+                                          ino, flushed, file_offset);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Background flush failed for inode {}: {}", ino, e);
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("Background flush failed for inode {}: {}", ino, e);
-                            }
-                        }
+                            in_flight_task.remove(&ino);
+                        });
                     }
                 }
             });
@@ -350,6 +374,7 @@ impl DfsFilesystem {
             lock_manager: Arc::new(LockManager::new()),
             buffer_flush_threshold,
             write_open_counts: Arc::new(DashMap::new()),
+            flush_in_flight: flush_in_flight_shared,
         })
     }
 
@@ -438,38 +463,49 @@ impl DfsFilesystem {
         self.last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
     }
 
-    /// Flush the write buffer for `ino` using the server-side AppendFile RPC.
+    /// Flush the write buffer for `ino`.
     ///
-    /// The server handles chunk alignment — we just send whatever bytes are buffered.
-    /// `force`: if true, flushes even if the buffer is small (used by fsync/close).
-    ///
-    /// Primary rotation: each WriteBuffer tracks a preferred primary node. When the
-    /// server signals remaining_in_chunk == 0 (chunk boundary sealed), we pick a new
-    /// primary so that write load is distributed across nodes per chunk.
+    /// Hybrid strategy:
+    ///   - Chunk-aligned data (multiples of 4MB): dual-parallel client write to 2 nodes
+    ///     via write_data_with_cache() — maximum throughput, no extra hop.
+    ///   - Partial tail (< 4MB remainder) on force=true (fsync/close): AppendFile RPC
+    ///     sends only the delta bytes; server reads its local partial tail, prepends,
+    ///     writes aligned chunks. Client never re-transmits existing data.
+    ///   - force=false (background): only flushes aligned chunks, leaves partial tail
+    ///     buffered until the next 4MB boundary or fsync/close.
     async fn flush_buffer_async(&self, ino: u64, force: bool) -> Result<()> {
-        // Snapshot buffer state without holding the lock during the network call
-        let flush_data_opt = {
+        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+
+        // Snapshot aligned portion (and optionally the full buffer including tail)
+        let snapshot = {
             if let Some(buffer_lock) = self.write_buffers.get(&ino) {
                 let buffer = buffer_lock.lock().await;
-                if (force || buffer.should_background_flush()) && !buffer.data.is_empty() {
-                    Some((buffer.data.clone(), buffer.start_offset, buffer.preferred_primary))
-                } else {
-                    None
+                if buffer.data.is_empty() {
+                    return Ok(());
                 }
+                let aligned_len = buffer.aligned_flush_len();
+                let tail_len = buffer.data.len() - aligned_len;
+                // Background flush: only if we have >= 1 full chunk
+                // Forced flush: always proceed (even if only tail remains)
+                if !force && aligned_len == 0 {
+                    return Ok(());
+                }
+                Some((
+                    buffer.data.clone(),
+                    buffer.start_offset,
+                    aligned_len,
+                    tail_len,
+                ))
             } else {
                 None
             }
         };
 
-        let (flush_data, expected_offset, preferred_primary) = match flush_data_opt {
+        let (all_data, start_offset, aligned_len, tail_len) = match snapshot {
             Some(v) => v,
             None => return Ok(()),
         };
 
-        info!("flush_buffer_async: flushing {} bytes for inode {} at offset {} (force={}, primary={:?})",
-              flush_data.len(), ino, expected_offset, force, preferred_primary);
-
-        // Get file_id and path from metadata cache
         let (file_id, path) = {
             let cache = self.metadata_cache.read().unwrap();
             match cache.get(&ino) {
@@ -478,53 +514,122 @@ impl DfsFilesystem {
             }
         };
 
-        // Call server-side AppendFile. On OffsetMismatch, re-fetch metadata and retry once.
-        let (updated_metadata, remaining_in_chunk) = match self.client
-            .append_file(file_id, flush_data.clone(), expected_offset, preferred_primary)
-            .await
-        {
-            Ok(result) => result,
-            Err(e) if e.to_string().contains("OffsetMismatch") => {
-                warn!("flush_buffer_async: OffsetMismatch for inode {}, re-fetching metadata and retrying", ino);
-                let fresh = self.client.get_file_metadata(&path).await?
-                    .ok_or_else(|| anyhow::anyhow!("File disappeared during flush retry: {}", path))?;
-                let new_offset = fresh.size;
-                self.metadata_cache.write().unwrap().insert(ino, fresh.clone());
-                if let Some(buffer_lock) = self.write_buffers.get(&ino) {
-                    let mut buffer = buffer_lock.lock().await;
-                    buffer.start_offset = new_offset;
-                    buffer.preferred_primary = None; // reset primary on mismatch
+        // --- Step 1: Dual-parallel write for all complete 4MB chunks ---
+        if aligned_len > 0 {
+            let aligned_data = &all_data[..aligned_len];
+            info!("flush_buffer_async: dual-parallel write {} bytes ({} chunks) for inode {} at offset {}",
+                  aligned_len, aligned_len / CHUNK_SIZE, ino, start_offset);
+
+            let (chunk_ids, chunk_sizes, locations_opt) = self.client
+                .write_data_with_cache(aligned_data, ino, start_offset)
+                .await?;
+
+            // Splice chunk metadata into cache
+            if let Some(buffer_lock) = self.write_buffers.get(&ino) {
+                let mut buffer = buffer_lock.lock().await;
+                if buffer.start_offset == start_offset {
+                    let drain = aligned_len.min(buffer.data.len());
+                    buffer.data.drain(..drain);
+                    buffer.start_offset += drain as u64;
+                    buffer.last_modified = SystemTime::now();
                 }
-                self.client.append_file(file_id, flush_data.clone(), new_offset, None).await?
             }
-            Err(e) => return Err(e),
-        };
 
-        let flushed_len = flush_data.len();
-
-        // Commit the buffer drain and rotate primary if chunk boundary was just crossed
-        if let Some(buffer_lock) = self.write_buffers.get(&ino) {
-            let mut buffer = buffer_lock.lock().await;
-            if buffer.start_offset == expected_offset {
-                let drain = flushed_len.min(buffer.data.len());
-                buffer.data.drain(..drain);
-                buffer.start_offset += drain as u64;
-                buffer.last_modified = SystemTime::now();
-
-                if remaining_in_chunk == 0 {
-                    // Chunk boundary sealed — clear preferred primary so next flush
-                    // picks a fresh node via health-sorted selection, distributing
-                    // write load across the cluster one chunk at a time.
-                    debug!("Chunk boundary sealed for inode {} — rotating primary node", ino);
-                    buffer.preferred_primary = None;
+            // Update metadata cache with new chunk locations
+            if let Some(locations) = locations_opt {
+                let mut cache = self.metadata_cache.write().unwrap();
+                if let Some(meta) = cache.get_mut(&ino) {
+                    for loc in &locations {
+                        if !meta.chunks.contains(&loc.chunk_id) {
+                            meta.chunks.push(loc.chunk_id);
+                            meta.chunk_sizes.push(loc.size as u64);
+                            meta.chunk_locations.push(loc.clone());
+                        }
+                    }
+                    meta.size = start_offset + aligned_len as u64;
+                    meta.modified_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
                 }
-                // If remaining > 0, keep the same primary so the partial chunk
-                // continues accumulating on the same server until it seals.
+            } else {
+                // Fallback: update size only
+                let mut cache = self.metadata_cache.write().unwrap();
+                if let Some(meta) = cache.get_mut(&ino) {
+                    meta.size = start_offset + aligned_len as u64;
+                }
+            }
+
+            // Persist metadata to server
+            if let Some(meta) = self.metadata_cache.read().unwrap().get(&ino).cloned() {
+                let _ = self.client.put_file_metadata(&meta).await;
             }
         }
 
-        // Store the authoritative metadata returned by the server — no manual chunk splicing
-        self.metadata_cache.write().unwrap().insert(ino, updated_metadata);
+        // --- Step 2: AppendFile for the partial tail (only on forced flush) ---
+        if force && tail_len > 0 {
+            // Wait for any in-flight background flush to complete first — a background
+            // task may still be writing the aligned portion we just submitted above,
+            // and its drain hasn't happened yet. Racing would cause OffsetMismatch.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let in_flight_opt = self.flush_in_flight.read().unwrap().clone();
+                let still_running = in_flight_opt.map(|s| s.contains(&ino)).unwrap_or(false);
+                if !still_running { break; }
+                if std::time::Instant::now() >= deadline {
+                    warn!("flush_buffer_async: timed out waiting for background flush on inode {}", ino);
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+
+            // Re-read current buffer state — aligned flush may have drained some data
+            let (tail_data, tail_offset) = {
+                if let Some(buffer_lock) = self.write_buffers.get(&ino) {
+                    let buffer = buffer_lock.lock().await;
+                    if buffer.data.is_empty() {
+                        return Ok(());
+                    }
+                    (buffer.data.clone(), buffer.start_offset)
+                } else {
+                    return Ok(());
+                }
+            };
+
+            info!("flush_buffer_async: AppendFile partial tail {} bytes for inode {} at offset {}",
+                  tail_data.len(), ino, tail_offset);
+
+            let (updated_metadata, _remaining, _primary) = match self.client
+                .append_file(file_id, tail_data.clone(), tail_offset, None)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) if e.to_string().contains("OffsetMismatch") => {
+                    warn!("flush_buffer_async: OffsetMismatch on tail flush for inode {}, re-fetching and retrying", ino);
+                    let fresh = self.client.get_file_metadata(&path).await?
+                        .ok_or_else(|| anyhow::anyhow!("File not found during tail flush retry: {}", path))?;
+                    let new_offset = fresh.size;
+                    self.metadata_cache.write().unwrap().insert(ino, fresh);
+                    if let Some(buffer_lock) = self.write_buffers.get(&ino) {
+                        let mut buffer = buffer_lock.lock().await;
+                        buffer.start_offset = new_offset;
+                    }
+                    self.client.append_file(file_id, tail_data.clone(), new_offset, None).await?
+                }
+                Err(e) => return Err(e),
+            };
+
+            // Drain tail from buffer
+            if let Some(buffer_lock) = self.write_buffers.get(&ino) {
+                let mut buffer = buffer_lock.lock().await;
+                let drain = tail_data.len().min(buffer.data.len());
+                buffer.data.drain(..drain);
+                buffer.start_offset += drain as u64;
+                buffer.last_modified = SystemTime::now();
+            }
+
+            self.metadata_cache.write().unwrap().insert(ino, updated_metadata);
+        }
 
         Ok(())
     }

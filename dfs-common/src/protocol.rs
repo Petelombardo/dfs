@@ -218,6 +218,19 @@ pub enum Request {
     GetFileChunkMap {
         file_id: FileId,
     },
+
+    /// Append data to an existing file. The server handles chunk alignment:
+    /// if the file's last chunk is partial (< 4MB), the server reads it back,
+    /// prepends it to `data`, writes complete 4MB chunks + new partial tail,
+    /// updates FileMetadata atomically, and returns the updated metadata.
+    ///
+    /// `expected_offset` is a CAS guard — server rejects with OffsetMismatch
+    /// if file.size != expected_offset, preventing double-appends on retry.
+    AppendFile {
+        file_id: FileId,
+        data: Vec<u8>,
+        expected_offset: u64,
+    },
 }
 
 /// Response types
@@ -331,6 +344,12 @@ pub enum Response {
         modified_at: u64,
     },
 
+    /// Returned by AppendFile on success. Contains the authoritative updated
+    /// FileMetadata so the client doesn't need a follow-up GetFileMetadata call.
+    AppendFileResult {
+        metadata: FileMetadata,
+    },
+
     /// Prefetch hint acknowledged (best-effort, no guarantee)
     PrefetchAccepted {
         /// Number of chunks that will be prefetched
@@ -355,6 +374,8 @@ pub enum ErrorCode {
     ChecksumMismatch,
     InvalidRequest,
     InternalError,
+    /// AppendFile: file.size != expected_offset
+    OffsetMismatch,
 }
 
 /// Cluster management messages

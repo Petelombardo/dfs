@@ -316,6 +316,10 @@ impl Server {
                 self.handle_get_file_chunk_map(file_id).await
             }
 
+            Request::AppendFile { file_id, data, expected_offset } => {
+                self.handle_append_file(file_id, data, expected_offset).await
+            }
+
             _ => Response::Error {
                 message: "Request type not yet implemented".to_string(),
                 code: ErrorCode::InternalError,
@@ -1289,6 +1293,246 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Handle append file request.
+    ///
+    /// The server reads the partial last chunk (if the file is not chunk-aligned),
+    /// prepends it to the new data, writes complete chunks + a new partial tail,
+    /// updates FileMetadata atomically, and returns the updated metadata.
+    ///
+    /// `expected_offset` is a CAS guard: if file.size != expected_offset the server
+    /// returns OffsetMismatch so the client can re-fetch and retry.
+    async fn handle_append_file(
+        &self,
+        file_id: dfs_common::FileId,
+        new_data: Vec<u8>,
+        expected_offset: u64,
+    ) -> Response {
+        info!("AppendFile: file_id={} expected_offset={} data_len={}", file_id, expected_offset, new_data.len());
+
+        // --- Step 1: Fetch current metadata ---
+        let mut metadata = match self.metadata.get_file(&file_id) {
+            Ok(Some(m)) => m,
+            Ok(None) => return Response::Error {
+                message: format!("File not found: {}", file_id),
+                code: ErrorCode::NotFound,
+            },
+            Err(e) => return Response::Error {
+                message: format!("Failed to read metadata: {}", e),
+                code: ErrorCode::InternalError,
+            },
+        };
+
+        // --- Step 2: CAS guard ---
+        if metadata.size != expected_offset {
+            return Response::Error {
+                message: format!("Offset mismatch: expected {} but file is {} bytes", expected_offset, metadata.size),
+                code: ErrorCode::OffsetMismatch,
+            };
+        }
+
+        // --- Step 3: Read partial tail if file is not chunk-aligned ---
+        let chunk_size = self.chunker.chunk_size() as u64;
+        let partial_bytes = metadata.size % chunk_size;
+
+        let (write_data, drop_last_chunk) = if partial_bytes > 0 {
+            // File ends mid-chunk — read back the partial last chunk and prepend it
+            let last_loc = match metadata.chunk_locations.last() {
+                Some(loc) => loc.clone(),
+                None => {
+                    // chunk_locations empty but file has data — try legacy chunks
+                    warn!("AppendFile: file {} has size {} but no chunk_locations, falling back", file_id, metadata.size);
+                    return Response::Error {
+                        message: "File metadata has no chunk locations".to_string(),
+                        code: ErrorCode::InternalError,
+                    };
+                }
+            };
+
+            match self.read_chunk(&last_loc.chunk_id).await {
+                Ok(tail_data) => {
+                    let mut combined = tail_data;
+                    combined.extend_from_slice(&new_data);
+                    (combined, true)
+                }
+                Err(e) => {
+                    warn!("AppendFile: failed to read partial tail chunk {}: {}", last_loc.chunk_id, e);
+                    return Response::Error {
+                        message: format!("Failed to read partial tail chunk: {}", e),
+                        code: ErrorCode::IOError,
+                    };
+                }
+            }
+        } else {
+            (new_data, false)
+        };
+
+        // --- Step 4+5: Chunk the combined data ---
+        let chunks = self.chunker.chunk_data(&write_data);
+        if chunks.is_empty() {
+            // Nothing to write — return current metadata unchanged
+            return Response::AppendFileResult { metadata };
+        }
+
+        // Base file offset for the new chunks: where the chunk-aligned region starts
+        let base_offset = metadata.size - partial_bytes;
+
+        // --- Step 6: Write each chunk with 2-replica guarantee ---
+        let mut new_locations: Vec<ChunkLocation> = Vec::new();
+        let mut current_offset = base_offset;
+
+        for (chunk_id, chunk_data) in &chunks {
+            let target_nodes = self.cluster
+                .get_nodes_with_capacity_awareness(chunk_id, self.replication_factor)
+                .await;
+
+            if target_nodes.is_empty() {
+                return Response::Error {
+                    message: "No nodes available for chunk replication".to_string(),
+                    code: ErrorCode::IOError,
+                };
+            }
+
+            let immediate_replicas = if self.replication_factor >= 3 { 2 } else { self.replication_factor };
+            let mut success_count = 0;
+            let mut successful_nodes: Vec<dfs_common::NodeId> = Vec::new();
+
+            for node_id in &target_nodes {
+                if success_count >= immediate_replicas {
+                    break;
+                }
+                let node_id = *node_id;
+
+                let ok = if node_id == self.cluster.local_node_id() {
+                    self.storage.write_chunk(chunk_id, chunk_data).is_ok()
+                } else {
+                    match self.cluster.get_node(&node_id).await {
+                        Some(node_info) => {
+                            let request = Request::ReplicateChunk {
+                                chunk_id: *chunk_id,
+                                data: chunk_data.clone(),
+                                checksum: chunk_id.hash,
+                            };
+                            matches!(
+                                self.client.send_message(node_info.addr, Message::Request(request)).await,
+                                Ok(dfs_common::protocol::MessageEnvelope { message: Message::Response(Response::Ok { .. }), .. })
+                            )
+                        }
+                        None => false,
+                    }
+                };
+
+                if ok {
+                    success_count += 1;
+                    successful_nodes.push(node_id);
+                }
+            }
+
+            if success_count < immediate_replicas {
+                return Response::Error {
+                    message: format!("Failed to achieve quorum for chunk {} ({}/{})", chunk_id, success_count, immediate_replicas),
+                    code: ErrorCode::IOError,
+                };
+            }
+
+            let chunk_size_bytes = chunk_data.len();
+            let location = ChunkLocation {
+                chunk_id: *chunk_id,
+                nodes: successful_nodes.clone(),
+                size: chunk_size_bytes,
+                checksum: chunk_id.hash,
+                file_offset: Some(current_offset),
+            };
+
+            // Persist chunk location locally
+            let _ = self.metadata.put_chunk_location(&location);
+
+            // Broadcast chunk location to remaining nodes fire-and-forget
+            {
+                let all_nodes = self.cluster.get_all_nodes().await;
+                let local_id = self.cluster.local_node_id();
+                for node in all_nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let client = self.client.clone();
+                    let loc = location.clone();
+                    tokio::spawn(async move {
+                        let req = Request::ReplicateChunkLocation { location: loc };
+                        let _ = client.send_message(node.addr, Message::Request(req)).await;
+                    });
+                }
+            }
+
+            current_offset += chunk_size_bytes as u64;
+            new_locations.push(location);
+        }
+
+        // --- Step 7: Splice metadata ---
+        if drop_last_chunk {
+            // Replace the partial tail chunk entry with the new chunk(s)
+            metadata.chunk_locations.pop();
+            // Also keep legacy fields in sync
+            if !metadata.chunks.is_empty() {
+                metadata.chunks.pop();
+                metadata.chunk_sizes.pop();
+            }
+        }
+        for loc in &new_locations {
+            metadata.chunks.push(loc.chunk_id);
+            metadata.chunk_sizes.push(loc.size as u64);
+            metadata.chunk_locations.push(loc.clone());
+        }
+
+        // --- Step 8: Update metadata size and timestamp ---
+        metadata.size = expected_offset + (write_data.len() as u64 - partial_bytes);
+        metadata.modified_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // --- Step 9: Persist metadata locally ---
+        if let Err(e) = self.metadata.put_file(&metadata) {
+            return Response::Error {
+                message: format!("Failed to persist metadata: {}", e),
+                code: ErrorCode::InternalError,
+            };
+        }
+
+        // Update in-memory chunk map
+        self.chunk_map_update(&metadata).await;
+
+        // --- Step 10: Async metadata replication (same as handle_put_file_metadata) ---
+        {
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            let metadata_clone = metadata.clone();
+            tokio::spawn(async move {
+                let nodes = cluster.get_all_nodes().await;
+                let local_id = cluster.local_node_id();
+                let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
+                for node in nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let request = Request::ReplicateMetadata { metadata: metadata_clone.clone() };
+                    let client_clone = client.clone();
+                    let sem = semaphore.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await.ok()?;
+                        let _ = tokio::time::timeout(
+                            tokio::time::Duration::from_secs(5),
+                            client_clone.send_message(node.addr, Message::Request(request)),
+                        ).await;
+                        Some(())
+                    });
+                }
+            });
+        }
+
+        info!("AppendFile: complete for file_id={}, new size={}", file_id, metadata.size);
+        Response::AppendFileResult { metadata }
     }
 
     /// Handle list directory request

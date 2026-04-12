@@ -2122,92 +2122,27 @@ impl DfsClient {
             anyhow::bail!("Need at least 2 nodes for dual-replica writes (only {} available)", nodes.len());
         }
 
-        // Select 2 replica nodes (simple round-robin, could use consistent hashing later)
-        let replica1 = nodes[0];
-        let replica2 = nodes[1 % nodes.len()];
+        // Use health-aware node selection with automatic fallback via write_chunk_to_replicas.
+        // Preferred pair is nodes[0]/nodes[1] but any 2 healthy nodes will do.
+        let preferred1 = nodes[0];
+        let preferred2 = nodes[1 % nodes.len()];
 
-        info!("Writing {} bytes with synchronous dual-replica to {} and {}", data.len(), replica1, replica2);
+        info!("Writing {} bytes with synchronous dual-replica (preferred: {}, {})",
+              data.len(), preferred1, preferred2);
 
-        // Write SAME data to both nodes in parallel (local-only, no server-side replication)
-        // Create one Vec and clone it once (instead of calling to_vec() twice on the slice)
-        let data_vec = data.to_vec();
-        let data_clone = data_vec.clone();
+        let chunk_locations = self.write_chunk_to_replicas(data, preferred1, preferred2, inode, file_offset, &nodes).await?;
 
-        let request1 = Request::WriteFileLocalOnly { data: data_vec };
-        let request2 = Request::WriteFileLocalOnly { data: data_clone };
-
-        let task1 = self.send_request(replica1, request1);
-        let task2 = self.send_request(replica2, request2);
-
-        let (result1, result2) = tokio::join!(task1, task2);
-
-        // Both must succeed for synchronous replication
-        let response1 = result1?;
-        let response2 = result2?;
-
-        let (chunk_ids_1, chunk_sizes_1) = match response1 {
-            Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes),
-            Response::Error { message, .. } => anyhow::bail!("Replica 1 ({}) failed: {}", replica1, message),
-            _ => anyhow::bail!("Unexpected response from replica 1"),
-        };
-
-        let (chunk_ids_2, chunk_sizes_2) = match response2 {
-            Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes),
-            Response::Error { message, .. } => anyhow::bail!("Replica 2 ({}) failed: {}", replica2, message),
-            _ => anyhow::bail!("Unexpected response from replica 2"),
-        };
-
-        // Verify both nodes produced the same chunks (content-addressable storage)
-        if chunk_ids_1.len() != chunk_ids_2.len() {
-            anyhow::bail!("Replica mismatch: {} chunks vs {} chunks", chunk_ids_1.len(), chunk_ids_2.len());
+        // Log which nodes were actually used
+        if let Some(loc) = chunk_locations.first() {
+            let node_id_map = self.addr_to_node_id.read().await;
+            let rev: std::collections::HashMap<_, _> = node_id_map.iter().map(|(a, id)| (id, a)).collect();
+            let n1 = loc.nodes.first().and_then(|id| rev.get(id)).map(|a| a.to_string()).unwrap_or_default();
+            let n2 = loc.nodes.get(1).and_then(|id| rev.get(id)).map(|a| a.to_string()).unwrap_or_default();
+            info!("Dual-replica write complete: {} chunks stored on {} and {}", chunk_locations.len(), n1, n2);
+            drop(node_id_map);
         }
 
-        // Create ChunkLocation entries with both replica addresses
-        // Use real node IDs from the cluster mapping
-        let node_id_map = self.addr_to_node_id.read().await;
-        let mut chunk_locations = Vec::new();
-
-        // Calculate file offset for each chunk
-        let mut current_offset = file_offset;
-        for (idx, chunk_id) in chunk_ids_1.iter().enumerate() {
-            // Verify chunk IDs match (they should since it's the same data)
-            if chunk_id != &chunk_ids_2[idx] {
-                warn!("Chunk ID mismatch at index {}: {} vs {}", idx, chunk_id, chunk_ids_2[idx]);
-            }
-
-            // Get real node IDs from mapping, fallback to synthetic if not found
-            let node1_id = node_id_map.get(&replica1)
-                .copied()
-                .unwrap_or_else(|| {
-                    warn!("Node ID not found for replica1 {}, using synthetic ID", replica1);
-                    Self::node_id_from_addr(replica1)
-                });
-            let node2_id = node_id_map.get(&replica2)
-                .copied()
-                .unwrap_or_else(|| {
-                    warn!("Node ID not found for replica2 {}, using synthetic ID", replica2);
-                    Self::node_id_from_addr(replica2)
-                });
-
-            debug!("Creating ChunkLocation with nodes: {} ({}) and {} ({})",
-                   node1_id, replica1, node2_id, replica2);
-
-            let chunk_size = chunk_sizes_1[idx] as usize;
-            let location = dfs_common::ChunkLocation {
-                chunk_id: *chunk_id,
-                nodes: vec![node1_id, node2_id],
-                size: chunk_size,
-                checksum: chunk_id.hash,  // ChunkId already is the Blake3 hash
-                file_offset: Some(current_offset),  // Track where in file this chunk belongs
-            };
-
-            chunk_locations.push(location);
-            current_offset += chunk_size as u64;
-        }
-        drop(node_id_map);  // Release lock
-
-        info!("Dual-replica write complete: {} chunks stored on {} and {}",
-              chunk_locations.len(), replica1, replica2);
+        // write_chunk_to_replicas already broadcasts ChunkLocation to all nodes.
 
         // Broadcast the full ChunkLocation (with both node IDs) to ALL cluster nodes.
         // Without this, nodes that didn't receive data only learn about replicas they

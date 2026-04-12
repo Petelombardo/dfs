@@ -2127,6 +2127,31 @@ impl Filesystem for DfsFilesystem {
                     let data_slice = &data_vec[..];
 
                     let should_flush = runtime.block_on(async move {
+                        // Back-pressure: if the buffer is over the cap, stall briefly to give the
+                        // background flusher time to drain. Cap the stall at 2s — if the cluster
+                        // can't drain within that window, something is badly wrong and we return EIO.
+                        // At cluster write speed (~25 MB/s), a 64MB buffer drains in ~2.5s so brief
+                        // stalls of a few hundred ms are the common case; 2s timeout catches outages.
+                        let max_buffer_size: usize = 64 * 1024 * 1024; // 64MB hard cap
+                        let stall_start = std::time::Instant::now();
+                        loop {
+                            let buf_len = if let Some(entry) = write_buffers_clone.get(&ino) {
+                                entry.lock().await.data.len()
+                            } else {
+                                0
+                            };
+                            if buf_len < max_buffer_size {
+                                break;
+                            }
+                            if stall_start.elapsed() > std::time::Duration::from_secs(2) {
+                                error!("Write buffer stall timeout for inode {}: {} bytes in buffer, cluster not draining", ino, buf_len);
+                                return Err(anyhow::anyhow!("Write buffer stall timeout"));
+                            }
+                            debug!("Back-pressure stall: inode {} buffer {} bytes (cap {}), waiting for flusher",
+                                   ino, buf_len, max_buffer_size);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        }
+
                         // Get or create buffer lock for this inode
                         let buffer_lock = write_buffers_clone.entry(ino).or_insert_with(|| {
                             // Calculate initial size

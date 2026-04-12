@@ -39,6 +39,19 @@ impl NodeHealth {
     fn is_penalized(&self) -> bool {
         self.penalized_until.map(|t| t > std::time::Instant::now()).unwrap_or(false)
     }
+
+    /// If the penalty timer has expired, reset state so the node is treated as healthy
+    /// again without needing an explicit success call.  This prevents the backoff level
+    /// from compounding forever on nodes that are simply never tried.
+    fn maybe_clear_expired_penalty(&mut self) {
+        if let Some(until) = self.penalized_until {
+            if until <= std::time::Instant::now() {
+                self.penalized_until = None;
+                self.consecutive_failures = 0;
+                self.backoff_level = 0;
+            }
+        }
+    }
 }
 
 /// Tracks per-node health across reads and writes.
@@ -55,7 +68,7 @@ impl NodeHealthTracker {
     /// Base probe interval (seconds) — doubles on each repeated failure.
     const BASE_PROBE_SECS: u64 = 30;
     /// Maximum probe interval (seconds).
-    const MAX_PROBE_SECS: u64 = 300;
+    const MAX_PROBE_SECS: u64 = 120;
 
     fn new() -> Self {
         Self { inner: Arc::new(Mutex::new(HashMap::new())) }
@@ -97,18 +110,31 @@ impl NodeHealthTracker {
 
     /// Returns true if `addr` is currently in a penalty period.
     pub async fn is_penalized(&self, addr: SocketAddr) -> bool {
-        let map = self.inner.lock().await;
-        map.get(&addr).map(|h| h.is_penalized()).unwrap_or(false)
+        let mut map = self.inner.lock().await;
+        if let Some(h) = map.get_mut(&addr) {
+            h.maybe_clear_expired_penalty();
+            h.is_penalized()
+        } else {
+            false
+        }
     }
 
     /// Sort a slice of addresses so healthy nodes come first, penalized nodes last.
     /// Within each group the original order (round-robin, warm-cache preference, etc.) is preserved.
+    /// Also clears any penalties whose timer has expired, so nodes self-recover without needing
+    /// an explicit success call after the probe interval passes.
     pub async fn sort_by_health(&self, addrs: &[SocketAddr]) -> Vec<SocketAddr> {
-        let map = self.inner.lock().await;
+        let mut map = self.inner.lock().await;
         let mut healthy = Vec::new();
         let mut penalized = Vec::new();
         for &addr in addrs {
-            if map.get(&addr).map(|h| h.is_penalized()).unwrap_or(false) {
+            let is_pen = if let Some(h) = map.get_mut(&addr) {
+                h.maybe_clear_expired_penalty();
+                h.is_penalized()
+            } else {
+                false
+            };
+            if is_pen {
                 penalized.push(addr);
             } else {
                 healthy.push(addr);

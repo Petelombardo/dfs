@@ -402,7 +402,7 @@ impl DfsFilesystem {
                     // Find inodes ready for a background flush.
                     // Fire when buffer has >= flush_threshold (12MB = 3 chunks) of aligned data
                     // so the pipelined write path is used (3 chunks in-flight = ~30 MB/s).
-                    // Also fire when buffer has >= 1 chunk AND data is > 500ms old, to drain
+                    // Also fire when buffer has >= 1 chunk AND data is > 2s old, to drain
                     // buffers that stopped accumulating (file closed without fsync, etc.).
                     let flush_inodes: Vec<u64> = {
                         let mut ready = Vec::new();
@@ -415,7 +415,7 @@ impl DfsFilesystem {
                             let age_ms = buffer.last_modified.elapsed()
                                 .unwrap_or_default().as_millis();
                             let enough_for_pipeline = aligned >= flush_threshold_for_task;
-                            let aging_out = aligned >= CHUNK_SIZE && age_ms >= 500;
+                            let aging_out = aligned >= CHUNK_SIZE && age_ms >= 2000;
                             if enough_for_pipeline || aging_out {
                                 ready.push(ino);
                             }
@@ -1137,6 +1137,7 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let last_warm_offset = self.last_warm_offset.clone();
         let chunk_offset_cache = self.chunk_offset_cache.clone();
+        let flush_in_flight = self.flush_in_flight.clone();
 
         // Spawn async read operation on tokio runtime
         self.runtime.spawn(async move {
@@ -1277,6 +1278,28 @@ impl Filesystem for DfsFilesystem {
                         false
                     }
                 };
+
+                // If a fsync-spawned flush is in flight for this inode, wait for it before
+                // falling through to a server read. This prevents stale reads after fsync:
+                // the kernel considers fsync complete (we replied ok immediately), so the
+                // application expects its data to be durable and readable. Without this wait
+                // the server still has the old data and the read returns stale content.
+                if !should_flush_buffer {
+                    let in_flight_opt = flush_in_flight.read().unwrap().clone();
+                    if let Some(ref in_flight_set) = in_flight_opt {
+                        if in_flight_set.contains(&ino) {
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            loop {
+                                if !in_flight_set.contains(&ino) { break; }
+                                if std::time::Instant::now() >= deadline {
+                                    warn!("read: timed out waiting for in-flight flush on inode {}, proceeding with server read", ino);
+                                    break;
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                            }
+                        }
+                    }
+                }
 
                 // Spawn background flush if needed (don't block read operation)
                 if should_flush_buffer {
@@ -1906,12 +1929,25 @@ impl Filesystem for DfsFilesystem {
                                 }
                             }
                         }
+                        let fetch_start = std::time::Instant::now();
                         if let Ok(sub_entries) = client.list_directory(&subdir).await {
-                            // Cache the directory listing
-                            dir_cache.write().unwrap().insert(
-                                subdir.clone(),
-                                (sub_entries.clone(), std::time::Instant::now()),
-                            );
+                            // Only cache if the directory hasn't been invalidated while we
+                            // were fetching.  An invalidation removes the entry from the cache
+                            // (e.g. a concurrent create/unlink in that directory); reinserting
+                            // stale prefetch results would hide the new file from the next
+                            // readdir until the 30-second TTL expires.
+                            let mut cache = dir_cache.write().unwrap();
+                            let still_valid = match cache.get(&subdir) {
+                                Some((_, ts)) => *ts < fetch_start, // entry predates our fetch
+                                None => false, // was invalidated — do not reinsert
+                            };
+                            if still_valid {
+                                cache.insert(
+                                    subdir.clone(),
+                                    (sub_entries.clone(), std::time::Instant::now()),
+                                );
+                            }
+                            drop(cache);
                             // Cache metadata for each entry so getattr is instant too
                             let now = std::time::Instant::now();
                             for entry in &sub_entries {

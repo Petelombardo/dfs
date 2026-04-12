@@ -544,6 +544,53 @@ impl DfsClient {
 
         let buf = match tokio::time::timeout(tokio::time::Duration::from_secs(3), io_future).await {
             Ok(Ok(buf)) => buf,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe
+                        || e.kind() == std::io::ErrorKind::ConnectionReset
+                        || e.kind() == std::io::ErrorKind::ConnectionAborted => {
+                // Stale pooled connection — retry with a fresh connection, same as the timeout path.
+                // Do NOT record a health failure; the node itself is fine.
+                debug!("Stale pooled connection to {} ({}), retrying with fresh connection", addr, e);
+                let mut fresh = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node {}: {}", addr, e));
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
+                    }
+                };
+                let len = encoded.len() as u32;
+                let retry_result = async {
+                    fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
+                    fresh.write_all(&encoded).await.context("write body")?;
+                    fresh.flush().await.context("flush")?;
+                    let mut len_buf = [0u8; 4];
+                    fresh.read_exact(&mut len_buf).await.context("read len")?;
+                    let rlen = u32::from_be_bytes(len_buf) as usize;
+                    let mut buf = vec![0u8; rlen];
+                    fresh.read_exact(&mut buf).await.context("read body")?;
+                    Ok::<Vec<u8>, anyhow::Error>(buf)
+                };
+                match tokio::time::timeout(tokio::time::Duration::from_secs(3), retry_result).await {
+                    Ok(Ok(buf)) => {
+                        stream = fresh;
+                        buf
+                    }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Timeout reading chunk from {}", addr));
+                    }
+                }
+            }
             Ok(Err(e)) => {
                 self.node_health.record_failure(addr).await;
                 return Err(anyhow::anyhow!("I/O error talking to {}: {}", addr, e));

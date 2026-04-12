@@ -82,13 +82,21 @@ impl WriteBuffer {
     /// 1. Buffer is reasonably full (>= 50% = 2MB) AND idle (5+ seconds), OR
     /// 2. Buffer is very idle (30+ seconds) regardless of size (file closed/abandoned)
     fn should_background_flush(&self, threshold: usize) -> bool {
+        let chunk_size = 4 * 1024 * 1024usize; // 4MB — must match server chunk size
+
+        // Always flush immediately when we have at least one complete 4MB chunk ready.
+        // This is the primary trigger for active recordings: write() no longer does any
+        // inline network I/O, so the background flusher must drain the buffer promptly.
+        if self.data.len() >= chunk_size {
+            return true;
+        }
+
         if let Ok(elapsed) = self.last_modified.elapsed() {
             let is_idle = elapsed > std::time::Duration::from_secs(15);
             let is_very_idle = elapsed > std::time::Duration::from_secs(60);
-            let is_reasonably_full = self.data.len() >= threshold / 2; // >= 2MB for 4MB threshold
+            let is_reasonably_full = self.data.len() >= threshold / 2;
 
             // Flush if substantially full and idle, OR very idle (abandoned file)
-            // Idle threshold increased to 15s to accommodate DVR's bursty write pattern (128KB every ~5-10s)
             (is_reasonably_full && is_idle) || is_very_idle
         } else {
             false
@@ -308,7 +316,7 @@ impl DfsFilesystem {
             let metadata_cache_for_cleanup = metadata_cache.clone();
             let flush_threshold = buffer_flush_threshold;
             runtime.spawn(async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
                 loop {
                     interval.tick().await;
 
@@ -1970,9 +1978,9 @@ impl Filesystem for DfsFilesystem {
                         let metadata_cache_clone4 = metadata_cache.clone();
                         let metadata_cache_clone5 = metadata_cache.clone();
                         let metadata_cache_clone6 = metadata_cache.clone();
-                        let last_metadata_update2 = last_metadata_update.clone();
+
                         let write_counters2 = write_counters.clone();
-                        let runtime2 = runtime.clone();
+
                         let padded_len = padded.len();
                         let buffer_flush_threshold2 = self.buffer_flush_threshold;
 
@@ -2028,31 +2036,13 @@ impl Filesystem for DfsFilesystem {
                         });
 
                         match gap_result {
-                            Ok((flush_now, _)) => {
+                            Ok((_flush_now, _)) => {
                                 {
                                     let mut counters = write_counters2.write().unwrap();
                                     let c = counters.entry(ino).or_insert(0);
                                     *c += 1;
                                 }
-                                if flush_now {
-                                    let flush_threshold_gap = self.buffer_flush_threshold;
-                                    if let Err(e) = runtime2.block_on(async {
-                                        flush_buffer_standalone(
-                                            ino,
-                                            &client,
-                                            &metadata_cache,
-                                            &write_buffers,
-                                            &last_metadata_update2,
-                                            &write_counters2,
-                                            flush_threshold_gap,
-                                            false,
-                                        ).await
-                                    }) {
-                                        error!("Failed to flush after gap-fill for inode {}: {}", ino, e);
-                                        reply.error(libc::EIO);
-                                        return;
-                                    }
-                                }
+                                // Background flusher handles draining — no inline network I/O.
                                 reply.written(data_vec.len() as u32);
                                 return;
                             }
@@ -2132,11 +2122,8 @@ impl Filesystem for DfsFilesystem {
 
                     let write_buffers_clone = write_buffers.clone();
                     let client_clone = client.clone();
-                    let client_clone2 = client.clone(); // for threshold flush after should_flush async move
-                    let metadata_cache_clone = metadata_cache.clone();
                     let metadata_cache_clone2 = metadata_cache.clone();
                     let metadata_cache_clone3 = metadata_cache.clone();
-                    let runtime_clone = runtime.clone();
                     let data_slice = &data_vec[..];
 
                     let should_flush = runtime.block_on(async move {
@@ -2237,136 +2224,10 @@ impl Filesystem for DfsFilesystem {
                                 *c += 1;
                             }
 
-                            // Flush if buffer is too large (BLOCKING to avoid gaps)
-                            if flush_now {
-                                debug!("Buffer threshold reached, flushing inode {}", ino);
-
-                                // Blocking flush
-                                let flush_result = runtime_clone.block_on(async {
-                                    // Clone the buffer data for flushing, but keep buffer for reads
-                                    // This prevents read gaps during the flush operation
-                                    let buffer_data: Option<(Vec<u8>, u64, usize)> = {
-                                        if let Some(buffer_lock) = write_buffers.get(&ino) {
-                                            let mut buffer = buffer_lock.lock().await;
-                                            let buffer_size = buffer.data.len();
-
-                                            // Only flush multiples of chunk_size to prevent server from creating tiny overflow chunks
-                                            // If buffer = 4.2MB, flush only 4MB and leave 200KB in buffer
-                                            // CRITICAL: Must align to chunk_size (4MB), NOT buffer_flush_threshold (12MB)!
-                                            let chunk_size = 4 * 1024 * 1024; // 4MB - must match server chunk size
-                                            let flush_size = (buffer_size / chunk_size) * chunk_size;
-
-                                            if flush_size == 0 {
-                                                // Buffer < threshold, nothing to flush
-                                                return Ok(());
-                                            }
-
-                                            let start: u64 = buffer.start_offset;
-                                            let drop_trailing = std::mem::replace(&mut buffer.drop_trailing_chunks_on_flush, 0);
-                                            let data: Vec<u8> = if flush_size == buffer_size {
-                                                // Flush entire buffer (it's exactly a multiple of chunk_size)
-                                                let data = std::mem::take(&mut buffer.data);
-                                                // CRITICAL: Update start_offset to point past the flushed data
-                                                // After flush, buffer is empty but future writes start at (old_start + flush_size)
-                                                buffer.start_offset = start + flush_size as u64;
-                                                data
-                                            } else {
-                                                // Flush only the aligned portion, keep overflow
-                                                let flush_data = buffer.data.drain(..flush_size).collect();
-                                                // CRITICAL: After drain, buffer.data[0] corresponds to file offset
-                                                // (start_offset + flush_size), so we must update start_offset accordingly
-                                                buffer.start_offset = start + flush_size as u64;
-                                                flush_data
-                                            };
-
-                                            buffer.last_modified = SystemTime::now();
-                                            Some((data, start, drop_trailing))
-                                        } else {
-                                            None
-                                        }
-                                    };
-
-                                    if let Some((data, buffer_start_offset, drop_trailing)) = buffer_data {
-                                        info!("Flushing {} bytes for inode {}", data.len(), ino);
-
-                                        // Get current metadata from cache
-                                        let mut flush_metadata = {
-                                            let cache = metadata_cache_clone.read().unwrap();
-                                            match cache.get(&ino) {
-                                                Some(m) => m.clone(),
-                                                None => {
-                                                    return Err(anyhow::anyhow!("Metadata not found for inode {}", ino));
-                                                }
-                                            }
-                                        };
-
-                                        // If the buffer was pre-seeded with a partial last chunk,
-                                        // drop that chunk before extending — it will be replaced.
-                                        if drop_trailing > 0 {
-                                            let keep = flush_metadata.chunk_locations.len().saturating_sub(drop_trailing);
-                                            flush_metadata.chunk_locations.truncate(keep);
-                                            let keep_legacy = flush_metadata.chunks.len().saturating_sub(drop_trailing);
-                                            flush_metadata.chunks.truncate(keep_legacy);
-                                            flush_metadata.chunk_sizes.truncate(keep_legacy);
-                                        }
-
-                                        // Write buffered data as new chunks with caching
-                                        let (new_chunk_ids, new_chunk_sizes, chunk_locations_opt) = client_clone2
-                                            .write_data_with_cache(&data, cache_inode, buffer_start_offset)
-                                            .await?;
-
-                                        // Calculate new size before moving chunk data
-                                        let new_size = buffer_start_offset + data.len() as u64;
-                                        let num_chunks = new_chunk_ids.len();
-
-                                        // If dual-replica writes provided chunk_locations, use them
-                                        if let Some(chunk_locations) = chunk_locations_opt {
-                                            flush_metadata.chunk_locations.extend(chunk_locations);
-                                        }
-                                        // Append new chunks to existing chunks and update size
-                                        flush_metadata.chunks.extend(new_chunk_ids);
-                                        flush_metadata.chunk_sizes.extend(new_chunk_sizes);
-                                        flush_metadata.size = new_size;
-                                        flush_metadata.modified_at = SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_secs();
-
-                                        info!("Flush complete: {} chunks added at offset {}, total file size {}",
-                                              num_chunks, buffer_start_offset, new_size);
-
-                                        // Store updated metadata (use time-based batching for auto-flush)
-                                        // Check if we should update based on time
-                                        let should_update_meta = {
-                                            let last_update_lock = last_metadata_update.read().unwrap();
-                                            match last_update_lock.get(&ino) {
-                                                None => true,  // First write
-                                                Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
-                                            }
-                                        };
-
-                                        if should_update_meta {
-                                            debug!("Auto-flush: updating metadata for inode {} (time-based batching)", ino);
-                                            client_clone2.put_file_metadata(&flush_metadata).await?;
-                                            last_metadata_update.write().unwrap().insert(ino, std::time::Instant::now());
-                                        } else {
-                                            debug!("Auto-flush: skipping metadata update for inode {} (batched)", ino);
-                                        }
-
-                                        // Always update cache
-                                        metadata_cache_clone.write().unwrap().insert(ino, flush_metadata);
-                                    }
-
-                                    Ok::<(), anyhow::Error>(())
-                                });
-
-                                if let Err(e) = flush_result {
-                                    error!("Failed to auto-flush buffer: {}", e);
-                                    reply.error(libc::EIO);
-                                    return;
-                                }
-                            }
-
+                            // Data is now in the write buffer. The background flusher
+                            // (running every 500ms) will drain it to the cluster as soon
+                            // as a full 4MB chunk is ready. write() does no network I/O.
+                            let _ = flush_now; // flushing is handled by background flusher
                             let total_elapsed = start.elapsed();
                             debug!("BUFFERED write() took {:?} for {} bytes ({:.2} MB/s)",
                                 total_elapsed, data_vec.len(),

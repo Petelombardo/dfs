@@ -1395,43 +1395,62 @@ impl Server {
             }
 
             let immediate_replicas = if self.replication_factor >= 3 { 2 } else { self.replication_factor };
-            let mut success_count = 0;
-            let mut successful_nodes: Vec<dfs_common::NodeId> = Vec::new();
 
-            for node_id in &target_nodes {
-                if success_count >= immediate_replicas {
-                    break;
-                }
+            // Fire all replica writes in parallel — same approach as the original client-side
+            // dual-write. Both the local write and the remote ReplicateChunk are spawned
+            // simultaneously; we wait for all quorum tasks together before ACKing.
+            let quorum_nodes: Vec<dfs_common::NodeId> = target_nodes.iter()
+                .take(immediate_replicas)
+                .copied()
+                .collect();
+
+            let mut write_tasks = Vec::new();
+            for node_id in &quorum_nodes {
                 let node_id = *node_id;
+                let chunk_id = *chunk_id;
+                let chunk_data = chunk_data.clone();
+                let storage = self.storage.clone();
+                let cluster = self.cluster.clone();
+                let client = self.client.clone();
+                let local_id = self.cluster.local_node_id();
 
-                let ok = if node_id == self.cluster.local_node_id() {
-                    self.storage.write_chunk(chunk_id, chunk_data).is_ok()
-                } else {
-                    match self.cluster.get_node(&node_id).await {
-                        Some(node_info) => {
-                            let request = Request::ReplicateChunk {
-                                chunk_id: *chunk_id,
-                                data: chunk_data.clone(),
-                                checksum: chunk_id.hash,
-                            };
-                            matches!(
-                                self.client.send_message(node_info.addr, Message::Request(request)).await,
-                                Ok(dfs_common::protocol::MessageEnvelope { message: Message::Response(Response::Ok { .. }), .. })
-                            )
-                        }
-                        None => false,
+                write_tasks.push(tokio::spawn(async move {
+                    if node_id == local_id {
+                        let ok = storage.write_chunk(&chunk_id, &chunk_data).is_ok();
+                        (node_id, ok)
+                    } else {
+                        let ok = match cluster.get_node(&node_id).await {
+                            Some(node_info) => {
+                                let request = Request::ReplicateChunk {
+                                    chunk_id,
+                                    data: chunk_data,
+                                    checksum: chunk_id.hash,
+                                };
+                                matches!(
+                                    client.send_message(node_info.addr, Message::Request(request)).await,
+                                    Ok(dfs_common::protocol::MessageEnvelope {
+                                        message: Message::Response(Response::Ok { .. }), ..
+                                    })
+                                )
+                            }
+                            None => false,
+                        };
+                        (node_id, ok)
                     }
-                };
+                }));
+            }
 
-                if ok {
-                    success_count += 1;
+            let mut successful_nodes: Vec<dfs_common::NodeId> = Vec::new();
+            for task in write_tasks {
+                if let Ok((node_id, true)) = task.await {
                     successful_nodes.push(node_id);
                 }
             }
 
-            if success_count < immediate_replicas {
+            if successful_nodes.len() < immediate_replicas {
                 return Response::Error {
-                    message: format!("Failed to achieve quorum for chunk {} ({}/{})", chunk_id, success_count, immediate_replicas),
+                    message: format!("Failed to achieve quorum for chunk {} ({}/{})",
+                                     chunk_id, successful_nodes.len(), immediate_replicas),
                     code: ErrorCode::IOError,
                 };
             }

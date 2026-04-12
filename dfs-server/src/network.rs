@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use bytes::{Buf, BytesMut};
+use dashmap::DashMap;
 use dfs_common::{Message, MessageEnvelope, Request, RequestId, Response, ErrorCode, ClusterMessage};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -247,8 +248,8 @@ async fn process_message<H: MessageHandler>(
 pub struct NetworkClient {
     /// Request ID counter
     next_request_id: Arc<AtomicU64>,
-    /// Idle connection pool: peer addr -> queue of reusable TcpStreams (cap 4 per peer)
-    pool: Arc<Mutex<HashMap<SocketAddr, VecDeque<TcpStream>>>>,
+    /// Idle connection pool: per-peer queue of reusable TcpStreams (cap 4 per peer)
+    pool: Arc<DashMap<SocketAddr, Mutex<VecDeque<TcpStream>>>>,
 }
 
 impl NetworkClient {
@@ -256,7 +257,7 @@ impl NetworkClient {
     pub fn new() -> Self {
         Self {
             next_request_id: Arc::new(AtomicU64::new(1)),
-            pool: Arc::new(Mutex::new(HashMap::new())),
+            pool: Arc::new(DashMap::new()),
         }
     }
 
@@ -271,9 +272,10 @@ impl NetworkClient {
 
         // Try a pooled connection first; fall back to a fresh one if the pool is empty
         // or the connection has gone stale (detected by write/read failure).
-        let stream = {
-            let mut pool = self.pool.lock().await;
-            pool.get_mut(&target).and_then(|q| q.pop_front())
+        let stream = if let Some(entry) = self.pool.get(&target) {
+            entry.lock().await.pop_front()
+        } else {
+            None
         };
 
         let mut stream = match stream {
@@ -316,8 +318,10 @@ impl NetworkClient {
 
         // Return connection to pool (cap 4 idle per peer)
         {
-            let mut pool = self.pool.lock().await;
-            let queue = pool.entry(target).or_insert_with(VecDeque::new);
+            let entry = self.pool
+                .entry(target)
+                .or_insert_with(|| Mutex::new(VecDeque::new()));
+            let mut queue = entry.lock().await;
             if queue.len() < 4 {
                 queue.push_back(stream);
             }

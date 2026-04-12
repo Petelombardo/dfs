@@ -409,6 +409,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "dashmap",
  "dfs-common",
  "lru",
  "nix",

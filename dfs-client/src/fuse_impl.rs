@@ -2127,6 +2127,25 @@ impl Filesystem for DfsFilesystem {
                     let data_slice = &data_vec[..];
 
                     let should_flush = runtime.block_on(async move {
+                        // Back-pressure loop: if the buffer is already at the overflow threshold,
+                        // wait for the background flusher to drain it rather than returning EIO.
+                        // This replaces the hard EIO with a soft stall — the writer slows down
+                        // to match the flusher's drain rate instead of failing.
+                        let max_buffer_size: usize = buffer_flush_threshold * 3;
+                        loop {
+                            let buf_len = if let Some(entry) = write_buffers_clone.get(&ino) {
+                                entry.lock().await.data.len()
+                            } else {
+                                0
+                            };
+                            if buf_len <= max_buffer_size {
+                                break;
+                            }
+                            debug!("Back-pressure: inode {} buffer at {} bytes (max {}), waiting for flusher",
+                                   ino, buf_len, max_buffer_size);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        }
+
                         // Get or create buffer lock for this inode
                         let buffer_lock = write_buffers_clone.entry(ino).or_insert_with(|| {
                             // Calculate initial size
@@ -2191,16 +2210,6 @@ impl Filesystem for DfsFilesystem {
 
                         // No need to check idle here - we'll append data first, then check
                         // This ensures data isn't lost
-
-                        // Safety check: if buffer is already way too large, something is wrong
-                        // This can happen if writes backed up during lock contention
-                        // REDUCED from 12MB to 3MB (3x the new 1MB threshold)
-                        let max_buffer_size: usize = buffer_flush_threshold * 3;
-                        if buffer.data.len() > max_buffer_size {
-                            error!("Buffer overflow detected for inode {}: {} bytes (max {}), refusing to buffer more data",
-                                   ino, buffer.data.len(), max_buffer_size);
-                            return Err(anyhow::anyhow!("Buffer overflow"));
-                        }
 
                         // Append data to buffer
                         buffer.data.extend_from_slice(data_slice);

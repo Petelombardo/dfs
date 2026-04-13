@@ -367,6 +367,46 @@ impl From<ChunkLocationV1> for ChunkLocation {
     }
 }
 
+/// FileMetadata format before written_at was added to ChunkLocation (uses ChunkLocationV1)
+/// This is used to deserialize metadata written after sparse file support but before written_at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetadataV1 {
+    pub id: FileId,
+    pub path: String,
+    pub size: u64,
+    #[serde(default)]
+    pub chunks: Vec<ChunkId>,
+    #[serde(default)]
+    pub chunk_sizes: Vec<u64>,
+    pub created_at: u64,
+    pub modified_at: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub file_type: FileType,
+    #[serde(default)]
+    pub chunk_locations: Vec<ChunkLocationV1>,
+}
+
+impl From<FileMetadataV1> for FileMetadata {
+    fn from(v1: FileMetadataV1) -> Self {
+        FileMetadata {
+            id: v1.id,
+            path: v1.path,
+            size: v1.size,
+            chunks: v1.chunks,
+            chunk_sizes: v1.chunk_sizes,
+            created_at: v1.created_at,
+            modified_at: v1.modified_at,
+            mode: v1.mode,
+            uid: v1.uid,
+            gid: v1.gid,
+            file_type: v1.file_type,
+            chunk_locations: v1.chunk_locations.into_iter().map(|loc| loc.into()).collect(),
+        }
+    }
+}
+
 /// Legacy FileMetadata format (before sparse file support with ChunkLocationV0)
 /// This is used to deserialize old metadata from bincode format
 #[derive(Debug, Clone, Serialize, Deserialize)]

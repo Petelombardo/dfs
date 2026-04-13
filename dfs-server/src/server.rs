@@ -544,7 +544,9 @@ impl Server {
     async fn handle_replicate_metadata(&self, metadata: FileMetadata) -> Response {
         debug!("Handling replicate metadata: {}", metadata.path);
 
-        // Store metadata locally without re-replicating (to avoid loops)
+        // Store metadata locally without re-replicating (to avoid loops).
+        // put_file() merges chunk_locations with existing ones, so healed replica
+        // nodes are preserved even when the incoming message carries a stale 2-node list.
         match self.metadata.put_file(&metadata) {
             Ok(_) => {
                 // Keep chunk map in sync on all nodes for seamless leader failover

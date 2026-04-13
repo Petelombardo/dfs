@@ -52,6 +52,11 @@ pub struct HealingManager {
     /// multiple nodes run the healer concurrently for the same chunk.
     /// A chunk is inserted before replication begins and removed on completion.
     in_flight_healing: Arc<RwLock<HashSet<ChunkId>>>,
+
+    /// Per-chunk confirmed-alive node list from the most recent discovery scan.
+    /// Written by run_discovery_loop(); read by run_heal_loop() so the heal loop
+    /// can issue PushChunkTo without waiting for a new full scan each time.
+    alive_nodes_cache: Arc<RwLock<HashMap<ChunkId, Vec<NodeId>>>>,
 }
 
 impl HealingManager {
@@ -66,15 +71,17 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
     ) -> Self {
-        // Heal up to 100 chunks per cycle. Keeps the connection rate low enough
-        // The broadcast_semaphore (20 permits) is the real fd guard; these caps
-        // control batch sizing and inter-batch pacing.  With RF=3 and dual-parallel
-        // client writes, every chunk needs the healer to place the 3rd replica.
-        // At 2MB/s DVR write rate that's ~30 new under-replicated chunks/min — the
-        // healer must comfortably exceed that to avoid an ever-growing backlog.
-        // 8 concurrent × 100ms between batches ≈ 80 heals/min steady-state.
+        // Concurrency and pacing tuned to avoid overwhelming nodes with chunk push
+        // traffic. Each PushChunkTo streams up to 4MB synchronously; 8 concurrent
+        // transfers was saturating the TCP stack and causing heartbeat misses → node
+        // failure detection → leader changes → all in-flight heals rejected.
+        //
+        // 2 concurrent × 1s between batches = gentle steady drip that leaves plenty
+        // of bandwidth and Tokio task capacity for heartbeats and client I/O.
+        // At 4MB chunks over a LAN this is still ~8MB/s of healing throughput, well
+        // above the ~2MB/s DVR write rate that generates new under-replicated chunks.
         let max_heal_per_cycle = 200;
-        let max_concurrent_heals = 8;
+        let max_concurrent_heals = 2;
 
         Self {
             storage,
@@ -89,6 +96,7 @@ impl HealingManager {
             max_concurrent_heals,
             pending_healing: Arc::new(RwLock::new(HashMap::new())),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
+            alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -104,33 +112,39 @@ impl HealingManager {
             self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle, self.max_concurrent_heals
         );
 
-        // Start healing checker (runs every minute)
-        let healing_checker = self.clone();
+        // Discovery loop: scans all chunks, bulk-queries nodes, classifies under/over
+        // replication, purges orphans. Runs every 60s and writes into pending_healing
+        // and alive_nodes_cache.
+        let discovery = self.clone();
         tokio::spawn(async move {
-            healing_checker.run_healing_checker().await;
+            discovery.run_discovery_loop().await;
         });
 
-        // Start scrubber (runs at configured interval)
+        // Heal loop: drains pending_healing using cached alive_nodes data. Runs every
+        // 15s and starts immediately on the first tick — no waiting for discovery.
+        let healer = self.clone();
+        tokio::spawn(async move {
+            healer.run_heal_loop().await;
+        });
+
+        // Scrubber (runs at configured interval)
         let scrubber = self.clone();
         tokio::spawn(async move {
             scrubber.run_scrubber().await;
         });
     }
 
-    /// Run periodic healing checker — only executes on the cluster leader.
+    /// Discovery loop — runs every 60s on the cluster leader.
     ///
-    /// Leadership is derived from the gossip cluster view: the online node with
-    /// the minimum NodeId is the leader. All nodes compute this identically so
-    /// no election protocol is needed. When the leader goes offline the next
-    /// lowest-ID node takes over on its next interval tick.
-    async fn run_healing_checker(&self) {
-        let mut cleanup_counter = 0;
+    /// Performs the expensive full scan: sled enumeration, bulk HasChunks RPCs,
+    /// orphan purge, ghost node pruning, and classification of under/over-replicated
+    /// chunks into pending_healing. Writes confirmed-alive node sets into
+    /// alive_nodes_cache so the heal loop can act without waiting for this scan.
+    async fn run_discovery_loop(&self) {
+        let mut cleanup_counter = 0u32;
         let mut was_leader = false;
 
         loop {
-            // Sleep first so startup doesn't immediately trigger a heal cycle.
-            // Using sleep-after-completion rather than a fixed interval ensures
-            // we never queue a second cycle before the first one finishes.
             tokio::time::sleep(Duration::from_secs(60)).await;
 
             let is_leader = self.cluster.is_leader().await;
@@ -145,17 +159,14 @@ impl HealingManager {
             }
 
             if !is_leader {
-                // Followers do not run orphan purge.  The leader purges orphaned
+                // Followers do not run orphan purge. The leader purges orphaned
                 // chunk: records and broadcasts PurgeChunkLocation to all followers,
                 // so follower DBs drain via targeted deletes rather than a local scan.
-                // Independent follower purging is unsafe: a follower can have chunk:
-                // records for a live recording whose file: metadata hasn't been flushed
-                // yet, and would incorrectly classify those chunks as orphans.
                 continue;
             }
 
-            if let Err(e) = self.check_and_heal().await {
-                warn!("Healing check error: {}", e);
+            if let Err(e) = self.run_discovery_pass().await {
+                warn!("Discovery pass error: {}", e);
             }
 
             cleanup_counter += 1;
@@ -164,6 +175,35 @@ impl HealingManager {
                 if let Err(e) = self.cleanup_stale_pending().await {
                     warn!("Pending healing cleanup error: {}", e);
                 }
+            }
+        }
+    }
+
+    /// Heal loop — runs every 15s on the cluster leader.
+    ///
+    /// Drains pending_healing for chunks that have waited healing_delay_secs,
+    /// using alive_nodes_cache populated by the discovery loop. Starts immediately
+    /// on first tick so chunks discovered in a previous cycle are healed right away
+    /// without waiting another 60s for a fresh scan.
+    async fn run_heal_loop(&self) {
+        let mut was_leader = false;
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+
+            let is_leader = self.cluster.is_leader().await;
+
+            if is_leader != was_leader {
+                was_leader = is_leader;
+                // Leadership transitions are logged by the discovery loop
+            }
+
+            if !is_leader {
+                continue;
+            }
+
+            if let Err(e) = self.drain_heal_queue().await {
+                warn!("Heal queue drain error: {}", e);
             }
         }
     }
@@ -225,14 +265,11 @@ impl HealingManager {
         }
     }
 
-    /// Check all chunks and heal under-replicated ones.
-    /// As leader, iterates over ALL chunk IDs known in metadata — not just local
-    /// ones — so it can coordinate healing regardless of where the data lives.
-    ///
-    /// Up to `max_heal_per_cycle` chunks are queued per cycle; up to
-    /// `max_concurrent_heals` ops run in parallel, each throttled by 200ms after
-    /// completion to avoid connection storms.
-    async fn check_and_heal(&self) -> Result<()> {
+    /// Discovery pass — scans all chunk IDs, bulk-queries node presence, classifies
+    /// under/over-replicated chunks into pending_healing, and updates alive_nodes_cache.
+    /// Called by run_discovery_loop() every 60s. Does NOT issue any PushChunkTo —
+    /// actual healing is handled by drain_heal_queue().
+    async fn run_discovery_pass(&self) -> Result<()> {
         debug!("Running healing check");
 
         // Gate destructive operations on quorum. Under-replication healing is always
@@ -244,16 +281,15 @@ impl HealingManager {
             warn!("Leader does not have quorum — skipping destructive healing operations (orphan purge, over-replication cleanup)");
         }
 
-        // Both list_all_chunk_ids and live_chunk_ids iterate large RocksDB datasets
-        // synchronously. Running them on a Tokio worker thread blocks the async
-        // executor — starving the network accept loop and causing visible latency on
-        // `dfs-admin` commands. Offload to the blocking thread pool instead.
-        let metadata = self.metadata.clone();
-        let (all_chunks, live_chunks) = tokio::task::spawn_blocking(move || {
-            let all = metadata.list_all_chunk_ids()?;
-            let live = metadata.live_chunk_ids()?;
+        // Kick off the sled scan concurrently with the HasChunks RPCs below.
+        // list_all_chunk_ids + live_chunk_ids are blocking sled scans — offload them
+        // so they don't hold the async executor while the bulk RPCs are in flight.
+        let metadata_scan = self.metadata.clone();
+        let scan_handle = tokio::task::spawn_blocking(move || {
+            let all = metadata_scan.list_all_chunk_ids()?;
+            let live = metadata_scan.live_chunk_ids()?;
             Ok::<_, anyhow::Error>((all, live))
-        }).await.context("spawn_blocking for chunk scan panicked")??;
+        });
 
         // First pass: classify all chunks.
         //
@@ -264,9 +300,30 @@ impl HealingManager {
         // one bulk RPC, then classify every chunk locally using the result maps.
         // This reduces scan-phase connections from potentially thousands to just one
         // per online node.
-        let mut work: Vec<(ChunkId, ReplicationStatus)> = Vec::new();
+        // While the sled scan runs in the background, do the HasChunks bulk RPCs
+        // concurrently — both are high-latency operations and neither depends on
+        // the other's results yet.
+        let local_id = self.cluster.local_node_id();
+        let online_nodes: Vec<_> = self.cluster.get_all_nodes().await
+            .into_iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online)
+            .collect();
+
+        // node_id → HashSet<ChunkId> of chunks confirmed present on that node.
+        // We can't send HasChunks yet (don't have chunk list), but we CAN collect
+        // the online node list and check local storage — done above.
+        // HasChunks RPCs happen after we have the chunk list from the scan below.
+
+        // Now await the scan — it's been running concurrently with the online_nodes fetch.
+        let (all_chunks, live_chunks) = scan_handle
+            .await
+            .context("spawn_blocking for chunk scan panicked")??;
+
+        // work carries (chunk_id, status, confirmed_alive_node_ids) from the bulk scan.
+        // Passing confirmed-alive nodes avoids re-querying in the heal path, which would
+        // race against transient RPC failures and misclassify good nodes as ghosts.
+        let mut work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = Vec::new();
         let mut pending_count = 0;
-        let mut skipped_count = 0;
         let mut orphan_count = 0;
 
         // Separate orphan candidates (no network I/O) from live chunks to check.
@@ -327,12 +384,6 @@ impl HealingManager {
 
         // Bulk-query each online remote node: "which of these chunks do you hold?"
         // One HasChunks RPC per node replaces O(chunks) HasChunk RPCs per node.
-        let local_id = self.cluster.local_node_id();
-        let online_nodes: Vec<_> = self.cluster.get_all_nodes().await
-            .into_iter()
-            .filter(|n| n.status == dfs_common::NodeStatus::Online)
-            .collect();
-
         // node_id → HashSet<ChunkId> of chunks confirmed present on that node
         let mut node_chunk_presence: HashMap<NodeId, HashSet<ChunkId>> = HashMap::new();
 
@@ -380,19 +431,17 @@ impl HealingManager {
             }
         }
 
-        // Now classify each chunk locally using the presence maps — no more network I/O.
-        // Yield to the Tokio scheduler every 100 chunks so the network accept loop
-        // isn't starved by the synchronous RocksDB reads in get_chunk_location.
+        // Classify all chunks — no work cap here. Every chunk must be classified so
+        // that pending_healing timestamps are updated for all under-replicated chunks,
+        // not just the first max_heal_per_cycle. Without this, chunks past position 200
+        // never enter pending_healing and never get healed until the queue drains.
+        // The work batch is capped after classification, sorted oldest-first so long-
+        // waiting chunks are not perpetually starved by newer ones.
         let mut classify_count = 0usize;
         for chunk_id in chunks_to_check {
             classify_count += 1;
             if classify_count % 100 == 0 {
                 tokio::task::yield_now().await;
-            }
-
-            if work.len() >= self.max_heal_per_cycle {
-                skipped_count += 1;
-                continue;
             }
 
             let location = match self.metadata.get_chunk_location(&chunk_id) {
@@ -403,81 +452,96 @@ impl HealingManager {
 
             let mut actual_replicas = 0usize;
             let mut nodes_without_chunk: Vec<NodeId> = Vec::new();
+            let mut confirmed_alive_nodes: Vec<NodeId> = Vec::new();
 
             for node_id in &location.nodes {
                 // Only count online nodes — offline nodes are expected to be absent.
                 if online_nodes.iter().any(|n| n.id == *node_id) {
                     if node_chunk_presence.get(node_id).map_or(false, |s| s.contains(&chunk_id)) {
                         actual_replicas += 1;
+                        confirmed_alive_nodes.push(*node_id);
                     } else {
                         nodes_without_chunk.push(*node_id);
                     }
                 }
             }
 
-            // Prune ghost nodes: metadata lists a node as holding the chunk but it
-            // doesn't actually have it (stale metadata from a failed write push).
-            //
-            // Safety guard: only prune if at least one replica survives. If actual_replicas
-            // is zero, every online node that was supposed to hold the chunk is missing it —
-            // this means the chunk files were lost (e.g. OOM crash mid-write). Pruning in
-            // that case would destroy the last record of which nodes *should* have had the
-            // data, making recovery impossible and turning a "lost chunk" into a silent gap.
-            // Leave the metadata intact so the unrecoverable loss is visible and auditable.
+            // Ghost node pruning: only remove a node from metadata after the healing
+            // delay has passed for this chunk. A single HasChunks miss is not enough —
+            // the node may have just restarted (connections drop, storage comes up within
+            // seconds, but the next heal cycle is 60s away). We wait healing_delay_secs
+            // before trusting the miss, same patience we apply to under-replication.
             if !nodes_without_chunk.is_empty() && actual_replicas > 0 {
-                warn!(
-                    "Chunk {} metadata lists {} online node(s) that don't hold the data — pruning: {:?}",
-                    chunk_id, nodes_without_chunk.len(), nodes_without_chunk
-                );
-                let pruned_nodes: Vec<NodeId> = location.nodes.iter()
-                    .filter(|n| !nodes_without_chunk.contains(n))
-                    .copied()
-                    .collect();
-                let updated_location = ChunkLocation {
-                    chunk_id,
-                    nodes: pruned_nodes,
-                    size: location.size,
-                    checksum: location.checksum,
-                    file_offset: location.file_offset,
-                    written_at: location.written_at,
-                };
-                if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
-                    warn!("Failed to prune ghost nodes from chunk {} metadata: {}", chunk_id, e);
+                let pending = self.pending_healing.read().await;
+                let delay_passed = pending.get(&chunk_id)
+                    .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs));
+                drop(pending);
+
+                if delay_passed {
+                    warn!(
+                        "Chunk {} — pruning {} ghost node(s) after delay (confirmed missing for {}s+): {:?}",
+                        chunk_id, nodes_without_chunk.len(), self.healing_delay_secs, nodes_without_chunk
+                    );
+                    let pruned_nodes: Vec<NodeId> = location.nodes.iter()
+                        .filter(|n| !nodes_without_chunk.contains(n))
+                        .copied()
+                        .collect();
+                    let updated_location = ChunkLocation {
+                        chunk_id,
+                        nodes: pruned_nodes,
+                        size: location.size,
+                        checksum: location.checksum,
+                        file_offset: location.file_offset,
+                        written_at: location.written_at,
+                    };
+                    if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
+                        warn!("Failed to prune ghost nodes from chunk {} metadata: {}", chunk_id, e);
+                    } else {
+                        HealingManager::broadcast_chunk_location_shared(&updated_location, &self.cluster, &self.client).await;
+                    }
                 } else {
-                    HealingManager::broadcast_chunk_location_shared(&updated_location, &self.cluster, &self.client).await;
+                    debug!(
+                        "Chunk {} — {} online node(s) didn't confirm holding it, waiting for delay before pruning: {:?}",
+                        chunk_id, nodes_without_chunk.len(), nodes_without_chunk
+                    );
                 }
-            } else if !nodes_without_chunk.is_empty() && actual_replicas == 0 {
-                warn!(
-                    "Chunk {} is unrecoverable — lost from all {} online node(s) that metadata lists: {:?}",
-                    chunk_id, nodes_without_chunk.len(), nodes_without_chunk
-                );
             }
 
             let replication_factor = self.replication_factor;
 
-            // Detect unrecoverable chunks: actual_replicas == 0 and either:
-            //  (a) the metadata node list is empty (nodes were already pruned — no record
-            //      of where the chunk ever lived), OR
-            //  (b) every node listed in metadata was successfully queried (reachable) and
-            //      confirmed it doesn't have the chunk.
-            // We require reachability for case (b) so a transient RPC failure can't cause
-            // us to write off a chunk that a temporarily-unreachable node still holds.
-            //
-            // When confirmed unrecoverable, delete the chunk location metadata so the stale
-            // record doesn't keep re-entering the scan every cycle. The data is already gone —
-            // leaving the metadata makes the file appear to have chunks it doesn't have.
+            // Detect unrecoverable chunks: actual_replicas == 0 and all metadata nodes
+            // were reachable and confirmed they don't have it (or node list is empty).
+            // Requirements before declaring unrecoverable:
+            //  1. All metadata nodes must be reachable (online + responded to HasChunks) —
+            //     an offline node might still hold the chunk.
+            //  2. The healing delay must have passed — a node that just restarted may be
+            //     online and responding but its storage could still be loading. We wait the
+            //     same delay we use for under-replication before writing off the data.
             let all_metadata_nodes_reachable = location.nodes.iter()
                 .all(|n| node_chunk_presence.contains_key(n));
             if actual_replicas == 0 && (location.nodes.is_empty() || all_metadata_nodes_reachable) {
-                warn!(
-                    "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
-                    chunk_id, location.nodes.len()
-                );
-                if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
-                    warn!("Failed to purge unrecoverable chunk {} metadata: {}", chunk_id, e);
+                let pending = self.pending_healing.read().await;
+                let delay_passed = location.nodes.is_empty() ||
+                    pending.get(&chunk_id)
+                        .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs));
+                drop(pending);
+
+                if delay_passed {
+                    warn!(
+                        "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
+                        chunk_id, location.nodes.len()
+                    );
+                    if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
+                        warn!("Failed to purge unrecoverable chunk {} metadata: {}", chunk_id, e);
+                    }
+                    self.pending_healing.write().await.remove(&chunk_id);
+                    continue;
+                } else {
+                    debug!(
+                        "Chunk {} has 0 accessible replicas but delay not yet passed — waiting before declaring unrecoverable",
+                        chunk_id
+                    );
                 }
-                self.pending_healing.write().await.remove(&chunk_id);
-                continue;
             }
 
             let status = if actual_replicas < replication_factor {
@@ -501,14 +565,14 @@ impl HealingManager {
                                 .entry(chunk_id)
                                 .or_insert_with(|| Instant::now() - Duration::from_secs(self.healing_delay_secs + 1));
                         }
-                        work.push((chunk_id, ReplicationStatus::UnderReplicated));
+                        work.push((chunk_id, ReplicationStatus::UnderReplicated, confirmed_alive_nodes.clone()));
                     } else {
                         pending_count += 1;
                     }
                 }
                 ReplicationStatus::OverReplicated => {
                     if quorum {
-                        work.push((chunk_id, ReplicationStatus::OverReplicated));
+                        work.push((chunk_id, ReplicationStatus::OverReplicated, confirmed_alive_nodes.clone()));
                     } else {
                         debug!("Skipping over-replication cleanup for {} — no quorum", chunk_id);
                     }
@@ -517,6 +581,24 @@ impl HealingManager {
                     self.pending_healing.write().await.remove(&chunk_id);
                 }
             }
+        }
+
+        // Update alive_nodes_cache so drain_heal_queue can read fresh presence data
+        // without waiting for another scan. Under-replicated and over-replicated chunks
+        // both need this; drain_heal_queue() reads the cache for all work it executes.
+        {
+            let mut cache = self.alive_nodes_cache.write().await;
+            for (chunk_id, _status, confirmed_alive) in &work {
+                cache.insert(*chunk_id, confirmed_alive.clone());
+            }
+            // Prune entries for chunks that are now Ok (pending removed above) or
+            // have been purged as orphans, so the cache doesn't grow unboundedly.
+            cache.retain(|chunk_id, _| {
+                self.metadata.get_chunk_location(chunk_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
         }
 
         if orphan_count > 0 {
@@ -528,24 +610,96 @@ impl HealingManager {
             }
         }
 
-        if work.is_empty() {
-            if pending_count > 0 {
-                debug!("Healing check: {} chunks pending delay", pending_count);
+        let under_count = work.iter().filter(|(_, s, _)| *s == ReplicationStatus::UnderReplicated).count();
+        let over_count  = work.iter().filter(|(_, s, _)| *s == ReplicationStatus::OverReplicated).count();
+        if under_count > 0 || over_count > 0 || pending_count > 0 {
+            info!(
+                "Discovery complete: under={}, over={}, pending_delay={}, orphans={}",
+                under_count, over_count, pending_count, orphan_count
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Drain the heal queue — issues PushChunkTo / DeleteChunkReplica for all chunks
+    /// in pending_healing whose delay has elapsed. Uses alive_nodes_cache populated by
+    /// run_discovery_pass() rather than re-scanning, so this can run frequently (15s)
+    /// without hammering the cluster with HasChunks RPCs on every tick.
+    async fn drain_heal_queue(&self) -> Result<()> {
+        let quorum = self.cluster.has_quorum().await;
+
+        // Build work list from pending_healing entries whose delay has passed.
+        // Read pending + cache under a single read lock snapshot, then drop the lock
+        // before issuing any network I/O.
+        let work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = {
+            let pending = self.pending_healing.read().await;
+            let cache   = self.alive_nodes_cache.read().await;
+
+            let mut v = Vec::new();
+            for (chunk_id, detected_at) in pending.iter() {
+                if detected_at.elapsed() < Duration::from_secs(self.healing_delay_secs) {
+                    continue;
+                }
+
+                // alive_nodes_cache tells us who confirmed holding this chunk. If
+                // there is no cache entry yet (discovery hasn't run for this chunk),
+                // skip — we'll pick it up after the first discovery pass runs.
+                let confirmed_alive = match cache.get(chunk_id) {
+                    Some(nodes) => nodes.clone(),
+                    None => continue,
+                };
+
+                // Classify using cached alive count vs replication factor.
+                let status = if confirmed_alive.len() < self.replication_factor {
+                    ReplicationStatus::UnderReplicated
+                } else if confirmed_alive.len() > self.replication_factor {
+                    if quorum {
+                        ReplicationStatus::OverReplicated
+                    } else {
+                        continue; // skip over-replication cleanup without quorum
+                    }
+                } else {
+                    // Now at RF — remove from pending, will be pruned from cache
+                    // on the next discovery pass.
+                    continue;
+                };
+
+                v.push((*chunk_id, status, confirmed_alive));
             }
+            drop(pending);
+            drop(cache);
+
+            // Sort oldest-first, cap to max_heal_per_cycle
+            {
+                let pending = self.pending_healing.read().await;
+                v.sort_by_key(|(chunk_id, _, _)| {
+                    pending.get(chunk_id)
+                        .map(|t| std::cmp::Reverse(t.elapsed()))
+                        .unwrap_or(std::cmp::Reverse(Duration::ZERO))
+                });
+            }
+            let skipped = v.len().saturating_sub(self.max_heal_per_cycle);
+            if skipped > 0 {
+                debug!("drain_heal_queue: deferring {} chunks past per-cycle cap", skipped);
+            }
+            v.truncate(self.max_heal_per_cycle);
+            v
+        };
+
+        if work.is_empty() {
             return Ok(());
         }
 
-        // Second pass: execute heals in batches of max_concurrent_heals.
-        // Processing in small batches (rather than spawning all work upfront behind a
-        // semaphore) keeps memory flat — only max_concurrent_heals tasks exist at once.
         let mut healed = 0usize;
 
         for batch in work.chunks(self.max_concurrent_heals) {
             let mut handles = Vec::with_capacity(batch.len());
 
-            for (chunk_id, status) in batch {
+            for (chunk_id, status, confirmed_alive) in batch {
                 let chunk_id = *chunk_id;
                 let status = *status;
+                let confirmed_alive = confirmed_alive.clone();
                 let storage = self.storage.clone();
                 let metadata = self.metadata.clone();
                 let cluster = self.cluster.clone();
@@ -558,7 +712,7 @@ impl HealingManager {
                     match status {
                         ReplicationStatus::UnderReplicated => {
                             if let Err(e) = HealingManager::do_heal_chunk_shared(
-                                &chunk_id, &storage, &metadata, &cluster, &client,
+                                &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
                                 &pending_healing, &in_flight_healing, replication_factor,
                             ).await {
                                 warn!("Failed to heal chunk {}: {}", chunk_id, e);
@@ -566,7 +720,7 @@ impl HealingManager {
                         }
                         ReplicationStatus::OverReplicated => {
                             if let Err(e) = HealingManager::do_cleanup_excess_shared(
-                                &chunk_id, &metadata, &cluster, &client, replication_factor,
+                                &chunk_id, confirmed_alive, &metadata, &cluster, &client, replication_factor,
                             ).await {
                                 warn!("Failed to cleanup over-replicated chunk {}: {}", chunk_id, e);
                             }
@@ -581,18 +735,15 @@ impl HealingManager {
                 healed += 1;
             }
 
-            // Brief pause between batches to yield to client I/O and spread
-            // connection load.  The broadcast_semaphore caps total concurrent
-            // outbound RPCs at 20, so this is just a politeness delay.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Pause between batches to let heartbeats through. Each PushChunkTo
+            // is a full chunk transfer (up to 4MB) — without a meaningful gap the
+            // TCP stack stays saturated, heartbeats miss their window, nodes get
+            // marked failed, and the leader changes mid-cycle killing all in-flight heals.
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
-        let healed = healed;
-        if healed > 0 || pending_count > 0 || skipped_count > 0 {
-            info!(
-                "Healing check complete: healed={}, pending={}, deferred={}",
-                healed, pending_count, skipped_count
-            );
+        if healed > 0 {
+            info!("Heal queue drain complete: healed={}", healed);
         }
 
         Ok(())
@@ -631,17 +782,10 @@ impl HealingManager {
     }
 
 
-    /// Heal an under-replicated chunk (instance method — delegates to shared static).
-    async fn heal_chunk(&self, chunk_id: &ChunkId) -> Result<()> {
-        Self::do_heal_chunk_shared(
-            chunk_id, &self.storage, &self.metadata, &self.cluster, &self.client,
-            &self.pending_healing, &self.in_flight_healing, self.replication_factor,
-        ).await
-    }
-
     /// Static heal implementation — callable from both instance methods and spawned tasks.
     async fn do_heal_chunk_shared(
         chunk_id: &ChunkId,
+        confirmed_alive_nodes: Vec<NodeId>,
         storage: &Arc<ChunkStorage>,
         metadata: &Arc<MetadataStore>,
         cluster: &Arc<ClusterManager>,
@@ -661,7 +805,7 @@ impl HealingManager {
         }
 
         let result = Self::do_heal_chunk_inner(
-            chunk_id, storage, metadata, cluster, client, pending_healing, replication_factor,
+            chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, pending_healing, replication_factor,
         ).await;
         in_flight_healing.write().await.remove(chunk_id);
         result
@@ -669,6 +813,7 @@ impl HealingManager {
 
     async fn do_heal_chunk_inner(
         chunk_id: &ChunkId,
+        confirmed_alive_nodes: Vec<NodeId>,
         storage: &Arc<ChunkStorage>,
         metadata: &Arc<MetadataStore>,
         cluster: &Arc<ClusterManager>,
@@ -682,42 +827,27 @@ impl HealingManager {
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
-        // Build alive node list with their addresses from metadata.
+        // Build alive list from confirmed_alive_nodes passed in from the bulk scan.
+        // These were verified by the HasChunks bulk RPC in the classification phase —
+        // no per-chunk re-querying here, which avoids misclassifying healthy nodes as
+        // ghosts due to transient RPC failures.
+        let local_id = cluster.local_node_id();
         let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
-        for node_id in &location.nodes {
-            if let Some(info) = cluster.get_node(node_id).await {
-                if info.status == dfs_common::NodeStatus::Online {
-                    alive.push((*node_id, info.addr));
-                }
+        for node_id in confirmed_alive_nodes {
+            if let Some(info) = cluster.get_node(&node_id).await {
+                alive.push((node_id, info.addr));
             }
         }
 
-        // Also check local storage directly — the chunk may exist here even if our
-        // node ID was incorrectly pruned from the metadata by a previous healer bug.
-        let local_id = cluster.local_node_id();
+        // Also check local storage — the chunk may exist here but not be in metadata
+        // (e.g. node ID was incorrectly pruned by a previous healer bug).
         if !alive.iter().any(|(id, _)| *id == local_id) && storage.has_chunk(chunk_id) {
             if let Some(info) = cluster.get_node(&local_id).await {
                 warn!(
-                    "Chunk {} found in local storage but missing from metadata node list — adding as source",
+                    "Chunk {} found in local storage but missing from confirmed-alive list — adding as source",
                     chunk_id
                 );
                 alive.push((local_id, info.addr));
-                // Repair the metadata to include this node
-                let mut repaired_nodes = location.nodes.clone();
-                repaired_nodes.push(local_id);
-                let repaired = ChunkLocation {
-                    chunk_id: *chunk_id,
-                    nodes: repaired_nodes,
-                    size: location.size,
-                    checksum: location.checksum,
-                    file_offset: location.file_offset,
-                    written_at: location.written_at,
-                };
-                if let Err(e) = metadata.put_chunk_location(&repaired) {
-                    warn!("Failed to repair chunk {} metadata: {}", chunk_id, e);
-                } else {
-                    Self::broadcast_chunk_location_shared(&repaired, cluster, client).await;
-                }
             }
         }
 
@@ -836,16 +966,10 @@ impl HealingManager {
         }
     }
 
-    /// Remove one excess replica (instance method — delegates to shared static).
-    async fn cleanup_excess_replicas(&self, chunk_id: &ChunkId) -> Result<()> {
-        Self::do_cleanup_excess_shared(
-            chunk_id, &self.metadata, &self.cluster, &self.client, self.replication_factor,
-        ).await
-    }
-
     /// Static cleanup implementation — callable from both instance methods and spawned tasks.
     async fn do_cleanup_excess_shared(
         chunk_id: &ChunkId,
+        confirmed_alive_nodes: Vec<NodeId>,
         metadata: &Arc<MetadataStore>,
         cluster: &Arc<ClusterManager>,
         client: &Arc<NetworkClient>,
@@ -855,13 +979,13 @@ impl HealingManager {
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
-        // Collect alive nodes in stable (location.nodes) order
+        // Use confirmed_alive_nodes from the bulk scan — these were verified via HasChunks.
+        // Don't re-derive from location.nodes + online check, which could include ghost nodes
+        // and lead to deleting a real replica while leaving a ghost in the metadata.
         let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
-        for node_id in &location.nodes {
+        for node_id in &confirmed_alive_nodes {
             if let Some(info) = cluster.get_node(node_id).await {
-                if info.status == dfs_common::NodeStatus::Online {
-                    alive.push((*node_id, info.addr));
-                }
+                alive.push((*node_id, info.addr));
             }
         }
 
@@ -978,7 +1102,11 @@ impl HealingManager {
             return Ok(());
         }
         info!("Manual heal cycle triggered");
-        self.check_and_heal().await
+        // Run a fresh discovery pass first so alive_nodes_cache is current,
+        // then immediately drain the queue — this mirrors what the periodic
+        // loops do but back-to-back for the manual trigger case.
+        self.run_discovery_pass().await?;
+        self.drain_heal_queue().await
     }
 }
 

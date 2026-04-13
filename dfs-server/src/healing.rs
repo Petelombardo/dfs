@@ -608,6 +608,22 @@ impl HealingManager {
 
             match status {
                 ReplicationStatus::UnderReplicated => {
+                    // If no node confirmed holding the chunk this cycle, don't queue it —
+                    // there's no source to heal from. Leave it in pending_healing and skip
+                    // the alive_nodes_cache entry so drain_heal_queue won't attempt it.
+                    // Either an offline node comes back (next discovery picks it up) or
+                    // the unrecoverable check above eventually fires once all nodes are
+                    // reachable and all confirm it's gone.
+                    if confirmed_alive_nodes.is_empty() {
+                        debug!("Chunk {} has 0 confirmed alive nodes this cycle — deferring heal", chunk_id);
+                        // Ensure it's in pending so it keeps being tracked
+                        self.pending_healing.write().await
+                            .entry(chunk_id)
+                            .or_insert_with(Instant::now);
+                        pending_count += 1;
+                        continue;
+                    }
+
                     // Skip healing_delay if the chunk was never fully replicated to RF nodes —
                     // metadata always listed fewer than replication_factor nodes, so this was
                     // never a transient node failure but a chunk that missed its 3rd write.

@@ -324,6 +324,8 @@ pub enum Response {
     HealingStatus {
         enabled: bool,
         pending_count: usize,
+        in_flight_count: usize,
+        stalled_count: usize,
         last_check: u64,
     },
 

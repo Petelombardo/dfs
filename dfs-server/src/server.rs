@@ -1959,12 +1959,16 @@ impl Server {
                 Response::HealingStatus {
                     enabled: stats.auto_heal_enabled,
                     pending_count: stats.pending_healing,
+                    in_flight_count: stats.in_flight_healing,
+                    stalled_count: stats.stalled_healing,
                     last_check: 0,
                 }
             }
             None => Response::HealingStatus {
                 enabled: false,
                 pending_count: 0,
+                in_flight_count: 0,
+                stalled_count: 0,
                 last_check: 0,
             },
         }

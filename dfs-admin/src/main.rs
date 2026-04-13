@@ -451,12 +451,16 @@ async fn handle_healing_command(
                 Response::HealingStatus {
                     enabled,
                     pending_count,
+                    in_flight_count,
+                    stalled_count,
                     last_check,
                 } => {
                     if json_output {
                         let output = serde_json::json!({
                             "enabled": enabled,
                             "pending_count": pending_count,
+                            "in_flight_count": in_flight_count,
+                            "stalled_count": stalled_count,
                             "last_check": last_check,
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -464,7 +468,9 @@ async fn handle_healing_command(
                         println!("DFS Healing Status (leader: {})", leader);
                         println!("==================");
                         println!("Enabled:       {}", if enabled { "Yes" } else { "No" });
-                        println!("Pending Count: {}", pending_count);
+                        println!("Pending:       {}", pending_count);
+                        println!("In-flight:     {}", in_flight_count);
+                        println!("Stalled:       {}", stalled_count);
                         println!("Last Check:    {} seconds ago", last_check);
                     }
                 }

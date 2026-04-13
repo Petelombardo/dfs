@@ -64,6 +64,19 @@ pub struct HealingManager {
     /// Written by run_discovery_loop(); read by run_heal_loop() so the heal loop
     /// can issue PushChunkTo without waiting for a new full scan each time.
     alive_nodes_cache: Arc<RwLock<HashMap<ChunkId, Vec<NodeId>>>>,
+
+    /// Chunks that timed out or errored during a heal attempt (chunk_id -> stalled_at).
+    /// Skipped by drain_heal_queue until stall_backoff_secs has elapsed, so a single
+    /// unreachable source/target can't block the rest of the queue. The next discovery
+    /// pass will re-add them to pending_healing once nodes come back online.
+    stalled_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
+
+    /// Backoff before retrying a stalled chunk (seconds).
+    stall_backoff_secs: u64,
+
+    /// Per-transfer timeout for a single PushChunkTo (seconds). If exceeded the
+    /// chunk is moved to stalled and the semaphore slot is released immediately.
+    heal_transfer_timeout_secs: u64,
 }
 
 impl HealingManager {
@@ -92,6 +105,16 @@ impl HealingManager {
         let heal_semaphore_capacity = heal_bw_mb * 1024 * 1024;
         let heal_semaphore = Arc::new(Semaphore::new(heal_semaphore_capacity));
 
+        let stall_backoff_secs = std::env::var("DFS_HEAL_STALL_BACKOFF_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300); // 5 minutes before retrying a stalled chunk
+
+        let heal_transfer_timeout_secs = std::env::var("DFS_HEAL_TRANSFER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120); // 2 minutes per transfer before declaring stalled
+
         Self {
             storage,
             metadata,
@@ -107,6 +130,9 @@ impl HealingManager {
             pending_healing: Arc::new(RwLock::new(HashMap::new())),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
+            stalled_healing: Arc::new(RwLock::new(HashMap::new())),
+            stall_backoff_secs,
+            heal_transfer_timeout_secs,
         }
     }
 
@@ -119,8 +145,9 @@ impl HealingManager {
 
         let heal_bw_mb = self.heal_semaphore_capacity / (1024 * 1024);
         info!(
-            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, bandwidth_budget: {}MB)",
-            self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle, heal_bw_mb
+            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, bandwidth_budget: {}MB, transfer_timeout: {}s, stall_backoff: {}s)",
+            self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle,
+            heal_bw_mb, self.heal_transfer_timeout_secs, self.stall_backoff_secs
         );
 
         // Discovery loop: scans all chunks, bulk-queries nodes, classifies under/over
@@ -253,6 +280,22 @@ impl HealingManager {
 
         if removed_count > 0 {
             info!("Cleaned up {} stale pending healing entries", removed_count);
+        }
+
+        // Also prune stalled entries whose backoff has long expired and whose chunk
+        // no longer has a location record (deleted/purged). Normally stalled entries
+        // are cleared on successful retry or re-queued after backoff, but if the chunk
+        // was deleted while stalled it would linger indefinitely without this sweep.
+        {
+            let mut stalled = self.stalled_healing.write().await;
+            let max_stall_time = Duration::from_secs(self.stall_backoff_secs * 10);
+            stalled.retain(|chunk_id, stalled_at| {
+                if stalled_at.elapsed() < max_stall_time {
+                    return true;
+                }
+                // Long-expired stall with no location record — drop it.
+                self.metadata.get_chunk_location(chunk_id).ok().flatten().is_some()
+            });
         }
 
         Ok(())
@@ -637,15 +680,19 @@ impl HealingManager {
     /// in pending_healing whose delay has elapsed. Uses alive_nodes_cache populated by
     /// run_discovery_pass() rather than re-scanning, so this can run frequently (15s)
     /// without hammering the cluster with HasChunks RPCs on every tick.
+    ///
+    /// Tasks are spawned-and-forgotten; in_flight_healing prevents double-queuing
+    /// across drain calls. Stalled chunks (timed-out or errored) are skipped until
+    /// their backoff expires so one unreachable node can't block the whole queue.
     async fn drain_heal_queue(&self) -> Result<()> {
         let quorum = self.cluster.has_quorum().await;
 
-        // Build work list from pending_healing entries whose delay has passed.
-        // Read pending + cache under a single read lock snapshot, then drop the lock
-        // before issuing any network I/O.
+        // Snapshot all three state maps under read locks, then drop before I/O.
         let work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = {
-            let pending = self.pending_healing.read().await;
-            let cache   = self.alive_nodes_cache.read().await;
+            let pending    = self.pending_healing.read().await;
+            let cache      = self.alive_nodes_cache.read().await;
+            let in_flight  = self.in_flight_healing.read().await;
+            let stalled    = self.stalled_healing.read().await;
 
             let mut v = Vec::new();
             for (chunk_id, detected_at) in pending.iter() {
@@ -653,35 +700,40 @@ impl HealingManager {
                     continue;
                 }
 
-                // alive_nodes_cache tells us who confirmed holding this chunk. If
-                // there is no cache entry yet (discovery hasn't run for this chunk),
-                // skip — we'll pick it up after the first discovery pass runs.
+                // Skip chunks already being transferred.
+                if in_flight.contains(chunk_id) {
+                    continue;
+                }
+
+                // Skip chunks in stall backoff.
+                if let Some(stalled_at) = stalled.get(chunk_id) {
+                    if stalled_at.elapsed() < Duration::from_secs(self.stall_backoff_secs) {
+                        continue;
+                    }
+                    // Backoff expired — will retry; stalled entry cleared on spawn below.
+                }
+
                 let confirmed_alive = match cache.get(chunk_id) {
                     Some(nodes) => nodes.clone(),
-                    None => continue,
+                    None => continue, // no cache entry yet; wait for discovery pass
                 };
 
-                // Classify using cached alive count vs replication factor.
                 let status = if confirmed_alive.len() < self.replication_factor {
                     ReplicationStatus::UnderReplicated
                 } else if confirmed_alive.len() > self.replication_factor {
-                    if quorum {
-                        ReplicationStatus::OverReplicated
-                    } else {
-                        continue; // skip over-replication cleanup without quorum
-                    }
+                    if quorum { ReplicationStatus::OverReplicated } else { continue }
                 } else {
-                    // Now at RF — remove from pending, will be pruned from cache
-                    // on the next discovery pass.
-                    continue;
+                    continue; // at RF, will be cleaned up by discovery
                 };
 
                 v.push((*chunk_id, status, confirmed_alive));
             }
             drop(pending);
             drop(cache);
+            drop(in_flight);
+            drop(stalled);
 
-            // Sort oldest-first, cap to max_heal_per_cycle
+            // Sort oldest-first, cap to max_heal_per_cycle.
             {
                 let pending = self.pending_healing.read().await;
                 v.sort_by_key(|(chunk_id, _, _)| {
@@ -702,73 +754,83 @@ impl HealingManager {
             return Ok(());
         }
 
-        // Spawn all work immediately — the heal_semaphore gates how many bytes can be
-        // in-flight at once. Each task acquires chunk_size permits before the transfer
-        // and releases them on completion, so concurrency self-tunes to actual chunk
-        // sizes with no fixed cap or inter-task sleeps needed.
-        let total = work.len();
-        let mut handles = Vec::with_capacity(total);
+        let dispatched = work.len();
 
+        // Spawn-and-forget: in_flight_healing prevents double-queuing if the next
+        // drain tick fires before these tasks complete. The semaphore gates how many
+        // bytes are in-flight simultaneously; each task acquires on entry and releases
+        // on completion (or timeout), so the drain loop never blocks.
         for (chunk_id, status, confirmed_alive) in work {
+            // Clear any expired stall entry before spawning so a clean retry starts fresh.
+            {
+                let mut stalled = self.stalled_healing.write().await;
+                if stalled.get(&chunk_id).map_or(false, |t| t.elapsed() >= Duration::from_secs(self.stall_backoff_secs)) {
+                    stalled.remove(&chunk_id);
+                }
+            }
+
             let storage = self.storage.clone();
             let metadata = self.metadata.clone();
             let cluster = self.cluster.clone();
             let client = self.client.clone();
             let pending_healing = self.pending_healing.clone();
             let in_flight_healing = self.in_flight_healing.clone();
+            let stalled_healing = self.stalled_healing.clone();
             let heal_semaphore = self.heal_semaphore.clone();
             let heal_semaphore_capacity = self.heal_semaphore_capacity;
             let replication_factor = self.replication_factor;
+            let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs);
+            let stall_backoff_secs = self.stall_backoff_secs;
 
-            handles.push(tokio::spawn(async move {
-                // Look up chunk size to size the semaphore acquisition.
-                // Fall back to max chunk size (4MB) if unknown — conservative but safe.
+            tokio::spawn(async move {
                 let chunk_size = metadata.get_chunk_location(&chunk_id)
                     .ok()
                     .flatten()
                     .map(|loc| loc.size)
                     .unwrap_or(4 * 1024 * 1024);
 
-                // Acquire permits proportional to chunk size. Clamp to total capacity
-                // so a single chunk larger than the budget can't deadlock — it just
-                // acquires the full budget and runs alone.
                 let permits = (chunk_size as u32).min(heal_semaphore_capacity as u32).max(1);
                 let _permit = heal_semaphore.acquire_many(permits).await;
 
-                match status {
-                    ReplicationStatus::UnderReplicated => {
-                        if let Err(e) = HealingManager::do_heal_chunk_shared(
-                            &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
-                            &pending_healing, &in_flight_healing, replication_factor,
-                        ).await {
-                            warn!("Failed to heal chunk {}: {}", chunk_id, e);
+                let result = tokio::time::timeout(transfer_timeout, async {
+                    match status {
+                        ReplicationStatus::UnderReplicated => {
+                            HealingManager::do_heal_chunk_shared(
+                                &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
+                                &pending_healing, &in_flight_healing, replication_factor,
+                            ).await
                         }
-                    }
-                    ReplicationStatus::OverReplicated => {
-                        if let Err(e) = HealingManager::do_cleanup_excess_shared(
-                            &chunk_id, confirmed_alive, &metadata, &cluster, &client, replication_factor,
-                        ).await {
-                            warn!("Failed to cleanup over-replicated chunk {}: {}", chunk_id, e);
+                        ReplicationStatus::OverReplicated => {
+                            HealingManager::do_cleanup_excess_shared(
+                                &chunk_id, confirmed_alive, &metadata, &cluster, &client, replication_factor,
+                            ).await
                         }
+                        ReplicationStatus::Ok => Ok(()),
                     }
-                    ReplicationStatus::Ok => {}
+                }).await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        // Success — clear any stall entry so it doesn't linger.
+                        stalled_healing.write().await.remove(&chunk_id);
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Heal failed for chunk {}, moving to stalled (backoff {}s): {}", chunk_id, stall_backoff_secs, e);
+                        stalled_healing.write().await.insert(chunk_id, Instant::now());
+                        in_flight_healing.write().await.remove(&chunk_id);
+                    }
+                    Err(_) => {
+                        warn!("Heal timed out for chunk {} after {}s, moving to stalled (backoff {}s)",
+                              chunk_id, transfer_timeout.as_secs(), stall_backoff_secs);
+                        stalled_healing.write().await.insert(chunk_id, Instant::now());
+                        in_flight_healing.write().await.remove(&chunk_id);
+                    }
                 }
-                // _permit drops here, releasing semaphore slots
-            }));
+                // _permit drops here, releasing semaphore budget
+            });
         }
 
-        // Wait for all spawned tasks to complete before returning, so the next
-        // drain_heal_queue call doesn't double-queue chunks still in flight.
-        let mut healed = 0usize;
-        for handle in handles {
-            let _ = handle.await;
-            healed += 1;
-        }
-
-        if healed > 0 {
-            info!("Heal queue drain complete: healed={}", healed);
-        }
-
+        debug!("Heal queue: dispatched {} tasks (spawn-and-forget)", dispatched);
         Ok(())
     }
 
@@ -1107,10 +1169,14 @@ impl HealingManager {
 
     /// Get healing statistics
     pub async fn get_stats(&self) -> HealingStats {
-        let pending = self.pending_healing.read().await;
+        let pending   = self.pending_healing.read().await;
+        let in_flight = self.in_flight_healing.read().await;
+        let stalled   = self.stalled_healing.read().await;
 
         HealingStats {
             pending_healing: pending.len(),
+            in_flight_healing: in_flight.len(),
+            stalled_healing: stalled.len(),
             auto_heal_enabled: self.auto_heal,
             healing_delay_secs: self.healing_delay_secs,
         }
@@ -1145,6 +1211,8 @@ enum ReplicationStatus {
 #[derive(Debug, Clone)]
 pub struct HealingStats {
     pub pending_healing: usize,
+    pub in_flight_healing: usize,
+    pub stalled_healing: usize,
     pub auto_heal_enabled: bool,
     pub healing_delay_secs: u64,
 }

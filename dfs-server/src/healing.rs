@@ -66,12 +66,12 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
     ) -> Self {
-        // Heal up to 2000 chunks per cycle. The bulk HasChunks RPC makes scanning
-        // cheap regardless of chunk count (O(nodes) connections not O(chunks)).
-        // Keep concurrent heals at 2 — each holds a 4MB chunk in memory on both
-        // the source and target node. SBC nodes have 3.8GB RAM with no swap so
-        // we stay conservative on peak memory pressure.
-        let max_heal_per_cycle = 2000;
+        // Heal up to 100 chunks per cycle. Keeps the connection rate low enough
+        // that fd exhaustion is not a risk even after a large backlog builds up
+        // (e.g. after nodes were down). Each heal opens connections for PushChunkTo
+        // + ReplicateChunkLocation broadcasts — at 2 concurrent with 500ms between
+        // batches this is ~12 heals/min, gentle enough to not disturb client I/O.
+        let max_heal_per_cycle = 100;
         let max_concurrent_heals = 2;
 
         Self {
@@ -538,8 +538,9 @@ impl HealingManager {
                 healed += 1;
             }
 
-            // Brief yield between batches so client I/O can get scheduled.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Throttle between batches: keeps connection rate low under large backlogs
+            // and ensures client I/O is never starved by healing bursts.
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
         let healed = healed;

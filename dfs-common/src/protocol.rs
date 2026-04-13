@@ -144,6 +144,7 @@ pub enum Request {
     DeleteMetadata {
         file_id: FileId,
         path: String,
+        chunk_ids: Vec<ChunkId>,
     },
 
     /// Replicate chunk location to this node (internal cluster operation)

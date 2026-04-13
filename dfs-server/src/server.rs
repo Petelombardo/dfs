@@ -268,8 +268,8 @@ impl Server {
             Request::ReplicateMetadata { metadata } => {
                 self.handle_replicate_metadata(metadata).await
             }
-            Request::DeleteMetadata { file_id, path } => {
-                self.handle_delete_metadata(file_id, path).await
+            Request::DeleteMetadata { file_id, path, chunk_ids } => {
+                self.handle_delete_metadata(file_id, path, chunk_ids).await
             }
             Request::ReplicateChunkLocation { location } => {
                 self.handle_replicate_chunk_location(location).await
@@ -551,30 +551,30 @@ impl Server {
     }
 
     /// Handle delete metadata replication (internal cluster operation)
-    async fn handle_delete_metadata(&self, file_id: FileId, path: String) -> Response {
+    async fn handle_delete_metadata(&self, file_id: FileId, path: String, chunk_ids: Vec<ChunkId>) -> Response {
         debug!("Handling delete metadata: {} (file_id: {})", path, file_id);
 
-        // CRITICAL: Only delete the path index, not the file metadata!
-        // This is used during rename to clean up the old path on replicas
-        // If we use delete_file(&file_id), we'll delete the NEW metadata that was just replicated!
-        // delete_file() would:
-        //   1. Look up metadata by file_id (finds the NEW path in metadata)
-        //   2. Delete path index for the CURRENT path in metadata (NEW path)
-        //   3. Delete the file_id entry (deletes ALL metadata)
-        // Instead, we just delete the specific old path index
-        match self.metadata.delete_path_index(&path) {
-            Ok(_) => {
-                debug!("Successfully deleted path index for {}", path);
-                Response::Ok { data: None }
-            }
-            Err(e) => {
-                warn!("Failed to delete path index: {}", e);
-                Response::Error {
-                    message: format!("Failed to delete path index: {}", e),
-                    code: ErrorCode::InternalError,
-                }
+        // Delete the file: record by ID (safe — only removes this specific file's record)
+        if let Err(e) = self.metadata.delete_file(&file_id) {
+            warn!("Failed to delete file record {} on peer: {}", file_id, e);
+        }
+
+        // Delete the path index
+        if let Err(e) = self.metadata.delete_path_index(&path) {
+            warn!("Failed to delete path index {} on peer: {}", path, e);
+        }
+
+        // Delete all chunk location records — this is the critical step that was missing.
+        // Without it, peers retained chunk: records after a file delete and the healer
+        // kept re-queuing those chunks for replication, causing a runaway healing backlog.
+        for chunk_id in &chunk_ids {
+            if let Err(e) = self.metadata.delete_chunk_location(chunk_id) {
+                warn!("Failed to delete chunk location {} on peer: {}", chunk_id, e);
             }
         }
+
+        debug!("Successfully deleted metadata and {} chunk locations for {} on peer", chunk_ids.len(), path);
+        Response::Ok { data: None }
     }
 
     /// Handle replicate chunk location (internal cluster operation)
@@ -1665,9 +1665,13 @@ impl Server {
                                     continue;
                                 }
 
+                                let chunk_ids_for_delete: Vec<ChunkId> = chunk_locations.iter()
+                                    .map(|loc| loc.chunk_id)
+                                    .collect();
                                 let request = Request::DeleteMetadata {
                                     file_id,
                                     path: path_clone.clone(),
+                                    chunk_ids: chunk_ids_for_delete,
                                 };
 
                                 if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
@@ -2124,6 +2128,7 @@ impl Server {
                                 let request = Request::DeleteMetadata {
                                     file_id,
                                     path: path_clone.clone(),
+                                    chunk_ids: Vec::new(), // purge = metadata only, chunks kept
                                 };
 
                                 if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
@@ -2286,6 +2291,7 @@ impl Server {
                                 let delete_request = Request::DeleteMetadata {
                                     file_id,
                                     path: old_path_clone.clone(),
+                                    chunk_ids: Vec::new(), // rename = path change only, chunks kept
                                 };
 
                                 if let Err(e) = client.send_message(node.addr, Message::Request(delete_request)).await {

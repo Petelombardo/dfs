@@ -58,6 +58,11 @@ pub struct Server {
     /// Limits low-priority prefetch operations while allowing unlimited high-priority reads
     prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// Outbound broadcast concurrency limiter - caps total in-flight cluster RPCs
+    /// (metadata replication, purge broadcasts, delete broadcasts) to prevent fd
+    /// exhaustion when many operations fan out to all 5 nodes simultaneously.
+    broadcast_semaphore: Arc<tokio::sync::Semaphore>,
+
     /// Leader-maintained in-memory chunk map: FileId -> Vec<ChunkLocation>.
     /// Only the leader serves GetFileChunkMap requests from this map.
     /// All nodes keep it up-to-date so leadership transitions are seamless.
@@ -99,6 +104,10 @@ impl Server {
             // With modern HDDs and read-ahead, parallel reads are efficient
             // Real client reads bypass this limit (high priority)
             prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            // Cap total outbound broadcast RPCs to 20 at a time across all operations.
+            // 5 nodes × 4 concurrent fan-outs = 20 max simultaneous cluster connections,
+            // well within the 65536 fd limit even under heavy delete/heal load.
+            broadcast_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
             chunk_map: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
             healing: Arc::new(RwLock::new(None)),
@@ -1195,18 +1204,18 @@ impl Server {
                 // Update in-memory chunk map
                 self.chunk_map_update(&metadata).await;
 
-                // Replicate metadata to all other nodes asynchronously with timeout
+                // Replicate metadata to all other nodes asynchronously with timeout.
+                // Uses the shared broadcast_semaphore so all fan-out operations
+                // (put, delete, purge) compete for the same pool of 20 permits.
                 let cluster = self.cluster.clone();
                 let client = self.client.clone();
                 let metadata_clone = metadata.clone();
+                let sem = self.broadcast_semaphore.clone();
 
                 tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok();
                     let nodes = cluster.get_all_nodes().await;
                     let local_id = cluster.local_node_id();
-
-                    // Limit to max 10 concurrent replications to prevent storms
-                    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
-                    let mut tasks = Vec::new();
 
                     for node in nodes {
                         // Skip self and offline nodes
@@ -1218,41 +1227,18 @@ impl Server {
                             metadata: metadata_clone.clone(),
                         };
 
-                        let client_clone = client.clone();
-                        let node_addr = node.addr;
-                        let semaphore_clone = semaphore.clone();
+                        // Replicate with 5 second timeout
+                        let result = tokio::time::timeout(
+                            tokio::time::Duration::from_secs(5),
+                            client.send_message(node.addr, Message::Request(request))
+                        ).await;
 
-                        let task = tokio::spawn(async move {
-                            // Acquire semaphore permit
-                            let _permit = semaphore_clone.acquire().await.ok()?;
-
-                            // Replicate with 5 second timeout
-                            let result = tokio::time::timeout(
-                                tokio::time::Duration::from_secs(5),
-                                client_clone.send_message(node_addr, Message::Request(request))
-                            ).await;
-
-                            match result {
-                                Ok(Ok(_)) => {
-                                    debug!("Replicated metadata to {}", node_addr);
-                                    Some(())
-                                }
-                                Ok(Err(e)) => {
-                                    debug!("Failed to replicate metadata to {}: {}", node_addr, e);
-                                    None
-                                }
-                                Err(_) => {
-                                    debug!("Timeout replicating metadata to {}", node_addr);
-                                    None
-                                }
-                            }
-                        });
-
-                        tasks.push(task);
+                        match result {
+                            Ok(Ok(_)) => debug!("Replicated metadata to {}", node.addr),
+                            Ok(Err(e)) => debug!("Failed to replicate metadata to {}: {}", node.addr, e),
+                            Err(_) => debug!("Timeout replicating metadata to {}", node.addr),
+                        }
                     }
-
-                    // Don't wait for all tasks, just spawn them
-                    drop(tasks);
                 });
 
                 Response::Ok { data: None }
@@ -1651,8 +1637,10 @@ impl Server {
                         let metadata_store = self.metadata.clone();
                         let file_id = metadata.id;
                         let path_clone = path.clone();
+                        let sem = self.broadcast_semaphore.clone();
 
                         tokio::spawn(async move {
+                            let _permit = sem.acquire().await.ok();
                             // First, replicate the metadata deletion to all nodes
                             let nodes = cluster.get_all_nodes().await;
                             let local_id = cluster.local_node_id();
@@ -2170,45 +2158,30 @@ impl Server {
             Ok(_) => {
                 info!("Purged metadata for file ID {} from local node", file_id);
 
-                // Broadcast deletion to all other nodes in the cluster
+                // Broadcast deletion to online peers asynchronously — do not block
+                // the handler and do not attempt to connect to offline nodes (each
+                // failed connect holds a socket in SYN_SENT for the full timeout,
+                // causing fd exhaustion when many purges run concurrently).
                 let nodes = self.cluster.get_all_nodes().await;
                 let local_id = self.cluster.local_node_id();
                 let client = self.client.clone();
+                let sem = self.broadcast_semaphore.clone();
 
-                let mut success_count = 1; // Local deletion succeeded
-                let total_nodes = nodes.len();
-
-                for node in nodes {
-                    if node.id == local_id {
-                        continue; // Skip local node
-                    }
-
-                    // Send purge request to remote node
-                    match client.send_message(
-                        node.addr,
-                        Message::Request(Request::PurgeFileMetadataById { file_id: file_id.clone() })
-                    ).await {
-                        Ok(envelope) => {
-                            match envelope.message {
-                                Message::Response(Response::Ok { .. }) => {
-                                    info!("Purged metadata for file ID {} from node {}", file_id, node.id);
-                                    success_count += 1;
-                                }
-                                Message::Response(Response::Error { message, .. }) => {
-                                    warn!("Failed to purge from node {}: {}", node.id, message);
-                                }
-                                _ => {
-                                    warn!("Unexpected response from node {} during purge", node.id);
-                                }
-                            }
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok();
+                    for node in nodes {
+                        if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                            continue;
                         }
-                        Err(e) => {
+                        if let Err(e) = client.send_message(
+                            node.addr,
+                            Message::Request(Request::PurgeFileMetadataById { file_id: file_id.clone() })
+                        ).await {
                             warn!("Error contacting node {} for purge: {}", node.id, e);
                         }
                     }
-                }
+                });
 
-                info!("Purged metadata from {}/{} nodes", success_count, total_nodes);
                 Response::Ok { data: None }
             }
             Err(e) => {

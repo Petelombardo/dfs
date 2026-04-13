@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -748,68 +749,84 @@ impl HealingManager {
             return Ok(());
         }
 
-        let dispatched = work.len();
+        let total = work.len();
 
-        for (chunk_id, status, confirmed_alive) in work {
-            let storage = self.storage.clone();
-            let metadata = self.metadata.clone();
-            let cluster = self.cluster.clone();
-            let client = self.client.clone();
-            let pending_healing = self.pending_healing.clone();
-            let in_flight_healing = self.in_flight_healing.clone();
-            let heal_semaphore = self.heal_semaphore.clone();
-            let heal_semaphore_capacity = self.heal_semaphore_capacity;
-            let replication_factor = self.replication_factor;
-            let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs);
+        // Max live tasks = semaphore_capacity / max_chunk_size (4MB).
+        // This bounds how many Tokio tasks exist simultaneously waiting for the semaphore.
+        // Without this cap, all `work` tasks would be spawned at once, each holding OS
+        // resources (stack, file descriptors from pending connects) while blocked on
+        // acquire_many — causing "too many orphaned sockets" kernel warnings under load.
+        let max_live = (self.heal_semaphore_capacity / (4 * 1024 * 1024)).max(1);
+        let mut set: JoinSet<()> = JoinSet::new();
+        let mut iter = work.into_iter();
 
-            tokio::spawn(async move {
-                let chunk_size = metadata.get_chunk_location(&chunk_id)
-                    .ok()
-                    .flatten()
-                    .map(|loc| loc.size)
-                    .unwrap_or(4 * 1024 * 1024);
+        loop {
+            // Fill up to max_live concurrent tasks.
+            while set.len() < max_live {
+                let Some((chunk_id, status, confirmed_alive)) = iter.next() else { break };
 
-                let permits = (chunk_size as u32).min(heal_semaphore_capacity as u32).max(1);
-                let _permit = heal_semaphore.acquire_many(permits).await;
+                let storage = self.storage.clone();
+                let metadata = self.metadata.clone();
+                let cluster = self.cluster.clone();
+                let client = self.client.clone();
+                let pending_healing = self.pending_healing.clone();
+                let in_flight_healing = self.in_flight_healing.clone();
+                let heal_semaphore = self.heal_semaphore.clone();
+                let heal_semaphore_capacity = self.heal_semaphore_capacity;
+                let replication_factor = self.replication_factor;
+                let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs);
 
-                let result = tokio::time::timeout(transfer_timeout, async {
-                    match status {
-                        ReplicationStatus::UnderReplicated => {
-                            HealingManager::do_heal_chunk_shared(
-                                &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
-                                &pending_healing, &in_flight_healing, replication_factor,
-                            ).await
+                set.spawn(async move {
+                    let chunk_size = metadata.get_chunk_location(&chunk_id)
+                        .ok()
+                        .flatten()
+                        .map(|loc| loc.size)
+                        .unwrap_or(4 * 1024 * 1024);
+
+                    let permits = (chunk_size as u32).min(heal_semaphore_capacity as u32).max(1);
+                    let _permit = heal_semaphore.acquire_many(permits).await;
+
+                    let result = tokio::time::timeout(transfer_timeout, async {
+                        match status {
+                            ReplicationStatus::UnderReplicated => {
+                                HealingManager::do_heal_chunk_shared(
+                                    &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
+                                    &pending_healing, &in_flight_healing, replication_factor,
+                                ).await
+                            }
+                            ReplicationStatus::OverReplicated => {
+                                HealingManager::do_cleanup_excess_shared(
+                                    &chunk_id, confirmed_alive, &metadata, &cluster, &client, replication_factor,
+                                ).await
+                            }
+                            ReplicationStatus::Ok => Ok(()),
                         }
-                        ReplicationStatus::OverReplicated => {
-                            HealingManager::do_cleanup_excess_shared(
-                                &chunk_id, confirmed_alive, &metadata, &cluster, &client, replication_factor,
-                            ).await
-                        }
-                        ReplicationStatus::Ok => Ok(()),
-                    }
-                }).await;
+                    }).await;
 
-                match result {
-                    Ok(Ok(())) => {
-                        // Success — pending entry removed inside do_heal_chunk_shared.
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!("Heal failed for chunk {}: {}", chunk_id, e);
+                            in_flight_healing.write().await.remove(&chunk_id);
+                        }
+                        Err(_) => {
+                            warn!("Heal timed out for chunk {} after {}s", chunk_id, transfer_timeout.as_secs());
+                            in_flight_healing.write().await.remove(&chunk_id);
+                        }
                     }
-                    Ok(Err(e)) => {
-                        // Transfer error — stays in pending, retried next drain tick.
-                        // Discovery will move it to stalled if the source disappears.
-                        warn!("Heal failed for chunk {}: {}", chunk_id, e);
-                        in_flight_healing.write().await.remove(&chunk_id);
-                    }
-                    Err(_) => {
-                        // Transfer timed out — stays in pending, retried next drain tick.
-                        warn!("Heal timed out for chunk {} after {}s", chunk_id, transfer_timeout.as_secs());
-                        in_flight_healing.write().await.remove(&chunk_id);
-                    }
-                }
-                // _permit drops here, releasing semaphore budget
-            });
+                    // _permit drops here, releasing semaphore budget
+                });
+            }
+
+            if set.is_empty() {
+                break;
+            }
+
+            // Wait for any one task to finish, then loop to fill the slot.
+            set.join_next().await;
         }
 
-        debug!("Heal queue: dispatched {} tasks", dispatched);
+        debug!("Heal queue drain: processed {} tasks (max_live={})", total, max_live);
         Ok(())
     }
 

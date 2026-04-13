@@ -316,7 +316,10 @@ impl NetworkClient {
 
         debug!("Received response from {}", target);
 
-        // Return connection to pool (cap 4 idle per peer)
+        // Return connection to pool (cap 4 idle per peer).
+        // If the pool is full, set SO_LINGER(0) before dropping so the kernel sends
+        // RST instead of going through TIME_WAIT — prevents orphaned socket accumulation
+        // under heavy healing load where many short-lived connections are created.
         {
             let entry = self.pool
                 .entry(target)
@@ -324,6 +327,11 @@ impl NetworkClient {
             let mut queue = entry.lock().await;
             if queue.len() < 4 {
                 queue.push_back(stream);
+            } else {
+                // Pool full — explicitly shut down before dropping so the kernel
+                // completes the TCP close handshake promptly rather than leaving
+                // the socket in TIME_WAIT as an orphan.
+                let _ = stream.shutdown().await;
             }
         }
 

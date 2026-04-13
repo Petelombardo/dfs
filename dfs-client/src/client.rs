@@ -571,9 +571,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             Ok(Ok(buf)) => buf,
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe
                         || e.kind() == std::io::ErrorKind::ConnectionReset
-                        || e.kind() == std::io::ErrorKind::ConnectionAborted => {
-                // Stale pooled connection — retry with a fresh connection, same as the timeout path.
-                // Do NOT record a health failure; the node itself is fine.
+                        || e.kind() == std::io::ErrorKind::ConnectionAborted
+                        || e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Stale pooled connection — server closed it after idle timeout.
+                // Retry transparently on a fresh connection; do NOT record a health
+                // failure since the node itself is fine.
+                // UnexpectedEof is the common case: server's 5s idle timeout fires
+                // while a connection is sitting in the client pool.
                 debug!("Stale pooled connection to {} ({}), retrying with fresh connection", addr, e);
                 let mut fresh = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(5),

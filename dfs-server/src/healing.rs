@@ -67,12 +67,14 @@ impl HealingManager {
         auto_heal: bool,
     ) -> Self {
         // Heal up to 100 chunks per cycle. Keeps the connection rate low enough
-        // that fd exhaustion is not a risk even after a large backlog builds up
-        // (e.g. after nodes were down). Each heal opens connections for PushChunkTo
-        // + ReplicateChunkLocation broadcasts — at 2 concurrent with 500ms between
-        // batches this is ~12 heals/min, gentle enough to not disturb client I/O.
-        let max_heal_per_cycle = 100;
-        let max_concurrent_heals = 2;
+        // The broadcast_semaphore (20 permits) is the real fd guard; these caps
+        // control batch sizing and inter-batch pacing.  With RF=3 and dual-parallel
+        // client writes, every chunk needs the healer to place the 3rd replica.
+        // At 2MB/s DVR write rate that's ~30 new under-replicated chunks/min — the
+        // healer must comfortably exceed that to avoid an ever-growing backlog.
+        // 8 concurrent × 100ms between batches ≈ 80 heals/min steady-state.
+        let max_heal_per_cycle = 200;
+        let max_concurrent_heals = 8;
 
         Self {
             storage,
@@ -577,9 +579,10 @@ impl HealingManager {
                 healed += 1;
             }
 
-            // Throttle between batches: keeps connection rate low under large backlogs
-            // and ensures client I/O is never starved by healing bursts.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Brief pause between batches to yield to client I/O and spread
+            // connection load.  The broadcast_semaphore caps total concurrent
+            // outbound RPCs at 20, so this is just a politeness delay.
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         let healed = healed;

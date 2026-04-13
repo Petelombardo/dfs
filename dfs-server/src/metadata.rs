@@ -37,6 +37,34 @@ impl MetadataStore {
 
     /// Store file metadata
     pub fn put_file(&self, metadata: &FileMetadata) -> Result<()> {
+        // If a different file ID already exists at this path, remove the old file: record
+        // before writing the new one. Without this, every create() on an existing path
+        // allocates a new FileId UUID and leaves the old file: entry orphaned in the DB —
+        // causing unbounded metadata growth and a permanent healer backlog.
+        let path_key = self.path_key(&metadata.path);
+        if let Ok(Some(existing_bytes)) = self.db.get(&path_key) {
+            // Try new format (full FileMetadata) then legacy format (just FileId)
+            let existing_id = if let Ok(existing) = bincode::deserialize::<FileMetadata>(&existing_bytes) {
+                Some(existing.id)
+            } else if let Ok(id) = bincode::deserialize::<FileId>(&existing_bytes) {
+                Some(id)
+            } else {
+                None
+            };
+
+            if let Some(old_id) = existing_id {
+                if old_id != metadata.id {
+                    // Different ID at same path — purge the old file: record
+                    let old_key = self.file_key(&old_id);
+                    if let Err(e) = self.db.remove(old_key) {
+                        warn!("Failed to remove stale file record {} for path {}: {}", old_id, metadata.path, e);
+                    } else {
+                        debug!("Removed stale file record {} superseded by {} at path {}", old_id, metadata.id, metadata.path);
+                    }
+                }
+            }
+        }
+
         let key = self.file_key(&metadata.id);
         let value = bincode::serialize(metadata)
             .context("Failed to serialize file metadata")?;
@@ -47,7 +75,6 @@ impl MetadataStore {
 
         // Also index by path for lookups — store full metadata so list_directory
         // is a single prefix scan with no per-entry secondary lookups.
-        let path_key = self.path_key(&metadata.path);
         self.db
             .insert(path_key, value)
             .context("Failed to insert path index")?;

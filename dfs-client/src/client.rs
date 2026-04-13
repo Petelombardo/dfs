@@ -677,7 +677,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 .entry(addr)
                 .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
             let mut queue = entry.lock().await;
-            if queue.len() < 2 {
+            if queue.len() < 8 {
                 queue.push_back(stream);
             }
         }
@@ -1903,13 +1903,13 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             match result {
                 Ok((stream, buf)) => {
-                    // Return connection to pool (cap per-server queue at 2 idle connections)
+                    // Return connection to pool (cap per-server queue at 8 idle connections)
                     {
                         let entry = self.connection_pool
                             .entry(server_addr)
                             .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
                         let mut queue = entry.lock().await;
-                        if queue.len() < 2 {
+                        if queue.len() < 8 {
                             queue.push_back(stream);
                         }
                         // If queue is full, stream drops here and TCP connection closes

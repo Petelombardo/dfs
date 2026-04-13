@@ -115,7 +115,7 @@ async fn handle_connection<H: MessageHandler>(
 
     // Close idle connections after 30s of inactivity so pooled connections from
     // peers don't accumulate indefinitely on the leader (which receives all healing ops).
-    const IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+    const IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
     loop {
         // Read message from stream, with idle timeout
@@ -316,14 +316,13 @@ impl NetworkClient {
 
         debug!("Received response from {}", target);
 
-        // Return connection to pool (cap 1 idle per peer — keeps reuse benefit without
-        // accumulating fds under healing/replication bursts across 5 nodes)
+        // Return connection to pool (cap 4 idle per peer)
         {
             let entry = self.pool
                 .entry(target)
                 .or_insert_with(|| Mutex::new(VecDeque::new()));
             let mut queue = entry.lock().await;
-            if queue.len() < 1 {
+            if queue.len() < 4 {
                 queue.push_back(stream);
             }
         }

@@ -52,30 +52,27 @@ pub struct HealingManager {
     /// can clamp their acquisition to the full budget without racing on available_permits().
     heal_semaphore_capacity: usize,
 
-    /// Chunks pending healing (chunk_id -> failure_detected_at)
+    /// Chunks ready to heal: under-replicated, has ≥1 confirmed alive source node,
+    /// and healing delay has passed. Maps chunk_id → first_detected_at so oldest-
+    /// first scheduling works correctly.
     pending_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
 
-    /// Chunks currently being healed by this node — prevents double-healing when
-    /// multiple nodes run the healer concurrently for the same chunk.
-    /// A chunk is inserted before replication begins and removed on completion.
+    /// Chunks currently being transferred — prevents double-dispatch across drain
+    /// ticks. Inserted just before PushChunkTo; removed on completion or timeout.
     in_flight_healing: Arc<RwLock<HashSet<ChunkId>>>,
 
     /// Per-chunk confirmed-alive node list from the most recent discovery scan.
-    /// Written by run_discovery_loop(); read by run_heal_loop() so the heal loop
-    /// can issue PushChunkTo without waiting for a new full scan each time.
+    /// Written by run_discovery_loop(); read by run_heal_loop().
     alive_nodes_cache: Arc<RwLock<HashMap<ChunkId, Vec<NodeId>>>>,
 
-    /// Chunks that timed out or errored during a heal attempt (chunk_id -> stalled_at).
-    /// Skipped by drain_heal_queue until stall_backoff_secs has elapsed, so a single
-    /// unreachable source/target can't block the rest of the queue. The next discovery
-    /// pass will re-add them to pending_healing once nodes come back online.
-    stalled_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
+    /// Chunks with no viable source: under-replicated but ALL nodes that hold the
+    /// data are currently offline. Managed entirely by discovery — moved here when
+    /// 0 alive nodes are found, promoted back to pending when ≥1 source reappears.
+    /// The heal loop never touches this set directly.
+    stalled_healing: Arc<RwLock<HashSet<ChunkId>>>,
 
-    /// Backoff before retrying a stalled chunk (seconds).
-    stall_backoff_secs: u64,
-
-    /// Per-transfer timeout for a single PushChunkTo (seconds). If exceeded the
-    /// chunk is moved to stalled and the semaphore slot is released immediately.
+    /// Per-transfer timeout for a single PushChunkTo (seconds). On expiry the chunk
+    /// stays in pending (retried next drain tick) and the semaphore slot is released.
     heal_transfer_timeout_secs: u64,
 }
 
@@ -105,15 +102,10 @@ impl HealingManager {
         let heal_semaphore_capacity = heal_bw_mb * 1024 * 1024;
         let heal_semaphore = Arc::new(Semaphore::new(heal_semaphore_capacity));
 
-        let stall_backoff_secs = std::env::var("DFS_HEAL_STALL_BACKOFF_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300); // 5 minutes before retrying a stalled chunk
-
         let heal_transfer_timeout_secs = std::env::var("DFS_HEAL_TRANSFER_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120); // 2 minutes per transfer before declaring stalled
+            .unwrap_or(120); // 2 minutes per transfer before timing out
 
         Self {
             storage,
@@ -130,8 +122,7 @@ impl HealingManager {
             pending_healing: Arc::new(RwLock::new(HashMap::new())),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
-            stalled_healing: Arc::new(RwLock::new(HashMap::new())),
-            stall_backoff_secs,
+            stalled_healing: Arc::new(RwLock::new(HashSet::new())),
             heal_transfer_timeout_secs,
         }
     }
@@ -145,9 +136,9 @@ impl HealingManager {
 
         let heal_bw_mb = self.heal_semaphore_capacity / (1024 * 1024);
         info!(
-            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, bandwidth_budget: {}MB, transfer_timeout: {}s, stall_backoff: {}s)",
+            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, bandwidth_budget: {}MB, transfer_timeout: {}s)",
             self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle,
-            heal_bw_mb, self.heal_transfer_timeout_secs, self.stall_backoff_secs
+            heal_bw_mb, self.heal_transfer_timeout_secs
         );
 
         // Discovery loop: scans all chunks, bulk-queries nodes, classifies under/over
@@ -282,18 +273,11 @@ impl HealingManager {
             info!("Cleaned up {} stale pending healing entries", removed_count);
         }
 
-        // Also prune stalled entries whose backoff has long expired and whose chunk
-        // no longer has a location record (deleted/purged). Normally stalled entries
-        // are cleared on successful retry or re-queued after backoff, but if the chunk
-        // was deleted while stalled it would linger indefinitely without this sweep.
+        // Prune stalled entries for chunks that have been deleted/purged — they won't
+        // come back, and discovery won't clean them up since it only sees live chunks.
         {
             let mut stalled = self.stalled_healing.write().await;
-            let max_stall_time = Duration::from_secs(self.stall_backoff_secs * 10);
-            stalled.retain(|chunk_id, stalled_at| {
-                if stalled_at.elapsed() < max_stall_time {
-                    return true;
-                }
-                // Long-expired stall with no location record — drop it.
+            stalled.retain(|chunk_id| {
                 self.metadata.get_chunk_location(chunk_id).ok().flatten().is_some()
             });
         }
@@ -608,15 +592,13 @@ impl HealingManager {
 
             match status {
                 ReplicationStatus::UnderReplicated => {
-                    // If no node confirmed holding the chunk this cycle, don't queue it —
-                    // there's no source to heal from. Leave it in pending_healing and skip
-                    // the alive_nodes_cache entry so drain_heal_queue won't attempt it.
-                    // Either an offline node comes back (next discovery picks it up) or
-                    // the unrecoverable check above eventually fires once all nodes are
-                    // reachable and all confirm it's gone.
                     if confirmed_alive_nodes.is_empty() {
-                        debug!("Chunk {} has 0 confirmed alive nodes this cycle — deferring heal", chunk_id);
-                        // Ensure it's in pending so it keeps being tracked
+                        // No source available — move to stalled. Discovery will promote
+                        // it back to pending as soon as a node that holds it comes online.
+                        debug!("Chunk {} has 0 confirmed alive nodes — moving to stalled", chunk_id);
+                        self.stalled_healing.write().await.insert(chunk_id);
+                        // Keep first_detected timestamp in pending so we know how long
+                        // it has been under-replicated, but mark it explicitly stalled.
                         self.pending_healing.write().await
                             .entry(chunk_id)
                             .or_insert_with(Instant::now);
@@ -624,13 +606,18 @@ impl HealingManager {
                         continue;
                     }
 
-                    // Skip healing_delay if the chunk was never fully replicated to RF nodes —
-                    // metadata always listed fewer than replication_factor nodes, so this was
-                    // never a transient node failure but a chunk that missed its 3rd write.
+                    // Source available — ensure not in stalled (promote if it was).
+                    {
+                        let mut stalled = self.stalled_healing.write().await;
+                        if stalled.remove(&chunk_id) {
+                            debug!("Chunk {} has a source again — promoted from stalled to pending", chunk_id);
+                        }
+                    }
+
+                    // Skip healing_delay if chunk was never fully replicated to RF nodes.
                     let never_fully_replicated = metadata_node_count < replication_factor;
                     if never_fully_replicated || self.should_heal(&chunk_id).await {
                         if never_fully_replicated {
-                            // Pre-insert into pending so should_heal won't re-delay it next cycle
                             self.pending_healing.write().await
                                 .entry(chunk_id)
                                 .or_insert_with(|| Instant::now() - Duration::from_secs(self.healing_delay_secs + 1));
@@ -649,6 +636,7 @@ impl HealingManager {
                 }
                 ReplicationStatus::Ok => {
                     self.pending_healing.write().await.remove(&chunk_id);
+                    self.stalled_healing.write().await.remove(&chunk_id);
                 }
             }
         }
@@ -692,46 +680,36 @@ impl HealingManager {
         Ok(())
     }
 
-    /// Drain the heal queue — issues PushChunkTo / DeleteChunkReplica for all chunks
-    /// in pending_healing whose delay has elapsed. Uses alive_nodes_cache populated by
-    /// run_discovery_pass() rather than re-scanning, so this can run frequently (15s)
-    /// without hammering the cluster with HasChunks RPCs on every tick.
-    ///
-    /// Tasks are spawned-and-forgotten; in_flight_healing prevents double-queuing
-    /// across drain calls. Stalled chunks (timed-out or errored) are skipped until
-    /// their backoff expires so one unreachable node can't block the whole queue.
+    /// Drain the heal queue — dispatches PushChunkTo / DeleteChunkReplica for all
+    /// chunks in pending_healing that are ready (delay passed, source known, not
+    /// in-flight, not stalled). Tasks are spawned-and-forgotten; in_flight_healing
+    /// prevents double-dispatch across 15s ticks.
     async fn drain_heal_queue(&self) -> Result<()> {
         let quorum = self.cluster.has_quorum().await;
 
-        // Snapshot all three state maps under read locks, then drop before I/O.
         let work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = {
-            let pending    = self.pending_healing.read().await;
-            let cache      = self.alive_nodes_cache.read().await;
-            let in_flight  = self.in_flight_healing.read().await;
-            let stalled    = self.stalled_healing.read().await;
+            let pending   = self.pending_healing.read().await;
+            let cache     = self.alive_nodes_cache.read().await;
+            let in_flight = self.in_flight_healing.read().await;
+            let stalled   = self.stalled_healing.read().await;
 
             let mut v = Vec::new();
             for (chunk_id, detected_at) in pending.iter() {
                 if detected_at.elapsed() < Duration::from_secs(self.healing_delay_secs) {
                     continue;
                 }
-
-                // Skip chunks already being transferred.
+                // Skip already in-flight.
                 if in_flight.contains(chunk_id) {
                     continue;
                 }
-
-                // Skip chunks in stall backoff.
-                if let Some(stalled_at) = stalled.get(chunk_id) {
-                    if stalled_at.elapsed() < Duration::from_secs(self.stall_backoff_secs) {
-                        continue;
-                    }
-                    // Backoff expired — will retry; stalled entry cleared on spawn below.
+                // Skip stalled — no source available; discovery promotes when a node returns.
+                if stalled.contains(chunk_id) {
+                    continue;
                 }
 
                 let confirmed_alive = match cache.get(chunk_id) {
                     Some(nodes) => nodes.clone(),
-                    None => continue, // no cache entry yet; wait for discovery pass
+                    None => continue, // discovery hasn't run yet for this chunk
                 };
 
                 let status = if confirmed_alive.len() < self.replication_factor {
@@ -739,7 +717,7 @@ impl HealingManager {
                 } else if confirmed_alive.len() > self.replication_factor {
                     if quorum { ReplicationStatus::OverReplicated } else { continue }
                 } else {
-                    continue; // at RF, will be cleaned up by discovery
+                    continue; // at RF, discovery will clean up pending entry
                 };
 
                 v.push((*chunk_id, status, confirmed_alive));
@@ -772,31 +750,17 @@ impl HealingManager {
 
         let dispatched = work.len();
 
-        // Spawn-and-forget: in_flight_healing prevents double-queuing if the next
-        // drain tick fires before these tasks complete. The semaphore gates how many
-        // bytes are in-flight simultaneously; each task acquires on entry and releases
-        // on completion (or timeout), so the drain loop never blocks.
         for (chunk_id, status, confirmed_alive) in work {
-            // Clear any expired stall entry before spawning so a clean retry starts fresh.
-            {
-                let mut stalled = self.stalled_healing.write().await;
-                if stalled.get(&chunk_id).map_or(false, |t| t.elapsed() >= Duration::from_secs(self.stall_backoff_secs)) {
-                    stalled.remove(&chunk_id);
-                }
-            }
-
             let storage = self.storage.clone();
             let metadata = self.metadata.clone();
             let cluster = self.cluster.clone();
             let client = self.client.clone();
             let pending_healing = self.pending_healing.clone();
             let in_flight_healing = self.in_flight_healing.clone();
-            let stalled_healing = self.stalled_healing.clone();
             let heal_semaphore = self.heal_semaphore.clone();
             let heal_semaphore_capacity = self.heal_semaphore_capacity;
             let replication_factor = self.replication_factor;
             let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs);
-            let stall_backoff_secs = self.stall_backoff_secs;
 
             tokio::spawn(async move {
                 let chunk_size = metadata.get_chunk_location(&chunk_id)
@@ -827,18 +791,17 @@ impl HealingManager {
 
                 match result {
                     Ok(Ok(())) => {
-                        // Success — clear any stall entry so it doesn't linger.
-                        stalled_healing.write().await.remove(&chunk_id);
+                        // Success — pending entry removed inside do_heal_chunk_shared.
                     }
                     Ok(Err(e)) => {
-                        warn!("Heal failed for chunk {}, moving to stalled (backoff {}s): {}", chunk_id, stall_backoff_secs, e);
-                        stalled_healing.write().await.insert(chunk_id, Instant::now());
+                        // Transfer error — stays in pending, retried next drain tick.
+                        // Discovery will move it to stalled if the source disappears.
+                        warn!("Heal failed for chunk {}: {}", chunk_id, e);
                         in_flight_healing.write().await.remove(&chunk_id);
                     }
                     Err(_) => {
-                        warn!("Heal timed out for chunk {} after {}s, moving to stalled (backoff {}s)",
-                              chunk_id, transfer_timeout.as_secs(), stall_backoff_secs);
-                        stalled_healing.write().await.insert(chunk_id, Instant::now());
+                        // Transfer timed out — stays in pending, retried next drain tick.
+                        warn!("Heal timed out for chunk {} after {}s", chunk_id, transfer_timeout.as_secs());
                         in_flight_healing.write().await.remove(&chunk_id);
                     }
                 }
@@ -846,7 +809,7 @@ impl HealingManager {
             });
         }
 
-        debug!("Heal queue: dispatched {} tasks (spawn-and-forget)", dispatched);
+        debug!("Heal queue: dispatched {} tasks", dispatched);
         Ok(())
     }
 
@@ -1189,10 +1152,15 @@ impl HealingManager {
         let in_flight = self.in_flight_healing.read().await;
         let stalled   = self.stalled_healing.read().await;
 
+        // pending count excludes stalled (they're a subset of pending_healing keys
+        // but have no source — not actionable by the heal loop right now).
+        let stalled_count = stalled.len();
+        let pending_count = pending.len().saturating_sub(stalled_count);
+
         HealingStats {
-            pending_healing: pending.len(),
+            pending_healing: pending_count,
             in_flight_healing: in_flight.len(),
-            stalled_healing: stalled.len(),
+            stalled_healing: stalled_count,
             auto_heal_enabled: self.auto_heal,
             healing_delay_secs: self.healing_delay_secs,
         }

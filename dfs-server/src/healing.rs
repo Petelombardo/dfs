@@ -3,7 +3,7 @@ use dfs_common::{ChunkId, ChunkLocation, Message, NodeId, Request, Response};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -39,11 +39,18 @@ pub struct HealingManager {
     /// Auto-healing enabled
     auto_heal: bool,
 
-    /// Maximum number of chunks to process per check cycle (queue depth)
+    /// Maximum number of chunks to process per drain cycle (queue depth)
     max_heal_per_cycle: usize,
 
-    /// Maximum number of heal/cleanup ops to run concurrently within a cycle
-    max_concurrent_heals: usize,
+    /// Byte-budget semaphore — limits total bytes in-flight across all concurrent
+    /// heal transfers. Each task acquires chunk_size permits before sending and
+    /// releases them on completion, naturally throttling without fixed concurrency
+    /// caps or inter-batch sleeps.
+    heal_semaphore: Arc<Semaphore>,
+
+    /// Total permit capacity of heal_semaphore (bytes). Stored separately so tasks
+    /// can clamp their acquisition to the full budget without racing on available_permits().
+    heal_semaphore_capacity: usize,
 
     /// Chunks pending healing (chunk_id -> failure_detected_at)
     pending_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
@@ -71,17 +78,19 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
     ) -> Self {
-        // Concurrency and pacing tuned to avoid overwhelming nodes with chunk push
-        // traffic. Each PushChunkTo streams up to 4MB synchronously; 8 concurrent
-        // transfers was saturating the TCP stack and causing heartbeat misses → node
-        // failure detection → leader changes → all in-flight heals rejected.
-        //
-        // 2 concurrent × 1s between batches = gentle steady drip that leaves plenty
-        // of bandwidth and Tokio task capacity for heartbeats and client I/O.
-        // At 4MB chunks over a LAN this is still ~8MB/s of healing throughput, well
-        // above the ~2MB/s DVR write rate that generates new under-replicated chunks.
         let max_heal_per_cycle = 200;
-        let max_concurrent_heals = 2;
+
+        // Byte-budget semaphore: cap total bytes in-flight across all concurrent
+        // heal transfers. Sized via DFS_HEAL_BANDWIDTH_MB (default 32MB).
+        // At 4MB chunks this allows up to 8 concurrent transfers; smaller end-of-segment
+        // chunks let more through automatically. No fixed concurrency cap needed —
+        // the semaphore self-tunes to actual chunk sizes.
+        let heal_bw_mb = std::env::var("DFS_HEAL_BANDWIDTH_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(32);
+        let heal_semaphore_capacity = heal_bw_mb * 1024 * 1024;
+        let heal_semaphore = Arc::new(Semaphore::new(heal_semaphore_capacity));
 
         Self {
             storage,
@@ -93,7 +102,8 @@ impl HealingManager {
             scrub_interval_hours,
             auto_heal,
             max_heal_per_cycle,
-            max_concurrent_heals,
+            heal_semaphore,
+            heal_semaphore_capacity,
             pending_healing: Arc::new(RwLock::new(HashMap::new())),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -107,9 +117,10 @@ impl HealingManager {
             return;
         }
 
+        let heal_bw_mb = self.heal_semaphore_capacity / (1024 * 1024);
         info!(
-            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, concurrency: {})",
-            self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle, self.max_concurrent_heals
+            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, bandwidth_budget: {}MB)",
+            self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle, heal_bw_mb
         );
 
         // Discovery loop: scans all chunks, bulk-queries nodes, classifies under/over
@@ -691,55 +702,67 @@ impl HealingManager {
             return Ok(());
         }
 
-        let mut healed = 0usize;
+        // Spawn all work immediately — the heal_semaphore gates how many bytes can be
+        // in-flight at once. Each task acquires chunk_size permits before the transfer
+        // and releases them on completion, so concurrency self-tunes to actual chunk
+        // sizes with no fixed cap or inter-task sleeps needed.
+        let total = work.len();
+        let mut handles = Vec::with_capacity(total);
 
-        for batch in work.chunks(self.max_concurrent_heals) {
-            let mut handles = Vec::with_capacity(batch.len());
+        for (chunk_id, status, confirmed_alive) in work {
+            let storage = self.storage.clone();
+            let metadata = self.metadata.clone();
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            let pending_healing = self.pending_healing.clone();
+            let in_flight_healing = self.in_flight_healing.clone();
+            let heal_semaphore = self.heal_semaphore.clone();
+            let heal_semaphore_capacity = self.heal_semaphore_capacity;
+            let replication_factor = self.replication_factor;
 
-            for (chunk_id, status, confirmed_alive) in batch {
-                let chunk_id = *chunk_id;
-                let status = *status;
-                let confirmed_alive = confirmed_alive.clone();
-                let storage = self.storage.clone();
-                let metadata = self.metadata.clone();
-                let cluster = self.cluster.clone();
-                let client = self.client.clone();
-                let pending_healing = self.pending_healing.clone();
-                let in_flight_healing = self.in_flight_healing.clone();
-                let replication_factor = self.replication_factor;
+            handles.push(tokio::spawn(async move {
+                // Look up chunk size to size the semaphore acquisition.
+                // Fall back to max chunk size (4MB) if unknown — conservative but safe.
+                let chunk_size = metadata.get_chunk_location(&chunk_id)
+                    .ok()
+                    .flatten()
+                    .map(|loc| loc.size)
+                    .unwrap_or(4 * 1024 * 1024);
 
-                handles.push(tokio::spawn(async move {
-                    match status {
-                        ReplicationStatus::UnderReplicated => {
-                            if let Err(e) = HealingManager::do_heal_chunk_shared(
-                                &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
-                                &pending_healing, &in_flight_healing, replication_factor,
-                            ).await {
-                                warn!("Failed to heal chunk {}: {}", chunk_id, e);
-                            }
+                // Acquire permits proportional to chunk size. Clamp to total capacity
+                // so a single chunk larger than the budget can't deadlock — it just
+                // acquires the full budget and runs alone.
+                let permits = (chunk_size as u32).min(heal_semaphore_capacity as u32).max(1);
+                let _permit = heal_semaphore.acquire_many(permits).await;
+
+                match status {
+                    ReplicationStatus::UnderReplicated => {
+                        if let Err(e) = HealingManager::do_heal_chunk_shared(
+                            &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
+                            &pending_healing, &in_flight_healing, replication_factor,
+                        ).await {
+                            warn!("Failed to heal chunk {}: {}", chunk_id, e);
                         }
-                        ReplicationStatus::OverReplicated => {
-                            if let Err(e) = HealingManager::do_cleanup_excess_shared(
-                                &chunk_id, confirmed_alive, &metadata, &cluster, &client, replication_factor,
-                            ).await {
-                                warn!("Failed to cleanup over-replicated chunk {}: {}", chunk_id, e);
-                            }
-                        }
-                        ReplicationStatus::Ok => {}
                     }
-                }));
-            }
+                    ReplicationStatus::OverReplicated => {
+                        if let Err(e) = HealingManager::do_cleanup_excess_shared(
+                            &chunk_id, confirmed_alive, &metadata, &cluster, &client, replication_factor,
+                        ).await {
+                            warn!("Failed to cleanup over-replicated chunk {}: {}", chunk_id, e);
+                        }
+                    }
+                    ReplicationStatus::Ok => {}
+                }
+                // _permit drops here, releasing semaphore slots
+            }));
+        }
 
-            for handle in handles {
-                let _ = handle.await;
-                healed += 1;
-            }
-
-            // Pause between batches to let heartbeats through. Each PushChunkTo
-            // is a full chunk transfer (up to 4MB) — without a meaningful gap the
-            // TCP stack stays saturated, heartbeats miss their window, nodes get
-            // marked failed, and the leader changes mid-cycle killing all in-flight heals.
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        // Wait for all spawned tasks to complete before returning, so the next
+        // drain_heal_queue call doesn't double-queue chunks still in flight.
+        let mut healed = 0usize;
+        for handle in handles {
+            let _ = handle.await;
+            healed += 1;
         }
 
         if healed > 0 {

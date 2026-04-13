@@ -207,6 +207,7 @@ impl SqlMetadataStore {
                 size: size as usize,
                 checksum,
                 file_offset: file_offset.map(|o| o as u64),
+                written_at: None,
             });
         }
 
@@ -284,6 +285,7 @@ impl SqlMetadataStore {
                 size: size as usize,
                 checksum,
                 file_offset: file_offset.map(|o| o as u64),
+                written_at: None,
             }))
         } else {
             Ok(None)

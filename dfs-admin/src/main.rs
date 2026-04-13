@@ -984,6 +984,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
                     size: chunk_size as usize,
                     checksum: chunk_id.hash,
                     file_offset: Some(current_offset),
+                    written_at: None,
                 });
                 current_offset += chunk_size;
             }

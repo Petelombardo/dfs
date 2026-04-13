@@ -298,7 +298,17 @@ pub struct ChunkLocationV0 {
     pub checksum: [u8; 32],
 }
 
-/// Information about where a chunk is stored (current format - 5 fields)
+/// Legacy ChunkLocation format (5 fields, before written_at was added)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkLocationV1 {
+    pub chunk_id: ChunkId,
+    pub nodes: Vec<NodeId>,
+    pub size: usize,
+    pub checksum: [u8; 32],
+    pub file_offset: Option<u64>,
+}
+
+/// Information about where a chunk is stored (current format - 6 fields)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkLocation {
     /// Chunk identifier
@@ -316,6 +326,19 @@ pub struct ChunkLocation {
     /// File offset where this chunk starts (for sparse file support)
     /// If None, chunks are assumed to be sequential (legacy behavior)
     pub file_offset: Option<u64>,
+
+    /// Unix timestamp (seconds) when this chunk location record was first written.
+    /// The healer uses this to skip recently-written chunks during orphan purge,
+    /// guarding against the race between ReplicateChunkLocation arriving before
+    /// the corresponding put_file_metadata has committed.
+    /// None for records written before this field was added (treated as old).
+    pub written_at: Option<u64>,
+}
+
+impl ChunkLocation {
+    pub fn written_at_secs(&self) -> u64 {
+        self.written_at.unwrap_or(0)
+    }
 }
 
 impl From<ChunkLocationV0> for ChunkLocation {
@@ -326,6 +349,20 @@ impl From<ChunkLocationV0> for ChunkLocation {
             size: v0.size,
             checksum: v0.checksum,
             file_offset: None,
+            written_at: None,
+        }
+    }
+}
+
+impl From<ChunkLocationV1> for ChunkLocation {
+    fn from(v1: ChunkLocationV1) -> Self {
+        ChunkLocation {
+            chunk_id: v1.chunk_id,
+            nodes: v1.nodes,
+            size: v1.size,
+            checksum: v1.checksum,
+            file_offset: v1.file_offset,
+            written_at: None,
         }
     }
 }

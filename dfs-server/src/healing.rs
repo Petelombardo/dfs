@@ -438,6 +438,7 @@ impl HealingManager {
                     size: location.size,
                     checksum: location.checksum,
                     file_offset: location.file_offset,
+                    written_at: location.written_at,
                 };
                 if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
                     warn!("Failed to prune ghost nodes from chunk {} metadata: {}", chunk_id, e);
@@ -709,6 +710,7 @@ impl HealingManager {
                     size: location.size,
                     checksum: location.checksum,
                     file_offset: location.file_offset,
+                    written_at: location.written_at,
                 };
                 if let Err(e) = metadata.put_chunk_location(&repaired) {
                     warn!("Failed to repair chunk {} metadata: {}", chunk_id, e);
@@ -795,6 +797,7 @@ impl HealingManager {
                 size: location.size,
                 checksum: location.checksum,
                 file_offset: location.file_offset,
+                written_at: location.written_at,
             };
 
             if let Err(e) = metadata.put_chunk_location(&updated_location) {
@@ -906,6 +909,7 @@ impl HealingManager {
             size: location.size,
             checksum: location.checksum,
             file_offset: location.file_offset,
+            written_at: location.written_at,
         };
 
         if let Err(e) = metadata.put_chunk_location(&updated_location) {

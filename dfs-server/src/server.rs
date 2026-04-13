@@ -613,6 +613,7 @@ impl Server {
                     size: location.size,
                     checksum: location.checksum,
                     file_offset: location.file_offset,  // Preserve existing offset
+                    written_at: existing.written_at.or(location.written_at),  // Preserve original write time
                 }
             }
             Ok(None) => {
@@ -914,6 +915,7 @@ impl Server {
                     size: chunk_data.len(),
                     checksum: chunk_id.hash,
                     file_offset: None,  // Server-side replication doesn't track file offsets
+                    written_at: None,
                 };
 
                 let metadata_start = std::time::Instant::now();
@@ -1019,6 +1021,7 @@ impl Server {
                     size: chunk_data.len(),
                     checksum: chunk_id.hash,
                     file_offset: None,  // Server-side local-only writes don't track file offsets
+                    written_at: None,
                 };
 
                 metadata.put_chunk_location(&location)
@@ -1160,6 +1163,7 @@ impl Server {
                 size,
                 checksum: chunk_id.hash,
                 file_offset: None,  // Legacy fallback when metadata not found
+                written_at: None,
             })
         }
     }
@@ -1455,6 +1459,7 @@ impl Server {
                 size: chunk_size_bytes,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
+                written_at: None,
             };
 
             // Persist chunk location locally

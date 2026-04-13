@@ -2402,6 +2402,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 size: chunk_size,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),  // Track where in file this chunk belongs
+                written_at: None,
             };
 
             chunk_locations.push(location);
@@ -2778,6 +2779,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 size: size as usize,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
+                written_at: None,
             });
             current_offset += size;
         }

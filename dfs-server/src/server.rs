@@ -1770,10 +1770,10 @@ impl Server {
                 }
             }
             Ok(None) => {
-                // File not found on this node — broadcast DeleteFile to all peers so
-                // whichever node holds the path: index can clean it up.  This handles
-                // the case where the file was written while this node was offline and
-                // the path index only lives on the nodes that were up at write time.
+                // File not found on this node — broadcast DeleteFile to ALL peers so
+                // every node that holds a copy of the path: index gets cleaned up.
+                // put_file_metadata uses quorum writes so the path: record may exist
+                // on multiple peers; we must not stop after the first Ok response.
                 let cluster = self.cluster.clone();
                 let client = self.client.clone();
                 let local_id = self.cluster.local_node_id();
@@ -1788,7 +1788,8 @@ impl Server {
                         Ok(envelope) => {
                             if matches!(envelope.message, Message::Response(Response::Ok { .. })) {
                                 found = true;
-                                break;
+                                // Do NOT break — keep forwarding to remaining peers so all
+                                // copies of the path: index and file: record are deleted.
                             }
                         }
                         Err(e) => {

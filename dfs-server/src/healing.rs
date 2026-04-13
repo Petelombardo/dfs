@@ -185,12 +185,13 @@ impl HealingManager {
                 continue;
             }
 
-            // Remove if chunk no longer exists in local storage or metadata
-            if !self.storage.has_chunk(chunk_id) {
-                if self.metadata.get_chunk_location(chunk_id).ok().flatten().is_none() {
-                    debug!("Removing pending healing entry for non-existent chunk {}", chunk_id);
-                    to_remove.push(*chunk_id);
-                }
+            // Remove if the chunk: location record is gone — this means the file was
+            // deleted (or the chunk was legitimately purged as an orphan).  There is
+            // nothing left to heal regardless of whether raw chunk data still exists
+            // on disk (stale data will be cleaned up separately).
+            if self.metadata.get_chunk_location(chunk_id).ok().flatten().is_none() {
+                debug!("Removing pending healing entry for chunk {} — no location record", chunk_id);
+                to_remove.push(*chunk_id);
             }
         }
 

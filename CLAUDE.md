@@ -8,4 +8,5 @@ Staging has 6 servers - 5 storage nodes, and 1 client.
 Our primary objectives are reliability (high availability and redundancy), and speed.  We want to maximize both.
 You can ssh into the staging nodes to test and gather logs.  All staging nodes start the dfs services using systemd.
 We run one service in staging, a hdhomerun dvr.  It runs from /mnt/test/podman/dvr/podman-compose.yml 
-
+Band-aids to the code are a last-resort.  We should always try to fix the underlying problem at its root.
+Propose protocol updates if they will make our app more efficient.

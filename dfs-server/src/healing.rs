@@ -143,6 +143,12 @@ impl HealingManager {
             }
 
             if !is_leader {
+                // Followers do not run orphan purge.  The leader purges orphaned
+                // chunk: records and broadcasts PurgeChunkLocation to all followers,
+                // so follower DBs drain via targeted deletes rather than a local scan.
+                // Independent follower purging is unsafe: a follower can have chunk:
+                // records for a live recording whose file: metadata hasn't been flushed
+                // yet, and would incorrectly classify those chunks as orphans.
                 continue;
             }
 
@@ -262,6 +268,7 @@ impl HealingManager {
 
         // Separate orphan candidates (no network I/O) from live chunks to check.
         let mut chunks_to_check: Vec<ChunkId> = Vec::new();
+        let mut purged_orphans: Vec<ChunkId> = Vec::new();
 
         for chunk_id in all_chunks {
             if !live_chunks.contains(&chunk_id) {
@@ -270,22 +277,49 @@ impl HealingManager {
                     self.pending_healing.write().await.remove(&chunk_id);
                     continue;
                 }
-                let mut pending = self.pending_healing.write().await;
-                if pending.contains_key(&chunk_id) {
-                    drop(pending);
-                    debug!("Purging orphaned chunk location record: {}", chunk_id);
-                    if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
-                        warn!("Failed to purge orphaned chunk location {}: {}", chunk_id, e);
-                    }
-                    self.pending_healing.write().await.remove(&chunk_id);
-                    orphan_count += 1;
+                // Purge immediately — no two-cycle wait.  The live_chunk_ids scan already
+                // cross-references every file record, so any chunk_id absent from that set
+                // is definitively unreferenced.  The two-cycle approach was causing orphans
+                // to survive indefinitely whenever the cluster leader changed (the new
+                // leader's pending_healing map is empty, so every orphan resets to
+                // "first sighting"), which let the sled DB grow to hundreds of MB and
+                // ultimately OOM the nodes.
+                debug!("Purging orphaned chunk location record: {}", chunk_id);
+                if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
+                    warn!("Failed to purge orphaned chunk location {}: {}", chunk_id, e);
                 } else {
-                    pending.insert(chunk_id, Instant::now());
-                    debug!("Chunk {} unreferenced by any file — will purge next cycle if still orphaned", chunk_id);
+                    purged_orphans.push(chunk_id);
                 }
+                self.pending_healing.write().await.remove(&chunk_id);
+                orphan_count += 1;
                 continue;
             }
             chunks_to_check.push(chunk_id);
+        }
+
+        // Broadcast orphan purges to all followers so their chunk: routing tables
+        // drain in sync with the leader.  Followers never purge independently —
+        // they could incorrectly delete records for live recordings whose file:
+        // metadata hasn't been flushed yet (e.g. an open file being written to).
+        if !purged_orphans.is_empty() {
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            let local_id = cluster.local_node_id();
+            let orphans_to_broadcast = purged_orphans.clone();
+            tokio::spawn(async move {
+                let nodes = cluster.get_all_nodes().await;
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    for &chunk_id in &orphans_to_broadcast {
+                        let req = Request::PurgeChunkLocation { chunk_id };
+                        if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                            debug!("Failed to broadcast PurgeChunkLocation {} to node {}: {}", chunk_id, node.id, e);
+                        }
+                    }
+                }
+            });
         }
 
         // Bulk-query each online remote node: "which of these chunks do you hold?"
@@ -483,6 +517,11 @@ impl HealingManager {
 
         if orphan_count > 0 {
             info!("Purged {} orphaned chunk location records", orphan_count);
+            // Flush sled after bulk orphan purge so the B-tree compacts and the OS
+            // can reclaim page-cache memory from the now-smaller DB file.
+            if let Err(e) = self.metadata.flush() {
+                warn!("Failed to flush metadata after orphan purge: {}", e);
+            }
         }
 
         if work.is_empty() {

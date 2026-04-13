@@ -19,7 +19,11 @@ impl MetadataStore {
         let cache_capacity_mb = std::env::var("DFS_METADATA_CACHE_MB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(128); // Default 128MB cache
+            .unwrap_or(16); // 16MB — keeps the hot working set (file: and path: keys) warm
+                            // without mapping the full chunk: index into RAM.  The chunk:
+                            // keyspace is large (100k+ records) but only scanned by the
+                            // leader healer once per minute; 16MB is enough for file lookups
+                            // and write-path hot keys.
 
         let cache_capacity_bytes = cache_capacity_mb * 1024 * 1024;
 

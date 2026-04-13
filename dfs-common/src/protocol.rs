@@ -232,6 +232,15 @@ pub enum Request {
         data: Vec<u8>,
         expected_offset: u64,
     },
+
+    /// Purge a chunk location record from this node's routing table.
+    /// Sent by the leader to all followers after the leader purges an orphaned
+    /// chunk: record, so follower DBs drain in sync with the leader rather than
+    /// accumulating stale records forever (which was causing OOM).
+    /// Does NOT delete chunk data — only the routing metadata entry.
+    PurgeChunkLocation {
+        chunk_id: ChunkId,
+    },
 }
 
 /// Response types

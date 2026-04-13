@@ -283,6 +283,9 @@ impl Server {
             Request::ReplicateChunkLocation { location } => {
                 self.handle_replicate_chunk_location(location).await
             }
+            Request::PurgeChunkLocation { chunk_id } => {
+                self.handle_purge_chunk_location(chunk_id).await
+            }
             Request::PrefetchHint { chunk_ids } => {
                 self.handle_prefetch_hint(chunk_ids).await
             }
@@ -635,6 +638,26 @@ impl Server {
                 warn!("Failed to replicate chunk location: {}", e);
                 Response::Error {
                     message: format!("Failed to replicate chunk location: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+        }
+    }
+
+    /// Handle purge chunk location — remove an orphaned chunk: routing record.
+    /// Sent by the cluster leader after it purges an orphan so that all followers
+    /// stay in sync and don't accumulate stale records indefinitely.
+    async fn handle_purge_chunk_location(&self, chunk_id: ChunkId) -> Response {
+        debug!("Handling purge chunk location: {}", chunk_id);
+        match self.metadata.delete_chunk_location(&chunk_id) {
+            Ok(_) => {
+                debug!("Purged chunk location record: {}", chunk_id);
+                Response::Ok { data: None }
+            }
+            Err(e) => {
+                warn!("Failed to purge chunk location {}: {}", chunk_id, e);
+                Response::Error {
+                    message: format!("Failed to purge chunk location: {}", e),
                     code: ErrorCode::InternalError,
                 }
             }
@@ -1294,7 +1317,7 @@ impl Server {
         let chunk_size = self.chunker.chunk_size() as u64;
         let partial_bytes = metadata.size % chunk_size;
 
-        let (write_data, drop_last_chunk) = if partial_bytes > 0 {
+        let (write_data, drop_last_chunk, actual_partial_bytes) = if partial_bytes > 0 {
             // File ends mid-chunk — read back the partial last chunk and prepend it
             let last_loc = match metadata.chunk_locations.last() {
                 Some(loc) => loc.clone(),
@@ -1310,9 +1333,20 @@ impl Server {
 
             match self.read_chunk(&last_loc.chunk_id).await {
                 Ok(tail_data) => {
+                    // Use the actual on-disk chunk size as partial_bytes, not the
+                    // metadata-derived value.  If the client's background flusher wrote
+                    // more data than metadata recorded (async replication lag), the
+                    // metadata-derived partial_bytes will be smaller than the real tail,
+                    // causing the new size calculation to undercount and corrupting the
+                    // file's recorded size on every subsequent AppendFile call.
+                    let actual = tail_data.len() as u64;
+                    if actual != partial_bytes {
+                        info!("AppendFile: tail chunk on disk is {} bytes but metadata says {} (replication lag) — using disk size",
+                              actual, partial_bytes);
+                    }
                     let mut combined = tail_data;
                     combined.extend_from_slice(&new_data);
-                    (combined, true)
+                    (combined, true, actual)
                 }
                 Err(e) => {
                     warn!("AppendFile: failed to read partial tail chunk {}: {}", last_loc.chunk_id, e);
@@ -1323,7 +1357,7 @@ impl Server {
                 }
             }
         } else {
-            (new_data, false)
+            (new_data, false, 0u64)
         };
 
         // --- Step 4+5: Chunk the combined data ---
@@ -1334,8 +1368,8 @@ impl Server {
             return Response::AppendFileResult { metadata, remaining_in_chunk: remaining };
         }
 
-        // Base file offset for the new chunks: where the chunk-aligned region starts
-        let base_offset = metadata.size - partial_bytes;
+        // Base file offset: where the chunk-aligned region starts, using actual disk size
+        let base_offset = metadata.size - actual_partial_bytes;
 
         // --- Step 6: Write each chunk with 2-replica guarantee ---
         let mut new_locations: Vec<ChunkLocation> = Vec::new();
@@ -1464,7 +1498,9 @@ impl Server {
         }
 
         // --- Step 8: Update metadata size and timestamp ---
-        metadata.size = expected_offset + (write_data.len() as u64 - partial_bytes);
+        // Use actual_partial_bytes (from disk) not partial_bytes (from metadata) so
+        // the recorded size matches what's actually on disk.
+        metadata.size = expected_offset + (write_data.len() as u64 - actual_partial_bytes);
         metadata.modified_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1728,10 +1764,42 @@ impl Server {
                     }
                 }
             }
-            Ok(None) => Response::Error {
-                message: "File not found".to_string(),
-                code: ErrorCode::NotFound,
-            },
+            Ok(None) => {
+                // File not found on this node — broadcast DeleteFile to all peers so
+                // whichever node holds the path: index can clean it up.  This handles
+                // the case where the file was written while this node was offline and
+                // the path index only lives on the nodes that were up at write time.
+                let cluster = self.cluster.clone();
+                let client = self.client.clone();
+                let local_id = self.cluster.local_node_id();
+                let nodes = cluster.get_all_nodes().await;
+                let mut found = false;
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let req = Request::DeleteFile { path: path.clone() };
+                    match client.send_message(node.addr, Message::Request(req)).await {
+                        Ok(envelope) => {
+                            if matches!(envelope.message, Message::Response(Response::Ok { .. })) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to forward DeleteFile to node {}: {}", node.id, e);
+                        }
+                    }
+                }
+                if found {
+                    Response::Ok { data: None }
+                } else {
+                    Response::Error {
+                        message: "File not found".to_string(),
+                        code: ErrorCode::NotFound,
+                    }
+                }
+            }
             Err(e) => {
                 warn!("Failed to find file: {}", e);
                 Response::Error {

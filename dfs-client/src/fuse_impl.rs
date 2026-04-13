@@ -1333,15 +1333,38 @@ impl Filesystem for DfsFilesystem {
             // Early return for out of bounds
             // But first, check if file might have grown by refreshing metadata
             if offset >= metadata.size as usize {
-                // File might be actively growing (e.g., recording in progress)
-                // Refresh metadata from server to see if more data is available
+                // File might be actively growing (e.g., live recording in progress).
+                // Rate-limit the metadata refresh so Kodi's frequent seek-past-EOF
+                // polls don't hammer the server.  We allow one refresh per second per
+                // inode; between refreshes we return empty immediately.
+                let should_refresh = match last_metadata_update.get(&ino) {
+                    None => true,
+                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(1),
+                };
+
+                if !should_refresh {
+                    debug!("Read at offset {} >= size {}, rate-limiting EOF refresh, returning empty",
+                           offset, metadata.size);
+                    reply.data(&[]);
+                    return;
+                }
+
                 info!("Read at offset {} >= cached size {}, refreshing metadata from server", offset, metadata.size);
+                last_metadata_update.insert(ino, std::time::Instant::now());
 
                 match client.get_file_metadata(&metadata.path).await {
                     Ok(Some(mut fresh_metadata)) => {
-                        // If file has grown, also refresh the chunk map from the leader so we
-                        // have accurate replica locations for the new chunks before reading them.
-                        // We compare modified_at: if it changed, the leader has new chunk entries.
+                        // Still past EOF even after refresh — return empty immediately,
+                        // no need to fetch the chunk map (there's nothing new to read).
+                        if offset >= fresh_metadata.size as usize {
+                            info!("Still at EOF after refresh: offset {} >= size {}", offset, fresh_metadata.size);
+                            metadata_cache.insert(ino, fresh_metadata);
+                            reply.data(&[]);
+                            return;
+                        }
+
+                        // File has grown past our read offset.  Now fetch the chunk map
+                        // so we have accurate replica locations for the new chunks.
                         let prev_modified_at = metadata.modified_at;
                         if fresh_metadata.modified_at != prev_modified_at || fresh_metadata.chunk_locations.is_empty() {
                             match client.get_file_chunk_map(fresh_metadata.id).await {
@@ -1350,7 +1373,6 @@ impl Filesystem for DfsFilesystem {
                                         info!("Refreshed chunk map from leader: {} locations for file {}",
                                               locations.len(), fresh_metadata.path);
                                         fresh_metadata.chunk_locations = locations;
-                                        // Invalidate chunk offset cache so it rebuilds with new offsets
                                         chunk_offset_cache.remove(&ino);
                                     }
                                 }
@@ -1363,9 +1385,7 @@ impl Filesystem for DfsFilesystem {
                         // Update cache with fresh metadata
                         metadata_cache.insert(ino, fresh_metadata.clone());
 
-                        // Warm replica cache with chunk locations for upcoming reads
-                        // Only warm chunks ahead of current read position (smart warming)
-                        // CRITICAL: Calculate correct chunk index using actual chunk sizes (variable-sized chunks)
+                        // Warm replica cache for chunks ahead of the current read position
                         let chunk_idx = if !fresh_metadata.chunk_sizes.is_empty() {
                             let mut cumulative = 0u64;
                             let mut idx = 0;
@@ -1375,34 +1395,24 @@ impl Filesystem for DfsFilesystem {
                                     break;
                                 }
                                 cumulative += size as u64;
-                                idx = i + 1; // If we don't break, we're past all chunks
+                                idx = i + 1;
                             }
                             Some(idx)
                         } else {
                             None
                         };
-
                         client.warm_replica_cache_by_index(&fresh_metadata.chunks, chunk_idx).await;
 
-                        // If file has grown, continue with the read using fresh metadata
-                        if offset < fresh_metadata.size as usize {
-                            info!("File grew from {} to {} bytes, continuing read", metadata.size, fresh_metadata.size);
-                            metadata = fresh_metadata;
-                        } else {
-                            // Still at EOF even after refresh
-                            info!("Still at EOF after refresh: offset {} >= size {}", offset, fresh_metadata.size);
-                            reply.data(&[]);
-                            return;
-                        }
+                        info!("File grew from {} to {} bytes, continuing read", metadata.size, fresh_metadata.size);
+                        metadata = fresh_metadata;
                     }
                     Ok(None) => {
-                        // File was deleted
                         info!("File not found when refreshing metadata");
                         reply.error(libc::ENOENT);
                         return;
                     }
                     Err(e) => {
-                        // Couldn't refresh, assume EOF
+                        // Server unreachable — return empty rather than blocking
                         info!("Failed to refresh metadata: {}, assuming EOF", e);
                         reply.data(&[]);
                         return;
@@ -2052,8 +2062,56 @@ impl Filesystem for DfsFilesystem {
             let mut metadata = match metadata_cache.get(&ino) {
                 Some(m) => m.clone(),
                 None => {
-                    reply.error(libc::ENOENT);
-                    return;
+                    // Metadata cache miss — the kernel may have sent open() with a cached
+                    // inode without going through lookup() first (FOPEN_KEEP_CACHE survives
+                    // client restarts).  Fetch from the server and populate the cache so
+                    // the write path has a FileId and correct start_offset.
+                    let path_opt = {
+                        let map = self.path_to_inode.read().unwrap();
+                        map.iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone())
+                    };
+                    if let Some(path) = path_opt {
+                        match runtime.block_on(client.get_file_metadata(&path)) {
+                            Ok(Some(fetched)) => {
+                                metadata_cache.insert(ino, fetched.clone());
+                                self.last_metadata_update.insert(ino, std::time::Instant::now());
+                                fetched
+                            }
+                            Ok(None) => {
+                                // File doesn't exist on server yet — new file, create minimal record
+                                let new_meta = dfs_common::FileMetadata {
+                                    id: dfs_common::FileId::new(),
+                                    path: path.clone(),
+                                    size: 0,
+                                    chunks: Vec::new(),
+                                    chunk_sizes: Vec::new(),
+                                    chunk_locations: Vec::new(),
+                                    created_at: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default().as_secs(),
+                                    modified_at: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default().as_secs(),
+                                    mode: 0o644,
+                                    uid: _req.uid(),
+                                    gid: _req.gid(),
+                                    file_type: dfs_common::FileType::RegularFile,
+                                };
+                                info!("write: inode {} has no server metadata, creating new record for {}", ino, path);
+                                metadata_cache.insert(ino, new_meta.clone());
+                                new_meta
+                            }
+                            Err(e) => {
+                                error!("write: failed to fetch metadata for inode {}: {}", ino, e);
+                                reply.error(libc::EIO);
+                                return;
+                            }
+                        }
+                    } else {
+                        error!("write: no path known for inode {}, returning ENOENT", ino);
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
                 }
             };
 

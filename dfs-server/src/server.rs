@@ -427,10 +427,14 @@ impl Server {
             };
         }
 
-        // Update chunk location metadata
+        // Update chunk location metadata: add local node if not already present.
+        // Don't push if the location already has >= RF nodes — this node is receiving a
+        // healing PushChunkTo and the healer will broadcast the authoritative updated
+        // location after it gets our Ok. Adding ourselves here before that broadcast
+        // would leave a stale 4th-node record that the merge logic then perpetuates.
         let local_node_id = self.cluster.local_node_id();
         if let Ok(mut location) = self.get_or_create_chunk_location(&chunk_id, data.len()).await {
-            if !location.nodes.contains(&local_node_id) {
+            if !location.nodes.contains(&local_node_id) && location.nodes.len() < self.replication_factor {
                 location.nodes.push(local_node_id);
                 let _ = self.metadata.put_chunk_location(&location);
             }
@@ -595,31 +599,50 @@ impl Server {
     async fn handle_replicate_chunk_location(&self, location: ChunkLocation) -> Response {
         info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
 
-        // MERGE chunk location with existing metadata instead of replacing
-        // This ensures all servers know about all replicas
+        // Merge chunk location with existing metadata, but treat an incoming node list
+        // at or above RF as authoritative — the healer only broadcasts after it has
+        // confirmed exactly which nodes hold the chunk, so a full-RF (or trimmed)
+        // broadcast should replace stale local state rather than unioning with it.
+        // A sub-RF incoming list (e.g. a client writing to 2 nodes) is still merged
+        // so we don't lose knowledge of nodes that received the chunk concurrently.
+        let replication_factor = self.replication_factor;
         let merged_location = match self.metadata.get_chunk_location(&location.chunk_id) {
             Ok(Some(existing)) => {
-                // Merge node lists - combine and deduplicate
-                let mut merged_nodes = existing.nodes.clone();
-                for node in &location.nodes {
-                    if !merged_nodes.contains(node) {
-                        merged_nodes.push(*node);
+                if location.nodes.len() >= replication_factor {
+                    // Incoming list is authoritative (healer broadcast or full-RF write).
+                    // Use it as-is, preserving existing timestamps.
+                    debug!("Replacing chunk location for {} with authoritative {}-node list (was {})",
+                           location.chunk_id, location.nodes.len(), existing.nodes.len());
+                    ChunkLocation {
+                        chunk_id: location.chunk_id,
+                        nodes: location.nodes.clone(),
+                        size: location.size,
+                        checksum: location.checksum,
+                        file_offset: location.file_offset.or(existing.file_offset),
+                        written_at: existing.written_at.or(location.written_at),
                     }
-                }
-                info!("Merging chunk location: {} existing nodes + {} new nodes = {} total",
-                      existing.nodes.len(), location.nodes.len(), merged_nodes.len());
-
-                ChunkLocation {
-                    chunk_id: location.chunk_id,
-                    nodes: merged_nodes,
-                    size: location.size,
-                    checksum: location.checksum,
-                    file_offset: location.file_offset,  // Preserve existing offset
-                    written_at: existing.written_at.or(location.written_at),  // Preserve original write time
+                } else {
+                    // Sub-RF incoming list: merge so we accumulate all known nodes.
+                    let mut merged_nodes = existing.nodes.clone();
+                    for node in &location.nodes {
+                        if !merged_nodes.contains(node) {
+                            merged_nodes.push(*node);
+                        }
+                    }
+                    debug!("Merging chunk location {}: {} existing + {} incoming = {} total",
+                           location.chunk_id, existing.nodes.len(), location.nodes.len(), merged_nodes.len());
+                    ChunkLocation {
+                        chunk_id: location.chunk_id,
+                        nodes: merged_nodes,
+                        size: location.size,
+                        checksum: location.checksum,
+                        file_offset: location.file_offset.or(existing.file_offset),
+                        written_at: existing.written_at.or(location.written_at),
+                    }
                 }
             }
             Ok(None) => {
-                info!("Creating new chunk location for {}", location.chunk_id);
+                debug!("Creating new chunk location for {}", location.chunk_id);
                 location.clone()
             }
             Err(e) => {

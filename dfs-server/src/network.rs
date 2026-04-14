@@ -280,8 +280,35 @@ impl NetworkClient {
 
         let mut stream = match stream {
             Some(s) => {
-                debug!("Reusing pooled connection to {}", target);
-                s
+                // Before reusing, non-blockingly check if the server already closed
+                // this connection. try_read is non-blocking: WouldBlock means the
+                // socket is open and idle (good to reuse); Ok(0) means the remote sent
+                // FIN (CLOSE-WAIT — discard); any other result means discard.
+                // DO NOT use ready(READABLE).await here — that blocks until data
+                // arrives, turning every idle-connection reuse into a multi-second hang.
+                let mut buf = [0u8; 1];
+                let peer_closed = match s.try_read(&mut buf) {
+                    Ok(0) => true,   // EOF — server closed connection
+                    Ok(_) => true,   // Unexpected data in pool — discard
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false, // idle, healthy
+                    Err(_) => true,  // Any other error — discard
+                };
+
+                if peer_closed {
+                    debug!("Pooled connection to {} was closed by peer, opening fresh", target);
+                    let mut s = s;
+                    let _ = s.shutdown().await;
+                    // Fall through to open a fresh connection below
+                    tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        TcpStream::connect(target),
+                    ).await
+                        .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
+                        .with_context(|| format!("Failed to connect to {}", target))?
+                } else {
+                    debug!("Reusing pooled connection to {}", target);
+                    s
+                }
             }
             None => {
                 debug!("Connecting to {}", target);

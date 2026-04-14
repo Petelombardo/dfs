@@ -152,6 +152,18 @@ pub enum Request {
         location: ChunkLocation,
     },
 
+    /// Batch replicate chunk locations — one round-trip replaces N×ReplicateChunkLocation.
+    /// Sent by the leader at the end of each heal/discovery cycle.
+    ReplicateChunkLocations {
+        locations: Vec<ChunkLocation>,
+    },
+
+    /// Batch replicate file metadata — one round-trip replaces N×ReplicateMetadata.
+    /// Used by the metadata retry loop to drain failed replications efficiently.
+    ReplicateMetadataBatch {
+        items: Vec<FileMetadata>,
+    },
+
     /// Hint to server: warm cache with these chunks (best-effort prefetch)
     /// Client sends this when it detects sequential reads and wants to minimize
     /// future read latency by having chunks pre-loaded into server's LRU cache
@@ -180,6 +192,19 @@ pub enum Request {
 
     /// Trigger immediate healing check
     TriggerHealing,
+
+    /// Trigger healing for a specific file by path or file ID (UUID).
+    /// Leader queues all of the file's chunks into pending_healing immediately,
+    /// bypassing the normal delay. Useful for testing or forcing a specific file
+    /// to be re-replicated without waiting for the full discovery pass.
+    HealFile {
+        /// File path (e.g. /podman/dvr/recordings/foo.mpg) or UUID string
+        path: String,
+    },
+
+    /// Trigger metadata repair: rebuild path index and chunk map from file records.
+    /// Safe to run at any time; runs in background and does not block responses.
+    TriggerMetadataRepair,
 
     /// Get file information with chunk locations
     GetFileInfo {
@@ -240,6 +265,12 @@ pub enum Request {
     /// Does NOT delete chunk data — only the routing metadata entry.
     PurgeChunkLocation {
         chunk_id: ChunkId,
+    },
+
+    /// Batch purge chunk location records — one round-trip replaces N×PurgeChunkLocation.
+    /// Sent by the leader after an orphan purge sweep.
+    PurgeChunkLocations {
+        chunk_ids: Vec<ChunkId>,
     },
 }
 
@@ -304,6 +335,9 @@ pub enum Response {
         /// NodeId of the current cluster leader (min NodeId among online nodes)
         #[serde(default)]
         leader_node_id: Option<NodeId>,
+        /// Replication factor configured on this node
+        #[serde(default)]
+        replication_factor: usize,
     },
 
     /// Storage statistics response

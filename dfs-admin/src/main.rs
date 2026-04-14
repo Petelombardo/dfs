@@ -81,6 +81,13 @@ enum HealingCommands {
     Disable,
     /// Trigger immediate healing check
     Trigger,
+    /// Rebuild path index and chunk map from file records (non-blocking, runs in background)
+    Repair,
+    /// Trigger immediate healing for a specific file (path or UUID)
+    File {
+        /// File path or UUID
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -97,18 +104,10 @@ enum FileCommands {
     },
     /// List all files in metadata database
     List,
-    /// Purge file metadata from database (without deleting chunks)
+    /// Purge file metadata from database (without deleting chunks). Accepts path or UUID.
     Purge {
-        /// File path to purge
+        /// File path or UUID
         path: String,
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        yes: bool,
-    },
-    /// Purge file metadata by ID (for corrupted path indexes)
-    PurgeById {
-        /// File ID (hex string)
-        file_id: String,
         /// Skip confirmation prompt
         #[arg(short, long)]
         yes: bool,
@@ -534,6 +533,37 @@ async fn handle_healing_command(
                 }
             }
         }
+        HealingCommands::Repair => {
+            // Broadcast to all nodes — each repairs its own metadata independently
+            for &addr in cluster_addrs {
+                let response = send_request(addr, Request::TriggerMetadataRepair).await?;
+                match response {
+                    Response::Ok { .. } => {
+                        println!("{}: metadata repair started in background", addr);
+                    }
+                    Response::Error { message, .. } => {
+                        eprintln!("{}: error — {}", addr, message);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        HealingCommands::File { path } => {
+            // Send to leader only — healing is leader-coordinated
+            let addr = cluster_addrs[0];
+            let response = send_request(addr, Request::HealFile { path: path.clone() }).await?;
+            match response {
+                Response::Ok { data } => {
+                    let msg = data.and_then(|d| String::from_utf8(d).ok())
+                        .unwrap_or_else(|| "healing queued".to_string());
+                    println!("{}", msg);
+                }
+                Response::Error { message, .. } => {
+                    eprintln!("Error: {}", message);
+                }
+                _ => {}
+            }
+        }
     }
 
     Ok(())
@@ -734,10 +764,15 @@ async fn handle_file_command(
                 }
             }
 
-            let response = send_request(
-                cluster_addrs[0],
-                Request::PurgeFileMetadata { path: path.clone() },
-            ).await?;
+            // Detect UUID vs path and send the appropriate request
+            let request = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
+                let file_id = dfs_common::FileId::from_uuid(uuid);
+                Request::PurgeFileMetadataById { file_id }
+            } else {
+                Request::PurgeFileMetadata { path: path.clone() }
+            };
+
+            let response = send_request(cluster_addrs[0], request).await?;
 
             match response {
                 Response::Ok { .. } => {
@@ -754,54 +789,12 @@ async fn handle_file_command(
                         anyhow::bail!("Command failed: {}", message);
                     }
                 }
-                _ => {
-                    anyhow::bail!("Unexpected response type");
-                }
+                _ => anyhow::bail!("Unexpected response type"),
             }
         }
 
         FileCommands::Repack { path, yes } => {
             handle_repack(path, yes, cluster_addrs).await?;
-        }
-
-        FileCommands::PurgeById { file_id, yes } => {
-            // Parse the file ID from hex string
-            let parsed_file_id = parse_file_id(&file_id)?;
-
-            if !yes {
-                print!("Are you sure you want to purge metadata for file ID '{}'? This will NOT delete chunks. [y/N]: ", file_id);
-                std::io::Write::flush(&mut std::io::stdout())?;
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Cancelled.");
-                    return Ok(());
-                }
-            }
-
-            let response = send_request(
-                cluster_addrs[0],
-                Request::PurgeFileMetadataById {
-                    file_id: parsed_file_id,
-                },
-            )
-            .await?;
-
-            match response {
-                Response::Ok { .. } => {
-                    println!("Successfully purged metadata for file ID: {}", file_id);
-                    println!();
-                    println!("Note: Chunks are still stored on disk.");
-                    println!("Run 'dfs-admin healing trigger' to clean up orphaned chunks.");
-                }
-                Response::Error { message, .. } => {
-                    error!("Error: {}", message);
-                    anyhow::bail!("Command failed: {}", message);
-                }
-                _ => {
-                    anyhow::bail!("Unexpected response type");
-                }
-            }
         }
     }
 

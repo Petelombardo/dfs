@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use blake3;
 use dashmap::DashMap;
-use dfs_common::{ChunkId, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
+use dfs_common::{ChunkId, ErrorCode, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -281,6 +281,10 @@ pub struct DfsClient {
     /// Per-node health tracker.  Penalizes nodes that time out repeatedly and
     /// automatically re-admits them after a back-off period.
     node_health: NodeHealthTracker,
+
+    /// Replication factor fetched from cluster during refresh_cluster_nodes.
+    /// Defaults to 2 until the first successful cluster status response.
+    replication_factor: Arc<AtomicUsize>,
 }
 
 impl DfsClient {
@@ -416,6 +420,7 @@ impl DfsClient {
 leader_addr: Arc::new(RwLock::new(None)),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
             node_health: NodeHealthTracker::new(),
+            replication_factor: Arc::new(AtomicUsize::new(2)),
         })
     }
 
@@ -540,7 +545,38 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         let mut stream = match pooled {
-            Some(s) => s,
+            Some(s) => {
+                // Check if the server closed this connection while it was pooled.
+                // A readable socket returning 0 bytes means the peer sent FIN —
+                // reusing it would leave the server in CLOSE-WAIT indefinitely.
+                use tokio::io::Interest;
+                let peer_closed = match s.ready(Interest::READABLE).await {
+                    Ok(ready) if ready.is_readable() => {
+                        let mut buf = [0u8; 1];
+                        match s.try_read(&mut buf) {
+                            Ok(0) => true,
+                            Ok(_) => true,  // unexpected data — discard
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                            Err(_) => true,
+                        }
+                    }
+                    _ => false,
+                };
+
+                if peer_closed {
+                    debug!("Pooled connection to {} closed by peer, reconnecting", addr);
+                    let mut s = s;
+                    let _ = s.shutdown().await;
+                    tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        TcpStream::connect(addr),
+                    ).await
+                        .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
+                        .context("Failed to connect to node")?
+                } else {
+                    s
+                }
+            }
             None => tokio::time::timeout(
                 tokio::time::Duration::from_secs(5),
                 TcpStream::connect(addr),
@@ -801,7 +837,26 @@ leader_addr: Arc::new(RwLock::new(None)),
             path: path.to_string(),
         };
 
-        let response = self.send_request_with_retry(request).await?;
+        // Always query the leader — followers can have stale metadata if async
+        // replication hasn't completed yet. Fall back to any node if leader unknown.
+        let target = {
+            let leader = self.leader_addr.read().await;
+            match *leader {
+                Some(addr) => addr,
+                None => {
+                    let nodes = self.cluster_nodes.read().await;
+                    *nodes.first().context("No cluster nodes available")?
+                }
+            }
+        };
+
+        let response = match self.send_request(target, request.clone()).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("list_directory to leader failed ({}), retrying any node", e);
+                self.send_request_with_retry(request).await?
+            }
+        };
 
         match response {
             Response::DirectoryListing { entries } => Ok(entries),
@@ -1848,9 +1903,34 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             let mut stream = match stream {
                 Some(s) => {
-                    debug!("Reusing pooled connection to {}", server_addr);
-                    s
+                    use tokio::io::Interest;
+                    let peer_closed = match s.ready(Interest::READABLE).await {
+                        Ok(ready) if ready.is_readable() => {
+                            let mut buf = [0u8; 1];
+                            match s.try_read(&mut buf) {
+                                Ok(0) => true,
+                                Ok(_) => true,
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                                Err(_) => true,
+                            }
+                        }
+                        _ => false,
+                    };
+                    if peer_closed {
+                        debug!("Pooled connection to {} closed by peer, reconnecting", server_addr);
+                        let mut s = s;
+                        let _ = s.shutdown().await;
+                        None // fall through to create new connection
+                    } else {
+                        debug!("Reusing pooled connection to {}", server_addr);
+                        Some(s)
+                    }
                 }
+                None => None,
+            };
+
+            let mut stream = match stream {
+                Some(s) => s,
                 None => {
                     debug!("Creating new connection to {}", server_addr);
                     tokio::time::timeout(
@@ -2124,7 +2204,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     pub async fn write_data_dual_replica(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<Vec<dfs_common::ChunkLocation>> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
-            anyhow::bail!("Need at least 2 nodes for dual-replica writes (only {} available)", nodes.len());
+            anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
         }
 
         // Use health-aware node selection with automatic fallback via write_chunk_to_replicas.
@@ -2209,7 +2289,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
-            anyhow::bail!("Need at least 2 nodes for dual-replica writes (only {} available)", nodes.len());
+            anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
         }
 
         // Split data into 4MB chunks
@@ -2298,9 +2378,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok(final_locations)
     }
 
-    /// Write a single chunk to two replica nodes in parallel, with fallback to other nodes.
-    /// Tries replica1+replica2 first; if either fails, substitutes the next available node
-    /// from `all_nodes`. Requires at least 2 successful writes before returning.
+    /// Write a single chunk to 2 replica nodes, with fallback to other nodes if either fails.
+    /// The server healer is responsible for lazily replicating to additional nodes up to RF.
     async fn write_chunk_to_replicas(
         &self,
         data: &[u8],
@@ -2323,9 +2402,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         rest = self.node_health.sort_by_health(&rest).await;
         candidates.extend(rest);
 
-        // We need exactly 2 successful replicas. Try candidates in order, skipping failures.
+        // Need exactly 2 successful writes. Try candidates in order, skipping failures.
         let mut successful: Vec<(SocketAddr, Response)> = Vec::new();
-        let mut candidate_iter = candidates.iter().peekable();
+        let mut candidate_iter = candidates.iter();
 
         while successful.len() < 2 {
             let node = match candidate_iter.next() {
@@ -2366,22 +2445,21 @@ leader_addr: Arc::new(RwLock::new(None)),
             _ => anyhow::bail!("Unexpected response from replica 1 ({})", addr1),
         };
 
-        let (chunk_ids_2, _chunk_sizes_2) = match response2 {
+        let (chunk_ids_2, _) = match response2 {
             Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes),
             Response::Error { message, .. } => anyhow::bail!("Replica 2 ({}) failed: {}", addr2, message),
             _ => anyhow::bail!("Unexpected response from replica 2 ({})", addr2),
         };
 
-        // Verify both nodes produced the same chunks
         if chunk_ids_1.len() != chunk_ids_2.len() {
             anyhow::bail!("Replica mismatch: {} chunks vs {} chunks", chunk_ids_1.len(), chunk_ids_2.len());
         }
 
-        // Create ChunkLocation entries
+        // Create ChunkLocation entries with the 2 nodes that received the data.
+        // The server healer will lazily replicate to additional nodes up to RF.
         let node_id_map = self.addr_to_node_id.read().await;
         let mut chunk_locations = Vec::new();
 
-        // Calculate file offset for each chunk
         let mut current_offset = file_offset;
         for (idx, chunk_id) in chunk_ids_1.iter().enumerate() {
             if chunk_id != &chunk_ids_2[idx] {
@@ -2401,7 +2479,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 nodes: vec![node1_id, node2_id],
                 size: chunk_size,
                 checksum: chunk_id.hash,
-                file_offset: Some(current_offset),  // Track where in file this chunk belongs
+                file_offset: Some(current_offset),
                 written_at: None,
             };
 
@@ -2599,7 +2677,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let chunk_ids: Vec<ChunkId> = chunk_locations.iter().map(|loc| loc.chunk_id).collect();
         let chunk_sizes: Vec<u64> = chunk_locations.iter().map(|loc| loc.size as u64).collect();
 
-        info!("Completed write: {} chunks, each stored on 2 nodes", chunk_ids.len());
+        info!("Completed write: {} chunks, each stored on 2 nodes (healer will replicate to RF)", chunk_ids.len());
 
         // Return chunk_locations for proper metadata tracking
         Ok((chunk_ids, chunk_sizes, Some(chunk_locations)))
@@ -2926,10 +3004,34 @@ leader_addr: Arc::new(RwLock::new(None)),
             path: path.to_string(),
         };
 
-        let response = self.send_request_with_retry(request).await?;
+        // Always send deletes to the leader. If sent to a follower that doesn't hold
+        // the file, the follower broadcasts to all peers — with a glob delete of
+        // hundreds of files this fans out to thousands of concurrent connections and
+        // exhausts file descriptors on every node. The leader always has the authoritative
+        // metadata and handles the broadcast itself under the broadcast_semaphore.
+        let response = {
+            let leader = self.leader_addr.read().await;
+            match *leader {
+                Some(addr) => match self.send_request(addr, request.clone()).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("delete_file to leader failed ({}), retrying any node", e);
+                        self.send_request_with_retry(request).await?
+                    }
+                },
+                None => self.send_request_with_retry(request).await?,
+            }
+        };
 
         match response {
             Response::Ok { .. } => Ok(()),
+            Response::Error { code: ErrorCode::NotFound, .. } => {
+                // File already gone — treat as success (idempotent delete).
+                // This can happen when a glob delete races: the first rm succeeds,
+                // the kernel dentry cache still has the inode, and the second rm
+                // fires before the kernel notices it's gone.
+                Ok(())
+            }
             Response::Error { message, .. } => {
                 anyhow::bail!("Failed to delete file: {}", message);
             }
@@ -3000,7 +3102,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let request = Request::GetClusterStatus;
 
             match self.send_request(*node_addr, request).await {
-                Ok(Response::ClusterStatus { nodes: cluster_nodes, leader_node_id, .. }) => {
+                Ok(Response::ClusterStatus { nodes: cluster_nodes, leader_node_id, replication_factor, .. }) => {
                     let new_addrs: Vec<SocketAddr> = cluster_nodes
                         .iter()
                         .filter(|n| n.status == dfs_common::NodeStatus::Online)
@@ -3027,9 +3129,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                             }
                         }
 
+                        if replication_factor > 0 {
+                            self.replication_factor.store(replication_factor, Ordering::Relaxed);
+                        }
+
                         let mut nodes_lock = self.cluster_nodes.write().await;
                         *nodes_lock = new_addrs;
-                        info!("Refreshed cluster nodes: {} nodes (via {})", nodes_lock.len(), node_addr);
+                        info!("Refreshed cluster nodes: {} nodes, RF={} (via {})", nodes_lock.len(), replication_factor, node_addr);
                         return Ok(());
                     }
                 }

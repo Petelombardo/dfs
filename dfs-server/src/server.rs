@@ -79,6 +79,12 @@ pub struct Server {
     /// Reference to the healing manager — set after construction via set_healing_manager().
     /// Used by admin handlers to query status and trigger immediate heal cycles.
     healing: Arc<RwLock<Option<Arc<HealingManager>>>>,
+
+    /// Metadata replication retry queue: per-node backlog of FileMetadata that failed
+    /// to replicate (timeout or connection error). A background task drains this every
+    /// 30 seconds so a transient failure (node restart, crash mid-write) self-heals
+    /// without waiting for the next write to the same file.
+    pending_metadata_replication: Arc<DashMap<dfs_common::NodeId, Vec<FileMetadata>>>,
 }
 
 impl Server {
@@ -111,32 +117,31 @@ impl Server {
             chunk_map: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
             healing: Arc::new(RwLock::new(None)),
+            pending_metadata_replication: Arc::new(DashMap::new()),
         };
-
-        // Build the in-memory chunk map from persistent metadata on startup
-        server.rebuild_chunk_map_from_metadata();
 
         server
     }
 
+    pub fn metadata_store(&self) -> Arc<MetadataStore> {
+        self.metadata.clone()
+    }
+
     /// Rebuild the in-memory chunk map by scanning all file metadata.
     /// Called once at startup; incremental updates happen via chunk_map_update().
-    fn rebuild_chunk_map_from_metadata(&self) {
-        let files = match self.metadata.list_files() {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Failed to list files for chunk map build: {}", e);
-                return;
-            }
-        };
-
+    /// Uses scan_files (streaming) to avoid loading the entire metadata set into
+    /// RAM at once — on a node with 535 MB of sled metadata, list_files() was
+    /// materialising a 2 GB Vec<FileMetadata> and triggering OOM-like behaviour.
+    pub fn rebuild_chunk_map_from_metadata(&self) {
         let chunk_map = self.chunk_map.clone();
         let metadata = self.metadata.clone();
 
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             let mut built = 0usize;
+            let mut total = 0usize;
 
-            for file in &files {
+            let result = metadata.scan_files(|file| {
+                total += 1;
                 if file.chunk_locations.is_empty() {
                     // Legacy file: load chunk locations from individual chunk records
                     let mut locations = Vec::new();
@@ -164,9 +169,13 @@ impl Server {
                     chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
                     built += 1;
                 }
-            }
+                Ok(())
+            });
 
-            info!("Chunk map built: {} / {} files indexed", built, files.len());
+            match result {
+                Ok(()) => info!("Chunk map built: {} / {} files indexed", built, total),
+                Err(e) => warn!("Chunk map build failed partway through: {}", e),
+            }
         });
     }
 
@@ -242,6 +251,82 @@ impl Server {
         *self.healing.write().await = Some(healing);
     }
 
+    /// Start the metadata replication retry loop.
+    /// Every 30 seconds, drain the pending_metadata_replication queue and retry
+    /// any entries that failed during the original fire-and-forget broadcast.
+    pub fn start_metadata_retry_loop(self: Arc<Self>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+                // Collect all pending entries, clearing the queue atomically per node.
+                let pending: Vec<(dfs_common::NodeId, Vec<FileMetadata>)> = server
+                    .pending_metadata_replication
+                    .iter()
+                    .map(|e| (*e.key(), e.value().clone()))
+                    .collect();
+
+                if pending.is_empty() {
+                    continue;
+                }
+
+                let nodes = server.cluster.get_all_nodes().await;
+                let node_map: std::collections::HashMap<dfs_common::NodeId, std::net::SocketAddr> =
+                    nodes.iter().map(|n| (n.id, n.addr)).collect();
+
+                for (node_id, items) in &pending {
+                    let addr = match node_map.get(node_id) {
+                        Some(a) => *a,
+                        None => continue, // node no longer in cluster
+                    };
+
+                    // Filter out entries for files deleted since they were queued.
+                    let live_items: Vec<FileMetadata> = items.iter()
+                        .filter(|m| {
+                            match server.metadata.get_file(&m.id) {
+                                Ok(None) => {
+                                    debug!("Retry: skipping deleted file '{}' ({})", m.path, m.id);
+                                    false
+                                }
+                                _ => true,
+                            }
+                        })
+                        .cloned()
+                        .collect();
+
+                    if live_items.is_empty() {
+                        server.pending_metadata_replication.remove(node_id);
+                        continue;
+                    }
+
+                    // Send all live items in one batch instead of one message per file.
+                    let request = Request::ReplicateMetadataBatch { items: live_items.clone() };
+                    let result = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(10),
+                        server.client.send_message(addr, Message::Request(request)),
+                    ).await;
+
+                    match result {
+                        Ok(Ok(_)) => {
+                            info!("Retry: replicated {} metadata items to {}", live_items.len(), addr);
+                            server.pending_metadata_replication.remove(node_id);
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Retry: failed to replicate {} metadata items to {}: {}", live_items.len(), addr, e);
+                            // Keep all live items for next retry
+                            server.pending_metadata_replication.insert(*node_id, live_items);
+                        }
+                        Err(_) => {
+                            warn!("Retry: timeout replicating {} metadata items to {}", live_items.len(), addr);
+                            server.pending_metadata_replication.insert(*node_id, live_items);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Handle an incoming request message
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
@@ -277,14 +362,23 @@ impl Server {
             Request::ReplicateMetadata { metadata } => {
                 self.handle_replicate_metadata(metadata).await
             }
+            Request::ReplicateMetadataBatch { items } => {
+                self.handle_replicate_metadata_batch(items).await
+            }
             Request::DeleteMetadata { file_id, path, chunk_ids } => {
                 self.handle_delete_metadata(file_id, path, chunk_ids).await
             }
             Request::ReplicateChunkLocation { location } => {
                 self.handle_replicate_chunk_location(location).await
             }
+            Request::ReplicateChunkLocations { locations } => {
+                self.handle_replicate_chunk_locations(locations).await
+            }
             Request::PurgeChunkLocation { chunk_id } => {
                 self.handle_purge_chunk_location(chunk_id).await
+            }
+            Request::PurgeChunkLocations { chunk_ids } => {
+                self.handle_purge_chunk_locations(chunk_ids).await
             }
             Request::PrefetchHint { chunk_ids } => {
                 self.handle_prefetch_hint(chunk_ids).await
@@ -311,6 +405,8 @@ impl Server {
             Request::EnableHealing => self.handle_enable_healing().await,
             Request::DisableHealing => self.handle_disable_healing().await,
             Request::TriggerHealing => self.handle_trigger_healing().await,
+            Request::TriggerMetadataRepair => self.handle_trigger_metadata_repair().await,
+            Request::HealFile { path } => self.handle_heal_file(path).await,
             Request::GetFileInfo { path } => self.handle_get_file_info(path).await,
             Request::GetFileInfoById { file_id } => self.handle_get_file_info_by_id(file_id).await,
             Request::GetChunkReplicas { chunk_id } => {
@@ -599,46 +695,52 @@ impl Server {
     async fn handle_replicate_chunk_location(&self, location: ChunkLocation) -> Response {
         info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
 
-        // Merge chunk location with existing metadata, but treat an incoming node list
-        // at or above RF as authoritative — the healer only broadcasts after it has
-        // confirmed exactly which nodes hold the chunk, so a full-RF (or trimmed)
-        // broadcast should replace stale local state rather than unioning with it.
-        // A sub-RF incoming list (e.g. a client writing to 2 nodes) is still merged
-        // so we don't lose knowledge of nodes that received the chunk concurrently.
-        let replication_factor = self.replication_factor;
+        // Merge strategy: take the larger node set, preserving the existing record's
+        // file_offset and written_at if the incoming doesn't carry them.
+        //
+        // Chunks are content-addressed — same chunk_id always means same bytes, so
+        // any node listed in either record genuinely holds (or held) the data.  The
+        // healer's DeleteChunkReplica path explicitly removes nodes *and then*
+        // broadcasts the trimmed set; that trim broadcast will always have fewer nodes
+        // than the current record, so we need to accept it.
+        //
+        // Rule: if incoming.nodes.len() > existing.nodes.len(), take incoming (expansion).
+        //       if incoming.nodes.len() <= existing.nodes.len() AND incoming.nodes.len() < RF,
+        //         this is a stale early-write broadcast arriving after healing — ignore it.
+        //       if incoming.nodes.len() <= existing.nodes.len() AND incoming.nodes.len() >= RF,
+        //         this is a legitimate healer trim or same-size update — accept it.
+        //
+        // This prevents the cycle: write broadcasts {A,B} → healer heals to {A,B,C} →
+        // stale write broadcast arrives, replaces with {A,B} → healer heals to {A,B,D}
+        // → accumulate nodes D,E,... = over-replication.
+        let rf = self.replication_factor;
         let merged_location = match self.metadata.get_chunk_location(&location.chunk_id) {
             Ok(Some(existing)) => {
-                if location.nodes.len() >= replication_factor {
-                    // Incoming list is authoritative (healer broadcast or full-RF write).
-                    // Use it as-is, preserving existing timestamps.
-                    debug!("Replacing chunk location for {} with authoritative {}-node list (was {})",
-                           location.chunk_id, location.nodes.len(), existing.nodes.len());
-                    ChunkLocation {
-                        chunk_id: location.chunk_id,
-                        nodes: location.nodes.clone(),
-                        size: location.size,
-                        checksum: location.checksum,
-                        file_offset: location.file_offset.or(existing.file_offset),
-                        written_at: existing.written_at.or(location.written_at),
-                    }
+                let incoming_count = location.nodes.len();
+                let existing_count = existing.nodes.len();
+                let nodes = if incoming_count > existing_count {
+                    // Expansion (new replicas added) — take incoming.
+                    debug!("Expanding chunk location for {} ({} → {} nodes)",
+                           location.chunk_id, existing_count, incoming_count);
+                    location.nodes.clone()
+                } else if incoming_count < rf && existing_count >= rf {
+                    // Stale early-write broadcast arriving after healing — ignore.
+                    debug!("Ignoring stale chunk location broadcast for {} ({} nodes incoming, existing has {}, RF={})",
+                           location.chunk_id, incoming_count, existing_count, rf);
+                    return Response::Ok { data: None };
                 } else {
-                    // Sub-RF incoming list: merge so we accumulate all known nodes.
-                    let mut merged_nodes = existing.nodes.clone();
-                    for node in &location.nodes {
-                        if !merged_nodes.contains(node) {
-                            merged_nodes.push(*node);
-                        }
-                    }
-                    debug!("Merging chunk location {}: {} existing + {} incoming = {} total",
-                           location.chunk_id, existing.nodes.len(), location.nodes.len(), merged_nodes.len());
-                    ChunkLocation {
-                        chunk_id: location.chunk_id,
-                        nodes: merged_nodes,
-                        size: location.size,
-                        checksum: location.checksum,
-                        file_offset: location.file_offset.or(existing.file_offset),
-                        written_at: existing.written_at.or(location.written_at),
-                    }
+                    // Healer trim or same-size update — accept.
+                    debug!("Updating chunk location for {} ({} → {} nodes)",
+                           location.chunk_id, existing_count, incoming_count);
+                    location.nodes.clone()
+                };
+                ChunkLocation {
+                    chunk_id: location.chunk_id,
+                    nodes,
+                    size: location.size,
+                    checksum: location.checksum,
+                    file_offset: location.file_offset.or(existing.file_offset),
+                    written_at: existing.written_at.or(location.written_at),
                 }
             }
             Ok(None) => {
@@ -686,6 +788,89 @@ impl Server {
                     message: format!("Failed to purge chunk location: {}", e),
                     code: ErrorCode::InternalError,
                 }
+            }
+        }
+    }
+
+    async fn handle_purge_chunk_locations(&self, chunk_ids: Vec<ChunkId>) -> Response {
+        debug!("Handling batch purge of {} chunk locations", chunk_ids.len());
+        let mut failed = 0usize;
+        for chunk_id in &chunk_ids {
+            if let Err(e) = self.metadata.delete_chunk_location(chunk_id) {
+                warn!("Failed to purge chunk location {}: {}", chunk_id, e);
+                failed += 1;
+            }
+        }
+        if failed == 0 {
+            Response::Ok { data: None }
+        } else {
+            Response::Error {
+                message: format!("Failed to purge {}/{} chunk locations", failed, chunk_ids.len()),
+                code: ErrorCode::InternalError,
+            }
+        }
+    }
+
+    async fn handle_replicate_chunk_locations(&self, locations: Vec<ChunkLocation>) -> Response {
+        debug!("Handling batch replicate of {} chunk locations", locations.len());
+        let mut failed = 0usize;
+        for location in &locations {
+            // Re-use existing merge logic from the single-item handler inline.
+            let existing = self.metadata.get_chunk_location(&location.chunk_id)
+                .ok().flatten();
+            let incoming_count = location.nodes.len();
+            let existing_count = existing.as_ref().map_or(0, |e| e.nodes.len());
+            let rf = self.replication_factor;
+            let nodes = if incoming_count > existing_count {
+                location.nodes.clone()
+            } else if incoming_count < rf && existing_count >= rf {
+                continue; // stale early-write — skip
+            } else {
+                location.nodes.clone()
+            };
+            let merged = ChunkLocation {
+                chunk_id: location.chunk_id,
+                nodes,
+                size: location.size,
+                checksum: location.checksum,
+                file_offset: location.file_offset.or_else(|| existing.as_ref().and_then(|e| e.file_offset)),
+                written_at: location.written_at.or_else(|| existing.as_ref().and_then(|e| e.written_at)),
+            };
+            if let Err(e) = self.metadata.put_chunk_location(&merged) {
+                warn!("Failed to replicate chunk location {}: {}", location.chunk_id, e);
+                failed += 1;
+            }
+        }
+        if failed == 0 {
+            Response::Ok { data: None }
+        } else {
+            Response::Error {
+                message: format!("Failed to replicate {}/{} chunk locations", failed, locations.len()),
+                code: ErrorCode::InternalError,
+            }
+        }
+    }
+
+    async fn handle_replicate_metadata_batch(&self, items: Vec<FileMetadata>) -> Response {
+        debug!("Handling batch replicate of {} metadata items", items.len());
+        let mut failed = 0usize;
+        for metadata in &items {
+            match self.metadata.put_file(metadata) {
+                Ok(_) => {
+                    self.chunk_map_update(metadata).await;
+                }
+                Err(e) => {
+                    warn!("Failed to replicate metadata '{}': {}", metadata.path, e);
+                    failed += 1;
+                }
+            }
+        }
+        if failed == 0 {
+            Response::Ok { data: None }
+        } else {
+            Response::Error {
+                message: format!("Failed to replicate {}/{} metadata items", failed, items.len()),
+                code: ErrorCode::InternalError,
             }
         }
     }
@@ -1246,6 +1431,46 @@ impl Server {
         } // end outer match lookup
     }
 
+    /// Spawn a fire-and-forget metadata replication task to all online peers.
+    /// Failures are queued into pending_metadata_replication for retry every 30s.
+    /// Used by both handle_put_file_metadata and handle_append_file.
+    fn replicate_metadata_async(&self, metadata: FileMetadata) {
+        let cluster = self.cluster.clone();
+        let client = self.client.clone();
+        let sem = self.broadcast_semaphore.clone();
+        let retry_queue = self.pending_metadata_replication.clone();
+
+        tokio::spawn(async move {
+            let _permit = sem.acquire().await.ok();
+            let nodes = cluster.get_all_nodes().await;
+            let local_id = cluster.local_node_id();
+
+            for node in nodes {
+                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                    continue;
+                }
+
+                let request = Request::ReplicateMetadata { metadata: metadata.clone() };
+                let result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(30),
+                    client.send_message(node.addr, Message::Request(request))
+                ).await;
+
+                match result {
+                    Ok(Ok(_)) => debug!("Replicated metadata '{}' to {}", metadata.path, node.addr),
+                    Ok(Err(e)) => {
+                        warn!("Failed to replicate metadata to {} ({}): queuing retry", node.addr, e);
+                        retry_queue.entry(node.id).or_default().push(metadata.clone());
+                    }
+                    Err(_) => {
+                        warn!("Timeout replicating metadata to {} (30s): queuing retry", node.addr);
+                        retry_queue.entry(node.id).or_default().push(metadata.clone());
+                    }
+                }
+            }
+        });
+    }
+
     /// Handle put file metadata request
     async fn handle_put_file_metadata(&self, metadata: FileMetadata) -> Response {
         debug!("Handling put file metadata: {}", metadata.path);
@@ -1256,43 +1481,7 @@ impl Server {
                 // Update in-memory chunk map
                 self.chunk_map_update(&metadata).await;
 
-                // Replicate metadata to all other nodes asynchronously with timeout.
-                // Uses the shared broadcast_semaphore so all fan-out operations
-                // (put, delete, purge) compete for the same pool of 20 permits.
-                let cluster = self.cluster.clone();
-                let client = self.client.clone();
-                let metadata_clone = metadata.clone();
-                let sem = self.broadcast_semaphore.clone();
-
-                tokio::spawn(async move {
-                    let _permit = sem.acquire().await.ok();
-                    let nodes = cluster.get_all_nodes().await;
-                    let local_id = cluster.local_node_id();
-
-                    for node in nodes {
-                        // Skip self and offline nodes
-                        if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                            continue;
-                        }
-
-                        let request = Request::ReplicateMetadata {
-                            metadata: metadata_clone.clone(),
-                        };
-
-                        // Replicate with 5 second timeout
-                        let result = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(5),
-                            client.send_message(node.addr, Message::Request(request))
-                        ).await;
-
-                        match result {
-                            Ok(Ok(_)) => debug!("Replicated metadata to {}", node.addr),
-                            Ok(Err(e)) => debug!("Failed to replicate metadata to {}: {}", node.addr, e),
-                            Err(_) => debug!("Timeout replicating metadata to {}", node.addr),
-                        }
-                    }
-                });
-
+                self.replicate_metadata_async(metadata.clone());
                 Response::Ok { data: None }
             }
             Err(e) => {
@@ -1547,33 +1736,9 @@ impl Server {
         // Update in-memory chunk map
         self.chunk_map_update(&metadata).await;
 
-        // --- Step 10: Async metadata replication (same as handle_put_file_metadata) ---
-        {
-            let cluster = self.cluster.clone();
-            let client = self.client.clone();
-            let metadata_clone = metadata.clone();
-            tokio::spawn(async move {
-                let nodes = cluster.get_all_nodes().await;
-                let local_id = cluster.local_node_id();
-                let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
-                for node in nodes {
-                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                        continue;
-                    }
-                    let request = Request::ReplicateMetadata { metadata: metadata_clone.clone() };
-                    let client_clone = client.clone();
-                    let sem = semaphore.clone();
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire().await.ok()?;
-                        let _ = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(5),
-                            client_clone.send_message(node.addr, Message::Request(request)),
-                        ).await;
-                        Some(())
-                    });
-                }
-            });
-        }
+        // --- Step 10: Async metadata replication — same path as handle_put_file_metadata,
+        // including the retry queue so failures on slow/full nodes are retried. ---
+        self.replicate_metadata_async(metadata.clone());
 
         // Tell the client how many bytes remain before this chunk seals.
         // When remaining_in_chunk == 0 the chunk is exactly full and the client
@@ -1687,6 +1852,15 @@ impl Server {
                         // Remove from chunk map
                         self.chunk_map_remove(&metadata.id).await;
 
+                        // Purge any pending metadata retry entries for this file.
+                        // The retry queue holds stale ReplicateMetadata entries from before
+                        // the delete; without this, the retry loop would push the deleted
+                        // file back onto peers every 30 seconds, resurrecting it after rm.
+                        let deleted_id = metadata.id;
+                        for mut entry in self.pending_metadata_replication.iter_mut() {
+                            entry.value_mut().retain(|m| m.id != deleted_id);
+                        }
+
                         // Delete chunk location records from local metadata DB immediately.
                         // This is the critical step that was missing — without it, chunk: keys
                         // accumulate forever and the healer spins on thousands of ghost chunks.
@@ -1799,6 +1973,10 @@ impl Server {
                 // every node that holds a copy of the path: index gets cleaned up.
                 // put_file_metadata uses quorum writes so the path: record may exist
                 // on multiple peers; we must not stop after the first Ok response.
+                // Acquire semaphore to prevent fd exhaustion when hundreds of files
+                // are deleted concurrently (glob rm): without this each forwarding
+                // task opens connections to all peers simultaneously.
+                let _permit = self.broadcast_semaphore.acquire().await.ok();
                 let cluster = self.cluster.clone();
                 let client = self.client.clone();
                 let local_id = self.cluster.local_node_id();
@@ -1864,6 +2042,7 @@ impl Server {
             healthy_nodes,
             chunk_size_mb,
             leader_node_id,
+            replication_factor: self.replication_factor,
         }
     }
 
@@ -2010,6 +2189,88 @@ impl Server {
                 message: "Healing manager not available".to_string(),
                 code: dfs_common::ErrorCode::InternalError,
             },
+        }
+    }
+
+    /// Handle on-demand metadata repair request.
+    /// Spawns path-index repair and chunk-map rebuild; returns immediately.
+    async fn handle_trigger_metadata_repair(&self) -> Response {
+        let metadata = self.metadata.clone();
+        let chunk_map = self.chunk_map.clone();
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                info!("Metadata repair: rebuilding path index");
+                if let Err(e) = metadata.repair_path_index() {
+                    warn!("Metadata repair: path index repair failed: {}", e);
+                } else {
+                    info!("Metadata repair: path index repair complete");
+                }
+                // Rebuild chunk map inline using the same scan
+                let mut built = 0usize;
+                let mut total = 0usize;
+                let metadata2 = metadata.clone();
+                let _ = metadata2.scan_files(|file| {
+                    total += 1;
+                    if !file.chunk_locations.is_empty() {
+                        chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
+                        built += 1;
+                    }
+                    Ok(())
+                });
+                info!("Metadata repair: chunk map rebuilt: {}/{} files", built, total);
+            }).await.ok();
+        });
+        Response::Ok { data: None }
+    }
+
+    /// Handle heal file request — queue all chunks of a specific file for immediate healing.
+    /// Accepts either a file path or a UUID string. Only meaningful on the leader.
+    async fn handle_heal_file(&self, path: String) -> Response {
+        // Resolve file metadata — try UUID first, then path
+        let file_meta = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
+            let file_id = dfs_common::FileId::from_uuid(uuid);
+            match self.metadata.get_file(&file_id) {
+                Ok(Some(m)) => m,
+                Ok(None) => return Response::Error {
+                    message: format!("File not found: {}", path),
+                    code: ErrorCode::NotFound,
+                },
+                Err(e) => return Response::Error {
+                    message: format!("Failed to look up file: {}", e),
+                    code: ErrorCode::InternalError,
+                },
+            }
+        } else {
+            match self.metadata.get_file_by_path(&path) {
+                Ok(Some(m)) => m,
+                Ok(None) => return Response::Error {
+                    message: format!("File not found: {}", path),
+                    code: ErrorCode::NotFound,
+                },
+                Err(e) => return Response::Error {
+                    message: format!("Failed to look up file: {}", e),
+                    code: ErrorCode::InternalError,
+                },
+            }
+        };
+
+        let healing_guard = self.healing.read().await;
+        let healing = match healing_guard.as_ref() {
+            Some(h) => h.clone(),
+            None => return Response::Error {
+                message: "Healing manager not available".to_string(),
+                code: ErrorCode::InternalError,
+            },
+        };
+        drop(healing_guard);
+
+        let chunk_ids: Vec<ChunkId> = file_meta.chunks.clone();
+        let count = chunk_ids.len();
+        healing.queue_chunks_immediate(chunk_ids).await;
+
+        info!("HealFile: queued {} chunks for immediate healing (file: {})", count, file_meta.path);
+        Response::Ok {
+            data: Some(format!("Queued {} chunks for immediate healing", count).into_bytes()),
         }
     }
 

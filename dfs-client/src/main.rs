@@ -249,15 +249,20 @@ fn mount_filesystem(
 
     info!("Mounting filesystem at {:?}", mountpoint);
 
-    // Mount the filesystem
-    // Note: This blocks until unmount
-    // The runtime stays alive because _rt is in scope
-    fuser::mount2(fs, mountpoint, &options)
+    // Mount the filesystem using spawn_mount2 for multi-threaded FUSE dispatch.
+    // Unlike mount2 (which serializes all FUSE callbacks on the calling thread),
+    // spawn_mount2 processes requests on a thread pool so reads and writes can
+    // proceed concurrently instead of queuing behind each other.
+    // BackgroundSession keeps the mount alive; dropping it unmounts.
+    let _session = fuser::spawn_mount2(fs, mountpoint, &options)
         .context("Failed to mount filesystem")?;
 
-    info!("Filesystem unmounted");
-
-    Ok(())
+    // Block the main thread until the mount is torn down.
+    // The background FUSE threads handle all requests independently.
+    #[allow(clippy::empty_loop)]
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 async fn unmount_filesystem(mountpoint: PathBuf) -> Result<()> {

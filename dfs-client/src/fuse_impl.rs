@@ -937,7 +937,7 @@ impl Filesystem for DfsFilesystem {
 
         if let Some((ino, metadata)) = cached {
             let attr = self.metadata_to_attr(ino, &metadata);
-            reply.entry(&Duration::from_secs(30), &attr, 0);
+            reply.entry(&Duration::from_secs(1), &attr, 0);
             return;
         }
 
@@ -963,7 +963,7 @@ impl Filesystem for DfsFilesystem {
                 self.safe_metadata_update(ino, metadata.clone());
 
                 let attr = self.metadata_to_attr(ino, &metadata);
-                reply.entry(&Duration::from_secs(30), &attr, 0);
+                reply.entry(&Duration::from_secs(1), &attr, 0);
             }
             Ok(None) => {
                 // Either file not found OR metadata not modified (cache still valid)
@@ -974,7 +974,7 @@ impl Filesystem for DfsFilesystem {
                         if let Some(metadata) = self.metadata_cache.get(&ino) {
                             debug!("Using cached metadata for {} (not modified)", path);
                             let attr = self.metadata_to_attr(ino, &*metadata);
-                            reply.entry(&Duration::from_secs(30), &attr, 0);
+                            reply.entry(&Duration::from_secs(1), &attr, 0);
                             return;
                         }
                     }
@@ -1245,27 +1245,13 @@ impl Filesystem for DfsFilesystem {
                     }
                 };
 
-                // If a fsync-spawned flush is in flight for this inode, wait for it before
-                // falling through to a server read. This prevents stale reads after fsync:
-                // the kernel considers fsync complete (we replied ok immediately), so the
-                // application expects its data to be durable and readable. Without this wait
-                // the server still has the old data and the read returns stale content.
-                if !should_flush_buffer {
-                    let in_flight_opt = flush_in_flight.read().unwrap().clone();
-                    if let Some(ref in_flight_set) = in_flight_opt {
-                        if in_flight_set.contains(&ino) {
-                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                            loop {
-                                if !in_flight_set.contains(&ino) { break; }
-                                if std::time::Instant::now() >= deadline {
-                                    warn!("read: timed out waiting for in-flight flush on inode {}, proceeding with server read", ino);
-                                    break;
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                            }
-                        }
-                    }
-                }
+                // Note: we intentionally do NOT wait for an in-flight fsync flush here.
+                // Waiting (spin-polling) blocks the single FUSE thread and freezes the
+                // entire mount — no reads, no getattrs, nothing — for up to 5 seconds
+                // while a slow AppendFile completes on a loaded node.
+                // The data being read is almost always already on the server (the player
+                // reads behind the write head during live recordings). If a chunk genuinely
+                // isn't there yet, the normal server read retry path handles it.
 
                 // Spawn background flush if needed (don't block read operation)
                 if should_flush_buffer {
@@ -1998,7 +1984,8 @@ impl Filesystem for DfsFilesystem {
                 self.metadata_cache.insert(ino, metadata.clone());
 
                 // CRITICAL: Invalidate parent directory cache so 'ls' shows new file immediately
-                let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
                 self.dir_cache.remove(parent_path);
                 debug!("Invalidated directory cache for parent: {}", parent_path);
 
@@ -2146,7 +2133,7 @@ impl Filesystem for DfsFilesystem {
                     }
                 };
 
-                info!("Buffered write check: offset={}, current_size={}, cache_size={}, buffer_present={}",
+                debug!("Buffered write check: offset={}, current_size={}, cache_size={}, buffer_present={}",
                        offset_usize, current_size,
                        metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0),
                        write_buffers.contains_key(&ino));
@@ -2969,13 +2956,14 @@ impl Filesystem for DfsFilesystem {
                 self.metadata_cache.insert(ino, metadata.clone());
 
                 // CRITICAL: Invalidate parent directory cache so 'ls' shows new directory immediately
-                let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
                 self.dir_cache.remove(parent_path);
                 debug!("Invalidated directory cache for parent: {}", parent_path);
 
                 // Convert to FUSE attr
                 let attr = self.metadata_to_attr(ino, &metadata);
-                reply.entry(&Duration::from_secs(30), &attr, 0);
+                reply.entry(&Duration::from_secs(1), &attr, 0);
             }
             Err(e) => {
                 error!("Failed to create directory {}: {}", path, e);
@@ -3015,7 +3003,8 @@ impl Filesystem for DfsFilesystem {
                 self.path_to_inode.write().unwrap().remove(&path);
 
                 // CRITICAL: Invalidate parent directory cache so 'ls' shows deletion immediately
-                let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
                 self.dir_cache.remove(parent_path);
                 debug!("Invalidated directory cache for parent: {}", parent_path);
 
@@ -3067,7 +3056,8 @@ impl Filesystem for DfsFilesystem {
                         self.path_to_inode.write().unwrap().remove(&path);
 
                         // CRITICAL: Invalidate parent directory cache so 'ls' shows deletion immediately
-                        let parent_path = path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                        let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                        let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
                         self.dir_cache.remove(parent_path);
                         debug!("Invalidated directory cache for parent: {}", parent_path);
 
@@ -3157,8 +3147,10 @@ impl Filesystem for DfsFilesystem {
                         self.metadata_cache.insert(ino, new_metadata);
 
                         // Invalidate directory cache for both old and new parent directories
-                        let old_parent = old_path.rsplitn(2, '/').nth(1).unwrap_or("/");
-                        let new_parent = new_path.rsplitn(2, '/').nth(1).unwrap_or("/");
+                        let raw_old = old_path.rsplitn(2, '/').nth(1).unwrap_or("");
+                        let old_parent = if raw_old.is_empty() { "/" } else { raw_old };
+                        let raw_new = new_path.rsplitn(2, '/').nth(1).unwrap_or("");
+                        let new_parent = if raw_new.is_empty() { "/" } else { raw_new };
                         self.dir_cache.remove(old_parent);
                         if old_parent != new_parent {
                             self.dir_cache.remove(new_parent);

@@ -72,6 +72,13 @@ pub struct HealingManager {
     /// The heal loop never touches this set directly.
     stalled_healing: Arc<RwLock<HashSet<ChunkId>>>,
 
+    /// Two-cycle orphan guard: chunk IDs that were absent from live_chunk_ids in the
+    /// previous discovery pass. Only purged when absent in two consecutive passes.
+    /// This prevents premature orphan-purge when the leader's metadata DB is temporarily
+    /// stale (e.g. during initial metadata replication lag after a write). One extra
+    /// 60s cycle of accumulation is acceptable vs. data loss from false-positive orphans.
+    orphan_candidates: Arc<RwLock<HashSet<ChunkId>>>,
+
     /// Per-transfer timeout for a single PushChunkTo (seconds). On expiry the chunk
     /// stays in pending (retried next drain tick) and the semaphore slot is released.
     heal_transfer_timeout_secs: u64,
@@ -124,6 +131,7 @@ impl HealingManager {
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
             stalled_healing: Arc::new(RwLock::new(HashSet::new())),
+            orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
             heal_transfer_timeout_secs,
         }
     }
@@ -348,6 +356,12 @@ impl HealingManager {
             .filter(|n| n.status == dfs_common::NodeStatus::Online)
             .collect();
 
+        // All known node IDs (online + offline) — used to detect completely-removed ghost nodes.
+        let all_known_node_ids: HashSet<NodeId> = self.cluster.get_all_nodes().await
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+
         // node_id → HashSet<ChunkId> of chunks confirmed present on that node.
         // We can't send HasChunks yet (don't have chunk list), but we CAN collect
         // the online node list and check local storage — done above.
@@ -369,37 +383,52 @@ impl HealingManager {
         let mut chunks_to_check: Vec<ChunkId> = Vec::new();
         let mut purged_orphans: Vec<ChunkId> = Vec::new();
 
-        for chunk_id in all_chunks {
-            if !live_chunks.contains(&chunk_id) {
-                if !quorum {
-                    debug!("Skipping orphan purge for {} — no quorum", chunk_id);
-                    self.pending_healing.write().await.remove(&chunk_id);
+        // Two-cycle orphan guard: chunks absent from live_chunk_ids are added to
+        // orphan_candidates on first sighting. Only purge if they were already
+        // candidates on the previous pass. This prevents false-positive orphan
+        // purge when the leader's metadata DB is temporarily stale (e.g. the file
+        // record hasn't been replicated yet but chunk: and path: entries exist).
+        // Chunks that reappear in live_chunk_ids are removed from candidates immediately.
+        let mut new_candidates: HashSet<ChunkId> = HashSet::new();
+        {
+            let prev_candidates = self.orphan_candidates.read().await;
+            for chunk_id in all_chunks {
+                if !live_chunks.contains(&chunk_id) {
+                    if !quorum {
+                        debug!("Skipping orphan purge for {} — no quorum", chunk_id);
+                        self.pending_healing.write().await.remove(&chunk_id);
+                        continue;
+                    }
+                    if prev_candidates.contains(&chunk_id) {
+                        // Absent for two consecutive passes — definitely orphaned.
+                        debug!("Purging orphaned chunk location record: {}", chunk_id);
+                        if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
+                            warn!("Failed to purge orphaned chunk location {}: {}", chunk_id, e);
+                        } else {
+                            purged_orphans.push(chunk_id);
+                        }
+                        self.pending_healing.write().await.remove(&chunk_id);
+                        orphan_count += 1;
+                        // Don't add to new_candidates — it's been purged.
+                    } else {
+                        // First sighting — stage for next pass.
+                        new_candidates.insert(chunk_id);
+                        debug!("Orphan candidate (first sighting, will purge next pass if still absent): {}", chunk_id);
+                    }
                     continue;
                 }
-                // Purge immediately — no two-cycle wait.  The live_chunk_ids scan already
-                // cross-references every file record, so any chunk_id absent from that set
-                // is definitively unreferenced.  The two-cycle approach was causing orphans
-                // to survive indefinitely whenever the cluster leader changed (the new
-                // leader's pending_healing map is empty, so every orphan resets to
-                // "first sighting"), which let the sled DB grow to hundreds of MB and
-                // ultimately OOM the nodes.
-                debug!("Purging orphaned chunk location record: {}", chunk_id);
-                if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
-                    warn!("Failed to purge orphaned chunk location {}: {}", chunk_id, e);
-                } else {
-                    purged_orphans.push(chunk_id);
-                }
-                self.pending_healing.write().await.remove(&chunk_id);
-                orphan_count += 1;
-                continue;
+                // Chunk is live — clear from candidates if it was staged.
+                chunks_to_check.push(chunk_id);
             }
-            chunks_to_check.push(chunk_id);
         }
+        *self.orphan_candidates.write().await = new_candidates;
 
         // Broadcast orphan purges to all followers so their chunk: routing tables
         // drain in sync with the leader.  Followers never purge independently —
         // they could incorrectly delete records for live recordings whose file:
         // metadata hasn't been flushed yet (e.g. an open file being written to).
+        // Use PurgeChunkLocations batch message — one round-trip per peer instead
+        // of one per chunk.
         if !purged_orphans.is_empty() {
             let cluster = self.cluster.clone();
             let client = self.client.clone();
@@ -411,15 +440,19 @@ impl HealingManager {
                     if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                         continue;
                     }
-                    for &chunk_id in &orphans_to_broadcast {
-                        let req = Request::PurgeChunkLocation { chunk_id };
-                        if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
-                            debug!("Failed to broadcast PurgeChunkLocation {} to node {}: {}", chunk_id, node.id, e);
-                        }
+                    let req = Request::PurgeChunkLocations { chunk_ids: orphans_to_broadcast.clone() };
+                    if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                        debug!("Failed to batch-broadcast PurgeChunkLocations ({} chunks) to node {}: {}",
+                               orphans_to_broadcast.len(), node.id, e);
                     }
                 }
             });
         }
+
+        // Accumulate chunk location updates from the discovery pass for batch broadcast.
+        // All updates collected here are sent in one ReplicateChunkLocations per peer
+        // at the end of the pass, instead of one connection per chunk per peer.
+        let mut location_updates: Vec<ChunkLocation> = Vec::new();
 
         // Bulk-query each online remote node: "which of these chunks do you hold?"
         // One HasChunks RPC per node replaces O(chunks) HasChunk RPCs per node.
@@ -492,8 +525,15 @@ impl HealingManager {
             let mut actual_replicas = 0usize;
             let mut nodes_without_chunk: Vec<NodeId> = Vec::new();
             let mut confirmed_alive_nodes: Vec<NodeId> = Vec::new();
+            let mut removed_node_ids: Vec<NodeId> = Vec::new();
 
             for node_id in &location.nodes {
+                if !all_known_node_ids.contains(node_id) {
+                    // Node is completely unknown to the cluster (removed/decommissioned).
+                    // Prune it immediately — no delay needed, it will never come back.
+                    removed_node_ids.push(*node_id);
+                    continue;
+                }
                 // Only count online nodes — offline nodes are expected to be absent.
                 if online_nodes.iter().any(|n| n.id == *node_id) {
                     if node_chunk_presence.get(node_id).map_or(false, |s| s.contains(&chunk_id)) {
@@ -502,6 +542,31 @@ impl HealingManager {
                     } else {
                         nodes_without_chunk.push(*node_id);
                     }
+                }
+            }
+
+            // Prune removed (completely unknown) nodes from metadata immediately.
+            if !removed_node_ids.is_empty() && quorum {
+                warn!(
+                    "Chunk {} — pruning {} removed node(s) from metadata (not in cluster): {:?}",
+                    chunk_id, removed_node_ids.len(), removed_node_ids
+                );
+                let pruned_nodes: Vec<NodeId> = location.nodes.iter()
+                    .filter(|n| !removed_node_ids.contains(n))
+                    .copied()
+                    .collect();
+                let updated_location = ChunkLocation {
+                    chunk_id,
+                    nodes: pruned_nodes,
+                    size: location.size,
+                    checksum: location.checksum,
+                    file_offset: location.file_offset,
+                    written_at: location.written_at,
+                };
+                if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
+                    warn!("Failed to prune removed nodes from chunk {} metadata: {}", chunk_id, e);
+                } else {
+                    location_updates.push(updated_location.clone());
                 }
             }
 
@@ -536,7 +601,7 @@ impl HealingManager {
                     if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
                         warn!("Failed to prune ghost nodes from chunk {} metadata: {}", chunk_id, e);
                     } else {
-                        HealingManager::broadcast_chunk_location_shared(&updated_location, &self.cluster, &self.client).await;
+                        location_updates.push(updated_location.clone());
                     }
                 } else {
                     debug!(
@@ -560,9 +625,27 @@ impl HealingManager {
                 .all(|n| node_chunk_presence.contains_key(n));
             if actual_replicas == 0 && (location.nodes.is_empty() || all_metadata_nodes_reachable) {
                 let pending = self.pending_healing.read().await;
-                let delay_passed = location.nodes.is_empty() ||
-                    pending.get(&chunk_id)
+                let delay_passed = if location.nodes.is_empty() {
+                    // No nodes in the location record at all. This could mean:
+                    //   (a) A genuinely incomplete write (nodes never populated), OR
+                    //   (b) The chunk is very new and the location record hasn't been
+                    //       updated with node IDs yet due to convergence lag.
+                    // Use written_at to apply the same delay as normal under-replication —
+                    // don't skip the delay just because nodes is empty.
+                    let age_secs = location.written_at_secs();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let written_age = now.saturating_sub(age_secs);
+                    // Also check pending_healing as a fallback (written_at may be 0 for old records).
+                    let pending_delay = pending.get(&chunk_id)
                         .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs));
+                    (age_secs > 0 && written_age >= self.healing_delay_secs) || pending_delay
+                } else {
+                    pending.get(&chunk_id)
+                        .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs))
+                };
                 drop(pending);
 
                 if delay_passed {
@@ -630,6 +713,12 @@ impl HealingManager {
                 }
                 ReplicationStatus::OverReplicated => {
                     if quorum {
+                        // Add to pending_healing so drain_heal_queue picks it up.
+                        // Use a backdated timestamp so the delay check passes immediately —
+                        // over-replication is safe to clean up without a wait window.
+                        self.pending_healing.write().await
+                            .entry(chunk_id)
+                            .or_insert_with(|| Instant::now() - Duration::from_secs(self.healing_delay_secs + 1));
                         work.push((chunk_id, ReplicationStatus::OverReplicated, confirmed_alive_nodes.clone()));
                     } else {
                         debug!("Skipping over-replication cleanup for {} — no quorum", chunk_id);
@@ -667,6 +756,29 @@ impl HealingManager {
             if let Err(e) = self.metadata.flush() {
                 warn!("Failed to flush metadata after orphan purge: {}", e);
             }
+        }
+
+        // Batch-broadcast all chunk location updates accumulated during this pass.
+        // One ReplicateChunkLocations per peer instead of one connection per chunk.
+        if !location_updates.is_empty() {
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            let local_id = cluster.local_node_id();
+            let updates = location_updates;
+            debug!("Batch-broadcasting {} chunk location updates to peers", updates.len());
+            tokio::spawn(async move {
+                let nodes = cluster.get_all_nodes().await;
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let req = Request::ReplicateChunkLocations { locations: updates.clone() };
+                    if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                        debug!("Failed to batch-broadcast {} chunk location updates to node {}: {}",
+                               updates.len(), node.id, e);
+                    }
+                }
+            });
         }
 
         let under_count = work.iter().filter(|(_, s, _)| *s == ReplicationStatus::UnderReplicated).count();
@@ -1161,6 +1273,16 @@ impl HealingManager {
         );
 
         Ok(())
+    }
+
+    /// Queue a specific set of chunks for immediate healing, bypassing the normal delay.
+    /// Used by HealFile to force-heal all chunks of a single file for targeted testing.
+    pub async fn queue_chunks_immediate(&self, chunk_ids: Vec<ChunkId>) {
+        let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs + 1);
+        let mut pending = self.pending_healing.write().await;
+        for chunk_id in chunk_ids {
+            pending.insert(chunk_id, backdated);
+        }
     }
 
     /// Get healing statistics

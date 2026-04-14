@@ -39,6 +39,74 @@ impl MetadataStore {
         Ok(Self { db })
     }
 
+    /// Scan all `file:` records and re-create any missing `path:` index entries.
+    ///
+    /// A crash between the two sled inserts in `put_file` (file: written, path: not yet)
+    /// leaves the DB with a file record that is invisible to `list_directory`.  This runs
+    /// at startup and is cheap: it only inserts when the path: key is absent.
+    pub fn repair_path_index(&self) -> Result<()> {
+        let mut repaired = 0usize;
+        // Pass 1: ensure every file: record has a corresponding path: entry.
+        for item in self.db.scan_prefix(b"file:") {
+            let (_, value) = item?;
+            let metadata = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
+                m
+            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
+                v1.into()
+            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
+                v0.into()
+            } else {
+                continue;
+            };
+
+            let path_key = self.path_key(&metadata.path);
+            if self.db.get(&path_key)?.is_none() {
+                self.db.insert(path_key, value)?;
+                warn!("Repaired missing path index for: {}", metadata.path);
+                repaired += 1;
+            }
+        }
+
+        // Pass 2: remove path: entries whose file: record no longer exists.
+        // These accumulate when a delete removes the file: record but the path:
+        // entry isn't cleaned up (crash, replication gap, etc.) — causing deleted
+        // files to reappear in readdir on every remount.
+        let mut stale_keys: Vec<sled::IVec> = Vec::new();
+        for item in self.db.scan_prefix(b"path:") {
+            let (key, value) = item?;
+            let file_id = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
+                m.id
+            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
+                v1.id
+            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
+                v0.id
+            } else if let Ok(id) = bincode::deserialize::<FileId>(&value) {
+                id
+            } else {
+                // Can't parse — leave it alone
+                continue;
+            };
+
+            let file_key = self.file_key(&file_id);
+            if self.db.get(&file_key)?.is_none() {
+                stale_keys.push(key);
+            }
+        }
+
+        let stale_count = stale_keys.len();
+        for key in stale_keys {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                warn!("Removing stale path index entry: {}", key_str);
+            }
+            self.db.remove(key)?;
+        }
+
+        if repaired > 0 || stale_count > 0 {
+            info!("Path index repair: {} entries rebuilt, {} stale entries removed", repaired, stale_count);
+        }
+        Ok(())
+    }
+
     /// Store file metadata
     pub fn put_file(&self, metadata: &FileMetadata) -> Result<()> {
         // If a different file ID already exists at this path, remove the old file: record
@@ -77,8 +145,13 @@ impl MetadataStore {
         // for any chunk, preserve those nodes. This prevents stale PutFileMetadata/
         // ReplicateMetadata broadcasts (which carry only the 2 nodes written by the client)
         // from overwriting healed 3-node state that was added via ReplicateChunkLocation.
+        //
+        // Also guards against stale-metadata resurrection: if the existing record is
+        // strictly newer (higher modified_at) AND has chunks while the incoming one
+        // does not, silently drop the incoming write. This prevents the metadata retry
+        // queue from clobbering a fully-written file with its zero-size create entry.
         let merged_metadata;
-        let metadata_to_store = if !metadata.chunk_locations.is_empty() {
+        let metadata_to_store = {
             let file_key = self.file_key(&metadata.id);
             if let Ok(Some(existing_bytes)) = self.db.get(&file_key) {
                 let existing_opt = if let Ok(m) = bincode::deserialize::<FileMetadata>(&existing_bytes) {
@@ -92,7 +165,21 @@ impl MetadataStore {
                 };
 
                 if let Some(existing) = existing_opt {
-                    // Build map of chunk_id → known nodes from existing record
+                    // Drop the incoming write if it is stale: existing record is strictly
+                    // newer and has chunks while the incoming one is empty (zero-size create).
+                    if existing.modified_at > metadata.modified_at
+                        && !existing.chunk_locations.is_empty()
+                        && metadata.chunk_locations.is_empty()
+                    {
+                        debug!(
+                            "Dropping stale zero-chunk metadata for {} (existing modified_at={} > incoming={})",
+                            metadata.path, existing.modified_at, metadata.modified_at
+                        );
+                        return Ok(());
+                    }
+
+                    // Merge chunk nodes: preserve any replica nodes from the existing record
+                    // that the incoming record doesn't know about yet.
                     let existing_nodes: std::collections::HashMap<ChunkId, Vec<NodeId>> =
                         existing.chunk_locations.iter()
                             .map(|loc| (loc.chunk_id, loc.nodes.clone()))
@@ -116,8 +203,6 @@ impl MetadataStore {
             } else {
                 metadata
             }
-        } else {
-            metadata
         };
 
         let key = self.file_key(&metadata_to_store.id);
@@ -285,14 +370,25 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// List all files (iterator for memory efficiency on SBCs)
+    /// List all files — returns a Vec, loading all records into memory.
+    /// Only use for admin/diagnostic paths where the full list is needed at once.
+    /// For startup scans use `scan_files` to avoid loading all metadata into RAM.
     pub fn list_files(&self) -> Result<Vec<FileMetadata>> {
         let mut files = Vec::new();
-        let prefix = b"file:";
+        self.scan_files(|m| { files.push(m); Ok(()) })?;
+        Ok(files)
+    }
 
-        for item in self.db.scan_prefix(prefix) {
+    /// Stream all file metadata records, calling `f` for each one without
+    /// materialising the full collection in memory.  Used at startup for the
+    /// chunk-map build so that 535 MB of on-disk sled data doesn't become 2 GB
+    /// of in-RAM Vec<FileMetadata>.
+    pub fn scan_files<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(FileMetadata) -> Result<()>,
+    {
+        for item in self.db.scan_prefix(b"file:") {
             let (key, value) = item?;
-            // Try current format, then V1 (no written_at), then V0 (no file_offset either).
             let metadata = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
                 m
             } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
@@ -303,10 +399,9 @@ impl MetadataStore {
                 warn!("Skipping corrupt metadata entry (key={:?})", key);
                 continue;
             };
-            files.push(metadata);
+            f(metadata)?;
         }
-
-        Ok(files)
+        Ok(())
     }
 
     /// List files in a directory (optimized with path prefix scan)

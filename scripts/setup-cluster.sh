@@ -31,12 +31,17 @@ for i in $(seq 1 $NUM_NODES); do
 
     # Update configuration
     # Set listen address
-    sed -i "s/listen_addr = \"0.0.0.0:8900\"/listen_addr = \"0.0.0.0:${PORT}\"/" "${NODE_DIR}/config.toml"
+    sed -i "s/listen_addr = \"0.0.0.0:8900\"/listen_addr = \"127.0.0.1:${PORT}\"/" "${NODE_DIR}/config.toml"
 
     # For nodes 2+, add node 1 as seed node (replace the empty array in [cluster] section)
     if [ $i -gt 1 ]; then
         sed -i 's/seed_nodes = \[\]/seed_nodes = ["127.0.0.1:'${BASE_PORT}'"]/' "${NODE_DIR}/config.toml"
     fi
+
+    # Fast settings for local dev testing
+    sed -i 's/heartbeat_interval_secs = .*/heartbeat_interval_secs = 5/' "${NODE_DIR}/config.toml"
+    sed -i 's/failure_timeout_secs = .*/failure_timeout_secs = 120/' "${NODE_DIR}/config.toml"
+    sed -i 's/healing_delay_secs = .*/healing_delay_secs = 10/' "${NODE_DIR}/config.toml"
 done
 
 echo ""

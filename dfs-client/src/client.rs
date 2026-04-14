@@ -2466,12 +2466,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                 warn!("Chunk ID mismatch at index {}: {} vs {}", idx, chunk_id, chunk_ids_2[idx]);
             }
 
-            let node1_id = node_id_map.get(&addr1)
-                .copied()
-                .unwrap_or_else(|| Self::node_id_from_addr(addr1));
-            let node2_id = node_id_map.get(&addr2)
-                .copied()
-                .unwrap_or_else(|| Self::node_id_from_addr(addr2));
+            let node1_id = Self::resolve_node_id(&node_id_map, addr1);
+            let node2_id = Self::resolve_node_id(&node_id_map, addr2);
 
             let chunk_size = chunk_sizes_1[idx] as usize;
             let location = dfs_common::ChunkLocation {
@@ -2535,6 +2531,21 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         Ok(chunk_locations)
+    }
+
+    /// Resolve a SocketAddr to a NodeId using the addr→id map.
+    /// The map is populated by refresh_cluster_nodes() using the peer_addr each server
+    /// advertises (non-wildcard), so exact matches should always succeed in a healthy
+    /// cluster. The fallback logs a warning so we notice if something goes wrong.
+    fn resolve_node_id(
+        node_id_map: &HashMap<SocketAddr, dfs_common::NodeId>,
+        addr: SocketAddr,
+    ) -> dfs_common::NodeId {
+        if let Some(&id) = node_id_map.get(&addr) {
+            return id;
+        }
+        warn!("addr_to_node_id: no entry for {} — falling back to hash-derived NodeId", addr);
+        Self::node_id_from_addr(addr)
     }
 
     /// Helper to create a NodeId from SocketAddr

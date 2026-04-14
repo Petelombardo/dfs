@@ -380,6 +380,9 @@ impl Server {
             Request::PurgeChunkLocations { chunk_ids } => {
                 self.handle_purge_chunk_locations(chunk_ids).await
             }
+            Request::ReconcileMetadata { live_file_ids } => {
+                self.handle_reconcile_metadata(live_file_ids).await
+            }
             Request::PrefetchHint { chunk_ids } => {
                 self.handle_prefetch_hint(chunk_ids).await
             }
@@ -807,6 +810,40 @@ impl Server {
             Response::Error {
                 message: format!("Failed to purge {}/{} chunk locations", failed, chunk_ids.len()),
                 code: ErrorCode::InternalError,
+            }
+        }
+    }
+
+    /// Handle ReconcileMetadata from the leader.
+    /// Removes any file: and path: records whose ID is not in the live set.
+    /// Runs in a blocking thread since it scans sled. Safe to call on any node.
+    async fn handle_reconcile_metadata(&self, live_file_ids: Vec<dfs_common::FileId>) -> Response {
+        let live_ids: std::collections::HashSet<dfs_common::FileId> =
+            live_file_ids.into_iter().collect();
+        let id_count = live_ids.len();
+        let metadata = self.metadata.clone();
+        match tokio::task::spawn_blocking(move || metadata.remove_unlisted_files(&live_ids)).await {
+            Ok(Ok(removed)) => {
+                if removed > 0 {
+                    info!("ReconcileMetadata: removed {} stale records ({} live file IDs from leader)", removed, id_count);
+                } else {
+                    debug!("ReconcileMetadata: no stale records found ({} live file IDs from leader)", id_count);
+                }
+                Response::Ok { data: None }
+            }
+            Ok(Err(e)) => {
+                warn!("ReconcileMetadata failed: {}", e);
+                Response::Error {
+                    message: format!("ReconcileMetadata failed: {}", e),
+                    code: ErrorCode::InternalError,
+                }
+            }
+            Err(e) => {
+                warn!("ReconcileMetadata spawn_blocking panicked: {}", e);
+                Response::Error {
+                    message: "ReconcileMetadata internal error".to_string(),
+                    code: ErrorCode::InternalError,
+                }
             }
         }
     }
@@ -2193,32 +2230,97 @@ impl Server {
     }
 
     /// Handle on-demand metadata repair request.
-    /// Spawns path-index repair and chunk-map rebuild; returns immediately.
+    ///
+    /// Runs locally first (path index repair, chunk map rebuild, chunk location
+    /// rebuild), then collects the leader's authoritative file ID set and sends
+    /// ReconcileMetadata to all followers so they remove stale records that
+    /// accumulated from missed deletes. Returns immediately; work is backgrounded.
     async fn handle_trigger_metadata_repair(&self) -> Response {
         let metadata = self.metadata.clone();
         let chunk_map = self.chunk_map.clone();
+        let cluster = self.cluster.clone();
+        let client = self.network_client();
+        let local_id = self.cluster.local_node_id();
         tokio::spawn(async move {
-            tokio::task::spawn_blocking(move || {
-                info!("Metadata repair: rebuilding path index");
-                if let Err(e) = metadata.repair_path_index() {
-                    warn!("Metadata repair: path index repair failed: {}", e);
-                } else {
-                    info!("Metadata repair: path index repair complete");
-                }
-                // Rebuild chunk map inline using the same scan
-                let mut built = 0usize;
-                let mut total = 0usize;
-                let metadata2 = metadata.clone();
-                let _ = metadata2.scan_files(|file| {
-                    total += 1;
-                    if !file.chunk_locations.is_empty() {
-                        chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
-                        built += 1;
+            // Step 1: local repair on this node (runs in blocking thread — sled scans).
+            let live_file_ids: Vec<dfs_common::FileId> =
+                tokio::task::spawn_blocking({
+                    let metadata = metadata.clone();
+                    let chunk_map = chunk_map.clone();
+                    move || -> anyhow::Result<Vec<dfs_common::FileId>> {
+                        info!("Metadata repair: rebuilding path index");
+                        if let Err(e) = metadata.repair_path_index() {
+                            warn!("Metadata repair: path index repair failed: {}", e);
+                        } else {
+                            info!("Metadata repair: path index repair complete");
+                        }
+
+                        // Rebuild in-memory chunk map.
+                        let mut built = 0usize;
+                        let mut total = 0usize;
+                        let _ = metadata.scan_files(|file| {
+                            total += 1;
+                            if !file.chunk_locations.is_empty() {
+                                chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
+                                built += 1;
+                            }
+                            Ok(())
+                        });
+                        info!("Metadata repair: chunk map rebuilt: {}/{} files", built, total);
+
+                        // Rebuild missing chunk: routing table entries.
+                        info!("Metadata repair: rebuilding missing chunk location records");
+                        match metadata.rebuild_chunk_locations_from_files() {
+                            Ok((written, _)) if written > 0 =>
+                                info!("Metadata repair: restored {} missing chunk: records", written),
+                            Ok(_) =>
+                                info!("Metadata repair: chunk location records are complete (no gaps)"),
+                            Err(e) =>
+                                warn!("Metadata repair: chunk location rebuild failed: {}", e),
+                        }
+
+                        // Collect the authoritative live file ID set from this node's
+                        // now-repaired file: records. Sent to followers for reconciliation.
+                        let mut ids = Vec::new();
+                        let _ = metadata.scan_files(|file| {
+                            ids.push(file.id);
+                            Ok(())
+                        });
+                        info!("Metadata repair: collected {} live file IDs for follower reconciliation", ids.len());
+                        Ok(ids)
                     }
-                    Ok(())
-                });
-                info!("Metadata repair: chunk map rebuilt: {}/{} files", built, total);
-            }).await.ok();
+                })
+                .await
+                .unwrap_or_else(|_| Ok(Vec::new()))
+                .unwrap_or_default();
+
+            if live_file_ids.is_empty() {
+                warn!("Metadata repair: no live file IDs collected — skipping follower reconciliation");
+                return;
+            }
+
+            // Step 2: send ReconcileMetadata to every online follower.
+            // Each follower removes file: and path: records not in this set.
+            // Only the leader should initiate this — followers receiving
+            // TriggerMetadataRepair run only their local repair (step 1 above),
+            // not the reconciliation broadcast, to avoid storms.
+            if !cluster.is_leader().await {
+                return;
+            }
+            let nodes = cluster.get_all_nodes().await;
+            for node in &nodes {
+                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                    continue;
+                }
+                let req = dfs_common::Request::ReconcileMetadata {
+                    live_file_ids: live_file_ids.clone(),
+                };
+                match client.send_message(node.addr, dfs_common::Message::Request(req)).await {
+                    Ok(_) => debug!("ReconcileMetadata sent to node {}", node.id),
+                    Err(e) => warn!("Failed to send ReconcileMetadata to node {}: {}", node.id, e),
+                }
+            }
+            info!("Metadata repair: follower reconciliation complete");
         });
         Response::Ok { data: None }
     }

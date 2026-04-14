@@ -152,8 +152,8 @@ fn init_node(data_dir: PathBuf, meta_dir: PathBuf, config_path: PathBuf) -> Resu
 async fn start_server(config_path: PathBuf) -> Result<()> {
     info!("Starting DFS server...");
 
-    // Load configuration
-    let config = Config::from_file(&config_path)?;
+    // Load configuration (mutable so we can write node_id back if needed)
+    let mut config = Config::from_file(&config_path)?;
 
     info!("Configuration loaded from: {:?}", config_path);
     info!("  Data directory: {:?}", config.storage.data_dir);
@@ -170,14 +170,21 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     let metadata = std::sync::Arc::new(metadata::MetadataStore::new(config.storage.metadata_dir.clone())?);
     info!("✓ Metadata store initialized");
 
-    // Load or create persistent node ID
-    let node_id = config.load_or_create_node_id()?;
+    // Load or create persistent node ID. Pass config_path so the ID is written
+    // back to config on first generation (migrating from node_id.json if present).
+    let node_id = config.load_or_create_node_id(Some(&config_path))?;
     info!("Node ID: {}", node_id);
+
+    // The address we register in the cluster and advertise to peers.
+    // Prefer advertise_addr; fall back to listen_addr. Either way the client
+    // now gets the real address from ClusterStatus and can map it to node_id.
+    let peer_addr = config.peer_addr();
+    info!("Peer address: {}", peer_addr);
 
     // Initialize cluster manager
     let cluster = std::sync::Arc::new(cluster::ClusterManager::new(
         node_id,
-        config.node.listen_addr,
+        peer_addr,
         config.cluster.heartbeat_interval_secs,
         config.cluster.failure_timeout_secs,
     ));
@@ -241,7 +248,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     // Try to join cluster using both seed nodes AND persisted peers
     // This ensures any node can rejoin even if the seed node is down
     let metadata_dir = std::path::PathBuf::from(&config.storage.metadata_dir);
-    let local_addr = config.node.listen_addr;
+    let local_addr = peer_addr; // Use peer_addr (our advertised address) for self-filtering
 
     // Start with configured seed nodes
     let mut all_join_targets = config.cluster.seed_nodes.clone();

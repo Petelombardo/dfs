@@ -174,11 +174,17 @@ impl HealingManager {
 
     /// Discovery loop — runs every 60s on the cluster leader.
     ///
-    /// Performs the expensive full scan: sled enumeration, bulk HasChunks RPCs,
-    /// orphan purge, ghost node pruning, and classification of under/over-replicated
-    /// chunks into pending_healing. Writes confirmed-alive node sets into
-    /// alive_nodes_cache so the heal loop can act without waiting for this scan.
+    /// Two-tier design:
+    ///   Fast cycle (every 60s): only checks chunks that need attention — those in
+    ///   pending_healing or with nodes.len() < RF in the routing table. Per-node
+    ///   HasChunks payload is scoped to chunks that node is listed for.
+    ///
+    ///   Deep cycle (every healing_delay_secs): checks all routing table entries to
+    ///   detect ghost nodes, orphans, and undocumented local copies. Interval matches
+    ///   healing_delay_secs so new under-replicated chunks are discovered within one
+    ///   delay window. Same scoped-per-node approach.
     async fn run_discovery_loop(&self) {
+        let mut cycle_counter = 0u32;
         let mut cleanup_counter = 0u32;
         let mut was_leader = false;
 
@@ -197,13 +203,16 @@ impl HealingManager {
             }
 
             if !is_leader {
-                // Followers do not run orphan purge. The leader purges orphaned
-                // chunk: records and broadcasts PurgeChunkLocation to all followers,
-                // so follower DBs drain via targeted deletes rather than a local scan.
                 continue;
             }
 
-            if let Err(e) = self.run_discovery_pass().await {
+            // Deep scan every healing_delay_secs (rounded to whole 60s cycles, minimum 1).
+            // This ensures new under-replicated chunks are discovered within one healing delay
+            // window — the same responsiveness guarantee the delay provides for known chunks.
+            let deep_every = ((self.healing_delay_secs + 59) / 60).max(1) as u32;
+            cycle_counter += 1;
+            let deep = cycle_counter % deep_every == 1; // first cycle after becoming leader is always deep
+            if let Err(e) = self.run_discovery_pass(deep).await {
                 warn!("Discovery pass error: {}", e);
             }
 
@@ -313,11 +322,25 @@ impl HealingManager {
     }
 
     /// Discovery pass — scans all chunk IDs, bulk-queries node presence, classifies
-    /// under/over-replicated chunks into pending_healing, and updates alive_nodes_cache.
+    /// Classify chunks, update pending_healing, and update alive_nodes_cache.
     /// Called by run_discovery_loop() every 60s. Does NOT issue any PushChunkTo —
     /// actual healing is handled by drain_heal_queue().
-    async fn run_discovery_pass(&self) -> Result<()> {
-        debug!("Running healing check");
+    ///
+    /// `deep`: when true, checks every routing table entry (detects ghost nodes,
+    /// undocumented local copies, orphans). When false (fast cycle), only checks
+    /// chunks that need attention: those in pending_healing or with nodes.len() < RF.
+    /// The fast cycle is O(pending) instead of O(all_chunks), making it viable at
+    /// 500K+ chunk scale without OOM or multi-minute stalls.
+    ///
+    /// In both modes, the HasChunks RPC payload sent to each node is scoped to only
+    /// the chunk IDs where that node is listed as a replica — so message size scales
+    /// with per-node replica count, not total cluster chunk count.
+    async fn run_discovery_pass(&self, deep: bool) -> Result<()> {
+        if deep {
+            debug!("Running deep discovery pass (full routing table scan)");
+        } else {
+            debug!("Running fast discovery pass (pending/under-replicated chunks only)");
+        }
 
         // Gate destructive operations on quorum. Under-replication healing is always
         // safe (adding replicas can't lose data), but orphan purge and over-replication
@@ -328,28 +351,6 @@ impl HealingManager {
             warn!("Leader does not have quorum — skipping destructive healing operations (orphan purge, over-replication cleanup)");
         }
 
-        // Kick off the sled scan concurrently with the HasChunks RPCs below.
-        // list_all_chunk_ids + live_chunk_ids are blocking sled scans — offload them
-        // so they don't hold the async executor while the bulk RPCs are in flight.
-        let metadata_scan = self.metadata.clone();
-        let scan_handle = tokio::task::spawn_blocking(move || {
-            let all = metadata_scan.list_all_chunk_ids()?;
-            let live = metadata_scan.live_chunk_ids()?;
-            Ok::<_, anyhow::Error>((all, live))
-        });
-
-        // First pass: classify all chunks.
-        //
-        // Old approach: HasChunk per-chunk per-node → O(chunks × nodes) connections.
-        // New approach: HasChunks (plural) per-node → O(nodes) connections total.
-        //
-        // We ask each online remote node "which of these chunk IDs do you hold?" in
-        // one bulk RPC, then classify every chunk locally using the result maps.
-        // This reduces scan-phase connections from potentially thousands to just one
-        // per online node.
-        // While the sled scan runs in the background, do the HasChunks bulk RPCs
-        // concurrently — both are high-latency operations and neither depends on
-        // the other's results yet.
         let local_id = self.cluster.local_node_id();
         let online_nodes: Vec<_> = self.cluster.get_all_nodes().await
             .into_iter()
@@ -362,37 +363,96 @@ impl HealingManager {
             .map(|n| n.id)
             .collect();
 
-        // node_id → HashSet<ChunkId> of chunks confirmed present on that node.
-        // We can't send HasChunks yet (don't have chunk list), but we CAN collect
-        // the online node list and check local storage — done above.
-        // HasChunks RPCs happen after we have the chunk list from the scan below.
+        // Sled scan: stream through chunk location records, building only what we need.
+        // Offloaded to a blocking thread to avoid stalling the async executor.
+        //
+        // We never materialise the full Vec<ChunkLocation> — instead the blocking task
+        // produces the derived data structures directly:
+        //   chunks_to_check   — locations that need network verification this cycle
+        //   live_chunks       — chunk IDs referenced by live file records (deep only)
+        //
+        // This keeps peak memory proportional to what we actually act on, not the
+        // entire routing table.
+        let metadata_scan = self.metadata.clone();
+        let pending_snapshot: HashSet<ChunkId> = self.pending_healing.read().await.keys().copied().collect();
 
-        // Now await the scan — it's been running concurrently with the online_nodes fetch.
-        let (all_chunks, live_chunks) = scan_handle
+        struct ScanResult {
+            /// Locations to verify with HasChunks this cycle.
+            chunks_to_check: Vec<ChunkLocation>,
+            /// live_chunk_ids from file records (deep scan only, else None).
+            live_chunks: Option<HashSet<ChunkId>>,
+            /// All chunk IDs from routing table (deep scan only, for orphan diff).
+            all_chunk_ids: Option<Vec<ChunkId>>,
+        }
+
+        // Fast path: no sled scan at all. We fetch locations only for chunks already
+        // in pending_healing — O(pending) individual lookups, not O(all_chunks).
+        // Deep path: full streaming sled scan for orphan detection and finding under-RF
+        // chunks that haven't entered pending_healing yet.
+        let scan_result = if !deep {
+            // Fast: look up only pending chunks by ID.
+            let mut chunks_to_check = Vec::with_capacity(pending_snapshot.len());
+            for chunk_id in &pending_snapshot {
+                if let Ok(Some(loc)) = self.metadata.get_chunk_location(chunk_id) {
+                    chunks_to_check.push(loc);
+                }
+            }
+            ScanResult { chunks_to_check, live_chunks: None, all_chunk_ids: None }
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let live = Some(metadata_scan.live_chunk_ids()?);
+
+                let mut chunks_to_check = Vec::new();
+                let mut all_chunk_ids_for_orphan_check: Vec<ChunkId> = Vec::new();
+
+                metadata_scan.scan_chunk_locations(|loc| {
+                    all_chunk_ids_for_orphan_check.push(loc.chunk_id);
+                    // Deep: include all live chunks for HasChunks verification.
+                    if let Some(ref live_set) = live {
+                        if live_set.contains(&loc.chunk_id) {
+                            chunks_to_check.push(loc);
+                        }
+                    }
+                    true
+                })?;
+
+                Ok::<_, anyhow::Error>(ScanResult {
+                    chunks_to_check,
+                    live_chunks: live,
+                    all_chunk_ids: Some(all_chunk_ids_for_orphan_check),
+                })
+            })
             .await
-            .context("spawn_blocking for chunk scan panicked")??;
+            .context("spawn_blocking for chunk scan panicked")??
+        };
+
+        // Re-check leadership after the sled scan — on large clusters the scan can
+        // take minutes, during which leadership may have transferred. No point sending
+        // HasChunks RPCs or modifying state if we're no longer the leader.
+        if !self.cluster.is_leader().await {
+            debug!("Leadership changed during deep scan — aborting discovery pass");
+            return Ok(());
+        }
+
+        let ScanResult {
+            chunks_to_check: mut chunks_to_check,
+            live_chunks: live_chunks_opt,
+            all_chunk_ids: all_chunk_ids_opt,
+        } = scan_result;
 
         // work carries (chunk_id, status, confirmed_alive_node_ids) from the bulk scan.
-        // Passing confirmed-alive nodes avoids re-querying in the heal path, which would
-        // race against transient RPC failures and misclassify good nodes as ghosts.
         let mut work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = Vec::new();
         let mut pending_count = 0;
         let mut orphan_count = 0;
-
-        // Separate orphan candidates (no network I/O) from live chunks to check.
-        let mut chunks_to_check: Vec<ChunkId> = Vec::new();
         let mut purged_orphans: Vec<ChunkId> = Vec::new();
-
-        // Two-cycle orphan guard: chunks absent from live_chunk_ids are added to
-        // orphan_candidates on first sighting. Only purge if they were already
-        // candidates on the previous pass. This prevents false-positive orphan
-        // purge when the leader's metadata DB is temporarily stale (e.g. the file
-        // record hasn't been replicated yet but chunk: and path: entries exist).
-        // Chunks that reappear in live_chunk_ids are removed from candidates immediately.
         let mut new_candidates: HashSet<ChunkId> = HashSet::new();
-        {
-            let prev_candidates = self.orphan_candidates.read().await;
-            for chunk_id in all_chunks {
+
+        // --- Orphan detection (deep scan only) ---
+        if let (Some(ref live_chunks), Some(all_chunk_ids)) = (live_chunks_opt.as_ref(), all_chunk_ids_opt) {
+            // Snapshot prev_candidates and immediately drop the read lock so we can
+            // take the write lock at the end of this block without deadlocking.
+            let prev_candidates: HashSet<ChunkId> = self.orphan_candidates.read().await.clone();
+            for chunk_id in all_chunk_ids {
                 if !live_chunks.contains(&chunk_id) {
                     if !quorum {
                         debug!("Skipping orphan purge for {} — no quorum", chunk_id);
@@ -400,7 +460,6 @@ impl HealingManager {
                         continue;
                     }
                     if prev_candidates.contains(&chunk_id) {
-                        // Absent for two consecutive passes — definitely orphaned.
                         debug!("Purging orphaned chunk location record: {}", chunk_id);
                         if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
                             warn!("Failed to purge orphaned chunk location {}: {}", chunk_id, e);
@@ -409,30 +468,24 @@ impl HealingManager {
                         }
                         self.pending_healing.write().await.remove(&chunk_id);
                         orphan_count += 1;
-                        // Don't add to new_candidates — it's been purged.
                     } else {
-                        // First sighting — stage for next pass.
                         new_candidates.insert(chunk_id);
                         debug!("Orphan candidate (first sighting, will purge next pass if still absent): {}", chunk_id);
                     }
-                    continue;
                 }
-                // Chunk is live — clear from candidates if it was staged.
-                chunks_to_check.push(chunk_id);
+            }
+            *self.orphan_candidates.write().await = new_candidates;
+            // Remove purged chunks from chunks_to_check.
+            if !purged_orphans.is_empty() {
+                let purged_set: HashSet<ChunkId> = purged_orphans.iter().copied().collect();
+                chunks_to_check.retain(|loc| !purged_set.contains(&loc.chunk_id));
             }
         }
-        *self.orphan_candidates.write().await = new_candidates;
 
-        // Broadcast orphan purges to all followers so their chunk: routing tables
-        // drain in sync with the leader.  Followers never purge independently —
-        // they could incorrectly delete records for live recordings whose file:
-        // metadata hasn't been flushed yet (e.g. an open file being written to).
-        // Use PurgeChunkLocations batch message — one round-trip per peer instead
-        // of one per chunk.
+        // Broadcast orphan purges to followers (deep scan only, but only if any occurred).
         if !purged_orphans.is_empty() {
             let cluster = self.cluster.clone();
             let client = self.client.clone();
-            let local_id = cluster.local_node_id();
             let orphans_to_broadcast = purged_orphans.clone();
             tokio::spawn(async move {
                 let nodes = cluster.get_all_nodes().await;
@@ -449,20 +502,29 @@ impl HealingManager {
             });
         }
 
-        // Accumulate chunk location updates from the discovery pass for batch broadcast.
-        // All updates collected here are sent in one ReplicateChunkLocations per peer
-        // at the end of the pass, instead of one connection per chunk per peer.
-        let mut location_updates: Vec<ChunkLocation> = Vec::new();
+        // --- Build per-node chunk assignment maps ---
+        // For each online node, collect only the chunk IDs where that node is listed
+        // as a replica. This scopes the HasChunks payload to each node's actual
+        // assignments rather than the entire cluster chunk universe.
+        //
+        // node_id → ordered Vec<ChunkId> that node is responsible for
+        let mut node_assigned: HashMap<NodeId, Vec<ChunkId>> = HashMap::new();
+        for loc in &chunks_to_check {
+            for node_id in &loc.nodes {
+                if all_known_node_ids.contains(node_id) {
+                    node_assigned.entry(*node_id).or_default().push(loc.chunk_id);
+                }
+            }
+        }
 
-        // Bulk-query each online remote node: "which of these chunks do you hold?"
-        // One HasChunks RPC per node replaces O(chunks) HasChunk RPCs per node.
-        // node_id → HashSet<ChunkId> of chunks confirmed present on that node
+        // --- HasChunks RPCs: one per online node, payload = that node's assignments ---
+        // node_id → HashSet<ChunkId> confirmed present
         let mut node_chunk_presence: HashMap<NodeId, HashSet<ChunkId>> = HashMap::new();
 
-        // Local node: check storage directly (no network).
-        {
+        // Local node: check storage directly (no network hop).
+        if let Some(assigned) = node_assigned.get(&local_id) {
             let mut local_set = HashSet::new();
-            for chunk_id in &chunks_to_check {
+            for chunk_id in assigned {
                 if self.storage.has_chunk(chunk_id) {
                     local_set.insert(*chunk_id);
                 }
@@ -470,38 +532,45 @@ impl HealingManager {
             node_chunk_presence.insert(local_id, local_set);
         }
 
-        // Remote nodes: one HasChunks RPC each.
+        // Remote nodes: one HasChunks RPC each, scoped to that node's assignments.
         for node_info in &online_nodes {
             if node_info.id == local_id {
                 continue;
             }
-            let request = Request::HasChunks { chunk_ids: chunks_to_check.clone() };
+            // Abort if we lost leadership mid-scan — don't send RPCs as non-leader.
+            if !self.cluster.is_leader().await {
+                debug!("Leadership changed during HasChunks RPCs — aborting discovery pass");
+                return Ok(());
+            }
+            let assigned = match node_assigned.get(&node_info.id) {
+                Some(ids) if !ids.is_empty() => ids.clone(),
+                _ => continue, // node has no assigned chunks in this scan scope — skip
+            };
+            let request = Request::HasChunks { chunk_ids: assigned.clone() };
             match self.client.send_message(node_info.addr, Message::Request(request)).await {
                 Ok(envelope) => {
                     if let Message::Response(Response::BoolVec { values }) = envelope.message {
                         let mut present = HashSet::new();
-                        for (chunk_id, has) in chunks_to_check.iter().zip(values.iter()) {
+                        for (chunk_id, has) in assigned.iter().zip(values.iter()) {
                             if *has {
                                 present.insert(*chunk_id);
                             }
                         }
-                        debug!("Node {} holds {}/{} queried chunks", node_info.id, present.len(), chunks_to_check.len());
+                        debug!("Node {} confirmed {}/{} assigned chunks present",
+                               node_info.id, present.len(), assigned.len());
                         node_chunk_presence.insert(node_info.id, present);
                     } else {
                         warn!("Unexpected response to HasChunks from node {}", node_info.id);
                     }
                 }
                 Err(e) => {
-                    // Don't insert anything for this node — we can't distinguish "node has
-                    // no chunks" from "node is unreachable". Leaving it absent from
-                    // node_chunk_presence means we won't count it as a confirmed replica,
-                    // but we also won't declare chunks unrecoverable just because this RPC
-                    // failed. The unrecoverable check requires all metadata nodes to be
-                    // reachable before writing off a chunk as permanently lost.
                     warn!("HasChunks RPC failed for node {} ({}): skipping node for this scan cycle", node_info.id, e);
                 }
             }
         }
+
+        // Accumulate chunk location updates for batch broadcast at end of pass.
+        let mut location_updates: Vec<ChunkLocation> = Vec::new();
 
         // Classify all chunks — no work cap here. Every chunk must be classified so
         // that pending_healing timestamps are updated for all under-replicated chunks,
@@ -509,17 +578,17 @@ impl HealingManager {
         // never enter pending_healing and never get healed until the queue drains.
         // The work batch is capped after classification, sorted oldest-first so long-
         // waiting chunks are not perpetually starved by newer ones.
+        //
+        // Note: chunks_to_check now carries full ChunkLocation records from the sled
+        // scan, so we don't need a per-chunk DB lookup here.
         let mut classify_count = 0usize;
-        for chunk_id in chunks_to_check {
+        for location in chunks_to_check {
+            let chunk_id = location.chunk_id;
             classify_count += 1;
             if classify_count % 100 == 0 {
                 tokio::task::yield_now().await;
             }
 
-            let location = match self.metadata.get_chunk_location(&chunk_id) {
-                Ok(Some(loc)) => loc,
-                _ => continue,
-            };
             let metadata_node_count = location.nodes.len();
 
             let mut actual_replicas = 0usize;
@@ -665,6 +734,43 @@ impl HealingManager {
                     );
                 }
             }
+
+            // Reconcile routing table: if discovery found the chunk alive on nodes that
+            // aren't in location.nodes, add them now before classifying. This prevents
+            // the routing table from staying stale when the leader or other nodes have a
+            // physical copy that wasn't recorded (e.g. from a previous local-fallback heal
+            // that pushed data but didn't update metadata, or manual copy). Without this,
+            // over-replication cleanup removes the "surprise" copies before the table is
+            // updated, leaving the chunk under-replicated again on the next cycle.
+            let extra_nodes: Vec<NodeId> = confirmed_alive_nodes.iter()
+                .filter(|n| !location.nodes.contains(n))
+                .copied()
+                .collect();
+            let (location, metadata_node_count) = if !extra_nodes.is_empty() {
+                let mut updated_nodes = location.nodes.clone();
+                updated_nodes.extend_from_slice(&extra_nodes);
+                debug!(
+                    "Chunk {} — reconciling routing table: adding {} newly-discovered node(s): {:?}",
+                    chunk_id, extra_nodes.len(), extra_nodes
+                );
+                let updated_location = ChunkLocation {
+                    chunk_id,
+                    nodes: updated_nodes,
+                    size: location.size,
+                    checksum: location.checksum,
+                    file_offset: location.file_offset,
+                    written_at: location.written_at,
+                };
+                if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
+                    warn!("Failed to reconcile chunk {} routing table: {}", chunk_id, e);
+                } else {
+                    location_updates.push(updated_location.clone());
+                }
+                let new_count = updated_location.nodes.len();
+                (updated_location, new_count)
+            } else {
+                (location, metadata_node_count)
+            };
 
             let status = if actual_replicas < replication_factor {
                 ReplicationStatus::UnderReplicated
@@ -1034,6 +1140,9 @@ impl HealingManager {
 
         // Also check local storage — the chunk may exist here but not be in metadata
         // (e.g. node ID was incorrectly pruned by a previous healer bug).
+        // NOTE: we track whether the local node was added via fallback so we don't
+        // count it toward replica_count — the routing table is authoritative for that.
+        let mut local_added_via_fallback = false;
         if !alive.iter().any(|(id, _)| *id == local_id) && storage.has_chunk(chunk_id) {
             if let Some(info) = cluster.get_node(&local_id).await {
                 warn!(
@@ -1041,6 +1150,7 @@ impl HealingManager {
                     chunk_id
                 );
                 alive.push((local_id, info.addr));
+                local_added_via_fallback = true;
             }
         }
 
@@ -1048,7 +1158,15 @@ impl HealingManager {
             anyhow::bail!("No alive nodes have chunk {}", chunk_id);
         }
 
-        let needed = replication_factor.saturating_sub(alive.len());
+        // Use confirmed_alive count (excluding the local fallback) for replica accounting.
+        // The routing table is authoritative for how many replicas exist; the local fallback
+        // is a source-of-data only and shouldn't inflate the replica count.
+        let replica_count = if local_added_via_fallback {
+            alive.len().saturating_sub(1)
+        } else {
+            alive.len()
+        };
+        let needed = replication_factor.saturating_sub(replica_count);
         if needed == 0 {
             pending_healing.write().await.remove(chunk_id);
             return Ok(());
@@ -1314,10 +1432,16 @@ impl HealingManager {
             return Ok(());
         }
         info!("Manual heal cycle triggered");
-        // Run a fresh discovery pass first so alive_nodes_cache is current,
-        // then immediately drain the queue — this mirrors what the periodic
-        // loops do but back-to-back for the manual trigger case.
-        self.run_discovery_pass().await?;
+        // Use a deep scan if there's nothing in pending_healing — fast scan would
+        // find nothing since it only checks already-known chunks. Deep scan finds
+        // all under-replicated chunks in the routing table regardless of whether
+        // they've been seen before. Fast scan is used when pending is non-empty.
+        let pending_count = self.pending_healing.read().await.len();
+        let deep = pending_count == 0;
+        if deep {
+            info!("Manual heal cycle: pending queue empty — running deep scan to discover new under-replicated chunks");
+        }
+        self.run_discovery_pass(deep).await?;
         self.drain_heal_queue().await
     }
 }

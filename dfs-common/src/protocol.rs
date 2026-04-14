@@ -272,6 +272,14 @@ pub enum Request {
     PurgeChunkLocations {
         chunk_ids: Vec<ChunkId>,
     },
+
+    /// Metadata reconciliation — sent by the leader after a repair pass.
+    /// Contains the authoritative set of live file IDs. Followers remove any
+    /// file: and path: records whose ID is not in this set, eliminating stale
+    /// entries that accumulated from missed deletes. Chunk data is never touched.
+    ReconcileMetadata {
+        live_file_ids: Vec<FileId>,
+    },
 }
 
 /// Response types

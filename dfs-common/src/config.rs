@@ -42,7 +42,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub advertise_addr: Option<SocketAddr>,
 
-    /// Optional node name (defaults to hostname)
+    /// Persistent node identity. Generated once on first start and written back
+    /// to this file. Subsequent restarts read it here — the config is the single
+    /// source of truth for node identity.
+    #[serde(default)]
+    pub node_id: Option<NodeId>,
+
+    /// Optional human-readable name (defaults to hostname)
     pub name: Option<String>,
 }
 
@@ -51,6 +57,7 @@ impl Default for NodeConfig {
         Self {
             listen_addr: "0.0.0.0:8900".parse().unwrap(),
             advertise_addr: None,
+            node_id: None,
             name: None,
         }
     }
@@ -195,31 +202,60 @@ impl Config {
         self.storage.chunk_size_mb * 1024 * 1024
     }
 
-    /// Load or create a persistent node ID
+    /// Return the address this node should advertise to the cluster.
     ///
-    /// The node ID is stored in the metadata directory to ensure it persists across restarts.
-    /// This prevents a node from joining the cluster with a new ID after every restart.
-    pub fn load_or_create_node_id(&self) -> anyhow::Result<NodeId> {
-        let node_id_path = self.storage.metadata_dir.join("node_id.json");
-
-        // Try to load existing node ID
-        if node_id_path.exists() {
-            let contents = std::fs::read_to_string(&node_id_path)?;
-            let node_id: NodeId = serde_json::from_str(&contents)?;
-            Ok(node_id)
-        } else {
-            // Create new node ID and save it
-            let node_id = NodeId::new();
-
-            // Ensure metadata directory exists
-            std::fs::create_dir_all(&self.storage.metadata_dir)?;
-
-            // Save node ID to file
-            let contents = serde_json::to_string_pretty(&node_id)?;
-            std::fs::write(&node_id_path, contents)?;
-
-            Ok(node_id)
+    /// Priority:
+    ///   1. `node.advertise_addr` if explicitly set in config
+    ///   2. `node.listen_addr` if it is not a wildcard (not 0.0.0.0 / ::)
+    ///   3. Falls back to `listen_addr` unchanged (callers that need a real IP
+    ///      must resolve it themselves from the incoming connection source addr)
+    pub fn peer_addr(&self) -> std::net::SocketAddr {
+        if let Some(addr) = self.node.advertise_addr {
+            return addr;
         }
+        self.node.listen_addr
+    }
+
+    /// Load or create a persistent node ID.
+    ///
+    /// Resolution order:
+    ///   1. `node.node_id` in config (fastest, canonical once written)
+    ///   2. `metadata_dir/node_id.json` legacy file (migrated into config on first read)
+    ///   3. Generate a fresh UUID and persist it into the config file at `config_path`
+    ///
+    /// When `config_path` is provided and the ID was not already in the config, the
+    /// resolved ID is written back to the config file so future starts use path 1.
+    pub fn load_or_create_node_id(
+        &mut self,
+        config_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<NodeId> {
+        // 1. Already in config — done.
+        if let Some(id) = self.node.node_id {
+            return Ok(id);
+        }
+
+        // 2. Migrate from legacy node_id.json if it exists.
+        let node_id_path = self.storage.metadata_dir.join("node_id.json");
+        let node_id = if node_id_path.exists() {
+            let contents = std::fs::read_to_string(&node_id_path)?;
+            let id: NodeId = serde_json::from_str(&contents)?;
+            id
+        } else {
+            // 3. Generate a fresh ID.
+            std::fs::create_dir_all(&self.storage.metadata_dir)?;
+            NodeId::new()
+        };
+
+        // Persist into config so future starts hit path 1.
+        self.node.node_id = Some(node_id);
+        if let Some(path) = config_path {
+            if let Err(e) = self.to_file(path) {
+                // Non-fatal: node still works, just won't be cached next time.
+                tracing::warn!("Could not write node_id back to config {:?}: {}", path, e);
+            }
+        }
+
+        Ok(node_id)
     }
 }
 

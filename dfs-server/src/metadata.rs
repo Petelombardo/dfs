@@ -404,6 +404,91 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Remove file: and path: records whose file ID is not in `live_ids`.
+    ///
+    /// Called on followers after the leader sends a ReconcileMetadata message.
+    /// The leader's file: keyspace is authoritative — any ID the leader doesn't
+    /// have is a stale entry from a missed delete. Chunk data is never touched.
+    ///
+    /// Returns the number of (file:, path:) record pairs removed.
+    pub fn remove_unlisted_files(
+        &self,
+        live_ids: &std::collections::HashSet<FileId>,
+    ) -> Result<usize> {
+        let mut removed = 0usize;
+
+        // Collect stale file: records.
+        let mut stale_file_keys: Vec<sled::IVec> = Vec::new();
+        let mut stale_paths: Vec<String> = Vec::new();
+
+        for item in self.db.scan_prefix(b"file:") {
+            let (key, value) = item?;
+            let file_id = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
+                // Also collect the path so we can remove the path: entry directly.
+                stale_paths.push(m.path.clone());
+                m.id
+            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
+                stale_paths.push(v1.path.clone());
+                v1.id
+            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
+                stale_paths.push(v0.path.clone());
+                v0.id
+            } else {
+                continue; // can't parse — leave it alone
+            };
+
+            if !live_ids.contains(&file_id) {
+                stale_file_keys.push(key);
+            } else {
+                stale_paths.pop(); // not stale, remove the path we just pushed
+            }
+        }
+
+        // Remove stale file: records and their path: index entries.
+        for (key, path) in stale_file_keys.iter().zip(stale_paths.iter()) {
+            if let Ok(key_str) = std::str::from_utf8(key) {
+                warn!("ReconcileMetadata: removing stale file record: {} (path: {})", key_str, path);
+            }
+            self.db.remove(key)?;
+            let path_key = self.path_key(path);
+            self.db.remove(path_key)?;
+            removed += 1;
+        }
+
+        // Also sweep path: entries independently — a path: record can exist without
+        // a file: record if the file: record was removed out-of-order.
+        let mut stale_path_keys: Vec<sled::IVec> = Vec::new();
+        for item in self.db.scan_prefix(b"path:") {
+            let (key, value) = item?;
+            let file_id = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
+                m.id
+            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
+                v1.id
+            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
+                v0.id
+            } else if let Ok(id) = bincode::deserialize::<FileId>(&value) {
+                id
+            } else {
+                continue;
+            };
+            if !live_ids.contains(&file_id) {
+                stale_path_keys.push(key);
+            }
+        }
+        for key in stale_path_keys {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                warn!("ReconcileMetadata: removing stale path index entry: {}", key_str);
+            }
+            self.db.remove(key)?;
+            removed += 1;
+        }
+
+        if removed > 0 {
+            info!("ReconcileMetadata: removed {} stale metadata records", removed);
+        }
+        Ok(removed)
+    }
+
     /// List files in a directory (optimized with path prefix scan)
     pub fn list_directory(&self, dir_path: &str) -> Result<Vec<FileMetadata>> {
         let mut files = Vec::new();
@@ -487,6 +572,40 @@ impl MetadataStore {
         Ok(ids)
     }
 
+    /// Return all chunk location records in one sled scan.
+    /// Used by the discovery pass to build per-node chunk assignment maps without
+    /// a second pass over the DB.
+    pub fn list_all_chunk_locations(&self) -> Result<Vec<ChunkLocation>> {
+        let prefix = b"chunk:";
+        let mut locations = Vec::new();
+        for item in self.db.scan_prefix(prefix) {
+            let (_, value) = item?;
+            if let Ok(loc) = bincode::deserialize::<ChunkLocation>(&value) {
+                locations.push(loc);
+            }
+        }
+        Ok(locations)
+    }
+
+    /// Stream chunk location records, calling `f` for each one.
+    /// Return `false` from `f` to stop iteration early.
+    /// More memory-efficient than list_all_chunk_locations when only a subset is needed.
+    pub fn scan_chunk_locations<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(ChunkLocation) -> bool,
+    {
+        let prefix = b"chunk:";
+        for item in self.db.scan_prefix(prefix) {
+            let (_, value) = item?;
+            if let Ok(loc) = bincode::deserialize::<ChunkLocation>(&value) {
+                if !f(loc) {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build the set of chunk IDs referenced by any live file in metadata.
     /// Used by the healer to identify orphaned chunk: records (chunks whose
     /// file metadata was deleted but whose chunk: record was not cleaned up).
@@ -516,6 +635,59 @@ impl MetadataStore {
             }
         }
         Ok(live)
+    }
+
+    /// Rebuild chunk: routing table entries from file metadata.
+    ///
+    /// If an earlier healer bug (aggressive orphan purge, crash mid-write, etc.) deleted
+    /// chunk: records while the file: record still references those chunks, the healer
+    /// can't discover them via its normal sled scan and healing stalls permanently.
+    ///
+    /// This repair pass reads every file: record, extracts each ChunkLocation embedded in
+    /// chunk_locations, and writes a chunk: entry if one doesn't already exist.  Existing
+    /// entries are left untouched — this only fills gaps.
+    ///
+    /// Returns (written, skipped) counts.
+    pub fn rebuild_chunk_locations_from_files(&self) -> Result<(usize, usize)> {
+        let mut written = 0usize;
+        let mut skipped = 0usize;
+
+        for item in self.db.scan_prefix(b"file:") {
+            let (_, value) = item?;
+            let metadata: FileMetadata = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
+                m
+            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
+                v1.into()
+            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
+                v0.into()
+            } else {
+                continue;
+            };
+
+            for loc in &metadata.chunk_locations {
+                let key = self.chunk_key(&loc.chunk_id);
+                if self.db.get(&key)?.is_none() {
+                    let bytes = bincode::serialize(loc)
+                        .context("Failed to serialize ChunkLocation during rebuild")?;
+                    self.db.insert(key, bytes)?;
+                    warn!(
+                        "Rebuilt missing chunk: record for {} (file: {})",
+                        loc.chunk_id, metadata.path
+                    );
+                    written += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+
+        if written > 0 {
+            info!(
+                "Chunk location rebuild: {} missing records restored, {} already present",
+                written, skipped
+            );
+        }
+        Ok((written, skipped))
     }
 
     /// Get chunk location information

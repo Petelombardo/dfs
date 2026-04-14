@@ -349,6 +349,11 @@ impl DfsFilesystem {
         info!("Client configured with buffer_flush_threshold={} bytes ({}MB, 3x cluster chunk size) for pipelined writes",
               buffer_flush_threshold, buffer_flush_threshold / (1024 * 1024));
 
+        // Populate addr_to_node_id immediately so the very first write gets real node IDs.
+        if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {
+            tracing::warn!("Initial cluster node refresh failed: {}", e);
+        }
+
         // Start background task to periodically refresh cluster nodes.
         // Uses exponential backoff on failure: 30s → 60s → 120s → 240s (cap),
         // resetting to 30s on the next success. This prevents hammering the network

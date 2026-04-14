@@ -2005,54 +2005,57 @@ impl Filesystem for DfsFilesystem {
             chunk_locations: Vec::new(),
         };
 
-        // Store metadata on cluster
+        // Store metadata on cluster — spawn so we never block_on the FUSE dispatch thread.
         let client = self.client.clone();
         let metadata_clone = metadata.clone();
-        let result = self.block_on(async {
-            client.put_file_metadata(&metadata_clone).await
+        let metadata_cache = self.metadata_cache.clone();
+        let dir_cache = self.dir_cache.clone();
+        let path_to_inode = self.path_to_inode.clone();
+        let next_inode = self.next_inode.clone();
+        let write_open_counts = self.write_open_counts.clone();
+
+        self.runtime.spawn(async move {
+            match client.put_file_metadata(&metadata_clone).await {
+                Ok(_) => {
+                    // Allocate inode
+                    let ino = {
+                        let path_map = path_to_inode.read().unwrap();
+                        if let Some(&existing) = path_map.get(&path) {
+                            existing
+                        } else {
+                            drop(path_map);
+                            let mut next = next_inode.write().unwrap();
+                            let v = *next; *next += 1; drop(next);
+                            path_to_inode.write().unwrap().insert(path.clone(), v);
+                            v
+                        }
+                    };
+
+                    // Cache metadata
+                    metadata_cache.insert(ino, metadata.clone());
+
+                    // Invalidate parent directory cache so 'ls' shows new file immediately
+                    let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                    let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
+                    dir_cache.remove(parent_path);
+
+                    // create() always opens for writing — count it
+                    *write_open_counts.entry(ino).or_insert(0) += 1;
+
+                    let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
+                    let open_flags = if is_sqlite_direct_io(&path) {
+                        fuser::consts::FOPEN_DIRECT_IO
+                    } else {
+                        0
+                    };
+                    reply.created(&Duration::from_secs(300), &attr, 0, 0, open_flags);
+                }
+                Err(e) => {
+                    error!("Failed to create file {}: {}", path, e);
+                    reply.error(libc::EIO);
+                }
+            }
         });
-
-        match result {
-            Ok(_) => {
-                // Allocate inode
-                let ino = self.get_or_create_inode(&path);
-
-                // Cache metadata
-                self.metadata_cache.insert(ino, metadata.clone());
-
-                // CRITICAL: Invalidate parent directory cache so 'ls' shows new file immediately
-                let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
-                let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-                self.dir_cache.remove(parent_path);
-                debug!("Invalidated directory cache for parent: {}", parent_path);
-
-                // create() always opens for writing — count it
-                *self.write_open_counts.entry(ino).or_insert(0) += 1;
-
-                // Convert to FUSE attr
-                let attr = self.metadata_to_attr(ino, &metadata);
-
-                // For SQLite files: use direct I/O to bypass page cache.
-                // This ensures reads see fresh data (no stale page cache).
-                // EXCEPTION: .db-shm must NOT use direct I/O — SQLite mmaps it
-                // (MAP_SHARED) for WAL index coordination. FOPEN_DIRECT_IO would
-                // cause mmap to return ENODEV → SQLITE_IOERR.
-                // SQLite pre-initializes the shm with sparse writes before mmap,
-                // so the page cache will have valid data when mmap is called.
-                let open_flags = if is_sqlite_direct_io(&path) {
-                    fuser::consts::FOPEN_DIRECT_IO
-                } else {
-                    0
-                };
-
-                // ReplyCreate expects: ttl, attr, generation, fh, flags
-                reply.created(&Duration::from_secs(300), &attr, 0, 0, open_flags);
-            }
-            Err(e) => {
-                error!("Failed to create file {}: {}", path, e);
-                reply.error(libc::EIO);
-            }
-        }
     }
 
     fn write(
@@ -2977,36 +2980,44 @@ impl Filesystem for DfsFilesystem {
             chunk_locations: Vec::new(),
         };
 
-        // Store metadata on cluster
+        // Store metadata on cluster — spawn so we never block_on the FUSE dispatch thread.
         let client = self.client.clone();
         let metadata_clone = metadata.clone();
-        let result = self.block_on(async {
-            client.put_file_metadata(&metadata_clone).await
+        let metadata_cache = self.metadata_cache.clone();
+        let dir_cache = self.dir_cache.clone();
+        let path_to_inode = self.path_to_inode.clone();
+        let next_inode = self.next_inode.clone();
+
+        self.runtime.spawn(async move {
+            match client.put_file_metadata(&metadata_clone).await {
+                Ok(_) => {
+                    let ino = {
+                        let path_map = path_to_inode.read().unwrap();
+                        if let Some(&existing) = path_map.get(&path) {
+                            existing
+                        } else {
+                            drop(path_map);
+                            let mut next = next_inode.write().unwrap();
+                            let v = *next; *next += 1; drop(next);
+                            path_to_inode.write().unwrap().insert(path.clone(), v);
+                            v
+                        }
+                    };
+                    metadata_cache.insert(ino, metadata.clone());
+
+                    let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                    let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
+                    dir_cache.remove(parent_path);
+
+                    let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
+                    reply.entry(&Duration::from_secs(1), &attr, 0);
+                }
+                Err(e) => {
+                    error!("Failed to create directory {}: {}", path, e);
+                    reply.error(libc::EIO);
+                }
+            }
         });
-
-        match result {
-            Ok(_) => {
-                // Allocate inode
-                let ino = self.get_or_create_inode(&path);
-
-                // Cache metadata
-                self.metadata_cache.insert(ino, metadata.clone());
-
-                // CRITICAL: Invalidate parent directory cache so 'ls' shows new directory immediately
-                let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
-                let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-                self.dir_cache.remove(parent_path);
-                debug!("Invalidated directory cache for parent: {}", parent_path);
-
-                // Convert to FUSE attr
-                let attr = self.metadata_to_attr(ino, &metadata);
-                reply.entry(&Duration::from_secs(1), &attr, 0);
-            }
-            Err(e) => {
-                error!("Failed to create directory {}: {}", path, e);
-                reply.error(libc::EIO);
-            }
-        }
     }
 
     fn unlink(&mut self, _req: &FuseRequest, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
@@ -3020,38 +3031,42 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
-        // Delete file from cluster
+        // Delete file from cluster — spawn so we never block_on the FUSE dispatch thread.
         let client = self.client.clone();
-        let result = self.block_on(async {
-            client.delete_file(&path).await
-        });
+        let metadata_cache = self.metadata_cache.clone();
+        let dir_cache = self.dir_cache.clone();
+        let path_to_inode = self.path_to_inode.clone();
+        let write_buffers = self.write_buffers.clone();
+        let write_counters = self.write_counters.clone();
+        let last_metadata_update = self.last_metadata_update.clone();
+        let last_warm_offset = self.last_warm_offset.clone();
+        let chunk_offset_cache = self.chunk_offset_cache.clone();
 
-        match result {
-            Ok(_) => {
-                // Remove from all caches to prevent memory leaks
-                if let Some(&ino) = self.path_to_inode.read().unwrap().get(&path) {
-                    self.metadata_cache.remove(&ino);
-                    self.write_buffers.remove(&ino); // Clean up write buffer
-                    self.write_counters.write().unwrap().remove(&ino); // Clean up write counter
-                    self.last_metadata_update.remove(&ino); // Clean up metadata update tracker
-                    self.last_warm_offset.remove(&ino); // Clean up warm offset tracker
-                    self.chunk_offset_cache.remove(&ino); // Clean up chunk offset cache
+        self.runtime.spawn(async move {
+            match client.delete_file(&path).await {
+                Ok(_) => {
+                    if let Some(&ino) = path_to_inode.read().unwrap().get(&path) {
+                        metadata_cache.remove(&ino);
+                        write_buffers.remove(&ino);
+                        write_counters.write().unwrap().remove(&ino);
+                        last_metadata_update.remove(&ino);
+                        last_warm_offset.remove(&ino);
+                        chunk_offset_cache.remove(&ino);
+                    }
+                    path_to_inode.write().unwrap().remove(&path);
+
+                    let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                    let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
+                    dir_cache.remove(parent_path);
+
+                    reply.ok();
                 }
-                self.path_to_inode.write().unwrap().remove(&path);
-
-                // CRITICAL: Invalidate parent directory cache so 'ls' shows deletion immediately
-                let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
-                let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-                self.dir_cache.remove(parent_path);
-                debug!("Invalidated directory cache for parent: {}", parent_path);
-
-                reply.ok();
+                Err(e) => {
+                    error!("Failed to delete file {}: {}", path, e);
+                    reply.error(libc::EIO);
+                }
             }
-            Err(e) => {
-                error!("Failed to delete file {}: {}", path, e);
-                reply.error(libc::EIO);
-            }
-        }
+        });
     }
 
     fn rmdir(&mut self, _req: &FuseRequest, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
@@ -3065,52 +3080,44 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
-        // Check if directory is empty
+        // Check if directory is empty then delete — spawn so we never block_on the FUSE dispatch thread.
         let client = self.client.clone();
-        let path_clone = path.clone();
-        let result = self.block_on(async {
-            client.list_directory(&path_clone).await
-        });
+        let metadata_cache = self.metadata_cache.clone();
+        let dir_cache = self.dir_cache.clone();
+        let path_to_inode = self.path_to_inode.clone();
 
-        match result {
-            Ok(entries) => {
-                if !entries.is_empty() {
-                    reply.error(libc::ENOTEMPTY);
-                    return;
-                }
+        self.runtime.spawn(async move {
+            match client.list_directory(&path).await {
+                Ok(entries) => {
+                    if !entries.is_empty() {
+                        reply.error(libc::ENOTEMPTY);
+                        return;
+                    }
+                    match client.delete_file(&path).await {
+                        Ok(_) => {
+                            if let Some(&ino) = path_to_inode.read().unwrap().get(&path) {
+                                metadata_cache.remove(&ino);
+                            }
+                            path_to_inode.write().unwrap().remove(&path);
 
-                // Delete directory
-                let delete_result = self.block_on(async {
-                    client.delete_file(&path).await
-                });
+                            let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                            let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
+                            dir_cache.remove(parent_path);
 
-                match delete_result {
-                    Ok(_) => {
-                        // Remove from cache
-                        if let Some(&ino) = self.path_to_inode.read().unwrap().get(&path) {
-                            self.metadata_cache.remove(&ino);
+                            reply.ok();
                         }
-                        self.path_to_inode.write().unwrap().remove(&path);
-
-                        // CRITICAL: Invalidate parent directory cache so 'ls' shows deletion immediately
-                        let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
-                        let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-                        self.dir_cache.remove(parent_path);
-                        debug!("Invalidated directory cache for parent: {}", parent_path);
-
-                        reply.ok();
-                    }
-                    Err(e) => {
-                        error!("Failed to delete directory {}: {}", path, e);
-                        reply.error(libc::EIO);
+                        Err(e) => {
+                            error!("Failed to delete directory {}: {}", path, e);
+                            reply.error(libc::EIO);
+                        }
                     }
                 }
+                Err(e) => {
+                    error!("Failed to check directory {}: {}", path, e);
+                    reply.error(libc::EIO);
+                }
             }
-            Err(e) => {
-                error!("Failed to check directory {}: {}", path, e);
-                reply.error(libc::EIO);
-            }
-        }
+        });
     }
 
     fn rename(
@@ -3144,72 +3151,68 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
-        // Get existing metadata
+        // Get existing metadata then rename — spawn so we never block_on the FUSE dispatch thread.
         let client = self.client.clone();
-        let old_path_clone = old_path.clone();
-        let result = self.block_on(async {
-            client.get_file_metadata(&old_path_clone).await
-        });
+        let metadata_cache = self.metadata_cache.clone();
+        let dir_cache = self.dir_cache.clone();
+        let path_to_inode = self.path_to_inode.clone();
+        let next_inode = self.next_inode.clone();
 
-        match result {
-            Ok(Some(metadata)) => {
-                // Use atomic rename operation - server handles the entire rename atomically
-                // This prevents race conditions where the file disappears during rename
-                let rename_result = self.block_on(async {
-                    client.rename_file(&old_path, &new_path).await
-                });
+        self.runtime.spawn(async move {
+            match client.get_file_metadata(&old_path).await {
+                Ok(Some(metadata)) => {
+                    match client.rename_file(&old_path, &new_path).await {
+                        Ok(_) => {
+                            // Keep the same inode number — kernel still holds references to it.
+                            let ino = {
+                                let path_map = path_to_inode.read().unwrap();
+                                if let Some(&existing) = path_map.get(&old_path) {
+                                    existing
+                                } else {
+                                    drop(path_map);
+                                    let mut next = next_inode.write().unwrap();
+                                    let v = *next; *next += 1; drop(next);
+                                    path_to_inode.write().unwrap().insert(old_path.clone(), v);
+                                    v
+                                }
+                            };
 
-                match rename_result {
-                    Ok(_) => {
-                        // CRITICAL: Keep the same inode number!
-                        // The kernel's FUSE layer still has references to the old inode
-                        // If we create a new inode, the old one becomes orphaned
-                        let ino = self.path_to_inode.read().unwrap().get(&old_path).copied()
-                            .unwrap_or_else(|| self.get_or_create_inode(&old_path));
+                            path_to_inode.write().unwrap().remove(&old_path);
+                            path_to_inode.write().unwrap().insert(new_path.clone(), ino);
 
-                        // Remove old path mapping
-                        self.path_to_inode.write().unwrap().remove(&old_path);
+                            let mut new_metadata = metadata.clone();
+                            new_metadata.path = new_path.clone();
+                            new_metadata.modified_at = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            metadata_cache.insert(ino, new_metadata);
 
-                        // Add new path mapping with SAME inode
-                        self.path_to_inode.write().unwrap().insert(new_path.clone(), ino);
+                            let raw_old = old_path.rsplitn(2, '/').nth(1).unwrap_or("");
+                            let old_parent = if raw_old.is_empty() { "/" } else { raw_old };
+                            let raw_new = new_path.rsplitn(2, '/').nth(1).unwrap_or("");
+                            let new_parent = if raw_new.is_empty() { "/" } else { raw_new };
+                            dir_cache.remove(old_parent);
+                            if old_parent != new_parent {
+                                dir_cache.remove(new_parent);
+                            }
 
-                        // Update metadata in cache with new path (same inode)
-                        let mut new_metadata = metadata.clone();
-                        new_metadata.path = new_path.clone();
-                        new_metadata.modified_at = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-
-                        self.metadata_cache.insert(ino, new_metadata);
-
-                        // Invalidate directory cache for both old and new parent directories
-                        let raw_old = old_path.rsplitn(2, '/').nth(1).unwrap_or("");
-                        let old_parent = if raw_old.is_empty() { "/" } else { raw_old };
-                        let raw_new = new_path.rsplitn(2, '/').nth(1).unwrap_or("");
-                        let new_parent = if raw_new.is_empty() { "/" } else { raw_new };
-                        self.dir_cache.remove(old_parent);
-                        if old_parent != new_parent {
-                            self.dir_cache.remove(new_parent);
+                            info!("Renamed {} -> {} (inode {} preserved {} chunks)", old_path, new_path, ino, metadata.chunks.len());
+                            reply.ok();
                         }
-
-                        info!("Renamed {} -> {} (inode {} preserved {} chunks)", old_path, new_path, ino, metadata.chunks.len());
-                        reply.ok();
-                    }
-                    Err(e) => {
-                        error!("Failed to rename {} -> {}: {}", old_path, new_path, e);
-                        reply.error(libc::EIO);
+                        Err(e) => {
+                            error!("Failed to rename {} -> {}: {}", old_path, new_path, e);
+                            reply.error(libc::EIO);
+                        }
                     }
                 }
+                Ok(None) => reply.error(libc::ENOENT),
+                Err(e) => {
+                    error!("Failed to get file metadata {}: {}", old_path, e);
+                    reply.error(libc::EIO);
+                }
             }
-            Ok(None) => {
-                reply.error(libc::ENOENT);
-            }
-            Err(e) => {
-                error!("Failed to get file metadata {}: {}", old_path, e);
-                reply.error(libc::EIO);
-            }
-        }
+        });
     }
 
     fn setattr(
@@ -3430,48 +3433,31 @@ impl Filesystem for DfsFilesystem {
             })
         };
 
-        let (total_blocks, free_blocks, avail_blocks) = if let Some((total, free, avail)) = cached {
-            (total, free, avail)
-        } else {
-            // Cache miss - query cluster (this is SLOW!)
-            debug!("statfs cache MISS - querying cluster");
-            let client = self.client.clone();
-            let statfs_cache = self.statfs_cache.clone();
+        if let Some((total, free, avail)) = cached {
+            reply.statfs(total, free, avail, 0, 0, BLOCK_SIZE, 255, BLOCK_SIZE);
+            return;
+        }
 
-            let result = self.block_on(async {
-                client.get_storage_stats().await
-            });
+        // Cache miss — spawn so we never block_on the FUSE dispatch thread.
+        debug!("statfs cache MISS - querying cluster");
+        let client = self.client.clone();
+        let statfs_cache = self.statfs_cache.clone();
 
-            match result {
+        self.runtime.spawn(async move {
+            match client.get_storage_stats().await {
                 Ok((total_space, free_space, available_space, _replication_factor)) => {
-                    // Convert bytes to blocks
                     let total = total_space / BLOCK_SIZE as u64;
                     let free = free_space / BLOCK_SIZE as u64;
                     let avail = available_space / BLOCK_SIZE as u64;
-
-                    // Update cache
                     *statfs_cache.write().unwrap() = Some((total, free, avail, std::time::Instant::now()));
-
-                    (total, free, avail)
+                    reply.statfs(total, free, avail, 0, 0, BLOCK_SIZE, 255, BLOCK_SIZE);
                 }
                 Err(e) => {
                     error!("Failed to get storage stats: {}", e);
-                    // Return reasonable defaults on error
-                    (1_000_000_000, 500_000_000, 500_000_000)
+                    reply.statfs(1_000_000_000, 500_000_000, 500_000_000, 0, 0, BLOCK_SIZE, 255, BLOCK_SIZE);
                 }
             }
-        };
-
-        reply.statfs(
-            total_blocks,  // blocks - total data blocks in filesystem
-            free_blocks,   // bfree - free blocks in filesystem
-            avail_blocks,  // bavail - free blocks available to non-privileged user
-            0,             // files - total file nodes in filesystem (unlimited)
-            0,             // ffree - free file nodes in filesystem (unlimited)
-            BLOCK_SIZE,    // bsize - block size
-            255,           // namelen - maximum filename length
-            BLOCK_SIZE,    // frsize - fragment size
-        );
+        });
     }
 
     fn access(&mut self, _req: &FuseRequest, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {

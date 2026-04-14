@@ -946,7 +946,11 @@ impl Filesystem for DfsFilesystem {
             return;
         }
 
-        // Cache miss or stale — fetch from cluster with conditional GET
+        // Cache miss or stale — fetch from cluster with conditional GET.
+        // Use runtime.spawn (non-blocking) so we never block the FUSE dispatch
+        // thread waiting for a runtime thread.  When all worker threads are busy
+        // (e.g. 44 concurrent getattr tasks after a readdir) a block_on here would
+        // deadlock — the FUSE thread parks waiting for a thread that will never free.
         let cached_modified_at = {
             let path_map = self.path_to_inode.read().unwrap();
             if let Some(&ino) = path_map.get(&path) {
@@ -957,41 +961,59 @@ impl Filesystem for DfsFilesystem {
         };
 
         let client = self.client.clone();
-        let result = self.block_on(async {
-            client.get_file_metadata_conditional(&path, cached_modified_at).await
-        });
+        let metadata_cache = self.metadata_cache.clone();
+        let path_to_inode = self.path_to_inode.clone();
+        let next_inode = self.next_inode.clone();
+        let last_metadata_update = self.last_metadata_update.clone();
 
-        match result {
-            Ok(Some(metadata)) => {
-                // Metadata was modified or first fetch - update cache
-                let ino = self.get_or_create_inode(&path);
-                self.safe_metadata_update(ino, metadata.clone());
+        self.runtime.spawn(async move {
+            let result = client.get_file_metadata_conditional(&path, cached_modified_at).await;
 
-                let attr = self.metadata_to_attr(ino, &metadata);
-                reply.entry(&Duration::from_secs(1), &attr, 0);
-            }
-            Ok(None) => {
-                // Either file not found OR metadata not modified (cache still valid)
-                if cached_modified_at.is_some() {
-                    // Cache is valid, use cached metadata
-                    let path_map = self.path_to_inode.read().unwrap();
-                    if let Some(&ino) = path_map.get(&path) {
-                        if let Some(metadata) = self.metadata_cache.get(&ino) {
-                            debug!("Using cached metadata for {} (not modified)", path);
-                            let attr = self.metadata_to_attr(ino, &*metadata);
-                            reply.entry(&Duration::from_secs(1), &attr, 0);
-                            return;
+            match result {
+                Ok(Some(metadata)) => {
+                    // Metadata was modified or first fetch — update cache.
+                    let ino = {
+                        let path_map = path_to_inode.read().unwrap();
+                        if let Some(&existing) = path_map.get(&path) {
+                            existing
+                        } else {
+                            drop(path_map);
+                            let mut next = next_inode.write().unwrap();
+                            let ino = *next;
+                            *next += 1;
+                            drop(next);
+                            path_to_inode.write().unwrap().insert(path.clone(), ino);
+                            ino
+                        }
+                    };
+                    metadata_cache.insert(ino, metadata.clone());
+                    last_metadata_update.insert(ino, std::time::Instant::now());
+
+                    let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
+                    reply.entry(&Duration::from_secs(1), &attr, 0);
+                }
+                Ok(None) => {
+                    // Either file not found OR metadata not modified (cache still valid).
+                    if cached_modified_at.is_some() {
+                        let path_map = path_to_inode.read().unwrap();
+                        if let Some(&ino) = path_map.get(&path) {
+                            if let Some(metadata) = metadata_cache.get(&ino) {
+                                debug!("Using cached metadata for {} (not modified)", path);
+                                let attr = DfsFilesystem::metadata_to_attr_static(ino, &*metadata);
+                                reply.entry(&Duration::from_secs(1), &attr, 0);
+                                return;
+                            }
                         }
                     }
+                    // File not found
+                    reply.error(libc::ENOENT);
                 }
-                // File not found
-                reply.error(libc::ENOENT);
+                Err(e) => {
+                    error!("Failed to lookup {}: {}", path, e);
+                    reply.error(libc::EIO);
+                }
             }
-            Err(e) => {
-                error!("Failed to lookup {}: {}", path, e);
-                reply.error(libc::EIO);
-            }
-        }
+        });
     }
 
     fn open(&mut self, _req: &FuseRequest, ino: u64, flags: i32, reply: fuser::ReplyOpen) {

@@ -202,7 +202,7 @@ fn mount_filesystem(
 
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(16)
             .enable_all()
             .build()?
     );

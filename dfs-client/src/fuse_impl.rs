@@ -1796,103 +1796,119 @@ impl Filesystem for DfsFilesystem {
             }
         });
 
-        let entries = if let Some(entries) = cached_entries {
-            entries
-        } else {
-            // Cache miss - fetch from server
-            debug!("Directory cache MISS for {}", path);
-            let client = self.client.clone();
-            let dir_cache = self.dir_cache.clone();
-            let path_clone = path.clone();
+        // Clone all Arc fields needed in the spawned task.
+        let client = self.client.clone();
+        let dir_cache = self.dir_cache.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let path_to_inode = self.path_to_inode.clone();
+        let next_inode = self.next_inode.clone();
+        let last_metadata_update = self.last_metadata_update.clone();
+        let write_buffers = self.write_buffers.clone();
+        let write_counters = self.write_counters.clone();
 
-            let result = self.block_on(async {
-                client.list_directory(&path_clone).await
-            });
-
-            match result {
-                Ok(entries) => {
-                    // Update cache
-                    dir_cache.insert(path.clone(), (entries.clone(), std::time::Instant::now()));
-                    entries
+        // Spawn the rest of readdir so we never block_on from the FUSE dispatch
+        // thread.  If the runtime is saturated (e.g. concurrent recording writes)
+        // a block_on here would deadlock — same root cause as the lookup() fix.
+        // ReplyDirectory is Send so it moves into the task safely.
+        self.runtime.spawn(async move {
+            let entries = if let Some(entries) = cached_entries {
+                entries
+            } else {
+                // Cache miss — fetch from server.
+                debug!("Directory cache MISS for {}", path);
+                match client.list_directory(&path).await {
+                    Ok(entries) => {
+                        dir_cache.insert(path.clone(), (entries.clone(), std::time::Instant::now()));
+                        entries
+                    }
+                    Err(e) => {
+                        error!("Failed to read directory {}: {}", path, e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to read directory {}: {}", path, e);
-                    reply.error(libc::EIO);
+            };
+
+            // Add . and ..
+            if offset == 0 {
+                if reply.add(ino, 1, FuseFileType::Directory, ".") {
+                    reply.ok();
                     return;
                 }
             }
-        };
-
-        // Add . and ..
-        if offset == 0 {
-            if reply.add(ino, 1, FuseFileType::Directory, ".") {
-                reply.ok();
-                return;
-            }
-        }
-        if offset <= 1 {
-            if reply.add(ino, 2, FuseFileType::Directory, "..") {
-                reply.ok();
-                return;
-            }
-        }
-
-        // Add actual entries
-        let skip_count = if offset > 2 { (offset - 2) as usize } else { 0 };
-        for (i, entry) in entries.iter().enumerate().skip(skip_count) {
-            let file_name = entry.path.rsplit('/').next().unwrap_or("");
-
-            // Skip entries with empty filenames (like the root directory "/")
-            if file_name.is_empty() {
-                debug!("Skipping entry with empty filename: path={}", entry.path);
-                continue;
+            if offset <= 1 {
+                if reply.add(ino, 2, FuseFileType::Directory, "..") {
+                    reply.ok();
+                    return;
+                }
             }
 
-            let kind = match entry.file_type {
-                FileType::RegularFile => FuseFileType::RegularFile,
-                FileType::Directory => FuseFileType::Directory,
-                FileType::Symlink => FuseFileType::Symlink,
-            };
+            // Add actual entries
+            let skip_count = if offset > 2 { (offset - 2) as usize } else { 0 };
+            for (i, entry) in entries.iter().enumerate().skip(skip_count) {
+                let file_name = entry.path.rsplit('/').next().unwrap_or("");
 
-            // Get or allocate inode
-            let entry_ino = self.get_or_create_inode(&entry.path);
+                // Skip entries with empty filenames (like the root directory "/")
+                if file_name.is_empty() {
+                    debug!("Skipping entry with empty filename: path={}", entry.path);
+                    continue;
+                }
 
-            // Cache metadata, but DON'T overwrite if there's an active write
-            // Use safe_metadata_update to check both buffers and write counters
-            self.safe_metadata_update(entry_ino, entry.clone());
+                let kind = match entry.file_type {
+                    FileType::RegularFile => FuseFileType::RegularFile,
+                    FileType::Directory => FuseFileType::Directory,
+                    FileType::Symlink => FuseFileType::Symlink,
+                };
 
-            // Mark metadata as just-refreshed so getattr skips the per-file server
-            // round-trip on the immediately following `ls -alh`. Without this, each
-            // of the 25 getattr calls would hit the server serially (~130ms each).
-            self.last_metadata_update.insert(entry_ino, std::time::Instant::now());
+                // Get or allocate inode
+                let entry_ino = {
+                    let path_map = path_to_inode.read().unwrap();
+                    if let Some(&existing) = path_map.get(&entry.path) {
+                        existing
+                    } else {
+                        drop(path_map);
+                        let mut next = next_inode.write().unwrap();
+                        let ino_val = *next;
+                        *next += 1;
+                        drop(next);
+                        path_to_inode.write().unwrap().insert(entry.path.clone(), ino_val);
+                        ino_val
+                    }
+                };
 
-            let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
-            if reply.add(entry_ino, next_offset, kind, file_name) {
-                break; // Buffer full
+                // Cache metadata, but DON'T overwrite if there's an active write.
+                let has_active_write = {
+                    let has_buffer = write_buffers.contains_key(&entry_ino);
+                    let has_counter = write_counters.read().unwrap().get(&entry_ino).map(|c| *c > 0).unwrap_or(false);
+                    has_buffer || has_counter
+                };
+                if !has_active_write {
+                    metadata_cache.insert(entry_ino, entry.clone());
+                }
+
+                // Mark metadata as just-refreshed so getattr skips the per-file server
+                // round-trip on the immediately following `ls -alh`.
+                last_metadata_update.insert(entry_ino, std::time::Instant::now());
+
+                let next_offset = 3 + i as i64;  // 3 because . is 1, .. is 2, first file is 3
+                if reply.add(entry_ino, next_offset, kind, file_name) {
+                    break; // Buffer full
+                }
             }
-        }
 
-        let elapsed = start.elapsed();
-        info!("readdir COMPLETE: {} with {} entries in {:?}", path, entries.len(), elapsed);
-        reply.ok();
+            let elapsed = start.elapsed();
+            info!("readdir COMPLETE: {} with {} entries in {:?}", path, entries.len(), elapsed);
+            reply.ok();
 
-        // Prefetch subdirectory listings in the background so the next level of
-        // readdir calls (e.g. DVR indexer walking show → episode directories) are
-        // instant cache hits.  Fire-and-forget — we don't wait for these.
-        let subdirs: Vec<String> = entries.iter()
-            .filter(|e| e.file_type == FileType::Directory)
-            .map(|e| e.path.clone())
-            .collect();
+            // Prefetch subdirectory listings in the background so the next level of
+            // readdir calls (e.g. DVR indexer walking show → episode directories) are
+            // instant cache hits.  Fire-and-forget — we don't wait for these.
+            let subdirs: Vec<String> = entries.iter()
+                .filter(|e| e.file_type == FileType::Directory)
+                .map(|e| e.path.clone())
+                .collect();
 
-        if !subdirs.is_empty() {
-            let client = self.client.clone();
-            let dir_cache = self.dir_cache.clone();
-            let metadata_cache = self.metadata_cache.clone();
-            let path_to_inode = self.path_to_inode.clone();
-            let next_inode = self.next_inode.clone();
-            let last_metadata_update = self.last_metadata_update.clone();
-            self.runtime.spawn(async move {
-                // Fetch all subdirs concurrently
+            if !subdirs.is_empty() {
                 let futures: Vec<_> = subdirs.into_iter().map(|subdir| {
                     let client = client.clone();
                     let dir_cache = dir_cache.clone();
@@ -1902,23 +1918,18 @@ impl Filesystem for DfsFilesystem {
                     let last_metadata_update = last_metadata_update.clone();
                     async move {
                         // Skip if already cached and fresh
-                        {
-                            if let Some(entry) = dir_cache.get(&subdir) {
-                                if entry.1.elapsed() < std::time::Duration::from_secs(29) {
-                                    return;
-                                }
+                        if let Some(entry) = dir_cache.get(&subdir) {
+                            if entry.1.elapsed() < std::time::Duration::from_secs(29) {
+                                return;
                             }
                         }
                         let fetch_start = std::time::Instant::now();
                         if let Ok(sub_entries) = client.list_directory(&subdir).await {
                             // Only cache if the directory hasn't been invalidated while we
-                            // were fetching.  An invalidation removes the entry from the cache
-                            // (e.g. a concurrent create/unlink in that directory); reinserting
-                            // stale prefetch results would hide the new file from the next
-                            // readdir until the 30-second TTL expires.
+                            // were fetching.
                             let still_valid = match dir_cache.get(&subdir) {
-                                Some(entry) => entry.1 < fetch_start, // entry predates our fetch
-                                None => false, // was invalidated — do not reinsert
+                                Some(entry) => entry.1 < fetch_start,
+                                None => false,
                             };
                             if still_valid {
                                 dir_cache.insert(
@@ -1926,31 +1937,30 @@ impl Filesystem for DfsFilesystem {
                                     (sub_entries.clone(), std::time::Instant::now()),
                                 );
                             }
-                            // Cache metadata for each entry so getattr is instant too
                             let now = std::time::Instant::now();
                             for entry in &sub_entries {
-                                let ino = {
+                                let ino_val = {
                                     let mut path_map = path_to_inode.write().unwrap();
                                     if let Some(&existing) = path_map.get(&entry.path) {
                                         existing
                                     } else {
                                         let mut next = next_inode.write().unwrap();
-                                        let ino = *next;
+                                        let v = *next;
                                         *next += 1;
-                                        path_map.insert(entry.path.clone(), ino);
-                                        ino
+                                        path_map.insert(entry.path.clone(), v);
+                                        v
                                     }
                                 };
-                                metadata_cache.insert(ino, entry.clone());
-                                last_metadata_update.insert(ino, now);
+                                metadata_cache.insert(ino_val, entry.clone());
+                                last_metadata_update.insert(ino_val, now);
                             }
                             debug!("Prefetched {} entries for {}", sub_entries.len(), subdir);
                         }
                     }
                 }).collect();
                 futures::future::join_all(futures).await;
-            });
-        }
+            }
+        });
     }
 
     fn create(

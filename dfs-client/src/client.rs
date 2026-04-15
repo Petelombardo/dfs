@@ -2445,8 +2445,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         if candidates.len() >= 2 {
             let n1 = candidates[0];
             let n2 = candidates[1];
-            let req1 = Request::WriteFileLocalOnly { data: data.to_vec() };
-            let req2 = Request::WriteFileLocalOnly { data: data.to_vec() };
+            let req1 = Request::WriteFileLocalOnly { data: data.to_vec(), file_offset };
+            let req2 = Request::WriteFileLocalOnly { data: data.to_vec(), file_offset };
             let t1 = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
                 self.send_request(n1, req1),
@@ -2479,7 +2479,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 ),
             };
 
-            let request = Request::WriteFileLocalOnly { data: data.to_vec() };
+            let request = Request::WriteFileLocalOnly { data: data.to_vec(), file_offset };
             let result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
                 self.send_request(node, request),
@@ -2826,11 +2826,11 @@ leader_addr: Arc::new(RwLock::new(None)),
 
     /// Write a chunk to a specific server (local only, no replication)
     /// Used for optimized RF=3+ writes
-    async fn write_chunk_to_server_local_only(server_addr: SocketAddr, data: Vec<u8>) -> Result<(Vec<ChunkId>, Vec<u64>)> {
+    async fn write_chunk_to_server_local_only(server_addr: SocketAddr, data: Vec<u8>, file_offset: u64) -> Result<(Vec<ChunkId>, Vec<u64>)> {
         let total_start = std::time::Instant::now();
         let data_len = data.len();
 
-        let request = Request::WriteFileLocalOnly { data };
+        let request = Request::WriteFileLocalOnly { data, file_offset };
 
         // Create connection
         let mut stream = tokio::time::timeout(

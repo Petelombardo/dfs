@@ -1024,22 +1024,42 @@ impl Filesystem for DfsFilesystem {
             let last_warm = last_warm_offset.get(&ino).map(|v| *v).unwrap_or(0);
             let should_warm = offset == 0 || offset.saturating_sub(last_warm as usize) >= 50 * 1024 * 1024;
 
-            if should_warm && !metadata.chunks.is_empty() && !metadata.chunk_sizes.is_empty() {
-                // Find which chunk index corresponds to this byte offset
-                let mut cumulative = 0u64;
-                let mut chunk_idx = 0;
-                for (idx, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
-                    if cumulative + chunk_size > offset as u64 {
-                        chunk_idx = idx;
-                        break;
+            let has_locations = !metadata.chunk_locations.is_empty();
+            let has_legacy = !metadata.chunks.is_empty() && !metadata.chunk_sizes.is_empty();
+            if should_warm && (has_locations || has_legacy) {
+                // Find which chunk index corresponds to this byte offset.
+                let chunk_idx = if has_locations {
+                    let mut cumulative = 0u64;
+                    let mut idx = 0;
+                    for (i, loc) in metadata.chunk_locations.iter().enumerate() {
+                        if cumulative + loc.size as u64 > offset as u64 {
+                            idx = i;
+                            break;
+                        }
+                        cumulative += loc.size as u64;
                     }
-                    cumulative += chunk_size;
+                    idx
+                } else {
+                    let mut cumulative = 0u64;
+                    let mut idx = 0;
+                    for (i, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
+                        if cumulative + chunk_size > offset as u64 {
+                            idx = i;
+                            break;
+                        }
+                        cumulative += chunk_size;
+                    }
+                    idx
+                };
+
+                // Prefer warming from real ChunkLocation data (has per-chunk node lists)
+                // over the legacy all-nodes fake entries — eliminates mid-read metadata RPCs.
+                if has_locations {
+                    client.warm_replica_cache_from_locations(&metadata.chunk_locations, Some(chunk_idx)).await;
+                } else {
+                    client.warm_replica_cache_by_index(&metadata.chunks, Some(chunk_idx)).await;
                 }
 
-                // Warm 1000 chunks ahead of current position using actual chunk index
-                client.warm_replica_cache_by_index(&metadata.chunks, Some(chunk_idx)).await;
-
-                // Update per-inode warming tracker
                 last_warm_offset.insert(ino, offset as u64);
             }
 

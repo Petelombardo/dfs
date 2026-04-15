@@ -1883,6 +1883,51 @@ leader_addr: Arc::new(RwLock::new(None)),
         self.warm_replica_cache_range(chunk_ids, None, 2 * 1024 * 1024).await;
     }
 
+    /// Warm replica cache from actual ChunkLocation data — uses real per-chunk node
+    /// lists instead of the fake "all nodes" entries that warm_replica_cache_by_index
+    /// produces.  This eliminates mid-read get_chunk_replicas RPCs on saturated links.
+    pub async fn warm_replica_cache_from_locations(
+        &self,
+        locations: &[dfs_common::ChunkLocation],
+        current_chunk_idx: Option<usize>,
+    ) {
+        if locations.is_empty() {
+            return;
+        }
+
+        let start = current_chunk_idx.unwrap_or(0).min(locations.len());
+        let end = (start + 1000).min(locations.len());
+
+        let addr_map = self.addr_to_node_id.read().await;
+        // Build node_id -> SocketAddr reverse map from cluster nodes.
+        let node_id_to_addr: std::collections::HashMap<dfs_common::NodeId, SocketAddr> = {
+            let nodes = self.cluster_nodes.read().await;
+            // We need NodeId for each addr — use addr_to_node_id reverse.
+            addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
+        };
+        drop(addr_map);
+
+        let mut cache = self.replica_cache.lock().await;
+        let mut warmed = 0usize;
+        for loc in &locations[start..end] {
+            if cache.contains(&loc.chunk_id) {
+                continue;
+            }
+            // Map NodeIds to SocketAddrs, skip any we don't have an address for.
+            let addrs: Vec<SocketAddr> = loc.nodes.iter()
+                .filter_map(|nid| node_id_to_addr.get(nid).copied())
+                .collect();
+            if !addrs.is_empty() {
+                cache.put(loc.chunk_id, Arc::new(addrs));
+                warmed += 1;
+            }
+        }
+        if warmed > 0 {
+            info!("Warmed replica cache: {} new entries (range {}-{} of {} total chunks, using actual locations)",
+                  warmed, start, end, locations.len());
+        }
+    }
+
     /// Read a single chunk from a specific server using connection pooling
     async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId) -> Result<Vec<u8>> {
         let request = Request::ReadChunk {

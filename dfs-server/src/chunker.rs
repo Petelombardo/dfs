@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::{compute_chunk_hash, ChunkId};
+use dfs_common::{compute_chunk_hash, compute_chunk_hash_at, ChunkId};
 use std::io::Read;
 
 /// File chunker - splits files into fixed-size chunks
@@ -22,12 +22,22 @@ impl Chunker {
     /// Split data into chunks and return chunk IDs and data
     /// Uses streaming to avoid loading entire file into memory
     pub fn chunk_data(&self, data: &[u8]) -> Vec<(ChunkId, Vec<u8>)> {
+        self.chunk_data_at(data, 0)
+    }
+
+    /// Split data into chunks with position-aware chunk IDs.
+    /// file_offset is the byte offset of data[0] within the file.
+    /// Mixing the offset into the hash prevents content-addressed deduplication
+    /// from aliasing identical blocks (e.g. zero regions) at different positions.
+    pub fn chunk_data_at(&self, data: &[u8], file_offset: u64) -> Vec<(ChunkId, Vec<u8>)> {
         let mut chunks = Vec::new();
+        let mut current_offset = file_offset;
 
         for chunk_data in data.chunks(self.chunk_size) {
-            let hash = compute_chunk_hash(chunk_data);
+            let hash = compute_chunk_hash_at(chunk_data, current_offset);
             let chunk_id = ChunkId::from_hash(hash);
             chunks.push((chunk_id, chunk_data.to_vec()));
+            current_offset += chunk_data.len() as u64;
         }
 
         chunks

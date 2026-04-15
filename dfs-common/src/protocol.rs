@@ -101,9 +101,12 @@ pub enum Request {
 
     /// Write file data locally only (no replication, returns chunk IDs)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
-    /// and healing creates the 3rd replica in background
+    /// and healing creates the 3rd replica in background.
+    /// file_offset is mixed into the chunk hash to prevent deduplication aliasing
+    /// (identical blocks at different file positions must get distinct ChunkIds).
     WriteFileLocalOnly {
         data: Vec<u8>,
+        file_offset: u64,
     },
 
     /// Delete file by path

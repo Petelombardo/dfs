@@ -14,5 +14,5 @@ pub use protocol::{
     ClusterMessage, ErrorCode, Message, MessageEnvelope, MetadataOperation, Request, RequestId,
     Response,
 };
-pub use hash::{compute_chunk_hash, verify_chunk_hash, ConsistentHashRing};
+pub use hash::{compute_chunk_hash, compute_chunk_hash_at, verify_chunk_hash, ConsistentHashRing};
 pub use memory::{calculate_cache_capacity, get_available_memory, get_total_memory};

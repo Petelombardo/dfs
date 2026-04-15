@@ -4,6 +4,8 @@ test_sqlite_sync.sh
 
 # Deployment scripts (contain staging hostnames/paths)
 deploy-build
+build-x86.sh
+dist/
 
 # Log files
 *.log

@@ -394,7 +394,7 @@ impl Server {
             }
             Request::ListDirectory { path } => self.handle_list_directory(path).await,
             Request::WriteFile { data } => self.handle_write_file(data).await,
-            Request::WriteFileLocalOnly { data } => self.handle_write_file_local_only(data).await,
+            Request::WriteFileLocalOnly { data, file_offset } => self.handle_write_file_local_only(data, file_offset).await,
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
             Request::RenameFile { old_path, new_path } => {
                 self.handle_rename_file(old_path, new_path).await
@@ -1238,12 +1238,12 @@ impl Server {
     /// Write data locally only (no replication)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
     /// Healing creates the 3rd replica in background
-    pub async fn write_data_local_only(&self, data: &[u8]) -> Result<Vec<(ChunkId, u64)>> {
+    pub async fn write_data_local_only(&self, data: &[u8], file_offset: u64) -> Result<Vec<(ChunkId, u64)>> {
         let total_start = std::time::Instant::now();
-        info!("Writing {} bytes locally (no replication)", data.len());
+        info!("Writing {} bytes locally (no replication) at file_offset={}", data.len(), file_offset);
 
-        // Chunk the data
-        let chunks = self.chunker.chunk_data(data);
+        // Chunk the data using position-aware hashing to prevent deduplication aliasing
+        let chunks = self.chunker.chunk_data_at(data, file_offset);
         info!("Chunked into {} chunks (local write only)", chunks.len());
 
         // Write all chunks locally in parallel
@@ -1570,7 +1570,14 @@ impl Server {
 
         // --- Step 3: Read partial tail if file is not chunk-aligned ---
         let chunk_size = self.chunker.chunk_size() as u64;
-        let partial_bytes = metadata.size % chunk_size;
+
+        // Use the actual written extent (sum of chunk sizes) as the true file position
+        // for append operations. metadata.size may be larger than the written extent when
+        // the file was pre-allocated via truncate (e.g. qemu-img creating a sparse qcow2).
+        // Appending at metadata.size would place chunks at the wrong offset (e.g. 8GiB
+        // instead of 0 for the first write into a freshly truncated file).
+        let written_extent: u64 = metadata.chunk_sizes.iter().sum();
+        let partial_bytes = written_extent % chunk_size;
 
         let (write_data, drop_last_chunk, actual_partial_bytes) = if partial_bytes > 0 {
             // File ends mid-chunk — read back the partial last chunk and prepend it
@@ -1616,15 +1623,14 @@ impl Server {
         };
 
         // --- Step 4+5: Chunk the combined data ---
-        let chunks = self.chunker.chunk_data(&write_data);
+        // base_offset is where the tail chunk starts (or where new data begins if aligned).
+        let base_offset = written_extent - actual_partial_bytes;
+        let chunks = self.chunker.chunk_data_at(&write_data, base_offset);
         if chunks.is_empty() {
             // Nothing to write — return current metadata unchanged
             let remaining = chunk_size - (metadata.size % chunk_size);
             return Response::AppendFileResult { metadata, remaining_in_chunk: remaining };
         }
-
-        // Base file offset: where the chunk-aligned region starts, using actual disk size
-        let base_offset = metadata.size - actual_partial_bytes;
 
         // --- Step 6: Write each chunk with 2-replica guarantee ---
         let mut new_locations: Vec<ChunkLocation> = Vec::new();
@@ -1754,9 +1760,13 @@ impl Server {
         }
 
         // --- Step 8: Update metadata size and timestamp ---
-        // Use actual_partial_bytes (from disk) not partial_bytes (from metadata) so
-        // the recorded size matches what's actually on disk.
-        metadata.size = expected_offset + (write_data.len() as u64 - actual_partial_bytes);
+        // Use written_extent (actual sum of chunk sizes) as the base, not expected_offset
+        // or metadata.size — both may reflect a sparse pre-allocation (e.g. truncate to 8GiB)
+        // rather than the actual written data position. After appending, the new size is the
+        // sum of chunks already written plus the net new bytes added in this call.
+        // Also preserve any sparse size declared by a prior truncate-grow.
+        let appended_size = written_extent + (write_data.len() as u64 - actual_partial_bytes);
+        metadata.size = appended_size.max(metadata.size);
         metadata.modified_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1842,11 +1852,11 @@ impl Server {
 
     /// Handle write file request (local only, no replication)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
-    async fn handle_write_file_local_only(&self, data: Vec<u8>) -> Response {
-        debug!("Handling write file local only: {} bytes", data.len());
+    async fn handle_write_file_local_only(&self, data: Vec<u8>, file_offset: u64) -> Response {
+        debug!("Handling write file local only: {} bytes at offset {}", data.len(), file_offset);
 
         let local_node_id = self.cluster.local_node_id();
-        match self.write_data_local_only(&data).await {
+        match self.write_data_local_only(&data, file_offset).await {
             Ok(chunk_ids_with_sizes) => {
                 let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
                 let chunk_sizes: Vec<u64> = chunk_ids_with_sizes.iter().map(|(_, size)| *size).collect();

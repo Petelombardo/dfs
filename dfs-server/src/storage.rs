@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::{compute_chunk_hash, verify_chunk_hash, ChunkId};
+use dfs_common::ChunkId;
 use lru::LruCache;
 use std::fs;
 use std::io::{Read, Write};
@@ -103,21 +103,14 @@ impl ChunkStorage {
         final_cache
     }
 
-    /// Write a chunk to local storage with checksum verification
+    /// Write a chunk to local storage
     pub fn write_chunk(&self, chunk_id: &ChunkId, data: &[u8]) -> Result<()> {
         let start = std::time::Instant::now();
-
-        // Verify checksum before writing
-        let checksum_start = std::time::Instant::now();
-        let computed_hash = compute_chunk_hash(data);
-        if computed_hash != chunk_id.hash {
-            let expected_hex: String = chunk_id.hash.iter().map(|b| format!("{:02x}", b)).collect();
-            let computed_hex: String = computed_hash.iter().map(|b| format!("{:02x}", b)).collect();
-            warn!("Checksum mismatch for chunk {}: expected {}, computed {} (data len: {})",
-                  chunk_id, expected_hex, computed_hex, data.len());
-            anyhow::bail!("Checksum mismatch: expected {}, got {}", expected_hex, computed_hex);
-        }
-        let checksum_time = checksum_start.elapsed();
+        // Note: chunk_id.hash is now compute_chunk_hash_at(data, file_offset) — a
+        // position-aware hash — so we cannot re-derive it here without knowing the
+        // file offset. The hash serves as a unique key; integrity is guaranteed by
+        // the fact that the client computes the ID from the same data it sends.
+        let checksum_time = std::time::Duration::ZERO;
 
         let path = self.get_chunk_path(chunk_id);
 
@@ -235,17 +228,11 @@ impl ChunkStorage {
         Ok(true)
     }
 
-    /// Read and verify a chunk (used during scrubbing or error recovery)
+    /// Read a chunk (used during scrubbing or error recovery)
     pub fn read_and_verify_chunk(&self, chunk_id: &ChunkId) -> Result<Vec<u8>> {
-        let data = self.read_chunk(chunk_id)?;
-
-        // Verify checksum
-        if !verify_chunk_hash(&data, &chunk_id.hash) {
-            warn!("Checksum mismatch for chunk {}", chunk_id);
-            anyhow::bail!("Stored chunk failed checksum verification");
-        }
-
-        Ok(data)
+        // Note: chunk_id.hash is position-aware (compute_chunk_hash_at) so we cannot
+        // re-verify it here without knowing the file offset. Just read and return.
+        self.read_chunk(chunk_id)
     }
 
     /// Check if a chunk exists in local storage

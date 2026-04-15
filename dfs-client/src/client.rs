@@ -190,6 +190,8 @@ pub struct ChunkReadHint {
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Round-robin counter for distributing dual-replica writes across node pairs.
+static WRITE_NODE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Maximum number of recent SQLite file writes to track for read-after-write consistency
 const SQLITE_WRITE_TRACKER_SIZE: usize = 256;
@@ -2207,10 +2209,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
         }
 
-        // Use health-aware node selection with automatic fallback via write_chunk_to_replicas.
-        // Preferred pair is nodes[0]/nodes[1] but any 2 healthy nodes will do.
-        let preferred1 = nodes[0];
-        let preferred2 = nodes[1 % nodes.len()];
+        // Round-robin the preferred pair across consecutive chunk writes so data
+        // is spread evenly across all nodes rather than always landing on nodes[0]/[1].
+        let n = nodes.len();
+        let base = WRITE_NODE_COUNTER.fetch_add(1, Ordering::Relaxed) % n;
+        let preferred1 = nodes[base];
+        let preferred2 = nodes[(base + 1) % n];
 
         info!("Writing {} bytes with synchronous dual-replica (preferred: {}, {})",
               data.len(), preferred1, preferred2);
@@ -2415,7 +2419,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 ),
             };
 
-            let request = Request::WriteFileLocalOnly { data: data.to_vec() };
+            let request = Request::WriteFileLocalOnly { data: data.to_vec(), file_offset };
             let result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
                 self.send_request(node, request),
@@ -2766,7 +2770,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let total_start = std::time::Instant::now();
         let data_len = data.len();
 
-        let request = Request::WriteFileLocalOnly { data };
+        let request = Request::WriteFileLocalOnly { data, file_offset: 0 };
 
         // Create connection
         let mut stream = tokio::time::timeout(

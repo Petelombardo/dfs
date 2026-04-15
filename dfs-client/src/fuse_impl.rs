@@ -3279,6 +3279,7 @@ impl Filesystem for DfsFilesystem {
                     // Just clear the metadata - no need to read old chunks
                     metadata.chunks = Vec::new();
                     metadata.chunk_sizes = Vec::new();
+                    metadata.chunk_locations = Vec::new();
                     metadata.size = 0;
                 } else if new_size > metadata.size {
                     // Growing file - just update metadata to extend with zeros
@@ -3389,6 +3390,7 @@ impl Filesystem for DfsFilesystem {
                             info!("Truncate: keeping {} full chunks, dropping rest", last_chunk_idx + 1);
                             metadata.chunks.truncate(last_chunk_idx + 1);
                             metadata.chunk_sizes.truncate(last_chunk_idx + 1);
+                            metadata.chunk_locations.truncate(last_chunk_idx + 1);
                             metadata.size = new_size;
                         }
                     }

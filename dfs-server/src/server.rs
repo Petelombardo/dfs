@@ -981,21 +981,18 @@ impl Server {
     async fn handle_delete_chunk(&self, chunk_id: ChunkId) -> Response {
         debug!("Handling delete chunk: {}", chunk_id);
 
+        // Always delete the chunk location record, even if the chunk data isn't here.
+        // A node may have a location record without the actual bytes — that stale record
+        // must be purged too, otherwise it causes ghost entries after delete+rewrite.
+        if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
+            warn!("Failed to delete chunk location record for {}: {}", chunk_id, e);
+        }
+
         match self.storage.delete_chunk(&chunk_id) {
-            Ok(_) => {
-                // Also remove the chunk location record from metadata so the healer
-                // doesn't try to re-replicate deleted chunks indefinitely.
-                if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
-                    warn!("Failed to delete chunk location record for {}: {}", chunk_id, e);
-                }
+            Ok(_) => Response::Ok { data: None },
+            Err(_) => {
+                // Chunk not present locally — that's fine, location record already cleaned up.
                 Response::Ok { data: None }
-            }
-            Err(e) => {
-                warn!("Failed to delete chunk {}: {}", chunk_id, e);
-                Response::Error {
-                    message: format!("Failed to delete chunk: {}", e),
-                    code: ErrorCode::IOError,
-                }
             }
         }
     }
@@ -1944,51 +1941,32 @@ impl Server {
                                 }
                             }
 
-                            // Then delete the actual chunk data from all nodes
-                            info!("Deleting {} chunks for file: {}", chunk_locations.len(), path_clone);
+                            // Delete chunks from ALL online nodes — not just loc.nodes.
+                            // The healer may have replicated to nodes not listed in loc.nodes;
+                            // those copies cause corruption after delete+rewrite.
+                            info!("Deleting {} chunks from all nodes for file: {}", chunk_locations.len(), path_clone);
 
                             for loc in &chunk_locations {
                                 let chunk_id = &loc.chunk_id;
 
-                                // Delete chunk location record on all peers
+                                // Delete locally if this node holds it
+                                if loc.nodes.contains(&local_id) {
+                                    if let Err(e) = storage.delete_chunk(chunk_id) {
+                                        warn!("Failed to delete local chunk {}: {}", chunk_id, e);
+                                    }
+                                }
+                                let _ = metadata_store.delete_chunk_location(chunk_id);
+
+                                // Send DeleteChunk to every other online node
                                 for node in &nodes {
                                     if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                                         continue;
                                     }
-                                    // Peers handle chunk location cleanup via DeleteMetadata;
-                                    // chunk data deletion below covers the actual bytes.
-                                }
-
-                                // Delete chunk data from every node that holds it
-                                for node_id in &loc.nodes {
-                                    if *node_id == local_id {
-                                        if let Err(e) = storage.delete_chunk(chunk_id) {
-                                            warn!("Failed to delete local chunk {}: {}", chunk_id, e);
-                                        }
-                                        // Also clean up local chunk location record on peers
-                                        // (DeleteMetadata handler on peers takes care of this)
-                                    } else {
-                                        if let Some(node_info) = cluster.get_node(node_id).await {
-                                            if node_info.status == dfs_common::NodeStatus::Online {
-                                                let request = Request::DeleteChunk {
-                                                    chunk_id: *chunk_id,
-                                                };
-                                                if let Err(e) = client
-                                                    .send_message(node_info.addr, Message::Request(request))
-                                                    .await
-                                                {
-                                                    warn!("Failed to delete chunk {} from node {}: {}",
-                                                          chunk_id, node_id, e);
-                                                }
-                                            }
-                                        }
+                                    let request = Request::DeleteChunk { chunk_id: *chunk_id };
+                                    if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
+                                        warn!("Failed to delete chunk {} from node {}: {}", chunk_id, node.id, e);
                                     }
                                 }
-
-                                // Remove chunk location record from local metadata DB on peers
-                                // via the existing DeleteMetadata path (peers call delete_chunk_location
-                                // in handle_delete_metadata — ensured below)
-                                let _ = metadata_store.delete_chunk_location(chunk_id);
                             }
 
                             info!("Chunk deletion complete for file: {}", path_clone);

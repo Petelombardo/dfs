@@ -142,18 +142,20 @@ pub struct DfsFilesystem {
     /// Uses std::sync::Mutex (not tokio) because FUSE callbacks run on OS threads.
     write_inode_locks: Arc<DashMap<u64, Arc<std::sync::Mutex<()>>>>,
 
-    /// Per-inode list of in-flight inline flush handles.
-    /// The write path spawns chunk flushes and pushes handles here without blocking.
-    /// flush_chunks_for_inode() drains all handles before collecting dirty buffers,
-    /// ensuring no double-write or missed flush on fsync/release.
-    /// release() cleans up the entry after a successful flush.
-    flush_handles: Arc<DashMap<u64, std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>>,
+    /// Per-inode pipeline queue of in-flight inline chunk flush handles.
+    /// Bounded to 2 handles: the write path joins the oldest before pushing a third,
+    /// so at most 2 chunks are in-flight per inode simultaneously (pipelining).
+    /// Buffer-fill for chunk N+1 overlaps with chunk N's network write.
+    /// flush_chunks_for_inode drains and joins all handles before collecting dirty buffers,
+    /// ensuring no in-flight task is still running when we inspect or persist state.
+    /// std::sync::Mutex because the join happens on a FUSE OS thread (not async context).
+    flush_handles: Arc<DashMap<u64, std::sync::Mutex<std::collections::VecDeque<tokio::task::JoinHandle<()>>>>>,
 
-    /// Global concurrency limiter for in-flight chunk writes.
-    /// Acquired inside each spawned flush task (not on the FUSE thread) so the
-    /// write path never blocks.  Bounds simultaneous network writes to prevent
-    /// overwhelming the servers when a large file triggers many back-to-back flushes.
-    write_concurrency: Arc<tokio::sync::Semaphore>,
+    /// Per-inode timestamp of last successful metadata persist to the cluster.
+    /// Used to throttle periodic metadata writes during long-running writes (e.g. DVR).
+    /// Separate from last_metadata_update which tracks read-side freshness and is
+    /// reset by getattr/lookup — that would suppress the write-side persist entirely.
+    last_metadata_persist: Arc<DashMap<u64, std::time::Instant>>,
 }
 
 impl DfsFilesystem {
@@ -258,7 +260,7 @@ impl DfsFilesystem {
             write_open_counts: Arc::new(DashMap::new()),
             write_inode_locks: Arc::new(DashMap::new()),
             flush_handles: Arc::new(DashMap::new()),
-            write_concurrency: Arc::new(tokio::sync::Semaphore::new(8)),
+            last_metadata_persist: Arc::new(DashMap::new()),
         })
     }
 
@@ -357,27 +359,20 @@ impl DfsFilesystem {
     ) {
         if let Some(mut meta) = metadata_cache.get_mut(&ino) {
             for loc in locations {
-                // Replace existing chunk at this file_offset if present, else append.
+                // Replace existing entry at this file_offset if present, else append.
+                // Only touch chunk_locations — chunks/chunk_sizes are derived from it below.
                 if let Some(pos) = meta.chunk_locations.iter().position(|l| l.file_offset == loc.file_offset) {
-                    meta.chunks[pos] = loc.chunk_id;
-                    meta.chunk_sizes[pos] = loc.size as u64;
                     meta.chunk_locations[pos] = loc.clone();
                 } else {
-                    meta.chunks.push(loc.chunk_id);
-                    meta.chunk_sizes.push(loc.size as u64);
                     meta.chunk_locations.push(loc.clone());
                 }
             }
-            // Sort chunk_locations by file_offset to keep them ordered
-            let mut combined: Vec<(dfs_common::ChunkLocation, ChunkId, u64)> = meta.chunk_locations.iter().cloned()
-                .zip(meta.chunks.iter().cloned())
-                .zip(meta.chunk_sizes.iter().cloned())
-                .map(|((loc, id), sz)| (loc, id, sz))
-                .collect();
-            combined.sort_by_key(|(loc, _, _)| loc.file_offset.unwrap_or(0));
-            meta.chunk_locations = combined.iter().map(|(loc, _, _)| loc.clone()).collect();
-            meta.chunks = combined.iter().map(|(_, id, _)| *id).collect();
-            meta.chunk_sizes = combined.iter().map(|(_, _, sz)| *sz).collect();
+            // Sort chunk_locations by file_offset to keep them ordered.
+            meta.chunk_locations.sort_by_key(|l| l.file_offset.unwrap_or(0));
+            // Re-derive the legacy parallel arrays from chunk_locations so they are
+            // always in sync regardless of what the metadata looked like when loaded.
+            meta.chunks = meta.chunk_locations.iter().map(|l| l.chunk_id).collect();
+            meta.chunk_sizes = meta.chunk_locations.iter().map(|l| l.size as u64).collect();
 
             // Update logical size: end of last location
             let written_end = file_offset + locations.iter().map(|l| l.size as u64).sum::<u64>();
@@ -405,9 +400,9 @@ impl DfsFilesystem {
         let chunk_size = self.chunk_size;
 
         // Drain all in-flight inline flush handles before inspecting dirty buffers.
-        // Without this, a spawned task might still be writing chunk N (and about to
-        // call buffers_t.remove) while we try to collect dirty chunks — causing a
-        // missed flush or double-write on fsync/release.
+        // Without this, a spawned task might still be running update_metadata_with_chunk
+        // or buffers_t.remove while we collect dirty chunks — causing a missed flush or
+        // stale metadata on fsync/release.
         let handles_to_drain: Vec<tokio::task::JoinHandle<()>> = self.flush_handles
             .get(&ino)
             .map(|m| m.lock().unwrap_or_else(|p| p.into_inner()).drain(..).collect())
@@ -1660,8 +1655,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let flush_handles = self.flush_handles.clone();
-        let write_concurrency = self.write_concurrency.clone();
-
+        let last_metadata_persist = self.last_metadata_persist.clone();
 
         // Acquire per-inode write lock to serialize concurrent writes to the same inode.
         // qemu-nbd issues parallel write requests; without this they'd race on chunk buffers.
@@ -1763,59 +1757,62 @@ impl Filesystem for DfsFilesystem {
                     let key = (ino, chunk_idx);
 
                     // RMW-on-buffer-init: if no in-memory buffer exists for this chunk but
-                    // the server already has committed data at this file_offset, seed the
-                    // buffer by fetching the existing chunk before applying the new write.
-                    // Without this, a zero-initialized buffer would overwrite prior data.
+                    // If the chunk buffer doesn't exist yet, we may need to seed it with
+                    // existing server data (read-modify-write) to preserve bytes outside
+                    // the incoming write range.  But if this write covers the ENTIRE chunk,
+                    // there's nothing to preserve — skip the network read entirely.
                     if !write_chunk_buffers.contains_key(&key) {
                         let file_offset = chunk_file_start;
-                        debug!("write new buffer: ino={} chunk_idx={} file_offset={}", ino, chunk_idx, file_offset);
+                        let full_chunk_overwrite = intra_off == 0 && write_len >= chunk_size;
 
-                        // Check if the cluster already has a chunk at this file_offset.
-                        let server_chunk: Option<(usize, ChunkId, Vec<dfs_common::ChunkLocation>)> = {
-                            metadata_cache.get(&ino).and_then(|m| {
-                                let locs = m.chunk_locations.clone();
-                                // Find the chunk whose file_offset matches this chunk slot.
-                                // chunk_locations and chunks are parallel arrays.
-                                locs.iter().enumerate().find_map(|(i, loc)| {
-                                    if loc.file_offset == Some(file_offset) {
-                                        // Get the corresponding chunk ID from m.chunks
-                                        m.chunks.get(i).map(|&cid| (i, cid, locs.clone()))
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                        };
-
-                        debug!("write RMW check: ino={} chunk_idx={} server_chunk found={}", ino, chunk_idx, server_chunk.is_some());
-                        let (buf_data, logical_len) = if let Some((chunk_arr_idx, chunk_id, chunk_locs)) = server_chunk {
-                            let all_chunks = {
-                                metadata_cache.get(&ino).map(|m| m.chunks.clone()).unwrap_or_default()
-                            };
-                            let hint = crate::client::ChunkReadHint {
-                                chunk_idx: chunk_arr_idx,
-                                chunk_id,
-                                full_chunk: true,
-                                offset_in_chunk: 0,
-                                length: chunk_size,
-                                file_offset,
-                            };
-                            match runtime.block_on(client.read_data(&[hint], &all_chunks, ino, &chunk_locs)) {
-                                Ok(data) => {
-                                    let copy_len = data.len().min(chunk_size);
-                                    let mut buf = vec![0u8; chunk_size];
-                                    buf[..copy_len].copy_from_slice(&data[..copy_len]);
-                                    let llen = copy_len;
-                                    debug!("write RMW seed: ino={} chunk_idx={} loaded {} bytes from server", ino, chunk_idx, copy_len);
-                                    (buf, llen)
-                                }
-                                Err(e) => {
-                                    error!("write RMW seed: failed to read chunk ino={} offset={}: {}", ino, file_offset, e);
-                                    (vec![0u8; chunk_size], 0)
-                                }
-                            }
-                        } else {
+                        let (buf_data, logical_len) = if full_chunk_overwrite {
+                            // Full chunk overwrite — no need to read existing data.
+                            debug!("write new buffer (full overwrite): ino={} chunk_idx={}", ino, chunk_idx);
                             (vec![0u8; chunk_size], 0)
+                        } else {
+                            // Partial write into an existing chunk — seed the buffer from
+                            // the server so bytes outside this write range are preserved.
+                            debug!("write new buffer: ino={} chunk_idx={} file_offset={}", ino, chunk_idx, file_offset);
+                            let server_chunk: Option<(usize, ChunkId, Vec<dfs_common::ChunkLocation>)> = {
+                                metadata_cache.get(&ino).and_then(|m| {
+                                    let locs = m.chunk_locations.clone();
+                                    locs.iter().enumerate().find_map(|(i, loc)| {
+                                        if loc.file_offset == Some(file_offset) {
+                                            m.chunks.get(i).map(|&cid| (i, cid, locs.clone()))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                            };
+
+                            if let Some((chunk_arr_idx, chunk_id, chunk_locs)) = server_chunk {
+                                let all_chunks = metadata_cache.get(&ino)
+                                    .map(|m| m.chunks.clone()).unwrap_or_default();
+                                let hint = crate::client::ChunkReadHint {
+                                    chunk_idx: chunk_arr_idx,
+                                    chunk_id,
+                                    full_chunk: true,
+                                    offset_in_chunk: 0,
+                                    length: chunk_size,
+                                    file_offset,
+                                };
+                                match runtime.block_on(client.read_data(&[hint], &all_chunks, ino, &chunk_locs)) {
+                                    Ok(data) => {
+                                        let copy_len = data.len().min(chunk_size);
+                                        let mut buf = vec![0u8; chunk_size];
+                                        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                                        debug!("write RMW seed: ino={} chunk_idx={} loaded {} bytes", ino, chunk_idx, copy_len);
+                                        (buf, copy_len)
+                                    }
+                                    Err(e) => {
+                                        error!("write RMW seed failed: ino={} offset={}: {}", ino, file_offset, e);
+                                        (vec![0u8; chunk_size], 0)
+                                    }
+                                }
+                            } else {
+                                (vec![0u8; chunk_size], 0)
+                            }
                         };
 
                         write_chunk_buffers.entry(key).or_insert_with(|| {
@@ -1896,18 +1893,33 @@ impl Filesystem for DfsFilesystem {
                         let file_offset = cidx * chunk_size as u64;
                         debug!("inline flush: ino={} chunk_idx={} offset={} (async spawn)", ino, cidx, file_offset);
 
-                        // Spawn the network write to tokio — do NOT block the FUSE thread.
-                        // Back pressure is applied at the START of the next write() call by
-                        // joining this handle after acquiring the inode lock.
+                        // Spawn the network write to tokio — do NOT block the FUSE thread
+                        // except to enforce the pipeline depth limit of 2.
+                        //
+                        // Back-pressure: if 2 flushes are already in-flight for this inode,
+                        // join the oldest one before spawning a new one.  This gives true
+                        // 2-deep pipelining: chunk N+1's buffer was already filled above
+                        // while chunk N was in-flight, so we get overlap without unbounded
+                        // concurrency.  The join happens after the inode lock is dropped
+                        // (drop(_inode_guard) above) so there is no deadlock risk.
+                        {
+                            let entry = flush_handles
+                                .entry(ino)
+                                .or_insert_with(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+                            let oldest = {
+                                let mut q = entry.lock().unwrap_or_else(|p| p.into_inner());
+                                if q.len() >= 2 { q.pop_front() } else { None }
+                            };
+                            if let Some(handle) = oldest {
+                                runtime.block_on(handle).ok();
+                            }
+                        }
+
                         let client_t = client.clone();
                         let metadata_t = metadata_cache.clone();
                         let buffers_t = write_chunk_buffers.clone();
-                        let concurrency = write_concurrency.clone();
+                        let last_meta_t = last_metadata_persist.clone();
                         let handle = runtime.spawn(async move {
-                            // Acquire global concurrency slot inside the task — never blocks
-                            // the FUSE OS thread.  Caps simultaneous network writes so we
-                            // don't overwhelm the servers with 100+ concurrent 4MB writes.
-                            let _slot = concurrency.acquire_owned().await.ok();
                             match client_t.write_data_with_cache(&data, ino, file_offset).await {
                                 Ok((_, _, locations_opt)) => {
                                     if let Some(locs) = locations_opt {
@@ -1917,11 +1929,23 @@ impl Filesystem for DfsFilesystem {
                                     }
                                     // Remove the buffer now that the chunk is committed.
                                     buffers_t.remove(&key);
-                                    // Persist metadata so dfs-admin sees current file size
-                                    // during long-running open writes (e.g. live DVR recordings).
-                                    if let Some(meta) = metadata_t.get(&ino).map(|m| m.clone()) {
-                                        if let Err(e) = client_t.put_file_metadata(&meta).await {
-                                            error!("inline flush: metadata persist failed ino={}: {}", ino, e);
+                                    // Periodically persist metadata to all nodes so:
+                                    //   1. The healer sees the correct replica set and doesn't
+                                    //      over-replicate chunks it thinks are under-RF.
+                                    //   2. A client crash mid-write loses at most 10s of chunks.
+                                    // Throttled to once per 10s per inode — not every chunk —
+                                    // so we don't add quorum round-trips to the hot write path.
+                                    const METADATA_PERSIST_INTERVAL_SECS: u64 = 10;
+                                    let should_persist = last_meta_t.get(&ino)
+                                        .map(|t| t.elapsed().as_secs() >= METADATA_PERSIST_INTERVAL_SECS)
+                                        .unwrap_or(true);
+                                    if should_persist {
+                                        if let Some(meta) = metadata_t.get(&ino).map(|m| m.clone()) {
+                                            if let Err(e) = client_t.put_file_metadata(&meta).await {
+                                                error!("inline flush: periodic metadata persist failed ino={}: {}", ino, e);
+                                            } else {
+                                                last_meta_t.insert(ino, std::time::Instant::now());
+                                            }
                                         }
                                     }
                                 }
@@ -1936,13 +1960,11 @@ impl Filesystem for DfsFilesystem {
                                 }
                             }
                         });
-                        // Store handle so flush_chunks_for_inode can drain it before
-                        // collecting dirty buffers on fsync/release.
                         flush_handles
                             .entry(ino)
-                            .or_insert_with(|| std::sync::Mutex::new(Vec::new()))
+                            .or_insert_with(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
                             .lock().unwrap_or_else(|p| p.into_inner())
-                            .push(handle);
+                            .push_back(handle);
                     }
                 }
 
@@ -2196,7 +2218,8 @@ impl Filesystem for DfsFilesystem {
                     }
                     // Clean up per-inode state — no longer needed after file is closed.
                     self.write_inode_locks.remove(&ino);
-                    self.flush_handles.remove(&ino);
+                    self.flush_handles.remove(&ino); // queue already drained by flush_chunks_for_inode
+                    self.last_metadata_persist.remove(&ino);
 
                     // If no more write-mode files are open anywhere, ask glibc to return
                     // freed pages to the OS.  Chunk buffers are 4MB each; after a burst of
@@ -2351,6 +2374,7 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let last_warm_offset = self.last_warm_offset.clone();
         let chunk_offset_cache = self.chunk_offset_cache.clone();
+        let last_metadata_persist = self.last_metadata_persist.clone();
 
         self.runtime.spawn(async move {
             match client.delete_file(&path).await {
@@ -2367,6 +2391,7 @@ impl Filesystem for DfsFilesystem {
                         last_metadata_update.remove(&ino);
                         last_warm_offset.remove(&ino);
                         chunk_offset_cache.remove(&ino);
+                        last_metadata_persist.remove(&ino);
                     }
                     path_to_inode.write().unwrap().remove(&path);
 
@@ -2582,6 +2607,7 @@ impl Filesystem for DfsFilesystem {
                     // Just clear the metadata - no need to read old chunks
                     metadata.chunks = Vec::new();
                     metadata.chunk_sizes = Vec::new();
+                    metadata.chunk_locations = Vec::new();
                     metadata.size = 0;
                 } else if new_size > metadata.size {
                     // Growing file - just update metadata to extend with zeros
@@ -2692,6 +2718,7 @@ impl Filesystem for DfsFilesystem {
                             info!("Truncate: keeping {} full chunks, dropping rest", last_chunk_idx + 1);
                             metadata.chunks.truncate(last_chunk_idx + 1);
                             metadata.chunk_sizes.truncate(last_chunk_idx + 1);
+                            metadata.chunk_locations.truncate(last_chunk_idx + 1);
                             metadata.size = new_size;
                         }
                     }

@@ -148,6 +148,12 @@ pub struct DfsFilesystem {
     /// ensuring no double-write or missed flush on fsync/release.
     /// release() cleans up the entry after a successful flush.
     flush_handles: Arc<DashMap<u64, std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>>,
+
+    /// Global concurrency limiter for in-flight chunk writes.
+    /// Acquired inside each spawned flush task (not on the FUSE thread) so the
+    /// write path never blocks.  Bounds simultaneous network writes to prevent
+    /// overwhelming the servers when a large file triggers many back-to-back flushes.
+    write_concurrency: Arc<tokio::sync::Semaphore>,
 }
 
 impl DfsFilesystem {
@@ -252,6 +258,7 @@ impl DfsFilesystem {
             write_open_counts: Arc::new(DashMap::new()),
             write_inode_locks: Arc::new(DashMap::new()),
             flush_handles: Arc::new(DashMap::new()),
+            write_concurrency: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 
@@ -1653,6 +1660,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let runtime = self.runtime.clone();
         let flush_handles = self.flush_handles.clone();
+        let write_concurrency = self.write_concurrency.clone();
 
 
         // Acquire per-inode write lock to serialize concurrent writes to the same inode.
@@ -1894,7 +1902,12 @@ impl Filesystem for DfsFilesystem {
                         let client_t = client.clone();
                         let metadata_t = metadata_cache.clone();
                         let buffers_t = write_chunk_buffers.clone();
+                        let concurrency = write_concurrency.clone();
                         let handle = runtime.spawn(async move {
+                            // Acquire global concurrency slot inside the task — never blocks
+                            // the FUSE OS thread.  Caps simultaneous network writes so we
+                            // don't overwhelm the servers with 100+ concurrent 4MB writes.
+                            let _slot = concurrency.acquire_owned().await.ok();
                             match client_t.write_data_with_cache(&data, ino, file_offset).await {
                                 Ok((_, _, locations_opt)) => {
                                     if let Some(locs) = locations_opt {

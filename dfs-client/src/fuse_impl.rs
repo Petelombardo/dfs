@@ -1895,6 +1895,14 @@ impl Filesystem for DfsFilesystem {
                                             &metadata_t, ino, &locs, file_offset, chunk_size, true,
                                         );
                                     }
+                                    // Persist metadata after each inline flush so dfs-admin
+                                    // and other clients see the current file size during
+                                    // long-running open writes (e.g. live DVR recordings).
+                                    if let Some(meta) = metadata_t.get(&ino).map(|m| m.clone()) {
+                                        if let Err(e) = client_t.put_file_metadata(&meta).await {
+                                            error!("inline flush: metadata persist failed ino={}: {}", ino, e);
+                                        }
+                                    }
                                     debug!("inline flush done: ino={} chunk_idx={}", ino, cidx);
                                 }
                                 Err(e) => {

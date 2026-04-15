@@ -142,13 +142,12 @@ pub struct DfsFilesystem {
     /// Uses std::sync::Mutex (not tokio) because FUSE callbacks run on OS threads.
     write_inode_locks: Arc<DashMap<u64, Arc<std::sync::Mutex<()>>>>,
 
-    /// Per-inode pipeline semaphore for inline chunk flushes.
-    /// Allows up to 2 chunks to be in-flight simultaneously per inode (pipelining),
-    /// while bounding memory to 2×chunk_size per active file.  The write path acquires
-    /// a permit before spawning a flush; the spawned task releases it on completion.
-    /// If both permits are taken the write path blocks briefly — back pressure without
-    /// serializing every chunk write through a full network round-trip.
-    flush_pipeline: Arc<DashMap<u64, Arc<tokio::sync::Semaphore>>>,
+    /// Per-inode list of in-flight inline flush handles.
+    /// The write path spawns chunk flushes and pushes handles here without blocking.
+    /// flush_chunks_for_inode() drains all handles before collecting dirty buffers,
+    /// ensuring no double-write or missed flush on fsync/release.
+    /// release() cleans up the entry after a successful flush.
+    flush_handles: Arc<DashMap<u64, std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>>,
 }
 
 impl DfsFilesystem {
@@ -252,7 +251,7 @@ impl DfsFilesystem {
             lock_manager: Arc::new(LockManager::new()),
             write_open_counts: Arc::new(DashMap::new()),
             write_inode_locks: Arc::new(DashMap::new()),
-            flush_pipeline: Arc::new(DashMap::new()),
+            flush_handles: Arc::new(DashMap::new()),
         })
     }
 
@@ -398,13 +397,16 @@ impl DfsFilesystem {
     async fn flush_chunks_for_inode(&self, ino: u64, force: bool) -> Result<()> {
         let chunk_size = self.chunk_size;
 
-        // Drain the pipeline semaphore before inspecting dirty buffers.
-        // Re-acquire all permits so we know no spawned flush is still in-flight
-        // for this inode before we collect dirty chunks.
-        if let Some(sem) = self.flush_pipeline.get(&ino) {
-            // Acquire both permits — blocks until all in-flight tasks release them.
-            let _p1 = sem.acquire().await.ok();
-            let _p2 = sem.acquire().await.ok();
+        // Drain all in-flight inline flush handles before inspecting dirty buffers.
+        // Without this, a spawned task might still be writing chunk N (and about to
+        // call buffers_t.remove) while we try to collect dirty chunks — causing a
+        // missed flush or double-write on fsync/release.
+        let handles_to_drain: Vec<tokio::task::JoinHandle<()>> = self.flush_handles
+            .get(&ino)
+            .map(|m| m.lock().unwrap_or_else(|p| p.into_inner()).drain(..).collect())
+            .unwrap_or_default();
+        for handle in handles_to_drain {
+            handle.await.ok();
         }
 
         // Collect all (chunk_idx, data, file_offset) to flush, releasing locks quickly.
@@ -1650,15 +1652,8 @@ impl Filesystem for DfsFilesystem {
         let chunk_offset_cache = self.chunk_offset_cache.clone();
         let client = self.client.clone();
         let runtime = self.runtime.clone();
-        let flush_pipeline = self.flush_pipeline.clone();
+        let flush_handles = self.flush_handles.clone();
 
-        // Get (or create) the pipeline semaphore for this inode.
-        // Permit acquisition happens per-chunk inside the flush loop below,
-        // but we need the semaphore reference before the inode lock.
-        let sem = flush_pipeline
-            .entry(ino)
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(2)))
-            .clone();
 
         // Acquire per-inode write lock to serialize concurrent writes to the same inode.
         // qemu-nbd issues parallel write requests; without this they'd race on chunk buffers.
@@ -1896,16 +1891,10 @@ impl Filesystem for DfsFilesystem {
                         // Spawn the network write to tokio — do NOT block the FUSE thread.
                         // Back pressure is applied at the START of the next write() call by
                         // joining this handle after acquiring the inode lock.
-                        // Acquire a pipeline slot before spawning — blocks only if 2 flushes
-                        // are already in-flight.  Must be outside the inode lock (held above)
-                        // to avoid deadlock: the semaphore wait parks this FUSE OS thread,
-                        // and the in-flight tasks release their permits on the tokio runtime.
-                        let permit = runtime.block_on(sem.clone().acquire_owned()).ok();
                         let client_t = client.clone();
                         let metadata_t = metadata_cache.clone();
                         let buffers_t = write_chunk_buffers.clone();
-                        runtime.spawn(async move {
-                            let _permit = permit; // released when this block exits
+                        let handle = runtime.spawn(async move {
                             match client_t.write_data_with_cache(&data, ino, file_offset).await {
                                 Ok((_, _, locations_opt)) => {
                                     if let Some(locs) = locations_opt {
@@ -1934,6 +1923,13 @@ impl Filesystem for DfsFilesystem {
                                 }
                             }
                         });
+                        // Store handle so flush_chunks_for_inode can drain it before
+                        // collecting dirty buffers on fsync/release.
+                        flush_handles
+                            .entry(ino)
+                            .or_insert_with(|| std::sync::Mutex::new(Vec::new()))
+                            .lock().unwrap_or_else(|p| p.into_inner())
+                            .push(handle);
                     }
                 }
 
@@ -2187,7 +2183,7 @@ impl Filesystem for DfsFilesystem {
                     }
                     // Clean up per-inode state — no longer needed after file is closed.
                     self.write_inode_locks.remove(&ino);
-                    self.flush_pipeline.remove(&ino);
+                    self.flush_handles.remove(&ino);
 
                     // If no more write-mode files are open anywhere, ask glibc to return
                     // freed pages to the OS.  Chunk buffers are 4MB each; after a burst of

@@ -2402,10 +2402,38 @@ leader_addr: Arc::new(RwLock::new(None)),
         rest = self.node_health.sort_by_health(&rest).await;
         candidates.extend(rest);
 
-        // Need exactly 2 successful writes. Try candidates in order, skipping failures.
+        // Try the preferred pair in parallel first — halves write latency on the hot path.
+        // If either fails, fall back to serial retries from the remaining candidates.
         let mut successful: Vec<(SocketAddr, Response)> = Vec::new();
-        let mut candidate_iter = candidates.iter();
 
+        if candidates.len() >= 2 {
+            let n1 = candidates[0];
+            let n2 = candidates[1];
+            let req1 = Request::WriteFileLocalOnly { data: data.to_vec() };
+            let req2 = Request::WriteFileLocalOnly { data: data.to_vec() };
+            let t1 = tokio::time::timeout(
+                tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+                self.send_request(n1, req1),
+            );
+            let t2 = tokio::time::timeout(
+                tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+                self.send_request(n2, req2),
+            );
+            let (r1, r2) = tokio::join!(t1, t2);
+            match r1 {
+                Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n1); successful.push((n1, resp)); }
+                Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n1, e); }
+                Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n1, WRITE_TIMEOUT_SECS); }
+            }
+            match r2 {
+                Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n2); successful.push((n2, resp)); }
+                Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n2, e); }
+                Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n2, WRITE_TIMEOUT_SECS); }
+            }
+        }
+
+        // Serial fallback for any missing replicas
+        let mut candidate_iter = candidates.iter().skip(if successful.len() == 2 { candidates.len() } else { 2 });
         while successful.len() < 2 {
             let node = match candidate_iter.next() {
                 Some(n) => *n,

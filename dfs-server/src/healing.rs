@@ -816,16 +816,23 @@ impl HealingManager {
                         }
                     }
 
-                    // Skip healing_delay if chunk was never fully replicated to RF nodes.
+                    // For chunks that were never fully replicated to RF nodes, apply a
+                    // minimum delay of healing_delay_secs before healing. This prevents
+                    // the healer from adding replicas to chunks that are still being
+                    // actively written — the write pipeline emits chunks one at a time
+                    // and the healer must wait for the file to be fully written before
+                    // it can know the correct final replica set.
                     let never_fully_replicated = metadata_node_count < replication_factor;
-                    if never_fully_replicated || self.should_heal(&chunk_id).await {
-                        if never_fully_replicated {
-                            self.pending_healing.write().await
-                                .entry(chunk_id)
-                                .or_insert_with(|| Instant::now() - Duration::from_secs(self.healing_delay_secs + 1));
-                        }
+                    if self.should_heal(&chunk_id).await {
                         work.push((chunk_id, ReplicationStatus::UnderReplicated, confirmed_alive_nodes.clone()));
                     } else {
+                        if never_fully_replicated {
+                            // Ensure pending_healing entry exists so should_heal() starts
+                            // tracking the delay from first discovery.
+                            self.pending_healing.write().await
+                                .entry(chunk_id)
+                                .or_insert_with(Instant::now);
+                        }
                         pending_count += 1;
                     }
                 }

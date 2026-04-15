@@ -2393,14 +2393,50 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Build the ordered list of candidates: preferred pair first, then others as fallbacks.
         // Sort so penalized nodes are tried last — healthy nodes get first crack at quorum.
+        //
+        // IMPORTANT: We must not write to a penalized node AND its healthy replacement in the same
+        // parallel round, or we end up with 3+ replicas on disk (the penalized write completes late).
+        // Fix: promote healthy rest nodes ahead of penalized preferred nodes in the candidate list,
+        // so the parallel pair is always 2 healthy nodes when healthy alternatives exist.
         let preferred: Vec<SocketAddr> = vec![replica1, replica2];
         let mut rest: Vec<SocketAddr> = all_nodes.iter().copied()
             .filter(|&n| n != replica1 && n != replica2)
             .collect();
 
-        let mut candidates = self.node_health.sort_by_health(&preferred).await;
-        rest = self.node_health.sort_by_health(&rest).await;
-        candidates.extend(rest);
+        let sorted_preferred = self.node_health.sort_by_health(&preferred).await;
+        let sorted_rest = self.node_health.sort_by_health(&rest).await;
+        rest = sorted_rest;
+
+        // Count how many of the preferred pair are healthy (not penalized)
+        let mut healthy_preferred: Vec<SocketAddr> = Vec::new();
+        let mut penalized_preferred: Vec<SocketAddr> = Vec::new();
+        for &n in &sorted_preferred {
+            if self.node_health.is_penalized(n).await {
+                penalized_preferred.push(n);
+            } else {
+                healthy_preferred.push(n);
+            }
+        }
+
+        // Build candidates: healthy preferred first, then healthy rest (to fill any gaps from
+        // penalized preferred), then penalized preferred last (only used if no other choice).
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        candidates.extend_from_slice(&healthy_preferred);
+        // Fill up to 2 with healthy rest nodes before falling back to penalized preferred
+        for &n in &rest {
+            if candidates.len() >= 2 { break; }
+            if !penalized_preferred.contains(&n) {
+                candidates.push(n);
+            }
+        }
+        // Append penalized preferred (fallback only)
+        candidates.extend_from_slice(&penalized_preferred);
+        // Append remaining rest nodes not yet in candidates
+        for &n in &rest {
+            if !candidates.contains(&n) {
+                candidates.push(n);
+            }
+        }
 
         // Try the preferred pair in parallel first — halves write latency on the hot path.
         // If either fails, fall back to serial retries from the remaining candidates.

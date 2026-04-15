@@ -1860,17 +1860,10 @@ impl Filesystem for DfsFilesystem {
                 }
                 chunk_offset_cache.remove(&ino);
 
-                // Release the inode write lock before doing any network I/O.
-                // The buffer merging is done; holding the lock through the flush would
-                // block other FUSE operations (reads, getattr, readdir) for the entire
-                // network round-trip, causing timeouts under concurrent DVR workloads.
+                // Release the inode write lock — buffer merging is done.
                 drop(_inode_guard);
 
-                // Inline flush-on-full: synchronously flush any chunk that just became
-                // completely full before returning to the kernel.  For sequential writers
-                // (DVR, cp, dd) each write fills one chunk then blocks here until the
-                // network write completes — natural back pressure, no extra threads, no
-                // semaphores, no deadlock risk.  Partial tail chunks wait for fsync/release.
+                // Collect full dirty chunks to flush.
                 let full_dirty_keys: Vec<u64> = {
                     write_chunk_buffers.iter()
                         .filter_map(|entry| {
@@ -1885,96 +1878,96 @@ impl Filesystem for DfsFilesystem {
                         })
                         .collect()
                 };
-                for cidx in full_dirty_keys {
-                    let key = (ino, cidx);
-                    let flush_data = write_chunk_buffers.get(&key).and_then(|lock| {
-                        lock.try_lock().ok().and_then(|mut buf| {
-                            if buf.dirty && buf.logical_len == chunk_size {
-                                let data = buf.data.clone();
-                                buf.dirty = false;
-                                Some(data)
-                            } else {
-                                None
-                            }
-                        })
-                    });
-                    if let Some(data) = flush_data {
-                        let file_offset = cidx * chunk_size as u64;
-                        debug!("inline flush: ino={} chunk_idx={} offset={} (async spawn)", ino, cidx, file_offset);
 
-                        // Spawn the network write to tokio — do NOT block the FUSE thread
-                        // except to enforce the pipeline depth limit of 2.
-                        //
-                        // Back-pressure: if 2 flushes are already in-flight for this inode,
-                        // join the oldest one before spawning a new one.  This gives true
-                        // 2-deep pipelining: chunk N+1's buffer was already filled above
-                        // while chunk N was in-flight, so we get overlap without unbounded
-                        // concurrency.  The join happens after the inode lock is dropped
-                        // (drop(_inode_guard) above) so there is no deadlock risk.
-                        {
-                            let entry = flush_handles
-                                .entry(ino)
-                                .or_insert_with(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+                // Move back-pressure + flush onto a tokio task so the fuser thread is
+                // freed immediately. Back-pressure is still enforced: if 2 flushes are
+                // already in-flight for this inode we await the oldest before spawning a
+                // new one — but that wait happens on a tokio worker, not the fuser thread.
+                // This prevents unbounded memory growth on large copies (cp 1GB) while
+                // keeping the fuser thread free for concurrent reads/getattrs/readdirs.
+                if !full_dirty_keys.is_empty() {
+                    let client_t = client.clone();
+                    let metadata_t = metadata_cache.clone();
+                    let buffers_t = write_chunk_buffers.clone();
+                    let last_meta_t = last_metadata_persist.clone();
+                    let flush_handles_t = flush_handles.clone();
+                    let runtime_t = runtime.clone();
+
+                    runtime.spawn(async move {
+                        for cidx in full_dirty_keys {
+                            let key = (ino, cidx);
+                            let flush_data = buffers_t.get(&key).and_then(|lock| {
+                                lock.try_lock().ok().and_then(|mut buf| {
+                                    if buf.dirty && buf.logical_len == chunk_size {
+                                        let data = buf.data.clone();
+                                        buf.dirty = false;
+                                        Some(data)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            });
+                            let Some(data) = flush_data else { continue };
+                            let file_offset = cidx * chunk_size as u64;
+                            debug!("inline flush: ino={} chunk_idx={} offset={}", ino, cidx, file_offset);
+
+                            // Back-pressure: join oldest handle if pipeline depth >= 2.
+                            // Runs on tokio worker — never blocks the fuser thread.
                             let oldest = {
+                                let entry = flush_handles_t
+                                    .entry(ino)
+                                    .or_insert_with(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
                                 let mut q = entry.lock().unwrap_or_else(|p| p.into_inner());
                                 if q.len() >= 2 { q.pop_front() } else { None }
                             };
                             if let Some(handle) = oldest {
-                                runtime.block_on(handle).ok();
+                                handle.await.ok();
                             }
-                        }
 
-                        let client_t = client.clone();
-                        let metadata_t = metadata_cache.clone();
-                        let buffers_t = write_chunk_buffers.clone();
-                        let last_meta_t = last_metadata_persist.clone();
-                        let handle = runtime.spawn(async move {
-                            match client_t.write_data_with_cache(&data, ino, file_offset).await {
-                                Ok((_, _, locations_opt)) => {
-                                    if let Some(locs) = locations_opt {
-                                        Self::update_metadata_with_chunk(
-                                            &metadata_t, ino, &locs, file_offset, chunk_size, true,
-                                        );
-                                    }
-                                    // Remove the buffer now that the chunk is committed.
-                                    buffers_t.remove(&key);
-                                    // Periodically persist metadata to all nodes so:
-                                    //   1. The healer sees the correct replica set and doesn't
-                                    //      over-replicate chunks it thinks are under-RF.
-                                    //   2. A client crash mid-write loses at most 10s of chunks.
-                                    // Throttled to once per 10s per inode — not every chunk —
-                                    // so we don't add quorum round-trips to the hot write path.
-                                    const METADATA_PERSIST_INTERVAL_SECS: u64 = 10;
-                                    let should_persist = last_meta_t.get(&ino)
-                                        .map(|t| t.elapsed().as_secs() >= METADATA_PERSIST_INTERVAL_SECS)
-                                        .unwrap_or(true);
-                                    if should_persist {
-                                        if let Some(meta) = metadata_t.get(&ino).map(|m| m.clone()) {
-                                            if let Err(e) = client_t.put_file_metadata(&meta).await {
-                                                error!("inline flush: periodic metadata persist failed ino={}: {}", ino, e);
-                                            } else {
-                                                last_meta_t.insert(ino, std::time::Instant::now());
+                            let client_f = client_t.clone();
+                            let metadata_f = metadata_t.clone();
+                            let buffers_f = buffers_t.clone();
+                            let last_meta_f = last_meta_t.clone();
+                            let handle = runtime_t.spawn(async move {
+                                match client_f.write_data_with_cache(&data, ino, file_offset).await {
+                                    Ok((_, _, locations_opt)) => {
+                                        if let Some(locs) = locations_opt {
+                                            Self::update_metadata_with_chunk(
+                                                &metadata_f, ino, &locs, file_offset, chunk_size, true,
+                                            );
+                                        }
+                                        buffers_f.remove(&key);
+                                        const METADATA_PERSIST_INTERVAL_SECS: u64 = 10;
+                                        let should_persist = last_meta_f.get(&ino)
+                                            .map(|t| t.elapsed().as_secs() >= METADATA_PERSIST_INTERVAL_SECS)
+                                            .unwrap_or(true);
+                                        if should_persist {
+                                            if let Some(meta) = metadata_f.get(&ino).map(|m| m.clone()) {
+                                                if let Err(e) = client_f.put_file_metadata(&meta).await {
+                                                    error!("inline flush: periodic metadata persist failed ino={}: {}", ino, e);
+                                                } else {
+                                                    last_meta_f.insert(ino, std::time::Instant::now());
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    // Restore dirty so release/fsync retries
-                                    if let Some(lock) = buffers_t.get(&key) {
-                                        if let Ok(mut buf) = lock.try_lock() {
-                                            buf.dirty = true;
+                                    Err(e) => {
+                                        if let Some(lock) = buffers_f.get(&key) {
+                                            if let Ok(mut buf) = lock.try_lock() {
+                                                buf.dirty = true;
+                                            }
                                         }
+                                        error!("inline flush failed: ino={} chunk_idx={}: {}", ino, cidx, e);
                                     }
-                                    error!("inline flush failed: ino={} chunk_idx={}: {}", ino, cidx, e);
                                 }
-                            }
-                        });
-                        flush_handles
-                            .entry(ino)
-                            .or_insert_with(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
-                            .lock().unwrap_or_else(|p| p.into_inner())
-                            .push_back(handle);
-                    }
+                            });
+                            flush_handles_t
+                                .entry(ino)
+                                .or_insert_with(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+                                .lock().unwrap_or_else(|p| p.into_inner())
+                                .push_back(handle);
+                        }
+                    });
                 }
 
                 let elapsed = start.elapsed();

@@ -142,12 +142,13 @@ pub struct DfsFilesystem {
     /// Uses std::sync::Mutex (not tokio) because FUSE callbacks run on OS threads.
     write_inode_locks: Arc<DashMap<u64, Arc<std::sync::Mutex<()>>>>,
 
-    /// Per-inode pending inline flush handle.
-    /// When a full chunk is spawned to tokio for flushing, the JoinHandle is stored here.
-    /// The NEXT write call for the same inode joins this handle first (blocking briefly
-    /// if the flush is still in-flight) before filling the next buffer slot.
-    /// This provides back pressure without blocking the FUSE thread during the flush itself.
-    pending_flushes: Arc<DashMap<u64, tokio::task::JoinHandle<()>>>,
+    /// Per-inode pipeline semaphore for inline chunk flushes.
+    /// Allows up to 2 chunks to be in-flight simultaneously per inode (pipelining),
+    /// while bounding memory to 2×chunk_size per active file.  The write path acquires
+    /// a permit before spawning a flush; the spawned task releases it on completion.
+    /// If both permits are taken the write path blocks briefly — back pressure without
+    /// serializing every chunk write through a full network round-trip.
+    flush_pipeline: Arc<DashMap<u64, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl DfsFilesystem {
@@ -251,7 +252,7 @@ impl DfsFilesystem {
             lock_manager: Arc::new(LockManager::new()),
             write_open_counts: Arc::new(DashMap::new()),
             write_inode_locks: Arc::new(DashMap::new()),
-            pending_flushes: Arc::new(DashMap::new()),
+            flush_pipeline: Arc::new(DashMap::new()),
         })
     }
 
@@ -397,11 +398,13 @@ impl DfsFilesystem {
     async fn flush_chunks_for_inode(&self, ino: u64, force: bool) -> Result<()> {
         let chunk_size = self.chunk_size;
 
-        // Drain any in-flight background flush before we inspect dirty buffers.
-        // Without this, the spawned task might still be writing chunk N while we
-        // try to collect it as dirty — causing a double-write or a missed flush.
-        if let Some((_, handle)) = self.pending_flushes.remove(&ino) {
-            handle.await.ok();
+        // Drain the pipeline semaphore before inspecting dirty buffers.
+        // Re-acquire all permits so we know no spawned flush is still in-flight
+        // for this inode before we collect dirty chunks.
+        if let Some(sem) = self.flush_pipeline.get(&ino) {
+            // Acquire both permits — blocks until all in-flight tasks release them.
+            let _p1 = sem.acquire().await.ok();
+            let _p2 = sem.acquire().await.ok();
         }
 
         // Collect all (chunk_idx, data, file_offset) to flush, releasing locks quickly.
@@ -1647,18 +1650,15 @@ impl Filesystem for DfsFilesystem {
         let chunk_offset_cache = self.chunk_offset_cache.clone();
         let client = self.client.clone();
         let runtime = self.runtime.clone();
-        let pending_flushes = self.pending_flushes.clone();
+        let flush_pipeline = self.flush_pipeline.clone();
 
-        // Join any in-flight background flush for this inode BEFORE acquiring the inode lock.
-        // Back-pressure point: if the previous chunk is still in-flight, we wait here.
-        // CRITICAL: must NOT hold the inode mutex while calling block_on — if the spawned
-        // flush task ever needs the inode lock (it doesn't currently, but to be safe) or if
-        // tokio worker threads are all parked on futex waiting for this very mutex, we'd
-        // deadlock.  Joining outside the lock is safe because the flush task already has its
-        // own clone of the data buffer and doesn't touch write_chunk_buffers after spawning.
-        if let Some((_, handle)) = pending_flushes.remove(&ino) {
-            runtime.block_on(handle).ok();
-        }
+        // Get (or create) the pipeline semaphore for this inode.
+        // Permit acquisition happens per-chunk inside the flush loop below,
+        // but we need the semaphore reference before the inode lock.
+        let sem = flush_pipeline
+            .entry(ino)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(2)))
+            .clone();
 
         // Acquire per-inode write lock to serialize concurrent writes to the same inode.
         // qemu-nbd issues parallel write requests; without this they'd race on chunk buffers.
@@ -1896,10 +1896,16 @@ impl Filesystem for DfsFilesystem {
                         // Spawn the network write to tokio — do NOT block the FUSE thread.
                         // Back pressure is applied at the START of the next write() call by
                         // joining this handle after acquiring the inode lock.
+                        // Acquire a pipeline slot before spawning — blocks only if 2 flushes
+                        // are already in-flight.  Must be outside the inode lock (held above)
+                        // to avoid deadlock: the semaphore wait parks this FUSE OS thread,
+                        // and the in-flight tasks release their permits on the tokio runtime.
+                        let permit = runtime.block_on(sem.clone().acquire_owned()).ok();
                         let client_t = client.clone();
                         let metadata_t = metadata_cache.clone();
                         let buffers_t = write_chunk_buffers.clone();
-                        let handle = runtime.spawn(async move {
+                        runtime.spawn(async move {
+                            let _permit = permit; // released when this block exits
                             match client_t.write_data_with_cache(&data, ino, file_offset).await {
                                 Ok((_, _, locations_opt)) => {
                                     if let Some(locs) = locations_opt {
@@ -1907,11 +1913,7 @@ impl Filesystem for DfsFilesystem {
                                             &metadata_t, ino, &locs, file_offset, chunk_size, true,
                                         );
                                     }
-                                    // Remove the buffer now that the chunk is committed —
-                                    // keeping it would accumulate 4MB per chunk for the
-                                    // entire file lifetime (e.g. 256 entries = 1GB for a
-                                    // 1GB DVR recording).  release() only sees dirty buffers
-                                    // so this is safe to drop here.
+                                    // Remove the buffer now that the chunk is committed.
                                     buffers_t.remove(&key);
                                     // Persist metadata so dfs-admin sees current file size
                                     // during long-running open writes (e.g. live DVR recordings).
@@ -1932,7 +1934,6 @@ impl Filesystem for DfsFilesystem {
                                 }
                             }
                         });
-                        pending_flushes.insert(ino, handle);
                     }
                 }
 
@@ -2186,7 +2187,7 @@ impl Filesystem for DfsFilesystem {
                     }
                     // Clean up per-inode state — no longer needed after file is closed.
                     self.write_inode_locks.remove(&ino);
-                    self.pending_flushes.remove(&ino);
+                    self.flush_pipeline.remove(&ino);
 
                     // If no more write-mode files are open anywhere, ask glibc to return
                     // freed pages to the OS.  Chunk buffers are 4MB each; after a burst of

@@ -1643,6 +1643,17 @@ impl Filesystem for DfsFilesystem {
         let runtime = self.runtime.clone();
         let pending_flushes = self.pending_flushes.clone();
 
+        // Join any in-flight background flush for this inode BEFORE acquiring the inode lock.
+        // Back-pressure point: if the previous chunk is still in-flight, we wait here.
+        // CRITICAL: must NOT hold the inode mutex while calling block_on — if the spawned
+        // flush task ever needs the inode lock (it doesn't currently, but to be safe) or if
+        // tokio worker threads are all parked on futex waiting for this very mutex, we'd
+        // deadlock.  Joining outside the lock is safe because the flush task already has its
+        // own clone of the data buffer and doesn't touch write_chunk_buffers after spawning.
+        if let Some((_, handle)) = pending_flushes.remove(&ino) {
+            runtime.block_on(handle).ok();
+        }
+
         // Acquire per-inode write lock to serialize concurrent writes to the same inode.
         // qemu-nbd issues parallel write requests; without this they'd race on chunk buffers.
         // std::sync::Mutex because FUSE callbacks run on OS threads.
@@ -1651,14 +1662,6 @@ impl Filesystem for DfsFilesystem {
             .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
             .clone();
         let _inode_guard = inode_lock.lock().unwrap_or_else(|p| p.into_inner());
-
-        // Join any in-flight background flush for this inode before touching buffers.
-        // This is the back-pressure point: we block here only if the previous chunk's
-        // network write hasn't finished yet.  The FUSE thread is blocked, but only for
-        // the tail of the previous flush, not the full round-trip of the current one.
-        if let Some((_, handle)) = pending_flushes.remove(&ino) {
-            runtime.block_on(handle).ok();
-        }
 
         // --- 4MB-aligned chunk write path ---
         // Every write goes into a per-(ino, chunk_idx) buffer.

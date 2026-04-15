@@ -1,6 +1,12 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use libc;
+
+// malloc_trim is a glibc extension — not available on musl.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+extern "C" {
+    fn malloc_trim(pad: libc::size_t) -> libc::c_int;
+}
 use dfs_common::{ChunkId, FileMetadata, FileType};
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
@@ -1901,6 +1907,12 @@ impl Filesystem for DfsFilesystem {
                                             &metadata_t, ino, &locs, file_offset, chunk_size, true,
                                         );
                                     }
+                                    // Remove the buffer now that the chunk is committed —
+                                    // keeping it would accumulate 4MB per chunk for the
+                                    // entire file lifetime (e.g. 256 entries = 1GB for a
+                                    // 1GB DVR recording).  release() only sees dirty buffers
+                                    // so this is safe to drop here.
+                                    buffers_t.remove(&key);
                                     // Persist metadata so dfs-admin sees current file size
                                     // during long-running open writes (e.g. live DVR recordings).
                                     if let Some(meta) = metadata_t.get(&ino).map(|m| m.clone()) {
@@ -2183,7 +2195,8 @@ impl Filesystem for DfsFilesystem {
                     // systems like nanopir3 (1.9 GB, no swap).  malloc_trim(0) releases
                     // the freed top-of-heap back to the kernel immediately.
                     if self.write_open_counts.is_empty() {
-                        unsafe { libc::malloc_trim(0); }
+                        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+                        unsafe { malloc_trim(0); }
                         debug!("release: malloc_trim after all write FDs closed");
                     }
 

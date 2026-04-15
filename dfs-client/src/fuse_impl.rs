@@ -1035,12 +1035,12 @@ impl Filesystem for DfsFilesystem {
                     // Cache miss or invalidated - build and cache it
                     let mut offsets = Vec::with_capacity(metadata.chunks.len());
 
-                    // Check if we have chunk_locations with file_offset (sparse file support)
-                    // IMPORTANT: chunk_locations count must match chunks count, otherwise offsets
-                    // would be misaligned (e.g., if a small chunk was written without chunk_locations
-                    // being populated). Fall back to sequential calculation in that case.
+                    // Use chunk_locations when available — it's the authoritative source.
+                    // The legacy chunks/chunk_sizes arrays may be empty when metadata was loaded
+                    // from a server that only persisted chunk_locations (all new writes go here).
+                    // The old requirement that chunk_locations.len() == chunks.len() is dropped:
+                    // chunk_locations is self-sufficient and doesn't need chunks to be populated.
                     let locations_match = !metadata.chunk_locations.is_empty()
-                        && metadata.chunk_locations.len() == metadata.chunks.len()
                         && metadata.chunk_locations[0].file_offset.is_some();
 
                     if locations_match {
@@ -1136,9 +1136,18 @@ impl Filesystem for DfsFilesystem {
                     let full_chunk = length_in_chunk >= (*chunk_size as usize / 4)
                         || length_in_chunk == 0;
 
+                    // Prefer chunk_locations as the authoritative source of chunk_id —
+                    // metadata.chunks may be empty or mismatched when loaded from a server
+                    // that only populated chunk_locations (common after a restart).
+                    let chunk_id = if *idx < metadata.chunk_locations.len() {
+                        metadata.chunk_locations[*idx].chunk_id
+                    } else {
+                        metadata.chunks[*idx]
+                    };
+
                     crate::client::ChunkReadHint {
                         chunk_idx: *idx,
-                        chunk_id: metadata.chunks[*idx],
+                        chunk_id,
                         full_chunk,
                         offset_in_chunk,
                         length: length_in_chunk,
@@ -2000,7 +2009,6 @@ impl Filesystem for DfsFilesystem {
                     (data_vec.clone(), offset as u64)
                 } else {
                     let locations_match = !metadata.chunk_locations.is_empty()
-                        && metadata.chunk_locations.len() == metadata.chunks.len()
                         && metadata.chunk_locations[0].file_offset.is_some();
 
                     let mut first_idx: Option<usize> = None;

@@ -205,6 +205,15 @@ impl ClusterManager {
         leader_id == Some(self.local_node_id)
     }
 
+    /// Returns the SocketAddr of the current leader, if known.
+    pub async fn get_leader_addr(&self) -> Option<std::net::SocketAddr> {
+        let nodes = self.nodes.read().await;
+        nodes.values()
+            .filter(|n| n.status == NodeStatus::Online)
+            .min_by_key(|n| n.id)
+            .map(|n| n.addr)
+    }
+
     /// Returns true if the given node_id is the current leader per this node's gossip view.
     /// Used to validate incoming healing instructions — if the sender claims to be leader
     /// but our view disagrees, we reject the instruction to prevent split-brain execution.

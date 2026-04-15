@@ -9,6 +9,20 @@ use tracing::{debug, info, warn};
 pub struct MetadataStore {
     /// Sled database instance
     db: Db,
+
+    /// Durable per-follower dissemination queue tree (leader-only).
+    /// Key: `{node_id_hex}:{seq:016x}` — Value: bincode-serialized FileMetadata.
+    /// The leader writes here before acking the client; a background loop drains
+    /// entries to each follower and removes them on confirmed ack.
+    pub meta_queue: sled::Tree,
+
+    /// Monotonic sequence counter for this node's metadata writes (leader-only).
+    /// Stored in sled so it survives restarts. Key: b"meta_seq".
+    pub meta_seq_tree: sled::Tree,
+
+    /// Last sequence number received from the leader (follower-only).
+    /// Key: b"follower_seq". Used by new leaders for catch-up calculation.
+    pub follower_seq_tree: sled::Tree,
 }
 
 impl MetadataStore {
@@ -34,9 +48,16 @@ impl MetadataStore {
             .open()
             .with_context(|| format!("Failed to open metadata database at {:?}", metadata_dir))?;
 
+        let meta_queue = db.open_tree(b"meta_queue")
+            .context("Failed to open meta_queue tree")?;
+        let meta_seq_tree = db.open_tree(b"meta_seq")
+            .context("Failed to open meta_seq tree")?;
+        let follower_seq_tree = db.open_tree(b"follower_seq")
+            .context("Failed to open follower_seq tree")?;
+
         info!("Initialized metadata store at {:?} (cache: {}MB)", metadata_dir, cache_capacity_mb);
 
-        Ok(Self { db })
+        Ok(Self { db, meta_queue, meta_seq_tree, follower_seq_tree })
     }
 
     /// Scan all `file:` records and re-create any missing `path:` index entries.
@@ -556,6 +577,184 @@ impl MetadataStore {
 
         Ok(())
     }
+
+    // -------------------------------------------------------------------------
+    // Leader metadata sequence & dissemination queue
+    // -------------------------------------------------------------------------
+
+    /// Increment and return the next metadata sequence number (leader-only).
+    /// Persisted in sled so it survives leader restarts.
+    pub fn next_meta_sequence(&self) -> Result<u64> {
+        // Atomic fetch-and-increment via sled's compare-and-swap loop.
+        loop {
+            let current_bytes = self.meta_seq_tree.get(b"meta_seq")?;
+            let current: u64 = current_bytes.as_ref()
+                .and_then(|b| b.as_ref().try_into().ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+            let next = current + 1;
+            let next_bytes = next.to_be_bytes();
+            match self.meta_seq_tree.compare_and_swap(
+                b"meta_seq",
+                current_bytes.as_deref(),
+                Some(&next_bytes),
+            )? {
+                Ok(_) => return Ok(next),
+                Err(_) => continue, // lost the race, retry
+            }
+        }
+    }
+
+    /// Read current metadata sequence (leader: last issued; follower: last received).
+    pub fn current_meta_sequence(&self) -> Result<u64> {
+        Ok(self.meta_seq_tree.get(b"meta_seq")?
+            .as_ref()
+            .and_then(|b| b.as_ref().try_into().ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0))
+    }
+
+    /// Format node_id as a fixed-length hex string for use as a sled key prefix.
+    fn node_id_hex(node_id: NodeId) -> String {
+        node_id.as_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Enqueue a metadata update destined for `node_id` at `sequence`.
+    /// Key format: `{node_id_hex}:{seq:016x}` — lexicographic order == sequence order.
+    pub fn enqueue_meta_for_node(&self, node_id: NodeId, sequence: u64, metadata: &FileMetadata) -> Result<()> {
+        let key = format!("{}:{:016x}", Self::node_id_hex(node_id), sequence);
+        let value = bincode::serialize(metadata).context("Failed to serialize metadata for queue")?;
+        self.meta_queue.insert(key.as_bytes(), value)?;
+        Ok(())
+    }
+
+    /// Return all queued metadata entries for `node_id`, in sequence order.
+    /// Returns Vec<(sequence, FileMetadata)>.
+    pub fn drain_meta_queue_for_node(&self, node_id: NodeId) -> Result<Vec<(u64, FileMetadata)>> {
+        let prefix = format!("{}:", Self::node_id_hex(node_id));
+        let mut items = Vec::new();
+        for item in self.meta_queue.scan_prefix(prefix.as_bytes()) {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
+            let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
+            match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => items.push((seq, m)),
+                Err(e) => warn!("meta_queue: failed to deserialize entry {}: {}", key_str, e),
+            }
+        }
+        Ok(items)
+    }
+
+    /// Remove all queue entries for `node_id` up to and including `up_to_sequence`.
+    pub fn ack_meta_queue_for_node(&self, node_id: NodeId, up_to_sequence: u64) -> Result<()> {
+        let prefix = format!("{}:", Self::node_id_hex(node_id));
+        let up_to_key = format!("{}:{:016x}", Self::node_id_hex(node_id), up_to_sequence);
+        let mut to_remove = Vec::new();
+        for item in self.meta_queue.scan_prefix(prefix.as_bytes()) {
+            let (key, _) = item?;
+            if key.as_ref() <= up_to_key.as_bytes() {
+                to_remove.push(key);
+            }
+        }
+        for key in to_remove {
+            self.meta_queue.remove(key)?;
+        }
+        Ok(())
+    }
+
+    /// Deduplication pass: for each node prefix, retain only the last entry per FileId.
+    /// Called before draining to avoid sending redundant updates for files written many times.
+    pub fn compact_meta_queue_for_node(&self, node_id: NodeId) -> Result<()> {
+        let prefix = format!("{}:", Self::node_id_hex(node_id));
+        // Build map: file_id -> (key, seq) — keep highest seq per file_id.
+        let mut seen: std::collections::HashMap<FileId, (sled::IVec, u64)> = std::collections::HashMap::new();
+        for item in self.meta_queue.scan_prefix(prefix.as_bytes()) {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).unwrap_or("");
+            let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
+            let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
+            if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
+                let entry = seen.entry(m.id).or_insert((key.clone(), seq));
+                if seq > entry.1 {
+                    self.meta_queue.remove(&entry.0)?;
+                    *entry = (key, seq);
+                } else if seq < entry.1 {
+                    self.meta_queue.remove(&key)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the last sequence number received from the leader (follower-only).
+    pub fn set_follower_sequence(&self, seq: u64) -> Result<()> {
+        self.follower_seq_tree.insert(b"follower_seq", &seq.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Get the last sequence number received from the leader (follower-only).
+    pub fn get_follower_sequence(&self) -> Result<u64> {
+        Ok(self.follower_seq_tree.get(b"follower_seq")?
+            .as_ref()
+            .and_then(|b| b.as_ref().try_into().ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0))
+    }
+
+    /// Return a compact inventory of all known files: Vec<(FileId, modified_at)>.
+    /// Used by a newly-elected leader to diff against follower inventories.
+    pub fn get_file_inventory(&self) -> Result<Vec<(FileId, u64)>> {
+        let mut out = Vec::new();
+        for item in self.db.scan_prefix(b"file:") {
+            let (_, value) = item?;
+            let (id, modified_at) = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
+                (m.id, m.modified_at)
+            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
+                let m: FileMetadata = v1.into();
+                (m.id, m.modified_at)
+            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
+                let m: FileMetadata = v0.into();
+                (m.id, m.modified_at)
+            } else {
+                continue;
+            };
+            out.push((id, modified_at));
+        }
+        Ok(out)
+    }
+
+    /// Fetch a batch of file records by ID. Missing IDs are silently skipped.
+    pub fn get_files_batch(&self, ids: &[FileId]) -> Result<Vec<FileMetadata>> {
+        let mut out = Vec::new();
+        for id in ids {
+            if let Ok(Some(m)) = self.get_file(id) {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Scan all file records and call `f` for each deserialized FileMetadata.
+    /// Used by the catch-up pass on leader election — avoids exposing `db` directly.
+    pub fn scan_all_files<F>(&self, mut f: F) -> Result<usize>
+    where
+        F: FnMut(FileMetadata) -> Result<()>,
+    {
+        let mut count = 0usize;
+        for item in self.db.scan_prefix(b"file:") {
+            let (_, value) = item?;
+            let meta: FileMetadata = if let Ok(m) = bincode::deserialize(&value) { m }
+                else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) { v1.into() }
+                else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) { v0.into() }
+                else { continue; };
+            f(meta)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    // -------------------------------------------------------------------------
 
     /// List all chunk IDs known in metadata (for leader-coordinated healing).
     /// Returns every chunk ID that has a location record, regardless of which

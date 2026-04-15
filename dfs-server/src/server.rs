@@ -80,11 +80,6 @@ pub struct Server {
     /// Used by admin handlers to query status and trigger immediate heal cycles.
     healing: Arc<RwLock<Option<Arc<HealingManager>>>>,
 
-    /// Metadata replication retry queue: per-node backlog of FileMetadata that failed
-    /// to replicate (timeout or connection error). A background task drains this every
-    /// 30 seconds so a transient failure (node restart, crash mid-write) self-heals
-    /// without waiting for the next write to the same file.
-    pending_metadata_replication: Arc<DashMap<dfs_common::NodeId, Vec<FileMetadata>>>,
 }
 
 impl Server {
@@ -117,7 +112,6 @@ impl Server {
             chunk_map: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
             healing: Arc::new(RwLock::new(None)),
-            pending_metadata_replication: Arc::new(DashMap::new()),
         };
 
         server
@@ -251,80 +245,290 @@ impl Server {
         *self.healing.write().await = Some(healing);
     }
 
-    /// Start the metadata replication retry loop.
-    /// Every 30 seconds, drain the pending_metadata_replication queue and retry
-    /// any entries that failed during the original fire-and-forget broadcast.
-    pub fn start_metadata_retry_loop(self: Arc<Self>) {
+    /// Start the leader metadata dissemination loop.
+    ///
+    /// Every 5 seconds (when this node is the leader), drain the per-follower
+    /// sled queue and send any pending metadata updates to each follower that
+    /// is currently online. Entries are removed only after the follower acks.
+    ///
+    /// On leader election (was_leader → is_leader transition), this loop also
+    /// runs a catch-up pass: it queries each follower's last received sequence
+    /// and re-enqueues any metadata the follower is missing.
+    pub fn start_metadata_dissemination_loop(self: Arc<Self>) {
         let server = self.clone();
         tokio::spawn(async move {
+            let mut was_leader = false;
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-                // Collect all pending entries, clearing the queue atomically per node.
-                let pending: Vec<(dfs_common::NodeId, Vec<FileMetadata>)> = server
-                    .pending_metadata_replication
-                    .iter()
-                    .map(|e| (*e.key(), e.value().clone()))
-                    .collect();
+                let is_leader = server.cluster.is_leader().await;
 
-                if pending.is_empty() {
+                // On leadership acquisition, run a catch-up pass to fill in
+                // what followers missed while we were a follower (or down).
+                if is_leader && !was_leader {
+                    info!("Became leader — running metadata catch-up for all followers");
+                    server.run_metadata_catchup().await;
+                }
+                was_leader = is_leader;
+
+                if !is_leader {
                     continue;
                 }
 
+                // Drain the queue for every online follower.
                 let nodes = server.cluster.get_all_nodes().await;
-                let node_map: std::collections::HashMap<dfs_common::NodeId, std::net::SocketAddr> =
-                    nodes.iter().map(|n| (n.id, n.addr)).collect();
+                let local_id = server.cluster.local_node_id();
 
-                for (node_id, items) in &pending {
-                    let addr = match node_map.get(node_id) {
-                        Some(a) => *a,
-                        None => continue, // node no longer in cluster
-                    };
-
-                    // Filter out entries for files deleted since they were queued.
-                    let live_items: Vec<FileMetadata> = items.iter()
-                        .filter(|m| {
-                            match server.metadata.get_file(&m.id) {
-                                Ok(None) => {
-                                    debug!("Retry: skipping deleted file '{}' ({})", m.path, m.id);
-                                    false
-                                }
-                                _ => true,
-                            }
-                        })
-                        .cloned()
-                        .collect();
-
-                    if live_items.is_empty() {
-                        server.pending_metadata_replication.remove(node_id);
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                         continue;
                     }
 
-                    // Send all live items in one batch instead of one message per file.
-                    let request = Request::ReplicateMetadataBatch { items: live_items.clone() };
+                    // Compact first — deduplicate writes to the same file.
+                    if let Err(e) = server.metadata.compact_meta_queue_for_node(node.id) {
+                        warn!("meta_queue compact error for {}: {}", node.id, e);
+                        continue;
+                    }
+
+                    let items = match server.metadata.drain_meta_queue_for_node(node.id) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("meta_queue drain error for {}: {}", node.id, e);
+                            continue;
+                        }
+                    };
+
+                    if items.is_empty() {
+                        continue;
+                    }
+
+                    let up_to_sequence = items.last().map(|(s, _)| *s).unwrap_or(0);
+                    let metadata_batch: Vec<FileMetadata> = items.into_iter().map(|(_, m)| m).collect();
+                    let count = metadata_batch.len();
+
+                    let req = Request::DisseminateMetadata {
+                        items: metadata_batch,
+                        up_to_sequence,
+                    };
+
                     let result = tokio::time::timeout(
                         tokio::time::Duration::from_secs(10),
-                        server.client.send_message(addr, Message::Request(request)),
+                        server.client.send_message(node.addr, Message::Request(req)),
                     ).await;
 
                     match result {
                         Ok(Ok(_)) => {
-                            info!("Retry: replicated {} metadata items to {}", live_items.len(), addr);
-                            server.pending_metadata_replication.remove(node_id);
+                            debug!("Disseminated {} metadata items to {} (seq≤{})", count, node.id, up_to_sequence);
+                            if let Err(e) = server.metadata.ack_meta_queue_for_node(node.id, up_to_sequence) {
+                                warn!("meta_queue ack error for {}: {}", node.id, e);
+                            }
                         }
                         Ok(Err(e)) => {
-                            warn!("Retry: failed to replicate {} metadata items to {}: {}", live_items.len(), addr, e);
-                            // Keep all live items for next retry
-                            server.pending_metadata_replication.insert(*node_id, live_items);
+                            debug!("Metadata dissemination to {} failed (will retry): {}", node.id, e);
                         }
                         Err(_) => {
-                            warn!("Retry: timeout replicating {} metadata items to {}", live_items.len(), addr);
-                            server.pending_metadata_replication.insert(*node_id, live_items);
+                            debug!("Metadata dissemination to {} timed out (will retry)", node.id);
                         }
                     }
                 }
             }
         });
+    }
+
+    /// Catch-up pass run when this node becomes leader.
+    ///
+    /// Two-phase process:
+    ///
+    /// Phase 1 — Pull merge: query every follower's file inventory (FileId, modified_at).
+    /// For any file that exists on a follower but NOT on us (or has a newer modified_at),
+    /// fetch the full metadata and store it locally.  This recovers writes that landed on
+    /// a follower during the window between the previous leader writing and crashing.
+    ///
+    /// Phase 2 — Push enqueue: for every follower, enqueue all files they are missing
+    /// (determined by comparing our inventory against theirs after the pull merge).
+    /// The dissemination loop delivers these within 5 seconds.
+    async fn run_metadata_catchup(&self) {
+        let nodes = self.cluster.get_all_nodes().await;
+        let local_id = self.cluster.local_node_id();
+
+        // Build our own inventory once (blocking sled scan).
+        let metadata = self.metadata.clone();
+        let my_inventory_result = tokio::task::spawn_blocking(move || metadata.get_file_inventory()).await;
+        let my_inventory: std::collections::HashMap<FileId, u64> = match my_inventory_result {
+            Ok(Ok(v)) => v.into_iter().collect(),
+            Ok(Err(e)) => { warn!("catchup: failed to build local inventory: {}", e); return; }
+            Err(e) => { warn!("catchup: spawn_blocking panic building inventory: {}", e); return; }
+        };
+
+        info!("catchup: starting with {} local file records", my_inventory.len());
+
+        // --- Phase 1: pull anything we're missing from each follower ---
+        // Collect all file IDs we pull so we can update our inventory for Phase 2.
+        let mut pulled_total = 0usize;
+
+        for node in &nodes {
+            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+
+            // Fetch the follower's inventory.
+            let inv_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(10),
+                self.client.send_message(node.addr, Message::Request(Request::GetFileInventory)),
+            ).await;
+
+            let follower_inventory: Vec<(FileId, u64)> = match inv_result {
+                Ok(Ok(env)) => match env.message {
+                    Message::Response(Response::FileInventory { entries }) => entries,
+                    other => {
+                        warn!("catchup: unexpected inventory response from {}: {:?}", node.id, other);
+                        continue;
+                    }
+                },
+                Ok(Err(e)) => { warn!("catchup: inventory fetch from {} failed: {}", node.id, e); continue; }
+                Err(_) => { warn!("catchup: inventory fetch from {} timed out", node.id); continue; }
+            };
+
+            // Find files the follower has that we don't, or that are newer on the follower.
+            let missing: Vec<FileId> = follower_inventory.iter()
+                .filter_map(|(id, follower_modified_at)| {
+                    match my_inventory.get(id) {
+                        None => Some(*id),  // we don't have it at all
+                        Some(our_modified_at) if follower_modified_at > our_modified_at => Some(*id),
+                        _ => None,
+                    }
+                })
+                .collect();
+
+            if missing.is_empty() {
+                debug!("catchup: {} has nothing we're missing", node.id);
+                continue;
+            }
+
+            info!("catchup: {} has {} records we need — fetching", node.id, missing.len());
+
+            // Fetch the full metadata for missing/stale records in batches of 200.
+            for chunk in missing.chunks(200) {
+                let batch_result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(15),
+                    self.client.send_message(node.addr, Message::Request(Request::GetFileMetadataBatch {
+                        file_ids: chunk.to_vec(),
+                    })),
+                ).await;
+
+                let batch: Vec<FileMetadata> = match batch_result {
+                    Ok(Ok(env)) => match env.message {
+                        Message::Response(Response::FileMetadataBatch { items }) => items,
+                        other => {
+                            warn!("catchup: unexpected batch response from {}: {:?}", node.id, other);
+                            continue;
+                        }
+                    },
+                    Ok(Err(e)) => { warn!("catchup: batch fetch from {} failed: {}", node.id, e); continue; }
+                    Err(_) => { warn!("catchup: batch fetch from {} timed out", node.id); continue; }
+                };
+
+                // Store each record locally if it's still newer than what we have.
+                let metadata = self.metadata.clone();
+                let chunk_map = self.chunk_map.clone();
+                let batch_clone = batch.clone();
+                let store_result = tokio::task::spawn_blocking(move || {
+                    let mut stored = 0usize;
+                    for item in &batch_clone {
+                        // Re-check: only store if still missing or newer.
+                        let should_store = match metadata.get_file(&item.id)? {
+                            None => true,
+                            Some(existing) => item.modified_at > existing.modified_at,
+                        };
+                        if should_store {
+                            metadata.put_file(item)?;
+                            stored += 1;
+                        }
+                    }
+                    Ok::<usize, anyhow::Error>(stored)
+                }).await;
+
+                match store_result {
+                    Ok(Ok(n)) => {
+                        pulled_total += n;
+                        // Update chunk map for stored records.
+                        for item in &batch {
+                            self.chunk_map_update(item).await;
+                        }
+                    }
+                    Ok(Err(e)) => warn!("catchup: store error pulling from {}: {}", node.id, e),
+                    Err(e) => warn!("catchup: spawn_blocking panic storing pull from {}: {}", node.id, e),
+                }
+            }
+        }
+
+        if pulled_total > 0 {
+            info!("catchup: pulled {} records from followers — leader DB is now authoritative", pulled_total);
+        }
+
+        // --- Phase 2: re-enqueue everything for followers that are behind ---
+        // Rebuild our inventory after the pull merge.
+        let metadata = self.metadata.clone();
+        let updated_inventory_result = tokio::task::spawn_blocking(move || metadata.get_file_inventory()).await;
+        let updated_inventory: std::collections::HashMap<FileId, u64> = match updated_inventory_result {
+            Ok(Ok(v)) => v.into_iter().collect(),
+            Ok(Err(e)) => { warn!("catchup: failed to rebuild inventory for push phase: {}", e); return; }
+            Err(e) => { warn!("catchup: spawn_blocking panic rebuilding inventory: {}", e); return; }
+        };
+
+        for node in &nodes {
+            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+
+            // Fetch the follower's inventory again (or reuse if we already have it).
+            // For simplicity, re-fetch — inventories are compact (~24 bytes per file).
+            let inv_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(10),
+                self.client.send_message(node.addr, Message::Request(Request::GetFileInventory)),
+            ).await;
+
+            let follower_has: std::collections::HashSet<FileId> = match inv_result {
+                Ok(Ok(env)) => match env.message {
+                    Message::Response(Response::FileInventory { entries }) => entries.into_iter().map(|(id, _)| id).collect(),
+                    _ => std::collections::HashSet::new(),
+                },
+                _ => std::collections::HashSet::new(),
+            };
+
+            // Enqueue everything the follower is missing.
+            let node_id = node.id;
+            let to_enqueue: Vec<FileId> = updated_inventory.keys()
+                .filter(|id| !follower_has.contains(id))
+                .copied()
+                .collect();
+
+            if to_enqueue.is_empty() {
+                debug!("catchup: {} is up-to-date after pull merge", node.id);
+                continue;
+            }
+
+            info!("catchup: enqueuing {} missing records for {}", to_enqueue.len(), node.id);
+
+            let metadata = self.metadata.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                metadata.scan_all_files(|meta| {
+                    if to_enqueue.contains(&meta.id) {
+                        let seq = metadata.next_meta_sequence()?;
+                        metadata.enqueue_meta_for_node(node_id, seq, &meta)?;
+                    }
+                    Ok(())
+                })
+            }).await;
+
+            match result {
+                Ok(Ok(scanned)) => debug!("catchup: scanned {} records, enqueued for {}", scanned, node_id),
+                Ok(Err(e)) => warn!("catchup: enqueue error for {}: {}", node_id, e),
+                Err(e) => warn!("catchup: spawn_blocking panic for {}: {}", node_id, e),
+            }
+        }
+
+        info!("catchup: complete");
     }
 
     /// Handle an incoming request message
@@ -383,6 +587,18 @@ impl Server {
             Request::ReconcileMetadata { live_file_ids } => {
                 self.handle_reconcile_metadata(live_file_ids).await
             }
+            Request::GetMetadataSequence => {
+                self.handle_get_metadata_sequence().await
+            }
+            Request::DisseminateMetadata { items, up_to_sequence } => {
+                self.handle_disseminate_metadata(items, up_to_sequence).await
+            }
+            Request::GetFileInventory => {
+                self.handle_get_file_inventory().await
+            }
+            Request::GetFileMetadataBatch { file_ids } => {
+                self.handle_get_file_metadata_batch(file_ids).await
+            }
             Request::PrefetchHint { chunk_ids } => {
                 self.handle_prefetch_hint(chunk_ids).await
             }
@@ -394,7 +610,7 @@ impl Server {
             }
             Request::ListDirectory { path } => self.handle_list_directory(path).await,
             Request::WriteFile { data } => self.handle_write_file(data).await,
-            Request::WriteFileLocalOnly { data } => self.handle_write_file_local_only(data).await,
+            Request::WriteFileLocalOnly { data, .. } => self.handle_write_file_local_only(data).await,
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
             Request::RenameFile { old_path, new_path } => {
                 self.handle_rename_file(old_path, new_path).await
@@ -1465,57 +1681,58 @@ impl Server {
         } // end outer match lookup
     }
 
-    /// Spawn a fire-and-forget metadata replication task to all online peers.
-    /// Failures are queued into pending_metadata_replication for retry every 30s.
-    /// Used by both handle_put_file_metadata and handle_append_file.
-    fn replicate_metadata_async(&self, metadata: FileMetadata) {
-        let cluster = self.cluster.clone();
-        let client = self.client.clone();
-        let sem = self.broadcast_semaphore.clone();
-        let retry_queue = self.pending_metadata_replication.clone();
+    /// Enqueue a metadata update into the per-follower durable sled queue.
+    /// Only the leader calls this. The dissemination loop drains the queue every 5s.
+    /// Non-leaders skip enqueueing — they just store locally and let the leader
+    /// handle dissemination to other followers.
+    async fn enqueue_metadata_for_followers(&self, metadata: &FileMetadata) {
+        if !self.cluster.is_leader().await {
+            return;
+        }
 
-        tokio::spawn(async move {
-            let _permit = sem.acquire().await.ok();
-            let nodes = cluster.get_all_nodes().await;
-            let local_id = cluster.local_node_id();
-
-            for node in nodes {
-                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                    continue;
-                }
-
-                let request = Request::ReplicateMetadata { metadata: metadata.clone() };
-                let result = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(30),
-                    client.send_message(node.addr, Message::Request(request))
-                ).await;
-
-                match result {
-                    Ok(Ok(_)) => debug!("Replicated metadata '{}' to {}", metadata.path, node.addr),
-                    Ok(Err(e)) => {
-                        warn!("Failed to replicate metadata to {} ({}): queuing retry", node.addr, e);
-                        retry_queue.entry(node.id).or_default().push(metadata.clone());
-                    }
-                    Err(_) => {
-                        warn!("Timeout replicating metadata to {} (30s): queuing retry", node.addr);
-                        retry_queue.entry(node.id).or_default().push(metadata.clone());
-                    }
-                }
+        let seq = match self.metadata.next_meta_sequence() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to increment meta sequence: {}", e);
+                return;
             }
-        });
+        };
+
+        let local_id = self.cluster.local_node_id();
+        let nodes = self.cluster.get_all_nodes().await;
+        for node in &nodes {
+            if node.id == local_id {
+                continue;
+            }
+            if let Err(e) = self.metadata.enqueue_meta_for_node(node.id, seq, metadata) {
+                warn!("Failed to enqueue metadata for node {}: {}", node.id, e);
+            }
+        }
     }
 
-    /// Handle put file metadata request
+    /// Handle put file metadata request.
+    ///
+    /// If this node is not the leader, return NotLeader so the client can redirect.
+    /// The leader stores locally, enqueues for followers, and returns Ok.
+    /// A non-leader that receives a direct write (e.g. quorum replica) stores locally
+    /// only — the leader will disseminate to the remaining followers.
     async fn handle_put_file_metadata(&self, metadata: FileMetadata) -> Response {
         debug!("Handling put file metadata: {}", metadata.path);
 
-        // Store metadata locally first
+        let is_leader = self.cluster.is_leader().await;
+
+        if !is_leader {
+            // Return the leader address so the client can redirect immediately.
+            let leader_addr = self.cluster.get_leader_addr().await;
+            return Response::NotLeader { leader_addr };
+        }
+
+        // Store locally first.
         match self.metadata.put_file(&metadata) {
             Ok(_) => {
-                // Update in-memory chunk map
                 self.chunk_map_update(&metadata).await;
-
-                self.replicate_metadata_async(metadata.clone());
+                // Enqueue for followers — dissemination loop delivers within 5s.
+                self.enqueue_metadata_for_followers(&metadata).await;
                 Response::Ok { data: None }
             }
             Err(e) => {
@@ -1525,6 +1742,70 @@ impl Server {
                     code: ErrorCode::InternalError,
                 }
             }
+        }
+    }
+
+    /// Handle GetMetadataSequence — return this node's last received (follower) or
+    /// last issued (leader) sequence number so a newly-elected leader can catch up.
+    async fn handle_get_metadata_sequence(&self) -> Response {
+        let seq = if self.cluster.is_leader().await {
+            self.metadata.current_meta_sequence().unwrap_or(0)
+        } else {
+            self.metadata.get_follower_sequence().unwrap_or(0)
+        };
+        Response::MetadataSequence { sequence: seq }
+    }
+
+    /// Handle DisseminateMetadata — leader delivers a batch to this follower.
+    /// Stores each item locally and records the sequence number.
+    async fn handle_disseminate_metadata(&self, items: Vec<FileMetadata>, up_to_sequence: u64) -> Response {
+        debug!("Handling disseminate metadata: {} items up to seq={}", items.len(), up_to_sequence);
+        let mut failed = 0usize;
+        for metadata in &items {
+            if let Err(e) = self.metadata.put_file(metadata) {
+                warn!("disseminate: failed to store '{}': {}", metadata.path, e);
+                failed += 1;
+            } else {
+                self.chunk_map_update(metadata).await;
+            }
+        }
+        // Record the highest sequence we've received.
+        if let Err(e) = self.metadata.set_follower_sequence(up_to_sequence) {
+            warn!("disseminate: failed to record follower sequence {}: {}", up_to_sequence, e);
+        }
+        if failed > 0 {
+            Response::Error {
+                message: format!("disseminate: {} items failed to store", failed),
+                code: ErrorCode::InternalError,
+            }
+        } else {
+            Response::Ok { data: None }
+        }
+    }
+
+    /// Return a compact file inventory: Vec<(FileId, modified_at)>.
+    async fn handle_get_file_inventory(&self) -> Response {
+        let metadata = self.metadata.clone();
+        match tokio::task::spawn_blocking(move || metadata.get_file_inventory()).await {
+            Ok(Ok(entries)) => Response::FileInventory { entries },
+            Ok(Err(e)) => {
+                warn!("get_file_inventory failed: {}", e);
+                Response::Error { message: e.to_string(), code: ErrorCode::InternalError }
+            }
+            Err(e) => Response::Error { message: e.to_string(), code: ErrorCode::InternalError },
+        }
+    }
+
+    /// Fetch full metadata for a batch of file IDs.
+    async fn handle_get_file_metadata_batch(&self, file_ids: Vec<FileId>) -> Response {
+        let metadata = self.metadata.clone();
+        match tokio::task::spawn_blocking(move || metadata.get_files_batch(&file_ids)).await {
+            Ok(Ok(items)) => Response::FileMetadataBatch { items },
+            Ok(Err(e)) => {
+                warn!("get_file_metadata_batch failed: {}", e);
+                Response::Error { message: e.to_string(), code: ErrorCode::InternalError }
+            }
+            Err(e) => Response::Error { message: e.to_string(), code: ErrorCode::InternalError },
         }
     }
 
@@ -1770,9 +2051,8 @@ impl Server {
         // Update in-memory chunk map
         self.chunk_map_update(&metadata).await;
 
-        // --- Step 10: Async metadata replication — same path as handle_put_file_metadata,
-        // including the retry queue so failures on slow/full nodes are retried. ---
-        self.replicate_metadata_async(metadata.clone());
+        // --- Step 10: Enqueue metadata for follower dissemination (leader-only). ---
+        self.enqueue_metadata_for_followers(&metadata).await;
 
         // Tell the client how many bytes remain before this chunk seals.
         // When remaining_in_chunk == 0 the chunk is exactly full and the client
@@ -1886,14 +2166,9 @@ impl Server {
                         // Remove from chunk map
                         self.chunk_map_remove(&metadata.id).await;
 
-                        // Purge any pending metadata retry entries for this file.
-                        // The retry queue holds stale ReplicateMetadata entries from before
-                        // the delete; without this, the retry loop would push the deleted
-                        // file back onto peers every 30 seconds, resurrecting it after rm.
-                        let deleted_id = metadata.id;
-                        for mut entry in self.pending_metadata_replication.iter_mut() {
-                            entry.value_mut().retain(|m| m.id != deleted_id);
-                        }
+                        // No pending_metadata_replication queue to purge — the sled
+                        // meta_queue is deduped by FileId on drain, and deleted files are
+                        // absent from the DB so they'll be skipped in the catchup scan.
 
                         // Delete chunk location records from local metadata DB immediately.
                         // This is the critical step that was missing — without it, chunk: keys

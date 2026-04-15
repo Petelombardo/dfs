@@ -1322,11 +1322,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let wait_start = std::time::Instant::now();
                 let mut data_found = false;
 
-                // Poll for up to 200ms (20 attempts @ 10ms each)
-                // With server-side caching, subsequent reads should be fast
-                // But don't wait too long - parallel fetches may be faster than waiting
-                for attempt in 0..20 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                // Poll for up to 3s (60 attempts @ 50ms each).
+                // SBC spinning disks can take 300-500ms for a cold read; 200ms was
+                // too short and caused spurious timeouts that then failed the fallback
+                // fetch as well (both requests racing for the same replica).
+                for attempt in 0..60 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
                     // Check chunk cache
                     let chunk_cache = self.chunk_cache.lock().await;
@@ -1338,8 +1339,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                     drop(chunk_cache);
 
-                    if attempt % 10 == 0 {
-                        debug!("Still waiting for chunk {} (attempt {})", chunk_id, attempt);
+                    if attempt % 20 == 0 && attempt > 0 {
+                        debug!("Still waiting for chunk {} ({}ms elapsed)", chunk_id, attempt * 50);
                     }
                 }
 
@@ -2940,99 +2941,102 @@ leader_addr: Arc::new(RwLock::new(None)),
         locations
     }
 
-    /// Write file metadata with quorum (3-node writes for split-brain prevention)
-    /// Requires at least 2 out of 3 writes to succeed
-    /// Uses the same 2 nodes that received chunk replicas + 1 additional node when possible
+    /// Write file metadata to the leader (with redirect on NotLeader) plus one
+    /// additional node for durability.  The leader owns dissemination to all other
+    /// followers via its sled-backed queue, so we no longer fan-out to all nodes.
+    ///
+    /// Retry strategy:
+    ///   1. Send to the known leader (or any node if leader unknown).
+    ///   2. If the response is NotLeader{leader_addr}, update our cached leader and retry.
+    ///   3. After getting leader ack, send to one non-leader for durability (fire-and-forget).
+    ///   4. Up to 4 retries total; on exhaustion, fall back to single-node write.
     pub async fn put_file_metadata_with_quorum(
         &self,
         metadata: &FileMetadata,
-        replica_nodes: Option<(SocketAddr, SocketAddr)>
+        _replica_nodes: Option<(SocketAddr, SocketAddr)>
     ) -> Result<()> {
         let nodes = self.cluster_nodes.read().await.clone();
-
-        // Need at least 3 nodes for quorum, fall back to single-node write otherwise
-        if nodes.len() < 3 {
-            info!("Not enough nodes for quorum ({} < 3), falling back to single-node metadata write", nodes.len());
-            return self.put_file_metadata_single(metadata).await;
+        if nodes.is_empty() {
+            anyhow::bail!("No cluster nodes available for metadata write");
         }
 
-        // Write to ALL nodes in parallel, return as soon as quorum (2) succeeds.
-        // Remaining writes complete in the background — a slow node never blocks the write path.
-        // Every node needs the metadata so the healer sees the correct replica set.
-        info!("Writing metadata to all {} nodes", nodes.len());
+        // --- Step 1: Send to leader, retrying on NotLeader redirect. ---
+        let mut leader_addr = *self.leader_addr.read().await;
+        let mut leader_acked_node: Option<SocketAddr> = None;
+        let mut last_err = String::new();
 
-        // The leader runs the healer and uses its local metadata for discovery.
-        // Always wait for the leader's ack before returning — otherwise the healer
-        // may see stale metadata and over-replicate chunks in the next cycle.
-        // If the leader is unknown or fails, fall back to any 2 successes.
-        let leader_addr = *self.leader_addr.read().await;
+        for attempt in 0..4u32 {
+            // Pick target: known leader, else first node.
+            let target = leader_addr.unwrap_or_else(|| nodes[0]);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(nodes.len());
-        for &node in &nodes {
             let req = Request::PutFileMetadata { metadata: metadata.clone() };
+            match self.send_request(target, req).await {
+                Ok(Response::Ok { .. }) => {
+                    // Leader accepted.
+                    *self.leader_addr.write().await = Some(target);
+                    leader_acked_node = Some(target);
+                    break;
+                }
+                Ok(Response::NotLeader { leader_addr: redirect }) => {
+                    debug!("PutFileMetadata: {} said NotLeader, redirecting to {:?}", target, redirect);
+                    if let Some(addr) = redirect {
+                        *self.leader_addr.write().await = Some(addr);
+                        leader_addr = Some(addr);
+                    } else {
+                        // Leader unknown — try next node.
+                        let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
+                        leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
+                    }
+                    if attempt < 3 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100 << attempt)).await;
+                    }
+                }
+                Ok(other) => {
+                    last_err = format!("unexpected response from {}: {:?}", target, other);
+                    warn!("PutFileMetadata: {}", last_err);
+                    // Try next node.
+                    let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
+                    leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
+                }
+                Err(e) => {
+                    last_err = format!("{}: {}", target, e);
+                    warn!("PutFileMetadata to {} failed (attempt {}): {}", target, attempt + 1, e);
+                    // Mark leader unknown; try next node.
+                    leader_addr = None;
+                    *self.leader_addr.write().await = None;
+                    let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
+                    leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
+                    if attempt < 3 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100 << attempt)).await;
+                    }
+                }
+            }
+        }
+
+        if leader_acked_node.is_none() {
+            anyhow::bail!("Metadata write to leader failed after retries: {}", last_err);
+        }
+
+        // --- Step 2: Fire a durability replica to one non-leader node (fire-and-forget). ---
+        // This means at least 2 nodes have the write before we return, so a single
+        // node failure (including the leader) doesn't lose the update.
+        let leader = leader_acked_node.unwrap();
+        if let Some(&replica_target) = nodes.iter().find(|&&n| n != leader) {
             let client = self.clone();
-            let tx = tx.clone();
+            let meta = metadata.clone();
             tokio::spawn(async move {
-                let result = client.send_request(node, req).await;
-                let _ = tx.send((node, result)).await;
+                let req = Request::ReplicateMetadata { metadata: meta };
+                if let Err(e) = client.send_request(replica_target, req).await {
+                    debug!("Durability replica to {} failed (leader will catch up): {}", replica_target, e);
+                }
             });
         }
-        drop(tx);
 
-        let mut success_count = 0;
-        let mut success_node: Option<SocketAddr> = None;
-        let mut leader_confirmed = leader_addr.is_none(); // if unknown, don't require it
-        let mut errors = Vec::new();
-        let mut received = 0;
-
-        while received < nodes.len() {
-            match rx.recv().await {
-                Some((node, Ok(_))) => {
-                    success_count += 1;
-                    if success_node.is_none() { success_node = Some(node); }
-                    if Some(node) == leader_addr { leader_confirmed = true; }
-                    received += 1;
-                    // Return early once we have quorum AND leader confirmed.
-                    if success_count >= 2 && leader_confirmed {
-                        info!("Metadata quorum reached: {}/{} nodes (leader confirmed), returning early",
-                              success_count, nodes.len());
-                        break;
-                    }
-                }
-                Some((node, Err(e))) => {
-                    if Some(node) == leader_addr {
-                        // Leader failed — don't block on it, any 2 will do.
-                        warn!("Metadata write to leader {} failed: {} — quorum without leader", node, e);
-                        leader_confirmed = true;
-                    }
-                    errors.push(format!("{}: {}", node, e));
-                    received += 1;
-                    let remaining = nodes.len() - received;
-                    if success_count + remaining < 2 {
-                        anyhow::bail!("Metadata write failed: quorum unreachable. Errors: {:?}", errors);
-                    }
-                }
-                None => break,
-            }
-        }
-
-        if success_count < 2 {
-            anyhow::bail!("Metadata write failed: only {}/{} nodes succeeded. Errors: {:?}", success_count, nodes.len(), errors);
-        }
-
-        info!("Metadata write succeeded: {}/{} nodes confirmed", success_count, nodes.len());
-
-        // Track SQLite writes for read-after-write consistency
+        // Track SQLite writes for read-after-write consistency.
         if Self::is_sqlite_file(&metadata.path) {
-            if let Some(node) = success_node {
-                let mut tracker = self.sqlite_write_tracker.lock().await;
-                tracker.put(metadata.path.clone(), (node, std::time::Instant::now()));
-
-                info!(
-                    "SQLite quorum write tracked: path={}, node={}, consistency_window={}ms",
-                    metadata.path, node, get_sqlite_consistency_window_ms()
-                );
-            }
+            let mut tracker = self.sqlite_write_tracker.lock().await;
+            tracker.put(metadata.path.clone(), (leader, std::time::Instant::now()));
+            debug!("SQLite write tracked: path={}, node={}", metadata.path, leader);
         }
 
         Ok(())

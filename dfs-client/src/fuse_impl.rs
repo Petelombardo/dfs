@@ -72,7 +72,7 @@ impl ChunkSlot {
     }
 
     fn is_idle(&self) -> bool {
-        self.last_modified.elapsed().unwrap_or_default() > std::time::Duration::from_secs(5)
+        self.last_modified.elapsed().unwrap_or_default() > std::time::Duration::from_millis(500)
     }
 }
 
@@ -356,6 +356,12 @@ pub struct DfsFilesystem {
     /// close must not touch the write buffer of a concurrently writing fd.
     write_open_counts: Arc<DashMap<u64, usize>>,
 
+    /// High-water mark of reported file size per inode.
+    /// Prevents getattr from reporting a smaller size during the window between a
+    /// slot being flushed (removed from write_buffers) and the metadata being committed.
+    /// Cleared on release() once the file is fully closed.
+    size_high_water: Arc<DashMap<u64, u64>>,
+
     /// Shared reference to the background flusher's in-flight set.
     /// Set by the background flusher task after spawn; flush_buffer_async (fsync/close)
     /// waits for any in-flight background flush to complete before sending its own flush
@@ -532,6 +538,7 @@ impl DfsFilesystem {
             lock_manager: Arc::new(LockManager::new()),
             buffer_flush_threshold,
             write_open_counts: Arc::new(DashMap::new()),
+            size_high_water: Arc::new(DashMap::new()),
             flush_in_flight: flush_in_flight_shared,
             flush_handle,
         })
@@ -740,7 +747,7 @@ impl Filesystem for DfsFilesystem {
             let path_map = self.path_to_inode.read().unwrap();
             if let Some(&ino) = path_map.get(&path) {
                 let fresh = self.last_metadata_update.get(&ino)
-                    .map(|t| t.elapsed() < std::time::Duration::from_secs(30))
+                    .map(|t| t.elapsed() < std::time::Duration::from_secs(5))
                     .unwrap_or(false);
                 if fresh {
                     self.metadata_cache.get(&ino).map(|m| (ino, m.clone()))
@@ -885,6 +892,7 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
+        let size_high_water = self.size_high_water.clone();
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
@@ -926,15 +934,26 @@ impl Filesystem for DfsFilesystem {
                     // getattr reports, causing the player to stall waiting for the file to
                     // appear to grow.
                     if write_buffer_enabled {
-                        if let Some(state_lock) = write_buffers.get(&ino) {
+                        // Compute the logical end of any buffered-but-not-yet-flushed data
+                        let buffered_end = if let Some(state_lock) = write_buffers.get(&ino) {
                             let state = state_lock.lock().await;
-                            let buffered_end = state.slots.iter()
+                            state.slots.iter()
                                 .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
                                 .max()
-                                .unwrap_or(0);
-                            if buffered_end > metadata.size {
-                                metadata.size = buffered_end;
-                            }
+                                .unwrap_or(0)
+                        } else { 0 };
+
+                        // Apply high-water mark: never report a size smaller than previously
+                        // reported. This prevents the visible size oscillating down during the
+                        // window between a slot being flushed and metadata being committed.
+                        let hwm = size_high_water.get(&ino).map(|v| *v).unwrap_or(0);
+                        let reported = metadata.size.max(buffered_end).max(hwm);
+                        if reported > metadata.size {
+                            metadata.size = reported;
+                        }
+                        // Update high-water mark
+                        if reported > hwm {
+                            size_high_water.insert(ino, reported);
                         }
                     }
                 }
@@ -1524,10 +1543,10 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
-        // Check directory cache first (30-second TTL)
+        // Check directory cache first (5-second TTL)
         let cached_entries = self.dir_cache.get(&path).and_then(|entry| {
             let (entries, timestamp) = &*entry;
-            if timestamp.elapsed() < std::time::Duration::from_secs(30) {
+            if timestamp.elapsed() < std::time::Duration::from_secs(5) {
                 debug!("Directory cache HIT for {}", path);
                 Some(entries.clone())
             } else {
@@ -1659,7 +1678,7 @@ impl Filesystem for DfsFilesystem {
                     async move {
                         // Skip if already cached and fresh
                         if let Some(entry) = dir_cache.get(&subdir) {
-                            if entry.1.elapsed() < std::time::Duration::from_secs(29) {
+                            if entry.1.elapsed() < std::time::Duration::from_secs(4) {
                                 return;
                             }
                         }
@@ -2554,7 +2573,10 @@ impl Filesystem for DfsFilesystem {
                 if *count > 0 { *count -= 1; }
                 if *count == 0 { remove = true; }
             }
-            if remove { self.write_open_counts.remove(&ino); }
+            if remove {
+                self.write_open_counts.remove(&ino);
+                self.size_high_water.remove(&ino);
+            }
         }
 
         let lock_manager = self.lock_manager.clone();

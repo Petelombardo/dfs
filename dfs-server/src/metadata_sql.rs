@@ -306,24 +306,56 @@ impl SqlMetadataStore {
 
     /// List all files in a directory
     pub fn list_directory(&self, dir_path: &str) -> Result<Vec<FileMetadata>> {
-        let pattern = format!("{}/%", dir_path.trim_end_matches('/'));
+        let prefix = format!("{}/", dir_path.trim_end_matches('/'));
+        let pattern = format!("{}%", prefix);
 
+        // Fetch all paths under this directory (any depth)
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM files WHERE path LIKE ?1 AND path NOT LIKE ?2"
+            "SELECT id, path FROM files WHERE path LIKE ?1"
         )?;
 
-        let deep_pattern = format!("{}/%/%", dir_path.trim_end_matches('/'));
-        let file_ids: Vec<Vec<u8>> = stmt.query_map(params![pattern, deep_pattern], |row| {
-            row.get(0)
+        let rows: Vec<(Vec<u8>, String)> = stmt.query_map(params![pattern], |row| {
+            Ok((row.get(0)?, row.get(1)?))
         })?.collect::<Result<Vec<_>, _>>()?;
 
         let mut files = Vec::new();
-        for id_bytes in file_ids {
-            let mut id_array = [0u8; 16];
-            id_array.copy_from_slice(&id_bytes);
-            let file_id = FileId::from_bytes(id_array);
-            if let Some(metadata) = self.get_file_metadata(&file_id)? {
-                files.push(metadata);
+        let mut synthetic_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (id_bytes, path) in rows {
+            // Strip the prefix to get the relative path within this directory
+            let rel = &path[prefix.len()..];
+            if let Some(slash_pos) = rel.find('/') {
+                // This entry is deeper than one level — synthesize a directory entry
+                // for the immediate child directory if not already present.
+                let child_dir_name = &rel[..slash_pos];
+                let child_dir_path = format!("{}{}", prefix, child_dir_name);
+                if synthetic_dirs.insert(child_dir_path.clone()) {
+                    // Synthesize a directory entry — real directory records (0-byte entries
+                    // written by mkdir) will be deduplicated below when the direct-child
+                    // loop adds them; this covers the case where no real record exists.
+                    files.push(FileMetadata {
+                        id: dfs_common::FileId::new(),
+                        path: child_dir_path,
+                        size: 0,
+                        chunks: Vec::new(),
+                        chunk_sizes: Vec::new(),
+                        chunk_locations: Vec::new(),
+                        created_at: 0,
+                        modified_at: 0,
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
+                        file_type: dfs_common::FileType::Directory,
+                    });
+                }
+            } else {
+                // Direct child file — include it normally
+                let mut id_array = [0u8; 16];
+                id_array.copy_from_slice(&id_bytes);
+                let file_id = FileId::from_bytes(id_array);
+                if let Some(metadata) = self.get_file_metadata(&file_id)? {
+                    files.push(metadata);
+                }
             }
         }
 

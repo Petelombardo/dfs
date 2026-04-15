@@ -222,7 +222,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     ));
     healing.clone().start().await;
     server.set_healing_manager(healing.clone()).await;
-    server.clone().start_metadata_retry_loop();
+    server.clone().start_metadata_dissemination_loop();
     info!("✓ Healing manager started");
 
     // Start network server

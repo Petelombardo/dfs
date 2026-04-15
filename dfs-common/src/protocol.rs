@@ -283,6 +283,29 @@ pub enum Request {
     ReconcileMetadata {
         live_file_ids: Vec<FileId>,
     },
+
+    /// Ask a node for its current metadata sequence number.
+    /// Used by a newly-elected leader to determine how far behind each follower is.
+    GetMetadataSequence,
+
+    /// Ask a node for its full file inventory: Vec<(FileId, modified_at)>.
+    /// Used by a newly-elected leader to find metadata it is missing or that is
+    /// newer on a follower (e.g. written during a brief leader outage).
+    GetFileInventory,
+
+    /// Request specific file metadata records by ID.
+    /// Sent by the new leader to pull records it is missing from a follower.
+    GetFileMetadataBatch {
+        file_ids: Vec<FileId>,
+    },
+
+    /// Leader-to-follower dissemination: deliver a batch of metadata updates in
+    /// sequence order. The sequence number is the leader's monotonic counter.
+    /// Followers store `last_received_sequence` and ack; leader removes from queue.
+    DisseminateMetadata {
+        items: Vec<FileMetadata>,
+        up_to_sequence: u64,
+    },
 }
 
 /// Response types
@@ -415,6 +438,28 @@ pub enum Response {
     PrefetchAccepted {
         /// Number of chunks that will be prefetched
         accepted: usize,
+    },
+
+    /// Returned when a client sends PutFileMetadata to a non-leader.
+    /// The client should redirect to leader_addr and retry immediately.
+    NotLeader {
+        leader_addr: Option<std::net::SocketAddr>,
+    },
+
+    /// Response to GetMetadataSequence — the node's last-received sequence number.
+    MetadataSequence {
+        sequence: u64,
+    },
+
+    /// Response to GetFileInventory — compact list of all known files.
+    FileInventory {
+        /// (file_id, modified_at) for every file record on this node.
+        entries: Vec<(FileId, u64)>,
+    },
+
+    /// Response to GetFileMetadataBatch — full metadata for the requested files.
+    FileMetadataBatch {
+        items: Vec<FileMetadata>,
     },
 
     /// Error response

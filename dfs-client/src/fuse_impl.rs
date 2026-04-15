@@ -136,11 +136,12 @@ pub struct DfsFilesystem {
     /// Uses std::sync::Mutex (not tokio) because FUSE callbacks run on OS threads.
     write_inode_locks: Arc<DashMap<u64, Arc<std::sync::Mutex<()>>>>,
 
-    /// Per-inode semaphore limiting concurrent in-flight inline chunk flushes.
-    /// Allows up to 2 chunks to be on the wire simultaneously so the application
-    /// can fill the next chunk while the previous one is being sent (pipelining).
-    /// Acquiring a permit blocks when both slots are full, providing back pressure.
-    flush_semaphores: Arc<DashMap<u64, Arc<tokio::sync::Semaphore>>>,
+    /// Per-inode pending inline flush handle.
+    /// When a full chunk is spawned to tokio for flushing, the JoinHandle is stored here.
+    /// The NEXT write call for the same inode joins this handle first (blocking briefly
+    /// if the flush is still in-flight) before filling the next buffer slot.
+    /// This provides back pressure without blocking the FUSE thread during the flush itself.
+    pending_flushes: Arc<DashMap<u64, tokio::task::JoinHandle<()>>>,
 }
 
 impl DfsFilesystem {
@@ -244,7 +245,7 @@ impl DfsFilesystem {
             lock_manager: Arc::new(LockManager::new()),
             write_open_counts: Arc::new(DashMap::new()),
             write_inode_locks: Arc::new(DashMap::new()),
-            flush_semaphores: Arc::new(DashMap::new()),
+            pending_flushes: Arc::new(DashMap::new()),
         })
     }
 
@@ -390,14 +391,11 @@ impl DfsFilesystem {
     async fn flush_chunks_for_inode(&self, ino: u64, force: bool) -> Result<()> {
         let chunk_size = self.chunk_size;
 
-        // Wait for any in-flight inline flushes to complete before we inspect the
-        // chunk buffers.  We do this by acquiring all semaphore permits — once we hold
-        // both, no background flush task is running for this inode.
-        if let Some(sem) = self.flush_semaphores.get(&ino) {
-            let _p1 = sem.acquire().await.ok();
-            let _p2 = sem.acquire().await.ok();
-            // Permits are released when _p1/_p2 drop at end of this block, which is
-            // fine — all in-flight tasks have completed by the time we hold both.
+        // Drain any in-flight background flush before we inspect dirty buffers.
+        // Without this, the spawned task might still be writing chunk N while we
+        // try to collect it as dirty — causing a double-write or a missed flush.
+        if let Some((_, handle)) = self.pending_flushes.remove(&ino) {
+            handle.await.ok();
         }
 
         // Collect all (chunk_idx, data, file_offset) to flush, releasing locks quickly.
@@ -1643,7 +1641,7 @@ impl Filesystem for DfsFilesystem {
         let chunk_offset_cache = self.chunk_offset_cache.clone();
         let client = self.client.clone();
         let runtime = self.runtime.clone();
-        let flush_semaphores = self.flush_semaphores.clone();
+        let pending_flushes = self.pending_flushes.clone();
 
         // Acquire per-inode write lock to serialize concurrent writes to the same inode.
         // qemu-nbd issues parallel write requests; without this they'd race on chunk buffers.
@@ -1653,6 +1651,14 @@ impl Filesystem for DfsFilesystem {
             .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
             .clone();
         let _inode_guard = inode_lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Join any in-flight background flush for this inode before touching buffers.
+        // This is the back-pressure point: we block here only if the previous chunk's
+        // network write hasn't finished yet.  The FUSE thread is blocked, but only for
+        // the tail of the previous flush, not the full round-trip of the current one.
+        if let Some((_, handle)) = pending_flushes.remove(&ino) {
+            runtime.block_on(handle).ok();
+        }
 
         // --- 4MB-aligned chunk write path ---
         // Every write goes into a per-(ino, chunk_idx) buffer.
@@ -1836,13 +1842,17 @@ impl Filesystem for DfsFilesystem {
                 }
                 chunk_offset_cache.remove(&ino);
 
-                // Inline flush-on-full: when a chunk just became completely full, pipeline
-                // it to the cluster while the app continues writing the next chunk.
-                // Uses a per-inode semaphore (2 permits) so at most 2 chunks are in-flight
-                // simultaneously.  Acquiring a permit blocks when both are taken, providing
-                // back pressure that caps write speed to network throughput.
-                // Only full chunks (logical_len == chunk_size) are flushed here; partial
-                // tail chunks wait for fsync/release.
+                // Release the inode write lock before doing any network I/O.
+                // The buffer merging is done; holding the lock through the flush would
+                // block other FUSE operations (reads, getattr, readdir) for the entire
+                // network round-trip, causing timeouts under concurrent DVR workloads.
+                drop(_inode_guard);
+
+                // Inline flush-on-full: synchronously flush any chunk that just became
+                // completely full before returning to the kernel.  For sequential writers
+                // (DVR, cp, dd) each write fills one chunk then blocks here until the
+                // network write completes — natural back pressure, no extra threads, no
+                // semaphores, no deadlock risk.  Partial tail chunks wait for fsync/release.
                 let full_dirty_keys: Vec<u64> = {
                     write_chunk_buffers.iter()
                         .filter_map(|entry| {
@@ -1872,22 +1882,15 @@ impl Filesystem for DfsFilesystem {
                     });
                     if let Some(data) = flush_data {
                         let file_offset = cidx * chunk_size as u64;
+                        debug!("inline flush: ino={} chunk_idx={} offset={} (async spawn)", ino, cidx, file_offset);
 
-                        // Acquire a semaphore permit — blocks if 2 flushes are already
-                        // in-flight, providing back pressure to the writer.
-                        let sem = flush_semaphores
-                            .entry(ino)
-                            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(2)))
-                            .clone();
-                        let permit = runtime.block_on(sem.acquire_owned())
-                            .expect("semaphore closed");
-
+                        // Spawn the network write to tokio — do NOT block the FUSE thread.
+                        // Back pressure is applied at the START of the next write() call by
+                        // joining this handle after acquiring the inode lock.
                         let client_t = client.clone();
                         let metadata_t = metadata_cache.clone();
                         let buffers_t = write_chunk_buffers.clone();
-
-                        debug!("inline flush spawn: ino={} chunk_idx={} offset={}", ino, cidx, file_offset);
-                        runtime.spawn(async move {
+                        let handle = runtime.spawn(async move {
                             match client_t.write_data_with_cache(&data, ino, file_offset).await {
                                 Ok((_, _, locations_opt)) => {
                                     if let Some(locs) = locations_opt {
@@ -1895,15 +1898,13 @@ impl Filesystem for DfsFilesystem {
                                             &metadata_t, ino, &locs, file_offset, chunk_size, true,
                                         );
                                     }
-                                    // Persist metadata after each inline flush so dfs-admin
-                                    // and other clients see the current file size during
-                                    // long-running open writes (e.g. live DVR recordings).
+                                    // Persist metadata so dfs-admin sees current file size
+                                    // during long-running open writes (e.g. live DVR recordings).
                                     if let Some(meta) = metadata_t.get(&ino).map(|m| m.clone()) {
                                         if let Err(e) = client_t.put_file_metadata(&meta).await {
                                             error!("inline flush: metadata persist failed ino={}: {}", ino, e);
                                         }
                                     }
-                                    debug!("inline flush done: ino={} chunk_idx={}", ino, cidx);
                                 }
                                 Err(e) => {
                                     // Restore dirty so release/fsync retries
@@ -1915,8 +1916,8 @@ impl Filesystem for DfsFilesystem {
                                     error!("inline flush failed: ino={} chunk_idx={}: {}", ino, cidx, e);
                                 }
                             }
-                            drop(permit); // release back-pressure slot
                         });
+                        pending_flushes.insert(ino, handle);
                     }
                 }
 
@@ -2168,6 +2169,21 @@ impl Filesystem for DfsFilesystem {
                     for k in keys_to_remove {
                         self.write_chunk_buffers.remove(&k);
                     }
+                    // Clean up per-inode state — no longer needed after file is closed.
+                    self.write_inode_locks.remove(&ino);
+                    self.pending_flushes.remove(&ino);
+
+                    // If no more write-mode files are open anywhere, ask glibc to return
+                    // freed pages to the OS.  Chunk buffers are 4MB each; after a burst of
+                    // writes (e.g. 3 simultaneous DVR recordings) glibc holds onto the VA
+                    // even after the Vec<u8>s are dropped, keeping RSS high on low-RAM
+                    // systems like nanopir3 (1.9 GB, no swap).  malloc_trim(0) releases
+                    // the freed top-of-heap back to the kernel immediately.
+                    if self.write_open_counts.is_empty() {
+                        unsafe { libc::malloc_trim(0); }
+                        debug!("release: malloc_trim after all write FDs closed");
+                    }
+
                     reply.ok();
                 }
                 Err(e) => {

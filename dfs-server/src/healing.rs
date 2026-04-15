@@ -520,6 +520,10 @@ impl HealingManager {
         // --- HasChunks RPCs: one per online node, payload = that node's assignments ---
         // node_id → HashSet<ChunkId> confirmed present
         let mut node_chunk_presence: HashMap<NodeId, HashSet<ChunkId>> = HashMap::new();
+        // Nodes whose HasChunks RPC failed this cycle — skip in classification rather than
+        // treating as "chunk missing". A timeout means we don't know the node's state;
+        // penalizing it causes ghost pruning + over-replication on the next cycle.
+        let mut rpc_failed_nodes: HashSet<NodeId> = HashSet::new();
 
         // Local node: check storage directly (no network hop).
         if let Some(assigned) = node_assigned.get(&local_id) {
@@ -565,6 +569,7 @@ impl HealingManager {
                 }
                 Err(e) => {
                     warn!("HasChunks RPC failed for node {} ({}): skipping node for this scan cycle", node_info.id, e);
+                    rpc_failed_nodes.insert(node_info.id);
                 }
             }
         }
@@ -605,6 +610,13 @@ impl HealingManager {
                 }
                 // Only count online nodes — offline nodes are expected to be absent.
                 if online_nodes.iter().any(|n| n.id == *node_id) {
+                    if rpc_failed_nodes.contains(node_id) {
+                        // RPC timed out — we don't know if chunk is present.
+                        // Skip entirely: don't count as alive OR missing.
+                        // Treating as missing causes ghost pruning + over-replication.
+                        debug!("Chunk {} — node {} had RPC failure this cycle, skipping", chunk_id, node_id);
+                        continue;
+                    }
                     if node_chunk_presence.get(node_id).map_or(false, |s| s.contains(&chunk_id)) {
                         actual_replicas += 1;
                         confirmed_alive_nodes.push(*node_id);

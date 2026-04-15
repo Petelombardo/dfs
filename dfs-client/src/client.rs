@@ -2891,76 +2891,56 @@ leader_addr: Arc::new(RwLock::new(None)),
             return self.put_file_metadata_single(metadata).await;
         }
 
-        // Select 3 nodes for metadata writes
-        let (node1, node2, node3) = if let Some((r1, r2)) = replica_nodes {
-            // Use the 2 nodes that got chunk replicas + 1 additional node
-            let mut remaining: Vec<_> = nodes.iter()
-                .filter(|&&n| n != r1 && n != r2)
-                .copied()
-                .collect();
+        // Write to ALL nodes in parallel, return as soon as quorum (2) succeeds.
+        // Remaining writes complete in the background — a slow node never blocks the write path.
+        // Every node needs the metadata so the healer sees the correct replica set.
+        info!("Writing metadata to all {} nodes", nodes.len());
 
-            if remaining.is_empty() {
-                // Edge case: only 2 nodes in cluster, use them + repeat first
-                (r1, r2, r1)
-            } else {
-                // Pick first available 3rd node
-                let node3 = remaining[0];
-                (r1, r2, node3)
-            }
-        } else {
-            // No replica info, just use first 3 nodes
-            (nodes[0], nodes[1], nodes[2 % nodes.len()])
-        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(nodes.len());
+        for &node in &nodes {
+            let req = Request::PutFileMetadata { metadata: metadata.clone() };
+            let client = self.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = client.send_request(node, req).await;
+                let _ = tx.send((node, result)).await;
+            });
+        }
+        drop(tx);
 
-        info!("Writing metadata with quorum to 3 nodes: {}, {}, {}", node1, node2, node3);
-
-        // Write to all 3 nodes in parallel
-        let request1 = Request::PutFileMetadata { metadata: metadata.clone() };
-        let request2 = Request::PutFileMetadata { metadata: metadata.clone() };
-        let request3 = Request::PutFileMetadata { metadata: metadata.clone() };
-
-        let task1 = self.send_request(node1, request1);
-        let task2 = self.send_request(node2, request2);
-        let task3 = self.send_request(node3, request3);
-
-        let (result1, result2, result3) = tokio::join!(task1, task2, task3);
-
-        // Count successes
         let mut success_count = 0;
         let mut success_node: Option<SocketAddr> = None;
         let mut errors = Vec::new();
+        let mut received = 0;
 
-        if result1.is_ok() {
-            success_count += 1;
-            success_node = Some(node1);
-        } else if let Err(e) = result1 {
-            errors.push(format!("node1 ({}): {}", node1, e));
-        }
-
-        if result2.is_ok() {
-            success_count += 1;
-            if success_node.is_none() {
-                success_node = Some(node2);
+        while received < nodes.len() {
+            match rx.recv().await {
+                Some((node, Ok(_))) => {
+                    success_count += 1;
+                    if success_node.is_none() { success_node = Some(node); }
+                    received += 1;
+                    if success_count >= 2 {
+                        info!("Metadata quorum reached: {}/{} nodes, returning early", success_count, nodes.len());
+                        break;
+                    }
+                }
+                Some((node, Err(e))) => {
+                    errors.push(format!("{}: {}", node, e));
+                    received += 1;
+                    let remaining = nodes.len() - received;
+                    if success_count + remaining < 2 {
+                        anyhow::bail!("Metadata write failed: quorum unreachable. Errors: {:?}", errors);
+                    }
+                }
+                None => break,
             }
-        } else if let Err(e) = result2 {
-            errors.push(format!("node2 ({}): {}", node2, e));
         }
 
-        if result3.is_ok() {
-            success_count += 1;
-            if success_node.is_none() {
-                success_node = Some(node3);
-            }
-        } else if let Err(e) = result3 {
-            errors.push(format!("node3 ({}): {}", node3, e));
-        }
-
-        // Require quorum: at least 2 out of 3 must succeed
         if success_count < 2 {
-            anyhow::bail!("Metadata quorum write failed: only {}/3 succeeded. Errors: {:?}", success_count, errors);
+            anyhow::bail!("Metadata write failed: only {}/{} nodes succeeded. Errors: {:?}", success_count, nodes.len(), errors);
         }
 
-        info!("Metadata quorum write succeeded: {}/3 nodes", success_count);
+        info!("Metadata write succeeded: {}/{} nodes confirmed", success_count, nodes.len());
 
         // Track SQLite writes for read-after-write consistency
         if Self::is_sqlite_file(&metadata.path) {

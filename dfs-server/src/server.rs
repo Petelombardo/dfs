@@ -394,7 +394,7 @@ impl Server {
             }
             Request::ListDirectory { path } => self.handle_list_directory(path).await,
             Request::WriteFile { data } => self.handle_write_file(data).await,
-            Request::WriteFileLocalOnly { data, file_offset } => self.handle_write_file_local_only(data, file_offset).await,
+            Request::WriteFileLocalOnly { data } => self.handle_write_file_local_only(data).await,
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
             Request::RenameFile { old_path, new_path } => {
                 self.handle_rename_file(old_path, new_path).await
@@ -982,10 +982,8 @@ impl Server {
         debug!("Handling delete chunk: {}", chunk_id);
 
         // Always delete the chunk location record, even if the chunk data isn't here.
-        // A node may have a location record from a ReplicateChunkLocation broadcast
-        // without holding the actual bytes — that stale record must be purged too,
-        // otherwise it causes ghost entries that confuse the healer and corrupt reads
-        // after a file is deleted and a new file is written to the same path.
+        // A node may have a location record without the actual bytes — that stale record
+        // must be purged too, otherwise it causes ghost entries after delete+rewrite.
         if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
             warn!("Failed to delete chunk location record for {}: {}", chunk_id, e);
         }
@@ -1237,12 +1235,12 @@ impl Server {
     /// Write data locally only (no replication)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
     /// Healing creates the 3rd replica in background
-    pub async fn write_data_local_only(&self, data: &[u8], file_offset: u64) -> Result<Vec<(ChunkId, u64)>> {
+    pub async fn write_data_local_only(&self, data: &[u8]) -> Result<Vec<(ChunkId, u64)>> {
         let total_start = std::time::Instant::now();
-        info!("Writing {} bytes locally (no replication) at file_offset={}", data.len(), file_offset);
+        info!("Writing {} bytes locally (no replication)", data.len());
 
-        // Chunk the data using position-aware hashing to prevent deduplication aliasing
-        let chunks = self.chunker.chunk_data_at(data, file_offset);
+        // Chunk the data
+        let chunks = self.chunker.chunk_data(data);
         info!("Chunked into {} chunks (local write only)", chunks.len());
 
         // Write all chunks locally in parallel
@@ -1569,14 +1567,7 @@ impl Server {
 
         // --- Step 3: Read partial tail if file is not chunk-aligned ---
         let chunk_size = self.chunker.chunk_size() as u64;
-
-        // Use the actual written extent (sum of chunk sizes) as the true file position
-        // for append operations. metadata.size may be larger than the written extent when
-        // the file was pre-allocated via truncate (e.g. qemu-img creating a sparse qcow2).
-        // Appending at metadata.size would place chunks at the wrong offset (e.g. 8GiB
-        // instead of 0 for the first write into a freshly truncated file).
-        let written_extent: u64 = metadata.chunk_sizes.iter().sum();
-        let partial_bytes = written_extent % chunk_size;
+        let partial_bytes = metadata.size % chunk_size;
 
         let (write_data, drop_last_chunk, actual_partial_bytes) = if partial_bytes > 0 {
             // File ends mid-chunk — read back the partial last chunk and prepend it
@@ -1622,14 +1613,15 @@ impl Server {
         };
 
         // --- Step 4+5: Chunk the combined data ---
-        // base_offset is where the tail chunk starts (or where new data begins if aligned).
-        let base_offset = written_extent - actual_partial_bytes;
-        let chunks = self.chunker.chunk_data_at(&write_data, base_offset);
+        let chunks = self.chunker.chunk_data(&write_data);
         if chunks.is_empty() {
             // Nothing to write — return current metadata unchanged
             let remaining = chunk_size - (metadata.size % chunk_size);
             return Response::AppendFileResult { metadata, remaining_in_chunk: remaining };
         }
+
+        // Base file offset: where the chunk-aligned region starts, using actual disk size
+        let base_offset = metadata.size - actual_partial_bytes;
 
         // --- Step 6: Write each chunk with 2-replica guarantee ---
         let mut new_locations: Vec<ChunkLocation> = Vec::new();
@@ -1759,13 +1751,9 @@ impl Server {
         }
 
         // --- Step 8: Update metadata size and timestamp ---
-        // Use written_extent (actual sum of chunk sizes) as the base, not expected_offset
-        // or metadata.size — both may reflect a sparse pre-allocation (e.g. truncate to 8GiB)
-        // rather than the actual written data position. After appending, the new size is the
-        // sum of chunks already written plus the net new bytes added in this call.
-        // Also preserve any sparse size declared by a prior truncate-grow.
-        let appended_size = written_extent + (write_data.len() as u64 - actual_partial_bytes);
-        metadata.size = appended_size.max(metadata.size);
+        // Use actual_partial_bytes (from disk) not partial_bytes (from metadata) so
+        // the recorded size matches what's actually on disk.
+        metadata.size = expected_offset + (write_data.len() as u64 - actual_partial_bytes);
         metadata.modified_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1851,11 +1839,11 @@ impl Server {
 
     /// Handle write file request (local only, no replication)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
-    async fn handle_write_file_local_only(&self, data: Vec<u8>, file_offset: u64) -> Response {
-        debug!("Handling write file local only: {} bytes at offset {}", data.len(), file_offset);
+    async fn handle_write_file_local_only(&self, data: Vec<u8>) -> Response {
+        debug!("Handling write file local only: {} bytes", data.len());
 
         let local_node_id = self.cluster.local_node_id();
-        match self.write_data_local_only(&data, file_offset).await {
+        match self.write_data_local_only(&data).await {
             Ok(chunk_ids_with_sizes) => {
                 let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
                 let chunk_sizes: Vec<u64> = chunk_ids_with_sizes.iter().map(|(_, size)| *size).collect();
@@ -1953,14 +1941,9 @@ impl Server {
                                 }
                             }
 
-                            // Delete chunk data from ALL cluster nodes, not just loc.nodes.
-                            // loc.nodes only tracks the 2 initial replica nodes. The healer
-                            // may have replicated to additional nodes whose copies are not
-                            // listed in loc.nodes — those orphaned copies cause corruption
-                            // when a new file is written to the same path and a node returns
-                            // stale chunk location records from the old file.
-                            // Solution: broadcast DeleteChunk to every online node for every
-                            // chunk. Nodes that don't have the chunk ignore it harmlessly.
+                            // Delete chunks from ALL online nodes — not just loc.nodes.
+                            // The healer may have replicated to nodes not listed in loc.nodes;
+                            // those copies cause corruption after delete+rewrite.
                             info!("Deleting {} chunks from all nodes for file: {}", chunk_locations.len(), path_clone);
 
                             for loc in &chunk_locations {
@@ -1974,8 +1957,7 @@ impl Server {
                                 }
                                 let _ = metadata_store.delete_chunk_location(chunk_id);
 
-                                // Send DeleteChunk to every other online node — exhaustive so
-                                // healer replicas are cleaned up regardless of what loc.nodes says.
+                                // Send DeleteChunk to every other online node
                                 for node in &nodes {
                                     if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                                         continue;

@@ -521,8 +521,8 @@ impl HealingManager {
         // node_id → HashSet<ChunkId> confirmed present
         let mut node_chunk_presence: HashMap<NodeId, HashSet<ChunkId>> = HashMap::new();
         // Nodes whose HasChunks RPC failed this cycle — skip in classification rather than
-        // treating as "chunk missing". A timeout/error means we don't know the node's state;
-        // penalizing it as missing causes ghost pruning + over-replication on next cycle.
+        // treating as "chunk missing". A timeout means we don't know the node's state;
+        // penalizing it causes ghost pruning + over-replication on the next cycle.
         let mut rpc_failed_nodes: HashSet<NodeId> = HashSet::new();
 
         // Local node: check storage directly (no network hop).
@@ -611,10 +611,10 @@ impl HealingManager {
                 // Only count online nodes — offline nodes are expected to be absent.
                 if online_nodes.iter().any(|n| n.id == *node_id) {
                     if rpc_failed_nodes.contains(node_id) {
-                        // RPC timed out or failed — we don't know if the chunk is there.
-                        // Skip this node entirely: don't count it as alive OR as missing.
-                        // Treating it as missing causes ghost pruning + over-replication.
-                        debug!("Chunk {} — node {} had RPC failure this cycle, skipping classification", chunk_id, node_id);
+                        // RPC timed out — we don't know if chunk is present.
+                        // Skip entirely: don't count as alive OR missing.
+                        // Treating as missing causes ghost pruning + over-replication.
+                        debug!("Chunk {} — node {} had RPC failure this cycle, skipping", chunk_id, node_id);
                         continue;
                     }
                     if node_chunk_presence.get(node_id).map_or(false, |s| s.contains(&chunk_id)) {
@@ -816,16 +816,23 @@ impl HealingManager {
                         }
                     }
 
-                    // Skip healing_delay if chunk was never fully replicated to RF nodes.
+                    // For chunks that were never fully replicated to RF nodes, apply a
+                    // minimum delay of healing_delay_secs before healing. This prevents
+                    // the healer from adding replicas to chunks that are still being
+                    // actively written — the write pipeline emits chunks one at a time
+                    // and the healer must wait for the file to be fully written before
+                    // it can know the correct final replica set.
                     let never_fully_replicated = metadata_node_count < replication_factor;
-                    if never_fully_replicated || self.should_heal(&chunk_id).await {
-                        if never_fully_replicated {
-                            self.pending_healing.write().await
-                                .entry(chunk_id)
-                                .or_insert_with(|| Instant::now() - Duration::from_secs(self.healing_delay_secs + 1));
-                        }
+                    if self.should_heal(&chunk_id).await {
                         work.push((chunk_id, ReplicationStatus::UnderReplicated, confirmed_alive_nodes.clone()));
                     } else {
+                        if never_fully_replicated {
+                            // Ensure pending_healing entry exists so should_heal() starts
+                            // tracking the delay from first discovery.
+                            self.pending_healing.write().await
+                                .entry(chunk_id)
+                                .or_insert_with(Instant::now);
+                        }
                         pending_count += 1;
                     }
                 }

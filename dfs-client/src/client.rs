@@ -190,8 +190,6 @@ pub struct ChunkReadHint {
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-/// Round-robin counter for distributing dual-replica writes across node pairs.
-static WRITE_NODE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Maximum number of recent SQLite file writes to track for read-after-write consistency
 const SQLITE_WRITE_TRACKER_SIZE: usize = 256;
@@ -2209,12 +2207,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
         }
 
-        // Round-robin the preferred pair across consecutive chunk writes so data
-        // is spread evenly across all nodes rather than always landing on nodes[0]/[1].
-        let n = nodes.len();
-        let base = WRITE_NODE_COUNTER.fetch_add(1, Ordering::Relaxed) % n;
-        let preferred1 = nodes[base];
-        let preferred2 = nodes[(base + 1) % n];
+        // Use health-aware node selection with automatic fallback via write_chunk_to_replicas.
+        // Preferred pair is nodes[0]/nodes[1] but any 2 healthy nodes will do.
+        let preferred1 = nodes[0];
+        let preferred2 = nodes[1 % nodes.len()];
 
         info!("Writing {} bytes with synchronous dual-replica (preferred: {}, {})",
               data.len(), preferred1, preferred2);
@@ -2231,11 +2227,25 @@ leader_addr: Arc::new(RwLock::new(None)),
             drop(node_id_map);
         }
 
-        // The 2 replica nodes already have the chunk data and their own chunk IDs.
-        // Full chunk location metadata (both node IDs) is propagated to all nodes at
-        // release time via put_file_metadata quorum write — no need to broadcast
-        // per-chunk during writes.  Doing so fires 5 concurrent TCP connections per
-        // chunk and saturates storage nodes on large files (300MB = 375 connections).
+        // write_chunk_to_replicas already broadcasts ChunkLocation to all nodes.
+
+        // Broadcast the full ChunkLocation (with both node IDs) to ALL cluster nodes.
+        // Without this, nodes that didn't receive data only learn about replicas they
+        // stored themselves — dfs-admin file info shows single-node entries and the
+        // healing engine can't see the full replica set.
+        let all_nodes = self.cluster_nodes.read().await.clone();
+        for location in &chunk_locations {
+            let req = Request::ReplicateChunkLocation { location: location.clone() };
+            for &addr in &all_nodes {
+                let client = self.clone();
+                let req = req.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client.send_request(addr, req).await {
+                        debug!("Failed to replicate chunk location to {}: {}", addr, e);
+                    }
+                });
+            }
+        }
 
         // Populate byte-range cache for immediate read-back
         if inode > 0 {
@@ -2368,7 +2378,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok(final_locations)
     }
 
-    /// Write a single chunk to 2 replica nodes in parallel, with serial fallback if either fails.
+    /// Write a single chunk to 2 replica nodes, with fallback to other nodes if either fails.
     /// The server healer is responsible for lazily replicating to additional nodes up to RF.
     async fn write_chunk_to_replicas(
         &self,
@@ -2381,76 +2391,113 @@ leader_addr: Arc::new(RwLock::new(None)),
     ) -> Result<Vec<dfs_common::ChunkLocation>> {
         const WRITE_TIMEOUT_SECS: u64 = 30;
 
-        // Build ordered fallback list: preferred pair first, then others sorted by health.
+        // Build the ordered list of candidates: preferred pair first, then others as fallbacks.
+        // Sort so penalized nodes are tried last — healthy nodes get first crack at quorum.
+        //
+        // IMPORTANT: We must not write to a penalized node AND its healthy replacement in the same
+        // parallel round, or we end up with 3+ replicas on disk (the penalized write completes late).
+        // Fix: promote healthy rest nodes ahead of penalized preferred nodes in the candidate list,
+        // so the parallel pair is always 2 healthy nodes when healthy alternatives exist.
         let preferred: Vec<SocketAddr> = vec![replica1, replica2];
         let mut rest: Vec<SocketAddr> = all_nodes.iter().copied()
             .filter(|&n| n != replica1 && n != replica2)
             .collect();
-        let mut candidates = self.node_health.sort_by_health(&preferred).await;
-        rest = self.node_health.sort_by_health(&rest).await;
-        candidates.extend(rest);
 
-        // Try the preferred pair in parallel first — this is the fast path.
-        // Both writes fire simultaneously; we wait for both to complete (or fail).
-        // If either fails, fall back to serial attempts against remaining candidates.
-        let data_arc = std::sync::Arc::new(data.to_vec());
+        let sorted_preferred = self.node_health.sort_by_health(&preferred).await;
+        let sorted_rest = self.node_health.sort_by_health(&rest).await;
+        rest = sorted_rest;
 
-        let write_one = |client: Self, node: SocketAddr, d: std::sync::Arc<Vec<u8>>, offset: u64| async move {
-            let request = Request::WriteFileLocalOnly { data: d.as_ref().clone(), file_offset: offset };
+        // Count how many of the preferred pair are healthy (not penalized)
+        let mut healthy_preferred: Vec<SocketAddr> = Vec::new();
+        let mut penalized_preferred: Vec<SocketAddr> = Vec::new();
+        for &n in &sorted_preferred {
+            if self.node_health.is_penalized(n).await {
+                penalized_preferred.push(n);
+            } else {
+                healthy_preferred.push(n);
+            }
+        }
+
+        // Build candidates: healthy preferred first, then healthy rest (to fill any gaps from
+        // penalized preferred), then penalized preferred last (only used if no other choice).
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        candidates.extend_from_slice(&healthy_preferred);
+        // Fill up to 2 with healthy rest nodes before falling back to penalized preferred
+        for &n in &rest {
+            if candidates.len() >= 2 { break; }
+            if !penalized_preferred.contains(&n) {
+                candidates.push(n);
+            }
+        }
+        // Append penalized preferred (fallback only)
+        candidates.extend_from_slice(&penalized_preferred);
+        // Append remaining rest nodes not yet in candidates
+        for &n in &rest {
+            if !candidates.contains(&n) {
+                candidates.push(n);
+            }
+        }
+
+        // Try the preferred pair in parallel first — halves write latency on the hot path.
+        // If either fails, fall back to serial retries from the remaining candidates.
+        let mut successful: Vec<(SocketAddr, Response)> = Vec::new();
+
+        if candidates.len() >= 2 {
+            let n1 = candidates[0];
+            let n2 = candidates[1];
+            let req1 = Request::WriteFileLocalOnly { data: data.to_vec() };
+            let req2 = Request::WriteFileLocalOnly { data: data.to_vec() };
+            let t1 = tokio::time::timeout(
+                tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+                self.send_request(n1, req1),
+            );
+            let t2 = tokio::time::timeout(
+                tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
+                self.send_request(n2, req2),
+            );
+            let (r1, r2) = tokio::join!(t1, t2);
+            match r1 {
+                Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n1); successful.push((n1, resp)); }
+                Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n1, e); }
+                Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n1, WRITE_TIMEOUT_SECS); }
+            }
+            match r2 {
+                Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n2); successful.push((n2, resp)); }
+                Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n2, e); }
+                Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n2, WRITE_TIMEOUT_SECS); }
+            }
+        }
+
+        // Serial fallback for any missing replicas
+        let mut candidate_iter = candidates.iter().skip(if successful.len() == 2 { candidates.len() } else { 2 });
+        while successful.len() < 2 {
+            let node = match candidate_iter.next() {
+                Some(n) => *n,
+                None => anyhow::bail!(
+                    "Chunk write failed: could not get 2 replicas after trying all {} nodes",
+                    candidates.len()
+                ),
+            };
+
+            let request = Request::WriteFileLocalOnly { data: data.to_vec() };
             let result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
-                client.send_request(node, request),
+                self.send_request(node, request),
             ).await;
+
             match result {
-                Ok(Ok(response)) => Ok((node, response)),
-                Ok(Err(e)) => Err(format!("{}: {}", node, e)),
-                Err(_) => Err(format!("{}: timeout after {}s", node, WRITE_TIMEOUT_SECS)),
-            }
-        };
-
-        let (r1, r2) = tokio::join!(
-            write_one(self.clone(), candidates[0], data_arc.clone(), file_offset),
-            write_one(self.clone(), candidates[1], data_arc.clone(), file_offset),
-        );
-
-        let mut successful: Vec<(SocketAddr, Response)> = Vec::new();
-        let mut failed_nodes: Vec<SocketAddr> = Vec::new();
-
-        for (candidate, result) in [(candidates[0], r1), (candidates[1], r2)] {
-            match result {
-                Ok(pair) => successful.push(pair),
-                Err(e) => {
-                    warn!("Parallel replica write failed: {}, will retry serially", e);
-                    failed_nodes.push(candidate);
+                Ok(Ok(response)) => {
+                    debug!("Chunk replica write succeeded to {}", node);
+                    successful.push((node, response));
+                }
+                Ok(Err(e)) => {
+                    warn!("Chunk replica write to {} failed: {}, trying next node", node, e);
+                }
+                Err(_) => {
+                    warn!("Chunk replica write to {} timed out after {}s, trying next node",
+                          node, WRITE_TIMEOUT_SECS);
                 }
             }
-        }
-
-        // If either parallel write failed, fill in with serial fallback candidates.
-        if successful.len() < 2 {
-            for &node in candidates.iter().skip(2) {
-                if successful.len() >= 2 { break; }
-                let request = Request::WriteFileLocalOnly { data: data_arc.as_ref().clone(), file_offset };
-                let result = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
-                    self.send_request(node, request),
-                ).await;
-                match result {
-                    Ok(Ok(response)) => {
-                        debug!("Fallback replica write succeeded to {}", node);
-                        successful.push((node, response));
-                    }
-                    Ok(Err(e)) => warn!("Fallback replica write to {} failed: {}", node, e),
-                    Err(_) => warn!("Fallback replica write to {} timed out", node),
-                }
-            }
-        }
-
-        if successful.len() < 2 {
-            anyhow::bail!(
-                "Chunk write failed: could not get 2 replicas after trying all {} nodes",
-                candidates.len()
-            );
         }
 
         let (addr1, response1) = successful.remove(0);
@@ -2472,30 +2519,52 @@ leader_addr: Arc::new(RwLock::new(None)),
             anyhow::bail!("Replica mismatch: {} chunks vs {} chunks", chunk_ids_1.len(), chunk_ids_2.len());
         }
 
-        // Build ChunkLocation entries. Full metadata propagates to all nodes at
-        // release time via put_file_metadata — no per-chunk broadcast needed.
+        // Create ChunkLocation entries with the 2 nodes that received the data.
+        // The server healer will lazily replicate to additional nodes up to RF.
         let node_id_map = self.addr_to_node_id.read().await;
         let mut chunk_locations = Vec::new();
-        let mut current_offset = file_offset;
 
+        let mut current_offset = file_offset;
         for (idx, chunk_id) in chunk_ids_1.iter().enumerate() {
             if chunk_id != &chunk_ids_2[idx] {
                 warn!("Chunk ID mismatch at index {}: {} vs {}", idx, chunk_id, chunk_ids_2[idx]);
             }
+
             let node1_id = Self::resolve_node_id(&node_id_map, addr1);
             let node2_id = Self::resolve_node_id(&node_id_map, addr2);
+
             let chunk_size = chunk_sizes_1[idx] as usize;
-            chunk_locations.push(dfs_common::ChunkLocation {
+            let location = dfs_common::ChunkLocation {
                 chunk_id: *chunk_id,
                 nodes: vec![node1_id, node2_id],
                 size: chunk_size,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
                 written_at: None,
-            });
+            };
+
+            chunk_locations.push(location);
             current_offset += chunk_size as u64;
         }
         drop(node_id_map);
+
+        // Broadcast the full ChunkLocation (with both node IDs) to ALL cluster nodes.
+        // Without this, nodes that didn't receive data only learn about replicas they
+        // stored themselves — dfs-admin file info shows single-node entries and the
+        // healing engine can't see the full replica set.
+        let all_nodes_snapshot = all_nodes.to_vec();
+        for location in &chunk_locations {
+            let req = Request::ReplicateChunkLocation { location: location.clone() };
+            for &addr in &all_nodes_snapshot {
+                let client = self.clone();
+                let req = req.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client.send_request(addr, req).await {
+                        debug!("Failed to replicate chunk location to {}: {}", addr, e);
+                    }
+                });
+            }
+        }
 
         // Populate byte-range cache for immediate read-back
         if inode > 0 {
@@ -2761,7 +2830,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let total_start = std::time::Instant::now();
         let data_len = data.len();
 
-        let request = Request::WriteFileLocalOnly { data, file_offset: 0 };
+        let request = Request::WriteFileLocalOnly { data };
 
         // Create connection
         let mut stream = tokio::time::timeout(
@@ -2886,20 +2955,18 @@ leader_addr: Arc::new(RwLock::new(None)),
             return self.put_file_metadata_single(metadata).await;
         }
 
-        // Write metadata to ALL nodes in parallel.
-        // Every node needs the full chunk_locations so:
-        //   1. The healer on every node sees the correct replica set and doesn't
-        //      re-replicate chunks that are already at RF.
-        //   2. Delete operations on any node have the complete chunk list and can
-        //      clean up all copies, not just the 2 initial replica nodes.
-        // Quorum success (2/3 of first 3) is still required before returning OK
-        // to the caller — the remaining writes are best-effort.
+        // Write to ALL nodes in parallel, return as soon as quorum (2) succeeds.
+        // Remaining writes complete in the background — a slow node never blocks the write path.
+        // Every node needs the metadata so the healer sees the correct replica set.
         info!("Writing metadata to all {} nodes", nodes.len());
 
-        // Write to all nodes in parallel but return as soon as quorum (2) succeeds.
-        // Remaining writes complete in the background — a slow node never blocks the write path.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(nodes.len());
+        // The leader runs the healer and uses its local metadata for discovery.
+        // Always wait for the leader's ack before returning — otherwise the healer
+        // may see stale metadata and over-replicate chunks in the next cycle.
+        // If the leader is unknown or fails, fall back to any 2 successes.
+        let leader_addr = *self.leader_addr.read().await;
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel(nodes.len());
         for &node in &nodes {
             let req = Request::PutFileMetadata { metadata: metadata.clone() };
             let client = self.clone();
@@ -2909,10 +2976,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let _ = tx.send((node, result)).await;
             });
         }
-        drop(tx); // close sender so rx terminates when all tasks finish
+        drop(tx);
 
         let mut success_count = 0;
         let mut success_node: Option<SocketAddr> = None;
+        let mut leader_confirmed = leader_addr.is_none(); // if unknown, don't require it
         let mut errors = Vec::new();
         let mut received = 0;
 
@@ -2921,22 +2989,26 @@ leader_addr: Arc::new(RwLock::new(None)),
                 Some((node, Ok(_))) => {
                     success_count += 1;
                     if success_node.is_none() { success_node = Some(node); }
+                    if Some(node) == leader_addr { leader_confirmed = true; }
                     received += 1;
-                    // Return as soon as quorum is met — don't wait for slow nodes.
-                    if success_count >= 2 {
-                        info!("Metadata quorum reached: {}/{} nodes so far, returning early",
+                    // Return early once we have quorum AND leader confirmed.
+                    if success_count >= 2 && leader_confirmed {
+                        info!("Metadata quorum reached: {}/{} nodes (leader confirmed), returning early",
                               success_count, nodes.len());
                         break;
                     }
                 }
                 Some((node, Err(e))) => {
+                    if Some(node) == leader_addr {
+                        // Leader failed — don't block on it, any 2 will do.
+                        warn!("Metadata write to leader {} failed: {} — quorum without leader", node, e);
+                        leader_confirmed = true;
+                    }
                     errors.push(format!("{}: {}", node, e));
                     received += 1;
-                    // Check if quorum is still achievable.
                     let remaining = nodes.len() - received;
                     if success_count + remaining < 2 {
-                        anyhow::bail!("Metadata write failed: quorum unreachable, only {}/{} nodes succeeded. Errors: {:?}",
-                            success_count, nodes.len(), errors);
+                        anyhow::bail!("Metadata write failed: quorum unreachable. Errors: {:?}", errors);
                     }
                 }
                 None => break,
@@ -2944,11 +3016,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         if success_count < 2 {
-            anyhow::bail!("Metadata write failed: only {}/{} nodes succeeded. Errors: {:?}",
-                success_count, nodes.len(), errors);
+            anyhow::bail!("Metadata write failed: only {}/{} nodes succeeded. Errors: {:?}", success_count, nodes.len(), errors);
         }
 
-        info!("Metadata write succeeded: {}/{} nodes confirmed (others in background)", success_count, nodes.len());
+        info!("Metadata write succeeded: {}/{} nodes confirmed", success_count, nodes.len());
 
         // Track SQLite writes for read-after-write consistency
         if Self::is_sqlite_file(&metadata.path) {

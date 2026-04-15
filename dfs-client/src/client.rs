@@ -2207,10 +2207,11 @@ leader_addr: Arc::new(RwLock::new(None)),
             anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
         }
 
-        // Use health-aware node selection with automatic fallback via write_chunk_to_replicas.
-        // Preferred pair is nodes[0]/nodes[1] but any 2 healthy nodes will do.
-        let preferred1 = nodes[0];
-        let preferred2 = nodes[1 % nodes.len()];
+        // Rotate the preferred pair by chunk index so each 4MB chunk lands on a different
+        // node pair. Without this, all chunks of a file go to nodes[0]+nodes[1].
+        let chunk_idx = (file_offset / (4 * 1024 * 1024)) as usize;
+        let preferred1 = nodes[chunk_idx % nodes.len()];
+        let preferred2 = nodes[(chunk_idx + 1) % nodes.len()];
 
         info!("Writing {} bytes with synchronous dual-replica (preferred: {}, {})",
               data.len(), preferred1, preferred2);

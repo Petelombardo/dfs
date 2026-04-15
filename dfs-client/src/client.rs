@@ -2896,6 +2896,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Every node needs the metadata so the healer sees the correct replica set.
         info!("Writing metadata to all {} nodes", nodes.len());
 
+        // The leader runs the healer and uses its local metadata for discovery.
+        // Always wait for the leader's ack before returning — otherwise the healer
+        // may see stale metadata and over-replicate chunks in the next cycle.
+        // If the leader is unknown or fails, fall back to any 2 successes.
+        let leader_addr = *self.leader_addr.read().await;
+
         let (tx, mut rx) = tokio::sync::mpsc::channel(nodes.len());
         for &node in &nodes {
             let req = Request::PutFileMetadata { metadata: metadata.clone() };
@@ -2910,6 +2916,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let mut success_count = 0;
         let mut success_node: Option<SocketAddr> = None;
+        let mut leader_confirmed = leader_addr.is_none(); // if unknown, don't require it
         let mut errors = Vec::new();
         let mut received = 0;
 
@@ -2918,13 +2925,21 @@ leader_addr: Arc::new(RwLock::new(None)),
                 Some((node, Ok(_))) => {
                     success_count += 1;
                     if success_node.is_none() { success_node = Some(node); }
+                    if Some(node) == leader_addr { leader_confirmed = true; }
                     received += 1;
-                    if success_count >= 2 {
-                        info!("Metadata quorum reached: {}/{} nodes, returning early", success_count, nodes.len());
+                    // Return early once we have quorum AND leader confirmed.
+                    if success_count >= 2 && leader_confirmed {
+                        info!("Metadata quorum reached: {}/{} nodes (leader confirmed), returning early",
+                              success_count, nodes.len());
                         break;
                     }
                 }
                 Some((node, Err(e))) => {
+                    if Some(node) == leader_addr {
+                        // Leader failed — don't block on it, any 2 will do.
+                        warn!("Metadata write to leader {} failed: {} — quorum without leader", node, e);
+                        leader_confirmed = true;
+                    }
                     errors.push(format!("{}: {}", node, e));
                     received += 1;
                     let remaining = nodes.len() - received;

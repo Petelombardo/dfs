@@ -5,13 +5,13 @@ use dfs_common::{ChunkId, ErrorCode, FileId, FileMetadata, Message, MessageEnvel
 use lru::LruCache;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, info, warn};
 
 /// Per-node health state used by NodeHealthTracker.
@@ -204,6 +204,116 @@ fn get_sqlite_consistency_window_ms() -> u64 {
         .unwrap_or(500)
 }
 
+/// Background metadata write queue.
+///
+/// Active writes enqueue metadata updates here instead of blocking the FUSE thread
+/// on a synchronous leader RPC. The worker drains the queue continuously, retrying
+/// with leader redirect on every failure. On file release (close), the caller
+/// bypasses the queue and sends synchronously via `flush_metadata_sync`.
+///
+/// Back-pressure: if the oldest item in the queue is >10s old (leader unreachable),
+/// new pushes block until the front clears. This propagates cluster unavailability
+/// back to the writer naturally.
+pub struct MetadataQueue {
+    /// (metadata, enqueue_time). Oldest at front; deduped by file_id.
+    inner: Mutex<VecDeque<(FileMetadata, Instant)>>,
+    /// Index: file_id -> position in inner, for O(1) dedup replace.
+    /// Kept in sync with inner on every push/pop.
+    index: Mutex<HashMap<FileId, usize>>,
+    /// Wakes the worker when a new item is pushed.
+    notify: Notify,
+    /// How long the oldest item may sit before new pushes block.
+    max_age: Duration,
+}
+
+impl MetadataQueue {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(VecDeque::new()),
+            index: Mutex::new(HashMap::new()),
+            notify: Notify::new(),
+            max_age: Duration::from_secs(10),
+        })
+    }
+
+    /// Enqueue a metadata update. If an entry for this file_id already exists,
+    /// replace its metadata in-place (keeping the original enqueue time for
+    /// back-pressure age tracking). Blocks if the oldest item is >max_age old.
+    pub async fn push(&self, metadata: FileMetadata) {
+        // Back-pressure: wait until the oldest item is young enough.
+        loop {
+            let age = {
+                let q = self.inner.lock().await;
+                q.front().map(|(_, t)| t.elapsed())
+            };
+            match age {
+                Some(a) if a > self.max_age => {
+                    // Queue is congested — yield and retry.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                _ => break,
+            }
+        }
+
+        let mut q = self.inner.lock().await;
+        let mut idx = self.index.lock().await;
+
+        if let Some(&pos) = idx.get(&metadata.id) {
+            // Dedup: replace in-place, keep original timestamp.
+            if let Some(entry) = q.get_mut(pos) {
+                entry.0 = metadata;
+                // Still notify: worker may have drained the queue and be waiting on notified().
+                // The item is still in the queue at pos; worker needs to wake up and pop it.
+                drop(q);
+                drop(idx);
+                self.notify.notify_one();
+                return;
+            }
+        }
+
+        // New entry.
+        let pos = q.len();
+        idx.insert(metadata.id, pos);
+        q.push_back((metadata, Instant::now()));
+        drop(q);
+        drop(idx);
+        self.notify.notify_one();
+    }
+
+    /// Remove and return the front item, if any.
+    async fn pop(&self) -> Option<FileMetadata> {
+        let mut q = self.inner.lock().await;
+        if let Some((meta, _)) = q.pop_front() {
+            // Rebuild index (positions shifted by 1).
+            let mut idx = self.index.lock().await;
+            idx.remove(&meta.id);
+            for (i, (m, _)) in q.iter().enumerate() {
+                idx.insert(m.id, i);
+            }
+            Some(meta)
+        } else {
+            None
+        }
+    }
+
+    /// Remove the entry for this file_id if present (used by release path
+    /// to take ownership of a queued update and send it synchronously).
+    pub async fn remove_by_file_id(&self, file_id: FileId) -> Option<FileMetadata> {
+        let mut q = self.inner.lock().await;
+        let mut idx = self.index.lock().await;
+        if let Some(pos) = idx.remove(&file_id) {
+            let (meta, _) = q.remove(pos)?;
+            // Rebuild index for entries that shifted.
+            for (i, (m, _)) in q.iter().enumerate() {
+                idx.insert(m.id, i);
+            }
+            Some(meta)
+        } else {
+            None
+        }
+    }
+}
+
 /// Client for communicating with DFS cluster
 #[derive(Clone)]
 pub struct DfsClient {
@@ -285,6 +395,11 @@ pub struct DfsClient {
     /// Replication factor fetched from cluster during refresh_cluster_nodes.
     /// Defaults to 2 until the first successful cluster status response.
     replication_factor: Arc<AtomicUsize>,
+
+    /// Async metadata write queue. Active writes enqueue here; background worker
+    /// drains to leader with redirect/retry. Release path bypasses this and sends
+    /// synchronously via flush_metadata_sync().
+    metadata_queue: Arc<MetadataQueue>,
 }
 
 impl DfsClient {
@@ -421,6 +536,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
+            metadata_queue: MetadataQueue::new(),
         })
     }
 
@@ -3143,6 +3259,75 @@ leader_addr: Arc::new(RwLock::new(None)),
     pub async fn put_file_metadata(&self, metadata: &FileMetadata) -> Result<()> {
         // Use quorum writes by default (will fall back internally if not enough nodes)
         self.put_file_metadata_with_quorum(metadata, None).await
+    }
+
+    /// Enqueue a metadata update for async delivery to the leader.
+    /// Returns immediately — the background worker handles retries and leader redirects.
+    /// Use this for in-progress writes where the FUSE thread must not block.
+    /// SQLite files are sent synchronously regardless (they require immediate consistency).
+    pub async fn enqueue_metadata(&self, metadata: &FileMetadata) {
+        if Self::is_sqlite_file(&metadata.path) {
+            // SQLite needs immediate consistency — bypass the queue.
+            if let Err(e) = self.put_file_metadata(metadata).await {
+                warn!("SQLite metadata sync failed ({}): {}", metadata.path, e);
+            }
+            return;
+        }
+        self.metadata_queue.push(metadata.clone()).await;
+    }
+
+    /// Send metadata to the leader synchronously, first draining any queued entry
+    /// for this file_id. Called from release() so close() blocks until the leader
+    /// confirms the final metadata before returning reply.ok().
+    pub async fn flush_metadata_sync(&self, metadata: &FileMetadata) -> Result<()> {
+        // Remove any pending async entry for this file — we'll send the caller's
+        // version (which is at least as fresh) synchronously instead.
+        self.metadata_queue.remove_by_file_id(metadata.id).await;
+        self.put_file_metadata(metadata).await
+    }
+
+    /// Spawn the background metadata queue worker onto the given runtime.
+    /// Must be called once after construction. The worker runs for the lifetime
+    /// of the process, retrying each item until the leader confirms receipt.
+    pub fn start_metadata_queue_worker(&self, runtime: &tokio::runtime::Handle) {
+        let client = self.clone();
+        runtime.spawn(async move {
+            loop {
+                // Wait for something to appear in the queue.
+                client.metadata_queue.notify.notified().await;
+
+                // Drain all available items before waiting again.
+                loop {
+                    let meta = match client.metadata_queue.pop().await {
+                        Some(m) => m,
+                        None => break,
+                    };
+
+                    // Retry until the leader confirms. Each failure re-identifies the leader.
+                    let mut attempts = 0u32;
+                    loop {
+                        match client.put_file_metadata_with_quorum(&meta, None).await {
+                            Ok(()) => {
+                                debug!("metadata_queue: delivered {} ({})", meta.path, meta.id);
+                                break;
+                            }
+                            Err(e) => {
+                                attempts += 1;
+                                let backoff_ms = (200u64 * attempts as u64).min(5000);
+                                warn!(
+                                    "metadata_queue: delivery failed for {} (attempt {}), \
+                                     retrying in {}ms: {}",
+                                    meta.path, attempts, backoff_ms, e
+                                );
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                // put_file_metadata_with_quorum already refreshes leader_addr
+                                // on NotLeader responses, so next attempt hits the new leader.
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Delete file

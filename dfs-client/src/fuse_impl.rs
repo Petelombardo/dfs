@@ -283,7 +283,13 @@ impl FlushHandle {
 
         let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
         if let Some(meta) = meta_to_persist {
-            let _ = self.client.put_file_metadata(&meta).await;
+            if force {
+                // release/fsync: wait for leader confirmation before returning.
+                let _ = self.client.flush_metadata_sync(&meta).await;
+            } else {
+                // Background tick: enqueue async, don't block the flush loop.
+                self.client.enqueue_metadata(&meta).await;
+            }
         }
 
         Ok(())
@@ -418,6 +424,9 @@ impl DfsFilesystem {
                 }
             }
         });
+
+        // Start background metadata queue worker.
+        client.start_metadata_queue_worker(&runtime);
 
         let metadata_cache = Arc::new(DashMap::<u64, FileMetadata>::new());
         let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
@@ -2088,14 +2097,10 @@ impl Filesystem for DfsFilesystem {
                                 .unwrap()
                                 .as_secs();
 
-                            // Store updated metadata
-                            if let Err(e) = runtime.block_on(async {
-                                client.put_file_metadata(&metadata).await
-                            }) {
-                                error!("Failed to store metadata after sparse write: {}", e);
-                                reply.error(libc::EIO);
-                                return;
-                            }
+                            // Enqueue metadata update async — data is already safe on disk.
+                            runtime.block_on(async {
+                                client.enqueue_metadata(&metadata).await;
+                            });
 
                             // Update cache
                             metadata_cache.insert(ino, metadata);
@@ -2415,64 +2420,22 @@ impl Filesystem for DfsFilesystem {
                         .unwrap()
                         .as_secs();
 
-                    // Check if this is a SQLite database file - they need immediate metadata updates
-                    let is_sqlite_db = is_sqlite_path(&metadata.path);
+                    // Enqueue metadata update async (sync for SQLite).
+                    // The background worker drains to the leader; data is already safe on disk.
+                    // Time-based batching is no longer needed: the queue deduplicates by file_id
+                    // so only the latest metadata snapshot is ever in-flight per file.
+                    let metadata_clone = metadata.clone();
+                    runtime.block_on(async {
+                        client.enqueue_metadata(&metadata_clone).await;
+                    });
 
-                    // Batch metadata updates for non-SQLite files: time-based (every 2 seconds)
-                    // For SQLite files: ALWAYS update immediately to prevent corruption
-                    let should_update = if is_sqlite_db {
-                        debug!("SQLite database detected - forcing immediate metadata update for ino={}", ino);
-                        true // Always update for SQLite
-                    } else {
-                        // Use time-based batching for regular files
-                        match last_metadata_update.get(&ino) {
-                            None => true,
-                            Some(last) => last.elapsed() >= std::time::Duration::from_secs(2)
-                        }
-                    };
-
-                    if should_update {
-                        // Store updated metadata
-                        let metadata_start = std::time::Instant::now();
-                        let metadata_clone = metadata.clone();
-                        let update_result = runtime.block_on(async {
-                            client.put_file_metadata(&metadata_clone).await
-                        });
-                        let metadata_elapsed = metadata_start.elapsed();
-
-                        // Record metadata update time for batching
-                        last_metadata_update.insert(ino, std::time::Instant::now());
-
-                        if is_sqlite_db {
-                            debug!("put_file_metadata took {:?} (SQLite immediate update)", metadata_elapsed);
-                        } else {
-                            debug!("put_file_metadata took {:?} (time-based batching)", metadata_elapsed);
-                        }
-
-                        match update_result {
-                            Ok(_) => {
-                                // Update cache
-                                metadata_cache.insert(ino, metadata);
-                                let total_elapsed = start.elapsed();
-                                debug!("TOTAL write() took {:?} for {} bytes ({:.2} MB/s)",
-                                    total_elapsed, data_vec.len(),
-                                    (data_vec.len() as f64 / 1024.0 / 1024.0) / total_elapsed.as_secs_f64());
-                                reply.written(data_vec.len() as u32);
-                            }
-                            Err(e) => {
-                                error!("Failed to update metadata: {}", e);
-                                reply.error(libc::EIO);
-                            }
-                        }
-                    } else {
-                        // Skip metadata update for this write, just cache locally
-                        metadata_cache.insert(ino, metadata);
-                        let total_elapsed = start.elapsed();
-                        debug!("TOTAL write() took {:?} for {} bytes (metadata skipped) ({:.2} MB/s)",
-                            total_elapsed, data_vec.len(),
-                            (data_vec.len() as f64 / 1024.0 / 1024.0) / total_elapsed.as_secs_f64());
-                        reply.written(data_vec.len() as u32);
-                    }
+                    // Update local cache and reply.
+                    metadata_cache.insert(ino, metadata);
+                    let total_elapsed = start.elapsed();
+                    debug!("TOTAL write() took {:?} for {} bytes ({:.2} MB/s)",
+                        total_elapsed, data_vec.len(),
+                        (data_vec.len() as f64 / 1024.0 / 1024.0) / total_elapsed.as_secs_f64());
+                    reply.written(data_vec.len() as u32);
                 }
                 Err(e) => {
                     error!("Failed to write data: {}", e);
@@ -2551,9 +2514,8 @@ impl Filesystem for DfsFilesystem {
                         };
 
                         if has_pending {
-                            debug!("flush: flushing pending metadata for ino={}", ino);
-                            client.put_file_metadata(&metadata).await?;
-                            // Reset write counter after successful metadata flush
+                            debug!("flush: enqueueing pending metadata async for ino={}", ino);
+                            client.enqueue_metadata(&metadata).await;
                             write_counters.write().unwrap().insert(ino, 0);
                         }
                     }
@@ -2653,10 +2615,9 @@ impl Filesystem for DfsFilesystem {
                 let metadata_opt = metadata_cache.get(&ino).map(|m| m.clone());
 
                 if let Some(metadata) = metadata_opt {
-                    // Always flush metadata on release for non-buffered writes — the 2-second
-                    // batch window means the final chunks may not have been committed yet.
-                    debug!("release: flushing metadata for ino={} ({} chunks)", ino, metadata.chunks.len());
-                    client.put_file_metadata(&metadata).await?;
+                    // release: send synchronously so close() confirms metadata on leader.
+                    debug!("release: flushing metadata sync for ino={} ({} chunks)", ino, metadata.chunks.len());
+                    client.flush_metadata_sync(&metadata).await?;
                     write_counters.write().unwrap().insert(ino, 0);
                 }
 
@@ -3296,9 +3257,8 @@ impl Filesystem for DfsFilesystem {
                     };
 
                     if has_pending {
-                        debug!("fsync: flushing pending metadata for ino={}", ino);
-                        client.put_file_metadata(&metadata).await?;
-                        // Reset write counter after successful metadata flush
+                        debug!("fsync: enqueueing pending metadata async for ino={}", ino);
+                        client.enqueue_metadata(&metadata).await;
                         write_counters.write().unwrap().insert(ino, 0);
                     }
                 }

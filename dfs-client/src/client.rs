@@ -1898,33 +1898,60 @@ leader_addr: Arc::new(RwLock::new(None)),
         let start = current_chunk_idx.unwrap_or(0).min(locations.len());
         let end = (start + 1000).min(locations.len());
 
-        let addr_map = self.addr_to_node_id.read().await;
-        // Build node_id -> SocketAddr reverse map from cluster nodes.
+        // Build NodeId -> SocketAddr from the cluster node list directly.
+        // This is authoritative and doesn't depend on addr_to_node_id being populated yet.
         let node_id_to_addr: std::collections::HashMap<dfs_common::NodeId, SocketAddr> = {
             let nodes = self.cluster_nodes.read().await;
-            // We need NodeId for each addr — use addr_to_node_id reverse.
-            addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
+            let addr_map = self.addr_to_node_id.read().await;
+            // Primary: invert addr_to_node_id (populated by refresh_cluster_nodes).
+            // Fallback: if addr_to_node_id is empty (first read before first refresh),
+            // use cluster_nodes directly paired with GetClusterStatus NodeIds if available.
+            if !addr_map.is_empty() {
+                addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
+            } else {
+                // addr_to_node_id not yet populated — can't map NodeIds to addrs.
+                // Return empty; replica_cache will miss and fall back to all-nodes.
+                std::collections::HashMap::new()
+            }
         };
-        drop(addr_map);
+
+        // If we have no mapping yet, fall back to all-nodes warmup so we at least
+        // have something rather than empty cache entries.
+        if node_id_to_addr.is_empty() {
+            let chunk_ids: Vec<ChunkId> = locations[start..end].iter()
+                .map(|l| l.chunk_id)
+                .collect();
+            self.warm_replica_cache_by_index(&chunk_ids, Some(0)).await;
+            return;
+        }
 
         let mut cache = self.replica_cache.lock().await;
         let mut warmed = 0usize;
+        let mut with_real_nodes = 0usize;
+        let nodes_fallback = {
+            let nodes = self.cluster_nodes.read().await;
+            Arc::new(nodes.clone())
+        };
+
         for loc in &locations[start..end] {
             if cache.contains(&loc.chunk_id) {
                 continue;
             }
-            // Map NodeIds to SocketAddrs, skip any we don't have an address for.
             let addrs: Vec<SocketAddr> = loc.nodes.iter()
                 .filter_map(|nid| node_id_to_addr.get(nid).copied())
                 .collect();
             if !addrs.is_empty() {
                 cache.put(loc.chunk_id, Arc::new(addrs));
-                warmed += 1;
+                with_real_nodes += 1;
+            } else {
+                // NodeId not in map (node removed, or stale location) — use all nodes.
+                cache.put(loc.chunk_id, Arc::clone(&nodes_fallback));
             }
+            warmed += 1;
         }
         if warmed > 0 {
-            info!("Warmed replica cache: {} new entries (range {}-{} of {} total chunks, using actual locations)",
-                  warmed, start, end, locations.len());
+            info!("Warmed replica cache: {} new entries (range {}-{} of {} total chunks, {} with real node mapping)",
+                  warmed, start, end, locations.len(), with_real_nodes);
         }
     }
 

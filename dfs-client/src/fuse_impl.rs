@@ -437,15 +437,15 @@ impl DfsFilesystem {
             warn!("Failed to query cluster chunk size, using default 4MB: {}", e);
             4  // Default to 4MB if query fails
         });
-        // Pipeline depth = ceil(32MB / chunk_size). Both the back-pressure cap and
-        // the write_data_pipelined in-flight limit derive from this.
+        // Buffer flush threshold = ceil(32MB / chunk_size) × chunk_size.
+        // This keeps ~32MB of data buffered in-flight regardless of chunk size.
         let chunk_size_bytes = chunk_size_mb * 1024 * 1024;
         let buffer_flush_threshold = chunk_size_bytes *
             ((32 * 1024 * 1024 + chunk_size_bytes - 1) / chunk_size_bytes);
-        client.set_pipeline_depth(chunk_size_bytes);
-        info!("Client configured with pipeline_depth={} chunks ({}MB in-flight)",
+        info!("Write buffer threshold: {}MB ({} chunks × {}MB)",
+              buffer_flush_threshold / (1024 * 1024),
               buffer_flush_threshold / chunk_size_bytes,
-              buffer_flush_threshold / (1024 * 1024));
+              chunk_size_mb);
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
         if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {

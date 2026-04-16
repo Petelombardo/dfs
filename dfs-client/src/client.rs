@@ -412,11 +412,6 @@ pub struct DfsClient {
     /// Defaults to 2 until the first successful cluster status response.
     replication_factor: Arc<AtomicUsize>,
 
-    /// Pipeline depth in chunks: ceil(32MB / chunk_size).
-    /// Set once at startup from the cluster chunk size config.
-    /// Used by write_data_pipelined to cap in-flight chunks at ~32MB regardless of chunk size.
-    pipeline_depth: Arc<AtomicUsize>,
-
     /// Async metadata write queue. Active writes enqueue here; background worker
     /// drains to leader with redirect/retry. Release path bypasses this and sends
     /// synchronously via flush_metadata_sync().
@@ -558,17 +553,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
-            pipeline_depth: Arc::new(AtomicUsize::new(8)), // default for 4MB; updated at startup
         })
-    }
-
-    /// Set the write pipeline depth based on cluster chunk size.
-    /// Called once after startup chunk-size query: ceil(32MB / chunk_size_bytes).
-    pub fn set_pipeline_depth(&self, chunk_size_bytes: usize) {
-        let depth = (32 * 1024 * 1024 + chunk_size_bytes - 1) / chunk_size_bytes;
-        self.pipeline_depth.store(depth, Ordering::Relaxed);
-        info!("Write pipeline depth: {} chunks (~{}MB in-flight)",
-              depth, depth * chunk_size_bytes / (1024 * 1024));
     }
 
     /// Check if a path represents a SQLite database file
@@ -2411,13 +2396,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         anyhow::bail!("read_chunk_by_id: failed to read chunk {} from any node", chunk_id)
     }
 
-    /// Write data to cluster with synchronous dual-replica replication
-    /// Returns (chunk_ids, chunk_sizes, replica_nodes)
-    pub async fn write_data(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
-        let (chunk_ids, chunk_sizes, _) = self.write_data_with_cache(data, 0, 0).await?;
-        Ok((chunk_ids, chunk_sizes))
-    }
-
     /// Write data with synchronous dual-replica replication
     /// NEW: Writes each chunk to 2 nodes synchronously (not striped)
     /// Returns chunk_locations with replica tracking
@@ -2499,105 +2477,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok(chunk_locations)
     }
 
-    /// Pipelined dual-replica writes with failure handling and retry logic
-    /// Writes multiple 4MB chunks in parallel (up to MAX_INFLIGHT at once) for better throughput
-    ///
-    /// Safety: If a chunk write fails, the pipeline stops, waits for in-flight chunks,
-    /// and retries the failed chunk with a different server pair.
-    pub async fn write_data_pipelined(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<Vec<dfs_common::ChunkLocation>> {
-        const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
-        let max_inflight = self.pipeline_depth.load(Ordering::Relaxed).max(1);
-
-        let nodes = self.cluster_nodes.read().await.clone();
-        if nodes.len() < 2 {
-            anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
-        }
-
-        // Split data into 4MB chunks
-        let chunks: Vec<(usize, &[u8])> = data.chunks(CHUNK_SIZE).enumerate().collect();
-        let total_chunks = chunks.len();
-
-        info!("Starting pipelined write: {} bytes in {} chunks, max {} in-flight",
-              data.len(), total_chunks, max_inflight);
-
-        let mut all_chunk_locations = Vec::new();
-        let mut next_chunk_idx = 0;
-        let mut in_flight: Vec<tokio::task::JoinHandle<Result<(usize, Vec<dfs_common::ChunkLocation>)>>> = Vec::new();
-        let mut failed_chunks: Vec<(usize, Vec<u8>)> = Vec::new();
-
-        // Pipeline: start new chunks while previous ones are in-flight
-        loop {
-            // Start new chunks up to MAX_INFLIGHT
-            while in_flight.len() < max_inflight && next_chunk_idx < total_chunks {
-                let (chunk_idx, chunk_data) = chunks[next_chunk_idx];
-                let chunk_vec = chunk_data.to_vec();
-                let chunk_offset = file_offset + (chunk_idx * CHUNK_SIZE) as u64;
-
-                // Select preferred replica nodes (round-robin); write_chunk_to_replicas will
-                // fall back to other nodes automatically if either of these fails.
-                let replica1 = nodes[chunk_idx % nodes.len()];
-                let replica2 = nodes[(chunk_idx + 1) % nodes.len()];
-                let all_nodes = nodes.clone();
-
-                let client = self.clone();
-
-                // Spawn async task for this chunk
-                let handle = tokio::spawn(async move {
-                    let result = client.write_chunk_to_replicas(
-                        &chunk_vec, replica1, replica2, inode, chunk_offset, &all_nodes,
-                    ).await;
-                    result.map(|locs| (chunk_idx, locs))
-                });
-
-                in_flight.push(handle);
-                next_chunk_idx += 1;
-            }
-
-            // If no more chunks to start and nothing in flight, we're done
-            if in_flight.is_empty() {
-                break;
-            }
-
-            // Wait for at least one chunk to complete
-            let (result, _index, remaining) = futures::future::select_all(in_flight).await;
-            in_flight = remaining;
-
-            match result {
-                Ok(Ok((chunk_idx, chunk_locations))) => {
-                    debug!("Chunk {} completed successfully", chunk_idx);
-                    all_chunk_locations.push((chunk_idx, chunk_locations));
-                }
-                Ok(Err(e)) => {
-                    // write_chunk_to_replicas already exhausted all available nodes — this is
-                    // a genuine hard failure (cluster has fewer than 2 healthy nodes).
-                    // Drain in-flight tasks so we don't leak, then propagate the error.
-                    tracing::error!("Chunk write failed after trying all nodes: {}", e);
-                    let remaining_handles = std::mem::take(&mut in_flight);
-                    for handle in remaining_handles {
-                        if let Ok(Ok((idx, locs))) = handle.await {
-                            all_chunk_locations.push((idx, locs));
-                        }
-                    }
-                    anyhow::bail!("Pipeline write failed: {}", e);
-                }
-                Err(e) => {
-                    anyhow::bail!("Pipeline task panicked: {}", e);
-                }
-            }
-        }
-
-        // Sort chunk locations by chunk index to maintain order
-        all_chunk_locations.sort_by_key(|(idx, _)| *idx);
-
-        // Flatten into single vector
-        let final_locations: Vec<dfs_common::ChunkLocation> = all_chunk_locations
-            .into_iter()
-            .flat_map(|(_, locs)| locs)
-            .collect();
-
-        info!("Pipelined write complete: {} total chunk locations", final_locations.len());
-        Ok(final_locations)
-    }
 
     /// Write a single chunk to 2 replica nodes, with fallback to other nodes if either fails.
     /// The server healer is responsible for lazily replicating to additional nodes up to RF.
@@ -2957,32 +2836,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
-        // Use pipelined writes for data >= 8MB (2+ chunks), otherwise use non-pipelined
-        const PIPELINED_THRESHOLD: usize = 8 * 1024 * 1024; // 8MB = 2 chunks
-
-        let chunk_locations = if data.len() >= PIPELINED_THRESHOLD {
-            info!("Writing {} bytes using pipelined dual-replica ({}MB)",
-                  data.len(), data.len() / (1024 * 1024));
-            self.write_data_pipelined(data, inode, file_offset).await?
-        } else {
-            info!("Writing {} bytes using synchronous dual-replica", data.len());
-            self.write_data_dual_replica(data, inode, file_offset).await?
-        };
+        let chunk_locations = self.write_data_dual_replica(data, inode, file_offset).await?;
 
         // Extract chunk IDs and sizes for backward compatibility
         let chunk_ids: Vec<ChunkId> = chunk_locations.iter().map(|loc| loc.chunk_id).collect();
         let chunk_sizes: Vec<u64> = chunk_locations.iter().map(|loc| loc.size as u64).collect();
 
-        info!("Completed write: {} chunks, each stored on 2 nodes (healer will replicate to RF)", chunk_ids.len());
-
-        // Return chunk_locations for proper metadata tracking
         Ok((chunk_ids, chunk_sizes, Some(chunk_locations)))
-    }
-
-    /// Write data (original API for backward compatibility)
-    pub async fn write_data_old(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
-        let (chunk_ids, chunk_sizes, _) = self.write_data_with_cache(data, 0, 0).await?;
-        Ok((chunk_ids, chunk_sizes))
     }
 
     /// Write a chunk to a specific server

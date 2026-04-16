@@ -243,13 +243,83 @@ impl FlushHandle {
         }
 
         // Snapshot all slot data before launching parallel writes.
+        // For a partial slot where a higher-indexed slot has already been flushed to the server
+        // (i.e. the file has grown past this slot's chunk boundary), we must read-modify-write:
+        // fetch the existing chunk from the server, overlay our buffered bytes on top, and write
+        // the full combined chunk. Without this, a DVR-style header write (small write to offset 0
+        // at recording start, followed by the full stream body) produces a 12032-byte stub chunk
+        // that replaces the correct 4MB first chunk when the file is closed.
+        let max_flushed_idx: Option<u64> = {
+            // The highest chunk index already committed to the server = max chunk in metadata
+            // that is NOT currently in the write buffer (already flushed).
+            let meta_chunk_count = self.metadata_cache.get(&ino)
+                .map(|m| m.chunk_locations.len().max(m.chunks.len()) as u64)
+                .unwrap_or(0);
+            if meta_chunk_count > 0 { Some(meta_chunk_count - 1) } else { None }
+        };
+
         let mut slots_to_write: Vec<(u64, Vec<u8>, u64)> = Vec::new(); // (chunk_idx, data, file_offset)
         for chunk_idx in &indices_to_flush {
             if let Some(state_lock) = self.write_buffers.get(&ino) {
                 let state = state_lock.lock().await;
                 if let Some(slot) = state.slots.get(chunk_idx) {
                     if !slot.data.is_empty() {
-                        slots_to_write.push((*chunk_idx, slot.data.clone(), chunk_idx * CHUNK_SIZE as u64));
+                        let file_offset = chunk_idx * CHUNK_SIZE as u64;
+                        let slot_data = slot.data.clone();
+                        let slot_len = slot_data.len();
+
+                        // If this slot is partial AND higher chunks are already on the server,
+                        // the slot holds an overlay (e.g. a header) written to the beginning of
+                        // a chunk that was previously flushed as a full 4MB chunk. We need to
+                        // read-modify-write: fetch the server copy, apply our bytes on top.
+                        let needs_rmw = slot_len < CHUNK_SIZE
+                            && max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false);
+
+                        if needs_rmw {
+                            info!("flush_buffer_async: partial slot {} ({} bytes) needs RMW — fetching existing chunk from server",
+                                  chunk_idx, slot_len);
+                            // Fetch the existing chunk data from the server
+                            let existing = {
+                                let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
+                                if let Some(meta) = meta {
+                                    let chunk_idx_usize = *chunk_idx as usize;
+                                    let chunk_id_opt = meta.chunk_locations.get(chunk_idx_usize)
+                                        .map(|l| l.chunk_id)
+                                        .or_else(|| meta.chunks.get(chunk_idx_usize).copied());
+                                    let chunk_size_opt = meta.chunk_locations.get(chunk_idx_usize)
+                                        .map(|l| l.size)
+                                        .or_else(|| meta.chunk_sizes.get(chunk_idx_usize).map(|&s| s as usize));
+                                    if let (Some(chunk_id), Some(_chunk_size)) = (chunk_id_opt, chunk_size_opt) {
+                                        let nodes = meta.chunk_locations.get(*chunk_idx as usize)
+                                            .map(|l| l.nodes.as_slice())
+                                            .unwrap_or(&[]);
+                                        match self.client.read_chunk_by_id(chunk_id, nodes).await {
+                                            Ok(data) => Some(data),
+                                            Err(e) => {
+                                                warn!("flush_buffer_async: RMW fetch failed for chunk {}: {} — flushing partial as-is", chunk_idx, e);
+                                                None
+                                            }
+                                        }
+                                    } else { None }
+                                } else { None }
+                            };
+
+                            if let Some(mut base) = existing {
+                                // Overlay our buffered bytes on top of the fetched chunk
+                                if base.len() < slot_len {
+                                    base.resize(slot_len, 0u8);
+                                }
+                                base[..slot_len].copy_from_slice(&slot_data);
+                                info!("flush_buffer_async: RMW slot {} — merged {} bytes into {} byte chunk",
+                                      chunk_idx, slot_len, base.len());
+                                slots_to_write.push((*chunk_idx, base, file_offset));
+                            } else {
+                                // RMW fetch failed; fall back to writing partial data as-is
+                                slots_to_write.push((*chunk_idx, slot_data, file_offset));
+                            }
+                        } else {
+                            slots_to_write.push((*chunk_idx, slot_data, file_offset));
+                        }
                     }
                 }
             }

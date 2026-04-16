@@ -2753,28 +2753,32 @@ impl Filesystem for DfsFilesystem {
 
         // Decrement write-mode open count when a write-mode fd is closed
         let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
-        if is_write {
+        let is_last_writer = if is_write {
             let mut remove = false;
+            let mut last = false;
             if let Some(mut count) = self.write_open_counts.get_mut(&ino) {
                 if *count > 0 { *count -= 1; }
-                if *count == 0 { remove = true; }
+                if *count == 0 { remove = true; last = true; }
             }
             if remove {
                 self.write_open_counts.remove(&ino);
                 self.size_high_water.remove(&ino);
             }
-        }
+            last
+        } else {
+            false
+        };
 
         let lock_manager = self.lock_manager.clone();
 
         if self.write_buffer_enabled {
-            // Only flush the write buffer when a write-mode fd is being closed.
-            // Read-only releases (e.g. Kodi closing a playback fd before a seek) must NOT
-            // touch the write buffer — doing so causes a synchronous multi-MB cluster write
-            // that stalls the FUSE thread for ~1.4 seconds and disrupts live-recording reads.
-            // The write buffer is owned by the writer; readers can serve from it but should
-            // not flush or remove it when they close.
-            if is_write {
+            // Only flush and remove the write buffer when ALL write-mode fds are closed
+            // (is_last_writer). Intermediate write closes (e.g. DVR opening a file twice
+            // then closing one fd while the other is still writing) must NOT flush or
+            // remove the shared buffer — doing so discards buffered data still being
+            // written by the remaining fd, producing a corrupt small first chunk.
+            // Read-only releases must also never touch the write buffer.
+            if is_last_writer {
                 let result = self.block_on(async {
                     // First flush writes (force metadata update on close)
                     self.flush_buffer_async(ino, true).await?;
@@ -2798,6 +2802,16 @@ impl Filesystem for DfsFilesystem {
                         reply.error(libc::EIO);
                     }
                 }
+            } else if is_write {
+                // Intermediate write close: release locks only, leave buffer intact.
+                // The remaining writer(s) will flush and remove the buffer on their close.
+                if let Some(owner) = lock_owner {
+                    let result = self.block_on(lock_manager.release_all(ino, owner));
+                    if let Err(e) = result {
+                        error!("Failed to release locks for inode {}: {}", ino, e);
+                    }
+                }
+                reply.ok();
             } else {
                 // Read-only close: release locks if needed, leave write buffer untouched.
                 if let Some(owner) = lock_owner {

@@ -178,6 +178,7 @@ struct FlushHandle {
     write_buffers: Arc<DashMap<u64, Arc<Mutex<InodeWriteState>>>>,
     metadata_cache: Arc<DashMap<u64, FileMetadata>>,
     flush_in_flight: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>>,
+    last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
 }
 
 impl FlushHandle {
@@ -330,8 +331,20 @@ impl FlushHandle {
                 // release/fsync: wait for leader confirmation before returning.
                 let _ = self.client.flush_metadata_sync(&meta).await;
             } else {
-                // Background tick: enqueue async, don't block the flush loop.
-                self.client.enqueue_metadata(&meta).await;
+                // Background tick: only enqueue if enough time has passed since last
+                // metadata update for this inode. With 4 simultaneous recordings each
+                // flushing a 4MB chunk every ~100ms, sending a metadata RPC on every
+                // flush saturates the leader. 30s between updates is plenty — the file
+                // size is authoritative at release(); mid-recording staleness is fine.
+                const METADATA_FLUSH_INTERVAL_SECS: u64 = 5;
+                let should_enqueue = match self.last_metadata_update.get(&ino) {
+                    None => true,
+                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(METADATA_FLUSH_INTERVAL_SECS),
+                };
+                if should_enqueue {
+                    self.last_metadata_update.insert(ino, std::time::Instant::now());
+                    self.client.enqueue_metadata(&meta).await;
+                }
             }
         }
 
@@ -481,6 +494,8 @@ impl DfsFilesystem {
         let write_buffers_for_cleanup = Arc::new(DashMap::<u64, Arc<Mutex<InodeWriteState>>>::new());
         let flush_in_flight_shared: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>> =
             Arc::new(RwLock::new(None));
+        let last_metadata_update_shared: Arc<DashMap<u64, std::time::Instant>> =
+            Arc::new(DashMap::new());
 
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
@@ -500,6 +515,7 @@ impl DfsFilesystem {
                 write_buffers: write_buffers_clone.clone(),
                 metadata_cache: metadata_cache_for_cleanup.clone(),
                 flush_in_flight: flush_in_flight_shared.clone(),
+                last_metadata_update: last_metadata_update_shared.clone(),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
@@ -573,6 +589,7 @@ impl DfsFilesystem {
             write_buffers: write_buffers_for_cleanup.clone(),
             metadata_cache: metadata_cache.clone(),
             flush_in_flight: flush_in_flight_shared.clone(),
+            last_metadata_update: last_metadata_update_shared.clone(),
         };
 
         Ok(Self {
@@ -585,7 +602,7 @@ impl DfsFilesystem {
             write_counters: Arc::new(RwLock::new(HashMap::new())),
             write_buffer_enabled,
             write_buffers: write_buffers_for_cleanup,
-            last_metadata_update: Arc::new(DashMap::new()),
+            last_metadata_update: last_metadata_update_shared,
             last_chunk_cache: Arc::new(RwLock::new(None)),
             last_warm_offset: Arc::new(DashMap::new()),
             chunk_offset_cache: Arc::new(DashMap::new()),
@@ -666,7 +683,7 @@ impl DfsFilesystem {
             return true;
         }
 
-        const METADATA_UPDATE_INTERVAL_SECS: u64 = 2;
+        const METADATA_UPDATE_INTERVAL_SECS: u64 = 10;
 
         match self.last_metadata_update.get(&ino) {
             None => true,  // First update
@@ -797,6 +814,7 @@ impl Filesystem for DfsFilesystem {
             write_buffers: write_buffers.clone(),
             metadata_cache: metadata_cache.clone(),
             flush_in_flight: flush_in_flight.clone(),
+            last_metadata_update: self.last_metadata_update.clone(),
         };
 
         self.block_on(async move {

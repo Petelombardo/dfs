@@ -241,7 +241,7 @@ impl MetadataQueue {
             inner: Mutex::new(VecDeque::new()),
             index: Mutex::new(HashMap::new()),
             notify: Notify::new(),
-            max_age: Duration::from_secs(10),
+            max_age: Duration::from_secs(24),
         })
     }
 
@@ -3193,10 +3193,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                     };
 
                     // Retry until the leader confirms. Each failure re-identifies the leader.
+                    // Each attempt is capped at 5s so a saturated/slow leader can't block
+                    // this worker (and any release() waiter) for 30s+ per attempt.
                     let mut attempts = 0u32;
                     loop {
-                        match client.put_file_metadata_with_quorum(&entry.metadata, None).await {
-                            Ok(()) => {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            client.put_file_metadata_with_quorum(&entry.metadata, None),
+                        ).await;
+                        match result {
+                            Ok(Ok(())) => {
                                 debug!("metadata_queue: delivered {} ({})",
                                        entry.metadata.path, entry.metadata.id);
                                 // Signal the release waiter if present.
@@ -3205,13 +3211,26 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 }
                                 break;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 attempts += 1;
                                 let backoff_ms = (200u64 * attempts as u64).min(5000);
                                 warn!(
                                     "metadata_queue: delivery failed for {} (attempt {}), \
                                      retrying in {}ms: {}",
                                     entry.metadata.path, attempts, backoff_ms, e
+                                );
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            }
+                            Err(_) => {
+                                // 5s deadline exceeded — leader is saturated or unreachable.
+                                // Clear cached leader so next attempt rediscovers via any node.
+                                *client.leader_addr.write().await = None;
+                                attempts += 1;
+                                let backoff_ms = (200u64 * attempts as u64).min(5000);
+                                warn!(
+                                    "metadata_queue: timed out delivering {} (attempt {}), \
+                                     retrying in {}ms",
+                                    entry.metadata.path, attempts, backoff_ms
                                 );
                                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                             }

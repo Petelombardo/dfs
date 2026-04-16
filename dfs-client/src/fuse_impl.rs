@@ -213,11 +213,21 @@ impl FlushHandle {
                         // fsync/release: flush everything including partial tail
                         state.all_slot_indices()
                     } else {
-                        // Background tick: flush full slots + idle partial slots
+                        // Background tick: flush full slots + idle partial slots.
+                        // A partial slot is only eligible for idle-flush if the file has
+                        // already moved past it (a higher-indexed slot exists). This prevents
+                        // prematurely flushing the first partial slot at recording startup
+                        // before the DVR has written enough data to fill the first chunk —
+                        // which produces a small first chunk and a visible artifact in the stream.
+                        let max_slot_idx = state.slots.keys().copied().max();
                         let mut indices = state.full_slot_indices();
                         for (idx, slot) in &state.slots {
                             if !indices.contains(idx) && slot.is_idle() && !slot.data.is_empty() {
-                                indices.push(*idx);
+                                // Only flush partial/idle slot if file has progressed past it
+                                let file_has_moved_on = max_slot_idx.map(|max| *idx < max).unwrap_or(false);
+                                if file_has_moved_on {
+                                    indices.push(*idx);
+                                }
                             }
                         }
                         indices.sort_unstable();
@@ -301,11 +311,27 @@ impl FlushHandle {
         }
 
         // Update metadata cache: insert new chunk_locations in file-offset order,
-        // deduplicate by chunk_id, and recalculate file size.
+        // deduplicate by file_offset (supersedes chunk_id dedup), and recalculate file size.
         {
             if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
                 for loc in &all_locations {
                     if !meta.chunk_locations.iter().any(|l| l.chunk_id == loc.chunk_id) {
+                        // Replace any existing entry at the same file_offset (from a previous
+                        // partial flush of this slot). Content-addressed hashes differ when the
+                        // same slot is flushed twice (partial then full), so chunk_id dedup alone
+                        // misses this — we must also dedup by file_offset.
+                        if let Some(offset) = loc.file_offset {
+                            if let Some(pos) = meta.chunk_locations.iter().position(|l| l.file_offset == Some(offset)) {
+                                let old_id = meta.chunk_locations[pos].chunk_id;
+                                meta.chunk_locations[pos] = loc.clone();
+                                // Keep legacy arrays consistent
+                                if let Some(p) = meta.chunks.iter().position(|&id| id == old_id) {
+                                    meta.chunks[p] = loc.chunk_id;
+                                    meta.chunk_sizes[p] = loc.size as u64;
+                                }
+                                continue;
+                            }
+                        }
                         meta.chunks.push(loc.chunk_id);
                         meta.chunk_sizes.push(loc.size as u64);
                         meta.chunk_locations.push(loc.clone());
@@ -332,10 +358,9 @@ impl FlushHandle {
                 let _ = self.client.flush_metadata_sync(&meta).await;
             } else {
                 // Background tick: only enqueue if enough time has passed since last
-                // metadata update for this inode. With 4 simultaneous recordings each
-                // flushing a 4MB chunk every ~100ms, sending a metadata RPC on every
-                // flush saturates the leader. 30s between updates is plenty — the file
-                // size is authoritative at release(); mid-recording staleness is fine.
+                // metadata update for this inode. The queue deduplicates by file_id so
+                // only the latest snapshot is ever in-flight per file, but we still
+                // rate-limit enqueues to avoid hammering the leader on every chunk flush.
                 const METADATA_FLUSH_INTERVAL_SECS: u64 = 5;
                 let should_enqueue = match self.last_metadata_update.get(&ino) {
                     None => true,
@@ -533,7 +558,13 @@ impl DfsFilesystem {
                             if in_flight.contains(&ino) { continue; }
                             let state = entry.value().lock().await;
                             let has_full = !state.full_slot_indices().is_empty();
-                            let has_idle = state.slots.values().any(|s| s.is_idle() && !s.data.is_empty());
+                            // A partial/idle slot is only eligible if the file has moved past it
+                            // (higher-indexed slot exists). See flush_buffer_async for rationale.
+                            let max_slot = state.slots.keys().copied().max();
+                            let has_idle = state.slots.iter().any(|(idx, s)| {
+                                s.is_idle() && !s.data.is_empty()
+                                    && max_slot.map(|max| *idx < max).unwrap_or(false)
+                            });
                             if has_full || has_idle {
                                 ready.push(ino);
                             }
@@ -669,6 +700,7 @@ impl DfsFilesystem {
         } else {
             debug!("UPDATING metadata for ino={}: cached_size={}, server_size={}",
                   ino, current_size, metadata.size);
+            self.client.seed_write_seq(metadata.id, metadata.write_seq);
             self.metadata_cache.insert(ino, metadata);
             true
         }
@@ -940,6 +972,7 @@ impl Filesystem for DfsFilesystem {
                             ino
                         }
                     };
+                    client.seed_write_seq(metadata.id, metadata.write_seq);
                     metadata_cache.insert(ino, metadata.clone());
                     last_metadata_update.insert(ino, std::time::Instant::now());
 
@@ -995,6 +1028,15 @@ impl Filesystem for DfsFilesystem {
                 info!("open: ino={} opened with O_SYNC/O_DSYNC — fsyncs will flush immediately", ino);
             }
             if self.write_buffer_enabled {
+                // If this is the first writer (count was 0 before incrementing above),
+                // discard any stale buffer left over from a previous session — e.g. after
+                // a client restart where release() never ran. Without this, the background
+                // flusher immediately flushes the stale data as a small first chunk.
+                let is_first_writer = self.write_open_counts.get(&ino).map(|c| *c == 1).unwrap_or(true);
+                if is_first_writer {
+                    self.write_buffers.remove(&ino);
+                }
+
                 // Create or update the InodeWriteState for this inode.
                 // If already exists (multiple writers), set sync_on_fsync if ANY fd requests it.
                 let state_entry = self.write_buffers
@@ -1061,6 +1103,7 @@ impl Filesystem for DfsFilesystem {
                                 debug!("getattr: metadata updated: size {} -> {}, chunks {} -> {}",
                                        metadata.size, fresh.size,
                                        metadata.chunks.len(), fresh.chunks.len());
+                                client.seed_write_seq(fresh.id, fresh.write_seq);
                                 metadata_cache.insert(ino, fresh.clone());
                                 metadata = fresh;
                             }
@@ -1283,6 +1326,7 @@ impl Filesystem for DfsFilesystem {
                         // no need to fetch the chunk map (there's nothing new to read).
                         if offset >= fresh_metadata.size as usize {
                             info!("Still at EOF after refresh: offset {} >= size {}", offset, fresh_metadata.size);
+                            client.seed_write_seq(fresh_metadata.id, fresh_metadata.write_seq);
                             metadata_cache.insert(ino, fresh_metadata);
                             reply.data(&[]);
                             return;
@@ -1308,6 +1352,7 @@ impl Filesystem for DfsFilesystem {
                         }
 
                         // Update cache with fresh metadata
+                        client.seed_write_seq(fresh_metadata.id, fresh_metadata.write_seq);
                         metadata_cache.insert(ino, fresh_metadata.clone());
 
                         // Warm replica cache for chunks ahead of the current read position
@@ -1384,23 +1429,29 @@ impl Filesystem for DfsFilesystem {
                     // from a server that only persisted chunk_locations (all new writes go here).
                     // The old requirement that chunk_locations.len() == chunks.len() is dropped:
                     // chunk_locations is self-sufficient and doesn't need chunks to be populated.
-                    let locations_match = !metadata.chunk_locations.is_empty()
-                        && metadata.chunk_locations[0].file_offset.is_some();
+                    // Use chunk_locations with explicit offsets when ALL chunks have file_offset set.
+                    // If any chunk has file_offset: None, fall back to sequential calculation —
+                    // a partial mix (some Some, some None) would place None-chunks at offset 0,
+                    // colliding with real chunk 0 and making subsequent chunks unreachable.
+                    let all_have_offsets = !metadata.chunk_locations.is_empty()
+                        && metadata.chunk_locations.iter().all(|l| l.file_offset.is_some());
 
-                    if locations_match {
+                    if all_have_offsets {
                         // SPARSE FILE: Use explicit file_offset from chunk_locations
                         for location in &metadata.chunk_locations {
-                            let chunk_offset = location.file_offset.unwrap_or(0);
+                            let chunk_offset = location.file_offset.unwrap();
                             offsets.push((chunk_offset as usize, location.size));
                         }
-                    } else {
-                        // LEGACY FILE or mismatched chunk_locations: Sequential chunks, calculate offsets
-                        if !metadata.chunk_locations.is_empty()
-                            && metadata.chunk_locations.len() != metadata.chunks.len()
-                        {
-                            warn!("chunk_locations count ({}) != chunks count ({}) for ino={}, using sequential offsets",
-                                  metadata.chunk_locations.len(), metadata.chunks.len(), ino);
+                    } else if !metadata.chunk_locations.is_empty() {
+                        // chunk_locations present but missing offsets on some chunks —
+                        // reconstruct sequentially from the sizes we do have.
+                        let mut current_offset = 0usize;
+                        for location in &metadata.chunk_locations {
+                            offsets.push((current_offset, location.size));
+                            current_offset += location.size;
                         }
+                    } else {
+                        // LEGACY FILE: fall back to legacy chunks/chunk_sizes arrays
                         let mut current_offset = 0usize;
                         for &chunk_size in metadata.chunk_sizes.iter() {
                             offsets.push((current_offset, chunk_size as usize));
@@ -1816,6 +1867,7 @@ impl Filesystem for DfsFilesystem {
                     has_buffer || has_counter
                 };
                 if !has_active_write {
+                    client.seed_write_seq(entry.id, entry.write_seq);
                     metadata_cache.insert(entry_ino, entry.clone());
                 }
 
@@ -1884,6 +1936,7 @@ impl Filesystem for DfsFilesystem {
                                         v
                                     }
                                 };
+                                client.seed_write_seq(entry.id, entry.write_seq);
                                 metadata_cache.insert(ino_val, entry.clone());
                                 last_metadata_update.insert(ino_val, now);
                             }
@@ -2035,6 +2088,7 @@ impl Filesystem for DfsFilesystem {
                     if let Some(path) = path_opt {
                         match runtime.block_on(client.get_file_metadata(&path)) {
                             Ok(Some(fetched)) => {
+                                client.seed_write_seq(fetched.id, fetched.write_seq);
                                 metadata_cache.insert(ino, fetched.clone());
                                 self.last_metadata_update.insert(ino, std::time::Instant::now());
                                 fetched

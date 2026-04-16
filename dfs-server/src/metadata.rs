@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::{ChunkId, ChunkLocation, ChunkLocationV0, ChunkLocationV1, FileId, FileMetadata, FileMetadataV0, FileMetadataV1, NodeId};
+use dfs_common::{ChunkId, ChunkLocation, ChunkLocationV0, ChunkLocationV1, FileId, FileMetadata, FileMetadataV0, FileMetadataV1, FileMetadataV2, NodeId};
 use sled::Db;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -294,8 +294,12 @@ impl MetadataStore {
                         Ok(Some(metadata))
                     }
                     Err(new_err) => {
+                        // Try V2 format (ChunkLocation with written_at, but no write_seq)
+                        let v2_result = bincode::deserialize::<FileMetadataV2>(&value).ok().map(FileMetadata::from);
                         // Try V1 format (ChunkLocationV1 — has file_offset but no written_at)
-                        let v1_result = bincode::deserialize::<FileMetadataV1>(&value).ok().map(FileMetadata::from);
+                        let v1_result = v2_result.or_else(|| {
+                            bincode::deserialize::<FileMetadataV1>(&value).ok().map(FileMetadata::from)
+                        });
                         // Then try V0 format (ChunkLocationV0 — no file_offset or written_at)
                         let legacy_metadata = v1_result.or_else(|| {
                             bincode::deserialize::<FileMetadataV0>(&value).ok().map(FileMetadata::from)
@@ -348,6 +352,12 @@ impl MetadataStore {
             Some(bytes) => {
                 // Try current FileMetadata format first
                 if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&bytes) {
+                    return Ok(Some(metadata));
+                }
+                // Try V2 format (ChunkLocation with written_at, but no write_seq)
+                if let Ok(v2) = bincode::deserialize::<FileMetadataV2>(&bytes) {
+                    let metadata: FileMetadata = v2.into();
+                    let _ = self.db.insert(&path_key, bincode::serialize(&metadata)?);
                     return Ok(Some(metadata));
                 }
                 // Try V1 format (ChunkLocationV1 — file_offset but no written_at)
@@ -549,6 +559,11 @@ impl MetadataStore {
                 if !relative.is_empty() && (!relative.contains('/') || relative.ends_with('/')) {
                     // Try current FileMetadata format first (no secondary lookup)
                     if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&value) {
+                        files.push(metadata);
+                    } else if let Ok(v2) = bincode::deserialize::<FileMetadataV2>(&value) {
+                        // Path index entry written before write_seq was added to FileMetadata
+                        let metadata: FileMetadata = v2.into();
+                        let _ = self.db.insert(key, bincode::serialize(&metadata)?);
                         files.push(metadata);
                     } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
                         // Path index entry written before written_at was added to ChunkLocation

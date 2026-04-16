@@ -375,6 +375,48 @@ impl From<ChunkLocationV1> for ChunkLocation {
     }
 }
 
+/// FileMetadata format before write_seq was added (uses ChunkLocation with written_at but no write_seq).
+/// This is used to deserialize metadata written after written_at was added to ChunkLocation
+/// but before the write_seq field was added to FileMetadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetadataV2 {
+    pub id: FileId,
+    pub path: String,
+    pub size: u64,
+    #[serde(default)]
+    pub chunks: Vec<ChunkId>,
+    #[serde(default)]
+    pub chunk_sizes: Vec<u64>,
+    pub created_at: u64,
+    pub modified_at: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub file_type: FileType,
+    #[serde(default)]
+    pub chunk_locations: Vec<ChunkLocation>,
+}
+
+impl From<FileMetadataV2> for FileMetadata {
+    fn from(v2: FileMetadataV2) -> Self {
+        FileMetadata {
+            id: v2.id,
+            path: v2.path,
+            size: v2.size,
+            chunks: v2.chunks,
+            chunk_sizes: v2.chunk_sizes,
+            created_at: v2.created_at,
+            modified_at: v2.modified_at,
+            mode: v2.mode,
+            uid: v2.uid,
+            gid: v2.gid,
+            file_type: v2.file_type,
+            chunk_locations: v2.chunk_locations,
+            write_seq: 0,
+        }
+    }
+}
+
 /// FileMetadata format before written_at was added to ChunkLocation (uses ChunkLocationV1)
 /// This is used to deserialize metadata written after sparse file support but before written_at.
 #[derive(Debug, Clone, Serialize, Deserialize)]

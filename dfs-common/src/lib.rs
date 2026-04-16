@@ -8,7 +8,7 @@ pub mod memory;
 pub use config::Config;
 pub use types::{
     ChunkId, ChunkLocation, ChunkLocationV0, ChunkLocationV1, FileId, FileMetadata, FileMetadataV0,
-    FileMetadataV1, FileType, NodeHealthGossip, NodeId, NodeInfo, NodeStatus,
+    FileMetadataV1, FileMetadataV2, FileType, NodeHealthGossip, NodeId, NodeInfo, NodeStatus,
 };
 pub use protocol::{
     ClusterMessage, ErrorCode, Message, MessageEnvelope, MetadataOperation, Request, RequestId,

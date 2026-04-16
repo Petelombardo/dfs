@@ -1334,8 +1334,10 @@ impl Filesystem for DfsFilesystem {
 
                         // File has grown past our read offset.  Now fetch the chunk map
                         // so we have accurate replica locations for the new chunks.
-                        let prev_modified_at = metadata.modified_at;
-                        if fresh_metadata.modified_at != prev_modified_at || fresh_metadata.chunk_locations.is_empty() {
+                        // Always refresh when size grew — modified_at may lag behind during
+                        // active recording if the async metadata queue hasn't flushed yet.
+                        let size_grew = fresh_metadata.size > metadata.size;
+                        if size_grew || fresh_metadata.chunk_locations.is_empty() {
                             match client.get_file_chunk_map(fresh_metadata.id).await {
                                 Ok((locations, _map_modified_at)) => {
                                     if !locations.is_empty() {

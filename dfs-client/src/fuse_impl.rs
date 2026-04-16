@@ -394,10 +394,10 @@ impl DfsFilesystem {
             warn!("Failed to query cluster chunk size, using default 4MB: {}", e);
             4  // Default to 4MB if query fails
         });
-        // Use 3x chunk size for write buffer threshold to enable pipelined writes
-        // With 4MB chunks, this gives us 12MB buffer = 3 chunks that can be written in parallel
-        let buffer_flush_threshold = chunk_size_mb * 1024 * 1024 * 3;
-        info!("Client configured with buffer_flush_threshold={} bytes ({}MB, 3x cluster chunk size) for pipelined writes",
+        // 8x chunk size = 32MB pipeline depth (8 chunks in-flight simultaneously).
+        // Matches MAX_BUFFERED_BYTES and MAX_INFLIGHT in the write path.
+        let buffer_flush_threshold = chunk_size_mb * 1024 * 1024 * 8;
+        info!("Client configured with buffer_flush_threshold={} bytes ({}MB, 8x cluster chunk size, 32MB pipeline)",
               buffer_flush_threshold, buffer_flush_threshold / (1024 * 1024));
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
@@ -735,6 +735,66 @@ impl Filesystem for DfsFilesystem {
                 Err(libc::EIO)
             }
         }
+    }
+
+    fn destroy(&mut self) {
+        info!("DFS filesystem destroy: flushing all write buffers and metadata queue");
+
+        let write_buffers = self.write_buffers.clone();
+        let flush_in_flight = self.flush_in_flight.clone();
+        let client = self.client.clone();
+        let metadata_cache = self.metadata_cache.clone();
+
+        let flush_handle = FlushHandle {
+            client: client.clone(),
+            write_buffers: write_buffers.clone(),
+            metadata_cache: metadata_cache.clone(),
+            flush_in_flight: flush_in_flight.clone(),
+        };
+
+        self.block_on(async move {
+            // Step 1: Force-flush all dirty write buffers.
+            let inodes: Vec<u64> = write_buffers.iter().map(|e| *e.key()).collect();
+            if !inodes.is_empty() {
+                info!("destroy: force-flushing {} open write buffers", inodes.len());
+                let handles: Vec<_> = inodes.into_iter().map(|ino| {
+                    let h = flush_handle.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = h.flush_buffer_async(ino, true).await {
+                            error!("destroy: flush failed for inode {}: {}", ino, e);
+                        }
+                    })
+                }).collect();
+                for h in handles {
+                    let _ = h.await;
+                }
+            }
+
+            // Step 2: Wait for any background in-flight flushes to drain.
+            if let Some(in_flight) = flush_in_flight.read().unwrap().as_ref() {
+                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                while !in_flight.is_empty() {
+                    if tokio::time::Instant::now() > deadline {
+                        warn!("destroy: timed out waiting for in-flight flushes");
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+            }
+
+            // Step 3: Wait for the metadata queue to drain completely.
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            loop {
+                if client.metadata_queue.is_empty().await { break; }
+                if tokio::time::Instant::now() > deadline {
+                    warn!("destroy: timed out waiting for metadata queue to drain");
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+
+            info!("destroy: all buffers flushed and metadata queue drained");
+        });
     }
 
     fn lookup(&mut self, _req: &FuseRequest, parent: u64, name: &OsStr, reply: ReplyEntry) {
@@ -2123,10 +2183,10 @@ impl Filesystem for DfsFilesystem {
                 // Overwrites that don't overlap a dirty slot bypass buffering (rare random I/O).
                 {
                     let write_buffers_clone = write_buffers.clone();
-                    // Hard back-pressure cap: 24MB (6 slots × 4MB).
+                    // Hard back-pressure cap: 32MB (8 slots × 4MB) = pipeline depth.
                     // Background flusher drains full slots automatically; this cap prevents OOM
                     // on low-RAM clients (nanopir3: 1.9 GB) if the cluster is temporarily slow.
-                    const MAX_BUFFERED_BYTES: usize = 24 * 1024 * 1024;
+                    const MAX_BUFFERED_BYTES: usize = 32 * 1024 * 1024;
                     let data_slice = data_vec.clone();
                     let write_offset = offset as u64;
 
@@ -2617,7 +2677,7 @@ impl Filesystem for DfsFilesystem {
                 if let Some(metadata) = metadata_opt {
                     // release: send synchronously so close() confirms metadata on leader.
                     debug!("release: flushing metadata sync for ino={} ({} chunks)", ino, metadata.chunks.len());
-                    client.flush_metadata_sync(&metadata).await?;
+                    client.flush_metadata_sync(&metadata).await;
                     write_counters.write().unwrap().insert(ino, 0);
                 }
 

@@ -309,6 +309,11 @@ impl MetadataQueue {
         self.notify.notify_one();
     }
 
+    /// Returns true if there are no pending entries.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.is_empty()
+    }
+
     /// Remove and return the front entry, if any.
     async fn pop(&self) -> Option<MetadataEntry> {
         let mut q = self.inner.lock().await;
@@ -410,7 +415,7 @@ pub struct DfsClient {
     /// Async metadata write queue. Active writes enqueue here; background worker
     /// drains to leader with redirect/retry. Release path bypasses this and sends
     /// synchronously via flush_metadata_sync().
-    metadata_queue: Arc<MetadataQueue>,
+    pub(crate) metadata_queue: Arc<MetadataQueue>,
 }
 
 impl DfsClient {
@@ -2486,7 +2491,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// and retries the failed chunk with a different server pair.
     pub async fn write_data_pipelined(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<Vec<dfs_common::ChunkLocation>> {
         const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
-        const MAX_INFLIGHT: usize = 3; // Max 3 chunks in-flight simultaneously
+        const MAX_INFLIGHT: usize = 8; // 8 chunks × 4MB = 32MB pipeline depth
 
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {

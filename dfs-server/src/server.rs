@@ -1729,10 +1729,21 @@ impl Server {
 
         // Store locally first.
         match self.metadata.put_file(&metadata) {
-            Ok(_) => {
+            Ok(crate::metadata::PutFileResult::Stored) => {
                 self.chunk_map_update(&metadata).await;
                 // Enqueue for followers — dissemination loop delivers within 5s.
                 self.enqueue_metadata_for_followers(&metadata).await;
+                Response::Ok { data: None }
+            }
+            Ok(crate::metadata::PutFileResult::Stale(newer)) => {
+                // We already have a newer version — re-disseminate it to all followers
+                // so any node that sent us stale data also converges.
+                debug!(
+                    "put_file_metadata: leader has newer write_seq={} for {}, re-disseminating",
+                    newer.write_seq, newer.path
+                );
+                self.enqueue_metadata_for_followers(&newer).await;
+                // Still return Ok — the client's data was structurally valid, just stale.
                 Response::Ok { data: None }
             }
             Err(e) => {
@@ -1758,21 +1769,63 @@ impl Server {
 
     /// Handle DisseminateMetadata — leader delivers a batch to this follower.
     /// Stores each item locally and records the sequence number.
+    /// If any item is dropped as stale (follower has a newer version), the follower
+    /// sends its newer version back to the leader to converge the cluster.
     async fn handle_disseminate_metadata(&self, items: Vec<FileMetadata>, up_to_sequence: u64) -> Response {
         debug!("Handling disseminate metadata: {} items up to seq={}", items.len(), up_to_sequence);
         let mut failed = 0usize;
+        let mut corrections: Vec<FileMetadata> = Vec::new();
+
         for metadata in &items {
-            if let Err(e) = self.metadata.put_file(metadata) {
-                warn!("disseminate: failed to store '{}': {}", metadata.path, e);
-                failed += 1;
-            } else {
-                self.chunk_map_update(metadata).await;
+            match self.metadata.put_file(metadata) {
+                Ok(crate::metadata::PutFileResult::Stored) => {
+                    self.chunk_map_update(metadata).await;
+                }
+                Ok(crate::metadata::PutFileResult::Stale(newer)) => {
+                    // Follower has a newer version — queue it to send back to leader.
+                    debug!(
+                        "disseminate: follower has newer write_seq={} for {}, will correct leader",
+                        newer.write_seq, newer.path
+                    );
+                    corrections.push(newer);
+                }
+                Err(e) => {
+                    warn!("disseminate: failed to store '{}': {}", metadata.path, e);
+                    failed += 1;
+                }
             }
         }
+
         // Record the highest sequence we've received.
         if let Err(e) = self.metadata.set_follower_sequence(up_to_sequence) {
             warn!("disseminate: failed to record follower sequence {}: {}", up_to_sequence, e);
         }
+
+        // Send corrections back to leader in the background — don't block the response.
+        if !corrections.is_empty() {
+            let client = self.network_client();
+            let cluster = self.cluster.clone();
+            tokio::spawn(async move {
+                let leader_addr = match cluster.get_leader_addr().await {
+                    Some(addr) => addr,
+                    None => {
+                        warn!("disseminate correction: no leader addr known, skipping {} corrections",
+                              corrections.len());
+                        return;
+                    }
+                };
+                for newer in corrections {
+                    let req = dfs_common::Request::PutFileMetadata { metadata: newer.clone() };
+                    match client.send_message(leader_addr, dfs_common::Message::Request(req)).await {
+                        Ok(_) => debug!("disseminate correction: sent write_seq={} for {} to leader",
+                                        newer.write_seq, newer.path),
+                        Err(e) => warn!("disseminate correction: failed to send {} to leader: {}",
+                                        newer.path, e),
+                    }
+                }
+            });
+        }
+
         if failed > 0 {
             Response::Error {
                 message: format!("disseminate: {} items failed to store", failed),
@@ -2565,7 +2618,7 @@ impl Server {
                                     .unwrap_or_default()
                                     .as_secs();
                                 match metadata.put_file(&file) {
-                                    Ok(()) => size_fixed += 1,
+                                    Ok(_) => size_fixed += 1,
                                     Err(e) => {
                                         warn!("Metadata repair: failed to fix size for {}: {}", file.path, e);
                                         size_errors += 1;

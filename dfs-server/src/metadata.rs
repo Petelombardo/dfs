@@ -4,6 +4,16 @@ use sled::Db;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+/// Result of a put_file call — distinguishes accepted writes from stale drops.
+pub enum PutFileResult {
+    /// Write was accepted and stored.
+    Stored,
+    /// Write was dropped because this node already has a newer version.
+    /// The existing (newer) record is returned so the caller can propagate
+    /// it back to whoever sent the stale write, converging the cluster.
+    Stale(FileMetadata),
+}
+
 /// Metadata storage using Sled embedded database
 /// Optimized for SBC environments (memory-efficient, crash-safe)
 pub struct MetadataStore {
@@ -129,7 +139,7 @@ impl MetadataStore {
     }
 
     /// Store file metadata
-    pub fn put_file(&self, metadata: &FileMetadata) -> Result<()> {
+    pub fn put_file(&self, metadata: &FileMetadata) -> Result<PutFileResult> {
         // If a different file ID already exists at this path, remove the old file: record
         // before writing the new one. Without this, every create() on an existing path
         // allocates a new FileId UUID and leaves the old file: entry orphaned in the DB —
@@ -199,7 +209,7 @@ impl MetadataStore {
                             "Dropping stale metadata for {} (existing write_seq={} > incoming={})",
                             metadata.path, existing.write_seq, metadata.write_seq
                         );
-                        return Ok(());
+                        return Ok(PutFileResult::Stale(existing));
                     }
 
                     // Merge chunk nodes: preserve any replica nodes from the existing record
@@ -245,7 +255,7 @@ impl MetadataStore {
 
         debug!("Stored metadata for file: {} ({})", metadata_to_store.path, metadata_to_store.id);
 
-        Ok(())
+        Ok(PutFileResult::Stored)
     }
 
     /// Get file metadata by ID

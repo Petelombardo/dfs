@@ -247,23 +247,32 @@ impl MetadataQueue {
 
     /// Enqueue an async metadata update (fire-and-forget, no confirmation).
     /// Deduplicates by file_id — replaces existing entry in-place keeping original
-    /// timestamp. Blocks caller if oldest item is >max_age old (back-pressure).
+    /// timestamp. Does NOT implement back-pressure directly — callers that need
+    /// back-pressure (enqueue_metadata) check age and rescue before calling this.
     pub async fn push(&self, metadata: FileMetadata) {
-        // Back-pressure: wait until oldest item is young enough.
-        loop {
-            let age = {
-                let q = self.inner.lock().await;
-                q.front().map(|e| e.enqueued_at.elapsed())
-            };
-            match age {
-                Some(a) if a > self.max_age => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                _ => break,
-            }
-        }
-
         self.push_inner(metadata, None).await;
+    }
+
+    /// Return the age of the front entry, if any.
+    pub async fn front_age(&self) -> Option<Duration> {
+        self.inner.lock().await.front().map(|e| e.enqueued_at.elapsed())
+    }
+
+    /// Pop the front entry only if it is older than max_age (the stalled entry
+    /// blocking back-pressure). Returns None if queue is empty or front is young.
+    pub async fn pop_stalled(&self) -> Option<MetadataEntry> {
+        let mut q = self.inner.lock().await;
+        match q.front() {
+            Some(e) if e.enqueued_at.elapsed() > self.max_age => {}
+            _ => return None,
+        }
+        let entry = q.pop_front().unwrap();
+        let mut idx = self.index.lock().await;
+        idx.remove(&entry.metadata.id);
+        for (i, e) in q.iter().enumerate() {
+            idx.insert(e.metadata.id, i);
+        }
+        Some(entry)
     }
 
     /// Enqueue a metadata update and wait for the worker to confirm delivery.
@@ -312,6 +321,19 @@ impl MetadataQueue {
     /// Returns true if there are no pending entries.
     pub async fn is_empty(&self) -> bool {
         self.inner.lock().await.is_empty()
+    }
+
+    /// Re-insert a rescued entry at the front of the queue (all nodes unreachable).
+    /// Preserves done_tx so any release() waiter is eventually notified.
+    async fn push_inner_front(&self, entry: MetadataEntry) {
+        let mut q = self.inner.lock().await;
+        let mut idx = self.index.lock().await;
+        // Rebuild index after prepend.
+        idx.insert(entry.metadata.id, 0);
+        q.push_front(entry);
+        for (i, e) in q.iter().enumerate() {
+            idx.insert(e.metadata.id, i);
+        }
     }
 
     /// Remove and return the front entry, if any.
@@ -3153,8 +3175,17 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Enqueue a metadata update for async delivery to the leader.
-    /// Returns immediately — the background worker handles retries and leader redirects.
-    /// Use this for in-progress writes where the FUSE thread must not block.
+    /// Returns immediately in the normal case — the background worker handles retries.
+    ///
+    /// Back-pressure + self-rescue: if the queue front is older than max_age the
+    /// worker is stalled. Rather than sleeping passively we:
+    ///   1. Pop the stalled entry and attempt immediate delivery (2s timeout).
+    ///   2. If that fails, fan out to ALL known nodes in parallel and take the
+    ///      first success — this bypasses the cached leader and finds whoever is up.
+    ///   3. Signal any release() waiter on the rescued entry.
+    ///   4. Re-enqueue the entry if all nodes are unreachable (genuine cluster down).
+    ///   5. Repeat until the queue front is young enough to proceed normally.
+    ///
     /// SQLite files are sent synchronously regardless (they require immediate consistency).
     pub async fn enqueue_metadata(&self, metadata: &FileMetadata) {
         if Self::is_sqlite_file(&metadata.path) {
@@ -3164,6 +3195,81 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
             return;
         }
+
+        // Back-pressure: if the front is stalled, rescue it before enqueueing.
+        loop {
+            match self.metadata_queue.front_age().await {
+                Some(age) if age > self.metadata_queue.max_age => {}
+                _ => break, // Queue is healthy — proceed.
+            }
+
+            // Pop the stalled front entry and attempt emergency delivery.
+            let stalled = match self.metadata_queue.pop_stalled().await {
+                Some(e) => e,
+                None => break, // Raced with worker — queue is clear now.
+            };
+
+            warn!(
+                "metadata_queue: back-pressure rescue for {} (age {}ms)",
+                stalled.metadata.path,
+                stalled.enqueued_at.elapsed().as_millis()
+            );
+
+            // Attempt 1: normal quorum write with 2s timeout.
+            let delivered = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.put_file_metadata_with_quorum(&stalled.metadata, None),
+            ).await.ok().and_then(|r| r.ok()).is_some();
+
+            if delivered {
+                debug!("metadata_queue: rescue delivered {} via quorum", stalled.metadata.path);
+                if let Some(tx) = stalled.done_tx { let _ = tx.send(()); }
+                continue; // Check front again.
+            }
+
+            // Attempt 2: fan out to all nodes in parallel, take first success.
+            *self.leader_addr.write().await = None;
+            let nodes = self.cluster_nodes.read().await.clone();
+            let meta = stalled.metadata.clone();
+            let rescued = if !nodes.is_empty() {
+                let futs: Vec<_> = nodes.iter().map(|&addr| {
+                    let client = self.clone();
+                    let m = meta.clone();
+                    async move {
+                        let req = Request::PutFileMetadata { metadata: m };
+                        match tokio::time::timeout(
+                            Duration::from_secs(2),
+                            client.send_request(addr, req),
+                        ).await {
+                            Ok(Ok(Response::Ok { .. })) => {
+                                *client.leader_addr.write().await = Some(addr);
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                }).collect();
+
+                // Race all nodes — unblock on first success.
+                let results = futures::future::join_all(futs).await;
+                results.into_iter().any(|ok| ok)
+            } else {
+                false
+            };
+
+            if rescued {
+                warn!("metadata_queue: rescue delivered {} via fan-out", stalled.metadata.path);
+                if let Some(tx) = stalled.done_tx { let _ = tx.send(()); }
+            } else {
+                // All nodes unreachable — put it back at the front and sleep briefly.
+                warn!("metadata_queue: rescue failed for {}, all nodes unreachable — requeueing",
+                      stalled.metadata.path);
+                // Re-insert preserving the done_tx so release() is still notified eventually.
+                self.metadata_queue.push_inner_front(stalled).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+
         self.metadata_queue.push(metadata.clone()).await;
     }
 

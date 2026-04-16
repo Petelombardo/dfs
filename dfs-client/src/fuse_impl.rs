@@ -186,6 +186,23 @@ impl FlushHandle {
     /// `force = false` → flush only full slots (background ticker path)
     /// `force = true`  → flush all dirty slots including partial tail (fsync/release path)
     async fn flush_buffer_async(&self, ino: u64, force: bool) -> Result<()> {
+        // If a background flush is in-flight for this inode, wait for it to finish
+        // before proceeding.  Without this, a force-flush (release/fsync) and a
+        // background tick flush can race: both snapshot the same slots, both try to
+        // write the same chunk hash, and the second write fails with "already exists".
+        if force {
+            let in_flight_set = self.flush_in_flight.read().unwrap().as_ref().cloned();
+            if let Some(in_flight_set) = in_flight_set {
+                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                while in_flight_set.contains(&ino) {
+                    if tokio::time::Instant::now() >= deadline {
+                        break; // don't block forever; proceed and let the write deduplicate
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+
         // Determine which chunk indices to flush
         let indices_to_flush: Vec<u64> = {
             match self.write_buffers.get(&ino) {
@@ -420,11 +437,15 @@ impl DfsFilesystem {
             warn!("Failed to query cluster chunk size, using default 4MB: {}", e);
             4  // Default to 4MB if query fails
         });
-        // 8x chunk size = 32MB pipeline depth (8 chunks in-flight simultaneously).
-        // Matches MAX_BUFFERED_BYTES and MAX_INFLIGHT in the write path.
-        let buffer_flush_threshold = chunk_size_mb * 1024 * 1024 * 8;
-        info!("Client configured with buffer_flush_threshold={} bytes ({}MB, 8x cluster chunk size, 32MB pipeline)",
-              buffer_flush_threshold, buffer_flush_threshold / (1024 * 1024));
+        // Pipeline depth = ceil(32MB / chunk_size). Both the back-pressure cap and
+        // the write_data_pipelined in-flight limit derive from this.
+        let chunk_size_bytes = chunk_size_mb * 1024 * 1024;
+        let buffer_flush_threshold = chunk_size_bytes *
+            ((32 * 1024 * 1024 + chunk_size_bytes - 1) / chunk_size_bytes);
+        client.set_pipeline_depth(chunk_size_bytes);
+        info!("Client configured with pipeline_depth={} chunks ({}MB in-flight)",
+              buffer_flush_threshold / chunk_size_bytes,
+              buffer_flush_threshold / (1024 * 1024));
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
         if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {
@@ -1950,6 +1971,7 @@ impl Filesystem for DfsFilesystem {
         let write_counters = self.write_counters.clone();
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
+        let buffer_flush_threshold = self.buffer_flush_threshold;
         let runtime = self.runtime.clone();
         let last_metadata_update = self.last_metadata_update.clone();
         let data_vec = data.to_vec(); // Copy data before moving
@@ -2209,10 +2231,10 @@ impl Filesystem for DfsFilesystem {
                 // Overwrites that don't overlap a dirty slot bypass buffering (rare random I/O).
                 {
                     let write_buffers_clone = write_buffers.clone();
-                    // Hard back-pressure cap: 32MB (8 slots × 4MB) = pipeline depth.
+                    // Hard back-pressure cap = pipeline depth (ceil(32MB / chunk_size) × chunk_size).
                     // Background flusher drains full slots automatically; this cap prevents OOM
                     // on low-RAM clients (nanopir3: 1.9 GB) if the cluster is temporarily slow.
-                    const MAX_BUFFERED_BYTES: usize = 32 * 1024 * 1024;
+                    let max_buffered_bytes: usize = buffer_flush_threshold;
                     let data_slice = data_vec.clone();
                     let write_offset = offset as u64;
 
@@ -2223,7 +2245,7 @@ impl Filesystem for DfsFilesystem {
                             let buffered = if let Some(entry) = write_buffers_clone.get(&ino) {
                                 entry.lock().await.buffered_bytes()
                             } else { 0 };
-                            if buffered < MAX_BUFFERED_BYTES { break; }
+                            if buffered < max_buffered_bytes { break; }
                             if stall_start.elapsed() > std::time::Duration::from_secs(10) {
                                 return Err(anyhow::anyhow!("Write buffer stall timeout"));
                             }

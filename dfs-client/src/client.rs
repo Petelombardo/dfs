@@ -412,6 +412,11 @@ pub struct DfsClient {
     /// Defaults to 2 until the first successful cluster status response.
     replication_factor: Arc<AtomicUsize>,
 
+    /// Pipeline depth in chunks: ceil(32MB / chunk_size).
+    /// Set once at startup from the cluster chunk size config.
+    /// Used by write_data_pipelined to cap in-flight chunks at ~32MB regardless of chunk size.
+    pipeline_depth: Arc<AtomicUsize>,
+
     /// Async metadata write queue. Active writes enqueue here; background worker
     /// drains to leader with redirect/retry. Release path bypasses this and sends
     /// synchronously via flush_metadata_sync().
@@ -553,7 +558,17 @@ leader_addr: Arc::new(RwLock::new(None)),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
+            pipeline_depth: Arc::new(AtomicUsize::new(8)), // default for 4MB; updated at startup
         })
+    }
+
+    /// Set the write pipeline depth based on cluster chunk size.
+    /// Called once after startup chunk-size query: ceil(32MB / chunk_size_bytes).
+    pub fn set_pipeline_depth(&self, chunk_size_bytes: usize) {
+        let depth = (32 * 1024 * 1024 + chunk_size_bytes - 1) / chunk_size_bytes;
+        self.pipeline_depth.store(depth, Ordering::Relaxed);
+        info!("Write pipeline depth: {} chunks (~{}MB in-flight)",
+              depth, depth * chunk_size_bytes / (1024 * 1024));
     }
 
     /// Check if a path represents a SQLite database file
@@ -2491,7 +2506,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// and retries the failed chunk with a different server pair.
     pub async fn write_data_pipelined(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<Vec<dfs_common::ChunkLocation>> {
         const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
-        const MAX_INFLIGHT: usize = 8; // 8 chunks × 4MB = 32MB pipeline depth
+        let max_inflight = self.pipeline_depth.load(Ordering::Relaxed).max(1);
 
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
@@ -2503,7 +2518,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let total_chunks = chunks.len();
 
         info!("Starting pipelined write: {} bytes in {} chunks, max {} in-flight",
-              data.len(), total_chunks, MAX_INFLIGHT);
+              data.len(), total_chunks, max_inflight);
 
         let mut all_chunk_locations = Vec::new();
         let mut next_chunk_idx = 0;
@@ -2513,7 +2528,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Pipeline: start new chunks while previous ones are in-flight
         loop {
             // Start new chunks up to MAX_INFLIGHT
-            while in_flight.len() < MAX_INFLIGHT && next_chunk_idx < total_chunks {
+            while in_flight.len() < max_inflight && next_chunk_idx < total_chunks {
                 let (chunk_idx, chunk_data) = chunks[next_chunk_idx];
                 let chunk_vec = chunk_data.to_vec();
                 let chunk_offset = file_offset + (chunk_idx * CHUNK_SIZE) as u64;

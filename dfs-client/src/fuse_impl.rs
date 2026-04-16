@@ -214,42 +214,68 @@ impl FlushHandle {
             return Ok(());
         }
 
-        // Flush each slot in ascending chunk-index order so metadata ends up consistent
-        let mut all_locations: Vec<dfs_common::ChunkLocation> = Vec::new();
-
+        // Snapshot all slot data before launching parallel writes.
+        let mut slots_to_write: Vec<(u64, Vec<u8>, u64)> = Vec::new(); // (chunk_idx, data, file_offset)
         for chunk_idx in &indices_to_flush {
-            // Snapshot this slot's data (keep it in the map until confirmed flushed)
-            let (slot_data, file_offset) = {
-                match self.write_buffers.get(&ino) {
-                    Some(state_lock) => {
-                        let state = state_lock.lock().await;
-                        match state.slots.get(chunk_idx) {
-                            Some(slot) if !slot.data.is_empty() => {
-                                (slot.data.clone(), chunk_idx * CHUNK_SIZE as u64)
-                            }
-                            _ => continue,
-                        }
-                    }
-                    None => continue,
-                }
-            };
-
-            info!("flush_buffer_async: writing chunk {} ({} bytes at offset {}) for inode {}",
-                  chunk_idx, slot_data.len(), file_offset, ino);
-
-            let (_, _, locations_opt) = self.client
-                .write_data_with_cache(&slot_data, ino, file_offset)
-                .await?;
-
-            // Remove the slot now that it's safely on disk
             if let Some(state_lock) = self.write_buffers.get(&ino) {
-                let mut state = state_lock.lock().await;
-                state.slots.remove(chunk_idx);
+                let state = state_lock.lock().await;
+                if let Some(slot) = state.slots.get(chunk_idx) {
+                    if !slot.data.is_empty() {
+                        slots_to_write.push((*chunk_idx, slot.data.clone(), chunk_idx * CHUNK_SIZE as u64));
+                    }
+                }
             }
+        }
 
-            if let Some(locations) = locations_opt {
-                all_locations.extend(locations);
+        if slots_to_write.is_empty() {
+            return Ok(());
+        }
+
+        info!("flush_buffer_async: flushing {} chunks in parallel for inode {}", slots_to_write.len(), ino);
+
+        // Flush all slots in parallel — each chunk write is independent.
+        // Results come back in arbitrary order; we sort by chunk_idx for metadata consistency.
+        let handles: Vec<_> = slots_to_write.iter().map(|(chunk_idx, slot_data, file_offset)| {
+            let client = self.client.clone();
+            let data = slot_data.clone();
+            let offset = *file_offset;
+            let idx = *chunk_idx;
+            tokio::spawn(async move {
+                info!("flush_buffer_async: writing chunk {} ({} bytes at offset {})", idx, data.len(), offset);
+                let result = client.write_data_with_cache(&data, ino, offset).await;
+                result.map(|(_, _, locs)| (idx, locs))
+            })
+        }).collect();
+
+        let results = futures::future::join_all(handles).await;
+
+        // Process results: remove flushed slots, collect locations.
+        let mut all_locations: Vec<dfs_common::ChunkLocation> = Vec::new();
+        let mut first_err: Option<anyhow::Error> = None;
+
+        for (join_result, (chunk_idx, _, _)) in results.into_iter().zip(slots_to_write.iter()) {
+            match join_result {
+                Ok(Ok((_, locations_opt))) => {
+                    // Remove slot now that it's safely on disk.
+                    if let Some(state_lock) = self.write_buffers.get(&ino) {
+                        let mut state = state_lock.lock().await;
+                        state.slots.remove(chunk_idx);
+                    }
+                    if let Some(locations) = locations_opt {
+                        all_locations.extend(locations);
+                    }
+                }
+                Ok(Err(e)) => {
+                    if first_err.is_none() { first_err = Some(e); }
+                }
+                Err(e) => {
+                    if first_err.is_none() { first_err = Some(anyhow::anyhow!("flush task panicked: {}", e)); }
+                }
             }
+        }
+
+        if let Some(e) = first_err {
+            return Err(e);
         }
 
         if all_locations.is_empty() {

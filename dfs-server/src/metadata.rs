@@ -187,13 +187,15 @@ impl MetadataStore {
 
                 if let Some(existing) = existing_opt {
                     // Drop the incoming write if it is stale: existing record is strictly
-                    // newer and has chunks while the incoming one is empty (zero-size create).
-                    if existing.modified_at > metadata.modified_at
-                        && !existing.chunk_locations.is_empty()
-                        && metadata.chunk_locations.is_empty()
-                    {
+                    // newer. modified_at is the authoritative ordering signal — if the
+                    // existing record is newer, the incoming write is an out-of-order
+                    // delivery (e.g. async dissemination, retry queue) and must not
+                    // overwrite the newer state. This prevents mid-recording metadata
+                    // snapshots from clobbering the final release() metadata when
+                    // dissemination delivers them out of order to followers.
+                    if existing.modified_at > metadata.modified_at {
                         debug!(
-                            "Dropping stale zero-chunk metadata for {} (existing modified_at={} > incoming={})",
+                            "Dropping stale metadata for {} (existing modified_at={} > incoming={})",
                             metadata.path, existing.modified_at, metadata.modified_at
                         );
                         return Ok(());

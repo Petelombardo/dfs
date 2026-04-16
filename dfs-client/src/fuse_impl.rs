@@ -1337,7 +1337,7 @@ impl Filesystem for DfsFilesystem {
                 }
             }
 
-            if metadata.chunks.is_empty() {
+            if metadata.chunks.is_empty() && metadata.chunk_locations.is_empty() {
                 reply.data(&[]);
                 return;
             }
@@ -1352,7 +1352,13 @@ impl Filesystem for DfsFilesystem {
                 // Check cache without holding a ref across the potential insert
                 let cached = chunk_offset_cache.get(&ino).and_then(|entry| {
                     let (cached_size, cached_chunk_count, ref cached_offsets) = *entry;
-                    if cached_size == metadata.size && cached_chunk_count == metadata.chunks.len() {
+                    // Use chunk_locations.len() for modern files; fall back to chunks.len() for legacy.
+                    let current_chunk_count = if !metadata.chunk_locations.is_empty() {
+                        metadata.chunk_locations.len()
+                    } else {
+                        metadata.chunks.len()
+                    };
+                    if cached_size == metadata.size && cached_chunk_count == current_chunk_count {
                         Some(cached_offsets.clone())
                     } else {
                         None
@@ -1394,8 +1400,14 @@ impl Filesystem for DfsFilesystem {
                         }
                     }
 
-                    // Store in cache
-                    chunk_offset_cache.insert(ino, (metadata.size, metadata.chunks.len(), offsets.clone()));
+                    // Store in cache — use chunk_locations.len() for modern files so the
+                    // cache invalidates correctly when new chunks are appended.
+                    let chunk_count_key = if !metadata.chunk_locations.is_empty() {
+                        metadata.chunk_locations.len()
+                    } else {
+                        metadata.chunks.len()
+                    };
+                    chunk_offset_cache.insert(ino, (metadata.size, chunk_count_key, offsets.clone()));
 
                     offsets
                 }

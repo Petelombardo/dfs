@@ -2532,6 +2532,53 @@ impl Server {
                                 warn!("Metadata repair: chunk location rebuild failed: {}", e),
                         }
 
+                        // File size repair: recompute size from chunk_locations and fix
+                        // any mismatch. This corrects files where a client crash or
+                        // out-of-order metadata delivery left a stale size on disk.
+                        let mut size_fixed = 0usize;
+                        let mut size_errors = 0usize;
+                        let files_to_check: Vec<dfs_common::FileMetadata> = {
+                            let mut v = Vec::new();
+                            let _ = metadata.scan_files(|file| {
+                                if !file.chunk_locations.is_empty() {
+                                    v.push(file.clone());
+                                }
+                                Ok(())
+                            });
+                            v
+                        };
+                        for mut file in files_to_check {
+                            let computed_size: u64 = file.chunk_locations.iter()
+                                .map(|loc| loc.size as u64)
+                                .sum();
+                            if computed_size != file.size && computed_size > 0 {
+                                warn!(
+                                    "Metadata repair: size mismatch for {} ({}): \
+                                     metadata={} computed={} — fixing",
+                                    file.path, file.id, file.size, computed_size
+                                );
+                                file.size = computed_size;
+                                // Bump modified_at so this repair write wins over any
+                                // stale in-flight dissemination carrying the old size.
+                                file.modified_at = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                match metadata.put_file(&file) {
+                                    Ok(()) => size_fixed += 1,
+                                    Err(e) => {
+                                        warn!("Metadata repair: failed to fix size for {}: {}", file.path, e);
+                                        size_errors += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if size_fixed > 0 || size_errors > 0 {
+                            info!("Metadata repair: fixed size for {} files ({} errors)", size_fixed, size_errors);
+                        } else {
+                            info!("Metadata repair: all file sizes are correct");
+                        }
+
                         // Collect the authoritative live file ID set from this node's
                         // now-repaired file: records. Sent to followers for reconciliation.
                         let mut ids = Vec::new();

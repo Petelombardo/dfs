@@ -186,17 +186,18 @@ impl MetadataStore {
                 };
 
                 if let Some(existing) = existing_opt {
-                    // Drop the incoming write if it is stale: existing record is strictly
-                    // newer. modified_at is the authoritative ordering signal — if the
-                    // existing record is newer, the incoming write is an out-of-order
-                    // delivery (e.g. async dissemination, retry queue) and must not
-                    // overwrite the newer state. This prevents mid-recording metadata
-                    // snapshots from clobbering the final release() metadata when
-                    // dissemination delivers them out of order to followers.
-                    if existing.modified_at > metadata.modified_at {
+                    // Drop the incoming write if it is stale: both records have a
+                    // write_seq > 0 and the existing is strictly newer.
+                    // write_seq is assigned by the client in strictly increasing order
+                    // before enqueueing, so higher == newer. Sequence 0 means legacy
+                    // record (no sequencing) — never drop those on sequence alone.
+                    if existing.write_seq > 0
+                        && metadata.write_seq > 0
+                        && existing.write_seq > metadata.write_seq
+                    {
                         debug!(
-                            "Dropping stale metadata for {} (existing modified_at={} > incoming={})",
-                            metadata.path, existing.modified_at, metadata.modified_at
+                            "Dropping stale metadata for {} (existing write_seq={} > incoming={})",
+                            metadata.path, existing.write_seq, metadata.write_seq
                         );
                         return Ok(());
                     }

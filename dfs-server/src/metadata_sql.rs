@@ -224,6 +224,7 @@ impl SqlMetadataStore {
             gid: gid as u32,
             file_type,
             chunk_locations,
+            write_seq: 0,
         }))
     }
 
@@ -346,6 +347,7 @@ impl SqlMetadataStore {
                         uid: 0,
                         gid: 0,
                         file_type: dfs_common::FileType::Directory,
+                        write_seq: 0,
                     });
                 }
             } else {

@@ -236,6 +236,13 @@ pub struct FileMetadata {
     /// When present, this takes precedence over chunks/chunk_sizes fields
     #[serde(default)]
     pub chunk_locations: Vec<ChunkLocation>,
+
+    /// Monotonically increasing sequence number assigned by the client before
+    /// enqueueing each metadata write. The server uses this to reject out-of-order
+    /// deliveries: if stored write_seq > incoming write_seq, the write is stale and
+    /// dropped. Defaults to 0 for legacy records (no ordering enforcement).
+    #[serde(default)]
+    pub write_seq: u64,
 }
 
 impl FileMetadata {
@@ -258,6 +265,7 @@ impl FileMetadata {
             gid: 0,
             file_type,
             chunk_locations: Vec::new(),
+            write_seq: 0,
         }
     }
 
@@ -403,6 +411,7 @@ impl From<FileMetadataV1> for FileMetadata {
             gid: v1.gid,
             file_type: v1.file_type,
             chunk_locations: v1.chunk_locations.into_iter().map(|loc| loc.into()).collect(),
+            write_seq: 0,
         }
     }
 }
@@ -443,6 +452,7 @@ impl From<FileMetadataV0> for FileMetadata {
             gid: v0.gid,
             file_type: v0.file_type,
             chunk_locations: v0.chunk_locations.into_iter().map(|loc| loc.into()).collect(),
+            write_seq: 0,
         }
     }
 }

@@ -295,14 +295,24 @@ impl MetadataQueue {
 
         if let Some(&pos) = idx.get(&metadata.id) {
             if let Some(entry) = q.get_mut(pos) {
-                // Dedup replace: update metadata, keep original timestamp.
-                // If the existing entry had a done_tx (sync waiter), preserve it —
-                // the release caller is still waiting and must be notified on delivery.
-                // If the new push also has a done_tx, the new one wins (latest close wins).
-                if done_tx.is_some() {
-                    entry.done_tx = done_tx;
+                // Dedup replace: only replace if incoming write_seq >= existing.
+                // This ensures newer metadata (higher sequence) always wins, even if
+                // a stale entry somehow arrives after a newer one was already queued.
+                if metadata.write_seq >= entry.metadata.write_seq {
+                    // If the existing entry had a done_tx (sync waiter), preserve it —
+                    // the release caller is still waiting and must be notified on delivery.
+                    // If the new push also has a done_tx, the new one wins (latest close wins).
+                    if done_tx.is_some() {
+                        entry.done_tx = done_tx;
+                    }
+                    entry.metadata = metadata;
+                } else {
+                    // Incoming is older — drop it, but transfer done_tx if present so
+                    // a release() waiter still gets notified when the newer entry delivers.
+                    if done_tx.is_some() && entry.done_tx.is_none() {
+                        entry.done_tx = done_tx;
+                    }
                 }
-                entry.metadata = metadata;
                 drop(q);
                 drop(idx);
                 self.notify.notify_one();
@@ -438,6 +448,12 @@ pub struct DfsClient {
     /// drains to leader with redirect/retry. Release path bypasses this and sends
     /// synchronously via flush_metadata_sync().
     pub(crate) metadata_queue: Arc<MetadataQueue>,
+
+    /// Per-file monotonic write sequence counter. Each metadata enqueue increments
+    /// the counter for that file_id and stamps it on the metadata before queuing.
+    /// Prevents out-of-order dissemination from overwriting newer records with stale ones.
+    /// Seeded from the server's stored write_seq on first open-for-write.
+    write_seq: Arc<DashMap<FileId, u64>>,
 }
 
 impl DfsClient {
@@ -575,6 +591,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
+            write_seq: Arc::new(DashMap::new()),
         })
     }
 
@@ -3174,6 +3191,33 @@ leader_addr: Arc::new(RwLock::new(None)),
         self.put_file_metadata_with_quorum(metadata, None).await
     }
 
+    /// Seed the per-file write sequence counter from an existing server record.
+    /// Called on open-for-write so that writes after a client restart continue
+    /// from where the server left off, not from 0 (which would be dropped by the
+    /// server's stale-write guard if the file already has a higher sequence).
+    pub fn seed_write_seq(&self, file_id: FileId, server_seq: u64) {
+        // Only seed if we don't already have a counter for this file, or if the
+        // server has a higher value (e.g. after a client restart).
+        let mut entry = self.write_seq.entry(file_id).or_insert(0);
+        if server_seq >= *entry {
+            *entry = server_seq;
+        }
+    }
+
+    /// Increment and return the next write sequence number for a file.
+    fn next_write_seq(&self, file_id: FileId) -> u64 {
+        let mut entry = self.write_seq.entry(file_id).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// Stamp the next write_seq onto a metadata clone and return it.
+    fn stamp_write_seq(&self, metadata: &FileMetadata) -> FileMetadata {
+        let mut m = metadata.clone();
+        m.write_seq = self.next_write_seq(m.id);
+        m
+    }
+
     /// Enqueue a metadata update for async delivery to the leader.
     /// Returns immediately in the normal case — the background worker handles retries.
     ///
@@ -3270,7 +3314,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        self.metadata_queue.push(metadata.clone()).await;
+        let stamped = self.stamp_write_seq(metadata);
+        self.metadata_queue.push(stamped).await;
     }
 
     /// Enqueue metadata for release (close). Waits until the background worker
@@ -3278,7 +3323,8 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// The FUSE thread is parked in block_on but tokio worker threads keep running,
     /// so the metadata queue worker proceeds without starvation.
     pub async fn flush_metadata_sync(&self, metadata: &FileMetadata) {
-        self.metadata_queue.push_and_wait(metadata.clone()).await;
+        let stamped = self.stamp_write_seq(metadata);
+        self.metadata_queue.push_and_wait(stamped).await;
     }
 
     /// Spawn the background metadata queue worker onto the given runtime.

@@ -578,6 +578,7 @@ impl DfsFilesystem {
             gid: 0,
             file_type: FileType::Directory,
             chunk_locations: Vec::new(),
+            write_seq: 0,
         };
 
         metadata_cache.insert(1, root_metadata);
@@ -977,6 +978,13 @@ impl Filesystem for DfsFilesystem {
         let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
         if is_write {
             *self.write_open_counts.entry(ino).or_insert(0) += 1;
+
+            // Seed the write_seq counter from the server's stored value so that
+            // writes after a client restart continue from the correct sequence,
+            // not from 0 (which would be treated as stale by the server).
+            if let Some(meta) = self.metadata_cache.get(&ino) {
+                self.client.seed_write_seq(meta.id, meta.write_seq);
+            }
 
             // O_SYNC / O_DSYNC: the caller wants every fsync() to be honored immediately.
             // SQLite, databases, and write-journaling apps use this. DVR/streaming apps don't.
@@ -1928,6 +1936,7 @@ impl Filesystem for DfsFilesystem {
             gid: _req.gid(),
             file_type: FileType::RegularFile,
             chunk_locations: Vec::new(),
+            write_seq: 0,
         };
 
         // Store metadata on cluster — spawn so we never block_on the FUSE dispatch thread.
@@ -2049,6 +2058,7 @@ impl Filesystem for DfsFilesystem {
                                     uid: _req.uid(),
                                     gid: _req.gid(),
                                     file_type: dfs_common::FileType::RegularFile,
+                                    write_seq: 0,
                                 };
                                 info!("write: inode {} has no server metadata, creating new record for {}", ino, path);
                                 metadata_cache.insert(ino, new_meta.clone());
@@ -2815,6 +2825,7 @@ impl Filesystem for DfsFilesystem {
             gid: _req.gid(),
             file_type: FileType::Directory,
             chunk_locations: Vec::new(),
+            write_seq: 0,
         };
 
         // Store metadata on cluster — spawn so we never block_on the FUSE dispatch thread.

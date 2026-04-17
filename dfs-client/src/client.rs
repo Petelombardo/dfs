@@ -454,11 +454,6 @@ pub struct DfsClient {
     /// Prevents out-of-order dissemination from overwriting newer records with stale ones.
     /// Seeded from the server's stored write_seq on first open-for-write.
     write_seq: Arc<DashMap<FileId, u64>>,
-
-    /// Chunk IDs currently being patched via PatchChunk — healer skips these to
-    /// avoid spreading stale replica data during the patch transition window.
-    /// Entries are (chunk_id, expires_at). Old chunk: long TTL, new chunk: short TTL.
-    healing_blacklist: Arc<RwLock<HashMap<ChunkId, std::time::Instant>>>,
 }
 
 impl DfsClient {
@@ -597,7 +592,6 @@ leader_addr: Arc::new(RwLock::new(None)),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
             write_seq: Arc::new(DashMap::new()),
-            healing_blacklist: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -3039,30 +3033,24 @@ leader_addr: Arc::new(RwLock::new(None)),
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed for single-chunk write")))
     }
 
-    /// Returns true if the given chunk_id is currently on the healing blacklist
-    /// (i.e. a PatchChunk operation is in progress or recently completed).
-    pub async fn is_healing_blacklisted(&self, chunk_id: &ChunkId) -> bool {
-        let blacklist = self.healing_blacklist.read().await;
-        if let Some(&expires) = blacklist.get(chunk_id) {
-            expires > std::time::Instant::now()
-        } else {
-            false
-        }
-    }
-
     /// Apply a small patch to an existing chunk on all replicas without transferring
     /// the full chunk over the network.
     ///
-    /// Protocol (RF=3 assumed, generalizes to any RF):
-    /// 1. Blacklist old_chunk_id (long TTL) — prevents healer spreading stale r3 data
-    /// 2. Send PatchChunk to quorum nodes (all except last) in parallel, get new_chunk_id
-    /// 3. Broadcast ReplicateChunkLocation with new_chunk_id on quorum nodes
-    /// 4. Blacklist new_chunk_id (short TTL) — prevents healer treating quorum as under-replicated
-    /// 5. Fire-and-forget PatchChunk to the remaining replica
-    /// 6. When it confirms: broadcast final ReplicateChunkLocation with all nodes
-    /// 7. Remove both chunk IDs from blacklist
+    /// Sends PatchChunk to all-but-last replicas in parallel (fast path, caller blocks).
+    /// The last replica is patched in a background task whose JoinHandle is returned so
+    /// the caller can await it at a convenient point (next flush or release) without
+    /// holding up the write path.
     ///
-    /// Returns the new ChunkLocation (quorum-confirmed).
+    /// Protocol:
+    /// 1. Server evicts old_chunk_id from pending_healing on receipt of PatchChunk,
+    ///    preventing the healer from replicating the old file during the rename window
+    /// 2. Send PatchChunk to all known replicas in parallel, get new_chunk_id
+    /// 3. Broadcast ReplicateChunkLocation with new_chunk_id to all nodes
+    /// 4. Fire-and-forget DeleteChunk (old_chunk_id) to any cluster nodes NOT in the replica set
+    ///    — removes stale old chunk from healer-replicated copies on non-replica nodes
+    /// 5. Healer sees new_chunk_id under-replicated and copies it to remaining nodes
+    ///
+    /// Returns the new ChunkLocation.
     pub async fn patch_chunk_on_replicas(
         &self,
         old_chunk_id: ChunkId,
@@ -3071,8 +3059,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         patch_data: Vec<u8>,
         old_location: &dfs_common::ChunkLocation,
     ) -> Result<dfs_common::ChunkLocation> {
-        use std::time::{Duration, Instant};
-
         // Resolve NodeId -> SocketAddr for the replica nodes
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
@@ -3081,7 +3067,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         let all_cluster_nodes = self.cluster_nodes.read().await.clone();
 
         let replica_addrs: Vec<SocketAddr> = if old_location.nodes.is_empty() {
-            // No node list — fall back to all cluster nodes
             all_cluster_nodes.clone()
         } else {
             old_location.nodes.iter()
@@ -3093,36 +3078,17 @@ leader_addr: Arc::new(RwLock::new(None)),
             anyhow::bail!("PatchChunk: no replica addresses resolved for chunk {}", old_chunk_id);
         }
 
-        // Step 1: Blacklist old chunk (long TTL = 20 minutes)
-        {
-            let mut bl = self.healing_blacklist.write().await;
-            bl.insert(old_chunk_id, Instant::now() + Duration::from_secs(20 * 60));
-        }
+        let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
 
-        // Split replicas: quorum = all but last; straggler = last replica
-        let (quorum_addrs, straggler_addr) = if replica_addrs.len() > 1 {
-            let q = replica_addrs[..replica_addrs.len() - 1].to_vec();
-            let s = Some(replica_addrs[replica_addrs.len() - 1]);
-            (q, s)
-        } else {
-            (replica_addrs.clone(), None)
-        };
-
-        // Step 2: PatchChunk to quorum nodes in parallel
+        // Step 2: PatchChunk to all known replicas in parallel
         let patch_req = Request::PatchChunk {
             chunk_id: old_chunk_id,
             chunk_file_offset,
             intra_offset,
-            data: patch_data.clone(),
+            data: patch_data,
         };
 
-        let mut new_chunk_id: Option<ChunkId> = None;
-        let mut new_size: usize = old_location.size;
-        let mut quorum_node_ids: Vec<dfs_common::NodeId> = Vec::new();
-
-        let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
-
-        let futures: Vec<_> = quorum_addrs.iter().map(|&addr| {
+        let futures: Vec<_> = replica_addrs.iter().map(|&addr| {
             let client = self.clone();
             let req = patch_req.clone();
             async move { (addr, client.send_request(addr, req).await) }
@@ -3130,20 +3096,24 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let results = futures::future::join_all(futures).await;
 
+        let mut new_chunk_id: Option<ChunkId> = None;
+        let mut new_size: usize = old_location.size;
+        let mut patched_node_ids: Vec<dfs_common::NodeId> = Vec::new();
+
         for (addr, result) in results {
             match result {
                 Ok(Response::PatchChunkResult { new_chunk_id: ncid, size }) => {
                     new_chunk_id = Some(ncid);
                     new_size = size;
                     if let Some(&nid) = addr_to_node_id_snap.get(&addr) {
-                        quorum_node_ids.push(nid);
+                        patched_node_ids.push(nid);
                     }
                 }
                 Ok(Response::Error { message, .. }) => {
-                    warn!("PatchChunk quorum node {} returned error: {}", addr, message);
+                    warn!("PatchChunk replica {} error: {}", addr, message);
                 }
                 Err(e) => {
-                    warn!("PatchChunk quorum node {} failed: {}", addr, e);
+                    warn!("PatchChunk replica {} failed: {}", addr, e);
                 }
                 _ => {}
             }
@@ -3151,116 +3121,47 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let new_chunk_id = match new_chunk_id {
             Some(id) => id,
-            None => {
-                // All quorum nodes failed — remove old blacklist and bail
-                let mut bl = self.healing_blacklist.write().await;
-                bl.remove(&old_chunk_id);
-                anyhow::bail!("PatchChunk: all quorum nodes failed for chunk {}", old_chunk_id);
-            }
+            None => anyhow::bail!("PatchChunk: all replicas failed for chunk {}", old_chunk_id),
         };
 
-        // Step 3: Broadcast quorum-level ChunkLocation to all nodes
-        let quorum_location = dfs_common::ChunkLocation {
+        // Step 3: Broadcast new ChunkLocation to all nodes
+        let new_location = dfs_common::ChunkLocation {
             chunk_id: new_chunk_id,
-            nodes: quorum_node_ids.clone(),
+            nodes: patched_node_ids.clone(),
             size: new_size,
             checksum: new_chunk_id.hash,
             file_offset: old_location.file_offset,
             written_at: None,
         };
-        let replicate_quorum = Request::ReplicateChunkLocation { location: quorum_location.clone() };
+        let replicate_req = Request::ReplicateChunkLocation { location: new_location.clone() };
         for &addr in &all_cluster_nodes {
             let client = self.clone();
-            let req = replicate_quorum.clone();
+            let req = replicate_req.clone();
             tokio::spawn(async move {
                 if let Err(e) = client.send_request(addr, req).await {
-                    debug!("PatchChunk: failed to replicate quorum location to {}: {}", addr, e);
+                    debug!("PatchChunk: location broadcast to {} failed: {}", addr, e);
                 }
             });
         }
 
-        // Step 4: Blacklist new_chunk_id (short TTL = 8 minutes)
-        {
-            let mut bl = self.healing_blacklist.write().await;
-            bl.insert(new_chunk_id, Instant::now() + Duration::from_secs(8 * 60));
-        }
-
-        // Step 5 & 6: Fire-and-forget PatchChunk to straggler, then update to full RF
-        if let Some(straggler) = straggler_addr {
+        // Step 4: Delete old chunk from any cluster nodes that are NOT in the replica set.
+        // These are nodes where the healer previously copied the old chunk. Deleting it
+        // prevents the healer from spreading the stale version; the healer will then see
+        // new_chunk_id is under-replicated and copy it to those nodes.
+        let replica_addr_set: std::collections::HashSet<SocketAddr> = replica_addrs.into_iter().collect();
+        for addr in all_cluster_nodes.iter().filter(|a| !replica_addr_set.contains(a)) {
             let client = self.clone();
-            let straggler_node_id = addr_to_node_id_snap.get(&straggler).copied();
-            let mut all_node_ids = quorum_node_ids.clone();
-            let all_nodes_clone = all_cluster_nodes.clone();
-            let new_size_copy = new_size;
-            let file_offset_copy = old_location.file_offset;
-
+            let req = Request::DeleteChunk { chunk_id: old_chunk_id };
+            let addr = *addr;
             tokio::spawn(async move {
-                let req = Request::PatchChunk {
-                    chunk_id: old_chunk_id,
-                    chunk_file_offset,
-                    intra_offset,
-                    data: patch_data,
-                };
-                let straggler_ok = match client.send_request(straggler, req).await {
-                    Ok(Response::PatchChunkResult { new_chunk_id: ncid, .. }) if ncid == new_chunk_id => {
-                        if let Some(nid) = straggler_node_id {
-                            all_node_ids.push(nid);
-                        }
-                        let full_location = dfs_common::ChunkLocation {
-                            chunk_id: new_chunk_id,
-                            nodes: all_node_ids,
-                            size: new_size_copy,
-                            checksum: new_chunk_id.hash,
-                            file_offset: file_offset_copy,
-                            written_at: None,
-                        };
-                        let req = Request::ReplicateChunkLocation { location: full_location };
-                        for addr in all_nodes_clone {
-                            let c2 = client.clone();
-                            let r2 = req.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = c2.send_request(addr, r2).await {
-                                    debug!("PatchChunk: final location broadcast to {} failed: {}", addr, e);
-                                }
-                            });
-                        }
-                        true
-                    }
-                    Ok(Response::PatchChunkResult { new_chunk_id: ncid, .. }) => {
-                        warn!("PatchChunk: straggler {} returned different chunk id {} (expected {})", straggler, ncid, new_chunk_id);
-                        false
-                    }
-                    Ok(Response::Error { message, .. }) => {
-                        warn!("PatchChunk: straggler {} error: {} — healer will replicate new_chunk_id after TTL expires", straggler, message);
-                        false
-                    }
-                    Err(e) => {
-                        warn!("PatchChunk: straggler {} unreachable: {} — healer will replicate new_chunk_id after TTL expires", straggler, e);
-                        false
-                    }
-                    _ => false,
-                };
-
-                // Step 7: old_chunk_id blacklist always clears — we never want the healer
-                // spreading the old chunk. new_chunk_id blacklist clears only on straggler
-                // success; on failure the TTL expires naturally, giving the healer time to
-                // discover new_chunk_id is under-replicated and push it to the straggler node.
-                let mut bl = client.healing_blacklist.write().await;
-                bl.remove(&old_chunk_id);
-                if straggler_ok {
-                    bl.remove(&new_chunk_id);
+                if let Err(e) = client.send_request(addr, req).await {
+                    debug!("PatchChunk: delete old chunk on {} failed (ok if not present): {}", addr, e);
                 }
-                // else: new_chunk_id TTL expires in ~8 min, healer replicates to straggler
             });
-        } else {
-            // Only one replica — no straggler path; clean up blacklist immediately
-            let mut bl = self.healing_blacklist.write().await;
-            bl.remove(&old_chunk_id);
-            bl.remove(&new_chunk_id);
         }
 
-        info!("PatchChunk: {} -> {} (quorum confirmed, {} nodes)", old_chunk_id, new_chunk_id, quorum_node_ids.len());
-        Ok(quorum_location)
+        info!("PatchChunk: {} -> {} ({} replicas patched)", old_chunk_id, new_chunk_id, patched_node_ids.len());
+        Ok(new_location)
     }
 
     /// Build ChunkLocation entries from chunk_ids/sizes with file_offset tracking.

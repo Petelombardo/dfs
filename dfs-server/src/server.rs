@@ -2211,6 +2211,15 @@ impl Server {
     ) -> Response {
         use std::fs;
 
+        // Evict old chunk from the healer's pending queue before we begin. The old chunk
+        // file stays on disk until the rename completes, and if the healer fires in that
+        // window it would replicate the stale version to another node. Removing it here
+        // means the healer won't act on it; after the client broadcasts the new location
+        // the healer will discover new_chunk_id as under-replicated and heal that instead.
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            healing.evict_from_pending(&chunk_id).await;
+        }
+
         // Read existing chunk
         let mut chunk_bytes = match self.storage.read_chunk(&chunk_id) {
             Ok(data) => data,

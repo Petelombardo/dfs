@@ -1414,6 +1414,13 @@ impl HealingManager {
 
     /// Queue a specific set of chunks for immediate healing, bypassing the normal delay.
     /// Used by HealFile to force-heal all chunks of a single file for targeted testing.
+    /// Remove a chunk from the healer's pending queue. Used by PatchChunk to prevent
+    /// the healer from replicating the old chunk file during the rename window.
+    pub async fn evict_from_pending(&self, chunk_id: &ChunkId) {
+        self.pending_healing.write().await.remove(chunk_id);
+        self.stalled_healing.write().await.remove(chunk_id);
+    }
+
     pub async fn queue_chunks_immediate(&self, chunk_ids: Vec<ChunkId>) {
         let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs + 1);
         let mut pending = self.pending_healing.write().await;

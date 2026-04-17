@@ -6,8 +6,8 @@ use crate::network::{MessageHandler, NetworkClient};
 use crate::storage::ChunkStorage;
 use anyhow::{Context, Result};
 use dfs_common::{
-    compute_chunk_hash, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
-    Message, NodeId, NodeInfo, Request, Response,
+    compute_chunk_hash_at, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
+    Message, NodeId, Request, Response,
 };
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -611,6 +611,9 @@ impl Server {
             Request::ListDirectory { path } => self.handle_list_directory(path).await,
             Request::WriteFile { data } => self.handle_write_file(data).await,
             Request::WriteFileLocalOnly { data, .. } => self.handle_write_file_local_only(data).await,
+            Request::PatchChunk { chunk_id, chunk_file_offset, intra_offset, data } => {
+                self.handle_patch_chunk(chunk_id, chunk_file_offset, intra_offset, data).await
+            }
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
             Request::RenameFile { old_path, new_path } => {
                 self.handle_rename_file(old_path, new_path).await
@@ -2193,6 +2196,56 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Apply a patch to an existing chunk without transferring the full chunk over the network.
+    /// Reads the chunk locally, splices in patch bytes, recomputes position-aware Blake3,
+    /// writes result as a new chunk file. Old chunk is left for GC by the healer.
+    async fn handle_patch_chunk(
+        &self,
+        chunk_id: ChunkId,
+        chunk_file_offset: u64,
+        intra_offset: usize,
+        patch_data: Vec<u8>,
+    ) -> Response {
+        // Read existing chunk
+        let mut chunk_bytes = match self.storage.read_chunk(&chunk_id) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("PatchChunk: chunk {} not found locally: {}", chunk_id, e);
+                return Response::Error {
+                    message: format!("Chunk not found: {}", e),
+                    code: ErrorCode::NotFound,
+                };
+            }
+        };
+
+        let patch_end = intra_offset + patch_data.len();
+        if patch_end > chunk_bytes.len() {
+            warn!("PatchChunk: patch [{}, {}) extends past chunk size {}", intra_offset, patch_end, chunk_bytes.len());
+            return Response::Error {
+                message: format!("Patch extends past chunk boundary: patch_end={} chunk_size={}", patch_end, chunk_bytes.len()),
+                code: ErrorCode::InvalidRequest,
+            };
+        }
+
+        chunk_bytes[intra_offset..patch_end].copy_from_slice(&patch_data);
+
+        let new_hash = compute_chunk_hash_at(&chunk_bytes, chunk_file_offset);
+        let new_chunk_id = ChunkId::from_hash(new_hash);
+        let size = chunk_bytes.len();
+
+        if let Err(e) = self.storage.write_chunk(&new_chunk_id, &chunk_bytes) {
+            warn!("PatchChunk: failed to write patched chunk {}: {}", new_chunk_id, e);
+            return Response::Error {
+                message: format!("Failed to write patched chunk: {}", e),
+                code: ErrorCode::InternalError,
+            };
+        }
+
+        info!("PatchChunk: {} -> {} ({} bytes patched at intra_offset={})", chunk_id, new_chunk_id, patch_data.len(), intra_offset);
+
+        Response::PatchChunkResult { new_chunk_id, size }
     }
 
     /// Handle delete file request

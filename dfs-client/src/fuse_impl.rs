@@ -269,52 +269,60 @@ impl FlushHandle {
                         let slot_len = slot_data.len();
 
                         // If this slot is partial AND higher chunks are already on the server,
-                        // the slot holds an overlay (e.g. a header) written to the beginning of
-                        // a chunk that was previously flushed as a full 4MB chunk. We need to
-                        // read-modify-write: fetch the server copy, apply our bytes on top.
-                        let needs_rmw = slot_len < CHUNK_SIZE
+                        // the slot holds an overlay (e.g. a header) written to a chunk that was
+                        // previously flushed as a full 4MB chunk. Use PatchChunk to send only
+                        // the changed bytes to each replica — no full chunk transfer needed.
+                        let needs_patch = slot_len < CHUNK_SIZE
                             && max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false);
 
-                        if needs_rmw {
-                            info!("flush_buffer_async: partial slot {} ({} bytes) needs RMW — fetching existing chunk from server",
+                        if needs_patch {
+                            info!("flush_buffer_async: partial slot {} ({} bytes) — using PatchChunk",
                                   chunk_idx, slot_len);
-                            // Fetch the existing chunk data from the server
-                            let existing = {
-                                let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
-                                if let Some(meta) = meta {
-                                    let chunk_idx_usize = *chunk_idx as usize;
-                                    let chunk_id_opt = meta.chunk_locations.get(chunk_idx_usize)
-                                        .map(|l| l.chunk_id)
-                                        .or_else(|| meta.chunks.get(chunk_idx_usize).copied());
-                                    let chunk_size_opt = meta.chunk_locations.get(chunk_idx_usize)
-                                        .map(|l| l.size)
-                                        .or_else(|| meta.chunk_sizes.get(chunk_idx_usize).map(|&s| s as usize));
-                                    if let (Some(chunk_id), Some(_chunk_size)) = (chunk_id_opt, chunk_size_opt) {
-                                        let nodes = meta.chunk_locations.get(*chunk_idx as usize)
-                                            .map(|l| l.nodes.as_slice())
-                                            .unwrap_or(&[]);
-                                        match self.client.read_chunk_by_id(chunk_id, nodes).await {
-                                            Ok(data) => Some(data),
-                                            Err(e) => {
-                                                warn!("flush_buffer_async: RMW fetch failed for chunk {}: {} — flushing partial as-is", chunk_idx, e);
-                                                None
+                            let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
+                            let patched = if let Some(meta) = meta {
+                                let chunk_idx_usize = *chunk_idx as usize;
+                                let old_location_opt = meta.chunk_locations.get(chunk_idx_usize).cloned()
+                                    .or_else(|| {
+                                        // Legacy: no chunk_locations — can't patch without node list
+                                        None
+                                    });
+                                if let Some(old_location) = old_location_opt {
+                                    match self.client.patch_chunk_on_replicas(
+                                        old_location.chunk_id,
+                                        file_offset,  // chunk_file_offset = start of this chunk
+                                        0,            // intra_offset: overlay always starts at byte 0 for DVR header
+                                        slot_data.clone(),
+                                        &old_location,
+                                    ).await {
+                                        Ok(new_location) => {
+                                            info!("flush_buffer_async: PatchChunk slot {} succeeded: {} -> {}",
+                                                  chunk_idx, old_location.chunk_id, new_location.chunk_id);
+                                            // Update metadata cache with new chunk location in-place
+                                            if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                                                if let Some(loc) = meta_entry.chunk_locations.get_mut(chunk_idx_usize) {
+                                                    *loc = new_location.clone();
+                                                }
+                                                if let Some(id) = meta_entry.chunks.get_mut(chunk_idx_usize) {
+                                                    *id = new_location.chunk_id;
+                                                }
                                             }
+                                            // Skip adding to slots_to_write — patch already committed
+                                            true
                                         }
-                                    } else { None }
-                                } else { None }
+                                        Err(e) => {
+                                            warn!("flush_buffer_async: PatchChunk failed for slot {}: {} — falling back to full write", chunk_idx, e);
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    warn!("flush_buffer_async: no chunk_location for slot {} — cannot patch, falling back to full write", chunk_idx);
+                                    false
+                                }
+                            } else {
+                                false
                             };
 
-                            if let Some(mut base) = existing {
-                                // Overlay our buffered bytes on top of the fetched chunk
-                                if base.len() < slot_len {
-                                    base.resize(slot_len, 0u8);
-                                }
-                                base[..slot_len].copy_from_slice(&slot_data);
-                                info!("flush_buffer_async: RMW slot {} — merged {} bytes into {} byte chunk",
-                                      chunk_idx, slot_len, base.len());
-                                slots_to_write.push((*chunk_idx, base, file_offset));
-                            } else {
-                                // RMW fetch failed; fall back to writing partial data as-is
+                            if !patched {
                                 slots_to_write.push((*chunk_idx, slot_data, file_offset));
                             }
                         } else {

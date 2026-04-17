@@ -174,6 +174,21 @@ pub enum Request {
         chunk_ids: Vec<ChunkId>,
     },
 
+    /// Apply a small patch to an existing chunk without transferring the full chunk.
+    /// Server reads the chunk locally, splices in the patch bytes, recomputes the
+    /// position-aware Blake3 hash, and writes the result as a new chunk file.
+    /// Used by the client instead of client-side read-modify-write for random small writes.
+    PatchChunk {
+        /// Existing chunk to patch
+        chunk_id: ChunkId,
+        /// Absolute file offset of the start of this chunk (for position-aware hash)
+        chunk_file_offset: u64,
+        /// Byte offset within the chunk where the patch data begins
+        intra_offset: usize,
+        /// The patch bytes to splice in
+        data: Vec<u8>,
+    },
+
     // Admin requests
     /// Get cluster status
     GetClusterStatus,
@@ -438,6 +453,14 @@ pub enum Response {
     PrefetchAccepted {
         /// Number of chunks that will be prefetched
         accepted: usize,
+    },
+
+    /// Response to PatchChunk — new chunk identity after patch applied
+    PatchChunkResult {
+        /// Blake3 hash of the patched content (position-aware, same scheme as WriteFileLocalOnly)
+        new_chunk_id: ChunkId,
+        /// Chunk size in bytes (unchanged by the patch)
+        size: usize,
     },
 
     /// Returned when a client sends PutFileMetadata to a non-leader.

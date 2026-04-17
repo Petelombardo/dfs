@@ -3201,7 +3201,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     intra_offset,
                     data: patch_data,
                 };
-                match client.send_request(straggler, req).await {
+                let straggler_ok = match client.send_request(straggler, req).await {
                     Ok(Response::PatchChunkResult { new_chunk_id: ncid, .. }) if ncid == new_chunk_id => {
                         if let Some(nid) = straggler_node_id {
                             all_node_ids.push(nid);
@@ -3224,22 +3224,33 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 }
                             });
                         }
+                        true
                     }
                     Ok(Response::PatchChunkResult { new_chunk_id: ncid, .. }) => {
                         warn!("PatchChunk: straggler {} returned different chunk id {} (expected {})", straggler, ncid, new_chunk_id);
+                        false
                     }
                     Ok(Response::Error { message, .. }) => {
-                        warn!("PatchChunk: straggler {} returned error: {}", straggler, message);
+                        warn!("PatchChunk: straggler {} error: {} — healer will replicate new_chunk_id after TTL expires", straggler, message);
+                        false
                     }
                     Err(e) => {
-                        warn!("PatchChunk: straggler {} failed: {} — chunk stays at RF-1, healer will repair", straggler, e);
+                        warn!("PatchChunk: straggler {} unreachable: {} — healer will replicate new_chunk_id after TTL expires", straggler, e);
+                        false
                     }
-                    _ => {}
-                }
-                // Step 7: Remove both IDs from blacklist after straggler path completes
+                    _ => false,
+                };
+
+                // Step 7: old_chunk_id blacklist always clears — we never want the healer
+                // spreading the old chunk. new_chunk_id blacklist clears only on straggler
+                // success; on failure the TTL expires naturally, giving the healer time to
+                // discover new_chunk_id is under-replicated and push it to the straggler node.
                 let mut bl = client.healing_blacklist.write().await;
                 bl.remove(&old_chunk_id);
-                bl.remove(&new_chunk_id);
+                if straggler_ok {
+                    bl.remove(&new_chunk_id);
+                }
+                // else: new_chunk_id TTL expires in ~8 min, healer replicates to straggler
             });
         } else {
             // Only one replica — no straggler path; clean up blacklist immediately

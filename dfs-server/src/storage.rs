@@ -13,6 +13,12 @@ use tracing::{debug, info, warn};
 /// two concurrent writes target the same chunk on the same node.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Increment and return the global write counter — used by callers (e.g. PatchChunk handler)
+/// that need a unique temp file name in the same directory as a chunk.
+pub fn next_write_seq() -> u64 {
+    WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Local chunk storage manager
 /// Optimized for SBC environments (limited CPU/RAM)
 pub struct ChunkStorage {
@@ -267,7 +273,7 @@ impl ChunkStorage {
 
     /// Get the filesystem path for a chunk
     /// Uses 2-level directory sharding: chunks/XX/YY/hash
-    fn get_chunk_path(&self, chunk_id: &ChunkId) -> PathBuf {
+    pub fn get_chunk_path(&self, chunk_id: &ChunkId) -> PathBuf {
         let (dir1, dir2, filename) = chunk_id.storage_path_components();
         self.data_dir
             .join("chunks")

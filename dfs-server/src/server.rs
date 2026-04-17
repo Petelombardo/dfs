@@ -2200,7 +2200,8 @@ impl Server {
 
     /// Apply a patch to an existing chunk without transferring the full chunk over the network.
     /// Reads the chunk locally, splices in patch bytes, recomputes position-aware Blake3,
-    /// writes result as a new chunk file. Old chunk is left for GC by the healer.
+    /// then atomically renames the chunk file to its new hash path and removes the old path.
+    /// No data bytes are written to disk beyond the temp file — this is a read+patch+rename.
     async fn handle_patch_chunk(
         &self,
         chunk_id: ChunkId,
@@ -2208,6 +2209,8 @@ impl Server {
         intra_offset: usize,
         patch_data: Vec<u8>,
     ) -> Response {
+        use std::fs;
+
         // Read existing chunk
         let mut chunk_bytes = match self.storage.read_chunk(&chunk_id) {
             Ok(data) => data,
@@ -2229,26 +2232,58 @@ impl Server {
             };
         }
 
+        // Apply patch in memory
         chunk_bytes[intra_offset..patch_end].copy_from_slice(&patch_data);
 
         let new_hash = compute_chunk_hash_at(&chunk_bytes, chunk_file_offset);
         let new_chunk_id = ChunkId::from_hash(new_hash);
         let size = chunk_bytes.len();
 
-        if let Err(e) = self.storage.write_chunk(&new_chunk_id, &chunk_bytes) {
-            warn!("PatchChunk: failed to write patched chunk {}: {}", new_chunk_id, e);
+        // Write patched bytes to a temp file in the same directory as the old chunk,
+        // then rename temp → new_path. Finally unlink old_path.
+        // This means only a single full-chunk write touches disk (the temp file);
+        // the rename and unlink are metadata-only ops — much cheaper than write+delete.
+        let old_path = self.storage.get_chunk_path(&chunk_id);
+        let new_path = self.storage.get_chunk_path(&new_chunk_id);
+
+        // Ensure new chunk's parent directory exists
+        if let Some(parent) = new_path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                warn!("PatchChunk: failed to create dir for {}: {}", new_chunk_id, e);
+                return Response::Error {
+                    message: format!("Failed to create chunk directory: {}", e),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        }
+
+        // Write to uniquely-named temp file in same dir as old chunk (same filesystem → cheap rename)
+        let seq = crate::storage::next_write_seq();
+        let temp_name = format!("{}.{}.ptmp", new_chunk_id, seq);
+        let temp_path = old_path.parent().unwrap_or(old_path.as_path()).join(temp_name);
+
+        let write_result = (|| -> Result<(), anyhow::Error> {
+            use std::io::Write;
+            let mut f = fs::File::create(&temp_path)?;
+            f.write_all(&chunk_bytes)?;
+            f.sync_all()?;
+            fs::rename(&temp_path, &new_path)?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&temp_path); // clean up temp on failure
+            warn!("PatchChunk: failed to write/rename patched chunk {}: {}", new_chunk_id, e);
             return Response::Error {
                 message: format!("Failed to write patched chunk: {}", e),
                 code: ErrorCode::InternalError,
             };
         }
 
-        // New chunk is safely written — delete the old chunk file immediately.
-        // No need to wait for orphan GC: the old hash is no longer referenced by
-        // any file metadata, and both old and new files would otherwise coexist on disk.
-        if let Err(e) = self.storage.delete_chunk(&chunk_id) {
-            // Non-fatal: the file will be caught by orphan GC eventually.
-            warn!("PatchChunk: failed to delete old chunk {}: {}", chunk_id, e);
+        // Unlink the old chunk file — it's been superseded by the renamed new file.
+        if let Err(e) = fs::remove_file(&old_path) {
+            // Non-fatal: orphan GC will catch it.
+            warn!("PatchChunk: failed to remove old chunk file {}: {}", chunk_id, e);
         }
 
         info!("PatchChunk: {} -> {} ({} bytes patched at intra_offset={})", chunk_id, new_chunk_id, patch_data.len(), intra_offset);

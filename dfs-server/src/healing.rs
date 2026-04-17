@@ -196,6 +196,11 @@ impl HealingManager {
             if is_leader != was_leader {
                 if is_leader {
                     info!("This node is now the cluster leader — taking over healing coordination");
+                    // Reset cycle_counter so the first scan after a leadership change is
+                    // always a deep scan. Without this, cycle_counter may be at an arbitrary
+                    // value and the fast-path condition (% deep_every == 1) might not fire
+                    // for many cycles, delaying discovery of under-replicated chunks.
+                    cycle_counter = 0;
                 } else {
                     info!("This node is no longer the cluster leader — yielding healing to new leader");
                 }

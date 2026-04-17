@@ -26,6 +26,11 @@ pub struct MetadataStore {
     /// entries to each follower and removes them on confirmed ack.
     pub meta_queue: sled::Tree,
 
+    /// Secondary index for write-path deduplication (leader-only).
+    /// Key: `{node_id_hex}:{file_id_hex}` — Value: `{seq:016x}` (8 raw bytes, big-endian).
+    /// Allows O(1) lookup of the existing queue entry for a file before replacement.
+    pub meta_queue_idx: sled::Tree,
+
     /// Monotonic sequence counter for this node's metadata writes (leader-only).
     /// Stored in sled so it survives restarts. Key: b"meta_seq".
     pub meta_seq_tree: sled::Tree,
@@ -60,6 +65,8 @@ impl MetadataStore {
 
         let meta_queue = db.open_tree(b"meta_queue")
             .context("Failed to open meta_queue tree")?;
+        let meta_queue_idx = db.open_tree(b"meta_queue_idx")
+            .context("Failed to open meta_queue_idx tree")?;
         let meta_seq_tree = db.open_tree(b"meta_seq")
             .context("Failed to open meta_seq tree")?;
         let follower_seq_tree = db.open_tree(b"follower_seq")
@@ -67,7 +74,7 @@ impl MetadataStore {
 
         info!("Initialized metadata store at {:?} (cache: {}MB)", metadata_dir, cache_capacity_mb);
 
-        Ok(Self { db, meta_queue, meta_seq_tree, follower_seq_tree })
+        Ok(Self { db, meta_queue, meta_queue_idx, meta_seq_tree, follower_seq_tree })
     }
 
     /// Scan all `file:` records and re-create any missing `path:` index entries.
@@ -650,9 +657,23 @@ impl MetadataStore {
     /// Enqueue a metadata update destined for `node_id` at `sequence`.
     /// Key format: `{node_id_hex}:{seq:016x}` — lexicographic order == sequence order.
     pub fn enqueue_meta_for_node(&self, node_id: NodeId, sequence: u64, metadata: &FileMetadata) -> Result<()> {
-        let key = format!("{}:{:016x}", Self::node_id_hex(node_id), sequence);
+        let node_hex = Self::node_id_hex(node_id);
+        let file_id_hex = metadata.id.0.as_simple().to_string();
+        let idx_key = format!("{}:{}", node_hex, file_id_hex);
+
+        // Remove any existing queue entry for this (node, file) pair before inserting.
+        if let Some(old_seq_bytes) = self.meta_queue_idx.get(idx_key.as_bytes())? {
+            if old_seq_bytes.len() == 8 {
+                let old_seq = u64::from_be_bytes(old_seq_bytes.as_ref().try_into().unwrap());
+                let old_key = format!("{}:{:016x}", node_hex, old_seq);
+                self.meta_queue.remove(old_key.as_bytes())?;
+            }
+        }
+
+        let key = format!("{}:{:016x}", node_hex, sequence);
         let value = bincode::serialize(metadata).context("Failed to serialize metadata for queue")?;
         self.meta_queue.insert(key.as_bytes(), value)?;
+        self.meta_queue_idx.insert(idx_key.as_bytes(), &sequence.to_be_bytes())?;
         Ok(())
     }
 
@@ -676,12 +697,29 @@ impl MetadataStore {
 
     /// Remove all queue entries for `node_id` up to and including `up_to_sequence`.
     pub fn ack_meta_queue_for_node(&self, node_id: NodeId, up_to_sequence: u64) -> Result<()> {
-        let prefix = format!("{}:", Self::node_id_hex(node_id));
-        let up_to_key = format!("{}:{:016x}", Self::node_id_hex(node_id), up_to_sequence);
+        let node_hex = Self::node_id_hex(node_id);
+        let prefix = format!("{}:", node_hex);
+        let up_to_key = format!("{}:{:016x}", node_hex, up_to_sequence);
         let mut to_remove = Vec::new();
         for item in self.meta_queue.scan_prefix(prefix.as_bytes()) {
-            let (key, _) = item?;
+            let (key, value) = item?;
             if key.as_ref() <= up_to_key.as_bytes() {
+                // Also remove the idx entry if it still points to this sequence.
+                if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
+                    let file_id_hex = m.id.0.as_simple().to_string();
+                    let idx_key = format!("{}:{}", node_hex, file_id_hex);
+                    if let Some(idx_seq_bytes) = self.meta_queue_idx.get(idx_key.as_bytes())? {
+                        if idx_seq_bytes.len() == 8 {
+                            let key_str = std::str::from_utf8(&key).unwrap_or("");
+                            let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
+                            let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
+                            let idx_seq = u64::from_be_bytes(idx_seq_bytes.as_ref().try_into().unwrap());
+                            if idx_seq == seq {
+                                self.meta_queue_idx.remove(idx_key.as_bytes())?;
+                            }
+                        }
+                    }
+                }
                 to_remove.push(key);
             }
         }

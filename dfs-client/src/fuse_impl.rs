@@ -273,12 +273,20 @@ impl FlushHandle {
                         let slot_data = slot.data.clone();
                         let slot_len = slot_data.len();
 
-                        // If this slot is partial AND higher chunks are already on the server,
-                        // the slot holds an overlay (e.g. a header) written to a chunk that was
-                        // previously flushed as a full 4MB chunk. Use PatchChunk to send only
-                        // the changed bytes to each replica — no full chunk transfer needed.
+                        // Use PatchChunk only when this is a true in-place overwrite:
+                        //   - slot is partial (< 4MB), AND
+                        //   - the chunk already exists on the server, AND
+                        //   - the new data is NOT larger than the existing stored chunk.
+                        // If slot_len > existing_chunk_size, this is a sequential grow/append —
+                        // PatchChunk would always fail ("patch extends past chunk boundary"),
+                        // so fall through to a full write instead. This avoids a double round-trip
+                        // (failed PatchChunk attempt + full write fallback) for log-style appenders.
+                        let existing_chunk_size = self.metadata_cache.get(&ino)
+                            .and_then(|m| m.chunk_sizes.get(*chunk_idx as usize).copied())
+                            .unwrap_or(0);
                         let needs_patch = slot_len < CHUNK_SIZE
-                            && max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false);
+                            && max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false)
+                            && slot_len <= existing_chunk_size as usize;
 
                         if needs_patch {
                             info!("flush_buffer_async: partial slot {} ({} bytes) — using PatchChunk",

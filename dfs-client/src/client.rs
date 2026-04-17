@@ -67,7 +67,7 @@ pub struct NodeHealthTracker {
 
 impl NodeHealthTracker {
     /// Number of consecutive failures before a node is penalized.
-    const PENALTY_THRESHOLD: u32 = 2;
+    const PENALTY_THRESHOLD: u32 = 5;
     /// Base probe interval (seconds) — doubles on each repeated failure.
     const BASE_PROBE_SECS: u64 = 30;
     /// Maximum probe interval (seconds).
@@ -593,7 +593,7 @@ impl DfsClient {
             addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
 leader_addr: Arc::new(RwLock::new(None)),
-            fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
+            fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
@@ -2462,12 +2462,22 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Send request + read 4-byte length prefix (tiny, fast).
         let len = encoded.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&encoded).await?;
-        stream.flush().await?;
+        let write_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            async {
+                stream.write_all(&len.to_be_bytes()).await?;
+                stream.write_all(&encoded).await?;
+                stream.flush().await
+            },
+        ).await.map_err(|_| anyhow::anyhow!("Timeout sending request to {}", server_addr))?;
+        write_result?;
 
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            stream.read_exact(&mut len_buf),
+        ).await
+            .map_err(|_| anyhow::anyhow!("Timeout reading length prefix from {}", server_addr))??;
         let body_len = u32::from_be_bytes(len_buf) as usize;
 
         Ok((stream, body_len))
@@ -2483,14 +2493,23 @@ leader_addr: Arc::new(RwLock::new(None)),
         body_len: usize,
     ) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; body_len];
-        stream.read_exact(&mut buf).await?;
+        // 30s per chunk body — enough for a 4MB chunk on a slow link, not forever on a hung node.
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            stream.read_exact(&mut buf),
+        ).await
+            .map_err(|_| anyhow::anyhow!("Timeout draining chunk body from {}", server_addr))??;
 
         let response_envelope = MessageEnvelope::from_bytes(&buf).context("deserialize")?;
         let data = match response_envelope.message {
             Message::Response(Response::ChunkData { data, .. }) => {
                 if data.is_empty() {
                     // Split-frame: raw payload follows on the stream — read before pooling.
-                    dfs_common::protocol::read_chunk_payload(&mut stream).await
+                    tokio::time::timeout(
+                        tokio::time::Duration::from_secs(30),
+                        dfs_common::protocol::read_chunk_payload(&mut stream),
+                    ).await
+                        .map_err(|_| anyhow::anyhow!("Timeout reading split-frame payload from {}", server_addr))?
                         .context("read split-frame chunk payload")?
                 } else {
                     data

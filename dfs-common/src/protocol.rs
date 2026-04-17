@@ -609,6 +609,15 @@ pub enum ClusterMessage {
     NodeJoined {
         node_info: NodeInfo,
     },
+
+    /// Broadcast when a node assumes leadership.
+    /// Recipients with lower-priority NodeId (higher UUID) concede immediately
+    /// by marking the sender Online in their gossip view, causing is_leader()
+    /// to re-evaluate and yield to the true leader.
+    LeaderAnnouncement {
+        node_id: NodeId,
+        addr: std::net::SocketAddr,
+    },
 }
 
 /// Type of metadata operation

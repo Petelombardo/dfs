@@ -263,11 +263,38 @@ impl Server {
 
                 let is_leader = server.cluster.is_leader().await;
 
-                // On leadership acquisition, run a catch-up pass to fill in
-                // what followers missed while we were a follower (or down).
+                // On leadership acquisition, announce to all peers immediately so any
+                // concurrent split-brain leader with a higher NodeId concedes.
                 if is_leader && !was_leader {
-                    info!("Became leader — running metadata catch-up for all followers");
-                    server.run_metadata_catchup().await;
+                    info!("Became leader — announcing leadership to all peers");
+                    let nodes = server.cluster.get_all_nodes().await;
+                    let local_id = server.cluster.local_node_id();
+                    let local_addr = server.cluster.local_addr();
+                    for node in &nodes {
+                        if node.id == local_id { continue; }
+                        let msg = dfs_common::Message::Cluster(
+                            dfs_common::protocol::ClusterMessage::LeaderAnnouncement {
+                                node_id: local_id,
+                                addr: local_addr,
+                            }
+                        );
+                        let client = server.client.clone();
+                        let addr = node.addr;
+                        tokio::spawn(async move {
+                            let _ = client.send_message(addr, msg).await;
+                        });
+                    }
+                    info!("Became leader — spawning metadata catch-up for all followers");
+                    let server_catchup = server.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::time::timeout(
+                            tokio::time::Duration::from_secs(120),
+                            server_catchup.run_metadata_catchup(),
+                        ).await;
+                        if result.is_err() {
+                            warn!("Metadata catch-up timed out after 120s — dissemination loop will cover remaining gaps");
+                        }
+                    });
                 }
                 was_leader = is_leader;
 
@@ -3478,6 +3505,27 @@ impl MessageHandler for Server {
                     }
 
                     // NO reciprocal announcements - prevents infinite loops
+                    Response::Ok { data: None }
+                }
+                ClusterMessage::LeaderAnnouncement { node_id, addr } => {
+                    let local_id = self.cluster.local_node_id();
+                    // If the announcer has a lower NodeId (higher election priority) than us,
+                    // ensure they are marked Online in our gossip view so is_leader() yields to them.
+                    if node_id < local_id {
+                        let node_info = dfs_common::NodeInfo::new(node_id, addr, None);
+                        if let Err(e) = self.cluster.add_node(node_info).await {
+                            warn!("LeaderAnnouncement: failed to update node {}: {}", node_id, e);
+                        }
+                        if self.cluster.is_leader().await {
+                            // We just conceded — this shouldn't happen since node_id < local_id
+                            // means is_leader() should now return false. Log for diagnostics.
+                            warn!("LeaderAnnouncement from higher-priority {}: we should have conceded but still see ourselves as leader", node_id);
+                        } else {
+                            info!("LeaderAnnouncement from {}: conceding leadership (they have higher priority)", node_id);
+                        }
+                    } else {
+                        info!("LeaderAnnouncement from {}: we have higher priority ({}), ignoring", node_id, local_id);
+                    }
                     Response::Ok { data: None }
                 }
                 _ => Response::Error {

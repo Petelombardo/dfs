@@ -2243,6 +2243,14 @@ impl Server {
             };
         }
 
+        // New chunk is safely written — delete the old chunk file immediately.
+        // No need to wait for orphan GC: the old hash is no longer referenced by
+        // any file metadata, and both old and new files would otherwise coexist on disk.
+        if let Err(e) = self.storage.delete_chunk(&chunk_id) {
+            // Non-fatal: the file will be caught by orphan GC eventually.
+            warn!("PatchChunk: failed to delete old chunk {}: {}", chunk_id, e);
+        }
+
         info!("PatchChunk: {} -> {} ({} bytes patched at intra_offset={})", chunk_id, new_chunk_id, patch_data.len(), intra_offset);
 
         Response::PatchChunkResult { new_chunk_id, size }

@@ -1,6 +1,42 @@
 use crate::types::{ChunkId, ChunkLocation, FileId, FileMetadata, NodeId, NodeInfo};
 use serde::{Deserialize, Serialize};
 
+/// Write a ChunkData response using split-frame encoding:
+///   [4B envelope len][bincode envelope (data=empty)][4B raw len][raw bytes]
+/// This avoids a full bincode copy of the chunk payload.
+pub async fn write_chunk_response<W>(
+    stream: &mut W,
+    envelope: &MessageEnvelope,
+    raw_data: &[u8],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let frame = envelope.to_bytes()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let frame_len = frame.len() as u32;
+    let data_len = raw_data.len() as u32;
+
+    stream.write_all(&frame_len.to_be_bytes()).await?;
+    stream.write_all(&frame).await?;
+    stream.write_all(&data_len.to_be_bytes()).await?;
+    stream.write_all(raw_data).await?;
+    stream.flush().await
+}
+
+/// Read the raw payload that follows a split-frame ChunkData envelope.
+pub async fn read_chunk_payload<R>(stream: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
 /// Messages exchanged between nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {

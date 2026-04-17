@@ -166,27 +166,45 @@ async fn read_message(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
 ) -> Result<Option<MessageEnvelope>> {
-    // Read length prefix (4 bytes)
     loop {
         if buf.len() >= 4 {
             let mut length_bytes = [0u8; 4];
             length_bytes.copy_from_slice(&buf[..4]);
             let length = u32::from_be_bytes(length_bytes) as usize;
 
-            // Check if we have the full message
             if buf.len() >= 4 + length {
-                buf.advance(4); // Skip length prefix
-
-                // Deserialize message
+                buf.advance(4);
                 let message_bytes = buf.split_to(length);
-                let envelope = MessageEnvelope::from_bytes(&message_bytes)
+                let mut envelope = MessageEnvelope::from_bytes(&message_bytes)
                     .context("Failed to deserialize message")?;
+
+                // Split-frame ChunkData: raw payload follows the envelope.
+                if let dfs_common::Message::Response(dfs_common::Response::ChunkData { ref mut data, .. }) = envelope.message {
+                    if data.is_empty() {
+                        // Drain raw payload from buf then stream.
+                        while buf.len() < 4 {
+                            if stream.read_buf(buf).await? == 0 {
+                                anyhow::bail!("Connection closed reading chunk payload length");
+                            }
+                        }
+                        let mut plen_bytes = [0u8; 4];
+                        plen_bytes.copy_from_slice(&buf[..4]);
+                        buf.advance(4);
+                        let plen = u32::from_be_bytes(plen_bytes) as usize;
+
+                        while buf.len() < plen {
+                            if stream.read_buf(buf).await? == 0 {
+                                anyhow::bail!("Connection closed reading chunk payload");
+                            }
+                        }
+                        *data = buf.split_to(plen).to_vec();
+                    }
+                }
 
                 return Ok(Some(envelope));
             }
         }
 
-        // Read more data
         if stream.read_buf(buf).await? == 0 {
             if buf.is_empty() {
                 return Ok(None);
@@ -197,20 +215,25 @@ async fn read_message(
     }
 }
 
-/// Write a framed message to the stream
-/// Format: [4 bytes length][message bytes]
+/// Write a framed message to the stream.
+/// ChunkData responses use split-frame encoding to avoid a bincode copy of the payload:
+///   [4B envelope len][bincode envelope (data=empty)][4B raw len][raw bytes]
+/// All other messages use standard framing: [4B len][bincode bytes]
 async fn write_message(stream: &mut TcpStream, envelope: &MessageEnvelope) -> Result<()> {
+    if let dfs_common::Message::Response(dfs_common::Response::ChunkData { ref data, ref chunk_id, ref cache_stats }) = envelope.message {
+        let raw_data = data.clone();
+        let stub = MessageEnvelope::new(envelope.request_id, dfs_common::Message::Response(
+            dfs_common::Response::ChunkData { chunk_id: *chunk_id, data: vec![], cache_stats: *cache_stats }
+        ));
+        dfs_common::protocol::write_chunk_response(stream, &stub, &raw_data).await?;
+        return Ok(());
+    }
+
     let message_bytes = envelope.to_bytes()?;
     let length = message_bytes.len() as u32;
-
-    // Write length prefix
     stream.write_all(&length.to_be_bytes()).await?;
-
-    // Write message
     stream.write_all(&message_bytes).await?;
-
     stream.flush().await?;
-
     Ok(())
 }
 

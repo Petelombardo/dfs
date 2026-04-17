@@ -14,6 +14,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::read_engine::{InodeReadEngine, ReadEngineRegistry};
+
 /// Per-node health state used by NodeHealthTracker.
 ///
 /// A node is "penalized" after PENALTY_THRESHOLD consecutive timeouts/errors.
@@ -378,7 +380,7 @@ pub struct DfsClient {
 
     /// LRU cache for chunks (ChunkId -> data)
     /// Cache up to 256 chunks (~1GB at 4MB/chunk)
-    chunk_cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
+    chunk_cache: Arc<tokio::sync::RwLock<LruCache<ChunkId, Arc<Vec<u8>>>>>,
 
     /// Byte-range cache for recently-accessed chunks (inode, offset) -> chunk data
     /// This solves the problem of content-addressed chunks changing during live DVR recording
@@ -395,7 +397,7 @@ pub struct DfsClient {
     /// Track recent read positions per file to detect sequential patterns
     /// Maps file_id (first chunk) -> VecDeque of last 4 read positions
     /// Limited to 256 entries to prevent unbounded growth during fast-forward/seeking
-    read_history: Arc<Mutex<LruCache<ChunkId, VecDeque<usize>>>>,
+    read_history: Arc<tokio::sync::RwLock<LruCache<ChunkId, VecDeque<usize>>>>,
 
     /// Track last prefetched position per file to avoid duplicate prefetch from parallel reads
     /// Maps file_id -> last_chunk_idx that triggered prefetch
@@ -454,6 +456,10 @@ pub struct DfsClient {
     /// Prevents out-of-order dissemination from overwriting newer records with stale ones.
     /// Seeded from the server's stored write_seq on first open-for-write.
     write_seq: Arc<DashMap<FileId, u64>>,
+
+    /// Per-inode read engines.  Each open file gets one engine that holds the chunk map
+    /// snapshot and pipeline state.  Writers never touch this; engines refresh lazily.
+    pub read_engines: ReadEngineRegistry,
 }
 
 impl DfsClient {
@@ -575,11 +581,11 @@ impl DfsClient {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes.clone())),
             seed_nodes: cluster_nodes,
             current_node: Arc::new(RwLock::new(0)),
-            chunk_cache: Arc::new(Mutex::new(cache)),
+            chunk_cache: Arc::new(tokio::sync::RwLock::new(cache)),
             byte_range_cache: Arc::new(Mutex::new(byte_range_cache)),
             connection_pool: Arc::new(DashMap::new()),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
-            read_history: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            read_history: Arc::new(tokio::sync::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
             last_prefetch_position: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
             replica_selector: Arc::new(AtomicU64::new(0)),
             replica_cache: Arc::new(Mutex::new(replica_cache)),
@@ -592,6 +598,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
             write_seq: Arc::new(DashMap::new()),
+            read_engines: ReadEngineRegistry::new(),
         })
     }
 
@@ -878,7 +885,25 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         };
 
-        // Return connection to pool
+        let response_envelope = MessageEnvelope::from_bytes(&buf)
+            .context("Failed to deserialize response")?;
+
+        let response = match response_envelope.message {
+            Message::Response(Response::ChunkData { data, chunk_id, cache_stats }) => {
+                // Split-frame: if data is empty, raw payload follows on the stream.
+                let data = if data.is_empty() {
+                    dfs_common::protocol::read_chunk_payload(&mut stream).await
+                        .context("read split-frame chunk payload")?
+                } else {
+                    data
+                };
+                Response::ChunkData { chunk_id, data, cache_stats }
+            }
+            Message::Response(response) => response,
+            _ => anyhow::bail!("Expected Response message"),
+        };
+
+        // Return connection to pool after all bytes are drained.
         {
             let entry = self.connection_pool
                 .entry(addr)
@@ -889,16 +914,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        let response_envelope = MessageEnvelope::from_bytes(&buf)
-            .context("Failed to deserialize response")?;
-
-        match response_envelope.message {
-            Message::Response(response) => {
-                self.node_health.record_success(addr).await;
-                Ok(response)
-            }
-            _ => anyhow::bail!("Expected Response message"),
-        }
+        self.node_health.record_success(addr).await;
+        Ok(response)
     }
 
     /// Get file metadata from cluster with optional conditional fetch
@@ -1039,6 +1056,427 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Read data from cluster by chunk IDs - parallelized with caching
+    /// Pipeline depth for sequential reads: how many chunks to keep in flight simultaneously.
+    /// Formula mirrors the write pipeline: ceil(32MB / chunk_size), minimum 1.
+    /// With 4MB chunks → 8 in flight, which at ~113 MB/s wire speed gives full saturation.
+    fn pipeline_depth(chunk_size: usize) -> usize {
+        // We want exactly 1 chunk of lookahead — enough to hide the connection RTT
+        // (~10ms) behind the body transfer of the current chunk (~250ms on 1Gbps).
+        // More than 2 in-flight at once wastes bandwidth and competes for NIC capacity.
+        let _ = chunk_size; // reserved for future adaptive tuning
+        2
+    }
+
+    // -------------------------------------------------------------------------
+    // New per-inode read engine path
+    // -------------------------------------------------------------------------
+
+    /// Main read entry point used by the FUSE layer.
+    ///
+    /// `inode`      — kernel inode number
+    /// `file_size`  — current size from metadata_cache (used to detect live-recording growth)
+    /// `file_id`    — FileId for chunk-map RPCs
+    /// `file_path`  — path, for SQLite cache-bypass detection
+    /// `offset`     — byte offset within file
+    /// `size`       — bytes requested
+    ///
+    /// Returns the raw bytes for [offset, offset+size) clipped to file_size.
+    /// Never blocks the write path — engine refreshes are async and use their own locks.
+    pub async fn read_file(
+        &self,
+        inode: u64,
+        file_size: u64,
+        file_id: FileId,
+        file_path: &str,
+        offset: usize,
+        size: usize,
+        metadata_locations: Vec<dfs_common::ChunkLocation>,
+    ) -> Result<Vec<u8>> {
+        if size == 0 || offset >= file_size as usize {
+            return Ok(Vec::new());
+        }
+
+        let engine = self.read_engines.get_or_create(inode);
+
+        // Refresh chunk map if stale or file grew.
+        // refresh_engine() is a no-op if another refresh (e.g. from open()) is already running,
+        // so after the call we spin-wait for the flag to clear before taking a snapshot.
+        if engine.needs_refresh(file_size).await {
+            self.refresh_engine(&engine, file_id, file_size, metadata_locations).await;
+        }
+        // Whether we refreshed or skipped, wait for any in-progress refresh to finish
+        // (could have been started by open() prefetch) before taking the snapshot.
+        if engine.refresh_in_progress.load(std::sync::atomic::Ordering::Acquire) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while engine.refresh_in_progress.load(std::sync::atomic::Ordering::Acquire) {
+                if std::time::Instant::now() >= deadline { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+
+        let (chunk_map, chunk_offsets, nim) = engine.snapshot().await;
+
+        if chunk_map.is_empty() {
+            info!("read_file: inode={} chunk map empty after refresh, returning empty", inode);
+            return Ok(Vec::new());
+        }
+
+        // SQLite files: bypass chunk_cache to prevent stale-read corruption.
+        let bypass_cache = crate::fuse_impl::is_sqlite_for_cache(file_path);
+
+        let end = offset + size;
+        let needed = InodeReadEngine::chunks_for_range(&chunk_offsets, offset, size);
+
+        if needed.is_empty() {
+            // Hole (sparse file) — return zeros.
+            let len = (file_size as usize).min(end).saturating_sub(offset);
+            return Ok(vec![0u8; len]);
+        }
+
+        let nodes = self.cluster_nodes.read().await.clone();
+        let selector = self.replica_selector.fetch_add(1, Ordering::Relaxed);
+
+        // --- Cache check ---
+        let mut result_chunks: Vec<(usize /*chunk_idx*/, Arc<Vec<u8>>)> = Vec::new();
+        let mut to_fetch: Vec<(usize, ChunkId, SocketAddr, Vec<SocketAddr>)> = Vec::new();
+        let mut to_wait: Vec<(usize, ChunkId)> = Vec::new();
+
+        for (chunk_idx, _chunk_start, _chunk_size) in &needed {
+            let idx = *chunk_idx;
+            let loc = &chunk_map[idx];
+            let cid = loc.chunk_id;
+
+            // 1. Chunk cache (skip for SQLite).
+            if !bypass_cache {
+                let cache = self.chunk_cache.read().await;
+                if let Some(data) = cache.peek(&cid) {
+                    result_chunks.push((idx, Arc::clone(data)));
+                    continue;
+                }
+            }
+
+            // 2. Another request already fetching it?
+            {
+                let inf = engine.in_flight.lock().await;
+                if inf.contains(&cid) {
+                    to_wait.push((idx, cid));
+                    continue;
+                }
+            }
+
+            // 3. Need to fetch.
+            let (primary, fallbacks) = match InodeReadEngine::resolve_primary(
+                loc, &nim, &nodes, selector + idx as u64,
+            ) {
+                Some(pf) => pf,
+                None => {
+                    // No replicas known — fall back to any cluster node.
+                    let p = nodes[selector as usize % nodes.len()];
+                    (p, nodes.iter().filter(|&&a| a != p).copied().collect())
+                }
+            };
+
+            engine.in_flight.lock().await.insert(cid);
+            to_fetch.push((idx, cid, primary, fallbacks));
+        }
+
+        // --- Pipeline lookahead: speculatively fetch the next N chunks. ---
+        // Fire-and-forget — their results go into chunk_cache; we don't await them here.
+        if !to_fetch.is_empty() {
+            let last_required_idx = needed.last().map(|(i, _, _)| *i).unwrap_or(0);
+            let lookahead = engine.pipeline_lookahead(
+                last_required_idx, chunk_map.len(),
+                &self.chunk_cache, &chunk_map,
+            ).await;
+
+            for (la_idx, la_cid) in lookahead {
+                let loc = &chunk_map[la_idx];
+                let (primary, fallbacks) = match InodeReadEngine::resolve_primary(
+                    loc, &nim, &nodes, selector + la_idx as u64,
+                ) {
+                    Some(pf) => pf,
+                    None => {
+                        engine.in_flight.lock().await.remove(&la_cid);
+                        continue;
+                    }
+                };
+                let client = self.clone();
+                let eng = engine.clone();
+                tokio::spawn(async move {
+                    let result = client.fetch_chunk_with_fallback(la_cid, primary, &fallbacks).await;
+                    match result {
+                        Ok(data) => {
+                            let arc = Arc::new(data);
+                            client.chunk_cache.write().await.put(la_cid, arc);
+                        }
+                        Err(e) => debug!("Pipeline lookahead fetch failed for {}: {}", la_cid, e),
+                    }
+                    eng.in_flight.lock().await.remove(&la_cid);
+                });
+            }
+        }
+
+        // --- Fetch required chunks (sequential pipeline for full-chunk sequential reads) ---
+        if !to_fetch.is_empty() {
+            // Determine if this looks like a sequential full-chunk read.
+            // All required chunks must be full (not seeking into the middle),
+            // and they must be consecutive in the chunk map.
+            let is_sequential_full = {
+                let first_idx = needed.first().map(|(i,_,_)| *i).unwrap_or(0);
+                needed.iter().enumerate().all(|(n, (ci, _co, cs))| {
+                    *ci == first_idx + n && *cs == chunk_map[*ci].size
+                })
+            };
+
+            let fetch_results: Vec<(usize, ChunkId, Result<Vec<u8>>)> =
+            if is_sequential_full && to_fetch.len() > 0 {
+                // Use the pipelined path: overlap connection setup with body drain.
+                let pipeline_input: Vec<(ChunkId, SocketAddr)> = to_fetch.iter()
+                    .map(|(_, cid, primary, _)| (*cid, *primary))
+                    .collect();
+                let results = self.sequential_pipeline_read(pipeline_input).await;
+                to_fetch.iter().zip(results).map(|((idx, cid, _, _), res)| (*idx, *cid, res)).collect()
+            } else {
+                // Parallel path for random reads — fetch full chunks (cached for future reads).
+                let tasks: Vec<_> = to_fetch.iter().map(|(idx, cid, primary, fallbacks)| {
+                    let client = self.clone();
+                    let idx = *idx;
+                    let cid = *cid;
+                    let primary = *primary;
+                    let fallbacks = fallbacks.clone();
+                    tokio::spawn(async move {
+                        let data = client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await;
+                        (idx, cid, data)
+                    })
+                }).collect();
+                futures::future::join_all(tasks).await.into_iter()
+                    .map(|r| r.unwrap_or_else(|e| {
+                        let dummy = ChunkId::from_hash([0u8; 32]);
+                        (0usize, dummy, Err(anyhow::anyhow!("task panicked: {}", e)))
+                    }))
+                    .collect()
+            };
+
+            // Collect results; cache full chunks; remove from in-flight.
+            for (idx, cid, res) in fetch_results {
+                let data = res.with_context(|| format!("Failed to fetch chunk {}", cid))?;
+                let arc = Arc::new(data);
+                if !bypass_cache {
+                    self.chunk_cache.write().await.put(cid, Arc::clone(&arc));
+                }
+                result_chunks.push((idx, arc));
+                engine.in_flight.lock().await.remove(&cid);
+            }
+        }
+
+        // --- Wait for in-flight chunks fetched by concurrent requests ---
+        for (idx, cid) in to_wait {
+            let data = self.wait_for_chunk_in_cache(cid, &engine).await?;
+            result_chunks.push((idx, data));
+        }
+
+        // --- Assemble the response ---
+        result_chunks.sort_by_key(|(i, _)| *i);
+
+        let mut out = Vec::with_capacity(size);
+        for (chunk_idx, data) in &result_chunks {
+            let (chunk_start, chunk_size) = chunk_offsets[*chunk_idx];
+            let read_start = offset.max(chunk_start);
+            let read_end = (offset + size).min(chunk_start + chunk_size);
+            if read_end <= read_start { continue; }
+            let local_start = read_start - chunk_start;
+            let local_end = read_end - chunk_start;
+            if local_end > data.len() {
+                // Partial/corrupt chunk — return what we have.
+                if local_start < data.len() {
+                    out.extend_from_slice(&data[local_start..]);
+                }
+            } else {
+                out.extend_from_slice(&data[local_start..local_end]);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Fetch with primary then fallbacks.
+    /// Tries primary first; if it fails with a permanent error (blocklisted/not-found), bails
+    /// immediately — no point trying other replicas for chunks the cluster doesn't have.
+    /// Otherwise falls back to remaining replicas in parallel to minimize stall time.
+    async fn fetch_chunk_with_fallback(
+        &self,
+        cid: ChunkId,
+        primary: SocketAddr,
+        fallbacks: &[SocketAddr],
+    ) -> Result<Vec<u8>> {
+        match self.read_chunk_from_server(primary, cid).await {
+            Ok(d) => return Ok(d),
+            Err(e) => {
+                let msg = e.to_string();
+                warn!("Primary {} failed for chunk {}: {}", primary, cid, msg);
+                self.node_health.record_failure(primary).await;
+                // Permanent errors: no replica will have it, fail fast.
+                if msg.contains("permanently missing") || msg.contains("blocklisted") {
+                    anyhow::bail!("Chunk {} is permanently missing", cid);
+                }
+            }
+        }
+        if fallbacks.is_empty() {
+            anyhow::bail!("All replicas failed for chunk {}", cid);
+        }
+        // Try all fallbacks in parallel — first success wins.
+        let tasks: Vec<_> = fallbacks.iter().map(|&fb| {
+            let client = self.clone();
+            tokio::spawn(async move {
+                let res = client.read_chunk_from_server(fb, cid).await;
+                (fb, res)
+            })
+        }).collect();
+        let results = futures::future::join_all(tasks).await;
+        for r in results {
+            match r {
+                Ok((fb, Ok(d))) => {
+                    self.node_health.record_success(fb).await;
+                    return Ok(d);
+                }
+                Ok((fb, Err(e))) => {
+                    let msg = e.to_string();
+                    warn!("Fallback {} failed for chunk {}: {}", fb, cid, msg);
+                    self.node_health.record_failure(fb).await;
+                    if msg.contains("permanently missing") || msg.contains("blocklisted") {
+                        anyhow::bail!("Chunk {} is permanently missing", cid);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        anyhow::bail!("All replicas failed for chunk {}", cid)
+    }
+
+    /// Poll chunk_cache for up to 1s waiting for a concurrent fetch to complete.
+    /// Exits early if the in-flight entry disappears (fetch failed on the other side).
+    async fn wait_for_chunk_in_cache(
+        &self,
+        cid: ChunkId,
+        engine: &InodeReadEngine,
+    ) -> Result<Arc<Vec<u8>>> {
+        for _ in 0..20 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            {
+                let cache = self.chunk_cache.read().await;
+                if let Some(data) = cache.peek(&cid) {
+                    return Ok(Arc::clone(data));
+                }
+            }
+            // If the other fetcher removed it from in-flight without caching, it failed.
+            let inf = engine.in_flight.lock().await;
+            if !inf.contains(&cid) {
+                break;
+            }
+        }
+        // Fall back — fetch ourselves.
+        warn!("Timeout waiting for concurrent fetch of chunk {}, fetching directly", cid);
+        let nodes = self.cluster_nodes.read().await.clone();
+        let primary = nodes[0];
+        let fallbacks: Vec<SocketAddr> = nodes[1..].to_vec();
+        let data = self.fetch_chunk_with_fallback(cid, primary, &fallbacks).await?;
+        Ok(Arc::new(data))
+    }
+
+    /// Refresh the engine's chunk map from the leader.
+    /// Falls back to `metadata_locations` (from metadata_cache) for legacy files where the
+    /// leader's in-memory chunk_map has no entry (files written before chunk_locations existed).
+    pub async fn refresh_engine(
+        &self,
+        engine: &InodeReadEngine,
+        file_id: FileId,
+        file_size: u64,
+        metadata_locations: Vec<dfs_common::ChunkLocation>,
+    ) {
+        use std::sync::atomic::Ordering;
+        // Only one refresh at a time — skip if another is already running.
+        if engine.refresh_in_progress.compare_exchange(
+            false, true, Ordering::AcqRel, Ordering::Relaxed,
+        ).is_err() {
+            return;
+        }
+
+        let nim: std::collections::HashMap<dfs_common::NodeId, SocketAddr> = {
+            let addr_map = self.addr_to_node_id.read().await;
+            addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
+        };
+
+        // Try the authoritative source first (leader's in-memory chunk_map).
+        let locations = match self.get_file_chunk_map(file_id).await {
+            Ok((locs, _)) if !locs.is_empty() => {
+                info!("refresh_engine: inode={} got {} chunks from leader", engine.inode, locs.len());
+                locs
+            }
+            Ok(_) | Err(_) => {
+                // Leader has no entry — use chunk_locations from cached metadata.
+                if !metadata_locations.is_empty() {
+                    info!("refresh_engine: inode={} falling back to {} metadata chunk_locations",
+                          engine.inode, metadata_locations.len());
+                    metadata_locations
+                } else {
+                    info!("refresh_engine: inode={} no chunk_locations available", engine.inode);
+                    engine.refresh_in_progress.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        };
+
+        engine.update_chunk_map(locations, Arc::new(nim), file_size).await;
+        engine.refresh_in_progress.store(false, Ordering::Release);
+    }
+
+    /// Like `refresh_engine` but assumes the caller already set `refresh_in_progress = true`.
+    /// Used by the open() prefetch which sets the flag synchronously before spawning.
+    pub async fn refresh_engine_flagged(
+        &self,
+        engine: &InodeReadEngine,
+        file_id: FileId,
+        file_size: u64,
+        metadata_locations: Vec<dfs_common::ChunkLocation>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let nim: std::collections::HashMap<dfs_common::NodeId, SocketAddr> = {
+            let addr_map = self.addr_to_node_id.read().await;
+            addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
+        };
+
+        let locations = match self.get_file_chunk_map(file_id).await {
+            Ok((locs, _)) if !locs.is_empty() => {
+                info!("refresh_engine: inode={} got {} chunks from leader", engine.inode, locs.len());
+                locs
+            }
+            Ok(_) | Err(_) => {
+                if !metadata_locations.is_empty() {
+                    info!("refresh_engine: inode={} falling back to {} metadata chunk_locations",
+                          engine.inode, metadata_locations.len());
+                    metadata_locations
+                } else {
+                    info!("refresh_engine: inode={} no chunk_locations available", engine.inode);
+                    engine.refresh_in_progress.store(false, Ordering::Release);
+                    return;
+                }
+            }
+        };
+
+        engine.update_chunk_map(locations, Arc::new(nim), file_size).await;
+        engine.refresh_in_progress.store(false, Ordering::Release);
+    }
+
+    /// Notify the read engine that a new chunk was appended by the write path.
+    /// Called from fuse_impl after a successful WriteData completes.  Does not block
+    /// writers — just bumps the engine's known_size so the next read triggers a refresh.
+    pub fn invalidate_read_engine(&self, inode: u64) {
+        if let Some(engine) = self.read_engines.engines.get(&inode) {
+            // Set known_size to 0 so needs_refresh() returns true on the next read.
+            engine.known_size.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// all_file_chunks: Complete list of chunk IDs for the file (for prefetch - can be same as chunk_ids)
     /// start_chunk_idx: Index in all_file_chunks where chunk_ids[0] is located
     /// inode: File inode for byte-range caching (optional, 0 to disable)
@@ -1072,21 +1510,20 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         let start = std::time::Instant::now();
+        let t0 = start;
 
         // Detect if we're in sequential access mode by checking read history
         // For sequential reads (DVR streaming), use single-node reads for best HDD performance
         // For random access, use striped reads for lower latency
         let is_sequential = if !all_file_chunks.is_empty() {
             let file_id = all_file_chunks[0];
-            let mut history = self.read_history.lock().await;
-            if let Some(positions) = history.get(&file_id) {
+            let history = self.read_history.read().await;
+            if let Some(positions) = history.peek(&file_id) {
                 if positions.len() >= 2 {
                     let mut sequential_count = 0;
                     for i in 1..positions.len() {
                         let prev = positions[i - 1];
                         let curr = positions[i];
-                        // Consider sequential if moving forward within 30 chunks
-                        // With DIRECT_IO and large chunks (4MB), FUSE may skip ahead
                         if curr > prev && curr <= prev + 30 {
                             sequential_count += 1;
                         }
@@ -1102,42 +1539,42 @@ leader_addr: Arc::new(RwLock::new(None)),
             false
         };
 
-        if is_sequential {
-            info!("Sequential access detected - using single-node reads for optimal HDD performance");
-        }
+        let t1 = start.elapsed(); // after sequential detection
 
         // Check byte-range cache first (for live DVR files), then chunk cache
         // Also track in-flight reads to prevent duplicate concurrent fetches
         // CRITICAL: Use separate lock acquisitions to reduce contention on fast CPUs
         let mut cached_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
-        let mut chunks_to_fetch: Vec<(usize, ChunkId, u64)> = Vec::new(); // (idx, chunk_id, file_offset)
+        let mut chunks_to_fetch: Vec<(usize, ChunkId, u64, bool)> = Vec::new(); // (idx, chunk_id, file_offset, pipeline_only)
         let mut chunks_to_wait_for: Vec<(usize, ChunkId, u64)> = Vec::new(); // chunks being fetched by another request
 
         for (idx, chunk_id) in chunk_ids.iter().enumerate() {
             let mut found = false;
 
-            // Try byte-range cache first if we have inode + offset
-            // Lock held ONLY during this check, then released
-            if inode > 0 && idx < chunk_offsets.len() {
-                let requested_offset = chunk_offsets[idx];
+            // Check chunk cache first — it's the primary cache for pipeline reads.
+            {
+                let chunk_hit = {
+                    let chunk_cache = self.chunk_cache.read().await;
+                    chunk_cache.peek(chunk_id).map(|data| (idx, Arc::clone(data)))
+                };
+                if let Some(cached) = chunk_hit {
+                    cached_chunks.push(cached);
+                    found = true;
+                }
+            }
 
+            // Only check byte-range cache (live DVR segments) if chunk cache missed.
+            if !found && inode > 0 && idx < chunk_offsets.len() {
+                let requested_offset = chunk_offsets[idx];
                 let byte_hit = {
                     let mut byte_cache = self.byte_range_cache.lock().await;
-
-                    // Direct lookup by (inode, file_offset, chunk_id) — O(1) and collision-free.
-                    // Including chunk_id prevents stale hits when a file is deleted and recreated
-                    // at the same inode: same offset but different chunk = different key.
                     let key = ByteRangeCacheKey {
                         inode,
                         file_offset: requested_offset,
                         chunk_id: *chunk_id,
                     };
-
                     if let Some(cached) = byte_cache.get(&key) {
-                        // Check if expired (TTL: 30 seconds)
                         if cached.is_expired() {
-                            info!("Byte-range cache EXPIRED for inode={} offset={} (age: {:?})",
-                                  inode, requested_offset, cached.cached_at.elapsed());
                             byte_cache.pop(&key);
                             None
                         } else {
@@ -1147,29 +1584,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                     } else {
                         None
                     }
-                    // byte_cache lock released here
                 };
-
                 if let Some(cached) = byte_hit {
-                    cached_chunks.push(cached);
-                    found = true;
-                }
-            }
-
-            // Fall back to chunk ID cache - separate lock acquisition
-            if !found {
-                let chunk_hit = {
-                    let mut chunk_cache = self.chunk_cache.lock().await;
-                    if let Some(data) = chunk_cache.get(chunk_id) {
-                        debug!("Chunk cache HIT for chunk {}", chunk_id);
-                        Some((idx, Arc::clone(data)))
-                    } else {
-                        None
-                    }
-                    // chunk_cache lock released here
-                };
-
-                if let Some(cached) = chunk_hit {
                     cached_chunks.push(cached);
                     found = true;
                 }
@@ -1195,7 +1611,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             if !found {
                 let file_offset = if idx < chunk_offsets.len() { chunk_offsets[idx] } else { 0 };
                 info!("Cache MISS for chunk {} (inode={}, offset={}) - will fetch", chunk_id, inode, file_offset);
-                chunks_to_fetch.push((idx, *chunk_id, file_offset));
+                chunks_to_fetch.push((idx, *chunk_id, file_offset, false));
 
                 // Mark as in-flight to prevent other concurrent requests from fetching
                 {
@@ -1206,26 +1622,60 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
+        // Pipeline lookahead: whenever we have a cache miss and a chunk map, speculatively
+        // fetch the next depth-1 chunks alongside the required one.  This ensures chunk N+1
+        // starts transferring while chunk N is being returned to FUSE — no sequential-
+        // detection warmup delay.  For random/seek workloads the extra fetches land in
+        // cache and are evicted harmlessly; the bandwidth waste is bounded (depth-1 chunks).
+        if !chunks_to_fetch.is_empty() && !all_file_chunks.is_empty() {
+            let chunk_size_hint = 4 * 1024 * 1024usize; // conservative; real size unknown here
+            let depth = Self::pipeline_depth(chunk_size_hint);
+            let last_required_file_idx = start_chunk_idx + chunk_ids.len().saturating_sub(1);
+            let lookahead_needed = depth.saturating_sub(chunk_ids.len());
+
+            if lookahead_needed > 0 {
+                let mut pipeline_chunks: Vec<ChunkId> = Vec::with_capacity(lookahead_needed);
+                {
+                    let cache = self.chunk_cache.read().await;
+                    let in_flight = self.prefetch_in_flight.lock().await;
+                    let mut file_idx = last_required_file_idx + 1;
+                    while pipeline_chunks.len() < lookahead_needed && file_idx < all_file_chunks.len() {
+                        let cid = all_file_chunks[file_idx];
+                        if cache.peek(&cid).is_none() && !in_flight.contains(&cid) {
+                            pipeline_chunks.push(cid);
+                        }
+                        file_idx += 1;
+                    }
+                }
+                // Mark pipeline chunks as in-flight and add to fetch list
+                {
+                    let mut in_flight = self.prefetch_in_flight.lock().await;
+                    for cid in &pipeline_chunks {
+                        in_flight.insert(*cid);
+                    }
+                }
+                for cid in pipeline_chunks {
+                    chunks_to_fetch.push((usize::MAX, cid, 0, true));
+                }
+            }
+        }
+
+        let t2 = start.elapsed(); // after cache lookup loop
         let cache_hits = cached_chunks.len();
-        let cache_misses = chunks_to_fetch.len();
+        let cache_misses = chunks_to_fetch.iter().filter(|(_, _, _, po)| !po).count();
 
-        info!("Reading {} chunks: {} cached, {} to fetch (chunk_ids: {:?})",
-              chunk_ids.len(), cache_hits, cache_misses, chunk_ids);
+        info!("Reading {} chunks: {} cached, {} to fetch ({} pipeline lookahead) (chunk_ids: {:?})",
+              chunk_ids.len(), cache_hits, cache_misses,
+              chunks_to_fetch.iter().filter(|(_, _, _, po)| *po).count(),
+              chunk_ids);
 
-        // Fetch missing chunks IN PARALLEL with intelligent replica selection
-        // Different chunks can be fetched from different replica nodes simultaneously,
-        // maximizing network bandwidth and reducing latency
+        // Fast path: all chunks were in cache, skip all fetch machinery.
+        let mut fetched_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
+        if !chunks_to_fetch.is_empty() {
+
         let nodes = self.cluster_nodes.read().await.clone();
-
-        // Build chunk_id -> ChunkLocation mapping for fast lookups
         let chunk_loc_map: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
             chunk_locations.iter().map(|loc| (loc.chunk_id, loc)).collect();
-
-        if chunk_locations.is_empty() && !chunk_ids.is_empty() {
-            warn!("No chunk_locations metadata available for {} chunks - will query metadata server for each chunk", chunk_ids.len());
-        } else if !chunk_locations.is_empty() {
-            info!("Using chunk_locations metadata for {} chunks (have {} locations)", chunk_ids.len(), chunk_locations.len());
-        }
 
         // Create parallel fetch tasks with concurrency limit
         // CRITICAL: Use a SHARED semaphore (stored on self) so concurrent read_data calls
@@ -1234,211 +1684,170 @@ leader_addr: Arc::new(RwLock::new(None)),
         // server file descriptors.
         let max_concurrent_fetches = self.fetch_semaphore.clone();
 
-        let fetch_tasks: Vec<_> = chunks_to_fetch.iter().map(|(idx, chunk_id, file_offset)| {
+        // --- Step 1: resolve replicas and select primary node for each chunk. ---
+        // Done upfront (sequentially, but all data is local after the first read)
+        // so we can branch between pipelined-sequential and parallel-random paths.
+        struct ResolvedFetch {
+            idx: usize,
+            chunk_id: ChunkId,
+            file_offset: u64,
+            pipeline_only: bool,
+            use_partial_read: bool,
+            primary: SocketAddr,
+            fallbacks: Vec<SocketAddr>, // other replicas, excluding primary
+        }
+
+        let node_id_map = self.addr_to_node_id.read().await.clone();
+        let mut resolved: Vec<ResolvedFetch> = Vec::with_capacity(chunks_to_fetch.len());
+
+        for (idx, chunk_id, file_offset, pipeline_only) in &chunks_to_fetch {
             let idx = *idx;
             let chunk_id = *chunk_id;
             let file_offset = *file_offset;
-            let client = self.clone();
-            let nodes = nodes.clone();
-            let chunk_location = chunk_loc_map.get(&chunk_id).map(|&loc| loc.clone());
-            let semaphore = max_concurrent_fetches.clone();
+            let pipeline_only = *pipeline_only;
 
-            // Get the read hint for this chunk to determine if we should do a partial read
-            let read_hint = read_hints.iter().find(|h| h.chunk_id == chunk_id).cloned();
+            // Resolve replica list from chunk_locations (fast, no network).
+            let mut replicas = if let Some(loc) = chunk_loc_map.get(&chunk_id) {
+                let addrs: Vec<SocketAddr> = loc.nodes.iter()
+                    .filter_map(|nid| node_id_map.iter()
+                        .find(|(_, &id)| id == *nid)
+                        .map(|(&addr, _)| addr))
+                    .collect();
+                if !addrs.is_empty() { addrs } else { Vec::new() }
+            } else {
+                Vec::new()
+            };
 
-            if chunk_location.is_none() && !chunk_locations.is_empty() {
-                warn!("Chunk {} not found in chunk_locations map (map has {} entries)", chunk_id, chunk_loc_map.len());
+            if replicas.is_empty() {
+                // Fall back to replica cache or metadata query.
+                let cached = { self.replica_cache.lock().await.get(&chunk_id).cloned() };
+                replicas = if let Some(c) = cached {
+                    (*c).clone()
+                } else {
+                    match self.get_chunk_replicas(chunk_id).await {
+                        Ok(r) => {
+                            self.replica_cache.lock().await.put(chunk_id, Arc::new(r.clone()));
+                            r
+                        }
+                        Err(_) => nodes.clone(),
+                    }
+                };
             }
 
-            let use_striped = is_sequential == false; // Only stripe for random access
+            // Check warm server cache.
+            let warm_node = {
+                self.warm_cache_map.lock().await.get(&chunk_id).and_then(|(addr, ts)| {
+                    if ts.elapsed().as_secs() < 60 { Some(*addr) } else { None }
+                })
+            };
 
-            tokio::spawn(async move {
-                // Acquire semaphore permit to limit concurrency
-                let _permit = semaphore.acquire().await.unwrap();
-
-                // Check if we should use striped reading
-                // Skip striped reads for sequential access (better for HDDs)
-                if use_striped {
-                    if let Some(ref location) = chunk_location {
-                        if location.nodes.len() >= 2 && location.size >= 512 * 1024 {
-                            // Use striped multi-replica reading for chunks >= 512KB with 2+ replicas
-                            // Split chunk in half, fetch from both nodes in parallel
-                            info!("Using striped read for chunk {} ({} bytes from {} nodes)",
-                                  chunk_id, location.size, location.nodes.len());
-
-                            return client.read_chunk_striped(chunk_id, location, file_offset).await
-                                .map(|data| (idx, chunk_id, file_offset, Arc::new(data), false));
-                        }
-                    }
+            // Select primary.
+            let primary = if let Some(w) = warm_node {
+                if replicas.contains(&w) { w } else {
+                    self.select_replica(&replicas).await.unwrap_or(nodes[0])
                 }
+            } else {
+                self.select_replica(&replicas).await.unwrap_or(nodes[0])
+            };
 
-                // Fallback to standard single-node read
-                // Try chunk_locations FIRST (fast, no network query needed!)
-                let mut replicas = if let Some(ref location) = chunk_location {
-                    // Map NodeIds to SocketAddrs from chunk_locations metadata
-                    let node_id_map = client.addr_to_node_id.read().await;
+            // Determine partial-read flag.
+            let use_partial_read = if pipeline_only {
+                false
+            } else {
+                read_hints.iter().find(|h| h.chunk_id == chunk_id)
+                    .map(|h| !h.full_chunk && !is_sequential)
+                    .unwrap_or(false)
+            };
 
-                    let chunk_addrs: Vec<SocketAddr> = location.nodes.iter()
-                        .filter_map(|node_id| {
-                            node_id_map.iter()
-                                .find(|(_, &id)| id == *node_id)
-                                .map(|(&addr, _)| addr)
-                        })
-                        .collect();
+            let fallbacks: Vec<SocketAddr> = replicas.iter()
+                .filter(|&&a| a != primary)
+                .copied()
+                .collect();
 
-                    if !chunk_addrs.is_empty() {
-                        info!("Using chunk_locations: chunk {} stored on {} specific nodes (skipping metadata query)",
-                               chunk_id, chunk_addrs.len());
-                        chunk_addrs
-                    } else {
-                        warn!("Chunk {} has {} nodes in metadata but none matched node_id_map (map size: {}), falling back to query",
-                              chunk_id, location.nodes.len(), node_id_map.len());
-                        // Fall through to query path below
-                        Vec::new()
+            resolved.push(ResolvedFetch { idx, chunk_id, file_offset, pipeline_only,
+                                          use_partial_read, primary, fallbacks });
+        }
+
+        // --- Step 2: fetch chunks. ---
+        // For sequential full-chunk reads: use sequential_pipeline_read so connection
+        // setup for chunk N+1 overlaps with body transfer of chunk N.
+        // For random / partial reads: fire parallel tasks (original behaviour).
+        let has_partial = resolved.iter().any(|r| r.use_partial_read);
+
+        let fetch_results: Vec<Result<(usize, ChunkId, u64, Arc<Vec<u8>>, bool, bool)>> =
+        if !has_partial && !all_file_chunks.is_empty() {
+            // Build ordered list for the pipeline (primary node per chunk).
+            let pipeline_input: Vec<(ChunkId, SocketAddr)> = resolved.iter()
+                .map(|r| (r.chunk_id, r.primary))
+                .collect();
+
+            let pipeline_results = self.sequential_pipeline_read(pipeline_input).await;
+
+            // Map results back to the common tuple format.
+            pipeline_results.into_iter().zip(resolved.iter()).map(|(res, r)| {
+                let data = match res {
+                    Ok(d) => d,
+                    Err(e) => {
+                        // Pipeline failed; could fall back to fallbacks here but keep it simple.
+                        return Err(e.context(format!("pipeline read chunk {}", r.chunk_id)));
                     }
-                } else {
-                    Vec::new()
                 };
+                info!("✓ Chunk {} via pipeline ({} bytes)", r.chunk_id, data.len());
+                Ok((r.idx, r.chunk_id, r.file_offset, Arc::new(data), false, r.pipeline_only))
+            }).collect()
+        } else {
+            // Original parallel path.
+            let tasks: Vec<_> = resolved.into_iter().map(|r| {
+                let client = self.clone();
+                let semaphore = max_concurrent_fetches.clone();
+                let read_hint = read_hints.iter().find(|h| h.chunk_id == r.chunk_id).cloned();
 
-                // If chunk_locations didn't give us nodes, fall back to querying or cache
-                if replicas.is_empty() {
-                    let cached_replicas = {
-                        let mut cache = client.replica_cache.lock().await;
-                        cache.get(&chunk_id).cloned()
-                    };
+                tokio::spawn(async move {
+                    let _permit = semaphore.acquire().await.unwrap();
+                    let all_nodes = std::iter::once(r.primary)
+                        .chain(r.fallbacks.iter().copied());
+                    let mut last_error = None;
+                    let mut data = None;
 
-                    replicas = if let Some(cached) = cached_replicas {
-                        debug!("Replica cache HIT for chunk {}", chunk_id);
-                        (*cached).clone()
-                    } else {
-                        // Cache miss - query metadata server
-                        debug!("Replica cache MISS for chunk {}, querying metadata server", chunk_id);
-                        match client.get_chunk_replicas(chunk_id).await {
-                            Ok(r) => {
-                                debug!("Found {} replicas for chunk {}", r.len(), chunk_id);
-                                // Cache the result
-                                let r_arc = Arc::new(r.clone());
-                                client.replica_cache.lock().await.put(chunk_id, r_arc);
-                                r
-                            }
-                            Err(e) => {
-                                // Fallback to trying all nodes if query fails
-                                debug!("Failed to get replicas for {}: {}, trying all nodes", chunk_id, e);
-                                nodes.clone()
-                            }
-                        }
-                    };
-                }
-
-                // Check if this chunk has a warm server cache (from prefetch hint)
-                let warm_node = {
-                    let mut warm_map = client.warm_cache_map.lock().await;
-                    warm_map.get(&chunk_id).and_then(|(addr, timestamp)| {
-                        // Expire warm cache entries after 60 seconds
-                        if timestamp.elapsed().as_secs() < 60 {
-                            Some(*addr)
+                    for (i, node_addr) in all_nodes.enumerate() {
+                        let read_start = std::time::Instant::now();
+                        let result = if r.use_partial_read {
+                            let hint = read_hint.as_ref().unwrap();
+                            info!("PARTIAL READ: chunk {} offset={} length={}", r.chunk_id, hint.offset_in_chunk, hint.length);
+                            client.read_chunk_range_from_server(node_addr, r.chunk_id,
+                                hint.offset_in_chunk as u64, hint.length as u64).await
                         } else {
-                            None
-                        }
-                    })
-                };
-
-                // Select replica: prefer warm cache, fallback to round-robin
-                let selected_replica = if let Some(warm_addr) = warm_node {
-                    // Verify warm node is in replica list
-                    if replicas.contains(&warm_addr) {
-                        debug!("Using WARM cache node {} for chunk {}", warm_addr, chunk_id);
-                        warm_addr
-                    } else {
-                        debug!("Warm node {} not in replica list for {}, using round-robin", warm_addr, chunk_id);
-                        client.select_replica(&replicas).await.context("No replicas available")?
-                    }
-                } else {
-                    // No warm cache - use standard round-robin
-                    client.select_replica(&replicas).await.context("No replicas available")?
-                };
-
-                let selection_mode = if warm_node.is_some() { "warm-cache" } else if use_striped { "round-robin" } else { "sticky" };
-                debug!("Selected replica {} for chunk {} ({})", selected_replica, chunk_id, selection_mode);
-
-                // Try selected replica first, then fallback to others
-                let mut last_error = None;
-                let mut data = None;
-
-                // Determine if we should use partial read (ReadChunkRange) or full chunk read.
-                // Hoisted out of the retry loop so it's accessible after the loop for caching.
-                let use_partial_read = if let Some(ref hint) = read_hint {
-                    // Use partial read when hint says partial AND not sequential.
-                    // Removed the old `offset_in_chunk > 0` guard: a seek that lands exactly
-                    // on a chunk boundary (offset_in_chunk == 0) but only reads a small slice
-                    // should still use ReadChunkRange rather than fetching the full 4MB chunk.
-                    !hint.full_chunk && !is_sequential
-                } else {
-                    false
-                };
-
-                for (i, node_addr) in std::iter::once(&selected_replica)
-                    .chain(replicas.iter().filter(|&n| n != &selected_replica))
-                    .enumerate()
-                {
-                    let read_start = std::time::Instant::now();
-
-                    let result = if use_partial_read {
-                        let hint = read_hint.as_ref().unwrap();
-                        info!("PARTIAL READ: chunk {} offset={} length={} (saving {} bytes)",
-                              chunk_id, hint.offset_in_chunk, hint.length,
-                              hint.offset_in_chunk);
-                        client.read_chunk_range_from_server(*node_addr, chunk_id,
-                                                            hint.offset_in_chunk as u64,
-                                                            hint.length as u64).await
-                    } else {
-                        client.read_chunk_from_server(*node_addr, chunk_id).await
-                    };
-
-                    match result {
-                        Ok(chunk_data) => {
-                            let read_time = read_start.elapsed();
-                            let was_warm = warm_node.is_some() && *node_addr == warm_node.unwrap();
-                            let source_desc = if was_warm {
-                                "WARM-CACHE"
-                            } else if i > 0 {
-                                "FALLBACK"
-                            } else {
-                                "PRIMARY"
-                            };
-                            let read_type = if use_partial_read { "PARTIAL" } else { "FULL" };
-
-                            info!("✓ Chunk {} from {} ({}/{}) in {:?} - {} bytes",
-                                  chunk_id, node_addr, source_desc, read_type, read_time, chunk_data.len());
-
-                            data = Some(chunk_data);
-                            break;
-                        }
-                        Err(e) => {
-                            let read_time = read_start.elapsed();
-                            debug!("✗ Chunk {} failed from {} after {:?}: {}", chunk_id, node_addr, read_time, e);
-                            last_error = Some(e);
-                            continue;
+                            client.read_chunk_from_server(node_addr, r.chunk_id).await
+                        };
+                        match result {
+                            Ok(d) => {
+                                info!("✓ Chunk {} from {} ({}) in {:?} - {} bytes",
+                                      r.chunk_id, node_addr,
+                                      if i > 0 { "FALLBACK" } else { "PRIMARY" },
+                                      read_start.elapsed(), d.len());
+                                data = Some(d);
+                                break;
+                            }
+                            Err(e) => { last_error = Some(e); }
                         }
                     }
-                }
+                    let chunk_data = data.ok_or_else(||
+                        last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed")))?;
+                    Ok::<_, anyhow::Error>((r.idx, r.chunk_id, r.file_offset,
+                                           Arc::new(chunk_data), r.use_partial_read, r.pipeline_only))
+                })
+            }).collect();
 
-                let chunk_data = data.ok_or_else(|| {
-                    last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed for chunk"))
-                })?;
-
-                Ok::<_, anyhow::Error>((idx, chunk_id, file_offset, Arc::new(chunk_data), use_partial_read))
-            })
-        }).collect();
-
-        // Wait for all fetches to complete
-        let fetch_results = futures::future::join_all(fetch_tasks).await;
+            // Wait for all parallel fetches to complete.
+            futures::future::join_all(tasks).await
+                .into_iter()
+                .map(|r| r.context("Fetch task panicked").and_then(|x| x))
+                .collect()
+        };
 
         // Process results and update both caches
-        let mut fetched_chunks = Vec::new();
         for result in fetch_results {
-            let (idx, chunk_id, file_offset, data_arc, was_partial) = result
-                .context("Fetch task panicked")?
+            let (idx, chunk_id, file_offset, data_arc, was_partial, is_pipeline_only) = result
                 .context("Failed to fetch chunk")?;
 
             // Only store FULL chunks in the chunk cache keyed by chunk_id.
@@ -1448,14 +1857,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Partial results are still stored in the byte-range cache below, which
             // is keyed by (inode, offset) and is safe for partial use.
             if !was_partial {
-                let mut chunk_cache = self.chunk_cache.lock().await;
+                let mut chunk_cache = self.chunk_cache.write().await;
                 chunk_cache.put(chunk_id, Arc::clone(&data_arc));
                 debug!("Cached chunk {} ({} bytes)", chunk_id, data_arc.len());
             }
 
-            // Add to byte-range cache if we have inode.
+            // Add to byte-range cache if we have inode (skip pipeline-only — no valid file_offset).
             // Note: file_offset == 0 is valid (first chunk of file) and should be cached.
-            if inode > 0 {
+            if inode > 0 && !is_pipeline_only {
                 let mut byte_cache = self.byte_range_cache.lock().await;
                 let key = ByteRangeCacheKey {
                     inode,
@@ -1471,18 +1880,21 @@ leader_addr: Arc::new(RwLock::new(None)),
                 info!("Byte-range cached: inode={} offset={} ({} bytes)", inode, file_offset, data_arc.len());
             }
 
-            fetched_chunks.push((idx, data_arc));
+            // Pipeline-only chunks are cached but not returned to the caller.
+            if !is_pipeline_only {
+                fetched_chunks.push((idx, data_arc));
+            }
         }
 
-        // Fetches are fully complete at this point (join_all above awaited all tasks).
-        // Remove from in-flight now so subsequent reads don't spin-wait 200ms for a
-        // chunk that already landed in cache (or failed and will never arrive).
+        // Remove from in-flight now that fetches are complete.
         {
             let mut in_flight = self.prefetch_in_flight.lock().await;
-            for (_, chunk_id, _) in &chunks_to_fetch {
+            for (_, chunk_id, _, _) in &chunks_to_fetch {
                 in_flight.remove(chunk_id);
             }
         }
+
+        } // end if !chunks_to_fetch.is_empty()
 
         // Wait for chunks that were already being fetched by other requests
         // Poll the cache until they appear (they should be there very soon)
@@ -1501,7 +1913,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
                     // Check chunk cache
-                    let chunk_cache = self.chunk_cache.lock().await;
+                    let chunk_cache = self.chunk_cache.read().await;
                     if let Some(data) = chunk_cache.peek(&chunk_id) {
                         debug!("Waited chunk {} now available after {:?}", chunk_id, wait_start.elapsed());
                         fetched_chunks.push((idx, Arc::clone(data)));
@@ -1523,7 +1935,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // Try to fetch it ourselves, trying multiple replicas if needed
                     let replicas = match self.get_chunk_replicas(chunk_id).await {
                         Ok(r) => r,
-                        Err(_) => nodes.clone(),
+                        Err(_) => self.cluster_nodes.read().await.clone(),
                     };
 
                     let selected_replica = self.select_replica(&replicas).await
@@ -1543,7 +1955,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 let data_arc = Arc::new(data);
 
                                 // Cache it
-                                let mut chunk_cache = self.chunk_cache.lock().await;
+                                let mut chunk_cache = self.chunk_cache.write().await;
                                 chunk_cache.put(chunk_id, Arc::clone(&data_arc));
 
                                 fetched_chunks.push((idx, data_arc));
@@ -1583,8 +1995,8 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let elapsed = start.elapsed();
         let throughput = (all_data.len() as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
-        info!("Read complete: {} bytes from {} chunks in {:?} ({:.2} MB/s) - cache: {}/{} hits",
-              all_data.len(), chunk_ids.len(), elapsed, throughput, cache_hits, chunk_ids.len());
+        info!("Read complete: {} bytes in {:?} ({:.2} MB/s) t1={:?} t2={:?} fetch={:?}",
+              all_data.len(), elapsed, throughput, t1, t2 - t1, elapsed - t2);
 
         // Detect sequential access patterns and prefetch aggressively
         // Prefetch on every read to keep the server cache warm ahead of our position
@@ -1596,17 +2008,22 @@ leader_addr: Arc::new(RwLock::new(None)),
             // read_history has its own Mutex, no outer lock needed
             let is_sequential = {
                 // Track read history and detect sequential patterns
-                let mut history = self.read_history.lock().await;
+                let mut history = self.read_history.write().await;
                 // LRU cache: get existing or create new entry
                 if !history.contains(&file_id) {
                     history.put(file_id, VecDeque::with_capacity(4));
                 }
                 let read_positions = history.get_mut(&file_id).unwrap();
 
-                // Add current read position
-                read_positions.push_back(last_file_chunk_idx);
-                if read_positions.len() > 4 {
-                    read_positions.pop_front();
+                // Add current read position only if it differs from the last recorded one.
+                // FUSE issues many 128KB reads within a single 4MB chunk — without this
+                // dedup the history fills with identical positions and sequential detection
+                // never fires until we've already crossed into the second chunk.
+                if read_positions.back() != Some(&last_file_chunk_idx) {
+                    read_positions.push_back(last_file_chunk_idx);
+                    if read_positions.len() > 4 {
+                        read_positions.pop_front();
+                    }
                 }
 
                 // Detect if we have sequential momentum (2+ consecutive sequential reads)
@@ -1638,270 +2055,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                 result
             };
 
-            // Re-enabled: Server-side prefetch hints to warm server LRU caches
-            // This reduces disk read latency by pre-loading chunks into server memory
-            // Enable aggressive prefetching for sequential reads (DVR playback, streaming)
-            // Adaptive based on both file chunk count AND available memory
-            if true && is_sequential {
-                // Check available memory to scale prefetch aggressiveness
-                let available_mb = dfs_common::get_available_memory()
-                    .map(|bytes| bytes / (1024 * 1024))
-                    .unwrap_or(1024);
-
-                // Base prefetch distance: scale based on available memory
-                // Moderate prefetching - enough to stay ahead but not so much we wait for them
-                // With round-robin across 5 servers, we get natural parallelism
-                let (base_large, base_medium, base_tiny) = if available_mb < 256 {
-                    // Extremely low memory: minimal prefetch
-                    (8, 12, 16)
-                } else if available_mb < 512 {
-                    // Very low memory: moderate prefetch
-                    (12, 16, 20)
-                } else if available_mb < 1024 {
-                    // Low memory: moderate prefetch
-                    (16, 20, 24)
-                } else {
-                    // Normal memory: aggressive prefetch (20 chunks = 80MB ahead)
-                    // With 5 servers, that's 4 chunks per server = ~16MB per server
-                    // At ~30-40 MB/s per server, ~0.4-0.5 seconds of prefetch buffer per server
-                    (20, 24, 28)
-                };
-
-                // Adaptive prefetch distance based on chunk count
-                let prefetch_distance = if all_file_chunks.len() > 500 {
-                    // Many tiny chunks (MPEG-TS): use base_tiny
-                    base_tiny
-                } else if all_file_chunks.len() > 100 {
-                    // Medium chunks: use base_medium
-                    base_medium
-                } else {
-                    // Large chunks (4MB): use base_large
-                    base_large
-                };
-
-                info!("Prefetch: detected sequential pattern at chunk_idx={}/{} chunk_id={:?}, prefetching next {} chunks",
-                      last_file_chunk_idx, all_file_chunks.len(), all_file_chunks.get(last_file_chunk_idx), prefetch_distance);
-
-                // Collect chunks to prefetch (filter out already cached/in-flight)
-                let mut chunks_to_prefetch = Vec::new();
-                {
-                    let cache = self.chunk_cache.lock().await;
-                    let in_flight = self.prefetch_in_flight.lock().await;
-
-                    for prefetch_offset in 1..=prefetch_distance {
-                        let prefetch_file_idx = last_file_chunk_idx + prefetch_offset;
-
-                        // Check if this chunk exists in the file
-                        if prefetch_file_idx >= all_file_chunks.len() {
-                            break; // Beyond end of file
-                        }
-
-                        let prefetch_chunk_id = all_file_chunks[prefetch_file_idx];
-
-                        // Skip if already cached or being fetched by a real read
-                        // NOTE: Don't mark as in-flight ourselves - prefetch is just a hint to servers
-                        // If a real read comes in, it should fetch immediately, not wait for prefetch
-                        if cache.peek(&prefetch_chunk_id).is_some() || in_flight.contains(&prefetch_chunk_id) {
-                            continue;
-                        }
-
-                        chunks_to_prefetch.push(prefetch_chunk_id);
-                    }
-                }
-
-                if !chunks_to_prefetch.is_empty() {
-                    info!("Sending server-side prefetch hints for {} chunks", chunks_to_prefetch.len());
-
-                    // Spawn background task to send prefetch hints (replica-aware batching)
-                    let client = self.clone();
-                    let nodes = nodes.clone();
-
-                    tokio::spawn(async move {
-                        // Group chunks by replica node using round-robin selection
-                        use std::collections::HashMap;
-                        let mut chunks_by_node: HashMap<SocketAddr, Vec<ChunkId>> = HashMap::new();
-
-                        for chunk_id in &chunks_to_prefetch {
-                            // Get replicas for this chunk
-                            let replicas = match client.get_chunk_replicas(*chunk_id).await {
-                                Ok(r) if !r.is_empty() => r,
-                                _ => nodes.clone(), // Fallback to all nodes
-                            };
-
-                            // Select replica using round-robin (same logic as reads)
-                            if let Some(selected_node) = client.select_replica(&replicas).await {
-                                chunks_by_node.entry(selected_node).or_default().push(*chunk_id);
-                            }
-                        }
-
-                        info!("Grouped {} chunks across {} nodes for prefetch hints",
-                              chunks_to_prefetch.len(), chunks_by_node.len());
-
-                        // Send batch prefetch hint to each node (truly fire-and-forget, no waiting)
-                        // Spawn separate task per node to avoid blocking on slow nodes
-                        for (node_addr, chunk_ids) in chunks_by_node {
-                            let client = client.clone();
-
-                            tokio::spawn(async move {
-                                let request = dfs_common::Request::PrefetchHint {
-                                    chunk_ids: chunk_ids.clone(),
-                                };
-
-                                match client.send_request(node_addr, request).await {
-                                    Ok(dfs_common::Response::PrefetchAccepted { accepted }) => {
-                                        debug!("Server {} accepted prefetch hint for {} chunks", node_addr, accepted);
-
-                                        // Record in warm_cache_map
-                                        let now = std::time::Instant::now();
-                                        let mut warm_map = client.warm_cache_map.lock().await;
-                                        for chunk_id in &chunk_ids {
-                                            warm_map.put(*chunk_id, (node_addr, now));
-                                        }
-                                    }
-                                    Ok(_) => {
-                                        debug!("Unexpected response from prefetch hint to {}", node_addr);
-                                    }
-                                    Err(e) => {
-                                        debug!("Failed to send prefetch hint to {}: {}", node_addr, e);
-                                    }
-                                }
-                            });
-                        }
-                    });
-                }
-
-            } else {
-                info!("Skipping prefetch: random/non-sequential access detected at chunk_idx={} chunk_id={:?}",
-                      last_file_chunk_idx, all_file_chunks.get(last_file_chunk_idx));
-            }
-
-            // CLIENT-SIDE PREFETCH: Modest aggressive client-side prefetch for sequential reads
-            // Fetch next chunks into client cache in background (non-blocking)
-            // This complements server-side hints by having data ready in client memory
-            // Client prefetch is ~half of server-side prefetch distance for optimal balance
-            if is_sequential && last_file_chunk_idx + 1 < all_file_chunks.len() {
-                // Get available memory to determine prefetch aggressiveness (same logic as server-side)
-                let available_mb = dfs_common::get_available_memory()
-                    .map(|bytes| bytes / (1024 * 1024))
-                    .unwrap_or(1024);
-
-                // Client prefetch is half of server-side prefetch distance
-                let (base_large, base_medium, base_tiny) = if available_mb < 256 {
-                    (4, 6, 8)      // Half of (8, 12, 16)
-                } else if available_mb < 512 {
-                    (6, 8, 10)     // Half of (12, 16, 20)
-                } else if available_mb < 1024 {
-                    (8, 10, 12)    // Half of (16, 20, 24)
-                } else {
-                    (10, 12, 14)   // Half of (20, 24, 28)
-                };
-
-                // Adaptive prefetch distance based on chunk count (same logic as server-side)
-                let client_prefetch_count = if all_file_chunks.len() > 500 {
-                    base_tiny      // Many tiny chunks
-                } else if all_file_chunks.len() > 100 {
-                    base_medium    // Medium chunks
-                } else {
-                    base_large     // Large chunks (4MB)
-                };
-
-                // Collect chunks to client-prefetch (skip already cached)
-                let mut chunks_to_client_prefetch = Vec::new();
-                {
-                    let cache = self.chunk_cache.lock().await;
-                    let in_flight = self.prefetch_in_flight.lock().await;
-
-                    for offset in 1..=client_prefetch_count {
-                        let prefetch_idx = last_file_chunk_idx + offset;
-
-                        if prefetch_idx >= all_file_chunks.len() {
-                            break; // Beyond end of file
-                        }
-
-                        let prefetch_chunk_id = all_file_chunks[prefetch_idx];
-
-                        // Skip if already cached or in-flight
-                        if cache.peek(&prefetch_chunk_id).is_some() || in_flight.contains(&prefetch_chunk_id) {
-                            continue;
-                        }
-
-                        chunks_to_client_prefetch.push((prefetch_idx, prefetch_chunk_id));
-                    }
-                }
-
-                if !chunks_to_client_prefetch.is_empty() {
-                    info!("Client-side prefetch: fetching {} chunks in background", chunks_to_client_prefetch.len());
-
-                    // Spawn background task for client-side prefetch
-                    let client = self.clone();
-                    let nodes = nodes.clone();
-                    let chunk_locations = chunk_locations.to_vec();
-
-                    tokio::spawn(async move {
-                        for (chunk_idx, chunk_id) in chunks_to_client_prefetch {
-                            // Mark as in-flight to prevent duplicates
-                            {
-                                let mut in_flight = client.prefetch_in_flight.lock().await;
-                                if in_flight.contains(&chunk_id) {
-                                    continue; // Already being fetched
-                                }
-                                in_flight.insert(chunk_id);
-                            }
-
-                            // Get chunk location from metadata
-                            let chunk_loc_map: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
-                                chunk_locations.iter().map(|loc| (loc.chunk_id, loc)).collect();
-
-                            let chunk_location = chunk_loc_map.get(&chunk_id).map(|&loc| loc.clone());
-
-                            // Get replicas
-                            let replicas = if let Some(ref location) = chunk_location {
-                                let node_id_map = client.addr_to_node_id.read().await;
-                                let chunk_addrs: Vec<SocketAddr> = location.nodes.iter()
-                                    .filter_map(|node_id| {
-                                        node_id_map.iter()
-                                            .find(|(_, &id)| id == *node_id)
-                                            .map(|(&addr, _)| addr)
-                                    })
-                                    .collect();
-
-                                if !chunk_addrs.is_empty() {
-                                    chunk_addrs
-                                } else {
-                                    nodes.clone()
-                                }
-                            } else {
-                                nodes.clone()
-                            };
-
-                            // Select replica using round-robin
-                            if let Some(selected_node) = client.select_replica(&replicas).await {
-                                // Fetch chunk from server
-                                match client.read_chunk_from_server(selected_node, chunk_id).await {
-                                    Ok(data) => {
-                                        debug!("Client prefetch SUCCESS: chunk {} ({} bytes) from {}",
-                                               chunk_id, data.len(), selected_node);
-
-                                        // Add to cache
-                                        let mut cache = client.chunk_cache.lock().await;
-                                        cache.put(chunk_id, Arc::new(data));
-                                    }
-                                    Err(e) => {
-                                        debug!("Client prefetch FAILED: chunk {} from {}: {}",
-                                               chunk_id, selected_node, e);
-                                    }
-                                }
-                            }
-
-                            // Remove from in-flight
-                            {
-                                let mut in_flight = client.prefetch_in_flight.lock().await;
-                                in_flight.remove(&chunk_id);
-                            }
-                        }
-                    });
-                }
-            }
         }
 
         Ok(all_data)
@@ -2226,32 +2379,37 @@ leader_addr: Arc::new(RwLock::new(None)),
             };
 
             match result {
-                Ok((stream, buf)) => {
-                    // Return connection to pool (cap per-server queue at 8 idle connections)
-                    {
-                        let entry = self.connection_pool
-                            .entry(server_addr)
-                            .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
-                        let mut queue = entry.lock().await;
-                        if queue.len() < 8 {
-                            queue.push_back(stream);
-                        }
-                        // If queue is full, stream drops here and TCP connection closes
-                    }
-
-                    // Deserialize response
+                Ok((mut stream, buf)) => {
+                    // Deserialize envelope first (before returning stream to pool).
                     let response_envelope = MessageEnvelope::from_bytes(&buf)
                         .context("Failed to deserialize response")?;
 
                     match response_envelope.message {
                         Message::Response(Response::ChunkData { data, cache_stats, .. }) => {
+                            // Split-frame: read raw payload before returning stream to pool.
+                            let data = if data.is_empty() {
+                                dfs_common::protocol::read_chunk_payload(&mut stream).await
+                                    .context("read split-frame chunk payload")?
+                            } else {
+                                data
+                            };
+
+                            // Return connection to pool now that we've drained all bytes.
+                            {
+                                let entry = self.connection_pool
+                                    .entry(server_addr)
+                                    .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
+                                let mut queue = entry.lock().await;
+                                if queue.len() < 8 {
+                                    queue.push_back(stream);
+                                }
+                            }
+
                             // Flow control: Check server cache pressure and throttle if needed
                             if let Some((_, capacity, size)) = cache_stats {
                                 let utilization = (size as f64 / capacity as f64) * 100.0;
-
-                                // If server cache is >90% full, it's thrashing - add backpressure
                                 if utilization > 90.0 {
-                                    let sleep_ms = ((utilization - 90.0) * 2.0) as u64; // 0-20ms sleep
+                                    let sleep_ms = ((utilization - 90.0) * 2.0) as u64;
                                     debug!("Server {} cache pressure: {:.1}% ({}/{}), throttling {}ms",
                                            server_addr, utilization, size, capacity, sleep_ms);
                                     tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
@@ -2279,6 +2437,179 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
             }
         }
+    }
+
+    /// Phase 1 of pipelined sequential reads: open connection, send ReadChunk request,
+    /// and read the 4-byte response-length prefix.  Returns the open stream plus the
+    /// declared response body length so the caller can drain the body separately.
+    ///
+    /// By running Phase 1 for chunk N+1 concurrently with draining chunk N we hide
+    /// TCP connection setup + server processing latency behind the data transfer.
+    async fn open_chunk_request(
+        &self,
+        server_addr: SocketAddr,
+        chunk_id: ChunkId,
+    ) -> Result<(TcpStream, usize)> {
+        let request = Request::ReadChunk { chunk_id, sequential_hint: None };
+        let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let envelope = MessageEnvelope::new(request_id, Message::Request(request));
+        let encoded = envelope.to_bytes().context("serialize")?;
+
+        // Prefer a pooled connection; fall back to a new one.
+        let pooled = if let Some(entry) = self.connection_pool.get(&server_addr) {
+            entry.lock().await.pop_front()
+        } else {
+            None
+        };
+
+        let mut stream = match pooled {
+            Some(s) => {
+                use tokio::io::Interest;
+                let peer_closed = match s.ready(Interest::READABLE).await {
+                    Ok(ready) if ready.is_readable() => {
+                        let mut buf = [0u8; 1];
+                        !matches!(s.try_read(&mut buf), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                    }
+                    _ => false,
+                };
+                if peer_closed {
+                    tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        TcpStream::connect(server_addr),
+                    ).await.map_err(|_| anyhow::anyhow!("connect timeout"))??
+                } else {
+                    s
+                }
+            }
+            None => tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                TcpStream::connect(server_addr),
+            ).await.map_err(|_| anyhow::anyhow!("connect timeout"))??,
+        };
+
+        // Send request + read 4-byte length prefix (tiny, fast).
+        let len = encoded.len() as u32;
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(&encoded).await?;
+        stream.flush().await?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let body_len = u32::from_be_bytes(len_buf) as usize;
+
+        Ok((stream, body_len))
+    }
+
+    /// Phase 2 of pipelined sequential reads: drain the response body from a stream
+    /// that has already completed Phase 1 (open_chunk_request).  Returns the chunk
+    /// data and hands the stream back to the connection pool.
+    async fn drain_chunk_response(
+        &self,
+        server_addr: SocketAddr,
+        mut stream: TcpStream,
+        body_len: usize,
+    ) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; body_len];
+        stream.read_exact(&mut buf).await?;
+
+        let response_envelope = MessageEnvelope::from_bytes(&buf).context("deserialize")?;
+        let data = match response_envelope.message {
+            Message::Response(Response::ChunkData { data, .. }) => {
+                if data.is_empty() {
+                    // Split-frame: raw payload follows on the stream — read before pooling.
+                    dfs_common::protocol::read_chunk_payload(&mut stream).await
+                        .context("read split-frame chunk payload")?
+                } else {
+                    data
+                }
+            }
+            Message::Response(Response::Error { message, .. }) => {
+                anyhow::bail!("Server error: {}", message)
+            }
+            _ => anyhow::bail!("Unexpected response type"),
+        };
+
+        // Return connection to pool after all bytes are drained.
+        {
+            let entry = self.connection_pool
+                .entry(server_addr)
+                .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
+            let mut queue = entry.lock().await;
+            if queue.len() < 8 {
+                queue.push_back(stream);
+            }
+        }
+
+        Ok(data)
+    }
+
+    /// Sequential pipeline read: fetch `chunks` one at a time but with the *next*
+    /// connection already established and request already sent before the current
+    /// chunk's body has finished transferring.  Eliminates per-chunk TCP + RTT latency
+    /// from the critical path.
+    ///
+    /// Returns chunk data in the same order as `chunks`.  On any Phase-1 error falls
+    /// back to the normal `read_chunk_from_server` path for that chunk.
+    pub async fn sequential_pipeline_read(
+        &self,
+        chunks: Vec<(ChunkId, SocketAddr)>,
+    ) -> Vec<Result<Vec<u8>>> {
+        if chunks.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results: Vec<Result<Vec<u8>>> = Vec::with_capacity(chunks.len());
+
+        type P1Handle = tokio::task::JoinHandle<Result<(TcpStream, usize)>>;
+
+        // Kick off Phase 1 for the first chunk immediately.
+        let mut pending: Option<(SocketAddr, P1Handle)> = {
+            let (cid, addr) = chunks[0]; // ChunkId and SocketAddr are Copy
+            let client = self.clone();
+            Some((addr, tokio::spawn(async move {
+                client.open_chunk_request(addr, cid).await
+            })))
+        };
+
+        for i in 0..chunks.len() {
+            let (cid, addr) = chunks[i];
+
+            let (p1_addr, p1_handle) = match pending.take() {
+                Some(p) => p,
+                None => {
+                    results.push(self.read_chunk_from_server(addr, cid).await);
+                    continue;
+                }
+            };
+
+            // Concurrently start Phase 1 for the next chunk while we await drain of this one.
+            let next_pending: Option<(SocketAddr, P1Handle)> = if i + 1 < chunks.len() {
+                let (next_cid, next_addr) = chunks[i + 1];
+                let client = self.clone();
+                Some((next_addr, tokio::spawn(async move {
+                    client.open_chunk_request(next_addr, next_cid).await
+                })))
+            } else {
+                None
+            };
+
+            // Await Phase 1 completion then drain the body.
+            let chunk_result = match p1_handle.await {
+                Ok(Ok((stream, body_len))) => {
+                    self.drain_chunk_response(p1_addr, stream, body_len).await
+                }
+                Ok(Err(e)) => {
+                    warn!("Pipeline Phase-1 failed for chunk {:?} on {}: {}", cid, p1_addr, e);
+                    self.read_chunk_from_server(addr, cid).await
+                }
+                Err(e) => Err(anyhow::anyhow!("Phase-1 task panicked: {}", e)),
+            };
+
+            results.push(chunk_result);
+            pending = next_pending;
+        }
+
+        results
     }
 
     /// Send prefetch hint to server (fire-and-forget, non-blocking)

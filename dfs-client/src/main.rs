@@ -1,6 +1,7 @@
 mod client;
 mod fuse_impl;
 mod locks;
+mod read_engine;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

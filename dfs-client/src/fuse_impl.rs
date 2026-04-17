@@ -21,6 +21,10 @@ use crate::locks::LockManager;
 /// Used to decide: direct I/O mode, write buffering bypass, immediate metadata flush.
 /// Matches .db/.sqlite/.sqlite3 and their -wal/-journal/-shm sidecars,
 /// plus _temp variants (e.g. gravity.db_temp used by pihole during gravity updates).
+pub fn is_sqlite_for_cache(path: &str) -> bool {
+    is_sqlite_path(path)
+}
+
 fn is_sqlite_path(path: &str) -> bool {
     path.ends_with(".db")
         || path.ends_with(".sqlite")
@@ -516,7 +520,7 @@ pub struct DfsFilesystem {
     chunk_offset_cache: Arc<DashMap<u64, (u64, usize, Vec<(usize, usize)>)>>, // (file_size, chunk_count, offsets)
 
     /// Directory listing cache: path -> (entries, timestamp)
-    /// Cache directory listings for 5 seconds to avoid repeated scans
+    /// Cache directory listings for 30 seconds to avoid repeated scans
     dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
 
     /// Filesystem stats cache: (total, free, avail, timestamp)
@@ -906,10 +910,9 @@ impl Filesystem for DfsFilesystem {
     ) -> Result<(), libc::c_int> {
         info!("Initializing DFS filesystem");
 
-        // Enable aggressive kernel read-ahead for sequential reads (DVR streaming)
-        // This tells the kernel to read ahead up to 16MB for sequential access patterns
-        config.set_max_readahead(16 * 1024 * 1024);
-        info!("Set max_readahead to 16MB for sequential streaming");
+        // Disable kernel readahead — our pipeline (depth=2) handles lookahead explicitly.
+        // Kernel readahead would race our pipeline with extra concurrent fetches.
+        let _ = config.set_max_readahead(0);
 
         // Enable POSIX file locking - tell kernel to use our setlk/getlk implementations
         // instead of handling locks in the kernel
@@ -1157,6 +1160,29 @@ impl Filesystem for DfsFilesystem {
             // For regular files: Use page cache for better performance
             reply.opened(0, fuser::consts::FOPEN_KEEP_CACHE);
         }
+
+        // Pre-warm the read engine so the first read() hits the chunk map immediately.
+        // Set refresh_in_progress synchronously before spawning so that read() racing in
+        // will spin-wait rather than see an empty engine and return 0 bytes.
+        if let Some(meta) = self.metadata_cache.get(&ino) {
+            let file_id = meta.id;
+            let file_size = meta.size;
+            let meta_locations = meta.chunk_locations.clone();
+            drop(meta);
+            let client = self.client.clone();
+            let engine = client.read_engines.get_or_create(ino);
+            // known_size == 0 means engine is cold (never populated). No async needed to check.
+            let is_cold = engine.known_size.load(std::sync::atomic::Ordering::Relaxed) == 0;
+            if is_cold && engine.refresh_in_progress
+                .compare_exchange(false, true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed).is_ok()
+            {
+                self.runtime.spawn(async move {
+                    client.refresh_engine_flagged(&engine, file_id, file_size, meta_locations).await;
+                });
+            }
+        }
     }
 
     fn getattr(&mut self, _req: &FuseRequest, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -1168,6 +1194,7 @@ impl Filesystem for DfsFilesystem {
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
         let size_high_water = self.size_high_water.clone();
+        let write_open_counts = self.write_open_counts.clone();
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
@@ -1206,10 +1233,15 @@ impl Filesystem for DfsFilesystem {
                     // than the last committed flush position in metadata.size. Report the
                     // buffer's logical end so that Kodi/players seeking in a live recording
                     // see the correct (current) file size instead of a stale flushed size.
-                    // Without this, a seek to the "end" of a live file may land beyond what
-                    // getattr reports, causing the player to stall waiting for the file to
-                    // appear to grow.
-                    if write_buffer_enabled {
+                    // WITHOUT this, a seek to the "end" of a live file may land beyond what
+                    // getattr reports, causing the player to stall waiting for the file to grow.
+                    //
+                    // BUT: only inflate the size if a writer currently has the file open.
+                    // If only readers are open, the buffered bytes aren't accessible to them
+                    // and reporting an inflated size causes seeks into the unflushed gap, which
+                    // returns short/zero data and makes players jump back to the start.
+                    let has_active_writer = write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
+                    if write_buffer_enabled && has_active_writer {
                         // Compute the logical end of any buffered-but-not-yet-flushed data
                         let buffered_end = if let Some(state_lock) = write_buffers.get(&ino) {
                             let state = state_lock.lock().await;
@@ -1266,26 +1298,19 @@ impl Filesystem for DfsFilesystem {
         let metadata_cache = self.metadata_cache.clone();
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
-        let buffer_flush_threshold = self.buffer_flush_threshold;
         let last_metadata_update = self.last_metadata_update.clone();
-        let last_warm_offset = self.last_warm_offset.clone();
-        let chunk_offset_cache = self.chunk_offset_cache.clone();
-        let flush_in_flight = self.flush_in_flight.clone();
 
-        // Spawn async read operation on tokio runtime
         self.runtime.spawn(async move {
             let start = std::time::Instant::now();
-            info!("FUSE read START: ino={}, offset={}, size={}", ino, offset, size);
+            debug!("FUSE read: ino={}, offset={}, size={}", ino, offset, size);
 
-            let mut metadata = match metadata_cache.get(&ino) {
-                Some(m) => m.clone(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+            // --- Metadata: read only scalars we need, release DashMap ref fast. ---
+            let (file_size, file_type, file_path, file_id) = match metadata_cache.get(&ino) {
+                Some(m) => (m.size, m.file_type, m.path.clone(), m.id),
+                None => { reply.error(libc::ENOENT); return; }
             };
 
-            if metadata.file_type != FileType::RegularFile {
+            if file_type != FileType::RegularFile {
                 reply.error(libc::EISDIR);
                 return;
             }
@@ -1293,69 +1318,17 @@ impl Filesystem for DfsFilesystem {
             let offset = offset as usize;
             let size = size as usize;
 
-            // Warm replica cache with sliding window - but only occasionally to avoid overhead
-            // For files with many small chunks, warming on every read causes significant CPU overhead
-            // Warm when: (1) first read, or (2) we've progressed significantly (every 50MB)
-            // CRITICAL: Track warming per-inode to prevent cross-file interference during seeks
-            let last_warm = last_warm_offset.get(&ino).map(|v| *v).unwrap_or(0);
-            let should_warm = offset == 0 || offset.saturating_sub(last_warm as usize) >= 50 * 1024 * 1024;
-
-            let has_locations = !metadata.chunk_locations.is_empty();
-            let has_legacy = !metadata.chunks.is_empty() && !metadata.chunk_sizes.is_empty();
-            if should_warm && (has_locations || has_legacy) {
-                // Find which chunk index corresponds to this byte offset.
-                let chunk_idx = if has_locations {
-                    let mut cumulative = 0u64;
-                    let mut idx = 0;
-                    for (i, loc) in metadata.chunk_locations.iter().enumerate() {
-                        if cumulative + loc.size as u64 > offset as u64 {
-                            idx = i;
-                            break;
-                        }
-                        cumulative += loc.size as u64;
-                    }
-                    idx
-                } else {
-                    let mut cumulative = 0u64;
-                    let mut idx = 0;
-                    for (i, &chunk_size) in metadata.chunk_sizes.iter().enumerate() {
-                        if cumulative + chunk_size > offset as u64 {
-                            idx = i;
-                            break;
-                        }
-                        cumulative += chunk_size;
-                    }
-                    idx
-                };
-
-                // Prefer warming from real ChunkLocation data (has per-chunk node lists)
-                // over the legacy all-nodes fake entries — eliminates mid-read metadata RPCs.
-                if has_locations {
-                    client.warm_replica_cache_from_locations(&metadata.chunk_locations, Some(chunk_idx)).await;
-                } else {
-                    client.warm_replica_cache_by_index(&metadata.chunks, Some(chunk_idx)).await;
-                }
-
-                last_warm_offset.insert(ino, offset as u64);
-            }
-
-            // Check write buffer first if write-behind buffering is enabled.
-            // With slot-based buffering, we look up the specific chunk slot(s) that
-            // cover the read range and serve directly from them if available.
+            // --- Write buffer: serve from dirty slots without any network I/O. ---
             if write_buffer_enabled {
                 if let Some(state_lock) = write_buffers.get(&ino) {
                     let state = state_lock.lock().await;
                     let read_end = offset + size;
-
-                    // Check if the entire read is satisfied from buffered slots
                     let mut buf_data: Vec<u8> = Vec::with_capacity(size);
-                    let mut fully_buffered = true;
                     let mut pos = offset;
 
                     while pos < read_end {
                         let chunk_idx = InodeWriteState::chunk_index(pos as u64);
                         let intra = InodeWriteState::intra_offset(pos as u64);
-                        let chunk_file_start = (chunk_idx * CHUNK_SIZE as u64) as usize;
                         let need = (read_end - pos).min(CHUNK_SIZE - intra);
 
                         if let Some(slot) = state.slots.get(&chunk_idx) {
@@ -1363,474 +1336,87 @@ impl Filesystem for DfsFilesystem {
                                 buf_data.extend_from_slice(&slot.data[intra..intra + need]);
                                 pos += need;
                             } else if intra < slot.data.len() {
-                                // Partial slot covers start of range but not all — serve what we have (live edge)
                                 let avail = slot.data.len() - intra;
                                 buf_data.extend_from_slice(&slot.data[intra..intra + avail]);
                                 pos += avail;
-                                fully_buffered = false; // will serve partial
                                 break;
                             } else {
-                                fully_buffered = false;
                                 break;
                             }
                         } else {
-                            fully_buffered = false;
                             break;
                         }
                     }
 
                     if !buf_data.is_empty() {
-                        info!("FUSE read from write buffer slots: ino={}, offset={}, serving={} bytes (requested={})",
-                              ino, offset, buf_data.len(), size);
+                        debug!("FUSE read from write buffer: ino={}, {} bytes", ino, buf_data.len());
                         reply.data(&buf_data);
                         return;
                     }
-                    // If no buffered data covers this range, fall through to server read
                 }
             }
 
-            // Early return for out of bounds
-            // But first, check if file might have grown by refreshing metadata
-            if offset >= metadata.size as usize {
-                // File might be actively growing (e.g., live recording in progress).
-                // Rate-limit the metadata refresh so Kodi's frequent seek-past-EOF
-                // polls don't hammer the server.  We allow one refresh per second per
-                // inode; between refreshes we return empty immediately.
+            // --- EOF check: refresh metadata if file may have grown. ---
+            let effective_size = if offset >= file_size as usize {
                 let should_refresh = match last_metadata_update.get(&ino) {
                     None => true,
                     Some(last) => last.elapsed() >= std::time::Duration::from_secs(1),
                 };
-
                 if !should_refresh {
-                    debug!("Read at offset {} >= size {}, rate-limiting EOF refresh, returning empty",
-                           offset, metadata.size);
                     reply.data(&[]);
                     return;
                 }
-
-                info!("Read at offset {} >= cached size {}, refreshing metadata from server", offset, metadata.size);
                 last_metadata_update.insert(ino, std::time::Instant::now());
 
-                match client.get_file_metadata(&metadata.path).await {
-                    Ok(Some(mut fresh_metadata)) => {
-                        // Still past EOF even after refresh — return empty immediately,
-                        // no need to fetch the chunk map (there's nothing new to read).
-                        if offset >= fresh_metadata.size as usize {
-                            info!("Still at EOF after refresh: offset {} >= size {}", offset, fresh_metadata.size);
-                            client.seed_write_seq(fresh_metadata.id, fresh_metadata.write_seq);
-                            metadata_cache.insert(ino, fresh_metadata);
+                match client.get_file_metadata(&file_path).await {
+                    Ok(Some(fresh)) => {
+                        if offset >= fresh.size as usize {
+                            client.seed_write_seq(fresh.id, fresh.write_seq);
+                            // Invalidate the read engine so next read picks up new chunk map.
+                            client.invalidate_read_engine(ino);
+                            metadata_cache.insert(ino, fresh);
                             reply.data(&[]);
                             return;
                         }
-
-                        // File has grown past our read offset.  Now fetch the chunk map
-                        // so we have accurate replica locations for the new chunks.
-                        // Always refresh when size grew — modified_at may lag behind during
-                        // active recording if the async metadata queue hasn't flushed yet.
-                        let size_grew = fresh_metadata.size > metadata.size;
-                        if size_grew || fresh_metadata.chunk_locations.is_empty() {
-                            match client.get_file_chunk_map(fresh_metadata.id).await {
-                                Ok((locations, _map_modified_at)) => {
-                                    if !locations.is_empty() {
-                                        info!("Refreshed chunk map from leader: {} locations for file {}",
-                                              locations.len(), fresh_metadata.path);
-                                        fresh_metadata.chunk_locations = locations;
-                                        chunk_offset_cache.remove(&ino);
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("Could not refresh chunk map from leader at EOF ({}), using metadata chunk_locations", e);
-                                }
-                            }
-                        }
-
-                        // Update cache with fresh metadata
-                        client.seed_write_seq(fresh_metadata.id, fresh_metadata.write_seq);
-                        metadata_cache.insert(ino, fresh_metadata.clone());
-
-                        // Warm replica cache for chunks ahead of the current read position
-                        let chunk_idx = if !fresh_metadata.chunk_sizes.is_empty() {
-                            let mut cumulative = 0u64;
-                            let mut idx = 0;
-                            for (i, &size) in fresh_metadata.chunk_sizes.iter().enumerate() {
-                                if cumulative + size as u64 > offset as u64 {
-                                    idx = i;
-                                    break;
-                                }
-                                cumulative += size as u64;
-                                idx = i + 1;
-                            }
-                            Some(idx)
-                        } else {
-                            None
-                        };
-                        client.warm_replica_cache_by_index(&fresh_metadata.chunks, chunk_idx).await;
-
-                        info!("File grew from {} to {} bytes, continuing read", metadata.size, fresh_metadata.size);
-                        metadata = fresh_metadata;
+                        let new_size = fresh.size;
+                        client.seed_write_seq(fresh.id, fresh.write_seq);
+                        client.invalidate_read_engine(ino);
+                        metadata_cache.insert(ino, fresh);
+                        info!("File grew to {} bytes (ino={})", new_size, ino);
+                        new_size
                     }
-                    Ok(None) => {
-                        info!("File not found when refreshing metadata");
-                        reply.error(libc::ENOENT);
-                        return;
-                    }
-                    Err(e) => {
-                        // Server unreachable — return empty rather than blocking
-                        info!("Failed to refresh metadata: {}, assuming EOF", e);
-                        reply.data(&[]);
-                        return;
-                    }
-                }
-            }
-
-            if metadata.chunks.is_empty() && metadata.chunk_locations.is_empty() {
-                reply.data(&[]);
-                return;
-            }
-
-            // Build or retrieve cached chunk offset map
-            // CRITICAL: Cache this to avoid O(n) iteration through all chunks on every read
-            // For 3GB files with 750+ chunks, this was a massive performance bottleneck
-            //
-            // SPARSE FILE SUPPORT: Use chunk_locations with file_offset if available,
-            // otherwise fall back to sequential offset calculation for legacy files
-            let chunk_offsets = {
-                // Check cache without holding a ref across the potential insert
-                let cached = chunk_offset_cache.get(&ino).and_then(|entry| {
-                    let (cached_size, cached_chunk_count, ref cached_offsets) = *entry;
-                    // Use chunk_locations.len() for modern files; fall back to chunks.len() for legacy.
-                    let current_chunk_count = if !metadata.chunk_locations.is_empty() {
-                        metadata.chunk_locations.len()
-                    } else {
-                        metadata.chunks.len()
-                    };
-                    if cached_size == metadata.size && cached_chunk_count == current_chunk_count {
-                        Some(cached_offsets.clone())
-                    } else {
-                        None
-                    }
-                });
-
-                if let Some(offsets) = cached {
-                    offsets
-                } else {
-                    // Cache miss or invalidated - build and cache it
-                    let mut offsets = Vec::with_capacity(metadata.chunks.len());
-
-                    // Use chunk_locations when available — it's the authoritative source.
-                    // The legacy chunks/chunk_sizes arrays may be empty when metadata was loaded
-                    // from a server that only persisted chunk_locations (all new writes go here).
-                    // The old requirement that chunk_locations.len() == chunks.len() is dropped:
-                    // chunk_locations is self-sufficient and doesn't need chunks to be populated.
-                    // Use chunk_locations with explicit offsets when ALL chunks have file_offset set.
-                    // If any chunk has file_offset: None, fall back to sequential calculation —
-                    // a partial mix (some Some, some None) would place None-chunks at offset 0,
-                    // colliding with real chunk 0 and making subsequent chunks unreachable.
-                    let all_have_offsets = !metadata.chunk_locations.is_empty()
-                        && metadata.chunk_locations.iter().all(|l| l.file_offset.is_some());
-
-                    if all_have_offsets {
-                        // SPARSE FILE: Use explicit file_offset from chunk_locations
-                        for location in &metadata.chunk_locations {
-                            let chunk_offset = location.file_offset.unwrap();
-                            offsets.push((chunk_offset as usize, location.size));
-                        }
-                    } else if !metadata.chunk_locations.is_empty() {
-                        // chunk_locations present but missing offsets on some chunks —
-                        // reconstruct sequentially from the sizes we do have.
-                        let mut current_offset = 0usize;
-                        for location in &metadata.chunk_locations {
-                            offsets.push((current_offset, location.size));
-                            current_offset += location.size;
-                        }
-                    } else {
-                        // LEGACY FILE: fall back to legacy chunks/chunk_sizes arrays
-                        let mut current_offset = 0usize;
-                        for &chunk_size in metadata.chunk_sizes.iter() {
-                            offsets.push((current_offset, chunk_size as usize));
-                            current_offset += chunk_size as usize;
-                        }
-                    }
-
-                    // Store in cache — use chunk_locations.len() for modern files so the
-                    // cache invalidates correctly when new chunks are appended.
-                    let chunk_count_key = if !metadata.chunk_locations.is_empty() {
-                        metadata.chunk_locations.len()
-                    } else {
-                        metadata.chunks.len()
-                    };
-                    chunk_offset_cache.insert(ino, (metadata.size, chunk_count_key, offsets.clone()));
-
-                    offsets
-                }
-            };
-
-            // Find which chunks we need to read
-            let end_offset = std::cmp::min(offset + size, metadata.size as usize);
-            let mut chunks_to_read = Vec::new();
-            let mut first_chunk_offset = 0usize;
-
-            for (idx, &(chunk_start, chunk_size)) in chunk_offsets.iter().enumerate() {
-                let chunk_end = chunk_start + chunk_size;
-
-                // Check if this chunk overlaps with requested range
-                if chunk_end > offset && chunk_start < end_offset {
-                    chunks_to_read.push((idx, chunk_start, chunk_size));
-                    if chunks_to_read.len() == 1 {
-                        first_chunk_offset = chunk_start;
-                    }
-                }
-
-                // Stop once we've found all needed chunks
-                if chunk_start >= end_offset {
-                    break;
-                }
-            }
-
-            // SPARSE FILE SUPPORT: If no chunks found in this range, it's a hole!
-            // Return zeros for the requested size (up to file size)
-            if chunks_to_read.is_empty() {
-                let bytes_to_read = end_offset.saturating_sub(offset);
-                if bytes_to_read > 0 {
-                    debug!("Reading from hole (unmapped region): offset {} size {} - returning zeros",
-                           offset, bytes_to_read);
-                    let zeros = vec![0u8; bytes_to_read];
-                    reply.data(&zeros);
-                } else {
-                    reply.data(&[]);
-                }
-                return;
-            }
-
-            debug!("Reading {} chunks (indices {:?}) for offset {} size {}",
-                   chunks_to_read.len(),
-                   chunks_to_read.iter().map(|(idx, _, _)| idx).collect::<Vec<_>>(),
-                   offset, size);
-
-            // Build ChunkReadHints to tell the client how to read each chunk
-            // For seeks (non-sequential reads), we can optimize by only fetching needed portions
-            let read_hints: Vec<crate::client::ChunkReadHint> = chunks_to_read
-                .iter()
-                .map(|(idx, chunk_start, chunk_size)| {
-                    let chunk_end = chunk_start + chunk_size;
-
-                    // Calculate the overlap between requested range and this chunk
-                    let read_start_in_file = offset.max(*chunk_start);
-                    let read_end_in_file = end_offset.min(chunk_end);
-
-                    // Calculate offset and length within the chunk
-                    let offset_in_chunk = read_start_in_file.saturating_sub(*chunk_start);
-                    let length_in_chunk = read_end_in_file.saturating_sub(read_start_in_file);
-
-                    // Use partial reads when the request covers only a small fraction of the chunk.
-                    // This is critical for Kodi seeks: it probes random offsets to detect duration,
-                    // and fetching a full 4MB chunk over a 20Mbit link takes ~1.6s per probe.
-                    // Only use partial reads when reading < 25% of the chunk to avoid overhead
-                    // of multiple round trips for sequential streaming.
-                    let full_chunk = length_in_chunk >= (*chunk_size as usize / 4)
-                        || length_in_chunk == 0;
-
-                    // Prefer chunk_locations as the authoritative source of chunk_id —
-                    // metadata.chunks may be empty or mismatched when loaded from a server
-                    // that only populated chunk_locations (common after a restart).
-                    let chunk_id = if *idx < metadata.chunk_locations.len() {
-                        metadata.chunk_locations[*idx].chunk_id
-                    } else {
-                        metadata.chunks[*idx]
-                    };
-
-                    crate::client::ChunkReadHint {
-                        chunk_idx: *idx,
-                        chunk_id,
-                        full_chunk,
-                        offset_in_chunk,
-                        length: length_in_chunk,
-                        file_offset: *chunk_start as u64,
-                    }
-                })
-                .collect();
-
-            let partial_reads = read_hints.iter().filter(|h| !h.full_chunk).count();
-            if partial_reads > 0 {
-                info!("Optimizing seek: {} partial chunk reads out of {}",
-                      partial_reads, read_hints.len());
-            }
-
-            // For SQLite database files, disable caching by passing inode=0
-            // This prevents stale cached data from causing corruption
-            let cache_inode = {
-                let path = &metadata.path;
-                if is_sqlite_path(path) {
-                    0 // Disable caching for SQLite files
-                } else {
-                    ino // Enable caching for other files
-                }
-            };
-
-            let all_chunks = metadata.chunks.clone();
-            // If metadata has no chunk_locations (legacy file or first read), fetch the full
-            // chunk map from the leader in one round-trip instead of per-chunk fallback queries.
-            let chunk_locations = if metadata.chunk_locations.is_empty() && !all_chunks.is_empty() {
-                match client.get_file_chunk_map(metadata.id).await {
-                    Ok((locations, _)) if !locations.is_empty() => {
-                        info!("Fetched chunk map from leader: {} locations for {}", locations.len(), metadata.path);
-                        // Cache the locations in metadata so subsequent reads skip this query
-                        let mut updated = metadata.clone();
-                        updated.chunk_locations = locations.clone();
-                        metadata_cache.insert(ino, updated);
-                        locations
-                    }
-                    Ok(_) => {
-                        debug!("Leader returned empty chunk map for {}, using per-chunk fallback", metadata.path);
-                        metadata.chunk_locations.clone()
-                    }
-                    Err(e) => {
-                        debug!("Could not fetch chunk map from leader for {} ({}), using per-chunk fallback", metadata.path, e);
-                        metadata.chunk_locations.clone()
-                    }
+                    Ok(None) => { reply.error(libc::ENOENT); return; }
+                    Err(_)   => { reply.data(&[]); return; }
                 }
             } else {
-                metadata.chunk_locations.clone()
-            };
-            let result = client.read_data(&read_hints, &all_chunks, cache_inode, &chunk_locations).await;
-
-            let chunk_data = match result {
-                Ok(data) => data,
-                Err(e) => {
-                    error!("Failed to read {} chunks: {}", read_hints.len(), e);
-                    reply.error(libc::EIO);
-                    return;
-                }
+                file_size
             };
 
-            // SPARSE FILE SUPPORT: Check if we need to handle holes
-            // Holes can appear: (a) between chunks, (b) before the first chunk
-            // (e.g. shm file truncated to N bytes then written at higher offsets)
-            let has_holes = {
-                // Check for leading hole: first chunk doesn't start at requested offset
-                let leading_hole = if let Some(&(_, first_start, _)) = chunks_to_read.first() {
-                    first_start > offset
-                } else {
-                    false
-                };
+            // Pass chunk_locations for legacy-file fallback in the engine.
+            // Re-read from cache here (not before the EOF check) to get the freshest data.
+            let meta_locations = metadata_cache.get(&ino)
+                .map(|m| m.chunk_locations.clone())
+                .unwrap_or_default();
 
-                // Check for gaps between consecutive chunks
-                let inter_chunk_gap = if chunks_to_read.len() > 1 {
-                    let mut has_gap = false;
-                    for i in 0..chunks_to_read.len() - 1 {
-                        let (_, curr_start, curr_size) = chunks_to_read[i];
-                        let (_, next_start, _) = chunks_to_read[i + 1];
-                        if curr_start + curr_size < next_start {
-                            has_gap = true;
-                            break;
-                        }
-                    }
-                    has_gap
-                } else {
-                    false
-                };
-
-                leading_hole || inter_chunk_gap
-            };
-
-            let final_data = if has_holes {
-                // SPARSE FILE: Build result buffer with holes filled with zeros
-                debug!("Sparse file read: filling holes with zeros");
-
-                let bytes_needed = end_offset - offset;
-                let mut result_buffer = vec![0u8; bytes_needed];
-
-                let mut chunk_data_offset = 0usize;
-                for (i, (_, chunk_start, chunk_size)) in chunks_to_read.iter().enumerate() {
-                    // Determine how many bytes were actually returned for this chunk.
-                    // Partial reads return only hint.length bytes, not the full chunk_size.
-                    let actual_bytes_returned = if let Some(hint) = read_hints.get(i) {
-                        if hint.full_chunk { *chunk_size } else { hint.length }
-                    } else {
-                        *chunk_size
-                    };
-
-                    // Calculate where this chunk's data should go in the result
-                    let chunk_end = chunk_start + chunk_size;
-
-                    // Find overlap between requested range [offset, end_offset) and chunk [chunk_start, chunk_end)
-                    let overlap_start = (*chunk_start).max(offset);
-                    let overlap_end = chunk_end.min(end_offset);
-
-                    if overlap_start < overlap_end {
-                        let result_offset = overlap_start - offset;
-                        // For partial reads, data starts at byte 0 of what was returned (the hint's
-                        // offset_in_chunk was already sent to the server as the range start).
-                        let chunk_offset = if let Some(hint) = read_hints.get(i) {
-                            if hint.full_chunk {
-                                overlap_start - chunk_start
-                            } else {
-                                // Data returned starts at hint.offset_in_chunk in the logical chunk,
-                                // but is at byte 0 in the returned buffer slice.
-                                overlap_start.saturating_sub(chunk_start + hint.offset_in_chunk)
-                            }
-                        } else {
-                            overlap_start - chunk_start
-                        };
-                        let overlap_size = overlap_end - overlap_start;
-
-                        let src_start = chunk_data_offset + chunk_offset;
-                        let src_end = src_start + overlap_size;
-                        if src_end <= chunk_data.len() {
-                            result_buffer[result_offset..result_offset + overlap_size]
-                                .copy_from_slice(&chunk_data[src_start..src_end]);
-                        } else {
-                            warn!("Sparse read: chunk {} data out of bounds (src {}..{} > buf {}), skipping",
-                                  i, src_start, src_end, chunk_data.len());
-                        }
-                    }
-
-                    chunk_data_offset += actual_bytes_returned;
-                }
-
-                result_buffer
-            } else {
-                // NON-SPARSE FILE: Use simple offset calculation (existing logic)
-                // For partial reads, data starts at hint.offset_in_chunk in the logical chunk
-                // but at byte 0 in the returned buffer, so adjust accordingly.
-                //
-                // IMPORTANT: If the hint requested a partial read but the cache served a full
-                // chunk (chunk_data.len() > hint.length), treat it as a full-chunk result so
-                // we index from the chunk start rather than the partial-read offset.
-                let first_hint_offset = read_hints.first()
-                    .map(|h| {
-                        if h.full_chunk {
-                            0
-                        } else if chunk_data.len() > h.length {
-                            // Cache served a larger (full) chunk despite partial hint — index from chunk start
-                            0
-                        } else {
-                            h.offset_in_chunk
-                        }
-                    })
-                    .unwrap_or(0);
-                let offset_in_data = offset.saturating_sub(first_chunk_offset + first_hint_offset);
-                let data_end = std::cmp::min(offset_in_data + size, chunk_data.len());
-
-                if offset_in_data >= chunk_data.len() {
-                    debug!("Read offset {} beyond data length {}", offset_in_data, chunk_data.len());
-                    Vec::new()
-                } else {
-                    chunk_data[offset_in_data..data_end].to_vec()
-                }
-            };
-
-            if final_data.is_empty() {
-                reply.data(&[]);
-            } else {
-                debug!("Returning {} bytes from offset {} (read {} chunks, has_holes: {})",
-                       final_data.len(), offset, read_hints.len(), has_holes);
-                reply.data(&final_data);
-            }
+            // --- Delegate to the read engine (chunk map + pipeline + cache). ---
+            info!("FUSE read: ino={}, offset={}, size={}, file_size={}", ino, offset, size, effective_size);
+            let result = client.read_file(
+                ino, effective_size, file_id, &file_path, offset, size, meta_locations,
+            ).await;
 
             let elapsed = start.elapsed();
-            info!("FUSE read COMPLETE: ino={}, offset={}, size={}, took {:?}",
-                  ino, offset, size, elapsed);
+            match result {
+                Ok(data) => {
+                    // FUSE rejects replies larger than the requested size with EINVAL.
+                    let reply_data = if data.len() > size { &data[..size] } else { &data[..] };
+                    info!("FUSE read done: ino={}, {} bytes in {:?}", ino, reply_data.len(), elapsed);
+                    reply.data(reply_data);
+                }
+                Err(e) => {
+                    tracing::error!("FUSE read error: ino={}, offset={}: {}", ino, offset, e);
+                    reply.error(libc::EIO);
+                }
+            }
         });
     }
 
@@ -1864,7 +1450,7 @@ impl Filesystem for DfsFilesystem {
         // Check directory cache first (5-second TTL)
         let cached_entries = self.dir_cache.get(&path).and_then(|entry| {
             let (entries, timestamp) = &*entry;
-            if timestamp.elapsed() < std::time::Duration::from_secs(5) {
+            if timestamp.elapsed() < std::time::Duration::from_secs(30) {
                 debug!("Directory cache HIT for {}", path);
                 Some(entries.clone())
             } else {
@@ -1997,7 +1583,7 @@ impl Filesystem for DfsFilesystem {
                     async move {
                         // Skip if already cached and fresh
                         if let Some(entry) = dir_cache.get(&subdir) {
-                            if entry.1.elapsed() < std::time::Duration::from_secs(4) {
+                            if entry.1.elapsed() < std::time::Duration::from_secs(30) {
                                 return;
                             }
                         }

@@ -1,3 +1,9 @@
+// Use jemalloc to reduce heap fragmentation from repeated large (4MB chunk) allocations.
+// glibc malloc holds onto freed arenas, causing RSS to grow proportionally to peak throughput.
+// jemalloc returns unused memory to the OS aggressively, keeping RSS close to live set size.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod chunker;
 mod cluster;
 mod healing;

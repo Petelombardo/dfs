@@ -26,6 +26,7 @@ dashmap = "6.1"
 lru = "0.12"
 uuid = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
+tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.15"

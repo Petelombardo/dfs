@@ -49,6 +49,9 @@ clap = { version = "4.5", features = ["derive"] }
 fuser = "0.16"
 libc = "0.2"
 
+# Allocator
+tikv-jemallocator = "0.6"
+
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

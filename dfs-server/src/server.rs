@@ -637,8 +637,8 @@ impl Server {
             Request::RemoveNode { node_id } => self.handle_remove_node(node_id).await,
             Request::ListAllFiles => self.handle_list_all_files().await,
             Request::PurgeFileMetadata { path } => self.handle_purge_file_metadata(path).await,
-            Request::PurgeFileMetadataById { file_id } => {
-                self.handle_purge_file_metadata_by_id(file_id).await
+            Request::PurgeFileMetadataById { file_id, propagate } => {
+                self.handle_purge_file_metadata_by_id(file_id, propagate).await
             }
             Request::GetFileChunkMap { file_id } => {
                 self.handle_get_file_chunk_map(file_id).await
@@ -3074,7 +3074,7 @@ impl Server {
         }
     }
 
-    async fn handle_purge_file_metadata_by_id(&self, file_id: FileId) -> Response {
+    async fn handle_purge_file_metadata_by_id(&self, file_id: FileId, propagate: bool) -> Response {
         info!("Handling purge file metadata by ID: {}", file_id);
 
         // Delete from local node first
@@ -3082,29 +3082,32 @@ impl Server {
             Ok(_) => {
                 info!("Purged metadata for file ID {} from local node", file_id);
 
-                // Broadcast deletion to online peers asynchronously — do not block
-                // the handler and do not attempt to connect to offline nodes (each
-                // failed connect holds a socket in SYN_SENT for the full timeout,
-                // causing fd exhaustion when many purges run concurrently).
-                let nodes = self.cluster.get_all_nodes().await;
-                let local_id = self.cluster.local_node_id();
-                let client = self.client.clone();
-                let sem = self.broadcast_semaphore.clone();
+                // Only the originating node broadcasts — peer recipients must not
+                // re-broadcast or every delete causes an exponential storm.
+                if propagate {
+                    let nodes = self.cluster.get_all_nodes().await;
+                    let local_id = self.cluster.local_node_id();
+                    let client = self.client.clone();
+                    let sem = self.broadcast_semaphore.clone();
 
-                tokio::spawn(async move {
-                    let _permit = sem.acquire().await.ok();
-                    for node in nodes {
-                        if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                            continue;
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await.ok();
+                        for node in nodes {
+                            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                continue;
+                            }
+                            if let Err(e) = client.send_message(
+                                node.addr,
+                                Message::Request(Request::PurgeFileMetadataById {
+                                    file_id: file_id.clone(),
+                                    propagate: false,
+                                })
+                            ).await {
+                                warn!("Error contacting node {} for purge: {}", node.id, e);
+                            }
                         }
-                        if let Err(e) = client.send_message(
-                            node.addr,
-                            Message::Request(Request::PurgeFileMetadataById { file_id: file_id.clone() })
-                        ).await {
-                            warn!("Error contacting node {} for purge: {}", node.id, e);
-                        }
-                    }
-                });
+                    });
+                }
 
                 Response::Ok { data: None }
             }

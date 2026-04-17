@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 /// Handler trait for processing messages
@@ -38,6 +38,11 @@ pub struct NetworkServer<H: MessageHandler> {
 
     /// Message handler
     handler: Arc<H>,
+
+    /// Limits concurrent request handlers to prevent OOM under load.
+    /// Excess connections block at accept until a slot frees — the kernel
+    /// buffers them in the TCP backlog, providing natural client backpressure.
+    concurrency_limit: Arc<Semaphore>,
 }
 
 impl<H: MessageHandler + 'static> NetworkServer<H> {
@@ -48,6 +53,7 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
             next_request_id: Arc::new(AtomicU64::new(1)),
             shutdown_tx: None,
             handler,
+            concurrency_limit: Arc::new(Semaphore::new(256)),
         }
     }
 
@@ -69,7 +75,9 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                         Ok((stream, peer_addr)) => {
                             debug!("Accepted connection from {}", peer_addr);
                             let handler = self.handler.clone();
+                            let sem = self.concurrency_limit.clone();
                             tokio::spawn(async move {
+                                let _permit = sem.acquire_owned().await.ok();
                                 if let Err(e) = handle_connection(stream, peer_addr, handler).await {
                                     error!("Connection error from {}: {}", peer_addr, e);
                                 }

@@ -772,7 +772,7 @@ async fn handle_file_command(
             // Detect UUID vs path and send the appropriate request
             let request = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
                 let file_id = dfs_common::FileId::from_uuid(uuid);
-                Request::PurgeFileMetadataById { file_id }
+                Request::PurgeFileMetadataById { file_id, propagate: true }
             } else {
                 Request::PurgeFileMetadata { path: path.clone() }
             };

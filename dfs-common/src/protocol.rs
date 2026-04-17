@@ -50,6 +50,8 @@ pub enum Message {
     Cluster(ClusterMessage),
 }
 
+fn default_true() -> bool { true }
+
 /// Request types sent between nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -286,6 +288,10 @@ pub enum Request {
     /// Purge file metadata by ID (for corrupted path indexes)
     PurgeFileMetadataById {
         file_id: FileId,
+        /// When true the receiver broadcasts to peers. Set to false on peer broadcasts
+        /// to prevent exponential storm — only the originating node propagates.
+        #[serde(default = "default_true")]
+        propagate: bool,
     },
 
     /// Get file information by file ID (UUID)

@@ -5,8 +5,13 @@ use std::fs;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
+
+/// Per-process counter for unique temp file names — avoids races when
+/// two concurrent writes target the same chunk on the same node.
+static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Local chunk storage manager
 /// Optimized for SBC environments (limited CPU/RAM)
@@ -122,9 +127,14 @@ impl ChunkStorage {
         }
         let mkdir_time = mkdir_start.elapsed();
 
-        // Write data atomically using temporary file
+        // Write data atomically using a unique temporary file.
+        // Using a counter-suffixed name prevents two concurrent writes to the
+        // same chunk (e.g. parallel dual-replica flush) from clobbering each
+        // other's temp file before rename.
         let write_start = std::time::Instant::now();
-        let temp_path = path.with_extension("tmp");
+        let seq = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_name = format!("{}.{}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), seq);
+        let temp_path = path.parent().unwrap_or(path.as_path()).join(temp_name);
         let mut file = fs::File::create(&temp_path)
             .with_context(|| format!("Failed to create temporary file: {:?}", temp_path))?;
 

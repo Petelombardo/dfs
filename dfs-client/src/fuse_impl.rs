@@ -259,6 +259,7 @@ impl FlushHandle {
         };
 
         let mut slots_to_write: Vec<(u64, Vec<u8>, u64)> = Vec::new(); // (chunk_idx, data, file_offset)
+        let mut patch_metadata_dirty = false; // true if any PatchChunk succeeded (needs metadata flush)
         for chunk_idx in &indices_to_flush {
             if let Some(state_lock) = self.write_buffers.get(&ino) {
                 let state = state_lock.lock().await;
@@ -307,6 +308,7 @@ impl FlushHandle {
                                                 }
                                             }
                                             // Skip adding to slots_to_write — patch already committed
+                                            patch_metadata_dirty = true;
                                             true
                                         }
                                         Err(e) => {
@@ -334,6 +336,17 @@ impl FlushHandle {
         }
 
         if slots_to_write.is_empty() {
+            // Nothing to write normally, but if PatchChunk updated metadata we still need to persist it.
+            if patch_metadata_dirty {
+                let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
+                if let Some(meta) = meta_to_persist {
+                    if force {
+                        let _ = self.client.flush_metadata_sync(&meta).await;
+                    } else {
+                        self.client.enqueue_metadata(&meta).await;
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -384,7 +397,7 @@ impl FlushHandle {
             return Err(e);
         }
 
-        if all_locations.is_empty() {
+        if all_locations.is_empty() && !patch_metadata_dirty {
             return Ok(());
         }
 

@@ -746,10 +746,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let mut s = s;
                     let _ = s.shutdown().await;
                     tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
+                        tokio::time::Duration::from_millis(1000),
                         TcpStream::connect(addr),
                     ).await
-                        .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
+                        .map_err(|_| anyhow::anyhow!("Connect timeout to {}", addr))?
                         .context("Failed to connect to node")?
                 } else {
                     s
@@ -1299,55 +1299,28 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok(out)
     }
 
-    /// Fetch with primary then fallbacks.
-    /// Tries primary first; if it fails with a permanent error (blocklisted/not-found), bails
-    /// immediately — no point trying other replicas for chunks the cluster doesn't have.
-    /// Otherwise falls back to remaining replicas in parallel to minimize stall time.
+    /// Fetch with primary then fallbacks sequentially.
+    /// Connect timeout is 1s so a dead node fails fast without wasting bandwidth.
     async fn fetch_chunk_with_fallback(
         &self,
         cid: ChunkId,
         primary: SocketAddr,
         fallbacks: &[SocketAddr],
     ) -> Result<Vec<u8>> {
-        match self.read_chunk_from_server(primary, cid).await {
-            Ok(d) => return Ok(d),
-            Err(e) => {
-                let msg = e.to_string();
-                warn!("Primary {} failed for chunk {}: {}", primary, cid, msg);
-                self.node_health.record_failure(primary).await;
-                // Permanent errors: no replica will have it, fail fast.
-                if msg.contains("permanently missing") || msg.contains("blocklisted") {
-                    anyhow::bail!("Chunk {} is permanently missing", cid);
-                }
-            }
-        }
-        if fallbacks.is_empty() {
-            anyhow::bail!("All replicas failed for chunk {}", cid);
-        }
-        // Try all fallbacks in parallel — first success wins.
-        let tasks: Vec<_> = fallbacks.iter().map(|&fb| {
-            let client = self.clone();
-            tokio::spawn(async move {
-                let res = client.read_chunk_from_server(fb, cid).await;
-                (fb, res)
-            })
-        }).collect();
-        let results = futures::future::join_all(tasks).await;
-        for r in results {
-            match r {
-                Ok((fb, Ok(d))) => {
-                    self.node_health.record_success(fb).await;
+        for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
+            match self.read_chunk_from_server(addr, cid).await {
+                Ok(d) => {
+                    self.node_health.record_success(addr).await;
                     return Ok(d);
                 }
-                Ok((fb, Err(e))) => {
+                Err(e) => {
                     let msg = e.to_string();
-                    warn!("Fallback {} failed for chunk {}: {}", fb, cid, msg);
-                    self.node_health.record_failure(fb).await;
+                    warn!("{} failed for chunk {}: {}", addr, cid, msg);
+                    self.node_health.record_failure(addr).await;
                     if msg.contains("permanently missing") || msg.contains("blocklisted") {
                         anyhow::bail!("Chunk {} is permanently missing", cid);
                     }
                 }
-                Err(_) => {}
             }
         }
         anyhow::bail!("All replicas failed for chunk {}", cid)

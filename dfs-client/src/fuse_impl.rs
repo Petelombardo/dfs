@@ -1074,8 +1074,9 @@ impl Filesystem for DfsFilesystem {
                     reply.entry(&Duration::from_secs(1), &attr, 0);
                 }
                 Ok(None) => {
-                    // Either file not found OR metadata not modified (cache still valid).
+                    // Either 304 not-modified (cache still valid) OR 404 not-found.
                     if cached_modified_at.is_some() {
+                        // We sent a conditional GET — None means "not modified", use cache.
                         let path_map = path_to_inode.read().unwrap();
                         if let Some(&ino) = path_map.get(&path) {
                             if let Some(metadata) = metadata_cache.get(&ino) {
@@ -1086,8 +1087,32 @@ impl Filesystem for DfsFilesystem {
                             }
                         }
                     }
-                    // File not found
-                    reply.error(libc::ENOENT);
+                    // No cached entry and server returned not-found. Do one unconditional
+                    // retry — transient leader misses can cause false not-found on first lookup.
+                    match client.get_file_metadata(&path).await {
+                        Ok(Some(metadata)) => {
+                            let ino = {
+                                let path_map = path_to_inode.read().unwrap();
+                                if let Some(&existing) = path_map.get(&path) {
+                                    existing
+                                } else {
+                                    drop(path_map);
+                                    let mut next = next_inode.write().unwrap();
+                                    let ino = *next;
+                                    *next += 1;
+                                    drop(next);
+                                    path_to_inode.write().unwrap().insert(path.clone(), ino);
+                                    ino
+                                }
+                            };
+                            client.seed_write_seq(metadata.id, metadata.write_seq);
+                            metadata_cache.insert(ino, metadata.clone());
+                            last_metadata_update.insert(ino, std::time::Instant::now());
+                            let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
+                            reply.entry(&Duration::from_secs(1), &attr, 0);
+                        }
+                        _ => reply.error(libc::ENOENT),
+                    }
                 }
                 Err(e) => {
                     error!("Failed to lookup {}: {}", path, e);

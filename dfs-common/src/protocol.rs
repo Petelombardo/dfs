@@ -179,6 +179,11 @@ pub enum Request {
     /// Replicate metadata to this node (internal cluster operation)
     ReplicateMetadata {
         metadata: FileMetadata,
+        /// Remaining hops. Receiver stores locally, then if ttl > 0 forwards to all
+        /// other nodes with ttl-1. Client sends ttl=1; prevents storms while ensuring
+        /// every node receives every write regardless of which node the client hit first.
+        #[serde(default)]
+        ttl: u8,
     },
 
     /// Delete metadata from this node (internal cluster operation)
@@ -186,6 +191,9 @@ pub enum Request {
         file_id: FileId,
         path: String,
         chunk_ids: Vec<ChunkId>,
+        /// Remaining hops — same TTL semantics as ReplicateMetadata.
+        #[serde(default)]
+        ttl: u8,
     },
 
     /// Replicate chunk location to this node (internal cluster operation)

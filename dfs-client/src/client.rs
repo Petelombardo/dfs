@@ -3508,7 +3508,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let client = self.clone();
             let meta = metadata.clone();
             tokio::spawn(async move {
-                let req = Request::ReplicateMetadata { metadata: meta };
+                let req = Request::ReplicateMetadata { metadata: meta, ttl: 1 };
                 if let Err(e) = client.send_request(replica_target, req).await {
                     debug!("Durability replica to {} failed (leader will catch up): {}", replica_target, e);
                 }

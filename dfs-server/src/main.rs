@@ -207,6 +207,12 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     ));
     info!("✓ Server instance created");
 
+    // Rebuild in-memory chunk map from persistent metadata.
+    // This is required on every startup — GetFileChunkMap is served from this
+    // in-memory map, so without it every file returns "no chunk map from leader".
+    server.rebuild_chunk_map_from_metadata();
+    info!("✓ Chunk map rebuild started (background)");
+
     // Start failure detector
     server.cluster().start_failure_detector().await;
     info!("✓ Failure detector started");

@@ -278,7 +278,19 @@ impl Server {
                     }
 
                     let up_to_sequence = items.last().map(|(s, _)| *s).unwrap_or(0);
-                    let metadata_batch: Vec<FileMetadata> = items.into_iter().map(|(_, m)| m).collect();
+                    // Filter out creates for files that have since been deleted on the leader.
+                    // This prevents the race where a create is queued, the file is immediately
+                    // deleted (sending DeleteMetadata directly to followers), and the queued
+                    // create later resurrects a ghost metadata entry on followers.
+                    let metadata_batch: Vec<FileMetadata> = items.into_iter().filter_map(|(_, m)| {
+                        match server.metadata.get_file(&m.id) {
+                            Ok(Some(_)) => Some(m),
+                            _ => {
+                                debug!("disseminate: skipping deleted file {} ({}) from queue", m.path, m.id);
+                                None
+                            }
+                        }
+                    }).collect();
                     let count = metadata_batch.len();
 
                     let req = Request::DisseminateMetadata {
@@ -538,14 +550,14 @@ impl Server {
             Request::DeleteChunkReplica { chunk_id, leader_id } => {
                 self.handle_delete_chunk_replica(chunk_id, leader_id).await
             }
-            Request::ReplicateMetadata { metadata } => {
-                self.handle_replicate_metadata(metadata).await
+            Request::ReplicateMetadata { metadata, ttl } => {
+                self.handle_replicate_metadata(metadata, ttl).await
             }
             Request::ReplicateMetadataBatch { items } => {
                 self.handle_replicate_metadata_batch(items).await
             }
-            Request::DeleteMetadata { file_id, path, chunk_ids } => {
-                self.handle_delete_metadata(file_id, path, chunk_ids).await
+            Request::DeleteMetadata { file_id, path, chunk_ids, ttl } => {
+                self.handle_delete_metadata(file_id, path, chunk_ids, ttl).await
             }
             Request::ReplicateChunkLocation { location } => {
                 self.handle_replicate_chunk_location(location).await
@@ -835,16 +847,34 @@ impl Server {
     }
 
     /// Handle replicate metadata request (metadata replication from another node)
-    async fn handle_replicate_metadata(&self, metadata: FileMetadata) -> Response {
-        debug!("Handling replicate metadata: {}", metadata.path);
+    async fn handle_replicate_metadata(&self, metadata: FileMetadata, ttl: u8) -> Response {
+        debug!("Handling replicate metadata: {} (ttl={})", metadata.path, ttl);
 
-        // Store metadata locally without re-replicating (to avoid loops).
-        // put_file() merges chunk_locations with existing ones, so healed replica
-        // nodes are preserved even when the incoming message carries a stale 2-node list.
         match self.metadata.put_file(&metadata) {
             Ok(_) => {
-                // Keep chunk map in sync on all nodes for seamless leader failover
                 self.chunk_map_update(&metadata).await;
+                // TTL>0: forward to all other nodes with ttl-1 so every node gets
+                // every write regardless of which node the client contacted first.
+                if ttl > 0 {
+                    let cluster = self.cluster.clone();
+                    let client = self.client.clone();
+                    let local_id = self.cluster.local_node_id();
+                    let metadata_clone = metadata.clone();
+                    let sem = self.broadcast_semaphore.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await.ok();
+                        let nodes = cluster.get_all_nodes().await;
+                        for node in &nodes {
+                            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                continue;
+                            }
+                            let req = Request::ReplicateMetadata { metadata: metadata_clone.clone(), ttl: ttl - 1 };
+                            if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                                warn!("TTL forward ReplicateMetadata to {} failed: {}", node.id, e);
+                            }
+                        }
+                    });
+                }
                 debug!("Successfully replicated metadata for {}", metadata.path);
                 Response::Ok { data: None }
             }
@@ -859,26 +889,49 @@ impl Server {
     }
 
     /// Handle delete metadata replication (internal cluster operation)
-    async fn handle_delete_metadata(&self, file_id: FileId, path: String, chunk_ids: Vec<ChunkId>) -> Response {
-        debug!("Handling delete metadata: {} (file_id: {})", path, file_id);
+    async fn handle_delete_metadata(&self, file_id: FileId, path: String, chunk_ids: Vec<ChunkId>, ttl: u8) -> Response {
+        debug!("Handling delete metadata: {} (file_id: {}, ttl={})", path, file_id, ttl);
 
-        // Delete the file: record by ID (safe — only removes this specific file's record)
         if let Err(e) = self.metadata.delete_file(&file_id) {
             warn!("Failed to delete file record {} on peer: {}", file_id, e);
         }
-
-        // Delete the path index
         if let Err(e) = self.metadata.delete_path_index(&path) {
             warn!("Failed to delete path index {} on peer: {}", path, e);
         }
-
-        // Delete all chunk location records — this is the critical step that was missing.
-        // Without it, peers retained chunk: records after a file delete and the healer
-        // kept re-queuing those chunks for replication, causing a runaway healing backlog.
         for chunk_id in &chunk_ids {
             if let Err(e) = self.metadata.delete_chunk_location(chunk_id) {
                 warn!("Failed to delete chunk location {} on peer: {}", chunk_id, e);
             }
+        }
+        self.chunk_map_remove(&file_id).await;
+
+        // TTL>0: forward to all other nodes so the delete reaches every node
+        // regardless of which node originally processed the DeleteFile.
+        if ttl > 0 {
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            let local_id = self.cluster.local_node_id();
+            let sem = self.broadcast_semaphore.clone();
+            let path_clone = path.clone();
+            let chunk_ids_clone = chunk_ids.clone();
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok();
+                let nodes = cluster.get_all_nodes().await;
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let req = Request::DeleteMetadata {
+                        file_id,
+                        path: path_clone.clone(),
+                        chunk_ids: chunk_ids_clone.clone(),
+                        ttl: ttl - 1,
+                    };
+                    if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                        warn!("TTL forward DeleteMetadata to {} failed: {}", node.id, e);
+                    }
+                }
+            });
         }
 
         debug!("Successfully deleted metadata and {} chunk locations for {} on peer", chunk_ids.len(), path);
@@ -1656,6 +1709,30 @@ impl Server {
         } // end outer match lookup
     }
 
+    /// Immediately broadcast metadata to all online followers with the given TTL.
+    /// Fire-and-forget (spawned). Used by the leader for low-latency propagation;
+    /// the dissemination queue is the durable catch-up path for offline nodes.
+    async fn broadcast_metadata_to_followers(&self, metadata: &FileMetadata, ttl: u8) {
+        let cluster = self.cluster.clone();
+        let client = self.client.clone();
+        let local_id = self.cluster.local_node_id();
+        let metadata_clone = metadata.clone();
+        let sem = self.broadcast_semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = sem.acquire().await.ok();
+            let nodes = cluster.get_all_nodes().await;
+            for node in &nodes {
+                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                    continue;
+                }
+                let req = Request::ReplicateMetadata { metadata: metadata_clone.clone(), ttl };
+                if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                    warn!("broadcast_metadata_to_followers: failed to reach {}: {}", node.id, e);
+                }
+            }
+        });
+    }
+
     /// Enqueue a metadata update into the per-follower durable sled queue.
     /// Only the leader calls this. The dissemination loop drains the queue every 5s.
     /// Non-leaders skip enqueueing — they just store locally and let the leader
@@ -1706,19 +1783,19 @@ impl Server {
         match self.metadata.put_file(&metadata) {
             Ok(crate::metadata::PutFileResult::Stored) => {
                 self.chunk_map_update(&metadata).await;
-                // Enqueue for followers — dissemination loop delivers within 5s.
+                // Broadcast immediately to all followers with ttl=0 (we're the last hop).
+                // Also enqueue for durability — catch-up for nodes that are temporarily offline.
+                self.broadcast_metadata_to_followers(&metadata, 0).await;
                 self.enqueue_metadata_for_followers(&metadata).await;
                 Response::Ok { data: None }
             }
             Ok(crate::metadata::PutFileResult::Stale(newer)) => {
-                // We already have a newer version — re-disseminate it to all followers
-                // so any node that sent us stale data also converges.
                 debug!(
                     "put_file_metadata: leader has newer write_seq={} for {}, re-disseminating",
                     newer.write_seq, newer.path
                 );
+                self.broadcast_metadata_to_followers(&newer, 0).await;
                 self.enqueue_metadata_for_followers(&newer).await;
-                // Still return Ok — the client's data was structurally valid, just stale.
                 Response::Ok { data: None }
             }
             Err(e) => {
@@ -2323,6 +2400,7 @@ impl Server {
                                     file_id,
                                     path: path_clone.clone(),
                                     chunk_ids: chunk_ids_for_delete,
+                                    ttl: 1,
                                 };
 
                                 if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
@@ -2873,16 +2951,30 @@ impl Server {
     /// Handle GetFileChunkMap — returns the full chunk location map for a file.
     /// Served from the in-memory chunk map maintained by all nodes (leader-authoritative).
     async fn handle_get_file_chunk_map(&self, file_id: FileId) -> Response {
-        match self.chunk_map.get(&file_id) {
-            Some(entry) => {
-                let (locations, modified_at) = entry.value();
+        if let Some(entry) = self.chunk_map.get(&file_id) {
+            let (locations, modified_at) = entry.value();
+            return Response::FileChunkMap {
+                file_id,
+                locations: locations.clone(),
+                modified_at: *modified_at,
+            };
+        }
+
+        // Cache miss — fall back to sled (chunk map may still be rebuilding after restart,
+        // or the file was written via a path that skipped chunk_map_update).
+        let metadata_store = self.metadata.clone();
+        let result = tokio::task::spawn_blocking(move || metadata_store.get_file(&file_id)).await;
+        match result {
+            Ok(Ok(Some(metadata))) if !metadata.chunk_locations.is_empty() => {
+                // Populate cache for future lookups.
+                self.chunk_map.insert(file_id, (metadata.chunk_locations.clone(), metadata.modified_at));
                 Response::FileChunkMap {
                     file_id,
-                    locations: locations.clone(),
-                    modified_at: *modified_at,
+                    locations: metadata.chunk_locations,
+                    modified_at: metadata.modified_at,
                 }
             }
-            None => Response::Error {
+            _ => Response::Error {
                 message: format!("No chunk map entry for file {}", file_id),
                 code: ErrorCode::NotFound,
             },
@@ -2944,6 +3036,7 @@ impl Server {
                                     file_id,
                                     path: path_clone.clone(),
                                     chunk_ids: Vec::new(), // purge = metadata only, chunks kept
+                                    ttl: 1,
                                 };
 
                                 if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
@@ -3041,6 +3134,11 @@ impl Server {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
+                // Bump write_seq so put_file's stale-drop guard never rejects this.
+                // The path: index entry may have write_seq=0 (loaded from sled via
+                // get_file_by_path), while the file: entry has a higher write_seq
+                // from the client's enqueue. Incrementing ensures we always win.
+                metadata.write_seq = metadata.write_seq.saturating_add(1);
 
                 // Store new metadata locally first
                 match self.metadata.put_file(&metadata) {
@@ -3062,6 +3160,7 @@ impl Server {
 
                             let put_request = Request::ReplicateMetadata {
                                 metadata: metadata_clone.clone(),
+                                ttl: 0, // already broadcasting to all nodes, no further forwarding needed
                             };
 
                             if let Err(e) = client.send_message(node.addr, Message::Request(put_request)).await {
@@ -3084,24 +3183,12 @@ impl Server {
                             warn!("Failed to delete old path index during rename: {}", e);
                         }
 
-                        // Replicate deletion of old path to all servers
-                        tokio::spawn(async move {
-                            for node in &nodes {
-                                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                                    continue;
-                                }
-
-                                let delete_request = Request::DeleteMetadata {
-                                    file_id,
-                                    path: old_path_clone.clone(),
-                                    chunk_ids: Vec::new(), // rename = path change only, chunks kept
-                                };
-
-                                if let Err(e) = client.send_message(node.addr, Message::Request(delete_request)).await {
-                                    warn!("Failed to replicate old metadata deletion to {}: {}", node.addr, e);
-                                }
-                            }
-                        });
+                        // No path-cleanup replication needed: ReplicateMetadata already
+                        // wrote new path: and file: records on each peer. The stale
+                        // path:/old_path entries on peers are orphaned (no file: record
+                        // points to them for get_file_by_path) and are harmless — scan_files
+                        // uses file: prefix only. Sending a path-delete message risks deleting
+                        // the renamed record if it races with ReplicateMetadata delivery.
 
                         info!("Renamed {} -> {} (file_id: {})", old_path, new_path, file_id);
                         Response::Ok { data: None }

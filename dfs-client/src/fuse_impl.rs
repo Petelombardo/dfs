@@ -217,21 +217,13 @@ impl FlushHandle {
                         // fsync/release: flush everything including partial tail
                         state.all_slot_indices()
                     } else {
-                        // Background tick: flush full slots + idle partial slots.
-                        // A partial slot is only eligible for idle-flush if the file has
-                        // already moved past it (a higher-indexed slot exists). This prevents
-                        // prematurely flushing the first partial slot at recording startup
-                        // before the DVR has written enough data to fill the first chunk —
-                        // which produces a small first chunk and a visible artifact in the stream.
-                        let max_slot_idx = state.slots.keys().copied().max();
+                        // Background tick: flush full slots + all idle partial slots.
+                        // The background flusher already verified no active write fds exist
+                        // before calling force=false, so any idle partial slot is safe to flush.
                         let mut indices = state.full_slot_indices();
                         for (idx, slot) in &state.slots {
                             if !indices.contains(idx) && slot.is_idle() && !slot.data.is_empty() {
-                                // Only flush partial/idle slot if file has progressed past it
-                                let file_has_moved_on = max_slot_idx.map(|max| *idx < max).unwrap_or(false);
-                                if file_has_moved_on {
-                                    indices.push(*idx);
-                                }
+                                indices.push(*idx);
                             }
                         }
                         indices.sort_unstable();
@@ -446,8 +438,12 @@ impl FlushHandle {
         let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
         if let Some(meta) = meta_to_persist {
             if force {
-                // release/fsync: wait for leader confirmation before returning.
-                let _ = self.client.flush_metadata_sync(&meta).await;
+                // release/fsync: enqueue metadata immediately (don't wait for leader ack).
+                // Chunk data is already durable above; metadata propagates async.
+                // Waiting synchronously here blocks the FUSE dispatch thread and causes
+                // all filesystem ops to stall if the queue worker is slow or races.
+                self.last_metadata_update.insert(ino, std::time::Instant::now());
+                self.client.enqueue_metadata(&meta).await;
             } else {
                 // Background tick: only enqueue if enough time has passed since last
                 // metadata update for this inode. The queue deduplicates by file_id so
@@ -549,6 +545,11 @@ pub struct DfsFilesystem {
 
     /// Cloneable handle used by fsync() to spawn background flush tasks.
     flush_handle: FlushHandle,
+
+    /// Paths for which an unlink is in flight to the server.
+    /// lookup() returns ENOENT for these paths so that a concurrent create/open
+    /// does not race with the still-pending server-side delete.
+    pending_deletes: Arc<dashmap::DashSet<String>>,
 }
 
 impl DfsFilesystem {
@@ -614,11 +615,14 @@ impl DfsFilesystem {
         let last_metadata_update_shared: Arc<DashMap<u64, std::time::Instant>> =
             Arc::new(DashMap::new());
 
+        let write_open_counts: Arc<DashMap<u64, usize>> = Arc::new(DashMap::new());
+
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
             let write_buffers_clone = write_buffers_for_cleanup.clone();
             let client_for_cleanup = client.clone();
             let metadata_cache_for_cleanup = metadata_cache.clone();
+            let write_open_counts_for_bg = write_open_counts.clone();
             // in_flight: tracks inodes with an active background flush task.
             // Prevents launching a second flush while the first is still in flight,
             // which would produce OffsetMismatch. Also used by flush_buffer_async
@@ -650,12 +654,15 @@ impl DfsFilesystem {
                             if in_flight.contains(&ino) { continue; }
                             let state = entry.value().lock().await;
                             let has_full = !state.full_slot_indices().is_empty();
-                            // A partial/idle slot is only eligible if the file has moved past it
-                            // (higher-indexed slot exists). See flush_buffer_async for rationale.
-                            let max_slot = state.slots.keys().copied().max();
-                            let has_idle = state.slots.iter().any(|(idx, s)| {
+                            // A partial/idle slot is safe to flush only when there are no
+                            // active write-mode fds — i.e. the writer has already closed the
+                            // file but the buffer wasn't flushed in release() for some reason
+                            // (e.g. rename-based save). DVR always has an open fd, so it is
+                            // never flushed prematurely here.
+                            let no_active_writers = write_open_counts_for_bg
+                                .get(&ino).map(|c| *c == 0).unwrap_or(true);
+                            let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
                                 s.is_idle() && !s.data.is_empty()
-                                    && max_slot.map(|max| *idx < max).unwrap_or(false)
                             });
                             if has_full || has_idle {
                                 ready.push(ino);
@@ -732,10 +739,11 @@ impl DfsFilesystem {
             statfs_cache: Arc::new(RwLock::new(None)),
             lock_manager: Arc::new(LockManager::new()),
             buffer_flush_threshold,
-            write_open_counts: Arc::new(DashMap::new()),
+            write_open_counts,
             size_high_water: Arc::new(DashMap::new()),
             flush_in_flight: flush_in_flight_shared,
             flush_handle,
+            pending_deletes: Arc::new(dashmap::DashSet::new()),
         })
     }
 
@@ -883,10 +891,19 @@ impl DfsFilesystem {
 
     /// Get path from parent inode and name
     fn get_path_from_parent(&self, parent: u64, name: &OsStr) -> Option<String> {
-        let parent_metadata = self.metadata_cache.get(&parent)?;
         let name_str = name.to_str()?;
 
-        let parent_path = &parent_metadata.path;
+        // Fast path: parent is in metadata_cache (normal case after lookup/readdir).
+        let parent_path_opt = self.metadata_cache.get(&parent).map(|m| m.path.clone());
+
+        // Fallback: scan path_to_inode for the parent inode. This covers the case
+        // where the kernel holds a directory inode from before a client restart but
+        // the metadata_cache is empty (in-memory only, lost on restart).
+        let parent_path = parent_path_opt.or_else(|| {
+            let map = self.path_to_inode.read().unwrap();
+            map.iter().find(|(_, &v)| v == parent).map(|(k, _)| k.clone())
+        })?;
+
         let full_path = if parent_path == "/" {
             format!("/{}", name_str)
         } else {
@@ -994,6 +1011,15 @@ impl Filesystem for DfsFilesystem {
                 return;
             }
         };
+
+        // If a concurrent unlink is in flight for this path, report it as gone immediately
+        // so creates/opens don't race with the still-pending server-side delete.
+        if self.pending_deletes.contains(&path) {
+            debug!("lookup: {} is pending delete, returning ENOENT", path);
+            reply.error(libc::ENOENT);
+            return;
+        }
+        debug!("lookup: pending_deletes ptr={:p} len={} checking {:?}", Arc::as_ptr(&self.pending_deletes), self.pending_deletes.len(), path);
 
         // Check if we have fresh metadata from a recent readdir — if so, skip the
         // server round-trip entirely.  readdir populates both metadata_cache and
@@ -1746,44 +1772,44 @@ impl Filesystem for DfsFilesystem {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        // Clone Arc-wrapped fields for thread pool
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let write_counters = self.write_counters.clone();
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
         let buffer_flush_threshold = self.buffer_flush_threshold;
-        let runtime = self.runtime.clone();
         let last_metadata_update = self.last_metadata_update.clone();
-        let data_vec = data.to_vec(); // Copy data before moving
+        let path_to_inode = self.path_to_inode.clone();
+        let flush_handle = self.flush_handle.clone();
+        let data_vec = data.to_vec();
+        let req_uid = _req.uid();
+        let req_gid = _req.gid();
 
-        // Execute write operation synchronously to preserve write order
-        // This ensures proper sequencing and prevents corruption
-        {
+        // Spawn onto tokio so block_on never monopolizes the FUSE dispatch thread.
+        // Back-pressure stalls (tokio::time::sleep inside the buffer loop) would
+        // deadlock if run synchronously — the FUSE thread parks waiting for the
+        // background flusher, which can't run because the FUSE thread owns the scheduler.
+        self.runtime.spawn(async move {
             let start = std::time::Instant::now();
             debug!("write: ino={}, offset={}, size={}", ino, offset, data_vec.len());
 
             let mut metadata = match metadata_cache.get(&ino) {
                 Some(m) => m.clone(),
                 None => {
-                    // Metadata cache miss — the kernel may have sent open() with a cached
-                    // inode without going through lookup() first (FOPEN_KEEP_CACHE survives
-                    // client restarts).  Fetch from the server and populate the cache so
-                    // the write path has a FileId and correct start_offset.
+                    // Metadata cache miss — fetch from server and populate.
                     let path_opt = {
-                        let map = self.path_to_inode.read().unwrap();
+                        let map = path_to_inode.read().unwrap();
                         map.iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone())
                     };
                     if let Some(path) = path_opt {
-                        match runtime.block_on(client.get_file_metadata(&path)) {
+                        match client.get_file_metadata(&path).await {
                             Ok(Some(fetched)) => {
                                 client.seed_write_seq(fetched.id, fetched.write_seq);
                                 metadata_cache.insert(ino, fetched.clone());
-                                self.last_metadata_update.insert(ino, std::time::Instant::now());
+                                last_metadata_update.insert(ino, std::time::Instant::now());
                                 fetched
                             }
                             Ok(None) => {
-                                // File doesn't exist on server yet — new file, create minimal record
                                 let new_meta = dfs_common::FileMetadata {
                                     id: dfs_common::FileId::new(),
                                     path: path.clone(),
@@ -1796,8 +1822,8 @@ impl Filesystem for DfsFilesystem {
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default().as_secs(),
                                     mode: 0o644,
-                                    uid: _req.uid(),
-                                    gid: _req.gid(),
+                                    uid: req_uid,
+                                    gid: req_gid,
                                     file_type: dfs_common::FileType::RegularFile,
                                     write_seq: 0,
                                 };
@@ -1824,26 +1850,18 @@ impl Filesystem for DfsFilesystem {
                 return;
             }
 
-            // For SQLite database files, disable caching AND buffering to prevent corruption
-            // SQLite does read-your-own-writes and needs immediate consistency
-            // .db-shm is excluded: it's mmapped by SQLite and managed via page cache
             let is_sqlite = is_sqlite_path(&metadata.path);
             let cache_inode = if is_sqlite { 0 } else { ino };
 
-            // Write-behind buffering: buffer sequential appends in memory
-            // EXCEPT for SQLite files which need immediate write-through for consistency
             if write_buffer_enabled && !is_sqlite {
                 let offset_usize = offset as usize;
-                // Calculate true current size including any buffered data.
-                // With slot-based buffering, the buffered "end" is the highest
-                // (chunk_idx * CHUNK_SIZE + slot.data.len()) across all dirty slots.
                 let current_size = {
                     let cache_size = metadata_cache.get(&ino)
                         .map(|m| m.size as usize)
                         .unwrap_or(metadata.size as usize);
 
                     if let Some(state_lock) = write_buffers.get(&ino) {
-                        let state = runtime.block_on(async { state_lock.lock().await });
+                        let state = state_lock.lock().await;
                         let buffered_end = state.slots.iter()
                             .map(|(idx, slot)| (idx * CHUNK_SIZE as u64 + slot.data.len() as u64) as usize)
                             .max()
@@ -1859,23 +1877,14 @@ impl Filesystem for DfsFilesystem {
                        metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0),
                        write_buffers.contains_key(&ino));
 
-                // Handle different write patterns:
-                // 1. Sequential appends (offset == current_size) → use buffering for performance
-                // 2. Overwrites (offset < current_size) → flush buffer first, then fall through to RMW
-                // 3. Sparse writes (offset > current_size) → write directly with hole support
-                let is_sequential_append = offset_usize == current_size;
                 let is_overwrite = offset_usize < current_size;
                 let is_sparse_write = offset_usize > current_size;
 
-                // Only flush the append buffer before an overwrite if the write actually
-                // overlaps with the buffered region. A Kodi-style metadata write at offset 0
-                // while the DVR is recording at offset 200MB does NOT overlap — flushing in
-                // that case produces a mis-aligned partial chunk and disrupts the recording.
+                // Only flush before an overwrite if it overlaps dirty buffered data.
                 let overwrite_overlaps_buffer = if is_overwrite {
                     if let Some(state_lock) = write_buffers.get(&ino) {
-                        let state = runtime.block_on(async { state_lock.lock().await });
-                        // An overwrite overlaps a dirty slot if any slot covers the write range
-                        let write_end = offset_usize + data.len();
+                        let state = state_lock.lock().await;
+                        let write_end = offset_usize + data_vec.len();
                         state.slots.iter().any(|(idx, slot)| {
                             let slot_start = (idx * CHUNK_SIZE as u64) as usize;
                             let slot_end = slot_start + slot.data.len();
@@ -1889,92 +1898,51 @@ impl Filesystem for DfsFilesystem {
                 };
 
                 if is_overwrite && write_buffers.contains_key(&ino) && overwrite_overlaps_buffer {
-                    // OVERWRITE overlaps buffered region: flush the buffer first so the
-                    // read-modify-write below sees the complete committed file. Without this,
-                    // the splice recalculates metadata.size = sum(flushed chunks) which
-                    // discards the buffered tail → file truncation.
                     info!("Overwrite at offset={} overlaps buffer (current_size={}): flushing buffer first",
                           offset_usize, current_size);
-                    if let Err(e) = runtime.block_on(self.flush_buffer_async(ino, true)) {
+                    if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
                         error!("Failed to flush buffer before overwrite for inode {}: {}", ino, e);
                         reply.error(libc::EIO);
                         return;
                     }
-                    // Fall through to the direct random-write path below (no buffering)
                 }
 
                 if is_sparse_write {
                     let gap = offset_usize - current_size;
 
-                    // Small gaps (< 64KB) are DVR/MPEG-TS packet padding — absorb into the
-                    // write buffer by zero-filling the gap so buffering stays intact.
-                    // Large gaps are genuine sparse writes and bypass buffering as before.
                     const SMALL_GAP_THRESHOLD: usize = 64 * 1024;
                     if gap < SMALL_GAP_THRESHOLD {
                         info!("Near-sequential write: offset={} current_size={} gap={} bytes — zero-filling into buffer",
                               offset_usize, current_size, gap);
-                        // Build padded data: zeros for the gap + the actual write data
                         let mut padded = vec![0u8; gap];
                         padded.extend_from_slice(&data_vec);
-                        // Re-route through the sequential append path by adjusting data_vec
-                        // and treating offset as current_size (now effectively sequential).
-                        // We do this by appending to the write buffer directly.
-                        let write_buffers_clone2 = write_buffers.clone();
-                        let client_clone3 = client.clone();
-                        let metadata_cache_clone4 = metadata_cache.clone();
-                        let metadata_cache_clone5 = metadata_cache.clone();
-                        let metadata_cache_clone6 = metadata_cache.clone();
-
-                        let write_counters2 = write_counters.clone();
-                        let padded_len = padded.len();
-                        // Gap-fill write: route padded data into slot starting at current_size
                         let gap_write_offset = current_size as u64;
+                        let padded_len = padded.len();
 
-                        let gap_result = runtime.block_on(async move {
-                            let state_arc = write_buffers_clone2
-                                .entry(ino)
-                                .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
-                                .clone();
-                            let mut state = state_arc.lock().await;
-                            state.write_at(gap_write_offset, &padded);
-                            Ok::<usize, anyhow::Error>(padded_len)
-                        });
+                        let state_arc = write_buffers
+                            .entry(ino)
+                            .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
+                            .clone();
+                        let mut state = state_arc.lock().await;
+                        state.write_at(gap_write_offset, &padded);
+                        drop(state);
 
-                        match gap_result {
-                            Ok(_) => {
-                                {
-                                    let mut counters = write_counters2.write().unwrap();
-                                    *counters.entry(ino).or_insert(0) += 1;
-                                }
-                                reply.written(data_vec.len() as u32);
-                                return;
-                            }
-                            Err(e) => {
-                                error!("Failed to buffer gap-fill write for inode {}: {}", ino, e);
-                                reply.error(libc::EIO);
-                                return;
-                            }
+                        {
+                            let mut counters = write_counters.write().unwrap();
+                            *counters.entry(ino).or_insert(0) += 1;
                         }
+                        reply.written(data_vec.len() as u32);
+                        return;
                     }
 
-                    // TRUE SPARSE WRITE: Large gap, write directly (hole support)
+                    // TRUE SPARSE WRITE: large gap, write directly.
                     info!("Sparse write: offset {} > current_size {} (gap: {} bytes)",
                            offset_usize, current_size, gap);
 
-                    // Write directly at the specified offset (no buffering for sparse writes)
-                    let write_result = runtime.block_on(async {
-                        // Write data with file_offset tracking (Phase 1 support)
-                        client.write_data_with_cache(&data_vec, ino, offset as u64).await
-                    });
-
-                    match write_result {
+                    match client.write_data_with_cache(&data_vec, ino, offset as u64).await {
                         Ok((_, _, chunk_locations_opt)) => {
-                            // Update file size to max(current, offset + len) for sparse files
-                            let new_size = (offset_usize + data.len()).max(current_size);
-
-                            // Update metadata with new chunks
+                            let new_size = (offset_usize + data_vec.len()).max(current_size);
                             let mut metadata = metadata_cache.get(&ino).map(|m| m.clone()).unwrap_or_else(|| metadata.clone());
-
                             if let Some(chunk_locations) = chunk_locations_opt {
                                 metadata.chunk_locations.extend(chunk_locations);
                             }
@@ -1983,18 +1951,11 @@ impl Filesystem for DfsFilesystem {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs();
-
-                            // Enqueue metadata update async — data is already safe on disk.
-                            runtime.block_on(async {
-                                client.enqueue_metadata(&metadata).await;
-                            });
-
-                            // Update cache
+                            client.enqueue_metadata(&metadata).await;
                             metadata_cache.insert(ino, metadata);
-
                             info!("Sparse write complete: ino={}, offset={}, len={}, new_size={}",
-                                  ino, offset, data.len(), new_size);
-                            reply.written(data.len() as u32);
+                                  ino, offset, data_vec.len(), new_size);
+                            reply.written(data_vec.len() as u32);
                         }
                         Err(e) => {
                             error!("Sparse write failed for inode {}: {}", ino, e);
@@ -2004,119 +1965,81 @@ impl Filesystem for DfsFilesystem {
                     return;
                 }
 
-                // BUFFERED WRITE (offset-based slot routing)
-                // All write patterns — sequential, overwrite, sparse-within-chunk — are routed
-                // into the correct per-chunk slot by file offset. No sequential ordering required.
-                // Overwrites that don't overlap a dirty slot bypass buffering (rare random I/O).
+                // BUFFERED WRITE with back-pressure.
+                // Running inside a spawned task means tokio::time::sleep yields correctly
+                // instead of deadlocking the FUSE dispatch thread.
                 {
-                    let write_buffers_clone = write_buffers.clone();
-                    // Hard back-pressure cap = pipeline depth (ceil(32MB / chunk_size) × chunk_size).
-                    // Background flusher drains full slots automatically; this cap prevents OOM
-                    // on low-RAM clients (nanopir3: 1.9 GB) if the cluster is temporarily slow.
                     let max_buffered_bytes: usize = buffer_flush_threshold;
-                    let data_slice = data_vec.clone();
                     let write_offset = offset as u64;
 
-                    let buf_result = runtime.block_on(async move {
-                        // Back-pressure: stall if too much unbuffered data
-                        let stall_start = std::time::Instant::now();
-                        loop {
-                            let buffered = if let Some(entry) = write_buffers_clone.get(&ino) {
-                                entry.lock().await.buffered_bytes()
-                            } else { 0 };
-                            if buffered < max_buffered_bytes { break; }
-                            if stall_start.elapsed() > std::time::Duration::from_secs(10) {
-                                return Err(anyhow::anyhow!("Write buffer stall timeout"));
-                            }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                        }
-
-                        // Get or create InodeWriteState for this inode
-                        let state_arc = write_buffers_clone
-                            .entry(ino)
-                            .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
-                            .clone();
-
-                        let mut state = state_arc.lock().await;
-                        let full_slots = state.write_at(write_offset, &data_slice);
-                        Ok::<Vec<u64>, anyhow::Error>(full_slots)
-                    });
-
-                    match buf_result {
-                        Ok(_full_slots) => {
-                            // Full slots will be drained by the background flusher automatically.
-                            // No inline network I/O — write() returns immediately.
-                            {
-                                let mut counters = write_counters.write().unwrap();
-                                *counters.entry(ino).or_insert(0) += 1;
-                            }
-                            let total_elapsed = start.elapsed();
-                            debug!("BUFFERED write() took {:?} for {} bytes at offset {}",
-                                   total_elapsed, data_vec.len(), offset);
-                            reply.written(data_vec.len() as u32);
-                            return;
-                        }
-                        Err(e) => {
-                            error!("Failed to buffer write for inode {}: {}", ino, e);
+                    let stall_start = std::time::Instant::now();
+                    loop {
+                        let buffered = if let Some(entry) = write_buffers.get(&ino) {
+                            entry.lock().await.buffered_bytes()
+                        } else { 0 };
+                        if buffered < max_buffered_bytes { break; }
+                        if stall_start.elapsed() > std::time::Duration::from_secs(10) {
+                            error!("Write buffer stall timeout for inode {}", ino);
                             reply.error(libc::EIO);
                             return;
                         }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     }
+
+                    let state_arc = write_buffers
+                        .entry(ino)
+                        .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
+                        .clone();
+                    let mut state = state_arc.lock().await;
+                    state.write_at(write_offset, &data_vec);
+                    drop(state);
+
+                    {
+                        let mut counters = write_counters.write().unwrap();
+                        *counters.entry(ino).or_insert(0) += 1;
+                    }
+                    let total_elapsed = start.elapsed();
+                    debug!("BUFFERED write() took {:?} for {} bytes at offset {}",
+                           total_elapsed, data_vec.len(), offset);
+                    reply.written(data_vec.len() as u32);
+                    return;
                 }
             }
 
-            // Optimize for sequential writes (appends)
+            // Non-buffered write path (SQLite or write_buffer_enabled=false).
             let offset = offset as usize;
-            // Calculate true current size including any buffered data
-            // IMPORTANT: Re-read metadata from cache to get latest updates
             let current_size = if write_buffer_enabled {
                 let cache_size = metadata_cache.get(&ino)
                     .map(|m| m.size as usize).unwrap_or(metadata.size as usize);
-
-                let buffered_end = runtime.block_on(async {
-                    if let Some(state_lock) = write_buffers.get(&ino) {
-                        let state = state_lock.lock().await;
-                        state.slots.iter()
-                            .map(|(idx, slot)| (idx * CHUNK_SIZE as u64 + slot.data.len() as u64) as usize)
-                            .max()
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    }
-                });
+                let buffered_end = if let Some(state_lock) = write_buffers.get(&ino) {
+                    let state = state_lock.lock().await;
+                    state.slots.iter()
+                        .map(|(idx, slot)| (idx * CHUNK_SIZE as u64 + slot.data.len() as u64) as usize)
+                        .max()
+                        .unwrap_or(0)
+                } else { 0 };
                 buffered_end.max(cache_size)
             } else {
                 metadata.size as usize
             };
 
-            // Track affected chunk range for random writes (for metadata splice)
             let mut affected_chunk_range: Option<(usize, usize)> = None;
 
             let (new_data, is_append) = if offset == current_size {
-                // Sequential write/append - just write new data
-                // This is the fast path for DVR recordings, dd, etc.
                 (data_vec.clone(), true)
             } else if offset > current_size {
-                // Writing past end of file - need to pad with zeros
                 let mut padded = vec![0u8; offset - current_size];
                 padded.extend_from_slice(&data_vec);
                 (padded, true)
             } else {
-                // Random write in middle of file - need read-modify-write
-                // CRITICAL FIX: Only read affected chunks, not entire file!
-                // For a 10GB file with 1KB write, reading entire file causes OOM
-
                 info!("Random write detected: offset={}, size={}, file_size={}",
                       offset, data_vec.len(), current_size);
 
                 let write_end = offset + data_vec.len();
 
-                // Calculate which chunks are affected by this write
                 if metadata.chunk_locations.is_empty() {
-                    // Empty file - just write the data
                     (data_vec.clone(), false)
                 } else {
-                    // Find chunk range that overlaps with write range [offset, write_end)
                     let mut chunk_start_offset = 0u64;
                     let mut first_affected_chunk: Option<usize> = None;
                     let mut last_affected_chunk: Option<usize> = None;
@@ -2124,125 +2047,91 @@ impl Filesystem for DfsFilesystem {
                     for (idx, loc) in metadata.chunk_locations.iter().enumerate() {
                         let chunk_size = loc.size as u64;
                         let chunk_end_offset = chunk_start_offset + chunk_size;
-
                         if chunk_end_offset > offset as u64 && chunk_start_offset < write_end as u64 {
-                            if first_affected_chunk.is_none() {
-                                first_affected_chunk = Some(idx);
-                            }
+                            if first_affected_chunk.is_none() { first_affected_chunk = Some(idx); }
                             last_affected_chunk = Some(idx);
                         }
-
                         chunk_start_offset = chunk_end_offset;
                     }
 
-                    // Check if we found affected chunks
                     if first_affected_chunk.is_none() || last_affected_chunk.is_none() {
-                        // Write is beyond EOF - treat as append
                         info!("Write beyond EOF, treating as append");
                         (data_vec.clone(), true)
                     } else {
                         let first_idx = first_affected_chunk.unwrap();
                         let last_idx = last_affected_chunk.unwrap();
 
-                    info!("Random write affects chunks {}-{} (out of {} total)",
-                          first_idx, last_idx, metadata.chunk_locations.len());
+                        info!("Random write affects chunks {}-{} (out of {} total)",
+                              first_idx, last_idx, metadata.chunk_locations.len());
+                        affected_chunk_range = Some((first_idx, last_idx));
 
-                    // Store affected range for metadata splice later
-                    affected_chunk_range = Some((first_idx, last_idx));
-
-                    let affected_locs = &metadata.chunk_locations[first_idx..=last_idx];
-
-                    // Calculate file offset of first affected chunk
-                    let first_chunk_file_offset: u64 = metadata.chunk_locations[..first_idx]
-                        .iter().map(|l| l.size as u64).sum();
-
-                    // Build read hints for affected chunks (full chunk reads for read-modify-write)
-                    let all_chunk_ids: Vec<_> = metadata.chunk_locations.iter().map(|l| l.chunk_id).collect();
-                    let mut read_hints = Vec::with_capacity(affected_locs.len());
-                    let mut current_offset = first_chunk_file_offset;
-                    for (i, loc) in affected_locs.iter().enumerate() {
-                        let chunk_size = loc.size as usize;
-                        read_hints.push(crate::client::ChunkReadHint {
-                            chunk_idx: first_idx + i,
-                            chunk_id: loc.chunk_id,
-                            full_chunk: true,
-                            offset_in_chunk: 0,
-                            length: chunk_size,
-                            file_offset: current_offset,
-                        });
-                        current_offset += chunk_size as u64;
-                    }
-
-                    let affected_data = match runtime.block_on(async {
-                        client.read_data(&read_hints, &all_chunk_ids, cache_inode, &metadata.chunk_locations).await
-                    }) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            error!("Failed to read affected chunks {}-{}: {}", first_idx, last_idx, e);
-                            reply.error(libc::EIO);
-                            return;
+                        let affected_locs = &metadata.chunk_locations[first_idx..=last_idx];
+                        let first_chunk_file_offset: u64 = metadata.chunk_locations[..first_idx]
+                            .iter().map(|l| l.size as u64).sum();
+                        let all_chunk_ids: Vec<_> = metadata.chunk_locations.iter().map(|l| l.chunk_id).collect();
+                        let mut read_hints = Vec::with_capacity(affected_locs.len());
+                        let mut current_offset = first_chunk_file_offset;
+                        for (i, loc) in affected_locs.iter().enumerate() {
+                            let chunk_size = loc.size as usize;
+                            read_hints.push(crate::client::ChunkReadHint {
+                                chunk_idx: first_idx + i,
+                                chunk_id: loc.chunk_id,
+                                full_chunk: true,
+                                offset_in_chunk: 0,
+                                length: chunk_size,
+                                file_offset: current_offset,
+                            });
+                            current_offset += chunk_size as u64;
                         }
-                    };
 
-                    // Calculate offset within the affected chunk range
-                    let write_offset_in_range = (offset as u64 - first_chunk_file_offset) as usize;
-                    let affected_data_len = affected_data.len();
+                        let affected_data = match client.read_data(&read_hints, &all_chunk_ids, cache_inode, &metadata.chunk_locations).await {
+                            Ok(data) => data,
+                            Err(e) => {
+                                error!("Failed to read affected chunks {}-{}: {}", first_idx, last_idx, e);
+                                reply.error(libc::EIO);
+                                return;
+                            }
+                        };
 
-                    // Merge write data into affected chunks
-                    let mut merged = affected_data;
-                    if write_offset_in_range + data_vec.len() > merged.len() {
-                        merged.resize(write_offset_in_range + data_vec.len(), 0);
-                    }
-                    merged[write_offset_in_range..write_offset_in_range + data_vec.len()]
-                        .copy_from_slice(&data_vec);
-
-                    info!("Random write: read {} bytes from {} chunks, merged to {} bytes",
-                          affected_data_len, affected_locs.len(), merged.len());
-
+                        let write_offset_in_range = (offset as u64 - first_chunk_file_offset) as usize;
+                        let affected_data_len = affected_data.len();
+                        let mut merged = affected_data;
+                        if write_offset_in_range + data_vec.len() > merged.len() {
+                            merged.resize(write_offset_in_range + data_vec.len(), 0);
+                        }
+                        merged[write_offset_in_range..write_offset_in_range + data_vec.len()]
+                            .copy_from_slice(&data_vec);
+                        info!("Random write: read {} bytes from {} chunks, merged to {} bytes",
+                              affected_data_len, affected_locs.len(), merged.len());
                         (merged, false)
                     }
                 }
             };
 
-            // Write to cluster (only new/modified data for appends)
-            // Use write_data_with_cache to populate byte-range cache for immediate read-back
             let write_start = std::time::Instant::now();
             let result = if is_append {
-                // Append: write just the new data as new chunks
-                runtime.block_on(async {
-                    // Pass file offset for cache population (write-through caching)
-                    client.write_data_with_cache(&new_data, cache_inode, current_size as u64).await
-                })
+                client.write_data_with_cache(&new_data, cache_inode, current_size as u64).await
             } else {
-                // Random write: write only the affected chunks
-                // Calculate file offset of first affected chunk for cache population
                 let write_file_offset = if let Some((first_idx, _)) = affected_chunk_range {
                     metadata.chunk_locations[..first_idx].iter().map(|l| l.size as u64).sum::<u64>()
                 } else {
                     0
                 };
-                runtime.block_on(async {
-                    client.write_data_with_cache(&new_data, cache_inode, write_file_offset).await
-                })
+                client.write_data_with_cache(&new_data, cache_inode, write_file_offset).await
             };
-            let write_elapsed = write_start.elapsed();
-            debug!("write_data took {:?}", write_elapsed);
+            debug!("write_data took {:?}", write_start.elapsed());
 
             match result {
                 Ok((_, _, chunk_locations_opt)) => {
-                    // Update metadata
                     if is_append {
-                        // Append: add new chunks to existing list
                         if let Some(chunk_locations) = chunk_locations_opt {
                             metadata.chunk_locations.extend(chunk_locations);
                         }
                         metadata.size = current_size as u64 + new_data.len() as u64;
                     } else if let Some((first_idx, last_idx)) = affected_chunk_range {
-                        // Random write: splice new chunks into affected range
                         let new_locations = chunk_locations_opt.unwrap_or_default();
                         info!("Splicing {} new chunks into range {}-{} (was {} chunks)",
                               new_locations.len(), first_idx, last_idx, last_idx - first_idx + 1);
-
                         let mut updated_locations = Vec::new();
                         updated_locations.extend_from_slice(&metadata.chunk_locations[..first_idx]);
                         updated_locations.extend(new_locations);
@@ -2250,14 +2139,10 @@ impl Filesystem for DfsFilesystem {
                             updated_locations.extend_from_slice(&metadata.chunk_locations[last_idx + 1..]);
                         }
                         metadata.chunk_locations = updated_locations;
-
-                        // Recalculate total file size
                         metadata.size = metadata.chunk_locations.iter().map(|l| l.size as u64).sum();
-
                         info!("After splice: {} total chunks, {} total bytes",
                               metadata.chunk_locations.len(), metadata.size);
                     } else {
-                        // Full rewrite (shouldn't happen with current logic, but keep as fallback)
                         warn!("Full file rewrite with {} bytes", new_data.len());
                         metadata.chunk_locations = chunk_locations_opt.unwrap_or_default();
                         metadata.size = new_data.len() as u64;
@@ -2267,16 +2152,7 @@ impl Filesystem for DfsFilesystem {
                         .unwrap()
                         .as_secs();
 
-                    // Enqueue metadata update async (sync for SQLite).
-                    // The background worker drains to the leader; data is already safe on disk.
-                    // Time-based batching is no longer needed: the queue deduplicates by file_id
-                    // so only the latest metadata snapshot is ever in-flight per file.
-                    let metadata_clone = metadata.clone();
-                    runtime.block_on(async {
-                        client.enqueue_metadata(&metadata_clone).await;
-                    });
-
-                    // Update local cache and reply.
+                    client.enqueue_metadata(&metadata).await;
                     metadata_cache.insert(ino, metadata);
                     let total_elapsed = start.elapsed();
                     debug!("TOTAL write() took {:?} for {} bytes ({:.2} MB/s)",
@@ -2289,7 +2165,7 @@ impl Filesystem for DfsFilesystem {
                     reply.error(libc::EIO);
                 }
             }
-        }
+        });
     }
 
     fn flush(
@@ -2392,7 +2268,8 @@ impl Filesystem for DfsFilesystem {
         reply: fuser::ReplyEmpty,
     ) {
         let pid = req.pid();
-        debug!("release: ino={}, owner={:?}, pid={}", ino, lock_owner, pid);
+        let is_write_flag = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
+        info!("release: ino={}, pid={}, is_write={}", ino, pid, is_write_flag);
 
         // Decrement write-mode open count when a write-mode fd is closed
         let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
@@ -2414,88 +2291,84 @@ impl Filesystem for DfsFilesystem {
 
         let lock_manager = self.lock_manager.clone();
 
+        // All release paths spawn async tasks and return immediately.
+        // Never use block_on here — it monopolizes the tokio scheduler and
+        // stalls all other FUSE operations (reads, writes, lookups) for the
+        // entire duration of the flush.
+
         if self.write_buffer_enabled {
-            // Only flush and remove the write buffer when ALL write-mode fds are closed
-            // (is_last_writer). Intermediate write closes (e.g. DVR opening a file twice
-            // then closing one fd while the other is still writing) must NOT flush or
-            // remove the shared buffer — doing so discards buffered data still being
-            // written by the remaining fd, producing a corrupt small first chunk.
-            // Read-only releases must also never touch the write buffer.
             if is_last_writer {
-                let result = self.block_on(async {
-                    // First flush writes (force metadata update on close)
-                    self.flush_buffer_async(ino, true).await?;
-
-                    // Then release all locks held by this owner (if lock_owner is provided)
-                    if let Some(owner) = lock_owner {
-                        lock_manager.release_all(ino, owner).await?;
-                    }
-
-                    Ok::<(), anyhow::Error>(())
-                });
-
-                // Clean up write buffer entry to prevent memory leak
-                // Even if flush failed, we should remove the buffer entry
-                self.write_buffers.remove(&ino);
-
-                match result {
-                    Ok(_) => reply.ok(),
-                    Err(e) => {
-                        error!("Failed to flush/release for inode {}: {}", ino, e);
+                info!("release: ino={} last writer — flushing buffer", ino);
+                let flush_handle = self.flush_handle.clone();
+                let write_buffers = self.write_buffers.clone();
+                self.runtime.spawn(async move {
+                    if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
+                        error!("release: flush failed for inode {}: {}", ino, e);
+                        write_buffers.remove(&ino);
                         reply.error(libc::EIO);
+                        return;
                     }
-                }
+                    write_buffers.remove(&ino);
+                    if let Some(owner) = lock_owner {
+                        if let Err(e) = lock_manager.release_all(ino, owner).await {
+                            error!("release: lock release failed for inode {}: {}", ino, e);
+                        }
+                    }
+                    reply.ok();
+                });
             } else if is_write {
                 // Intermediate write close: release locks only, leave buffer intact.
-                // The remaining writer(s) will flush and remove the buffer on their close.
-                if let Some(owner) = lock_owner {
-                    let result = self.block_on(lock_manager.release_all(ino, owner));
-                    if let Err(e) = result {
-                        error!("Failed to release locks for inode {}: {}", ino, e);
+                self.runtime.spawn(async move {
+                    if let Some(owner) = lock_owner {
+                        if let Err(e) = lock_manager.release_all(ino, owner).await {
+                            error!("release: lock release failed for inode {}: {}", ino, e);
+                        }
                     }
-                }
-                reply.ok();
+                    reply.ok();
+                });
             } else {
-                // Read-only close: release locks if needed, leave write buffer untouched.
-                if let Some(owner) = lock_owner {
-                    let result = self.block_on(lock_manager.release_all(ino, owner));
-                    if let Err(e) = result {
-                        error!("Failed to release locks for inode {}: {}", ino, e);
+                // Read-only close: if buffered data exists (e.g. from a rename-based
+                // save where we missed the write open), flush it now.
+                let has_buffer = self.write_buffers.get(&ino)
+                    .map(|s| s.try_lock().map(|s| !s.slots.is_empty()).unwrap_or(false))
+                    .unwrap_or(false);
+                let flush_handle = self.flush_handle.clone();
+                let write_buffers = self.write_buffers.clone();
+                self.runtime.spawn(async move {
+                    if has_buffer {
+                        debug!("release: read-only close for ino={} has buffered data — flushing", ino);
+                        if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
+                            error!("release: flush failed for inode {}: {}", ino, e);
+                        }
+                        write_buffers.remove(&ino);
                     }
-                }
-                reply.ok();
+                    if let Some(owner) = lock_owner {
+                        if let Err(e) = lock_manager.release_all(ino, owner).await {
+                            error!("release: lock release failed for inode {}: {}", ino, e);
+                        }
+                    }
+                    reply.ok();
+                });
             }
         } else {
-            // No write buffer, but flush any pending metadata updates before releasing locks
+            // No write buffer: enqueue metadata async and release locks.
             let client = self.client.clone();
             let metadata_cache = self.metadata_cache.clone();
             let write_counters = self.write_counters.clone();
-
-            let result = self.block_on(async {
-                // Flush pending metadata if any
+            self.runtime.spawn(async move {
                 let metadata_opt = metadata_cache.get(&ino).map(|m| m.clone());
-
                 if let Some(metadata) = metadata_opt {
-                    // release: send synchronously so close() confirms metadata on leader.
-                    debug!("release: flushing metadata sync for ino={} ({} chunks)", ino, metadata.chunk_locations.len());
-                    client.flush_metadata_sync(&metadata).await;
+                    debug!("release: enqueuing metadata for ino={} ({} chunks)", ino, metadata.chunk_locations.len());
+                    client.enqueue_metadata(&metadata).await;
                     write_counters.write().unwrap().insert(ino, 0);
                 }
-
-                // Release locks if lock_owner is provided
                 if let Some(owner) = lock_owner {
-                    lock_manager.release_all(ino, owner).await?;
+                    if let Err(e) = lock_manager.release_all(ino, owner).await {
+                        error!("release: lock release failed for inode {}: {}", ino, e);
+                    }
                 }
-                Ok::<(), anyhow::Error>(())
+                reply.ok();
             });
-
-            match result {
-                Ok(_) => reply.ok(),
-                Err(e) => {
-                    error!("Failed to flush/release locks for inode {}: {}", ino, e);
-                    reply.error(libc::EIO);
-                }
-            }
         }
     }
 
@@ -2600,27 +2473,37 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let last_warm_offset = self.last_warm_offset.clone();
         let chunk_offset_cache = self.chunk_offset_cache.clone();
+        let pending_deletes = self.pending_deletes.clone();
+
+        // Mark as pending-delete immediately so concurrent lookup() returns ENOENT
+        // even while the server-side delete is still in flight.
+        pending_deletes.insert(path.clone());
+        debug!("unlink: inserted {:?} into pending_deletes (len={}, ptr={:p})", path, pending_deletes.len(), Arc::as_ptr(&pending_deletes));
 
         self.runtime.spawn(async move {
+            // Always clean local cache first — stale entries block future creates even
+            // when the server delete times out. The server/healer will clean up its side.
+            let ino_opt = path_to_inode.read().unwrap().get(&path).copied();
+            if let Some(ino) = ino_opt {
+                metadata_cache.remove(&ino);
+                write_buffers.remove(&ino);
+                write_counters.write().unwrap().remove(&ino);
+                last_metadata_update.remove(&ino);
+                last_warm_offset.remove(&ino);
+                chunk_offset_cache.remove(&ino);
+            }
+            path_to_inode.write().unwrap().remove(&path);
+            let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+            let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
+            dir_cache.remove(parent_path);
+
             match client.delete_file(&path).await {
                 Ok(_) => {
-                    if let Some(&ino) = path_to_inode.read().unwrap().get(&path) {
-                        metadata_cache.remove(&ino);
-                        write_buffers.remove(&ino);
-                        write_counters.write().unwrap().remove(&ino);
-                        last_metadata_update.remove(&ino);
-                        last_warm_offset.remove(&ino);
-                        chunk_offset_cache.remove(&ino);
-                    }
-                    path_to_inode.write().unwrap().remove(&path);
-
-                    let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
-                    let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-                    dir_cache.remove(parent_path);
-
+                    pending_deletes.remove(&path);
                     reply.ok();
                 }
                 Err(e) => {
+                    pending_deletes.remove(&path);
                     error!("Failed to delete file {}: {}", path, e);
                     reply.error(libc::EIO);
                 }
@@ -2710,64 +2593,98 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
-        // Get existing metadata then rename — spawn so we never block_on the FUSE dispatch thread.
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let dir_cache = self.dir_cache.clone();
         let path_to_inode = self.path_to_inode.clone();
-        let next_inode = self.next_inode.clone();
+        let flush_handle = self.flush_handle.clone();
+        let write_buffers = self.write_buffers.clone();
+
+        // Look up old inode from local cache — the file may have been written
+        // but not yet persisted to the server (write buffer still in flight).
+        let old_ino = path_to_inode.read().unwrap().get(&old_path).copied();
+        let old_ino = match old_ino {
+            Some(i) => i,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Look up destination inode if it already exists (overwrite case).
+        let new_ino = path_to_inode.read().unwrap().get(&new_path).copied();
 
         self.runtime.spawn(async move {
-            match client.get_file_metadata(&old_path).await {
-                Ok(Some(metadata)) => {
-                    match client.rename_file(&old_path, &new_path).await {
-                        Ok(_) => {
-                            // Keep the same inode number — kernel still holds references to it.
-                            let ino = {
-                                let path_map = path_to_inode.read().unwrap();
-                                if let Some(&existing) = path_map.get(&old_path) {
-                                    existing
-                                } else {
-                                    drop(path_map);
-                                    let mut next = next_inode.write().unwrap();
-                                    let v = *next; *next += 1; drop(next);
-                                    path_to_inode.write().unwrap().insert(old_path.clone(), v);
-                                    v
-                                }
-                            };
+            // Flush the source file's write buffer to the server before renaming,
+            // so the server has the current metadata for old_path.
+            if write_buffers.contains_key(&old_ino) {
+                if let Err(e) = flush_handle.flush_buffer_async(old_ino, true).await {
+                    error!("rename: flush failed for ino={}: {}", old_ino, e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+                write_buffers.remove(&old_ino);
+            }
 
-                            path_to_inode.write().unwrap().remove(&old_path);
-                            path_to_inode.write().unwrap().insert(new_path.clone(), ino);
+            // If destination exists, delete it first so the server doesn't have
+            // two metadata entries for the same path after rename.
+            if let Some(new_ino_val) = new_ino {
+                if let Some(existing_meta) = metadata_cache.get(&new_ino_val).map(|m| m.clone()) {
+                    if let Err(e) = client.delete_file(&existing_meta.path).await {
+                        warn!("rename: failed to delete destination {}: {}", existing_meta.path, e);
+                        // Non-fatal: proceed with rename
+                    }
+                    metadata_cache.remove(&new_ino_val);
+                }
+            }
 
-                            let mut new_metadata = metadata.clone();
-                            new_metadata.path = new_path.clone();
-                            new_metadata.modified_at = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            metadata_cache.insert(ino, new_metadata);
-
-                            let raw_old = old_path.rsplitn(2, '/').nth(1).unwrap_or("");
-                            let old_parent = if raw_old.is_empty() { "/" } else { raw_old };
-                            let raw_new = new_path.rsplitn(2, '/').nth(1).unwrap_or("");
-                            let new_parent = if raw_new.is_empty() { "/" } else { raw_new };
-                            dir_cache.remove(old_parent);
-                            if old_parent != new_parent {
-                                dir_cache.remove(new_parent);
-                            }
-
-                            info!("Renamed {} -> {} (inode {} preserved {} chunks)", old_path, new_path, ino, metadata.chunk_locations.len());
-                            reply.ok();
-                        }
+            // Get source metadata from local cache (already flushed above).
+            let metadata = match metadata_cache.get(&old_ino).map(|m| m.clone()) {
+                Some(m) => m,
+                None => {
+                    // Cache miss after flush — try server.
+                    match client.get_file_metadata(&old_path).await {
+                        Ok(Some(m)) => m,
+                        Ok(None) => { reply.error(libc::ENOENT); return; }
                         Err(e) => {
-                            error!("Failed to rename {} -> {}: {}", old_path, new_path, e);
+                            error!("rename: get metadata failed for {}: {}", old_path, e);
                             reply.error(libc::EIO);
+                            return;
                         }
                     }
                 }
-                Ok(None) => reply.error(libc::ENOENT),
+            };
+
+            match client.rename_file(&old_path, &new_path).await {
+                Ok(_) => {
+                    // Update local path→inode mapping.
+                    path_to_inode.write().unwrap().remove(&old_path);
+                    path_to_inode.write().unwrap().insert(new_path.clone(), old_ino);
+
+                    // Update local metadata cache with new path.
+                    let mut new_metadata = metadata.clone();
+                    new_metadata.path = new_path.clone();
+                    new_metadata.modified_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    metadata_cache.insert(old_ino, new_metadata);
+
+                    // Invalidate directory caches.
+                    let raw_old = old_path.rsplitn(2, '/').nth(1).unwrap_or("");
+                    let old_parent = if raw_old.is_empty() { "/" } else { raw_old };
+                    let raw_new = new_path.rsplitn(2, '/').nth(1).unwrap_or("");
+                    let new_parent = if raw_new.is_empty() { "/" } else { raw_new };
+                    dir_cache.remove(old_parent);
+                    if old_parent != new_parent {
+                        dir_cache.remove(new_parent);
+                    }
+
+                    info!("Renamed {} -> {} (ino={}, {} chunks)", old_path, new_path, old_ino, metadata.chunk_locations.len());
+                    reply.ok();
+                }
                 Err(e) => {
-                    error!("Failed to get file metadata {}: {}", old_path, e);
+                    error!("rename: server rename failed {} -> {}: {}", old_path, new_path, e);
                     reply.error(libc::EIO);
                 }
             }
@@ -3030,47 +2947,28 @@ impl Filesystem for DfsFilesystem {
                 })
                 .unwrap_or(false);
 
-            let in_flight_opt = self.flush_in_flight.read().unwrap().clone();
-
             if sync_on_fsync {
-                // O_SYNC / O_DSYNC: flush synchronously and wait for network ack
-                // before returning reply.ok() to the caller.
-                if let Some(ref in_flight) = in_flight_opt {
-                    in_flight.insert(ino);
-                }
+                // O_SYNC / O_DSYNC: flush synchronously and wait for network ack.
                 let handle = self.flush_handle.clone();
-                let in_flight_for_sync = in_flight_opt.clone();
                 let result = self.block_on(async move {
-                    let r = handle.flush_buffer_async(ino, true).await;
-                    if let Some(ref inf) = in_flight_for_sync { inf.remove(&ino); }
-                    r
+                    handle.flush_buffer_async(ino, true).await
                 });
                 match result {
                     Ok(_) => reply.ok(),
                     Err(e) => { error!("fsync (O_SYNC) failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
                 }
-            } else if let Some(in_flight) = in_flight_opt {
-                // Async flush: don't block the FUSE thread
-                in_flight.insert(ino);
+            } else {
+                // Async flush: spawn and reply immediately. Do NOT insert into in_flight —
+                // that set is only for background-ticker vs force-flush races. If we insert
+                // here, a concurrent release flush will wait 30s for this task to start,
+                // causing the well-known nano close hang.
                 let handle = self.flush_handle.clone();
-                let in_flight_clone = in_flight.clone();
                 self.runtime.spawn(async move {
                     if let Err(e) = handle.flush_buffer_async(ino, true).await {
                         error!("fsync background flush failed for inode {}: {}", ino, e);
                     }
-                    in_flight_clone.remove(&ino);
                 });
                 reply.ok();
-            } else {
-                // Background flusher not yet started — fall back to synchronous flush
-                let result = self.block_on(self.flush_buffer_async(ino, true));
-                match result {
-                    Ok(_) => reply.ok(),
-                    Err(e) => {
-                        error!("Failed to fsync inode {}: {}", ino, e);
-                        reply.error(libc::EIO);
-                    }
-                }
             }
         } else {
             // No write buffer, but we still need to flush any pending metadata updates

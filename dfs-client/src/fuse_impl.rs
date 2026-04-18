@@ -1256,21 +1256,29 @@ impl Filesystem for DfsFilesystem {
                     };
 
                     if should_refresh {
-                        if let Ok(Some(fresh)) = client.get_file_metadata(&metadata.path).await {
-                            let server_is_newer = fresh.modified_at > metadata.modified_at
-                                || (fresh.modified_at == metadata.modified_at
-                                    && (fresh.size > metadata.size
-                                        || fresh.chunk_locations.len() > metadata.chunk_locations.len()));
-                            if server_is_newer {
-                                debug!("getattr: metadata updated: size {} -> {}, chunks {} -> {}",
-                                       metadata.size, fresh.size,
-                                       metadata.chunk_locations.len(), fresh.chunk_locations.len());
-                                client.seed_write_seq(fresh.id, fresh.write_seq);
-                                metadata_cache.insert(ino, fresh.clone());
-                                metadata = fresh;
+                        // Refresh in the background — don't block the FUSE reply on a server
+                        // round-trip. Stale-by-a-few-seconds is fine for stat/getattr; blocking
+                        // here makes find/ls hang when nodes are slow or temporarily overloaded.
+                        let client_bg = client.clone();
+                        let metadata_cache_bg = metadata_cache.clone();
+                        let last_metadata_update_bg = last_metadata_update.clone();
+                        let path_bg = metadata.path.clone();
+                        let current_modified_at = metadata.modified_at;
+                        let current_size = metadata.size;
+                        let current_chunks = metadata.chunk_locations.len();
+                        tokio::spawn(async move {
+                            if let Ok(Some(fresh)) = client_bg.get_file_metadata(&path_bg).await {
+                                let server_is_newer = fresh.modified_at > current_modified_at
+                                    || (fresh.modified_at == current_modified_at
+                                        && (fresh.size > current_size
+                                            || fresh.chunk_locations.len() > current_chunks));
+                                if server_is_newer {
+                                    client_bg.seed_write_seq(fresh.id, fresh.write_seq);
+                                    metadata_cache_bg.insert(ino, fresh);
+                                }
                             }
-                        }
-                        last_metadata_update.insert(ino, std::time::Instant::now());
+                            last_metadata_update_bg.insert(ino, std::time::Instant::now());
+                        });
                     }
 
                     // For files with an active write buffer, the true EOF is further ahead

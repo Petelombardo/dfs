@@ -1013,6 +1013,7 @@ impl HealingManager {
                 let client = self.client.clone();
                 let pending_healing = self.pending_healing.clone();
                 let in_flight_healing = self.in_flight_healing.clone();
+                let stalled_healing = self.stalled_healing.clone();
                 let heal_semaphore = self.heal_semaphore.clone();
                 let heal_semaphore_capacity = self.heal_semaphore_capacity;
                 let replication_factor = self.replication_factor;
@@ -1048,12 +1049,14 @@ impl HealingManager {
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            warn!("Heal failed for chunk {}: {}", chunk_id, e);
+                            warn!("Heal failed for chunk {}: {} — stalling until next discovery", chunk_id, e);
                             in_flight_healing.write().await.remove(&chunk_id);
+                            stalled_healing.write().await.insert(chunk_id);
                         }
                         Err(_) => {
-                            warn!("Heal timed out for chunk {} after {}s", chunk_id, transfer_timeout.as_secs());
+                            warn!("Heal timed out for chunk {} after {}s — stalling until next discovery", chunk_id, transfer_timeout.as_secs());
                             in_flight_healing.write().await.remove(&chunk_id);
+                            stalled_healing.write().await.insert(chunk_id);
                         }
                     }
                     // _permit drops here, releasing semaphore budget

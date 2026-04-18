@@ -25,7 +25,7 @@ A high-performance distributed file system written in Rust with FUSE support. De
 │  - Presents a normal filesystem via /mnt/...             │
 │  - Chunks files into 4MB pieces on write                 │
 │  - Fetches chunk map from leader on open                 │
-│  - Reads: parallel fetches with shared 20-slot semaphore │
+│  - Reads: pipelined sequential fetches; parallel fetches with shared 8-slot semaphore │
 │  - Writes: buffered → flush on full chunk or close       │
 └────────────────────────┬────────────────────────────────┘
                          │ TCP :8900
@@ -208,13 +208,14 @@ dfs-admin -c 192.168.1.10:8900 file purge '/podman/dvr/recordings/Today/Today.mp
 
 ## Performance
 
-5-node ARM64 cluster, spinning HDD backend:
+5-node ARM64 cluster, spinning HDD backend, measured from a NanoPi R3 client over GbE:
 
 | Operation | Throughput |
 |-----------|-----------|
-| Sequential read (DVR playback) | ~90 MB/s |
-| Sequential write (DVR recording) | ~45 MB/s |
-| Random read (seek / fast-forward) | ~25 MB/s |
+| Sequential read (DVR playback) | ~47 MB/s |
+| Sequential write (DVR recording) | ~38 MB/s |
+
+Sequential reads are network-bound (GbE ceiling ~125 MB/s; spinning HDD random reads are the practical limit per node). Writes use `/dev/urandom` as source, so throughput reflects network + replication overhead with no compression benefit.
 
 ## Known Limitations
 

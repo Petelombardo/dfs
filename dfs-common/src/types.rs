@@ -203,16 +203,6 @@ pub struct FileMetadata {
     /// File size in bytes
     pub size: u64,
 
-    /// DEPRECATED: Legacy chunks field for backward compatibility
-    /// Use chunk_locations instead - this will be removed in future versions
-    #[serde(default)]
-    pub chunks: Vec<ChunkId>,
-
-    /// DEPRECATED: Legacy chunk sizes field for backward compatibility
-    /// Use chunk_locations[].size instead - this will be removed in future versions
-    #[serde(default)]
-    pub chunk_sizes: Vec<u64>,
-
     /// Creation timestamp (Unix epoch seconds)
     pub created_at: u64,
 
@@ -231,16 +221,13 @@ pub struct FileMetadata {
     /// File type
     pub file_type: FileType,
 
-    /// Chunk locations with replica node tracking (optional, for dual-replica writes)
-    /// Added at END for bincode backward compatibility
-    /// When present, this takes precedence over chunks/chunk_sizes fields
-    #[serde(default)]
+    /// Chunk locations with replica node tracking
     pub chunk_locations: Vec<ChunkLocation>,
 
     /// Monotonically increasing sequence number assigned by the client before
     /// enqueueing each metadata write. The server uses this to reject out-of-order
     /// deliveries: if stored write_seq > incoming write_seq, the write is stale and
-    /// dropped. Defaults to 0 for legacy records (no ordering enforcement).
+    /// dropped. 0 means unsequenced (no ordering enforcement).
     #[serde(default)]
     pub write_seq: u64,
 }
@@ -252,15 +239,9 @@ impl FileMetadata {
             id: FileId::new(),
             path,
             size: 0,
-            chunks: Vec::new(),  // Deprecated, kept for backward compat
-            chunk_sizes: Vec::new(),  // Deprecated, kept for backward compat
             created_at: now,
             modified_at: now,
-            mode: if file_type == FileType::Directory {
-                0o755
-            } else {
-                0o644
-            },
+            mode: if file_type == FileType::Directory { 0o755 } else { 0o644 },
             uid: 0,
             gid: 0,
             file_type,
@@ -269,22 +250,12 @@ impl FileMetadata {
         }
     }
 
-    /// Get chunk IDs from either chunk_locations or legacy chunks field
     pub fn get_chunk_ids(&self) -> Vec<ChunkId> {
-        if !self.chunk_locations.is_empty() {
-            self.chunk_locations.iter().map(|loc| loc.chunk_id).collect()
-        } else {
-            self.chunks.clone()
-        }
+        self.chunk_locations.iter().map(|loc| loc.chunk_id).collect()
     }
 
-    /// Get chunk sizes from either chunk_locations or legacy chunk_sizes field
     pub fn get_chunk_sizes(&self) -> Vec<u64> {
-        if !self.chunk_locations.is_empty() {
-            self.chunk_locations.iter().map(|loc| loc.size as u64).collect()
-        } else {
-            self.chunk_sizes.clone()
-        }
+        self.chunk_locations.iter().map(|loc| loc.size as u64).collect()
     }
 }
 
@@ -296,27 +267,7 @@ pub enum FileType {
     Symlink,
 }
 
-/// Legacy ChunkLocation format (before sparse file support - 4 fields)
-/// This is used to deserialize old metadata from bincode format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkLocationV0 {
-    pub chunk_id: ChunkId,
-    pub nodes: Vec<NodeId>,
-    pub size: usize,
-    pub checksum: [u8; 32],
-}
-
-/// Legacy ChunkLocation format (5 fields, before written_at was added)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkLocationV1 {
-    pub chunk_id: ChunkId,
-    pub nodes: Vec<NodeId>,
-    pub size: usize,
-    pub checksum: [u8; 32],
-    pub file_offset: Option<u64>,
-}
-
-/// Information about where a chunk is stored (current format - 6 fields)
+/// Information about where a chunk is stored
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkLocation {
     /// Chunk identifier
@@ -349,155 +300,6 @@ impl ChunkLocation {
     }
 }
 
-impl From<ChunkLocationV0> for ChunkLocation {
-    fn from(v0: ChunkLocationV0) -> Self {
-        ChunkLocation {
-            chunk_id: v0.chunk_id,
-            nodes: v0.nodes,
-            size: v0.size,
-            checksum: v0.checksum,
-            file_offset: None,
-            written_at: None,
-        }
-    }
-}
-
-impl From<ChunkLocationV1> for ChunkLocation {
-    fn from(v1: ChunkLocationV1) -> Self {
-        ChunkLocation {
-            chunk_id: v1.chunk_id,
-            nodes: v1.nodes,
-            size: v1.size,
-            checksum: v1.checksum,
-            file_offset: v1.file_offset,
-            written_at: None,
-        }
-    }
-}
-
-/// FileMetadata format before write_seq was added (uses ChunkLocation with written_at but no write_seq).
-/// This is used to deserialize metadata written after written_at was added to ChunkLocation
-/// but before the write_seq field was added to FileMetadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMetadataV2 {
-    pub id: FileId,
-    pub path: String,
-    pub size: u64,
-    #[serde(default)]
-    pub chunks: Vec<ChunkId>,
-    #[serde(default)]
-    pub chunk_sizes: Vec<u64>,
-    pub created_at: u64,
-    pub modified_at: u64,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub file_type: FileType,
-    #[serde(default)]
-    pub chunk_locations: Vec<ChunkLocation>,
-}
-
-impl From<FileMetadataV2> for FileMetadata {
-    fn from(v2: FileMetadataV2) -> Self {
-        FileMetadata {
-            id: v2.id,
-            path: v2.path,
-            size: v2.size,
-            chunks: v2.chunks,
-            chunk_sizes: v2.chunk_sizes,
-            created_at: v2.created_at,
-            modified_at: v2.modified_at,
-            mode: v2.mode,
-            uid: v2.uid,
-            gid: v2.gid,
-            file_type: v2.file_type,
-            chunk_locations: v2.chunk_locations,
-            write_seq: 0,
-        }
-    }
-}
-
-/// FileMetadata format before written_at was added to ChunkLocation (uses ChunkLocationV1)
-/// This is used to deserialize metadata written after sparse file support but before written_at.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMetadataV1 {
-    pub id: FileId,
-    pub path: String,
-    pub size: u64,
-    #[serde(default)]
-    pub chunks: Vec<ChunkId>,
-    #[serde(default)]
-    pub chunk_sizes: Vec<u64>,
-    pub created_at: u64,
-    pub modified_at: u64,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub file_type: FileType,
-    #[serde(default)]
-    pub chunk_locations: Vec<ChunkLocationV1>,
-}
-
-impl From<FileMetadataV1> for FileMetadata {
-    fn from(v1: FileMetadataV1) -> Self {
-        FileMetadata {
-            id: v1.id,
-            path: v1.path,
-            size: v1.size,
-            chunks: v1.chunks,
-            chunk_sizes: v1.chunk_sizes,
-            created_at: v1.created_at,
-            modified_at: v1.modified_at,
-            mode: v1.mode,
-            uid: v1.uid,
-            gid: v1.gid,
-            file_type: v1.file_type,
-            chunk_locations: v1.chunk_locations.into_iter().map(|loc| loc.into()).collect(),
-            write_seq: 0,
-        }
-    }
-}
-
-/// Legacy FileMetadata format (before sparse file support with ChunkLocationV0)
-/// This is used to deserialize old metadata from bincode format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMetadataV0 {
-    pub id: FileId,
-    pub path: String,
-    pub size: u64,
-    #[serde(default)]
-    pub chunks: Vec<ChunkId>,
-    #[serde(default)]
-    pub chunk_sizes: Vec<u64>,
-    pub created_at: u64,
-    pub modified_at: u64,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub file_type: FileType,
-    #[serde(default)]
-    pub chunk_locations: Vec<ChunkLocationV0>,
-}
-
-impl From<FileMetadataV0> for FileMetadata {
-    fn from(v0: FileMetadataV0) -> Self {
-        FileMetadata {
-            id: v0.id,
-            path: v0.path,
-            size: v0.size,
-            chunks: v0.chunks,
-            chunk_sizes: v0.chunk_sizes,
-            created_at: v0.created_at,
-            modified_at: v0.modified_at,
-            mode: v0.mode,
-            uid: v0.uid,
-            gid: v0.gid,
-            file_type: v0.file_type,
-            chunk_locations: v0.chunk_locations.into_iter().map(|loc| loc.into()).collect(),
-            write_seq: 0,
-        }
-    }
-}
 
 /// Get current Unix timestamp in seconds
 pub fn current_timestamp() -> u64 {

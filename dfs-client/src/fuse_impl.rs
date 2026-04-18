@@ -257,7 +257,7 @@ impl FlushHandle {
             // The highest chunk index already committed to the server = max chunk in metadata
             // that is NOT currently in the write buffer (already flushed).
             let meta_chunk_count = self.metadata_cache.get(&ino)
-                .map(|m| m.chunk_locations.len().max(m.chunks.len()) as u64)
+                .map(|m| m.chunk_locations.len() as u64)
                 .unwrap_or(0);
             if meta_chunk_count > 0 { Some(meta_chunk_count - 1) } else { None }
         };
@@ -282,7 +282,7 @@ impl FlushHandle {
                         // so fall through to a full write instead. This avoids a double round-trip
                         // (failed PatchChunk attempt + full write fallback) for log-style appenders.
                         let existing_chunk_size = self.metadata_cache.get(&ino)
-                            .and_then(|m| m.chunk_sizes.get(*chunk_idx as usize).copied())
+                            .and_then(|m| m.chunk_locations.get(*chunk_idx as usize).map(|l| l.size as u64))
                             .unwrap_or(0);
                         let needs_patch = slot_len < CHUNK_SIZE
                             && max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false)
@@ -314,9 +314,6 @@ impl FlushHandle {
                                             if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
                                                 if let Some(loc) = meta_entry.chunk_locations.get_mut(chunk_idx_usize) {
                                                     *loc = new_location.clone();
-                                                }
-                                                if let Some(id) = meta_entry.chunks.get_mut(chunk_idx_usize) {
-                                                    *id = new_location.chunk_id;
                                                 }
                                             }
                                             // Skip adding to slots_to_write — patch already committed
@@ -425,18 +422,10 @@ impl FlushHandle {
                         // misses this — we must also dedup by file_offset.
                         if let Some(offset) = loc.file_offset {
                             if let Some(pos) = meta.chunk_locations.iter().position(|l| l.file_offset == Some(offset)) {
-                                let old_id = meta.chunk_locations[pos].chunk_id;
                                 meta.chunk_locations[pos] = loc.clone();
-                                // Keep legacy arrays consistent
-                                if let Some(p) = meta.chunks.iter().position(|&id| id == old_id) {
-                                    meta.chunks[p] = loc.chunk_id;
-                                    meta.chunk_sizes[p] = loc.size as u64;
-                                }
                                 continue;
                             }
                         }
-                        meta.chunks.push(loc.chunk_id);
-                        meta.chunk_sizes.push(loc.size as u64);
                         meta.chunk_locations.push(loc.clone());
                     }
                 }
@@ -697,8 +686,6 @@ impl DfsFilesystem {
             id: dfs_common::FileId::new(),
             path: "/".to_string(),
             size: 0,
-            chunks: Vec::new(),
-            chunk_sizes: Vec::new(),
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1200,11 +1187,9 @@ impl Filesystem for DfsFilesystem {
         if let Some(meta) = self.metadata_cache.get(&ino) {
             let file_id = meta.id;
             let file_size = meta.size;
-            let meta_locations = meta.chunk_locations.clone();
             drop(meta);
             let client = self.client.clone();
             let engine = client.read_engines.get_or_create(ino);
-            // known_size == 0 means engine is cold (never populated). No async needed to check.
             let is_cold = engine.known_size.load(std::sync::atomic::Ordering::Relaxed) == 0;
             if is_cold && engine.refresh_in_progress
                 .compare_exchange(false, true,
@@ -1212,7 +1197,7 @@ impl Filesystem for DfsFilesystem {
                     std::sync::atomic::Ordering::Relaxed).is_ok()
             {
                 self.runtime.spawn(async move {
-                    client.refresh_engine_flagged(&engine, file_id, file_size, meta_locations).await;
+                    client.refresh_engine_flagged(&engine, file_id, file_size).await;
                 });
             }
         }
@@ -1249,11 +1234,11 @@ impl Filesystem for DfsFilesystem {
                             let server_is_newer = fresh.modified_at > metadata.modified_at
                                 || (fresh.modified_at == metadata.modified_at
                                     && (fresh.size > metadata.size
-                                        || fresh.chunks.len() > metadata.chunks.len()));
+                                        || fresh.chunk_locations.len() > metadata.chunk_locations.len()));
                             if server_is_newer {
                                 debug!("getattr: metadata updated: size {} -> {}, chunks {} -> {}",
                                        metadata.size, fresh.size,
-                                       metadata.chunks.len(), fresh.chunks.len());
+                                       metadata.chunk_locations.len(), fresh.chunk_locations.len());
                                 client.seed_write_seq(fresh.id, fresh.write_seq);
                                 metadata_cache.insert(ino, fresh.clone());
                                 metadata = fresh;
@@ -1425,16 +1410,10 @@ impl Filesystem for DfsFilesystem {
                 file_size
             };
 
-            // Pass chunk_locations for legacy-file fallback in the engine.
-            // Re-read from cache here (not before the EOF check) to get the freshest data.
-            let meta_locations = metadata_cache.get(&ino)
-                .map(|m| m.chunk_locations.clone())
-                .unwrap_or_default();
-
             // --- Delegate to the read engine (chunk map + pipeline + cache). ---
             info!("FUSE read: ino={}, offset={}, size={}, file_size={}", ino, offset, size, effective_size);
             let result = client.read_file(
-                ino, effective_size, file_id, &file_path, offset, size, meta_locations,
+                ino, effective_size, file_id, &file_path, offset, size,
             ).await;
 
             let elapsed = start.elapsed();
@@ -1686,8 +1665,6 @@ impl Filesystem for DfsFilesystem {
             id: dfs_common::FileId::new(),
             path: path.clone(),
             size: 0,
-            chunks: Vec::new(),
-            chunk_sizes: Vec::new(),
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1811,8 +1788,6 @@ impl Filesystem for DfsFilesystem {
                                     id: dfs_common::FileId::new(),
                                     path: path.clone(),
                                     size: 0,
-                                    chunks: Vec::new(),
-                                    chunk_sizes: Vec::new(),
                                     chunk_locations: Vec::new(),
                                     created_at: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
@@ -1993,7 +1968,7 @@ impl Filesystem for DfsFilesystem {
                     });
 
                     match write_result {
-                        Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
+                        Ok((_, _, chunk_locations_opt)) => {
                             // Update file size to max(current, offset + len) for sparse files
                             let new_size = (offset_usize + data.len()).max(current_size);
 
@@ -2003,8 +1978,6 @@ impl Filesystem for DfsFilesystem {
                             if let Some(chunk_locations) = chunk_locations_opt {
                                 metadata.chunk_locations.extend(chunk_locations);
                             }
-                            metadata.chunks.extend(new_chunk_ids);
-                            metadata.chunk_sizes.extend(new_chunk_sizes);
                             metadata.size = new_size as u64;
                             metadata.modified_at = SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -2139,25 +2112,19 @@ impl Filesystem for DfsFilesystem {
                 let write_end = offset + data_vec.len();
 
                 // Calculate which chunks are affected by this write
-                let chunk_ids = metadata.chunks.clone();
-                let chunk_sizes = metadata.chunk_sizes.clone();
-
-                if chunk_ids.is_empty() {
+                if metadata.chunk_locations.is_empty() {
                     // Empty file - just write the data
                     (data_vec.clone(), false)
                 } else {
-                    let locations_match = !metadata.chunk_locations.is_empty()
-                        && metadata.chunk_locations[0].file_offset.is_some();
-
                     // Find chunk range that overlaps with write range [offset, write_end)
                     let mut chunk_start_offset = 0u64;
                     let mut first_affected_chunk: Option<usize> = None;
                     let mut last_affected_chunk: Option<usize> = None;
 
-                    for (idx, &chunk_size) in chunk_sizes.iter().enumerate() {
+                    for (idx, loc) in metadata.chunk_locations.iter().enumerate() {
+                        let chunk_size = loc.size as u64;
                         let chunk_end_offset = chunk_start_offset + chunk_size;
 
-                        // Check if this chunk overlaps with write range
                         if chunk_end_offset > offset as u64 && chunk_start_offset < write_end as u64 {
                             if first_affected_chunk.is_none() {
                                 first_affected_chunk = Some(idx);
@@ -2178,28 +2145,27 @@ impl Filesystem for DfsFilesystem {
                         let last_idx = last_affected_chunk.unwrap();
 
                     info!("Random write affects chunks {}-{} (out of {} total)",
-                          first_idx, last_idx, chunk_ids.len());
+                          first_idx, last_idx, metadata.chunk_locations.len());
 
                     // Store affected range for metadata splice later
                     affected_chunk_range = Some((first_idx, last_idx));
 
-                    // Read only the affected chunks
-                    let affected_chunk_ids: Vec<_> = chunk_ids[first_idx..=last_idx].to_vec();
-                    let affected_chunk_sizes: Vec<_> = chunk_sizes[first_idx..=last_idx].to_vec();
+                    let affected_locs = &metadata.chunk_locations[first_idx..=last_idx];
 
                     // Calculate file offset of first affected chunk
-                    let first_chunk_file_offset: u64 = chunk_sizes[..first_idx].iter().sum();
+                    let first_chunk_file_offset: u64 = metadata.chunk_locations[..first_idx]
+                        .iter().map(|l| l.size as u64).sum();
 
-                    // Build chunk offsets for affected chunks only
                     // Build read hints for affected chunks (full chunk reads for read-modify-write)
-                    let mut read_hints = Vec::with_capacity(affected_chunk_ids.len());
+                    let all_chunk_ids: Vec<_> = metadata.chunk_locations.iter().map(|l| l.chunk_id).collect();
+                    let mut read_hints = Vec::with_capacity(affected_locs.len());
                     let mut current_offset = first_chunk_file_offset;
-                    for (i, &chunk_id) in affected_chunk_ids.iter().enumerate() {
-                        let chunk_size = affected_chunk_sizes[i] as usize;
+                    for (i, loc) in affected_locs.iter().enumerate() {
+                        let chunk_size = loc.size as usize;
                         read_hints.push(crate::client::ChunkReadHint {
                             chunk_idx: first_idx + i,
-                            chunk_id,
-                            full_chunk: true,  // Always read full chunks for read-modify-write
+                            chunk_id: loc.chunk_id,
+                            full_chunk: true,
                             offset_in_chunk: 0,
                             length: chunk_size,
                             file_offset: current_offset,
@@ -2208,7 +2174,7 @@ impl Filesystem for DfsFilesystem {
                     }
 
                     let affected_data = match runtime.block_on(async {
-                        client.read_data(&read_hints, &chunk_ids, cache_inode, &metadata.chunk_locations).await
+                        client.read_data(&read_hints, &all_chunk_ids, cache_inode, &metadata.chunk_locations).await
                     }) {
                         Ok(data) => data,
                         Err(e) => {
@@ -2231,10 +2197,8 @@ impl Filesystem for DfsFilesystem {
                         .copy_from_slice(&data_vec);
 
                     info!("Random write: read {} bytes from {} chunks, merged to {} bytes",
-                          affected_data_len, affected_chunk_ids.len(), merged.len());
+                          affected_data_len, affected_locs.len(), merged.len());
 
-                        // Return merged data and metadata update strategy
-                        // We'll need to splice the new chunks into the metadata
                         (merged, false)
                     }
                 }
@@ -2253,7 +2217,7 @@ impl Filesystem for DfsFilesystem {
                 // Random write: write only the affected chunks
                 // Calculate file offset of first affected chunk for cache population
                 let write_file_offset = if let Some((first_idx, _)) = affected_chunk_range {
-                    metadata.chunk_sizes[..first_idx].iter().sum::<u64>()
+                    metadata.chunk_locations[..first_idx].iter().map(|l| l.size as u64).sum::<u64>()
                 } else {
                     0
                 };
@@ -2265,68 +2229,37 @@ impl Filesystem for DfsFilesystem {
             debug!("write_data took {:?}", write_elapsed);
 
             match result {
-                Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
+                Ok((_, _, chunk_locations_opt)) => {
                     // Update metadata
                     if is_append {
                         // Append: add new chunks to existing list
-                        if let Some(ref chunk_locations) = chunk_locations_opt {
-                            metadata.chunk_locations.extend(chunk_locations.clone());
+                        if let Some(chunk_locations) = chunk_locations_opt {
+                            metadata.chunk_locations.extend(chunk_locations);
                         }
-                        metadata.chunks.extend(new_chunk_ids);
-                        metadata.chunk_sizes.extend(new_chunk_sizes);
                         metadata.size = current_size as u64 + new_data.len() as u64;
                     } else if let Some((first_idx, last_idx)) = affected_chunk_range {
                         // Random write: splice new chunks into affected range
-                        // Keep chunks before affected range, insert new chunks, keep chunks after
+                        let new_locations = chunk_locations_opt.unwrap_or_default();
                         info!("Splicing {} new chunks into range {}-{} (was {} chunks)",
-                              new_chunk_ids.len(), first_idx, last_idx, last_idx - first_idx + 1);
+                              new_locations.len(), first_idx, last_idx, last_idx - first_idx + 1);
 
-                        let mut updated_chunks = Vec::new();
-                        let mut updated_sizes = Vec::new();
                         let mut updated_locations = Vec::new();
-
-                        // Keep chunks before affected range
-                        updated_chunks.extend_from_slice(&metadata.chunks[..first_idx]);
-                        updated_sizes.extend_from_slice(&metadata.chunk_sizes[..first_idx]);
-                        if !metadata.chunk_locations.is_empty() && first_idx <= metadata.chunk_locations.len() {
-                            updated_locations.extend_from_slice(&metadata.chunk_locations[..first_idx]);
+                        updated_locations.extend_from_slice(&metadata.chunk_locations[..first_idx]);
+                        updated_locations.extend(new_locations);
+                        if last_idx + 1 < metadata.chunk_locations.len() {
+                            updated_locations.extend_from_slice(&metadata.chunk_locations[last_idx + 1..]);
                         }
-
-                        // Insert new chunks
-                        updated_chunks.extend(new_chunk_ids);
-                        updated_sizes.extend(new_chunk_sizes);
-                        if let Some(ref chunk_locations) = chunk_locations_opt {
-                            updated_locations.extend(chunk_locations.clone());
-                        }
-
-                        // Keep chunks after affected range (if any)
-                        if last_idx + 1 < metadata.chunks.len() {
-                            updated_chunks.extend_from_slice(&metadata.chunks[last_idx + 1..]);
-                            updated_sizes.extend_from_slice(&metadata.chunk_sizes[last_idx + 1..]);
-                            if !metadata.chunk_locations.is_empty() && last_idx + 1 < metadata.chunk_locations.len() {
-                                updated_locations.extend_from_slice(&metadata.chunk_locations[last_idx + 1..]);
-                            }
-                        }
-
-                        metadata.chunks = updated_chunks;
-                        metadata.chunk_sizes = updated_sizes;
                         metadata.chunk_locations = updated_locations;
 
                         // Recalculate total file size
-                        metadata.size = metadata.chunk_sizes.iter().sum();
+                        metadata.size = metadata.chunk_locations.iter().map(|l| l.size as u64).sum();
 
                         info!("After splice: {} total chunks, {} total bytes",
-                              metadata.chunks.len(), metadata.size);
+                              metadata.chunk_locations.len(), metadata.size);
                     } else {
                         // Full rewrite (shouldn't happen with current logic, but keep as fallback)
                         warn!("Full file rewrite with {} bytes", new_data.len());
-                        if let Some(chunk_locations) = chunk_locations_opt {
-                            metadata.chunk_locations = chunk_locations;
-                        } else {
-                            metadata.chunk_locations.clear();
-                        }
-                        metadata.chunks = new_chunk_ids;
-                        metadata.chunk_sizes = new_chunk_sizes;
+                        metadata.chunk_locations = chunk_locations_opt.unwrap_or_default();
                         metadata.size = new_data.len() as u64;
                     }
                     metadata.modified_at = SystemTime::now()
@@ -2544,7 +2477,7 @@ impl Filesystem for DfsFilesystem {
 
                 if let Some(metadata) = metadata_opt {
                     // release: send synchronously so close() confirms metadata on leader.
-                    debug!("release: flushing metadata sync for ino={} ({} chunks)", ino, metadata.chunks.len());
+                    debug!("release: flushing metadata sync for ino={} ({} chunks)", ino, metadata.chunk_locations.len());
                     client.flush_metadata_sync(&metadata).await;
                     write_counters.write().unwrap().insert(ino, 0);
                 }
@@ -2590,8 +2523,6 @@ impl Filesystem for DfsFilesystem {
             id: dfs_common::FileId::new(),
             path: path.clone(),
             size: 0,
-            chunks: Vec::new(),
-            chunk_sizes: Vec::new(),
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -2825,7 +2756,7 @@ impl Filesystem for DfsFilesystem {
                                 dir_cache.remove(new_parent);
                             }
 
-                            info!("Renamed {} -> {} (inode {} preserved {} chunks)", old_path, new_path, ino, metadata.chunks.len());
+                            info!("Renamed {} -> {} (inode {} preserved {} chunks)", old_path, new_path, ino, metadata.chunk_locations.len());
                             reply.ok();
                         }
                         Err(e) => {
@@ -2893,39 +2824,31 @@ impl Filesystem for DfsFilesystem {
                 // may be unavailable due to garbage collection or incomplete replication
                 if new_size == 0 {
                     // Just clear the metadata - no need to read old chunks
-                    metadata.chunks = Vec::new();
-                    metadata.chunk_sizes = Vec::new();
                     metadata.chunk_locations = Vec::new();
                     metadata.size = 0;
                 } else if new_size > metadata.size {
                     // Growing file - just update metadata to extend with zeros
-                    // No need to read existing data, just keep existing chunks
                     info!("Truncate growing: {} -> {} bytes (keeping {} chunks)",
-                          metadata.size, new_size, metadata.chunks.len());
+                          metadata.size, new_size, metadata.chunk_locations.len());
                     metadata.size = new_size;
-                    // Note: The chunks stay the same, reads beyond will return zeros via FUSE
                 } else {
                     // Shrinking file - only read chunks up to new_size
-                    // CRITICAL FIX: Don't read entire file for truncate!
                     info!("Truncate shrinking: {} -> {} bytes", metadata.size, new_size);
 
-                    if metadata.chunks.is_empty() {
+                    if metadata.chunk_locations.is_empty() {
                         metadata.size = new_size;
                     } else {
-                        let chunk_sizes = metadata.chunk_sizes.clone();
-
                         // Find which chunks we need to keep (up to new_size)
                         let mut cumulative_size = 0u64;
                         let mut last_chunk_idx = 0;
                         let mut bytes_in_last_chunk = 0u64;
 
-                        for (idx, &size) in chunk_sizes.iter().enumerate() {
+                        for (idx, loc) in metadata.chunk_locations.iter().enumerate() {
+                            let size = loc.size as u64;
                             if cumulative_size + size <= new_size {
-                                // Entire chunk is kept
                                 cumulative_size += size;
                                 last_chunk_idx = idx;
                             } else if cumulative_size < new_size {
-                                // This chunk is partially kept
                                 bytes_in_last_chunk = new_size - cumulative_size;
                                 last_chunk_idx = idx;
                                 break;
@@ -2939,23 +2862,24 @@ impl Filesystem for DfsFilesystem {
                             info!("Truncate: keeping {} full chunks, truncating chunk {} to {} bytes",
                                   last_chunk_idx, last_chunk_idx, bytes_in_last_chunk);
 
-                            let chunk_id = metadata.chunks[last_chunk_idx];
-                            let chunk_offset: u64 = chunk_sizes[..last_chunk_idx].iter().sum();
-                            let chunk_size = chunk_sizes[last_chunk_idx] as usize;
+                            let loc = &metadata.chunk_locations[last_chunk_idx];
+                            let chunk_id = loc.chunk_id;
+                            let chunk_offset: u64 = metadata.chunk_locations[..last_chunk_idx]
+                                .iter().map(|l| l.size as u64).sum();
+                            let chunk_size = loc.size as usize;
 
-                            // Build read hint for the last partial chunk (full chunk read for truncate)
+                            let all_chunk_ids: Vec<_> = metadata.chunk_locations.iter().map(|l| l.chunk_id).collect();
                             let read_hint = vec![crate::client::ChunkReadHint {
                                 chunk_idx: last_chunk_idx,
                                 chunk_id,
-                                full_chunk: true,  // Read full chunk for truncate operation
+                                full_chunk: true,
                                 offset_in_chunk: 0,
                                 length: chunk_size,
                                 file_offset: chunk_offset,
                             }];
 
-                            // Read only the last partial chunk
                             let last_chunk_data = match self.block_on(async {
-                                client.read_data(&read_hint, &metadata.chunks, ino, &metadata.chunk_locations).await
+                                client.read_data(&read_hint, &all_chunk_ids, ino, &metadata.chunk_locations).await
                             }) {
                                 Ok(data) => data,
                                 Err(e) => {
@@ -2965,34 +2889,17 @@ impl Filesystem for DfsFilesystem {
                                 }
                             };
 
-                            // Truncate the chunk data
                             let truncated_chunk = &last_chunk_data[..bytes_in_last_chunk as usize];
 
-                            // Write back the truncated chunk
                             match self.block_on(async {
                                 client.write_data_with_cache(truncated_chunk, ino, chunk_offset).await
                             }) {
-                                Ok((new_chunk_ids, new_chunk_sizes, chunk_locations_opt)) => {
-                                    // Keep chunks before last, add truncated chunk
-                                    let mut new_all_chunks = metadata.chunks[..last_chunk_idx].to_vec();
-                                    new_all_chunks.extend(new_chunk_ids);
-
-                                    let mut new_all_sizes = metadata.chunk_sizes[..last_chunk_idx].to_vec();
-                                    new_all_sizes.extend(new_chunk_sizes);
-
-                                    // Update chunk_locations if provided
-                                    if let Some(chunk_locations) = chunk_locations_opt {
-                                        let mut new_all_locations = if last_chunk_idx < metadata.chunk_locations.len() {
-                                            metadata.chunk_locations[..last_chunk_idx].to_vec()
-                                        } else {
-                                            Vec::new()
-                                        };
-                                        new_all_locations.extend(chunk_locations);
-                                        metadata.chunk_locations = new_all_locations;
+                                Ok((_, _, chunk_locations_opt)) => {
+                                    let mut new_locs = metadata.chunk_locations[..last_chunk_idx].to_vec();
+                                    if let Some(new_chunk_locs) = chunk_locations_opt {
+                                        new_locs.extend(new_chunk_locs);
                                     }
-
-                                    metadata.chunks = new_all_chunks;
-                                    metadata.chunk_sizes = new_all_sizes;
+                                    metadata.chunk_locations = new_locs;
                                     metadata.size = new_size;
                                 }
                                 Err(e) => {
@@ -3004,8 +2911,6 @@ impl Filesystem for DfsFilesystem {
                         } else {
                             // All chunks are complete, just drop the ones after
                             info!("Truncate: keeping {} full chunks, dropping rest", last_chunk_idx + 1);
-                            metadata.chunks.truncate(last_chunk_idx + 1);
-                            metadata.chunk_sizes.truncate(last_chunk_idx + 1);
                             metadata.chunk_locations.truncate(last_chunk_idx + 1);
                             metadata.size = new_size;
                         }

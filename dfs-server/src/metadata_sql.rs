@@ -215,8 +215,6 @@ impl SqlMetadataStore {
             id: *file_id,
             path,
             size: size as u64,
-            chunks: Vec::new(),  // Deprecated
-            chunk_sizes: Vec::new(),  // Deprecated
             created_at: created_at as u64,
             modified_at: modified_at as u64,
             mode: mode as u32,
@@ -338,8 +336,6 @@ impl SqlMetadataStore {
                         id: dfs_common::FileId::new(),
                         path: child_dir_path,
                         size: 0,
-                        chunks: Vec::new(),
-                        chunk_sizes: Vec::new(),
                         chunk_locations: Vec::new(),
                         created_at: 0,
                         modified_at: 0,
@@ -386,6 +382,7 @@ mod tests {
             size: 4096,
             checksum: [2u8; 32],
             file_offset: Some(0),
+            written_at: None,
         });
 
         // Store and retrieve
@@ -413,7 +410,8 @@ mod tests {
             nodes: vec![node1],
             size: 4096,
             checksum: [0u8; 32],
-            file_offset: Some(0),  // Bytes 0-4095
+            file_offset: Some(0),
+            written_at: None,
         });
 
         // Gap: bytes 4096-8191 (no chunk = hole)
@@ -423,7 +421,8 @@ mod tests {
             nodes: vec![node1],
             size: 4096,
             checksum: [0u8; 32],
-            file_offset: Some(8192),  // Bytes 8192-12287
+            file_offset: Some(8192),
+            written_at: None,
         });
 
         store.put_file_metadata(&metadata).unwrap();

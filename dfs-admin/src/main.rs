@@ -600,7 +600,7 @@ async fn handle_file_command(
                         let output = serde_json::json!({
                             "path": metadata.path,
                             "size": metadata.size,
-                            "chunks": metadata.chunks.len(),
+                            "chunks": metadata.chunk_locations.len(),
                             "created_at": metadata.created_at,
                             "modified_at": metadata.modified_at,
                             "mode": format!("{:o}", metadata.mode),
@@ -621,7 +621,7 @@ async fn handle_file_command(
                         println!("==================");
                         println!("Path:       {}", metadata.path);
                         println!("Size:       {} bytes", metadata.size);
-                        println!("Chunks:     {}", metadata.chunks.len());
+                        println!("Chunks:     {}", metadata.chunk_locations.len());
                         println!("Created:    {}", metadata.created_at);
                         println!("Modified:   {}", metadata.modified_at);
                         println!("Mode:       {:o}", metadata.mode);
@@ -663,50 +663,11 @@ async fn handle_file_command(
             }
         }
         FileCommands::Replicas { chunk_id } => {
-            // Parse chunk ID from hex string
-            let chunk_id_parsed = parse_chunk_id(&chunk_id)?;
-
-            let response = send_request(
-                cluster_addrs[0],
-                Request::GetChunkReplicas {
-                    chunk_id: chunk_id_parsed,
-                },
-            )
-            .await?;
-
-            match response {
-                Response::ChunkReplicas { chunk_id, nodes } => {
-                    if json_output {
-                        let output = serde_json::json!({
-                            "chunk_id": chunk_id.to_string(),
-                            "replicas": nodes.len(),
-                            "nodes": nodes.iter().map(|n| n.to_string()).collect::<Vec<_>>()
-                        });
-                        println!("{}", serde_json::to_string_pretty(&output)?);
-                    } else {
-                        println!("Chunk Replicas");
-                        println!("==============");
-                        println!("Chunk ID: {}", chunk_id);
-                        println!("Replicas: {}", nodes.len());
-                        println!();
-                        println!("Stored on nodes:");
-                        for node in nodes {
-                            println!("  - {}", node);
-                        }
-                    }
-                }
-                Response::Error { message, code } => {
-                    error!("Error: {}", message);
-                    if code == dfs_common::ErrorCode::NotFound {
-                        anyhow::bail!("Chunk not found: {}", chunk_id);
-                    } else {
-                        anyhow::bail!("Command failed: {}", message);
-                    }
-                }
-                _ => {
-                    anyhow::bail!("Unexpected response type");
-                }
-            }
+            anyhow::bail!(
+                "The 'replicas' command has been removed. \
+                 Use 'file info <path>' to see chunk locations for a file."
+            );
+            let _ = chunk_id; // suppress unused warning
         }
         FileCommands::List => {
             let response = send_request(cluster_addrs[0], Request::ListAllFiles).await?;
@@ -721,7 +682,7 @@ async fn handle_file_command(
                                     "id": f.id.to_string(),
                                     "path": f.path,
                                     "size": f.size,
-                                    "chunks": f.chunks.len(),
+                                    "chunks": f.chunk_locations.len(),
                                     "created": f.created_at,
                                     "modified": f.modified_at,
                                 })
@@ -742,7 +703,7 @@ async fn handle_file_command(
                                 file.id.to_string(),
                                 truncate_path(&file.path, 80),
                                 size_str,
-                                file.chunks.len(),
+                                file.chunk_locations.len(),
                                 file.modified_at
                             );
                         }
@@ -826,7 +787,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
         _ => anyhow::bail!("Unexpected response"),
     };
 
-    let old_chunk_count = metadata.chunks.len();
+    let old_chunk_count = metadata.chunk_locations.len();
     let file_size = metadata.size;
 
     // Skip if already well-packed (average chunk size >= 2MB)
@@ -902,7 +863,8 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
     // Helper closure to write a buffer to 2 nodes and return ChunkLocations
     // We'll do this inline in the loop below
 
-    for (i, chunk_id) in metadata.chunks.iter().enumerate() {
+    for (i, loc) in metadata.chunk_locations.iter().enumerate() {
+        let chunk_id = &loc.chunk_id;
         // Pick the best node to read from
         let read_addr = chunk_node_map.get(chunk_id)
             .and_then(|addrs| addrs.first().copied())
@@ -1013,8 +975,6 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
 
     // Build updated metadata
     let mut new_metadata = metadata.clone();
-    new_metadata.chunks = new_chunk_locations.iter().map(|l| l.chunk_id).collect();
-    new_metadata.chunk_sizes = new_chunk_locations.iter().map(|l| l.size as u64).collect();
     new_metadata.chunk_locations = new_chunk_locations;
     new_metadata.modified_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

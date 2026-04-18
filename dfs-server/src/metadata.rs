@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::{ChunkId, ChunkLocation, ChunkLocationV0, ChunkLocationV1, FileId, FileMetadata, FileMetadataV0, FileMetadataV1, FileMetadataV2, NodeId};
+use dfs_common::{ChunkId, ChunkLocation, FileId, FileMetadata, NodeId};
 use sled::Db;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -87,14 +87,9 @@ impl MetadataStore {
         // Pass 1: ensure every file: record has a corresponding path: entry.
         for item in self.db.scan_prefix(b"file:") {
             let (_, value) = item?;
-            let metadata = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                m
-            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                v1.into()
-            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                v0.into()
-            } else {
-                continue;
+            let metadata = match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => m,
+                Err(_) => continue,
             };
 
             let path_key = self.path_key(&metadata.path);
@@ -112,17 +107,9 @@ impl MetadataStore {
         let mut stale_keys: Vec<sled::IVec> = Vec::new();
         for item in self.db.scan_prefix(b"path:") {
             let (key, value) = item?;
-            let file_id = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                m.id
-            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                v1.id
-            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                v0.id
-            } else if let Ok(id) = bincode::deserialize::<FileId>(&value) {
-                id
-            } else {
-                // Can't parse — leave it alone
-                continue;
+            let file_id = match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => m.id,
+                Err(_) => continue,
             };
 
             let file_key = self.file_key(&file_id);
@@ -153,18 +140,9 @@ impl MetadataStore {
         // causing unbounded metadata growth and a permanent healer backlog.
         let path_key = self.path_key(&metadata.path);
         if let Ok(Some(existing_bytes)) = self.db.get(&path_key) {
-            // Try all FileMetadata formats, then legacy FileId-only format
-            let existing_id = if let Ok(existing) = bincode::deserialize::<FileMetadata>(&existing_bytes) {
-                Some(existing.id)
-            } else if let Ok(existing) = bincode::deserialize::<FileMetadataV1>(&existing_bytes) {
-                Some(existing.id)
-            } else if let Ok(existing) = bincode::deserialize::<FileMetadataV0>(&existing_bytes) {
-                Some(existing.id)
-            } else if let Ok(id) = bincode::deserialize::<FileId>(&existing_bytes) {
-                Some(id)
-            } else {
-                None
-            };
+            let existing_id = bincode::deserialize::<FileMetadata>(&existing_bytes)
+                .ok()
+                .map(|m| m.id);
 
             if let Some(old_id) = existing_id {
                 if old_id != metadata.id {
@@ -192,15 +170,7 @@ impl MetadataStore {
         let metadata_to_store = {
             let file_key = self.file_key(&metadata.id);
             if let Ok(Some(existing_bytes)) = self.db.get(&file_key) {
-                let existing_opt = if let Ok(m) = bincode::deserialize::<FileMetadata>(&existing_bytes) {
-                    Some(m)
-                } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&existing_bytes) {
-                    Some(v1.into())
-                } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&existing_bytes) {
-                    Some(v0.into())
-                } else {
-                    None
-                };
+                let existing_opt = bincode::deserialize::<FileMetadata>(&existing_bytes).ok();
 
                 if let Some(existing) = existing_opt {
                     // Drop the incoming write if it is stale: both records have a
@@ -266,87 +236,11 @@ impl MetadataStore {
     }
 
     /// Get file metadata by ID
-    ///
-    /// BACKWARD COMPATIBILITY: This method handles both old (FileMetadataV0 with ChunkLocationV0)
-    /// and new (FileMetadata with ChunkLocation) formats for seamless upgrades.
     pub fn get_file(&self, file_id: &FileId) -> Result<Option<FileMetadata>> {
         let key = self.file_key(file_id);
-
         match self.db.get(key)? {
-            Some(value) => {
-                // Try to deserialize as new format first
-                match bincode::deserialize::<FileMetadata>(&value) {
-                    Ok(mut metadata) => {
-                        // MIGRATION FIXUP: Even for new format, populate chunk_locations if empty
-                        // This handles files that were migrated before we added chunk_locations population
-                        if metadata.chunk_locations.is_empty() && !metadata.chunks.is_empty() {
-                            info!("Populating chunk_locations for file {} ({} chunks)",
-                                  file_id, metadata.chunks.len());
-
-                            for (idx, chunk_id) in metadata.chunks.iter().enumerate() {
-                                if let Ok(Some(location)) = self.get_chunk_location(chunk_id) {
-                                    metadata.chunk_locations.push(location);
-                                } else {
-                                    warn!("Failed to find chunk location for chunk {} (idx {}) during fixup",
-                                          chunk_id, idx);
-                                }
-                            }
-
-                            // Write back updated metadata
-                            if let Err(e) = self.put_file(&metadata) {
-                                warn!("Failed to update metadata for {}: {}", file_id, e);
-                            }
-                        }
-
-                        Ok(Some(metadata))
-                    }
-                    Err(new_err) => {
-                        // Try V2 format (ChunkLocation with written_at, but no write_seq)
-                        let v2_result = bincode::deserialize::<FileMetadataV2>(&value).ok().map(FileMetadata::from);
-                        // Try V1 format (ChunkLocationV1 — has file_offset but no written_at)
-                        let v1_result = v2_result.or_else(|| {
-                            bincode::deserialize::<FileMetadataV1>(&value).ok().map(FileMetadata::from)
-                        });
-                        // Then try V0 format (ChunkLocationV0 — no file_offset or written_at)
-                        let legacy_metadata = v1_result.or_else(|| {
-                            bincode::deserialize::<FileMetadataV0>(&value).ok().map(FileMetadata::from)
-                        });
-
-                        match legacy_metadata {
-                            Some(mut metadata) => {
-                                // CRITICAL: Populate chunk_locations from legacy chunks array
-                                if metadata.chunk_locations.is_empty() && !metadata.chunks.is_empty() {
-                                    info!("Migrating {} legacy chunks to chunk_locations for file {}",
-                                          metadata.chunks.len(), file_id);
-
-                                    for (idx, chunk_id) in metadata.chunks.iter().enumerate() {
-                                        if let Ok(Some(location)) = self.get_chunk_location(chunk_id) {
-                                            metadata.chunk_locations.push(location);
-                                        } else {
-                                            warn!("Failed to find chunk location for chunk {} (idx {}) during migration",
-                                                  chunk_id, idx);
-                                        }
-                                    }
-                                }
-
-                                // Auto-migrate by writing back in current format
-                                if let Err(e) = self.put_file(&metadata) {
-                                    warn!("Failed to auto-migrate metadata for {}: {}", file_id, e);
-                                }
-
-                                Ok(Some(metadata))
-                            }
-                            None => {
-                                Err(anyhow::anyhow!(
-                                    "Failed to deserialize file metadata (tried all formats). \
-                                     New format error: {}",
-                                    new_err
-                                ))
-                            }
-                        }
-                    }
-                }
-            }
+            Some(value) => Ok(Some(bincode::deserialize::<FileMetadata>(&value)
+                .with_context(|| format!("Failed to deserialize metadata for {}", file_id))?)),
             None => Ok(None),
         }
     }
@@ -354,41 +248,9 @@ impl MetadataStore {
     /// Get file metadata by path
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
         let path_key = self.path_key(path);
-
         match self.db.get(&path_key)? {
-            Some(bytes) => {
-                // Try current FileMetadata format first
-                if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&bytes) {
-                    return Ok(Some(metadata));
-                }
-                // Try V2 format (ChunkLocation with written_at, but no write_seq)
-                if let Ok(v2) = bincode::deserialize::<FileMetadataV2>(&bytes) {
-                    let metadata: FileMetadata = v2.into();
-                    let _ = self.db.insert(&path_key, bincode::serialize(&metadata)?);
-                    return Ok(Some(metadata));
-                }
-                // Try V1 format (ChunkLocationV1 — file_offset but no written_at)
-                if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&bytes) {
-                    let metadata: FileMetadata = v1.into();
-                    let _ = self.db.insert(&path_key, bincode::serialize(&metadata)?);
-                    return Ok(Some(metadata));
-                }
-                // Try V0 format (ChunkLocationV0 — no file_offset or written_at)
-                if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&bytes) {
-                    let metadata: FileMetadata = v0.into();
-                    let _ = self.db.insert(&path_key, bincode::serialize(&metadata)?);
-                    return Ok(Some(metadata));
-                }
-                // Legacy format: FileId stored, requires second lookup
-                let file_id: FileId = bincode::deserialize(&bytes)
-                    .context("Failed to deserialize file ID")?;
-                let result = self.get_file(&file_id)?;
-                // Rewrite in new format so next access is fast
-                if let Some(ref metadata) = result {
-                    let _ = self.db.insert(path_key, bincode::serialize(metadata)?);
-                }
-                Ok(result)
-            }
+            Some(bytes) => Ok(Some(bincode::deserialize::<FileMetadata>(&bytes)
+                .with_context(|| format!("Failed to deserialize metadata for path {}", path))?)),
             None => Ok(None),
         }
     }
@@ -440,17 +302,10 @@ impl MetadataStore {
     {
         for item in self.db.scan_prefix(b"file:") {
             let (key, value) = item?;
-            let metadata = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                m
-            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                v1.into()
-            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                v0.into()
-            } else {
-                warn!("Skipping corrupt metadata entry (key={:?})", key);
-                continue;
-            };
-            f(metadata)?;
+            match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => f(m)?,
+                Err(_) => warn!("Skipping corrupt metadata entry (key={:?})", key),
+            }
         }
         Ok(())
     }
@@ -474,19 +329,12 @@ impl MetadataStore {
 
         for item in self.db.scan_prefix(b"file:") {
             let (key, value) = item?;
-            let file_id = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                // Also collect the path so we can remove the path: entry directly.
-                stale_paths.push(m.path.clone());
-                m.id
-            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                stale_paths.push(v1.path.clone());
-                v1.id
-            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                stale_paths.push(v0.path.clone());
-                v0.id
-            } else {
-                continue; // can't parse — leave it alone
+            let m = match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => m,
+                Err(_) => continue,
             };
+            let file_id = m.id;
+            stale_paths.push(m.path.clone());
 
             if !live_ids.contains(&file_id) {
                 stale_file_keys.push(key);
@@ -511,16 +359,9 @@ impl MetadataStore {
         let mut stale_path_keys: Vec<sled::IVec> = Vec::new();
         for item in self.db.scan_prefix(b"path:") {
             let (key, value) = item?;
-            let file_id = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                m.id
-            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                v1.id
-            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                v0.id
-            } else if let Ok(id) = bincode::deserialize::<FileId>(&value) {
-                id
-            } else {
-                continue;
+            let file_id = match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => m.id,
+                Err(_) => continue,
             };
             if !live_ids.contains(&file_id) {
                 stale_path_keys.push(key);
@@ -564,32 +405,9 @@ impl MetadataStore {
                 // Check if this is a direct child (not nested subdirectory)
                 let relative = &path[dir_path.len()..];
                 if !relative.is_empty() && (!relative.contains('/') || relative.ends_with('/')) {
-                    // Try current FileMetadata format first (no secondary lookup)
-                    if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&value) {
-                        files.push(metadata);
-                    } else if let Ok(v2) = bincode::deserialize::<FileMetadataV2>(&value) {
-                        // Path index entry written before write_seq was added to FileMetadata
-                        let metadata: FileMetadata = v2.into();
-                        let _ = self.db.insert(key, bincode::serialize(&metadata)?);
-                        files.push(metadata);
-                    } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                        // Path index entry written before written_at was added to ChunkLocation
-                        let metadata: FileMetadata = v1.into();
-                        let _ = self.db.insert(key, bincode::serialize(&metadata)?);
-                        files.push(metadata);
-                    } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                        // Path index entry written before file_offset was added to ChunkLocation
-                        let metadata: FileMetadata = v0.into();
-                        let _ = self.db.insert(key, bincode::serialize(&metadata)?);
-                        files.push(metadata);
-                    } else if let Ok(file_id) = bincode::deserialize::<FileId>(&value) {
-                        // Legacy entry — fetch metadata and rewrite index in new format
-                        if let Some(metadata) = self.get_file(&file_id)? {
-                            let _ = self.db.insert(key, bincode::serialize(&metadata)?);
-                            files.push(metadata);
-                        }
-                    } else {
-                        warn!("list_directory: could not deserialize path index entry for {}", path);
+                    match bincode::deserialize::<FileMetadata>(&value) {
+                        Ok(metadata) => files.push(metadata),
+                        Err(_) => warn!("list_directory: could not deserialize path index entry for {}", path),
                     }
                 }
             }
@@ -774,18 +592,10 @@ impl MetadataStore {
         let mut out = Vec::new();
         for item in self.db.scan_prefix(b"file:") {
             let (_, value) = item?;
-            let (id, modified_at) = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                (m.id, m.modified_at)
-            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                let m: FileMetadata = v1.into();
-                (m.id, m.modified_at)
-            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                let m: FileMetadata = v0.into();
-                (m.id, m.modified_at)
-            } else {
-                continue;
-            };
-            out.push((id, modified_at));
+            match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => out.push((m.id, m.modified_at)),
+                Err(_) => continue,
+            }
         }
         Ok(out)
     }
@@ -810,12 +620,10 @@ impl MetadataStore {
         let mut count = 0usize;
         for item in self.db.scan_prefix(b"file:") {
             let (_, value) = item?;
-            let meta: FileMetadata = if let Ok(m) = bincode::deserialize(&value) { m }
-                else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) { v1.into() }
-                else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) { v0.into() }
-                else { continue; };
-            f(meta)?;
-            count += 1;
+            match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => { f(m)?; count += 1; }
+                Err(_) => continue,
+            }
         }
         Ok(count)
     }
@@ -880,22 +688,9 @@ impl MetadataStore {
         let prefix = b"file:";
         for item in self.db.scan_prefix(prefix) {
             let (_, value) = item?;
-            // Try current format, then V1, then V0.
-            let metadata_opt: Option<FileMetadata> = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                Some(m)
-            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                Some(v1.into())
-            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                Some(v0.into())
-            } else {
-                None
-            };
-            if let Some(metadata) = metadata_opt {
+            if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&value) {
                 for loc in &metadata.chunk_locations {
                     live.insert(loc.chunk_id);
-                }
-                for &chunk_id in &metadata.chunks {
-                    live.insert(chunk_id);
                 }
             }
         }
@@ -919,14 +714,9 @@ impl MetadataStore {
 
         for item in self.db.scan_prefix(b"file:") {
             let (_, value) = item?;
-            let metadata: FileMetadata = if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                m
-            } else if let Ok(v1) = bincode::deserialize::<FileMetadataV1>(&value) {
-                v1.into()
-            } else if let Ok(v0) = bincode::deserialize::<FileMetadataV0>(&value) {
-                v0.into()
-            } else {
-                continue;
+            let metadata: FileMetadata = match bincode::deserialize::<FileMetadata>(&value) {
+                Ok(m) => m,
+                Err(_) => continue,
             };
 
             for loc in &metadata.chunk_locations {
@@ -960,33 +750,8 @@ impl MetadataStore {
         let key = self.chunk_key(chunk_id);
 
         match self.db.get(&key)? {
-            Some(value) => {
-                // Try current format (6 fields), then V1 (5 fields, no written_at),
-                // then V0 (4 fields, no file_offset or written_at).
-                match bincode::deserialize::<ChunkLocation>(&value) {
-                    Ok(location) => Ok(Some(location)),
-                    Err(_) => match bincode::deserialize::<ChunkLocationV1>(&value) {
-                        Ok(v1) => {
-                            let location = ChunkLocation::from(v1);
-                            if let Ok(encoded) = bincode::serialize(&location) {
-                                let _ = self.db.insert(&key, encoded);
-                            }
-                            Ok(Some(location))
-                        }
-                        Err(_) => match bincode::deserialize::<ChunkLocationV0>(&value) {
-                            Ok(v0) => {
-                                let location = ChunkLocation::from(v0);
-                                // Migrate in place so we don't hit this path again
-                                if let Ok(encoded) = bincode::serialize(&location) {
-                                    let _ = self.db.insert(&key, encoded);
-                                }
-                                Ok(Some(location))
-                            }
-                            Err(e) => Err(anyhow::anyhow!("Failed to deserialize chunk location (tried all formats): {}", e)),
-                        },
-                    },
-                }
-            }
+            Some(value) => Ok(Some(bincode::deserialize::<ChunkLocation>(&value)
+                .with_context(|| format!("Failed to deserialize chunk location {}", chunk_id))?)),
             None => Ok(None),
         }
     }
@@ -1115,7 +880,8 @@ mod tests {
             nodes: vec![NodeId::new(), NodeId::new()],
             size: 4096,
             checksum: [2u8; 32],
-            file_offset: None,  // Test data doesn't need file offsets
+            file_offset: None,
+            written_at: None,
         };
 
         store.put_chunk_location(&location).unwrap();

@@ -1090,7 +1090,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         file_path: &str,
         offset: usize,
         size: usize,
-        metadata_locations: Vec<dfs_common::ChunkLocation>,
     ) -> Result<Vec<u8>> {
         if size == 0 || offset >= file_size as usize {
             return Ok(Vec::new());
@@ -1102,7 +1101,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // refresh_engine() is a no-op if another refresh (e.g. from open()) is already running,
         // so after the call we spin-wait for the flag to clear before taking a snapshot.
         if engine.needs_refresh(file_size).await {
-            self.refresh_engine(&engine, file_id, file_size, metadata_locations).await;
+            self.refresh_engine(&engine, file_id, file_size).await;
         }
         // Whether we refreshed or skipped, wait for any in-progress refresh to finish
         // (could have been started by open() prefetch) before taking the snapshot.
@@ -1357,50 +1356,19 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Refresh the engine's chunk map from the leader.
-    /// Falls back to `metadata_locations` (from metadata_cache) for legacy files where the
-    /// leader's in-memory chunk_map has no entry (files written before chunk_locations existed).
     pub async fn refresh_engine(
         &self,
         engine: &InodeReadEngine,
         file_id: FileId,
         file_size: u64,
-        metadata_locations: Vec<dfs_common::ChunkLocation>,
     ) {
         use std::sync::atomic::Ordering;
-        // Only one refresh at a time — skip if another is already running.
         if engine.refresh_in_progress.compare_exchange(
             false, true, Ordering::AcqRel, Ordering::Relaxed,
         ).is_err() {
             return;
         }
-
-        let nim: std::collections::HashMap<dfs_common::NodeId, SocketAddr> = {
-            let addr_map = self.addr_to_node_id.read().await;
-            addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
-        };
-
-        // Try the authoritative source first (leader's in-memory chunk_map).
-        let locations = match self.get_file_chunk_map(file_id).await {
-            Ok((locs, _)) if !locs.is_empty() => {
-                info!("refresh_engine: inode={} got {} chunks from leader", engine.inode, locs.len());
-                locs
-            }
-            Ok(_) | Err(_) => {
-                // Leader has no entry — use chunk_locations from cached metadata.
-                if !metadata_locations.is_empty() {
-                    info!("refresh_engine: inode={} falling back to {} metadata chunk_locations",
-                          engine.inode, metadata_locations.len());
-                    metadata_locations
-                } else {
-                    info!("refresh_engine: inode={} no chunk_locations available", engine.inode);
-                    engine.refresh_in_progress.store(false, Ordering::Release);
-                    return;
-                }
-            }
-        };
-
-        engine.update_chunk_map(locations, Arc::new(nim), file_size).await;
-        engine.refresh_in_progress.store(false, Ordering::Release);
+        self.refresh_engine_flagged(engine, file_id, file_size).await;
     }
 
     /// Like `refresh_engine` but assumes the caller already set `refresh_in_progress = true`.
@@ -1410,7 +1378,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         engine: &InodeReadEngine,
         file_id: FileId,
         file_size: u64,
-        metadata_locations: Vec<dfs_common::ChunkLocation>,
     ) {
         use std::sync::atomic::Ordering;
         let nim: std::collections::HashMap<dfs_common::NodeId, SocketAddr> = {
@@ -1418,25 +1385,16 @@ leader_addr: Arc::new(RwLock::new(None)),
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
         };
 
-        let locations = match self.get_file_chunk_map(file_id).await {
+        match self.get_file_chunk_map(file_id).await {
             Ok((locs, _)) if !locs.is_empty() => {
                 info!("refresh_engine: inode={} got {} chunks from leader", engine.inode, locs.len());
-                locs
+                engine.update_chunk_map(locs, Arc::new(nim), file_size).await;
             }
             Ok(_) | Err(_) => {
-                if !metadata_locations.is_empty() {
-                    info!("refresh_engine: inode={} falling back to {} metadata chunk_locations",
-                          engine.inode, metadata_locations.len());
-                    metadata_locations
-                } else {
-                    info!("refresh_engine: inode={} no chunk_locations available", engine.inode);
-                    engine.refresh_in_progress.store(false, Ordering::Release);
-                    return;
-                }
+                info!("refresh_engine: inode={} no chunk map from leader", engine.inode);
             }
-        };
+        }
 
-        engine.update_chunk_map(locations, Arc::new(nim), file_size).await;
         engine.refresh_in_progress.store(false, Ordering::Release);
     }
 
@@ -1697,13 +1655,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 replicas = if let Some(c) = cached {
                     (*c).clone()
                 } else {
-                    match self.get_chunk_replicas(chunk_id).await {
-                        Ok(r) => {
-                            self.replica_cache.lock().await.put(chunk_id, Arc::new(r.clone()));
-                            r
-                        }
-                        Err(_) => nodes.clone(),
-                    }
+                    nodes.clone()
                 };
             }
 
@@ -1906,10 +1858,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     warn!("Timeout waiting for chunk {} being fetched by another request, fetching ourselves", chunk_id);
 
                     // Try to fetch it ourselves, trying multiple replicas if needed
-                    let replicas = match self.get_chunk_replicas(chunk_id).await {
-                        Ok(r) => r,
-                        Err(_) => self.cluster_nodes.read().await.clone(),
-                    };
+                    let replicas = self.cluster_nodes.read().await.clone();
 
                     let selected_replica = self.select_replica(&replicas).await
                         .context("No replicas available for fallback fetch")?;
@@ -2073,34 +2022,6 @@ leader_addr: Arc::new(RwLock::new(None)),
             Response::FileChunkMap { locations, modified_at, .. } => Ok((locations, modified_at)),
             Response::Error { message, .. } => anyhow::bail!("GetFileChunkMap error: {}", message),
             _ => anyhow::bail!("Unexpected response to GetFileChunkMap"),
-        }
-    }
-
-    /// Query cluster for chunk replica locations (returns node addresses that have this chunk)
-    async fn get_chunk_replicas(&self, chunk_id: ChunkId) -> Result<Vec<SocketAddr>> {
-        let request = Request::GetChunkReplicas { chunk_id };
-        let nodes = self.cluster_nodes.read().await;
-
-        // Query any node for replica locations
-        let query_node = nodes.first().context("No cluster nodes available")?;
-
-        let response = self.send_request(*query_node, request).await?;
-
-        match response {
-            Response::ChunkReplicas { nodes: replica_node_ids, .. } => {
-                // Convert NodeIds to SocketAddrs using cluster node list
-                // For now, use all nodes as potential replicas if we can't map NodeId
-                // In production, you'd maintain a NodeId->SocketAddr mapping
-                if !replica_node_ids.is_empty() {
-                    Ok(nodes.clone())
-                } else {
-                    anyhow::bail!("No replicas found for chunk")
-                }
-            }
-            Response::Error { message, .. } => {
-                anyhow::bail!("Failed to get chunk replicas: {}", message)
-            }
-            _ => anyhow::bail!("Unexpected response type"),
         }
     }
 
@@ -2655,16 +2576,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         if node_addrs.is_empty() {
             // None of the chunk_locations nodes exist in current cluster
             // Fall back to normal replica discovery path
-            warn!("Striped read requested but none of the chunk_location nodes are in current cluster, using replica discovery");
+            warn!("Striped read requested but none of the chunk_location nodes are in current cluster, falling back to all nodes");
 
-            let replicas = match self.get_chunk_replicas(chunk_id).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Last resort: try all cluster nodes
-                    warn!("Failed to get chunk replicas: {}, trying all cluster nodes", e);
-                    self.cluster_nodes.read().await.clone()
-                }
-            };
+            let replicas = self.cluster_nodes.read().await.clone();
 
             for node_addr in &replicas {
                 match self.read_chunk_from_server(*node_addr, chunk_id).await {
@@ -2742,10 +2656,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         drop(node_id_map);
 
         if node_addrs.is_empty() {
-            node_addrs = match self.get_chunk_replicas(chunk_id).await {
-                Ok(r) => r,
-                Err(_) => self.cluster_nodes.read().await.clone(),
-            };
+            node_addrs = self.cluster_nodes.read().await.clone();
         }
 
         for addr in &node_addrs {

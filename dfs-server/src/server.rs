@@ -136,30 +136,7 @@ impl Server {
 
             let result = metadata.scan_files(|file| {
                 total += 1;
-                if file.chunk_locations.is_empty() {
-                    // Legacy file: load chunk locations from individual chunk records
-                    let mut locations = Vec::new();
-                    let mut file_offset = 0u64;
-                    let mut ok = true;
-                    for (&chunk_id, &size) in file.chunks.iter().zip(file.chunk_sizes.iter()) {
-                        match metadata.get_chunk_location(&chunk_id) {
-                            Ok(Some(loc)) => {
-                                let mut loc = loc;
-                                if loc.file_offset.is_none() {
-                                    loc.file_offset = Some(file_offset);
-                                }
-                                file_offset += loc.size as u64;
-                                locations.push(loc);
-                            }
-                            _ => { ok = false; break; }
-                        }
-                        let _ = size; // suppress unused warning
-                    }
-                    if ok && !locations.is_empty() {
-                        chunk_map.insert(file.id, (locations, file.modified_at));
-                        built += 1;
-                    }
-                } else {
+                if !file.chunk_locations.is_empty() {
                     chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
                     built += 1;
                 }
@@ -175,37 +152,8 @@ impl Server {
 
     /// Update the chunk map for a single file — called after every metadata write or heal.
     async fn chunk_map_update(&self, metadata: &FileMetadata) {
-        let locations = if !metadata.chunk_locations.is_empty() {
-            metadata.chunk_locations.clone()
-        } else {
-            // Legacy path: resolve locations from chunk records
-            let mut locations = Vec::new();
-            let mut file_offset = 0u64;
-            for &chunk_id in &metadata.chunks {
-                match self.metadata.get_chunk_location(&chunk_id) {
-                    Ok(Some(mut loc)) => {
-                        if loc.file_offset.is_none() {
-                            loc.file_offset = Some(file_offset);
-                        }
-                        file_offset += loc.size as u64;
-                        locations.push(loc);
-                    }
-                    _ => break,
-                }
-            }
-            locations
-        };
-
-        if !locations.is_empty() {
-            self.chunk_map.insert(metadata.id, (locations, metadata.modified_at));
-        } else if !metadata.chunks.is_empty() {
-            // The file has chunks but we couldn't resolve their locations — this node
-            // may not yet have received the chunk-location replication for this write
-            // (metadata arrived before chunk locations in the async replication pipeline).
-            // Do NOT overwrite an existing valid entry with nothing; preserve whatever
-            // we already have so reads can still route correctly.
-            debug!("chunk_map_update: could not resolve locations for {} ({} chunks), preserving existing map entry",
-                   metadata.path, metadata.chunks.len());
+        if !metadata.chunk_locations.is_empty() {
+            self.chunk_map.insert(metadata.id, (metadata.chunk_locations.clone(), metadata.modified_at));
         }
         // If the file has no chunks yet (new empty file), no map entry is needed.
     }
@@ -658,9 +606,6 @@ impl Server {
             Request::HealFile { path } => self.handle_heal_file(path).await,
             Request::GetFileInfo { path } => self.handle_get_file_info(path).await,
             Request::GetFileInfoById { file_id } => self.handle_get_file_info_by_id(file_id).await,
-            Request::GetChunkReplicas { chunk_id } => {
-                self.handle_get_chunk_replicas(chunk_id).await
-            }
             Request::RemoveNode { node_id } => self.handle_remove_node(node_id).await,
             Request::ListAllFiles => self.handle_list_all_files().await,
             Request::PurgeFileMetadata { path } => self.handle_purge_file_metadata(path).await,
@@ -2100,17 +2045,9 @@ impl Server {
 
         // --- Step 7: Splice metadata ---
         if drop_last_chunk {
-            // Replace the partial tail chunk entry with the new chunk(s)
             metadata.chunk_locations.pop();
-            // Also keep legacy fields in sync
-            if !metadata.chunks.is_empty() {
-                metadata.chunks.pop();
-                metadata.chunk_sizes.pop();
-            }
         }
         for loc in &new_locations {
-            metadata.chunks.push(loc.chunk_id);
-            metadata.chunk_sizes.push(loc.size as u64);
             metadata.chunk_locations.push(loc.clone());
         }
 
@@ -2335,15 +2272,7 @@ impl Server {
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
                 // Collect chunk locations NOW, before deleting metadata.
-                // Prefer inline chunk_locations (new format); fall back to querying
-                // individual chunk: records for legacy files.
-                let chunk_locations: Vec<_> = if !metadata.chunk_locations.is_empty() {
-                    metadata.chunk_locations.clone()
-                } else {
-                    metadata.chunks.iter().filter_map(|chunk_id| {
-                        self.metadata.get_chunk_location(chunk_id).ok().flatten()
-                    }).collect()
-                };
+                let chunk_locations = metadata.chunk_locations.clone();
 
                 // Delete the file metadata
                 match self.metadata.delete_file(&metadata.id) {
@@ -2851,7 +2780,7 @@ impl Server {
         };
         drop(healing_guard);
 
-        let chunk_ids: Vec<ChunkId> = file_meta.chunks.clone();
+        let chunk_ids: Vec<ChunkId> = file_meta.chunk_locations.iter().map(|l| l.chunk_id).collect();
         let count = chunk_ids.len();
         healing.queue_chunks_immediate(chunk_ids).await;
 
@@ -2867,39 +2796,21 @@ impl Server {
 
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                // Build chunk locations: prefer inline chunk_locations in FileMetadata (most
-                // accurate — written by the client with both replica node IDs), falling back
-                // to the per-chunk sled DB for any chunks not covered by the inline map.
-                let chunk_locations = if !metadata.chunk_locations.is_empty()
-                    && metadata.chunk_locations.len() == metadata.chunks.len()
-                {
-                    // Inline locations are complete — use them directly, but merge with sled
-                    // to pick up any extra nodes added by ReplicateChunkLocation since the
-                    // file was written.
-                    metadata.chunk_locations.iter().map(|inline| {
-                        if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
-                            // Merge: union of both node lists
-                            let mut merged_nodes = inline.nodes.clone();
-                            for node in &sled_loc.nodes {
-                                if !merged_nodes.contains(node) {
-                                    merged_nodes.push(*node);
-                                }
+                // Merge sled node lists into inline chunk_locations to pick up any
+                // extra replica nodes added by ReplicateChunkLocation since the file was written.
+                let chunk_locations = metadata.chunk_locations.iter().map(|inline| {
+                    if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
+                        let mut merged_nodes = inline.nodes.clone();
+                        for node in &sled_loc.nodes {
+                            if !merged_nodes.contains(node) {
+                                merged_nodes.push(*node);
                             }
-                            ChunkLocation { nodes: merged_nodes, ..inline.clone() }
-                        } else {
-                            inline.clone()
                         }
-                    }).collect()
-                } else {
-                    // Inline locations absent or mismatched — fall back to sled DB
-                    let mut locs = Vec::new();
-                    for chunk_id in &metadata.chunks {
-                        if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
-                            locs.push(location);
-                        }
+                        ChunkLocation { nodes: merged_nodes, ..inline.clone() }
+                    } else {
+                        inline.clone()
                     }
-                    locs
-                };
+                }).collect();
 
                 Response::FileInfo {
                     metadata,
@@ -2926,31 +2837,19 @@ impl Server {
 
         match self.metadata.get_file(&file_id) {
             Ok(Some(metadata)) => {
-                let chunk_locations = if !metadata.chunk_locations.is_empty()
-                    && metadata.chunk_locations.len() == metadata.chunks.len()
-                {
-                    metadata.chunk_locations.iter().map(|inline| {
-                        if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
-                            let mut merged_nodes = inline.nodes.clone();
-                            for node in &sled_loc.nodes {
-                                if !merged_nodes.contains(node) {
-                                    merged_nodes.push(*node);
-                                }
+                let chunk_locations = metadata.chunk_locations.iter().map(|inline| {
+                    if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
+                        let mut merged_nodes = inline.nodes.clone();
+                        for node in &sled_loc.nodes {
+                            if !merged_nodes.contains(node) {
+                                merged_nodes.push(*node);
                             }
-                            ChunkLocation { nodes: merged_nodes, ..inline.clone() }
-                        } else {
-                            inline.clone()
                         }
-                    }).collect()
-                } else {
-                    let mut locs = Vec::new();
-                    for chunk_id in &metadata.chunks {
-                        if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
-                            locs.push(location);
-                        }
+                        ChunkLocation { nodes: merged_nodes, ..inline.clone() }
+                    } else {
+                        inline.clone()
                     }
-                    locs
-                };
+                }).collect();
 
                 Response::FileInfo {
                     metadata,
@@ -2987,29 +2886,6 @@ impl Server {
                 message: format!("No chunk map entry for file {}", file_id),
                 code: ErrorCode::NotFound,
             },
-        }
-    }
-
-    /// Handle get chunk replicas request
-    async fn handle_get_chunk_replicas(&self, chunk_id: ChunkId) -> Response {
-        debug!("Handling get chunk replicas: {}", chunk_id);
-
-        match self.metadata.get_chunk_location(&chunk_id) {
-            Ok(Some(location)) => Response::ChunkReplicas {
-                chunk_id,
-                nodes: location.nodes,
-            },
-            Ok(None) => Response::Error {
-                message: "Chunk not found".to_string(),
-                code: ErrorCode::NotFound,
-            },
-            Err(e) => {
-                warn!("Failed to get chunk replicas: {}", e);
-                Response::Error {
-                    message: format!("Failed to get chunk replicas: {}", e),
-                    code: ErrorCode::InternalError,
-                }
-            }
         }
     }
 
@@ -3284,6 +3160,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dfs_common::hash::compute_chunk_hash;
     use tempfile::TempDir;
 
     #[tokio::test]

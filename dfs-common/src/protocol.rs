@@ -267,11 +267,6 @@ pub enum Request {
         path: String,
     },
 
-    /// Get chunk replica locations
-    GetChunkReplicas {
-        chunk_id: ChunkId,
-    },
-
     /// Remove a node from the cluster
     RemoveNode {
         node_id: NodeId,
@@ -411,9 +406,6 @@ pub enum Response {
     ChunkIds {
         chunk_ids: Vec<ChunkId>,
         chunk_sizes: Vec<u64>,
-        /// All NodeIds that received replicas of the written chunks.
-        /// One entry per chunk_id (same ordering). Empty means unknown (legacy).
-        #[serde(default)]
         replica_nodes_per_chunk: Vec<Vec<crate::NodeId>>,
     },
 
@@ -458,12 +450,6 @@ pub enum Response {
     FileInfo {
         metadata: FileMetadata,
         chunk_locations: Vec<ChunkLocation>,
-    },
-
-    /// Chunk replicas response
-    ChunkReplicas {
-        chunk_id: ChunkId,
-        nodes: Vec<NodeId>,
     },
 
     /// File list response (admin operation)

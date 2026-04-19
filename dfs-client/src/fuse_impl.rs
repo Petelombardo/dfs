@@ -1537,7 +1537,7 @@ impl Filesystem for DfsFilesystem {
         // Check directory cache first (5-second TTL)
         let cached_entries = self.dir_cache.get(&path).and_then(|entry| {
             let (entries, timestamp) = &*entry;
-            if timestamp.elapsed() < std::time::Duration::from_secs(30) {
+            if timestamp.elapsed() < std::time::Duration::from_secs(5) {
                 debug!("Directory cache HIT for {}", path);
                 Some(entries.clone())
             } else {
@@ -1659,7 +1659,7 @@ impl Filesystem for DfsFilesystem {
                 let subdir = entry.path.clone();
                 // Skip if already cached and fresh
                 if let Some(cached) = dir_cache.get(&subdir) {
-                    if cached.1.elapsed() < std::time::Duration::from_secs(30) {
+                    if cached.1.elapsed() < std::time::Duration::from_secs(5) {
                         continue;
                     }
                 }

@@ -1653,44 +1653,41 @@ impl Filesystem for DfsFilesystem {
 
             // Prefetch subdirectory listings in the background so the next level of
             // readdir calls (e.g. DVR indexer walking show → episode directories) are
-            // instant cache hits.  Fire-and-forget — we don't wait for these.
-            let subdirs: Vec<String> = entries.iter()
-                .filter(|e| e.file_type == FileType::Directory)
-                .map(|e| e.path.clone())
-                .collect();
-
-            if !subdirs.is_empty() {
-                let futures: Vec<_> = subdirs.into_iter().map(|subdir| {
-                    let client = client.clone();
-                    let dir_cache = dir_cache.clone();
-                    let metadata_cache = metadata_cache.clone();
-                    let path_to_inode = path_to_inode.clone();
-                    let next_inode = next_inode.clone();
-                    let last_metadata_update = last_metadata_update.clone();
-                    async move {
-                        // Skip if already cached and fresh
-                        if let Some(entry) = dir_cache.get(&subdir) {
-                            if entry.1.elapsed() < std::time::Duration::from_secs(30) {
-                                return;
-                            }
+            // instant cache hits.  Each subdir gets its own independent task so the
+            // readdir reply is not delayed waiting for network I/O.
+            for entry in entries.iter().filter(|e| e.file_type == FileType::Directory) {
+                let subdir = entry.path.clone();
+                // Skip if already cached and fresh
+                if let Some(cached) = dir_cache.get(&subdir) {
+                    if cached.1.elapsed() < std::time::Duration::from_secs(30) {
+                        continue;
+                    }
+                }
+                let client = client.clone();
+                let dir_cache = dir_cache.clone();
+                let metadata_cache = metadata_cache.clone();
+                let path_to_inode = path_to_inode.clone();
+                let next_inode = next_inode.clone();
+                let last_metadata_update = last_metadata_update.clone();
+                tokio::spawn(async move {
+                    let fetch_start = std::time::Instant::now();
+                    if let Ok(sub_entries) = client.list_directory(&subdir).await {
+                        // Only cache if the directory hasn't been invalidated while fetching.
+                        let still_valid = match dir_cache.get(&subdir) {
+                            Some(entry) => entry.1 < fetch_start,
+                            None => true,
+                        };
+                        if still_valid {
+                            dir_cache.insert(subdir.clone(), (sub_entries.clone(), std::time::Instant::now()));
                         }
-                        let fetch_start = std::time::Instant::now();
-                        if let Ok(sub_entries) = client.list_directory(&subdir).await {
-                            // Only cache if the directory hasn't been invalidated while we
-                            // were fetching.
-                            let still_valid = match dir_cache.get(&subdir) {
-                                Some(entry) => entry.1 < fetch_start,
-                                None => false,
-                            };
-                            if still_valid {
-                                dir_cache.insert(
-                                    subdir.clone(),
-                                    (sub_entries.clone(), std::time::Instant::now()),
-                                );
-                            }
-                            let now = std::time::Instant::now();
-                            for entry in &sub_entries {
-                                let ino_val = {
+                        let now = std::time::Instant::now();
+                        for entry in &sub_entries {
+                            let ino_val = {
+                                let path_map = path_to_inode.read().unwrap();
+                                if let Some(&existing) = path_map.get(&entry.path) {
+                                    existing
+                                } else {
+                                    drop(path_map);
                                     let mut path_map = path_to_inode.write().unwrap();
                                     if let Some(&existing) = path_map.get(&entry.path) {
                                         existing
@@ -1698,19 +1695,19 @@ impl Filesystem for DfsFilesystem {
                                         let mut next = next_inode.write().unwrap();
                                         let v = *next;
                                         *next += 1;
+                                        drop(next);
                                         path_map.insert(entry.path.clone(), v);
                                         v
                                     }
-                                };
-                                client.seed_write_seq(entry.id, entry.write_seq);
-                                metadata_cache.insert(ino_val, entry.clone());
-                                last_metadata_update.insert(ino_val, now);
-                            }
-                            debug!("Prefetched {} entries for {}", sub_entries.len(), subdir);
+                                }
+                            };
+                            client.seed_write_seq(entry.id, entry.write_seq);
+                            metadata_cache.insert(ino_val, entry.clone());
+                            last_metadata_update.insert(ino_val, now);
                         }
+                        debug!("Prefetched {} entries for {}", sub_entries.len(), subdir);
                     }
-                }).collect();
-                futures::future::join_all(futures).await;
+                });
             }
         });
     }

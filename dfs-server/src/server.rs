@@ -406,6 +406,7 @@ impl Server {
                     continue;
                 }
 
+                let mut backoff_ms = 2_000u64;
                 loop {
                     let entry = {
                         let queue = server.leader_forward_queue.lock().await;
@@ -416,17 +417,17 @@ impl Server {
                         None => break,
                     };
 
-                    // Expired — drop it (leader catchup will cover it within 5 min).
+                    // Expired — drop it (periodic catchup covers remaining gaps).
                     if enqueued_at.elapsed() > std::time::Duration::from_secs(60) {
                         warn!("leader_forward: dropping expired entry for {} (>60s)", metadata.path);
                         server.leader_forward_queue.lock().await.pop_front();
+                        backoff_ms = 2_000;
                         continue;
                     }
 
                     // Re-check leader — may have changed while we were working.
                     let now_leader = server.cluster.get_leader_addr().await;
                     if now_leader != Some(leader_addr) {
-                        // Leader changed mid-drain — break to outer loop to re-evaluate.
                         break;
                     }
 
@@ -439,24 +440,27 @@ impl Server {
                             Message::Response(Response::Ok { .. }) => {
                                 debug!("leader_forward: delivered {} to leader {}", metadata.path, leader_addr);
                                 server.leader_forward_queue.lock().await.pop_front();
+                                backoff_ms = 2_000; // reset for next entry
                             }
                             Message::Response(Response::NotLeader { leader_addr: redirect }) => {
-                                // Leader moved — update and break to re-evaluate.
-                                debug!("leader_forward: {} said NotLeader, redirecting to {:?}", leader_addr, redirect);
+                                debug!("leader_forward: NotLeader, redirecting to {:?}", redirect);
                                 break;
                             }
                             other => {
-                                warn!("leader_forward: unexpected response from leader for {}: {:?}", metadata.path, other);
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                warn!("leader_forward: unexpected response for {}: {:?}", metadata.path, other);
+                                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(30_000);
                             }
                         },
                         Ok(Err(e)) => {
                             debug!("leader_forward: send failed for {} to {}: {}", metadata.path, leader_addr, e);
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2).min(30_000);
                         }
                         Err(_) => {
                             debug!("leader_forward: timeout forwarding {} to {}", metadata.path, leader_addr);
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2).min(30_000);
                         }
                     }
                 }

@@ -550,6 +550,10 @@ pub struct DfsFilesystem {
     /// lookup() returns ENOENT for these paths so that a concurrent create/open
     /// does not race with the still-pending server-side delete.
     pending_deletes: Arc<dashmap::DashSet<String>>,
+
+    /// Inodes for which a background getattr refresh is already in flight.
+    /// Prevents unbounded spawning of concurrent refresh tasks (one per inode max).
+    refreshing_inodes: Arc<dashmap::DashSet<u64>>,
 }
 
 impl DfsFilesystem {
@@ -744,6 +748,7 @@ impl DfsFilesystem {
             flush_in_flight: flush_in_flight_shared,
             flush_handle,
             pending_deletes: Arc::new(dashmap::DashSet::new()),
+            refreshing_inodes: Arc::new(dashmap::DashSet::new()),
         })
     }
 
@@ -1239,6 +1244,7 @@ impl Filesystem for DfsFilesystem {
         let write_buffer_enabled = self.write_buffer_enabled;
         let size_high_water = self.size_high_water.clone();
         let write_open_counts = self.write_open_counts.clone();
+        let refreshing_inodes = self.refreshing_inodes.clone();
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
@@ -1255,19 +1261,24 @@ impl Filesystem for DfsFilesystem {
                         Some(t) => t.elapsed() >= std::time::Duration::from_secs(5),
                     };
 
-                    if should_refresh {
-                        // Refresh in the background — don't block the FUSE reply on a server
-                        // round-trip. Stale-by-a-few-seconds is fine for stat/getattr; blocking
-                        // here makes find/ls hang when nodes are slow or temporarily overloaded.
+                    // Gate: only one background refresh per inode at a time.
+                    // Without this, a slow node causes unbounded task accumulation that
+                    // exhausts the connection pool and freezes the entire tokio runtime.
+                    if should_refresh && refreshing_inodes.insert(ino) {
                         let client_bg = client.clone();
                         let metadata_cache_bg = metadata_cache.clone();
                         let last_metadata_update_bg = last_metadata_update.clone();
+                        let refreshing_inodes_bg = refreshing_inodes.clone();
                         let path_bg = metadata.path.clone();
                         let current_modified_at = metadata.modified_at;
                         let current_size = metadata.size;
                         let current_chunks = metadata.chunk_locations.len();
                         tokio::spawn(async move {
-                            if let Ok(Some(fresh)) = client_bg.get_file_metadata(&path_bg).await {
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                client_bg.get_file_metadata(&path_bg),
+                            ).await;
+                            if let Ok(Ok(Some(fresh))) = result {
                                 let server_is_newer = fresh.modified_at > current_modified_at
                                     || (fresh.modified_at == current_modified_at
                                         && (fresh.size > current_size
@@ -1278,6 +1289,7 @@ impl Filesystem for DfsFilesystem {
                                 }
                             }
                             last_metadata_update_bg.insert(ino, std::time::Instant::now());
+                            refreshing_inodes_bg.remove(&ino);
                         });
                     }
 

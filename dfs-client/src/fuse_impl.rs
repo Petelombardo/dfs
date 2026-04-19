@@ -183,6 +183,7 @@ struct FlushHandle {
     metadata_cache: Arc<DashMap<u64, FileMetadata>>,
     flush_in_flight: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>>,
     last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
+    dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
 }
 
 impl FlushHandle {
@@ -437,6 +438,28 @@ impl FlushHandle {
 
         let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
         if let Some(meta) = meta_to_persist {
+            // Update the parent directory cache with our current metadata so readdir
+            // reflects writes the client itself made without waiting for a server round-trip.
+            // The client already knows what it wrote — no need to ask the server.
+            let parent_path = meta.path.rfind('/').map(|i| {
+                let p = &meta.path[..i];
+                if p.is_empty() { "/".to_string() } else { p.to_string() }
+            });
+            if let Some(parent) = parent_path {
+                if let Some(mut dir_entry) = self.dir_cache.get_mut(&parent) {
+                    let (entries, _) = &mut *dir_entry;
+                    if let Some(pos) = entries.iter().position(|e| e.id == meta.id) {
+                        entries[pos] = meta.clone();
+                    } else {
+                        entries.push(meta.clone());
+                    }
+                }
+                // If not in dir cache yet, just invalidate so next readdir fetches fresh.
+                else {
+                    self.dir_cache.remove(&parent);
+                }
+            }
+
             if force {
                 // release/fsync: enqueue metadata immediately (don't wait for leader ack).
                 // Chunk data is already durable above; metadata propagates async.
@@ -621,6 +644,9 @@ impl DfsFilesystem {
 
         let write_open_counts: Arc<DashMap<u64, usize>> = Arc::new(DashMap::new());
 
+        let dir_cache_shared: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>> =
+            Arc::new(DashMap::new());
+
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
             let write_buffers_clone = write_buffers_for_cleanup.clone();
@@ -641,6 +667,7 @@ impl DfsFilesystem {
                 metadata_cache: metadata_cache_for_cleanup.clone(),
                 flush_in_flight: flush_in_flight_shared.clone(),
                 last_metadata_update: last_metadata_update_shared.clone(),
+                dir_cache: dir_cache_shared.clone(),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
@@ -723,6 +750,7 @@ impl DfsFilesystem {
             metadata_cache: metadata_cache.clone(),
             flush_in_flight: flush_in_flight_shared.clone(),
             last_metadata_update: last_metadata_update_shared.clone(),
+            dir_cache: dir_cache_shared.clone(),
         };
 
         Ok(Self {
@@ -739,7 +767,7 @@ impl DfsFilesystem {
             last_chunk_cache: Arc::new(RwLock::new(None)),
             last_warm_offset: Arc::new(DashMap::new()),
             chunk_offset_cache: Arc::new(DashMap::new()),
-            dir_cache: Arc::new(DashMap::new()),
+            dir_cache: dir_cache_shared,
             statfs_cache: Arc::new(RwLock::new(None)),
             lock_manager: Arc::new(LockManager::new()),
             buffer_flush_threshold,
@@ -959,6 +987,7 @@ impl Filesystem for DfsFilesystem {
             metadata_cache: metadata_cache.clone(),
             flush_in_flight: flush_in_flight.clone(),
             last_metadata_update: self.last_metadata_update.clone(),
+            dir_cache: self.dir_cache.clone(),
         };
 
         self.block_on(async move {

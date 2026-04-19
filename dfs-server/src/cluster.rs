@@ -190,19 +190,26 @@ impl ClusterManager {
 
     /// Returns true if this node is the current cluster leader.
     ///
-    /// Leader = the online node with the minimum NodeId. Every node computes this
-    /// independently from its gossip view — no election protocol needed. Leadership
-    /// transfers automatically when the current leader goes offline.
+    /// Leader = the online node with the minimum NodeId, BUT only if this node
+    /// can see a strict majority of the cluster as online (quorum). Without the
+    /// quorum gate, a node that just restarted and only sees itself will declare
+    /// itself leader and run heal/catchup against the real leader's partition.
     ///
-    /// The leader is the sole node responsible for healing and cleanup decisions.
+    /// Leadership transfers automatically when the current leader goes offline
+    /// and a majority of remaining nodes agree on the new minimum-ID leader.
     pub async fn is_leader(&self) -> bool {
         let nodes = self.nodes.read().await;
-        let leader_id = nodes
+        let total = nodes.len();
+        let online_ids: Vec<NodeId> = nodes
             .values()
             .filter(|n| n.status == NodeStatus::Online)
             .map(|n| n.id)
-            .min();
-        leader_id == Some(self.local_node_id)
+            .collect();
+        let quorum = total / 2 + 1;
+        if online_ids.len() < quorum {
+            return false;
+        }
+        online_ids.iter().min() == Some(&self.local_node_id)
     }
 
     /// Returns the SocketAddr of the current leader, if known.

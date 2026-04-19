@@ -250,6 +250,32 @@ impl Server {
                     continue;
                 }
 
+                // Periodically re-run the full pull-merge catchup so the leader stays
+                // converged with followers even when not re-electing. Without this, files
+                // written to followers (pre-TTL or during brief leader unreachability) never
+                // reach the leader until a restart. Run every 5 minutes.
+                {
+                    static LAST_CATCHUP: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> = std::sync::OnceLock::new();
+                    let last = LAST_CATCHUP.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(300)));
+                    let should_run = {
+                        let t = last.lock().unwrap();
+                        t.elapsed() >= std::time::Duration::from_secs(300)
+                    };
+                    if should_run {
+                        *last.lock().unwrap() = std::time::Instant::now();
+                        let server_catchup = server.clone();
+                        tokio::spawn(async move {
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(120),
+                                server_catchup.run_metadata_catchup(),
+                            ).await;
+                            if result.is_err() {
+                                warn!("Periodic metadata catch-up timed out after 120s");
+                            }
+                        });
+                    }
+                }
+
                 // Drain the queue for every online follower.
                 let nodes = server.cluster.get_all_nodes().await;
                 let local_id = server.cluster.local_node_id();

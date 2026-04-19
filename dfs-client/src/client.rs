@@ -931,7 +931,20 @@ leader_addr: Arc::new(RwLock::new(None)),
             if_modified_since,
         };
 
-        let response = self.send_request_with_retry(request).await?;
+        // Always query the leader — followers can have stale or missing metadata.
+        // Fall back to any node if the leader is unknown or unavailable.
+        let leader = { *self.leader_addr.read().await };
+        let response = if let Some(leader_addr) = leader {
+            match self.send_request(leader_addr, request.clone()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("get_file_metadata_conditional: leader {} failed ({}), retrying any node", leader_addr, e);
+                    self.send_request_with_retry(request).await?
+                }
+            }
+        } else {
+            self.send_request_with_retry(request).await?
+        };
 
         match response {
             Response::FileMetadata { metadata } => Ok(Some(metadata)),

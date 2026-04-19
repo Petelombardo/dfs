@@ -388,8 +388,10 @@ pub struct DfsClient {
     byte_range_cache: Arc<Mutex<LruCache<ByteRangeCacheKey, CachedChunk>>>,
 
     /// TCP connection pool - maintains up to N idle connections per server
-    /// VecDeque allows concurrent callers to each get their own connection
-    connection_pool: Arc<DashMap<SocketAddr, Mutex<std::collections::VecDeque<TcpStream>>>>,
+    /// VecDeque allows concurrent callers to each get their own connection.
+    /// Arc<Mutex<...>> so the Arc can be cloned out of the DashMap before any .await,
+    /// preventing the DashMap shard read-lock from being held across await points.
+    connection_pool: Arc<DashMap<SocketAddr, Arc<Mutex<std::collections::VecDeque<TcpStream>>>>>,
 
     /// Track chunks currently being prefetched to avoid duplicates
     prefetch_in_flight: Arc<Mutex<HashSet<ChunkId>>>,
@@ -716,10 +718,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
         // Try pooled connection first; on failure (stale) fall back to a fresh one.
-        let pooled = if let Some(entry) = self.connection_pool.get(&addr) {
-            entry.lock().await.pop_front()
-        } else {
-            None
+        // Clone the Arc out of DashMap before .await to release the shard read-lock immediately.
+        let pooled = {
+            let mutex_opt = self.connection_pool.get(&addr).map(|e| Arc::clone(&*e));
+            if let Some(mutex) = mutex_opt {
+                mutex.lock().await.pop_front()
+            } else {
+                None
+            }
         };
 
         let mut stream = match pooled {
@@ -898,11 +904,15 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         // Return connection to pool after all bytes are drained.
+        // Clone Arc out before .await to avoid holding DashMap shard lock across await.
         {
-            let entry = self.connection_pool
-                .entry(addr)
-                .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
-            let mut queue = entry.lock().await;
+            let mutex = {
+                let entry = self.connection_pool
+                    .entry(addr)
+                    .or_insert_with(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
+                Arc::clone(&*entry)
+            };
+            let mut queue = mutex.lock().await;
             if queue.len() < 8 {
                 queue.push_back(stream);
             }
@@ -2180,10 +2190,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             attempt += 1;
 
             // Get or create connection (pop from per-server VecDeque)
-            let stream = if let Some(entry) = self.connection_pool.get(&server_addr) {
-                entry.lock().await.pop_front()
-            } else {
-                None
+            // Clone Arc out before .await to avoid holding DashMap shard lock across await.
+            let stream = {
+                let mutex_opt = self.connection_pool.get(&server_addr).map(|e| Arc::clone(&*e));
+                if let Some(mutex) = mutex_opt {
+                    mutex.lock().await.pop_front()
+                } else {
+                    None
+                }
             };
 
             let mut stream = match stream {
@@ -2277,11 +2291,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                             };
 
                             // Return connection to pool now that we've drained all bytes.
+                            // Clone Arc out before .await to avoid holding DashMap shard lock.
                             {
-                                let entry = self.connection_pool
-                                    .entry(server_addr)
-                                    .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
-                                let mut queue = entry.lock().await;
+                                let mutex = {
+                                    let entry = self.connection_pool
+                                        .entry(server_addr)
+                                        .or_insert_with(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
+                                    Arc::clone(&*entry)
+                                };
+                                let mut queue = mutex.lock().await;
                                 if queue.len() < 8 {
                                     queue.push_back(stream);
                                 }
@@ -2338,10 +2356,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         let encoded = envelope.to_bytes().context("serialize")?;
 
         // Prefer a pooled connection; fall back to a new one.
-        let pooled = if let Some(entry) = self.connection_pool.get(&server_addr) {
-            entry.lock().await.pop_front()
-        } else {
-            None
+        // Clone Arc out before .await to avoid holding DashMap shard lock across await.
+        let pooled = {
+            let mutex_opt = self.connection_pool.get(&server_addr).map(|e| Arc::clone(&*e));
+            if let Some(mutex) = mutex_opt {
+                mutex.lock().await.pop_front()
+            } else {
+                None
+            }
         };
 
         let mut stream = match pooled {
@@ -2425,11 +2447,15 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         // Return connection to pool after all bytes are drained.
+        // Clone Arc out before .await to avoid holding DashMap shard lock across await.
         {
-            let entry = self.connection_pool
-                .entry(server_addr)
-                .or_insert_with(|| Mutex::new(std::collections::VecDeque::new()));
-            let mut queue = entry.lock().await;
+            let mutex = {
+                let entry = self.connection_pool
+                    .entry(server_addr)
+                    .or_insert_with(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
+                Arc::clone(&*entry)
+            };
+            let mut queue = mutex.lock().await;
             if queue.len() < 8 {
                 queue.push_back(stream);
             }

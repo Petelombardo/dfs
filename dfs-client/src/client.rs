@@ -2677,6 +2677,56 @@ leader_addr: Arc::new(RwLock::new(None)),
         anyhow::bail!("read_chunk_by_id: failed to read chunk {} from any node", chunk_id)
     }
 
+    /// Broadcast a ChunkLocation to every cluster node.
+    /// The leader gets reliable delivery with exponential-backoff retries (up to ~30s).
+    /// Followers get fire-and-forget — they learn about the chunk from the server-side
+    /// ReplicateChunkLocation handler anyway, and the healer reconciles any gaps.
+    fn broadcast_chunk_location(&self, location: dfs_common::ChunkLocation, all_nodes: Vec<SocketAddr>) {
+        let leader_addr = {
+            // Snapshot leader addr synchronously; we're not in an async context here.
+            // If the RwLock is uncontended this is instant; worst case we skip retry for
+            // this one call — the healer will catch up.
+            self.leader_addr.try_read().ok().and_then(|g| *g)
+        };
+
+        for &addr in &all_nodes {
+            let client = self.clone();
+            let loc = location.clone();
+            let is_leader = Some(addr) == leader_addr;
+            tokio::spawn(async move {
+                let req = Request::ReplicateChunkLocation { location: loc };
+                if is_leader {
+                    // Retry to the leader with exponential backoff so the chunk map stays
+                    // current even if the leader is momentarily slow.
+                    let mut backoff_ms = 500u64;
+                    for attempt in 1u32..=6 {
+                        match tokio::time::timeout(
+                            Duration::from_secs(3),
+                            client.send_request(addr, req.clone()),
+                        ).await {
+                            Ok(Ok(_)) => return,
+                            Ok(Err(e)) => warn!(
+                                "ReplicateChunkLocation to leader {} failed (attempt {}): {}",
+                                addr, attempt, e
+                            ),
+                            Err(_) => warn!(
+                                "ReplicateChunkLocation to leader {} timed out (attempt {})",
+                                addr, attempt
+                            ),
+                        }
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(30_000);
+                    }
+                    warn!("ReplicateChunkLocation to leader {} gave up after 6 attempts", addr);
+                } else {
+                    if let Err(e) = client.send_request(addr, req).await {
+                        debug!("Failed to replicate chunk location to {}: {}", addr, e);
+                    }
+                }
+            });
+        }
+    }
+
     /// Write data with synchronous dual-replica replication
     /// NEW: Writes each chunk to 2 nodes synchronously (not striped)
     /// Returns chunk_locations with replica tracking
@@ -2713,18 +2763,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Without this, nodes that didn't receive data only learn about replicas they
         // stored themselves — dfs-admin file info shows single-node entries and the
         // healing engine can't see the full replica set.
+        // Leader gets reliable delivery with retries; followers are fire-and-forget.
         let all_nodes = self.cluster_nodes.read().await.clone();
-        for location in &chunk_locations {
-            let req = Request::ReplicateChunkLocation { location: location.clone() };
-            for &addr in &all_nodes {
-                let client = self.clone();
-                let req = req.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = client.send_request(addr, req).await {
-                        debug!("Failed to replicate chunk location to {}: {}", addr, e);
-                    }
-                });
-            }
+        for location in chunk_locations.iter().cloned() {
+            self.broadcast_chunk_location(location, all_nodes.clone());
         }
 
         // Populate byte-range cache for immediate read-back
@@ -2933,18 +2975,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Without this, nodes that didn't receive data only learn about replicas they
         // stored themselves — dfs-admin file info shows single-node entries and the
         // healing engine can't see the full replica set.
+        // Leader gets reliable delivery with retries; followers are fire-and-forget.
         let all_nodes_snapshot = all_nodes.to_vec();
-        for location in &chunk_locations {
-            let req = Request::ReplicateChunkLocation { location: location.clone() };
-            for &addr in &all_nodes_snapshot {
-                let client = self.clone();
-                let req = req.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = client.send_request(addr, req).await {
-                        debug!("Failed to replicate chunk location to {}: {}", addr, e);
-                    }
-                });
-            }
+        for location in chunk_locations.iter().cloned() {
+            self.broadcast_chunk_location(location, all_nodes_snapshot.clone());
         }
 
         // Populate byte-range cache for immediate read-back

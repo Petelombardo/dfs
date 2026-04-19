@@ -727,18 +727,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // Check if the server closed this connection while it was pooled.
                 // A readable socket returning 0 bytes means the peer sent FIN —
                 // reusing it would leave the server in CLOSE-WAIT indefinitely.
-                use tokio::io::Interest;
-                let peer_closed = match s.ready(Interest::READABLE).await {
-                    Ok(ready) if ready.is_readable() => {
-                        let mut buf = [0u8; 1];
-                        match s.try_read(&mut buf) {
-                            Ok(0) => true,
-                            Ok(_) => true,  // unexpected data — discard
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                            Err(_) => true,
-                        }
-                    }
-                    _ => false,
+                let mut buf = [0u8; 1];
+                let peer_closed = match s.try_read(&mut buf) {
+                    Ok(0) => true,
+                    Ok(_) => true,  // unexpected data — discard
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(_) => true,
                 };
 
                 if peer_closed {
@@ -2194,18 +2188,12 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             let mut stream = match stream {
                 Some(s) => {
-                    use tokio::io::Interest;
-                    let peer_closed = match s.ready(Interest::READABLE).await {
-                        Ok(ready) if ready.is_readable() => {
-                            let mut buf = [0u8; 1];
-                            match s.try_read(&mut buf) {
-                                Ok(0) => true,
-                                Ok(_) => true,
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                                Err(_) => true,
-                            }
-                        }
-                        _ => false,
+                    let mut buf = [0u8; 1];
+                    let peer_closed = match s.try_read(&mut buf) {
+                        Ok(0) => true,
+                        Ok(_) => true,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                        Err(_) => true,
                     };
                     if peer_closed {
                         debug!("Pooled connection to {} closed by peer, reconnecting", server_addr);
@@ -2358,14 +2346,8 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let mut stream = match pooled {
             Some(s) => {
-                use tokio::io::Interest;
-                let peer_closed = match s.ready(Interest::READABLE).await {
-                    Ok(ready) if ready.is_readable() => {
-                        let mut buf = [0u8; 1];
-                        !matches!(s.try_read(&mut buf), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock)
-                    }
-                    _ => false,
-                };
+                let mut buf = [0u8; 1];
+                let peer_closed = !matches!(s.try_read(&mut buf), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock);
                 if peer_closed {
                     tokio::time::timeout(
                         tokio::time::Duration::from_secs(5),

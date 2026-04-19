@@ -959,6 +959,65 @@ impl Filesystem for DfsFilesystem {
         // Kernel readahead would race our pipeline with extra concurrent fetches.
         let _ = config.set_max_readahead(0);
 
+        // Warm metadata and directory caches from the leader on startup so that the
+        // first ls/find/DVR index scan sees all files immediately without round-trips.
+        {
+            let client = self.client.clone();
+            let metadata_cache = self.metadata_cache.clone();
+            let path_to_inode = self.path_to_inode.clone();
+            let next_inode = self.next_inode.clone();
+            let last_metadata_update = self.last_metadata_update.clone();
+            let dir_cache = self.dir_cache.clone();
+            self.runtime.spawn(async move {
+                info!("Startup: warming metadata cache from leader");
+                let files = match client.list_all_files().await {
+                    Ok(f) => f,
+                    Err(e) => { warn!("Startup warm: {}", e); return; }
+                };
+                let now = std::time::Instant::now();
+                let count = files.len();
+                // Group into dir-cache entries as we go.
+                let mut dir_entries: std::collections::HashMap<String, Vec<dfs_common::FileMetadata>> =
+                    std::collections::HashMap::new();
+                for file in files {
+                    // Allocate inode
+                    let ino = {
+                        let path_map = path_to_inode.read().unwrap();
+                        if let Some(&existing) = path_map.get(&file.path) {
+                            existing
+                        } else {
+                            drop(path_map);
+                            let mut path_map = path_to_inode.write().unwrap();
+                            if let Some(&existing) = path_map.get(&file.path) {
+                                existing
+                            } else {
+                                let mut next = next_inode.write().unwrap();
+                                let v = *next;
+                                *next += 1;
+                                drop(next);
+                                path_map.insert(file.path.clone(), v);
+                                v
+                            }
+                        }
+                    };
+                    client.seed_write_seq(file.id, file.write_seq);
+                    metadata_cache.insert(ino, file.clone());
+                    last_metadata_update.insert(ino, now);
+
+                    // Bucket into parent dir for dir_cache population.
+                    if let Some(slash) = file.path.rfind('/') {
+                        let parent = if slash == 0 { "/".to_string() } else { file.path[..slash].to_string() };
+                        dir_entries.entry(parent).or_default().push(file);
+                    }
+                }
+                // Populate dir_cache for every parent directory seen.
+                for (dir, entries) in dir_entries {
+                    dir_cache.insert(dir, (entries, now));
+                }
+                info!("Startup: warmed {} files into metadata/dir cache", count);
+            });
+        }
+
         // Enable POSIX file locking - tell kernel to use our setlk/getlk implementations
         // instead of handling locks in the kernel
         match config.add_capabilities(fuser::consts::FUSE_POSIX_LOCKS) {

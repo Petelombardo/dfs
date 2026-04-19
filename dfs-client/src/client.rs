@@ -932,13 +932,21 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         // Always query the leader — followers can have stale or missing metadata.
-        // Fall back to any node if the leader is unknown or unavailable.
+        // Use a short 1s timeout so a busy leader doesn't stall every lookup;
+        // fall back to any node quickly rather than waiting for send_request's full 3s.
         let leader = { *self.leader_addr.read().await };
         let response = if let Some(leader_addr) = leader {
-            match self.send_request(leader_addr, request.clone()).await {
-                Ok(r) => r,
-                Err(e) => {
+            match tokio::time::timeout(
+                Duration::from_secs(1),
+                self.send_request(leader_addr, request.clone()),
+            ).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     warn!("get_file_metadata_conditional: leader {} failed ({}), retrying any node", leader_addr, e);
+                    self.send_request_with_retry(request).await?
+                }
+                Err(_) => {
+                    warn!("get_file_metadata_conditional: leader {} timed out, retrying any node", leader_addr);
                     self.send_request_with_retry(request).await?
                 }
             }
@@ -1034,6 +1042,37 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Fallback: use normal retry logic if write node failed
         info!("Falling back to normal retry for {}", path);
         self.get_file_metadata_conditional(path, None).await
+    }
+
+    /// Fetch all files from the leader for startup cache warming.
+    pub async fn list_all_files(&self) -> Result<Vec<FileMetadata>> {
+        let request = Request::ListAllFiles;
+        let leader = { *self.leader_addr.read().await };
+        let target = if let Some(addr) = leader {
+            addr
+        } else {
+            let nodes = self.cluster_nodes.read().await.clone();
+            *nodes.first().context("No cluster nodes available")?
+        };
+        let response = match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.send_request(target, request.clone()),
+        ).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                warn!("list_all_files: leader failed ({}), retrying any node", e);
+                self.send_request_with_retry(request).await?
+            }
+            Err(_) => {
+                warn!("list_all_files: leader timed out, retrying any node");
+                self.send_request_with_retry(request).await?
+            }
+        };
+        match response {
+            Response::FileList { files, .. } => Ok(files),
+            Response::Error { message, .. } => anyhow::bail!("Server error: {}", message),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
     }
 
     /// List directory contents

@@ -80,6 +80,15 @@ pub struct Server {
     /// Used by admin handlers to query status and trigger immediate heal cycles.
     healing: Arc<RwLock<Option<Arc<HealingManager>>>>,
 
+    /// Follower-to-leader forward queue.
+    /// When this node is a follower and receives a ReplicateMetadata, it enqueues
+    /// the metadata here. A background task forwards each entry to the current leader
+    /// with retries and a 1-minute deadline. On leader change: if we became leader,
+    /// drain immediately as local stores; otherwise re-route to the new leader.
+    leader_forward_queue: Arc<tokio::sync::Mutex<std::collections::VecDeque<(FileMetadata, std::time::Instant)>>>,
+
+    /// Notifier for the leader forward queue background task.
+    leader_forward_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Server {
@@ -112,6 +121,8 @@ impl Server {
             chunk_map: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
             healing: Arc::new(RwLock::new(None)),
+            leader_forward_queue: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            leader_forward_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         server
@@ -341,6 +352,111 @@ impl Server {
                         }
                         Err(_) => {
                             debug!("Metadata dissemination to {} timed out (will retry)", node.id);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Start the follower-to-leader forward queue background task.
+    ///
+    /// When a follower receives ReplicateMetadata it enqueues the metadata here.
+    /// This task drains the queue by forwarding each entry to the current leader:
+    ///   - Retries with backoff up to a 1-minute deadline per entry.
+    ///   - On leader change: if we became the leader, store locally and expire.
+    ///                       if it's a new remote leader, re-route there.
+    pub fn start_leader_forward_loop(self: Arc<Self>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut prev_leader: Option<std::net::SocketAddr> = None;
+            loop {
+                // Wait for something to appear, or wake on leader change (poll every 5s max).
+                tokio::select! {
+                    _ = server.leader_forward_notify.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                }
+
+                let current_leader = server.cluster.get_leader_addr().await;
+                let leader_changed = current_leader != prev_leader;
+                prev_leader = current_leader;
+
+                // On leader change, check if we became leader — drain queue locally if so.
+                if leader_changed && server.cluster.is_leader().await {
+                    let mut queue = server.leader_forward_queue.lock().await;
+                    if !queue.is_empty() {
+                        info!("leader_forward: became leader — draining {} queued items locally", queue.len());
+                        while let Some((metadata, _enqueued_at)) = queue.pop_front() {
+                            match server.metadata.put_file(&metadata) {
+                                Ok(_) => { server.chunk_map_update(&metadata).await; }
+                                Err(e) => warn!("leader_forward: local store failed for {}: {}", metadata.path, e),
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let leader_addr = match current_leader {
+                    Some(addr) => addr,
+                    None => continue, // No known leader yet — wait.
+                };
+
+                // Don't forward to ourselves.
+                if leader_addr == server.cluster.local_addr() {
+                    continue;
+                }
+
+                loop {
+                    let entry = {
+                        let queue = server.leader_forward_queue.lock().await;
+                        queue.front().cloned()
+                    };
+                    let (metadata, enqueued_at) = match entry {
+                        Some(e) => e,
+                        None => break,
+                    };
+
+                    // Expired — drop it (leader catchup will cover it within 5 min).
+                    if enqueued_at.elapsed() > std::time::Duration::from_secs(60) {
+                        warn!("leader_forward: dropping expired entry for {} (>60s)", metadata.path);
+                        server.leader_forward_queue.lock().await.pop_front();
+                        continue;
+                    }
+
+                    // Re-check leader — may have changed while we were working.
+                    let now_leader = server.cluster.get_leader_addr().await;
+                    if now_leader != Some(leader_addr) {
+                        // Leader changed mid-drain — break to outer loop to re-evaluate.
+                        break;
+                    }
+
+                    let req = Request::PutFileMetadata { metadata: metadata.clone() };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        server.client.send_message(leader_addr, Message::Request(req)),
+                    ).await {
+                        Ok(Ok(env)) => match env.message {
+                            Message::Response(Response::Ok { .. }) => {
+                                debug!("leader_forward: delivered {} to leader {}", metadata.path, leader_addr);
+                                server.leader_forward_queue.lock().await.pop_front();
+                            }
+                            Message::Response(Response::NotLeader { leader_addr: redirect }) => {
+                                // Leader moved — update and break to re-evaluate.
+                                debug!("leader_forward: {} said NotLeader, redirecting to {:?}", leader_addr, redirect);
+                                break;
+                            }
+                            other => {
+                                warn!("leader_forward: unexpected response from leader for {}: {:?}", metadata.path, other);
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        },
+                        Ok(Err(e)) => {
+                            debug!("leader_forward: send failed for {} to {}: {}", metadata.path, leader_addr, e);
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        Err(_) => {
+                            debug!("leader_forward: timeout forwarding {} to {}", metadata.path, leader_addr);
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                     }
                 }
@@ -900,6 +1016,21 @@ impl Server {
                             }
                         }
                     });
+                }
+                // If we're a follower, enqueue toward the leader so it always has
+                // the latest metadata even if the client's direct write missed it.
+                if !self.cluster.is_leader().await {
+                    let leader_addr = self.cluster.get_leader_addr().await;
+                    let local_addr = self.cluster.local_addr();
+                    // Only enqueue if the leader is a different node (not us).
+                    if leader_addr.map(|a| a != local_addr).unwrap_or(true) {
+                        let mut queue = self.leader_forward_queue.lock().await;
+                        // Deduplicate: replace any existing entry for the same file_id
+                        // so only the latest snapshot is in-flight.
+                        queue.retain(|(m, _)| m.id != metadata.id);
+                        queue.push_back((metadata.clone(), std::time::Instant::now()));
+                        self.leader_forward_notify.notify_one();
+                    }
                 }
                 debug!("Successfully replicated metadata for {}", metadata.path);
                 Response::Ok { data: None }

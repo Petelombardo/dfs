@@ -1156,9 +1156,10 @@ impl Server {
                         }
                     });
                 }
-                // If we're a follower, enqueue toward the leader so it always has
-                // the latest metadata even if the client's direct write missed it.
-                if !self.cluster.is_leader().await {
+                // Only enqueue toward leader if ttl > 0, meaning this write came
+                // from a client directly to this follower (not from a leader broadcast).
+                // When ttl == 0 the leader is the sender — forwarding back creates a storm.
+                if ttl > 0 && !self.cluster.is_leader().await {
                     let leader_addr = self.cluster.get_leader_addr().await;
                     let local_addr = self.cluster.local_addr();
                     // Only enqueue if the leader is a different node (not us).
@@ -2076,7 +2077,11 @@ impl Server {
                     continue;
                 }
                 let req = Request::ReplicateMetadata { metadata: metadata_clone.clone(), ttl };
-                if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                let result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    client.send_message(node.addr, Message::Request(req)),
+                ).await;
+                if let Err(e) = result.map_err(|_| anyhow::anyhow!("timeout")).and_then(|r| r) {
                     warn!("broadcast_metadata_to_followers: failed to reach {}: {}", node.id, e);
                 }
             }
@@ -2112,6 +2117,12 @@ impl Server {
         let nodes = self.cluster.get_all_nodes().await;
         for node in &nodes {
             if node.id == local_id {
+                continue;
+            }
+            // Only enqueue for offline nodes — online nodes receive it immediately
+            // via broadcast_metadata_to_followers. Enqueueing for online nodes causes
+            // the dissemination loop to re-deliver every 5s, creating a metadata storm.
+            if node.status == dfs_common::NodeStatus::Online {
                 continue;
             }
             if let Err(e) = self.metadata.enqueue_meta_for_node(node.id, seq, metadata) {
@@ -3229,11 +3240,11 @@ impl Server {
         let local_id = self.cluster.local_node_id();
         tokio::spawn(async move {
             // Step 1: local repair on this node (runs in blocking thread — sled scans).
-            let live_file_ids: Vec<dfs_common::FileId> =
+            let (live_file_ids, repaired_files): (Vec<dfs_common::FileId>, Vec<dfs_common::FileMetadata>) =
                 tokio::task::spawn_blocking({
                     let metadata = metadata.clone();
                     let chunk_map = chunk_map.clone();
-                    move || -> anyhow::Result<Vec<dfs_common::FileId>> {
+                    move || -> anyhow::Result<(Vec<dfs_common::FileId>, Vec<dfs_common::FileMetadata>)> {
                         info!("Metadata repair: rebuilding path index");
                         if let Err(e) = metadata.repair_path_index() {
                             warn!("Metadata repair: path index repair failed: {}", e);
@@ -3270,6 +3281,7 @@ impl Server {
                         // out-of-order metadata delivery left a stale size on disk.
                         let mut size_fixed = 0usize;
                         let mut size_errors = 0usize;
+                        let mut repaired_files: Vec<dfs_common::FileMetadata> = Vec::new();
                         let files_to_check: Vec<dfs_common::FileMetadata> = {
                             let mut v = Vec::new();
                             let _ = metadata.scan_files(|file| {
@@ -3291,14 +3303,20 @@ impl Server {
                                     file.path, file.id, file.size, computed_size
                                 );
                                 file.size = computed_size;
-                                // Bump modified_at so this repair write wins over any
-                                // stale in-flight dissemination carrying the old size.
                                 file.modified_at = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
                                     .as_secs();
+                                // Bump write_seq so put_file's stale-drop guard never
+                                // rejects this repair write. Without this, any existing
+                                // record with write_seq=N silently wins over our repair
+                                // (which also has write_seq=N), and the fixed size is lost.
+                                file.write_seq = file.write_seq.saturating_add(1);
                                 match metadata.put_file(&file) {
-                                    Ok(_) => size_fixed += 1,
+                                    Ok(_) => {
+                                        repaired_files.push(file);
+                                        size_fixed += 1;
+                                    }
                                     Err(e) => {
                                         warn!("Metadata repair: failed to fix size for {}: {}", file.path, e);
                                         size_errors += 1;
@@ -3320,11 +3338,11 @@ impl Server {
                             Ok(())
                         });
                         info!("Metadata repair: collected {} live file IDs for follower reconciliation", ids.len());
-                        Ok(ids)
+                        Ok((ids, repaired_files))
                     }
                 })
                 .await
-                .unwrap_or_else(|_| Ok(Vec::new()))
+                .unwrap_or_else(|_| Ok((Vec::new(), Vec::new())))
                 .unwrap_or_default();
 
             if live_file_ids.is_empty() {
@@ -3354,6 +3372,26 @@ impl Server {
                 }
             }
             info!("Metadata repair: follower reconciliation complete");
+
+            // Step 3: push repaired metadata to followers so they get the corrected sizes.
+            // ReconcileMetadata only prunes orphans — it doesn't update existing records.
+            if !repaired_files.is_empty() {
+                info!("Metadata repair: broadcasting {} repaired files to followers", repaired_files.len());
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    for file in &repaired_files {
+                        let req = dfs_common::Request::ReplicateMetadata {
+                            metadata: file.clone(),
+                            ttl: 0,
+                        };
+                        if let Err(e) = client.send_message(node.addr, dfs_common::Message::Request(req)).await {
+                            warn!("Metadata repair: failed to push repaired {} to {}: {}", file.path, node.id, e);
+                        }
+                    }
+                }
+            }
         });
         Response::Ok { data: None }
     }
@@ -3526,7 +3564,19 @@ impl Server {
     async fn handle_list_all_files(&self) -> Response {
         debug!("Handling list all files");
 
-        match self.metadata.list_files() {
+        let metadata = self.metadata.clone();
+        let result = tokio::task::spawn_blocking(move || metadata.list_files()).await;
+        let list_result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Failed to list files (spawn_blocking panic): {}", e);
+                return Response::Error {
+                    message: format!("Failed to list files: {}", e),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        };
+        match list_result {
             Ok(files) => {
                 let total_count = files.len();
                 Response::FileList { files, total_count }

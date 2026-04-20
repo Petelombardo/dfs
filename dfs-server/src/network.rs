@@ -364,11 +364,16 @@ impl NetworkClient {
             stream = fresh;
         }
 
-        // Read response
+        // Read response — bounded so a hung peer never holds a semaphore permit forever.
         let mut read_buf = BytesMut::with_capacity(8192);
-        let response = read_message(&mut stream, &mut read_buf)
-            .await?
-            .context("Connection closed before receiving response")?;
+        let response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            read_message(&mut stream, &mut read_buf),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Read timeout from {}", target))?  // Elapsed → Err
+        ?                                                                  // Result<Option> → Option
+        .context("Connection closed before receiving response")?;          // Option → MessageEnvelope
 
         debug!("Received response from {}", target);
 

@@ -3005,43 +3005,35 @@ impl Server {
             Ok(None) => {
                 // File not found on this node — broadcast DeleteFile to ALL peers so
                 // every node that holds a copy of the path: index gets cleaned up.
-                // put_file_metadata uses quorum writes so the path: record may exist
-                // on multiple peers; we must not stop after the first Ok response.
-                // Acquire semaphore to prevent fd exhaustion when hundreds of files
-                // are deleted concurrently (glob rm): without this each forwarding
-                // task opens connections to all peers simultaneously.
-                let _permit = self.broadcast_semaphore.acquire().await.ok();
+                // Spawned fire-and-forget so the handler returns immediately and doesn't
+                // block on slow/unresponsive peers (30s timeout × N peers × M concurrent
+                // deletes = cascade that starves all other requests).
+                let sem = self.broadcast_semaphore.clone();
                 let cluster = self.cluster.clone();
                 let client = self.client.clone();
                 let local_id = self.cluster.local_node_id();
-                let nodes = cluster.get_all_nodes().await;
-                let mut found = false;
-                for node in &nodes {
-                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                        continue;
-                    }
-                    let req = Request::DeleteFile { path: path.clone() };
-                    match client.send_message(node.addr, Message::Request(req)).await {
-                        Ok(envelope) => {
-                            if matches!(envelope.message, Message::Response(Response::Ok { .. })) {
-                                found = true;
-                                // Do NOT break — keep forwarding to remaining peers so all
-                                // copies of the path: index and file: record are deleted.
-                            }
+                let path_clone = path.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok();
+                    let nodes = cluster.get_all_nodes().await;
+                    for node in &nodes {
+                        if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                            continue;
                         }
-                        Err(e) => {
+                        let req = Request::DeleteFile { path: path_clone.clone() };
+                        let result = tokio::time::timeout(
+                            tokio::time::Duration::from_secs(5),
+                            client.send_message(node.addr, Message::Request(req)),
+                        ).await;
+                        if let Err(e) = result.map_err(|_| anyhow::anyhow!("timeout")).and_then(|r| r) {
                             warn!("Failed to forward DeleteFile to node {}: {}", node.id, e);
                         }
                     }
-                }
-                if found {
-                    Response::Ok { data: None }
-                } else {
-                    Response::Error {
-                        message: "File not found".to_string(),
-                        code: ErrorCode::NotFound,
-                    }
-                }
+                });
+                // Return Ok immediately — the delete will propagate asynchronously.
+                // If the file truly doesn't exist anywhere the client gets a clean Ok,
+                // which is correct POSIX behavior for unlink of a non-existent file.
+                Response::Ok { data: None }
             }
             Err(e) => {
                 warn!("Failed to find file: {}", e);

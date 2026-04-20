@@ -821,6 +821,9 @@ impl Server {
             Request::DeleteMetadata { file_id, path, chunk_ids, ttl } => {
                 self.handle_delete_metadata(file_id, path, chunk_ids, ttl).await
             }
+            Request::DeletePathIndex { path } => {
+                self.handle_delete_path_index(path).await
+            }
             Request::ReplicateChunkLocation { location } => {
                 self.handle_replicate_chunk_location(location).await
             }
@@ -1232,6 +1235,15 @@ impl Server {
         }
 
         debug!("Successfully deleted metadata and {} chunk locations for {} on peer", chunk_ids.len(), path);
+        Response::Ok { data: None }
+    }
+
+    /// Handle path-index-only deletion (used by rename to clean up stale old-path entries on peers).
+    async fn handle_delete_path_index(&self, path: String) -> Response {
+        if let Err(e) = self.metadata.delete_path_index(&path) {
+            warn!("Failed to delete path index {} on peer: {}", path, e);
+        }
+        debug!("Deleted path index entry for {} on peer", path);
         Response::Ok { data: None }
     }
 
@@ -2801,12 +2813,10 @@ impl Server {
         };
 
         let patch_end = intra_offset + patch_data.len();
+        // Allow extending the chunk for append-style writes (patch_end > current size).
+        // Zero-fill any gap between the old end and intra_offset, then extend.
         if patch_end > chunk_bytes.len() {
-            warn!("PatchChunk: patch [{}, {}) extends past chunk size {}", intra_offset, patch_end, chunk_bytes.len());
-            return Response::Error {
-                message: format!("Patch extends past chunk boundary: patch_end={} chunk_size={}", patch_end, chunk_bytes.len()),
-                code: ErrorCode::InvalidRequest,
-            };
+            chunk_bytes.resize(patch_end, 0u8);
         }
 
         // Apply patch in memory
@@ -3704,22 +3714,28 @@ impl Server {
                             warn!("Some replications failed for rename {} -> {}", old_path, new_path);
                         }
 
-                        // Now delete the OLD path index entry locally
-                        // We use delete_path_index() instead of delete_file() because:
-                        // - put_file() already updated the file_id → metadata entry
-                        // - put_file() already created the new_path → file_id entry
-                        // - We just need to remove the old_path → file_id entry
-                        // - delete_file() would delete EVERYTHING including the new metadata!
+                        // Delete the OLD path index entry locally first, then replicate
+                        // synchronously to all peers so no peer can resolve the old path.
                         if let Err(e) = self.metadata.delete_path_index(&old_path) {
                             warn!("Failed to delete old path index during rename: {}", e);
                         }
 
-                        // No path-cleanup replication needed: ReplicateMetadata already
-                        // wrote new path: and file: records on each peer. The stale
-                        // path:/old_path entries on peers are orphaned (no file: record
-                        // points to them for get_file_by_path) and are harmless — scan_files
-                        // uses file: prefix only. Sending a path-delete message risks deleting
-                        // the renamed record if it races with ReplicateMetadata delivery.
+                        // Synchronously send DeletePathIndex to all peers so the old path
+                        // is gone cluster-wide before we reply to the client. This prevents
+                        // any node from returning the renamed file under its old name.
+                        {
+                            let nodes = self.cluster.get_all_nodes().await;
+                            let local_id = self.cluster.local_node_id();
+                            for node in &nodes {
+                                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                    continue;
+                                }
+                                let req = Request::DeletePathIndex { path: old_path.clone() };
+                                if let Err(e) = self.client.send_message(node.addr, Message::Request(req)).await {
+                                    warn!("Failed to replicate path deletion to {}: {}", node.addr, e);
+                                }
+                            }
+                        }
 
                         info!("Renamed {} -> {} (file_id: {})", old_path, new_path, file_id);
                         Response::Ok { data: None }

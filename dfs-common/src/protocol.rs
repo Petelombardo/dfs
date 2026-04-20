@@ -196,6 +196,12 @@ pub enum Request {
         ttl: u8,
     },
 
+    /// Delete only the path→file_id index entry on this node (used by rename).
+    /// Does NOT delete the file record or chunk locations — those belong to the renamed file.
+    DeletePathIndex {
+        path: String,
+    },
+
     /// Replicate chunk location to this node (internal cluster operation)
     ReplicateChunkLocation {
         location: ChunkLocation,

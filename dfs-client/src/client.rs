@@ -3869,7 +3869,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         runtime.spawn(async move {
             loop {
                 // Wait for something to appear in the queue.
-                client.metadata_queue.notify.notified().await;
+                // Use enable()+notified() so a notify_one() that fires while we are
+                // inside the drain loop is not lost — the permit is stored and the
+                // next notified().await returns immediately.
+                let notified = client.metadata_queue.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();  // arm the permit before we check the queue
 
                 // Drain all available items before waiting again.
                 loop {
@@ -3926,6 +3931,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                         }
                     }
                 }
+                // Queue is empty — wait for the next notification.  The permit was
+                // armed before the drain loop, so any notify_one() that fired during
+                // delivery is captured here and won't cause a missed wakeup.
+                notified.await;
             }
         });
     }

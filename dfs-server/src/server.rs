@@ -59,9 +59,14 @@ pub struct Server {
     prefetch_semaphore: Arc<tokio::sync::Semaphore>,
 
     /// Outbound broadcast concurrency limiter - caps total in-flight cluster RPCs
-    /// (metadata replication, purge broadcasts, delete broadcasts) to prevent fd
-    /// exhaustion when many operations fan out to all 5 nodes simultaneously.
+    /// (metadata replication, purge broadcasts) to prevent fd exhaustion when
+    /// many operations fan out to all 5 nodes simultaneously.
     broadcast_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// Separate semaphore for delete fan-out tasks (leader-only Ok(None) path).
+    /// Kept small (4) so a burst of deletes doesn't starve metadata broadcasts
+    /// or exhaust the broadcast_semaphore and stall heartbeat-adjacent operations.
+    delete_semaphore: Arc<tokio::sync::Semaphore>,
 
     /// Leader-maintained in-memory chunk map: FileId -> Vec<ChunkLocation>.
     /// Only the leader serves GetFileChunkMap requests from this map.
@@ -130,6 +135,7 @@ impl Server {
             // 5 nodes × 4 concurrent fan-outs = 20 max simultaneous cluster connections,
             // well within the 65536 fd limit even under heavy delete/heal load.
             broadcast_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
+            delete_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             chunk_map: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
             healing: Arc::new(RwLock::new(None)),
@@ -2929,7 +2935,7 @@ impl Server {
                         let metadata_store = self.metadata.clone();
                         let file_id = metadata.id;
                         let path_clone = path.clone();
-                        let sem = self.broadcast_semaphore.clone();
+                        let sem = self.delete_semaphore.clone();
 
                         tokio::spawn(async move {
                             let _permit = sem.acquire().await.ok();
@@ -3003,12 +3009,22 @@ impl Server {
                 }
             }
             Ok(None) => {
-                // File not found on this node — broadcast DeleteFile to ALL peers so
-                // every node that holds a copy of the path: index gets cleaned up.
-                // Spawned fire-and-forget so the handler returns immediately and doesn't
-                // block on slow/unresponsive peers (30s timeout × N peers × M concurrent
-                // deletes = cascade that starves all other requests).
-                let sem = self.broadcast_semaphore.clone();
+                // File not found on this node.
+                // Only the leader fans out to peers — followers return NotFound so the
+                // client can redirect to the leader. This prevents the N×N cascade where
+                // every follower forwards to every other node on a burst of deletes,
+                // saturating thread pools and starving heartbeats.
+                if !self.cluster.is_leader().await {
+                    return Response::Error {
+                        message: "File not found".to_string(),
+                        code: ErrorCode::NotFound,
+                    };
+                }
+                // Leader: broadcast to all peers so every node's path: index is cleaned.
+                // Spawned fire-and-forget — handler returns immediately.
+                // Uses delete_semaphore (4 permits) not broadcast_semaphore so delete
+                // bursts don't starve metadata replication.
+                let sem = self.delete_semaphore.clone();
                 let cluster = self.cluster.clone();
                 let client = self.client.clone();
                 let local_id = self.cluster.local_node_id();
@@ -3030,9 +3046,6 @@ impl Server {
                         }
                     }
                 });
-                // Return Ok immediately — the delete will propagate asynchronously.
-                // If the file truly doesn't exist anywhere the client gets a clean Ok,
-                // which is correct POSIX behavior for unlink of a non-existent file.
                 Response::Ok { data: None }
             }
             Err(e) => {

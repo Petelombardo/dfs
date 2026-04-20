@@ -914,19 +914,20 @@ impl Server {
     async fn handle_read_chunk(&self, chunk_id: ChunkId) -> Response {
         debug!("Handling read chunk: {}", chunk_id);
 
-        // Use the internal read_chunk method which tries local first,
-        // then forwards to other nodes if needed
-        match self.read_chunk(&chunk_id).await {
+        // Serve from local storage only — never proxy to other nodes.
+        // If the client sends a ReadChunk to a node that doesn't hold the chunk,
+        // the client's fallback logic will retry a different replica. Proxying
+        // causes cascading timeouts: a node under load holds up all its request
+        // handlers waiting for remote fetches, starving heartbeats.
+        match self.storage.read_chunk(&chunk_id) {
             Ok(data) => {
-                // Get cache stats for flow control
                 let (capacity, size) = self.storage.get_cache_stats();
-                let cache_stats = Some((0, capacity, size)); // hits=0 for now, can track later
+                let cache_stats = Some((0, capacity, size));
                 Response::ChunkData { chunk_id, data, cache_stats }
-            },
-            Err(e) => {
-                warn!("Failed to read chunk {}: {}", chunk_id, e);
+            }
+            Err(_) => {
                 Response::Error {
-                    message: format!("Failed to read chunk: {}", e),
+                    message: format!("Chunk {} not found on this node", chunk_id),
                     code: ErrorCode::NotFound,
                 }
             }
@@ -937,7 +938,7 @@ impl Server {
     async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64) -> Response {
         debug!("Handling read chunk range: {} offset={} length={}", chunk_id, offset, length);
 
-        match self.read_chunk(&chunk_id).await {
+        match self.storage.read_chunk(&chunk_id).map_err(|e| anyhow::anyhow!(e)) {
             Ok(data) => {
                 let start = offset as usize;
                 let end = std::cmp::min(start + length as usize, data.len());
@@ -1957,20 +1958,25 @@ impl Server {
                     sequential_hint: None,
                 };
 
-                match self
-                    .client
-                    .send_message(node_info.addr, Message::Request(request))
-                    .await
-                {
-                    Ok(response) => match response.message {
+                let result = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    self.client.send_message(node_info.addr, Message::Request(request)),
+                ).await;
+                match result {
+                    Ok(Ok(response)) => match response.message {
                         Message::Response(Response::ChunkData { data, .. }) => {
                             debug!("Read chunk {} from remote node {}", chunk_id, node_id);
                             return Ok(data);
                         }
                         _ => { online_nodes_tried += 1; continue; }
                     },
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!("Failed to read from node {}: {}", node_id, e);
+                        online_nodes_tried += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!("Read timeout from node {} for chunk {}", node_id, chunk_id);
                         online_nodes_tried += 1;
                         continue;
                     }

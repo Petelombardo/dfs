@@ -292,6 +292,7 @@ impl MetadataQueue {
         metadata: FileMetadata,
         done_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) {
+        let op = if done_tx.is_some() { "release" } else { "update" };
         let mut q = self.inner.lock().await;
         let mut idx = self.index.lock().await;
 
@@ -301,6 +302,11 @@ impl MetadataQueue {
                 // This ensures newer metadata (higher sequence) always wins, even if
                 // a stale entry somehow arrives after a newer one was already queued.
                 if metadata.write_seq >= entry.metadata.write_seq {
+                    info!(
+                        "[META QUEUE] enqueue op={} path={} id={} seq={} size={} (replacing seq={})",
+                        op, metadata.path, metadata.id, metadata.write_seq,
+                        metadata.size, entry.metadata.write_seq
+                    );
                     // If the existing entry had a done_tx (sync waiter), preserve it —
                     // the release caller is still waiting and must be notified on delivery.
                     // If the new push also has a done_tx, the new one wins (latest close wins).
@@ -311,6 +317,11 @@ impl MetadataQueue {
                 } else {
                     // Incoming is older — drop it, but transfer done_tx if present so
                     // a release() waiter still gets notified when the newer entry delivers.
+                    info!(
+                        "[META QUEUE] drop-stale op={} path={} id={} seq={} (queue has seq={})",
+                        op, metadata.path, metadata.id, metadata.write_seq,
+                        entry.metadata.write_seq
+                    );
                     if done_tx.is_some() && entry.done_tx.is_none() {
                         entry.done_tx = done_tx;
                     }
@@ -322,6 +333,10 @@ impl MetadataQueue {
             }
         }
 
+        info!(
+            "[META QUEUE] enqueue op={} path={} id={} seq={} size={} queue_len={}",
+            op, metadata.path, metadata.id, metadata.write_seq, metadata.size, q.len() + 1
+        );
         let pos = q.len();
         idx.insert(metadata.id, pos);
         q.push_back(MetadataEntry { metadata, enqueued_at: Instant::now(), done_tx });
@@ -345,6 +360,26 @@ impl MetadataQueue {
         q.push_front(entry);
         for (i, e) in q.iter().enumerate() {
             idx.insert(e.metadata.id, i);
+        }
+    }
+
+    /// Cancel any pending queue entry for the given file_id.
+    /// Called after a successful delete_file so the queue worker doesn't
+    /// resurrect the file by delivering a stale metadata update.
+    pub async fn cancel(&self, file_id: FileId) {
+        let mut q = self.inner.lock().await;
+        let mut idx = self.index.lock().await;
+        if let Some(pos) = idx.remove(&file_id) {
+            if let Some(removed) = q.remove(pos) {
+                info!(
+                    "[META QUEUE] cancel id={} path={} seq={} (delete pre-empt)",
+                    file_id, removed.metadata.path, removed.metadata.write_seq
+                );
+            }
+            // Rebuild index positions after removal.
+            for (i, e) in q.iter().enumerate() {
+                idx.insert(e.metadata.id, i);
+            }
         }
     }
 
@@ -745,22 +780,28 @@ leader_addr: Arc::new(RwLock::new(None)),
                     debug!("Pooled connection to {} closed by peer, reconnecting", addr);
                     let mut s = s;
                     let _ = s.shutdown().await;
-                    tokio::time::timeout(
+                    let fresh = tokio::time::timeout(
                         tokio::time::Duration::from_millis(1000),
                         TcpStream::connect(addr),
                     ).await
                         .map_err(|_| anyhow::anyhow!("Connect timeout to {}", addr))?
-                        .context("Failed to connect to node")?
+                        .context("Failed to connect to node")?;
+                    let _ = fresh.set_nodelay(true);
+                    fresh
                 } else {
                     s
                 }
             }
-            None => tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
-                TcpStream::connect(addr),
-            ).await
-                .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
-                .context("Failed to connect to node")?,
+            None => {
+                let fresh = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await
+                    .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
+                    .context("Failed to connect to node")?;
+                let _ = fresh.set_nodelay(true);
+                fresh
+            }
         };
 
         // Send and receive with a 30s timeout.  This must cover the full round-trip for large
@@ -797,7 +838,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     tokio::time::Duration::from_secs(5),
                     TcpStream::connect(addr),
                 ).await {
-                    Ok(Ok(s)) => s,
+                    Ok(Ok(s)) => { let _ = s.set_nodelay(true); s }
                     Ok(Err(e)) => {
                         self.node_health.record_failure(addr).await;
                         return Err(anyhow::anyhow!("Failed to connect to node {}: {}", addr, e));
@@ -844,7 +885,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     tokio::time::Duration::from_secs(5),
                     TcpStream::connect(addr),
                 ).await {
-                    Ok(Ok(s)) => s,
+                    Ok(Ok(s)) => { let _ = s.set_nodelay(true); s }
                     Ok(Err(e)) => {
                         self.node_health.record_failure(addr).await;
                         return Err(anyhow::anyhow!("Failed to connect to node {}: {}", addr, e));
@@ -1372,7 +1413,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let msg = e.to_string();
                     warn!("{} failed for chunk {}: {}", addr, cid, msg);
                     self.node_health.record_failure(addr).await;
-                    if msg.contains("permanently missing") || msg.contains("blocklisted") {
+                    if msg.contains("permanently missing") || msg.contains("blocklisted")
+                        || msg.contains("location not found")
+                    {
                         anyhow::bail!("Chunk {} is permanently missing", cid);
                     }
                 }
@@ -2809,17 +2852,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             drop(node_id_map);
         }
 
-        // write_chunk_to_replicas already broadcasts ChunkLocation to all nodes.
-
-        // Broadcast the full ChunkLocation (with both node IDs) to ALL cluster nodes.
-        // Without this, nodes that didn't receive data only learn about replicas they
-        // stored themselves — dfs-admin file info shows single-node entries and the
-        // healing engine can't see the full replica set.
-        // Leader gets reliable delivery with retries; followers are fire-and-forget.
-        let all_nodes = self.cluster_nodes.read().await.clone();
-        for location in chunk_locations.iter().cloned() {
-            self.broadcast_chunk_location(location, all_nodes.clone());
-        }
+        // write_chunk_to_replicas already delivered ChunkLocation to leader (sync) and
+        // followers (async). No second broadcast needed here.
 
         // Populate byte-range cache for immediate read-back
         if inode > 0 {
@@ -3023,14 +3057,40 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
         drop(node_id_map);
 
-        // Broadcast the full ChunkLocation (with both node IDs) to ALL cluster nodes.
-        // Without this, nodes that didn't receive data only learn about replicas they
-        // stored themselves — dfs-admin file info shows single-node entries and the
-        // healing engine can't see the full replica set.
-        // Leader gets reliable delivery with retries; followers are fire-and-forget.
+        // Deliver ChunkLocation to the leader synchronously before returning to the caller.
+        // This guarantees the leader has the chunk map entry before the client's write ACK
+        // lands — so any subsequent read (even from another node that queries the leader)
+        // sees the chunk. Followers get it asynchronously via the leader's own broadcast.
         let all_nodes_snapshot = all_nodes.to_vec();
+        let leader_addr = *self.leader_addr.read().await;
         for location in chunk_locations.iter().cloned() {
-            self.broadcast_chunk_location(location, all_nodes_snapshot.clone());
+            // Deliver ChunkLocation to all nodes in parallel — all 3 send simultaneously,
+            // total latency = time of the slowest single send (not 3× serial).
+            // All nodes use a single attempt with a short timeout; leader gets one retry.
+            // The metadata queue will propagate any misses asynchronously.
+            let mut node_futures = Vec::new();
+            for &addr in &all_nodes_snapshot {
+                let client = self.clone();
+                let loc = location.clone();
+                let is_leader = Some(addr) == leader_addr;
+                node_futures.push(tokio::spawn(async move {
+                    let req = Request::ReplicateChunkLocation { location: loc.clone() };
+                    match tokio::time::timeout(Duration::from_secs(2), client.send_request(addr, req.clone())).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) if is_leader => {
+                            // One retry for the leader — without it a transient error loses chunk routing.
+                            warn!("ChunkLocation to leader {} failed: {}, retrying once", addr, e);
+                            if let Err(e2) = client.send_request(addr, req).await {
+                                warn!("ChunkLocation to leader {} retry also failed: {}", addr, e2);
+                            }
+                        }
+                        Ok(Err(e)) => debug!("ChunkLocation to {} failed (leader will catch up): {}", addr, e),
+                        Err(_) => warn!("ChunkLocation to {} timed out", addr),
+                    }
+                }));
+            }
+            // Wait for all nodes (takes as long as the slowest — same as a single serial send).
+            futures::future::join_all(node_futures).await;
         }
 
         // Populate byte-range cache for immediate read-back
@@ -3461,13 +3521,32 @@ leader_addr: Arc::new(RwLock::new(None)),
             file_offset: old_location.file_offset,
             written_at: None,
         };
-        let replicate_req = Request::ReplicateChunkLocation { location: new_location.clone() };
+        // Leader gets new ChunkLocation synchronously — guarantees the leader's chunk map
+        // is current before we return. Followers get it async via leader's own broadcast.
+        let leader_addr = *self.leader_addr.read().await;
+        if let Some(leader) = leader_addr {
+            let req = Request::ReplicateChunkLocation { location: new_location.clone() };
+            let mut backoff_ms = 250u64;
+            for attempt in 1u32..=4 {
+                match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    self.send_request(leader, req.clone()),
+                ).await {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(e)) => warn!("PatchChunk: ChunkLocation to leader {} failed (attempt {}): {}", leader, attempt, e),
+                    Err(_)    => warn!("PatchChunk: ChunkLocation to leader {} timed out (attempt {})", leader, attempt),
+                }
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(4_000);
+            }
+        }
         for &addr in &all_cluster_nodes {
+            if Some(addr) == leader_addr { continue; }
             let client = self.clone();
-            let req = replicate_req.clone();
+            let req = Request::ReplicateChunkLocation { location: new_location.clone() };
             tokio::spawn(async move {
                 if let Err(e) = client.send_request(addr, req).await {
-                    debug!("PatchChunk: location broadcast to {} failed: {}", addr, e);
+                    debug!("PatchChunk: location to follower {} failed (leader will catch up): {}", addr, e);
                 }
             });
         }
@@ -3594,20 +3673,11 @@ leader_addr: Arc::new(RwLock::new(None)),
             anyhow::bail!("Metadata write to leader failed after retries: {}", last_err);
         }
 
-        // --- Step 2: Fire a durability replica to one non-leader node (fire-and-forget). ---
-        // This means at least 2 nodes have the write before we return, so a single
-        // node failure (including the leader) doesn't lose the update.
+        // Step 2: Leader already broadcasts to all followers via broadcast_metadata_to_followers
+        // and the durability catch-up queue. No client-side replica needed — sending
+        // ReplicateMetadata directly to a follower caused resurrection of deleted files
+        // via the follower's leader_forward_queue.
         let leader = leader_acked_node.unwrap();
-        if let Some(&replica_target) = nodes.iter().find(|&&n| n != leader) {
-            let client = self.clone();
-            let meta = metadata.clone();
-            tokio::spawn(async move {
-                let req = Request::ReplicateMetadata { metadata: meta, ttl: 1 };
-                if let Err(e) = client.send_request(replica_target, req).await {
-                    debug!("Durability replica to {} failed (leader will catch up): {}", replica_target, e);
-                }
-            });
-        }
 
         // Track SQLite writes for read-after-write consistency.
         if Self::is_sqlite_file(&metadata.path) {
@@ -3675,6 +3745,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         let mut m = metadata.clone();
         m.write_seq = self.next_write_seq(m.id);
         m
+    }
+
+    /// Public alias for stamp_write_seq — used by fuse_impl's FlushHandle.
+    pub fn stamp_write_seq_pub(&self, metadata: &FileMetadata) -> FileMetadata {
+        self.stamp_write_seq(metadata)
     }
 
     /// Enqueue a metadata update for async delivery to the leader.
@@ -3814,8 +3889,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                         ).await;
                         match result {
                             Ok(Ok(())) => {
-                                debug!("metadata_queue: delivered {} ({})",
-                                       entry.metadata.path, entry.metadata.id);
+                                info!(
+                                    "[META QUEUE] delivered path={} id={} seq={} size={}",
+                                    entry.metadata.path, entry.metadata.id,
+                                    entry.metadata.write_seq, entry.metadata.size
+                                );
                                 // Signal the release waiter if present.
                                 if let Some(tx) = entry.done_tx {
                                     let _ = tx.send(());
@@ -3850,6 +3928,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
             }
         });
+    }
+
+    /// Cancel any pending metadata queue entry for the given file_id.
+    /// Must be called after a successful delete so the queue worker can't resurrect the file.
+    pub async fn cancel_metadata(&self, file_id: dfs_common::FileId) {
+        self.metadata_queue.cancel(file_id).await;
     }
 
     /// Delete file

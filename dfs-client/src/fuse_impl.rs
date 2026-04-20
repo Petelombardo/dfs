@@ -52,6 +52,16 @@ fn is_sqlite_direct_io(path: &str) -> bool {
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
 
+/// RAII guard that decrements a per-inode write-task counter on drop.
+/// Used by write() spawned tasks so release() can wait for all pending writes
+/// to land in the slot before flushing.
+struct WriteTaskGuard(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for WriteTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A single 4MB-aligned write buffer slot for one chunk.
 /// Writes land in the slot at `file_offset % CHUNK_SIZE`.
 /// The slot is flushed when it fills (exactly CHUNK_SIZE) or on fsync/release/timer.
@@ -184,6 +194,11 @@ struct FlushHandle {
     flush_in_flight: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>>,
     last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
     dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
+    path_to_inode: Arc<RwLock<HashMap<String, u64>>>,
+    /// Dedicated runtime for chunk network I/O. Isolated from the main runtime so
+    /// flush sub-tasks (which do blocking network writes) never starve write reply
+    /// tasks, which must run to unblock the kernel's FUSE write queue.
+    flush_runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl FlushHandle {
@@ -343,7 +358,7 @@ impl FlushHandle {
                 let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
                 if let Some(meta) = meta_to_persist {
                     if force {
-                        let _ = self.client.flush_metadata_sync(&meta).await;
+                        self.client.flush_metadata_sync(&meta).await;
                     } else {
                         self.client.enqueue_metadata(&meta).await;
                     }
@@ -354,8 +369,9 @@ impl FlushHandle {
 
         info!("flush_buffer_async: flushing {} chunks in parallel for inode {}", slots_to_write.len(), ino);
 
-        // Flush all slots in parallel — each chunk write is independent.
-        // Results come back in arbitrary order; we sort by chunk_idx for metadata consistency.
+        // Flush all slots in parallel. When flush_buffer_async runs on the flush_runtime
+        // (as dispatched by the background flusher and release/fsync callers), these
+        // tokio::spawn calls land on flush_runtime workers — isolated from the main runtime.
         let handles: Vec<_> = slots_to_write.iter().map(|(chunk_idx, slot_data, file_offset)| {
             let client = self.client.clone();
             let data = slot_data.clone();
@@ -399,12 +415,41 @@ impl FlushHandle {
             return Err(e);
         }
 
+        info!("flush_buffer_async: got {} chunk locations from {} slot writes", all_locations.len(), slots_to_write.len());
         if all_locations.is_empty() && !patch_metadata_dirty {
             return Ok(());
         }
 
         // Update metadata cache: insert new chunk_locations in file-offset order,
         // deduplicate by file_offset (supersedes chunk_id dedup), and recalculate file size.
+        // If the entry isn't cached yet (create()'s async task may still be in flight),
+        // fetch from server so we have a valid base to merge chunk locations into.
+        if !self.metadata_cache.contains_key(&ino) {
+            let path_opt = self.path_to_inode.read().unwrap()
+                .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+            match path_opt {
+                None => {
+                    // No path → file was deleted; skip metadata commit.
+                    debug!("flush_buffer_async: ino={} not in path_to_inode (deleted) — skipping metadata", ino);
+                    return Ok(());
+                }
+                Some(path) => {
+                    match self.client.get_file_metadata(&path).await {
+                        Ok(Some(fetched)) => {
+                            self.client.seed_write_seq(fetched.id, fetched.write_seq);
+                            self.metadata_cache.insert(ino, fetched);
+                        }
+                        Ok(None) | Err(_) => {
+                            // File not on server yet or fetch failed — create() still in flight.
+                            // destroy() sweep will commit once create() finishes.
+                            warn!("flush_buffer_async: ino={} ({}) metadata not available — deferring to destroy()", ino, path);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
         {
             if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
                 for loc in &all_locations {
@@ -461,17 +506,14 @@ impl FlushHandle {
             }
 
             if force {
-                // release/fsync: enqueue metadata immediately (don't wait for leader ack).
-                // Chunk data is already durable above; metadata propagates async.
-                // Waiting synchronously here blocks the FUSE dispatch thread and causes
-                // all filesystem ops to stall if the queue worker is slow or races.
-                self.last_metadata_update.insert(ino, std::time::Instant::now());
-                self.client.enqueue_metadata(&meta).await;
+                // release/fsync: flush metadata synchronously so new chunk IDs survive restart.
+                self.client.flush_metadata_sync(&meta).await;
             } else {
-                // Background tick: only enqueue if enough time has passed since last
-                // metadata update for this inode. The queue deduplicates by file_id so
-                // only the latest snapshot is ever in-flight per file, but we still
-                // rate-limit enqueues to avoid hammering the leader on every chunk flush.
+                // Background tick: push directly into the queue (no back-pressure wait).
+                // enqueue_metadata() may block waiting to rescue a stalled queue entry,
+                // which would hold the in_flight slot and prevent new background flushes
+                // from starting — starving the write pipeline. We stamp the seq and push
+                // directly; the queue worker handles delivery and retries independently.
                 const METADATA_FLUSH_INTERVAL_SECS: u64 = 5;
                 let should_enqueue = match self.last_metadata_update.get(&ino) {
                     None => true,
@@ -479,7 +521,8 @@ impl FlushHandle {
                 };
                 if should_enqueue {
                     self.last_metadata_update.insert(ino, std::time::Instant::now());
-                    self.client.enqueue_metadata(&meta).await;
+                    let stamped = self.client.stamp_write_seq_pub(&meta);
+                    self.client.metadata_queue.push(stamped).await;
                 }
             }
         }
@@ -566,6 +609,9 @@ pub struct DfsFilesystem {
     /// to avoid concurrent flushes that would produce OffsetMismatch.
     flush_in_flight: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>>,
 
+    /// Dedicated runtime for chunk network I/O. Isolated from the main runtime.
+    flush_runtime: Arc<tokio::runtime::Runtime>,
+
     /// Cloneable handle used by fsync() to spawn background flush tasks.
     flush_handle: FlushHandle,
 
@@ -577,6 +623,16 @@ pub struct DfsFilesystem {
     /// Inodes for which a background getattr refresh is already in flight.
     /// Prevents unbounded spawning of concurrent refresh tasks (one per inode max).
     refreshing_inodes: Arc<dashmap::DashSet<u64>>,
+
+    /// Count of release() flush tasks still in flight.
+    /// destroy() waits for this to reach zero before exiting so no in-progress
+    /// release flush is interrupted mid-write by process shutdown.
+    release_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// Per-inode count of write() tasks still running (spawned but not yet written into the slot).
+    /// release() waits for this to reach zero before flush so we don't flush an incomplete slot.
+    write_tasks_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
+
 }
 
 impl DfsFilesystem {
@@ -647,12 +703,26 @@ impl DfsFilesystem {
         let dir_cache_shared: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>> =
             Arc::new(DashMap::new());
 
+
+        // Dedicated runtime for chunk network I/O during flush.
+        // Isolated from the main runtime so flush sub-tasks (network writes) never
+        // saturate the main pool and starve write reply tasks.
+        let flush_runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(8)
+                .enable_all()
+                .thread_name("dfs-flush")
+                .build()
+                .expect("Failed to build flush runtime")
+        );
+
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
             let write_buffers_clone = write_buffers_for_cleanup.clone();
             let client_for_cleanup = client.clone();
             let metadata_cache_for_cleanup = metadata_cache.clone();
             let write_open_counts_for_bg = write_open_counts.clone();
+            let path_to_inode_for_bg = path_to_inode.clone();
             // in_flight: tracks inodes with an active background flush task.
             // Prevents launching a second flush while the first is still in flight,
             // which would produce OffsetMismatch. Also used by flush_buffer_async
@@ -668,6 +738,8 @@ impl DfsFilesystem {
                 flush_in_flight: flush_in_flight_shared.clone(),
                 last_metadata_update: last_metadata_update_shared.clone(),
                 dir_cache: dir_cache_shared.clone(),
+                path_to_inode: path_to_inode_for_bg.clone(),
+                flush_runtime: flush_runtime.clone(),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
@@ -678,37 +750,48 @@ impl DfsFilesystem {
                     // A full slot (exactly 4MB) is safe to flush without waiting for fsync.
                     // Partial slots are also flushed if they haven't been written to for 2s
                     // (file may have stopped growing — drain it rather than holding memory).
-                    let flush_inodes: Vec<u64> = {
-                        let mut ready = Vec::new();
-                        for entry in write_buffers_clone.iter() {
-                            let ino = *entry.key();
-                            if in_flight.contains(&ino) { continue; }
-                            let state = entry.value().lock().await;
-                            let has_full = !state.full_slot_indices().is_empty();
-                            // A partial/idle slot is safe to flush only when there are no
-                            // active write-mode fds — i.e. the writer has already closed the
-                            // file but the buffer wasn't flushed in release() for some reason
-                            // (e.g. rename-based save). DVR always has an open fd, so it is
-                            // never flushed prematurely here.
-                            let no_active_writers = write_open_counts_for_bg
-                                .get(&ino).map(|c| *c == 0).unwrap_or(true);
-                            let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
-                                s.is_idle() && !s.data.is_empty()
-                            });
-                            if has_full || has_idle {
-                                ready.push(ino);
-                            }
+                    // Collect keys first (brief DashMap read lock, no await held).
+                    // Holding a DashMap shard lock across an .await is a deadlock:
+                    // write() calls .entry().or_insert_with() (needs DashMap write lock)
+                    // while holding the buffer mutex — if the ticker holds the shard read
+                    // lock while awaiting the buffer mutex, both tasks block each other.
+                    let inodes: Vec<u64> = write_buffers_clone.iter()
+                        .map(|e| *e.key())
+                        .collect();
+
+                    let mut flush_inodes: Vec<u64> = Vec::new();
+                    for ino in inodes {
+                        if in_flight.contains(&ino) { continue; }
+                        let state_arc = match write_buffers_clone.get(&ino) {
+                            Some(a) => a.clone(),
+                            None => continue,
+                        };
+                        let state = state_arc.lock().await;
+                        let has_full = !state.full_slot_indices().is_empty();
+                        // A partial/idle slot is safe to flush only when there are no
+                        // active write-mode fds — i.e. the writer has already closed the
+                        // file but the buffer wasn't flushed in release() for some reason
+                        // (e.g. rename-based save). DVR always has an open fd, so it is
+                        // never flushed prematurely here.
+                        let no_active_writers = write_open_counts_for_bg
+                            .get(&ino).map(|c| *c == 0).unwrap_or(true);
+                        let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
+                            s.is_idle() && !s.data.is_empty()
+                        });
+                        if has_full || has_idle {
+                            flush_inodes.push(ino);
                         }
-                        ready
-                    };
+                    }
 
                     for ino in flush_inodes {
                         in_flight.insert(ino);
                         let handle = flush_handle_for_bg.clone();
                         let in_flight_task = in_flight.clone();
+                        let flush_rt = handle.flush_runtime.clone();
 
-                        tokio::spawn(async move {
-                            // force=false: flush full slots + idle partial slots
+                        // Spawn on flush_runtime so chunk network I/O runs isolated from
+                        // the main runtime, preventing worker starvation of write reply tasks.
+                        flush_rt.spawn(async move {
                             if let Err(e) = handle.flush_buffer_async(ino, false).await {
                                 tracing::error!("Background flush failed for inode {}: {}", ino, e);
                             }
@@ -751,6 +834,8 @@ impl DfsFilesystem {
             flush_in_flight: flush_in_flight_shared.clone(),
             last_metadata_update: last_metadata_update_shared.clone(),
             dir_cache: dir_cache_shared.clone(),
+            path_to_inode: path_to_inode.clone(),
+            flush_runtime: flush_runtime.clone(),
         };
 
         Ok(Self {
@@ -774,9 +859,12 @@ impl DfsFilesystem {
             write_open_counts,
             size_high_water: Arc::new(DashMap::new()),
             flush_in_flight: flush_in_flight_shared,
+            flush_runtime,
             flush_handle,
             pending_deletes: Arc::new(dashmap::DashSet::new()),
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
+            release_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            write_tasks_in_flight: Arc::new(DashMap::new()),
         })
     }
 
@@ -1039,6 +1127,7 @@ impl Filesystem for DfsFilesystem {
         let flush_in_flight = self.flush_in_flight.clone();
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
+        let release_in_flight = self.release_in_flight.clone();
 
         let flush_handle = FlushHandle {
             client: client.clone(),
@@ -1047,16 +1136,34 @@ impl Filesystem for DfsFilesystem {
             flush_in_flight: flush_in_flight.clone(),
             last_metadata_update: self.last_metadata_update.clone(),
             dir_cache: self.dir_cache.clone(),
+            path_to_inode: self.path_to_inode.clone(),
+            flush_runtime: self.flush_runtime.clone(),
         };
 
         self.block_on(async move {
-            // Step 1: Force-flush all dirty write buffers.
+            // Step 0: Wait for any in-flight release() flush tasks to complete.
+            // release() spawns async tasks that aren't tracked by flush_in_flight.
+            // Without this wait, a release flush that started just before unmount
+            // may be interrupted mid-write, losing the final metadata commit.
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            loop {
+                if release_in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0 { break; }
+                if tokio::time::Instant::now() > deadline {
+                    warn!("destroy: timed out waiting for release tasks");
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+
+            // Step 1: Force-flush all dirty write buffers (catches buffers not yet
+            // picked up by a release task, e.g. files open when unmount was called).
             let inodes: Vec<u64> = write_buffers.iter().map(|e| *e.key()).collect();
             if !inodes.is_empty() {
                 info!("destroy: force-flushing {} open write buffers", inodes.len());
                 let handles: Vec<_> = inodes.into_iter().map(|ino| {
                     let h = flush_handle.clone();
-                    tokio::spawn(async move {
+                    let flush_rt = h.flush_runtime.clone();
+                    flush_rt.spawn(async move {
                         if let Err(e) = h.flush_buffer_async(ino, true).await {
                             error!("destroy: flush failed for inode {}: {}", ino, e);
                         }
@@ -1079,18 +1186,24 @@ impl Filesystem for DfsFilesystem {
                 }
             }
 
-            // Step 3: Wait for the metadata queue to drain completely.
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-            loop {
-                if client.metadata_queue.is_empty().await { break; }
-                if tokio::time::Instant::now() > deadline {
-                    warn!("destroy: timed out waiting for metadata queue to drain");
-                    break;
+            // Step 3: Commit metadata for any inode that has chunk_locations in cache.
+            // Catches files where flush_buffer_async ran but metadata_cache was missing
+            // (race with create()'s async task) or where the buffer was flushed by the
+            // background flusher but the metadata commit was skipped due to cache miss.
+            {
+                let to_commit: Vec<_> = metadata_cache.iter()
+                    .filter(|e| !e.chunk_locations.is_empty())
+                    .map(|e| e.clone())
+                    .collect();
+                if !to_commit.is_empty() {
+                    info!("destroy: committing metadata for {} inodes with chunks", to_commit.len());
+                    for meta in to_commit {
+                        client.flush_metadata_sync(&meta).await;
+                    }
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
 
-            info!("destroy: all buffers flushed and metadata queue drained");
+            info!("destroy: all buffers flushed and metadata committed");
         });
     }
 
@@ -1237,7 +1350,43 @@ impl Filesystem for DfsFilesystem {
     }
 
     fn open(&mut self, _req: &FuseRequest, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-        info!("open: ino={}", ino);
+        info!("open: ino={} flags=0x{:x} release_in_flight={} write_tasks_in_flight={:?}",
+              ino, flags,
+              self.release_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+              self.write_tasks_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)));
+
+        // If a release() flush task is still in flight for this inode, wait for it to
+        // complete before proceeding. This closes the write-then-read gap: the kernel
+        // considers the write fd closed as soon as it sends RELEASE (not waiting for our
+        // reply), so a subsequent open() for reading can race with the flush task that is
+        // still committing metadata to the leader.
+        let is_read = (flags & libc::O_ACCMODE) == libc::O_RDONLY;
+        if is_read {
+            if let Some(counter) = self.write_tasks_in_flight.get(&ino) {
+                let counter = counter.clone();
+                self.block_on(async move {
+                    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                    while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        if tokio::time::Instant::now() > deadline { break; }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                });
+            }
+            // Also wait for any in-flight release flush tasks for this inode.
+            // release_in_flight is a global counter; we can't distinguish per-inode,
+            // so we check if there are any and pause briefly — this only applies when
+            // the release task is for THIS inode (common case: write then immediate read).
+            let release_in_flight = self.release_in_flight.clone();
+            if release_in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                self.block_on(async move {
+                    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                    while release_in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        if tokio::time::Instant::now() > deadline { break; }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                    }
+                });
+            }
+        }
 
         // Track write-mode opens so flush() can skip the write buffer for read-only closes.
         // O_RDONLY == 0; any flag with the low two bits set (O_WRONLY=1, O_RDWR=2) is a write open.
@@ -1276,11 +1425,7 @@ impl Filesystem for DfsFilesystem {
                     .entry(ino)
                     .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(sync_on_fsync))));
                 if sync_on_fsync {
-                    // Upgrade existing state to sync mode
-                    let state_arc = state_entry.clone();
-                    let _ = self.runtime.block_on(async move {
-                        state_arc.lock().await.sync_on_fsync = true;
-                    });
+                    if let Ok(mut st) = state_entry.try_lock() { st.sync_on_fsync = true; }
                 }
             }
         }
@@ -1301,16 +1446,17 @@ impl Filesystem for DfsFilesystem {
         }
 
         // Pre-warm the read engine so the first read() hits the chunk map immediately.
-        // Set refresh_in_progress synchronously before spawning so that read() racing in
-        // will spin-wait rather than see an empty engine and return 0 bytes.
+        // For read-mode opens after waiting for in-flight flush tasks, always refresh
+        // so we pick up the newly committed chunk locations (not the stale size=0 cache).
         if let Some(meta) = self.metadata_cache.get(&ino) {
             let file_id = meta.id;
             let file_size = meta.size;
             drop(meta);
             let client = self.client.clone();
             let engine = client.read_engines.get_or_create(ino);
-            let is_cold = engine.known_size.load(std::sync::atomic::Ordering::Relaxed) == 0;
-            if is_cold && engine.refresh_in_progress
+            let needs_refresh = is_read  // always refresh on read-open after flush drain
+                || engine.known_size.load(std::sync::atomic::Ordering::Relaxed) == 0;
+            if needs_refresh && engine.refresh_in_progress
                 .compare_exchange(false, true,
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Relaxed).is_ok()
@@ -1320,6 +1466,7 @@ impl Filesystem for DfsFilesystem {
                 });
             }
         }
+        info!("open: ino={} DONE — reply sent", ino);
     }
 
     fn getattr(&mut self, _req: &FuseRequest, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -1414,6 +1561,22 @@ impl Filesystem for DfsFilesystem {
                         // Update high-water mark
                         if reported > hwm {
                             size_high_water.insert(ino, reported);
+                        }
+                    } else if write_buffer_enabled {
+                        // No active writer, but the release flush task may still be running.
+                        // Check the write buffer and size_high_water so getattr doesn't report
+                        // size=0 to a reader racing with the flush (post-close/pre-flush window).
+                        let buffered_end = if let Some(state_lock) = write_buffers.get(&ino) {
+                            let state = state_lock.lock().await;
+                            state.slots.iter()
+                                .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
+                                .max()
+                                .unwrap_or(0)
+                        } else { 0 };
+                        let hwm = size_high_water.get(&ino).map(|v| *v).unwrap_or(0);
+                        let reported = metadata.size.max(buffered_end).max(hwm);
+                        if reported > metadata.size {
+                            metadata.size = reported;
                         }
                     }
                 }
@@ -1877,6 +2040,8 @@ impl Filesystem for DfsFilesystem {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
+        debug!("write FUSE: ino={} offset={} len={}", ino, offset, data.len());
+
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let write_counters = self.write_counters.clone();
@@ -1890,11 +2055,14 @@ impl Filesystem for DfsFilesystem {
         let req_uid = _req.uid();
         let req_gid = _req.gid();
 
-        // Spawn onto tokio so block_on never monopolizes the FUSE dispatch thread.
-        // Back-pressure stalls (tokio::time::sleep inside the buffer loop) would
-        // deadlock if run synchronously — the FUSE thread parks waiting for the
-        // background flusher, which can't run because the FUSE thread owns the scheduler.
+        let write_task_counter = self.write_tasks_in_flight
+            .entry(ino)
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .clone();
+        write_task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         self.runtime.spawn(async move {
+            let _write_guard = WriteTaskGuard(write_task_counter);
             let start = std::time::Instant::now();
             debug!("write: ino={}, offset={}, size={}", ino, offset, data_vec.len());
 
@@ -2070,26 +2238,14 @@ impl Filesystem for DfsFilesystem {
                     return;
                 }
 
-                // BUFFERED WRITE with back-pressure.
-                // Running inside a spawned task means tokio::time::sleep yields correctly
-                // instead of deadlocking the FUSE dispatch thread.
+                // BUFFERED WRITE — write into the slot and return immediately.
+                // No back-pressure: the background flusher drains full slots continuously
+                // and is always schedulable (write tasks never block waiting for it).
+                // Memory is bounded in practice: the flusher runs every 100ms and each
+                // 4MB slot takes ~50ms to write to two replicas, so at most ~2 batches
+                // accumulate before the flusher catches up.
                 {
-                    let max_buffered_bytes: usize = buffer_flush_threshold;
                     let write_offset = offset as u64;
-
-                    let stall_start = std::time::Instant::now();
-                    loop {
-                        let buffered = if let Some(entry) = write_buffers.get(&ino) {
-                            entry.lock().await.buffered_bytes()
-                        } else { 0 };
-                        if buffered < max_buffered_bytes { break; }
-                        if stall_start.elapsed() > std::time::Duration::from_secs(10) {
-                            error!("Write buffer stall timeout for inode {}", ino);
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    }
 
                     let state_arc = write_buffers
                         .entry(ino)
@@ -2104,8 +2260,8 @@ impl Filesystem for DfsFilesystem {
                         *counters.entry(ino).or_insert(0) += 1;
                     }
                     let total_elapsed = start.elapsed();
-                    debug!("BUFFERED write() took {:?} for {} bytes at offset {}",
-                           total_elapsed, data_vec.len(), offset);
+                    debug!("write REPLY: ino={} offset={} len={} took={:?}",
+                           ino, offset, data_vec.len(), total_elapsed);
                     reply.written(data_vec.len() as u32);
                     return;
                 }
@@ -2342,7 +2498,7 @@ impl Filesystem for DfsFilesystem {
                         };
 
                         if has_pending {
-                            debug!("flush: enqueueing pending metadata async for ino={}", ino);
+                            debug!("flush: enqueueing pending metadata for ino={}", ino);
                             client.enqueue_metadata(&metadata).await;
                             write_counters.write().unwrap().insert(ino, 0);
                         }
@@ -2387,7 +2543,8 @@ impl Filesystem for DfsFilesystem {
             }
             if remove {
                 self.write_open_counts.remove(&ino);
-                self.size_high_water.remove(&ino);
+                // size_high_water is cleared after the flush completes (in the release task)
+                // so that getattr during the flush window still reports the correct size.
             }
             last
         } else {
@@ -2406,19 +2563,74 @@ impl Filesystem for DfsFilesystem {
                 info!("release: ino={} last writer — flushing buffer", ino);
                 let flush_handle = self.flush_handle.clone();
                 let write_buffers = self.write_buffers.clone();
+                let release_in_flight = self.release_in_flight.clone();
+                let write_tasks_in_flight = self.write_tasks_in_flight.clone();
+                let pending_deletes_for_release = self.pending_deletes.clone();
+                let path_to_inode_for_release = self.path_to_inode.clone();
+                let size_high_water_for_release = self.size_high_water.clone();
+                release_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.runtime.spawn(async move {
-                    if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
+                    // Wait for any concurrent write() tasks for this inode to finish writing
+                    // into the slot before we flush. Without this, a close() that arrives
+                    // while write() tasks are still queued flushes an incomplete slot.
+                    if let Some(counter) = write_tasks_in_flight.get(&ino) {
+                        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                        while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                            if tokio::time::Instant::now() > deadline {
+                                warn!("release: timed out waiting for write tasks for ino={}", ino);
+                                break;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                        }
+                    }
+                    // If the file was unlinked while this release task was queued, skip the
+                    // flush — sending PutFileMetadata for a deleted file resurrects it on
+                    // the server.
+                    //
+                    // Two complementary signals:
+                    // 1. pending_deletes: set synchronously by unlink() before its async task;
+                    //    cleared after delete_file() returns. Catches the early window.
+                    // 2. path_to_inode no longer contains the path: cleared by unlink()'s async
+                    //    task. Catches the window after pending_deletes was cleared.
+                    // A file is absent from path_to_inode if it was deleted (unlink removes it)
+                    // OR if it was never registered (shouldn't happen — create() registers before
+                    // replying, and write() is only called after create() replies).
+                    let release_path = path_to_inode_for_release.read().unwrap()
+                        .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                    let is_pending_delete = release_path.as_deref()
+                        .map_or(false, |p| pending_deletes_for_release.contains(p));
+                    // Path gone from path_to_inode means the file was deleted and unlink's
+                    // task has already run (it removes path before or after server call).
+                    let path_gone = release_path.is_none();
+                    if is_pending_delete || path_gone {
+                        debug!("release: ino={} path={:?} deleted (pending={} path_gone={}) — skipping flush",
+                               ino, release_path, is_pending_delete, path_gone);
+                        write_buffers.remove(&ino);
+                        release_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        reply.ok();
+                        return;
+                    }
+                    // Run flush on the dedicated flush_runtime so chunk network I/O
+                    // doesn't consume main runtime workers needed for write reply tasks.
+                    let flush_result = flush_handle.flush_runtime.spawn({
+                        let h = flush_handle.clone();
+                        async move { h.flush_buffer_async(ino, true).await }
+                    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("flush task panicked: {}", e)));
+                    if let Err(e) = flush_result {
                         error!("release: flush failed for inode {}: {}", ino, e);
                         write_buffers.remove(&ino);
+                        release_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         reply.error(libc::EIO);
                         return;
                     }
                     write_buffers.remove(&ino);
+                    size_high_water_for_release.remove(&ino);
                     if let Some(owner) = lock_owner {
                         if let Err(e) = lock_manager.release_all(ino, owner).await {
                             error!("release: lock release failed for inode {}: {}", ino, e);
                         }
                     }
+                    release_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     reply.ok();
                 });
             } else if is_write {
@@ -2463,7 +2675,7 @@ impl Filesystem for DfsFilesystem {
             self.runtime.spawn(async move {
                 let metadata_opt = metadata_cache.get(&ino).map(|m| m.clone());
                 if let Some(metadata) = metadata_opt {
-                    debug!("release: enqueuing metadata for ino={} ({} chunks)", ino, metadata.chunk_locations.len());
+                    debug!("release: enqueueing metadata for ino={} ({} chunks)", ino, metadata.chunk_locations.len());
                     client.enqueue_metadata(&metadata).await;
                     write_counters.write().unwrap().insert(ino, 0);
                 }
@@ -2589,8 +2801,10 @@ impl Filesystem for DfsFilesystem {
             // Always clean local cache first — stale entries block future creates even
             // when the server delete times out. The server/healer will clean up its side.
             let ino_opt = path_to_inode.read().unwrap().get(&path).copied();
+            let file_id_opt = ino_opt.and_then(|ino| {
+                metadata_cache.remove(&ino).map(|(_, m)| m.id)
+            });
             if let Some(ino) = ino_opt {
-                metadata_cache.remove(&ino);
                 write_buffers.remove(&ino);
                 write_counters.write().unwrap().remove(&ino);
                 last_metadata_update.remove(&ino);
@@ -2601,6 +2815,12 @@ impl Filesystem for DfsFilesystem {
             let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
             let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
             dir_cache.remove(parent_path);
+
+            // Cancel any queued metadata flush for this file before sending the delete.
+            // This prevents the queue worker from resurrecting the file after deletion.
+            if let Some(file_id) = file_id_opt {
+                client.cancel_metadata(file_id).await;
+            }
 
             match client.delete_file(&path).await {
                 Ok(_) => {
@@ -3094,7 +3314,7 @@ impl Filesystem for DfsFilesystem {
                     };
 
                     if has_pending {
-                        debug!("fsync: enqueueing pending metadata async for ino={}", ino);
+                        debug!("fsync: enqueueing pending metadata for ino={}", ino);
                         client.enqueue_metadata(&metadata).await;
                         write_counters.write().unwrap().insert(ino, 0);
                     }

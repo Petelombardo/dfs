@@ -89,6 +89,18 @@ pub struct Server {
 
     /// Notifier for the leader forward queue background task.
     leader_forward_notify: Arc<tokio::sync::Notify>,
+
+    /// Short-term gossip ring: metadata written by this node in the last ~30s.
+    /// Each entry is (FileMetadata, written_at). The gossip loop broadcasts these
+    /// to all peers (including the leader) every 15s with TTL=0, fire-and-forget.
+    /// Capped at 512 entries; oldest entries are evicted when full.
+    recent_writes: Arc<tokio::sync::Mutex<std::collections::VecDeque<(FileMetadata, std::time::Instant)>>>,
+
+    /// Delete tombstone set: FileId -> deleted_at instant.
+    /// Any PutFileMetadata that arrives for an ID in this set within TOMBSTONE_TTL
+    /// is rejected so that in-flight seq=0 creates can't resurrect a deleted file.
+    /// Entries are expired lazily on each put check.
+    delete_tombstones: Arc<DashMap<FileId, std::time::Instant>>,
 }
 
 impl Server {
@@ -123,6 +135,8 @@ impl Server {
             healing: Arc::new(RwLock::new(None)),
             leader_forward_queue: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
             leader_forward_notify: Arc::new(tokio::sync::Notify::new()),
+            recent_writes: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            delete_tombstones: Arc::new(DashMap::new()),
         };
 
         server
@@ -387,6 +401,11 @@ impl Server {
                     if !queue.is_empty() {
                         info!("leader_forward: became leader — draining {} queued items locally", queue.len());
                         while let Some((metadata, _enqueued_at)) = queue.pop_front() {
+                            // Skip files that were deleted since they were enqueued.
+                            if server.metadata.get_file(&metadata.id).ok().flatten().is_none() {
+                                debug!("leader_forward: skipping deleted file {} on leader drain", metadata.path);
+                                continue;
+                            }
                             match server.metadata.put_file(&metadata) {
                                 Ok(_) => { server.chunk_map_update(&metadata).await; }
                                 Err(e) => warn!("leader_forward: local store failed for {}: {}", metadata.path, e),
@@ -431,6 +450,15 @@ impl Server {
                         break;
                     }
 
+                    // Don't forward if the file was deleted locally since it was enqueued.
+                    // Sending PutFileMetadata to the leader for a deleted file resurrects it.
+                    if server.metadata.get_file(&metadata.id).ok().flatten().is_none() {
+                        debug!("leader_forward: skipping deleted file {} ({})", metadata.path, metadata.id);
+                        server.leader_forward_queue.lock().await.pop_front();
+                        backoff_ms = 2_000;
+                        continue;
+                    }
+
                     let req = Request::PutFileMetadata { metadata: metadata.clone() };
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(5),
@@ -466,6 +494,94 @@ impl Server {
                 }
             }
         });
+    }
+
+    /// Start the chunk-location sync loop (follower side).
+    ///
+    /// Pushes all local chunk location records to the current leader whenever:
+    ///   - the server starts up
+    ///   - the leader address changes or appears (new leader / None→Some)
+    ///   - any peer node recovers or joins (the notify fires regardless of whether
+    ///     that peer is the leader — a recovering follower should also push in case
+    ///     it was the node whose locations are missing from the stable leader)
+    ///
+    /// This fills the gap caused by the write path: each replica node stores only
+    /// a single-node location record locally; the client broadcasts the full record
+    /// to the leader, but if that broadcast is lost the leader ends up with no record
+    /// at all even though data exists on disk.  Proactive push on every leader/node
+    /// transition ensures the leader can always reconstruct the full replica picture.
+    pub fn start_chunk_location_sync_loop(self: Arc<Self>) {
+        let server = self;
+        tokio::spawn(async move {
+            let mut prev_leader: Option<std::net::SocketAddr> = None;
+            let notify = server.cluster.node_recovered_notify.clone();
+
+            // First iteration triggers immediately (startup).
+            let mut node_event = true;
+
+            loop {
+                if !node_event {
+                    // Wake on node recovery/join OR poll every 30s as a backstop.
+                    tokio::select! {
+                        _ = notify.notified() => { node_event = true; }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    }
+                }
+
+                let current_leader = server.cluster.get_leader_addr().await;
+                let leader_changed = current_leader != prev_leader;
+                prev_leader = current_leader;
+
+                // Push if leader changed/appeared, OR if a node event fired (a peer
+                // recovered or joined — that node may now need us to push our locations
+                // to the stable leader so the leader can see the full replica set).
+                let should_push = leader_changed || node_event;
+                node_event = false;
+
+                if !should_push {
+                    continue;
+                }
+
+                let leader_addr = match current_leader {
+                    Some(addr) => addr,
+                    None => continue,
+                };
+
+                // If we ARE the leader, no need to push to ourselves.
+                if leader_addr == server.cluster.local_addr() {
+                    continue;
+                }
+
+                info!("chunk_location_sync: pushing local locations to leader {}", leader_addr);
+                if let Err(e) = Self::push_locations_to(&server, leader_addr).await {
+                    warn!("chunk_location_sync: push failed: {}", e);
+                }
+            }
+        });
+    }
+
+    /// Push all local chunk locations to `target` in 500-record batches.
+    async fn push_locations_to(server: &Arc<Self>, target: std::net::SocketAddr) -> anyhow::Result<()> {
+        let metadata = server.metadata.clone();
+        let locations = tokio::task::spawn_blocking(move || {
+            metadata.list_all_chunk_locations()
+        }).await??;
+
+        if locations.is_empty() {
+            return Ok(());
+        }
+
+        let total = locations.len();
+        let mut sent = 0usize;
+        for batch in locations.chunks(500) {
+            let req = dfs_common::Request::ReplicateChunkLocations {
+                locations: batch.to_vec(),
+            };
+            server.client.send_message(target, dfs_common::Message::Request(req)).await?;
+            sent += batch.len();
+        }
+        info!("chunk_location_sync: pushed {}/{} locations to {}", sent, total, target);
+        Ok(())
     }
 
     /// Catch-up pass run when this node becomes leader.
@@ -996,6 +1112,22 @@ impl Server {
     async fn handle_replicate_metadata(&self, metadata: FileMetadata, ttl: u8) -> Response {
         debug!("Handling replicate metadata: {} (ttl={})", metadata.path, ttl);
 
+        // Tombstone check: if this file was recently deleted on this node, reject the
+        // replicate so we don't resurrect a deleted file from an in-flight broadcast.
+        const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        if let Some(entry) = self.delete_tombstones.get(&metadata.id) {
+            if entry.value().elapsed() < TOMBSTONE_TTL {
+                debug!(
+                    "[META SERVER] tombstone-reject replicate path={} id={} seq={}",
+                    metadata.path, metadata.id, metadata.write_seq
+                );
+                return Response::Ok { data: None };
+            } else {
+                drop(entry);
+                self.delete_tombstones.remove(&metadata.id);
+            }
+        }
+
         match self.metadata.put_file(&metadata) {
             Ok(_) => {
                 self.chunk_map_update(&metadata).await;
@@ -1051,7 +1183,11 @@ impl Server {
 
     /// Handle delete metadata replication (internal cluster operation)
     async fn handle_delete_metadata(&self, file_id: FileId, path: String, chunk_ids: Vec<ChunkId>, ttl: u8) -> Response {
-        debug!("Handling delete metadata: {} (file_id: {}, ttl={})", path, file_id, ttl);
+        info!("[META SERVER] delete path={} id={} chunks={} ttl={}", path, file_id, chunk_ids.len(), ttl);
+
+        // Record tombstone before deleting so that any concurrent ReplicateMetadata
+        // arriving on this node is also blocked from resurrecting the file.
+        self.delete_tombstones.insert(file_id, std::time::Instant::now());
 
         if let Err(e) = self.metadata.delete_file(&file_id) {
             warn!("Failed to delete file record {} on peer: {}", file_id, e);
@@ -1126,8 +1262,23 @@ impl Server {
             Ok(Some(existing)) => {
                 let incoming_count = location.nodes.len();
                 let existing_count = existing.nodes.len();
-                let nodes = if incoming_count > existing_count {
-                    // Expansion (new replicas added) — take incoming.
+                let nodes = if incoming_count < rf && existing_count < rf {
+                    // Both sides are under-RF — union the node sets.  This handles the
+                    // startup-sync case where followers each push their single-node record
+                    // and we need to accumulate them rather than overwrite.
+                    let mut merged: Vec<_> = existing.nodes.clone();
+                    for n in &location.nodes {
+                        if !merged.contains(n) {
+                            merged.push(*n);
+                        }
+                    }
+                    if merged.len() > existing_count {
+                        debug!("Merging chunk location for {} ({} + {} → {} nodes)",
+                               location.chunk_id, existing_count, incoming_count, merged.len());
+                    }
+                    merged
+                } else if incoming_count > existing_count {
+                    // Expansion (new replicas added, at least one side is at/above RF) — take incoming.
                     debug!("Expanding chunk location for {} ({} → {} nodes)",
                            location.chunk_id, existing_count, incoming_count);
                     location.nodes.clone()
@@ -1168,6 +1319,28 @@ impl Server {
                 self.chunk_map_update_location(&merged_location).await;
                 info!("Successfully replicated chunk location for {} (total nodes: {})",
                       merged_location.chunk_id, merged_location.nodes.len());
+
+                // If we are the leader, broadcast the merged location to all followers so they
+                // stay consistent without the client having to contact each one individually.
+                if self.cluster.is_leader().await {
+                    let cluster = self.cluster.clone();
+                    let client = self.client.clone();
+                    let local_id = self.cluster.local_node_id();
+                    let loc = merged_location.clone();
+                    tokio::spawn(async move {
+                        let nodes = cluster.get_all_nodes().await;
+                        for node in &nodes {
+                            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                continue;
+                            }
+                            let req = Request::ReplicateChunkLocation { location: loc.clone() };
+                            if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                                debug!("Leader chunk-location broadcast to {} failed: {}", node.id, e);
+                            }
+                        }
+                    });
+                }
+
                 Response::Ok { data: None }
             }
             Err(e) => {
@@ -1874,6 +2047,10 @@ impl Server {
     /// Fire-and-forget (spawned). Used by the leader for low-latency propagation;
     /// the dissemination queue is the durable catch-up path for offline nodes.
     async fn broadcast_metadata_to_followers(&self, metadata: &FileMetadata, ttl: u8) {
+        // Don't broadcast empty seq=0 creates — no chunk data, just noise on the wire.
+        if metadata.write_seq == 0 && metadata.chunk_locations.is_empty() {
+            return;
+        }
         let cluster = self.cluster.clone();
         let client = self.client.clone();
         let local_id = self.cluster.local_node_id();
@@ -1903,6 +2080,14 @@ impl Server {
             return;
         }
 
+        // Don't queue seq=0 empty creates — they carry no chunk data and generate a
+        // continuous replay storm from the dissemination loop that buries real writes.
+        // The real metadata (with write_seq>0 and chunk_locations) will be enqueued
+        // when the flush sends it.
+        if metadata.write_seq == 0 && metadata.chunk_locations.is_empty() {
+            return;
+        }
+
         let seq = match self.metadata.next_meta_sequence() {
             Ok(s) => s,
             Err(e) => {
@@ -1923,6 +2108,162 @@ impl Server {
         }
     }
 
+    /// Record a metadata write in the short-term gossip ring.
+    /// Evicts the oldest entry when the ring exceeds 512 items.
+    async fn record_recent_write(&self, metadata: FileMetadata) {
+        const MAX_RECENT: usize = 512;
+        let mut ring = self.recent_writes.lock().await;
+        // Dedup: replace any existing entry for this file_id so we only gossip the latest.
+        ring.retain(|(m, _)| m.id != metadata.id);
+        ring.push_back((metadata, std::time::Instant::now()));
+        while ring.len() > MAX_RECENT {
+            ring.pop_front();
+        }
+    }
+
+    /// Short-term gossip loop: every 15s broadcast all writes from the last 30s
+    /// to every known peer (including the leader) with TTL=0 (no re-broadcast).
+    /// Fire-and-forget — a missed delivery is covered by the long-term reconciliation.
+    pub fn start_metadata_gossip_loop(self: Arc<Self>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            const GOSSIP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+            const GOSSIP_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+            loop {
+                tokio::time::sleep(GOSSIP_INTERVAL).await;
+
+                // Collect writes from the last 30s, then evict older ones from the ring.
+                let batch: Vec<FileMetadata> = {
+                    let mut ring = server.recent_writes.lock().await;
+                    ring.retain(|(_, t)| t.elapsed() < GOSSIP_WINDOW * 2); // keep up to 60s for safety
+                    ring.iter()
+                        .filter(|(_, t)| t.elapsed() < GOSSIP_WINDOW)
+                        .map(|(m, _)| m.clone())
+                        .collect()
+                };
+
+                if batch.is_empty() {
+                    continue;
+                }
+
+                let nodes = server.cluster.get_all_nodes().await;
+                let local_id = server.cluster.local_node_id();
+                let leader_addr = server.cluster.get_leader_addr().await;
+
+                // Build target list: all online peers + the leader (even if also a peer).
+                let mut targets: Vec<std::net::SocketAddr> = nodes.iter()
+                    .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+                    .map(|n| n.addr)
+                    .collect();
+                // Ensure the leader is included even if not yet in the node list.
+                if let Some(la) = leader_addr {
+                    if la != server.cluster.local_addr() && !targets.contains(&la) {
+                        targets.push(la);
+                    }
+                }
+
+                if targets.is_empty() {
+                    continue;
+                }
+
+                debug!("[META GOSSIP] broadcasting {} recent writes to {} peers", batch.len(), targets.len());
+
+                for addr in targets {
+                    for metadata in &batch {
+                        // TTL=0: recipient stores and does NOT rebroadcast.
+                        let req = dfs_common::Request::ReplicateMetadata {
+                            metadata: metadata.clone(),
+                            ttl: 0,
+                        };
+                        let client = server.client.clone();
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                client.send_message(addr, dfs_common::Message::Request(req)),
+                            ).await;
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    /// Periodic long-term reconciliation loop: every 5 minutes the leader collects
+    /// its authoritative file inventory and sends ReconcileMetadata to each follower,
+    /// waiting for each follower to ack before moving to the next.
+    /// This is NOT fire-and-forget — failures are logged and retried next cycle.
+    pub fn start_periodic_reconciliation_loop(self: Arc<Self>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+            // Stagger first run by 60s to avoid reconcile storm at cluster startup.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            loop {
+                tokio::time::sleep(RECONCILE_INTERVAL).await;
+
+                if !server.cluster.is_leader().await {
+                    continue;
+                }
+
+                info!("[META RECONCILE] starting periodic reconciliation");
+
+                // Collect authoritative file ID set from the leader's sled store.
+                let metadata_ref = server.metadata.clone();
+                let live_ids: Vec<dfs_common::FileId> = match tokio::task::spawn_blocking(move || {
+                    let mut ids = Vec::new();
+                    let _ = metadata_ref.scan_files(|file| {
+                        ids.push(file.id);
+                        Ok(())
+                    });
+                    ids
+                }).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        warn!("[META RECONCILE] failed to collect live IDs: {}", e);
+                        continue;
+                    }
+                };
+
+                info!("[META RECONCILE] {} live file IDs — sending to followers", live_ids.len());
+
+                let nodes = server.cluster.get_all_nodes().await;
+                let local_id = server.cluster.local_node_id();
+                let mut any_failed = false;
+
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let req = dfs_common::Request::ReconcileMetadata {
+                        live_file_ids: live_ids.clone(),
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        server.client.send_message(node.addr, dfs_common::Message::Request(req)),
+                    ).await {
+                        Ok(Ok(_)) => {
+                            info!("[META RECONCILE] node {} acked reconciliation", node.id);
+                        }
+                        Ok(Err(e)) => {
+                            warn!("[META RECONCILE] node {} failed reconciliation: {}", node.id, e);
+                            any_failed = true;
+                        }
+                        Err(_) => {
+                            warn!("[META RECONCILE] node {} timed out during reconciliation", node.id);
+                            any_failed = true;
+                        }
+                    }
+                }
+
+                if any_failed {
+                    warn!("[META RECONCILE] reconciliation completed with failures — will retry next cycle");
+                } else {
+                    info!("[META RECONCILE] reconciliation complete");
+                }
+            }
+        });
+    }
+
     /// Handle put file metadata request.
     ///
     /// If this node is not the leader, return NotLeader so the client can redirect.
@@ -1930,7 +2271,11 @@ impl Server {
     /// A non-leader that receives a direct write (e.g. quorum replica) stores locally
     /// only — the leader will disseminate to the remaining followers.
     async fn handle_put_file_metadata(&self, metadata: FileMetadata) -> Response {
-        debug!("Handling put file metadata: {}", metadata.path);
+        info!(
+            "[META SERVER] put path={} id={} seq={} size={} is_leader={}",
+            metadata.path, metadata.id, metadata.write_seq, metadata.size,
+            self.cluster.is_leader().await
+        );
 
         let is_leader = self.cluster.is_leader().await;
 
@@ -1940,10 +2285,31 @@ impl Server {
             return Response::NotLeader { leader_addr };
         }
 
+        // Tombstone check: reject puts for recently-deleted files to prevent in-flight
+        // seq=0 creates (from open() before write) from resurrecting deleted metadata.
+        // TOMBSTONE_TTL is 30s — long enough for all in-flight disseminations to drain.
+        const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        if let Some(entry) = self.delete_tombstones.get(&metadata.id) {
+            if entry.value().elapsed() < TOMBSTONE_TTL {
+                info!(
+                    "[META SERVER] tombstone-reject path={} id={} seq={} (deleted {:.1}s ago)",
+                    metadata.path, metadata.id, metadata.write_seq,
+                    entry.value().elapsed().as_secs_f64()
+                );
+                // Return Ok so the client doesn't retry — the file is intentionally gone.
+                return Response::Ok { data: None };
+            } else {
+                // Tombstone expired — remove it and allow the write.
+                drop(entry);
+                self.delete_tombstones.remove(&metadata.id);
+            }
+        }
+
         // Store locally first.
         match self.metadata.put_file(&metadata) {
             Ok(crate::metadata::PutFileResult::Stored) => {
                 self.chunk_map_update(&metadata).await;
+                self.record_recent_write(metadata.clone()).await;
                 // Broadcast immediately to all followers with ttl=0 (we're the last hop).
                 // Also enqueue for durability — catch-up for nodes that are temporarily offline.
                 self.broadcast_metadata_to_followers(&metadata, 0).await;
@@ -1951,9 +2317,9 @@ impl Server {
                 Response::Ok { data: None }
             }
             Ok(crate::metadata::PutFileResult::Stale(newer)) => {
-                debug!(
-                    "put_file_metadata: leader has newer write_seq={} for {}, re-disseminating",
-                    newer.write_seq, newer.path
+                info!(
+                    "[META SERVER] stale-drop path={} id={} incoming_seq={} leader_seq={} — re-disseminating leader version",
+                    newer.path, newer.id, newer.write_seq, newer.write_seq
                 );
                 self.broadcast_metadata_to_followers(&newer, 0).await;
                 self.enqueue_metadata_for_followers(&newer).await;
@@ -2515,6 +2881,10 @@ impl Server {
                 // Delete the file metadata
                 match self.metadata.delete_file(&metadata.id) {
                     Ok(_) => {
+                        // Record tombstone immediately so in-flight seq=0 creates can't
+                        // resurrect this file before the delete replicates to all nodes.
+                        self.delete_tombstones.insert(metadata.id, std::time::Instant::now());
+
                         // Remove from chunk map
                         self.chunk_map_remove(&metadata.id).await;
 

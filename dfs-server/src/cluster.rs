@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
@@ -48,6 +48,10 @@ pub struct ClusterManager {
 
     /// Node failure timeout in seconds
     failure_timeout: u64,
+
+    /// Fired whenever any peer node transitions to Online (recovered or newly joined).
+    /// Listeners use this to trigger proactive sync without polling.
+    pub node_recovered_notify: Arc<Notify>,
 }
 
 impl ClusterManager {
@@ -73,6 +77,7 @@ impl ClusterManager {
             node_capacities: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_interval,
             failure_timeout,
+            node_recovered_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -91,14 +96,21 @@ impl ClusterManager {
         let mut nodes = self.nodes.write().await;
         let mut ring = self.hash_ring.write().await;
 
-        if nodes.contains_key(&node_info.id) {
-            debug!("Node {} already exists, updating info", node_info.id);
-        } else {
+        let is_new = !nodes.contains_key(&node_info.id);
+        if is_new {
             info!("Adding new node {} to cluster", node_info.id);
             ring.add_node(node_info.id);
+        } else {
+            debug!("Node {} already exists, updating info", node_info.id);
         }
 
         nodes.insert(node_info.id, node_info);
+        drop(nodes);
+        drop(ring);
+
+        if is_new {
+            self.node_recovered_notify.notify_waiters();
+        }
 
         Ok(())
     }
@@ -622,6 +634,7 @@ impl ClusterManager {
                 info!("Adding recovered node {} back to hash ring", node_id);
                 ring.add_node(node_id);
             }
+            self.node_recovered_notify.notify_waiters();
         }
 
         // Purge long-failed nodes from nodes HashMap to prevent memory leak

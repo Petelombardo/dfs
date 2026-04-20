@@ -236,6 +236,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.set_healing_manager(healing.clone()).await;
     server.clone().start_metadata_dissemination_loop();
     server.clone().start_leader_forward_loop();
+    server.clone().start_chunk_location_sync_loop();
+    server.clone().start_metadata_gossip_loop();
+    server.clone().start_periodic_reconciliation_loop();
     info!("✓ Healing manager started");
 
     // Start network server
@@ -289,7 +292,12 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await; // Let server start
 
         match join_cluster(server.clone(), &all_join_targets, &metadata_dir, local_addr).await {
-            Ok(_) => info!("✓ Successfully joined cluster"),
+            Ok(_) => {
+                info!("✓ Successfully joined cluster");
+                // Wake the chunk-location sync loop — now that we have a leader, push
+                // our local locations immediately rather than waiting for the 30s poll.
+                server.cluster().node_recovered_notify.notify_waiters();
+            }
             Err(e) => warn!("Failed to join cluster: {}", e),
         }
 
@@ -475,6 +483,7 @@ async fn start_periodic_rejoin(
                 match join_cluster(server.clone(), &join_targets, &metadata_dir, local_addr).await {
                     Ok(_) => {
                         info!("✓ Successfully rejoined cluster via periodic retry");
+                        server.cluster().node_recovered_notify.notify_waiters();
                     }
                     Err(e) => {
                         debug!("Periodic rejoin attempt failed: {}", e);

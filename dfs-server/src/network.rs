@@ -69,6 +69,7 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                     match result {
                         Ok((stream, peer_addr)) => {
                             debug!("Accepted connection from {}", peer_addr);
+                            let _ = stream.set_nodelay(true);
                             let handler = self.handler.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(stream, peer_addr, handler).await {
@@ -322,13 +323,14 @@ impl NetworkClient {
                     debug!("Pooled connection to {} was closed by peer, opening fresh", target);
                     let mut s = s;
                     let _ = s.shutdown().await;
-                    // Fall through to open a fresh connection below
-                    tokio::time::timeout(
+                    let fresh = tokio::time::timeout(
                         tokio::time::Duration::from_secs(5),
                         TcpStream::connect(target),
                     ).await
                         .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
-                        .with_context(|| format!("Failed to connect to {}", target))?
+                        .with_context(|| format!("Failed to connect to {}", target))?;
+                    let _ = fresh.set_nodelay(true);
+                    fresh
                 } else {
                     debug!("Reusing pooled connection to {}", target);
                     s
@@ -336,12 +338,14 @@ impl NetworkClient {
             }
             None => {
                 debug!("Connecting to {}", target);
-                tokio::time::timeout(
+                let fresh = tokio::time::timeout(
                     tokio::time::Duration::from_secs(5),
                     TcpStream::connect(target),
                 ).await
                     .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
-                    .with_context(|| format!("Failed to connect to {}", target))?
+                    .with_context(|| format!("Failed to connect to {}", target))?;
+                let _ = fresh.set_nodelay(true);
+                fresh
             }
         };
 
@@ -355,6 +359,7 @@ impl NetworkClient {
             ).await
                 .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
                 .with_context(|| format!("Failed to reconnect to {}", target))?;
+            let _ = fresh.set_nodelay(true);
             write_message(&mut fresh, &envelope).await?;
             stream = fresh;
         }

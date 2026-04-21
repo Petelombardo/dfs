@@ -2786,6 +2786,7 @@ impl Filesystem for DfsFilesystem {
                 let pending_deletes_for_release = self.pending_deletes.clone();
                 let path_to_inode_for_release = self.path_to_inode.clone();
                 let size_high_water_for_release = self.size_high_water.clone();
+                let read_engines_for_release = self.client.read_engines.engines.clone();
                 release_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Reply to FUSE immediately — release() errors are informational only
                 // and the kernel ignores them. Parking a main-runtime worker for the
@@ -2823,6 +2824,11 @@ impl Filesystem for DfsFilesystem {
                     }
                     if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
                         error!("release: flush failed for inode {}: {}", ino, e);
+                    }
+                    // Invalidate the read engine's chunk map so the next reader
+                    // immediately picks up the newly flushed chunks.
+                    if let Some(engine) = read_engines_for_release.get(&ino) {
+                        engine.expire_chunk_map();
                     }
                     write_buffers.remove(&ino);
                     size_high_water_for_release.remove(&ino);

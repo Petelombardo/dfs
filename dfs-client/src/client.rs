@@ -1204,7 +1204,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         const CHUNK_SIZE_USIZE: usize = 4 * 1024 * 1024;
         let current_chunk = (offset / CHUNK_SIZE_USIZE) as u32;
 
-        if engine.needs_refresh(file_size).await {
+        if engine.needs_refresh(file_size, current_chunk).await {
             let engine_clone = engine.clone();
             let client_clone = self.clone();
             tokio::spawn(async move {

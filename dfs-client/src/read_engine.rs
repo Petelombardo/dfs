@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use dfs_common::{ChunkId, ChunkLocation};
@@ -52,6 +52,11 @@ pub struct InodeReadEngine {
 
     /// Set while a refresh is in progress; prevents duplicate concurrent refreshes.
     pub refresh_in_progress: AtomicBool,
+
+    /// Chunk index range [window_start, window_end) covered by the last windowed fetch.
+    /// Used to detect when a seek lands outside the cached window and force a re-fetch.
+    pub last_window_start: AtomicU32,
+    pub last_window_end: AtomicU32,
 }
 
 impl InodeReadEngine {
@@ -68,20 +73,26 @@ impl InodeReadEngine {
             pipeline_head: AtomicUsize::new(0),
             pipeline_depth: 2,
             refresh_in_progress: AtomicBool::new(false),
+            last_window_start: AtomicU32::new(0),
+            last_window_end: AtomicU32::new(0),
         })
     }
 
-    /// Returns true if the chunk map needs a refresh (too old or file grew by a full chunk).
-    pub async fn needs_refresh(&self, current_size: u64) -> bool {
+    /// Returns true if the chunk map needs a refresh.
+    /// Triggers on: file grew by a chunk, TTL expired, or current read position is outside
+    /// the last-fetched window (e.g. seek backward past the window start).
+    pub async fn needs_refresh(&self, current_size: u64, current_chunk: u32) -> bool {
         let known = self.known_size.load(Ordering::Relaxed) as u64;
-        // Only refresh when the file has grown by at least one full chunk boundary since
-        // the last refresh — not on every byte change. For live recordings the file grows
-        // continuously; refreshing on every size tick causes a leader round-trip on nearly
-        // every read, which is the primary cause of stutter during live playback.
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let new_chunk_count = (current_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let known_chunk_count = (known + CHUNK_SIZE - 1) / CHUNK_SIZE;
         if new_chunk_count > known_chunk_count {
+            return true;
+        }
+        // Seek landed outside the cached window — need to fetch the new region.
+        let ws = self.last_window_start.load(Ordering::Relaxed);
+        let we = self.last_window_end.load(Ordering::Relaxed);
+        if current_chunk < ws || current_chunk >= we {
             return true;
         }
         let last = self.last_map_refresh.lock().await;
@@ -102,11 +113,14 @@ impl InodeReadEngine {
         let mut co = self.chunk_offsets.lock().await;
         let mut nim = self.node_id_to_addr.lock().await;
         let mut lr = self.last_map_refresh.lock().await;
+        let loc_len = locations.len() as u32;
         *cm = Arc::new(locations);
         *co = Arc::new(offsets);
         *nim = node_map;
         *lr = std::time::Instant::now();
         self.known_size.store(file_size as usize, Ordering::Relaxed);
+        self.last_window_start.store(0, Ordering::Relaxed);
+        self.last_window_end.store(loc_len, Ordering::Relaxed);
         info!("Engine inode={}: chunk map updated ({} chunks, {} bytes)",
               self.inode, cm.len(), file_size);
     }
@@ -145,6 +159,7 @@ impl InodeReadEngine {
             });
         }
         // Overwrite the refreshed window.
+        let window_len = window.len() as u32;
         for (i, loc) in window.into_iter().enumerate() {
             let idx = from + i;
             if idx < new_map.len() {
@@ -157,13 +172,16 @@ impl InodeReadEngine {
         }
 
         let offsets = build_offsets(&new_map);
-        info!("Engine inode={}: chunk map window merged ({} chunks, {} bytes, window from={})",
-              self.inode, new_map.len(), file_size, from_chunk);
+        let window_end = from_chunk + window_len;
+        info!("Engine inode={}: chunk map window merged ({} chunks, {} bytes, window from={} end={})",
+              self.inode, new_map.len(), file_size, from_chunk, window_end);
         *cm = Arc::new(new_map);
         *co = Arc::new(offsets);
         *nim = node_map;
         *lr = std::time::Instant::now();
         self.known_size.store(file_size as usize, Ordering::Relaxed);
+        self.last_window_start.store(from_chunk, Ordering::Relaxed);
+        self.last_window_end.store(window_end, Ordering::Relaxed);
     }
 
     /// Cheap snapshot — does not block writers.

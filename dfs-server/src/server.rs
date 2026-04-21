@@ -3720,7 +3720,7 @@ impl Server {
         let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, modified_at: u64| {
             let total_chunks = locations.len() as u32;
             let start = (from_chunk as usize).min(locations.len());
-            let end = (start + count as usize).min(locations.len());
+            let end = start.saturating_add(count as usize).min(locations.len());
             Response::FileChunkMap {
                 file_id,
                 locations: locations[start..end].to_vec(),

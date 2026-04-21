@@ -1507,10 +1507,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
         };
 
-        // Request a window of chunks ahead of the current read position.
-        // 64 chunks = 256MB of lookahead — enough for smooth playback without
-        // sending the full map of a multi-hour recording on every refresh.
-        const CHUNK_MAP_WINDOW: u32 = 64;
+        // Fetch all chunks from the current read position to EOF.
+        // u32::MAX tells the server "give me everything from from_chunk onward".
+        // This ensures any forward seek — even 10+ minutes ahead — has valid chunk
+        // locations without a second round-trip. Backward seeks still trigger a
+        // re-fetch (needs_refresh detects out-of-window), but those are rare.
+        const CHUNK_MAP_WINDOW: u32 = u32::MAX;
         match self.get_file_chunk_map(file_id, from_chunk, CHUNK_MAP_WINDOW).await {
             Ok((locs, window_from, total_chunks, _)) if !locs.is_empty() => {
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader",

@@ -235,6 +235,8 @@ struct FlushHandle {
     /// flush sub-tasks (which do blocking network writes) never starve write reply
     /// tasks, which must run to unblock the kernel's FUSE write queue.
     flush_runtime: Arc<tokio::runtime::Runtime>,
+    /// Global write buffer byte counter — decremented when slots are flushed and removed.
+    global_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FlushHandle {
@@ -471,7 +473,12 @@ impl FlushHandle {
                             // Remember how many bytes this chunk has on the server so that
                             // if the slot is recreated (e.g. DVR appending into a partial
                             // chunk), the read path can bypass our zero-fill prefix.
-                            state.flushed_sizes.insert(*chunk_idx, removed.data.len());
+                            let flushed_len = removed.data.len();
+                            state.flushed_sizes.insert(*chunk_idx, flushed_len);
+                            self.global_buffered_bytes.fetch_sub(
+                                flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
                     }
                     if let Some(locations) = locations_opt {
@@ -727,6 +734,14 @@ pub struct DfsFilesystem {
     /// release() waits for this to reach zero before flush so we don't flush an incomplete slot.
     write_tasks_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
 
+    /// Total bytes currently held across all per-inode write buffers.
+    /// Updated atomically on every buffered write and on every flush completion.
+    /// The write path spins with a 5ms sleep when this exceeds global_write_buffer_cap
+    /// to prevent unbounded memory growth when the storage nodes are slow.
+    global_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// Hard cap on total write buffer bytes. Set to ~8% of available RAM at init.
+    global_write_buffer_cap: usize,
 }
 
 impl DfsFilesystem {
@@ -754,6 +769,17 @@ impl DfsFilesystem {
               buffer_flush_threshold / (1024 * 1024),
               buffer_flush_threshold / chunk_size_bytes,
               chunk_size_mb);
+
+        // Global write buffer cap: 8% of available RAM, minimum 32MB, maximum 128MB.
+        // Applies across ALL inodes to prevent OOM when multiple recordings are active.
+        let available_mb = dfs_common::get_available_memory()
+            .map(|b| b / (1024 * 1024))
+            .unwrap_or(512) as usize;
+        let global_write_buffer_cap = (available_mb * 1024 * 1024 / 12)
+            .max(32 * 1024 * 1024)
+            .min(128 * 1024 * 1024);
+        info!("Global write buffer cap: {}MB (available RAM: {}MB)",
+              global_write_buffer_cap / (1024 * 1024), available_mb);
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
         if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {
@@ -812,6 +838,9 @@ impl DfsFilesystem {
                 .expect("Failed to build flush runtime")
         );
 
+        let global_buffered_bytes: Arc<std::sync::atomic::AtomicUsize> =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
             let write_buffers_clone = write_buffers_for_cleanup.clone();
@@ -837,6 +866,7 @@ impl DfsFilesystem {
                 path_to_inode: path_to_inode_for_bg.clone(),
                 truncated_inodes: truncated_inodes_shared.clone(),
                 flush_runtime: flush_runtime.clone(),
+                global_buffered_bytes: global_buffered_bytes.clone(),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
@@ -934,6 +964,7 @@ impl DfsFilesystem {
             path_to_inode: path_to_inode.clone(),
             truncated_inodes: truncated_inodes_shared.clone(),
             flush_runtime: flush_runtime.clone(),
+            global_buffered_bytes: global_buffered_bytes.clone(),
         };
 
         Ok(Self {
@@ -965,6 +996,8 @@ impl DfsFilesystem {
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
             release_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             write_tasks_in_flight: Arc::new(DashMap::new()),
+            global_buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            global_write_buffer_cap,
         })
     }
 
@@ -1239,6 +1272,7 @@ impl Filesystem for DfsFilesystem {
             path_to_inode: self.path_to_inode.clone(),
             truncated_inodes: self.truncated_inodes.clone(),
             flush_runtime: self.flush_runtime.clone(),
+            global_buffered_bytes: self.global_buffered_bytes.clone(),
         };
 
         self.block_on(async move {
@@ -2181,6 +2215,8 @@ impl Filesystem for DfsFilesystem {
         let path_to_inode = self.path_to_inode.clone();
         let flush_handle = self.flush_handle.clone();
         let size_high_water = self.size_high_water.clone();
+        let global_buffered_bytes = self.global_buffered_bytes.clone();
+        let global_write_buffer_cap = self.global_write_buffer_cap;
         let data_vec = data.to_vec();
         let req_uid = _req.uid();
         let req_gid = _req.gid();
@@ -2395,12 +2431,24 @@ impl Filesystem for DfsFilesystem {
                 }
 
                 // BUFFERED WRITE — write into the slot and return immediately.
-                // No back-pressure: the background flusher drains full slots continuously
-                // and is always schedulable (write tasks never block waiting for it).
-                // Memory is bounded in practice: the flusher runs every 100ms and each
-                // 4MB slot takes ~50ms to write to two replicas, so at most ~2 batches
-                // accumulate before the flusher catches up.
+                // Back-pressure: if total buffered bytes across all inodes exceeds the
+                // global cap, spin with a 5ms sleep until the background flusher drains
+                // enough. This prevents OOM when storage nodes are slow and multiple
+                // recordings are active simultaneously.
                 {
+                    const BACKPRESSURE_SLEEP_MS: u64 = 5;
+                    let mut waited = 0u64;
+                    while global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed) >= global_write_buffer_cap {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(BACKPRESSURE_SLEEP_MS)).await;
+                        waited += BACKPRESSURE_SLEEP_MS;
+                        if waited % 500 == 0 {
+                            warn!("write back-pressure: ino={} waiting for buffer drain ({}MB buffered, cap={}MB)",
+                                  ino,
+                                  global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed) / (1024*1024),
+                                  global_write_buffer_cap / (1024*1024));
+                        }
+                    }
+
                     let write_offset = offset as u64;
 
                     let state_arc = write_buffers
@@ -2410,6 +2458,7 @@ impl Filesystem for DfsFilesystem {
                     let mut state = state_arc.lock().await;
                     state.write_at(write_offset, &data_vec);
                     drop(state);
+                    global_buffered_bytes.fetch_add(data_vec.len(), std::sync::atomic::Ordering::Relaxed);
 
                     // Update size_high_water immediately so concurrent writes that hit
                     // try_lock() failure see the correct write position and don't misclassify

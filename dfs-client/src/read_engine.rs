@@ -111,6 +111,61 @@ impl InodeReadEngine {
               self.inode, cm.len(), file_size);
     }
 
+    /// Merge a windowed chunk map response into the engine's full map.
+    /// Slots [from_chunk .. from_chunk+window.len()) are updated in place;
+    /// slots outside the window are preserved from the previous snapshot.
+    /// If `total_chunks` exceeds the current map length, the map is extended.
+    pub async fn update_chunk_map_window(
+        &self,
+        window: Vec<ChunkLocation>,
+        from_chunk: u32,
+        total_chunks: u32,
+        node_map: Arc<std::collections::HashMap<dfs_common::NodeId, SocketAddr>>,
+        file_size: u64,
+    ) {
+        let from = from_chunk as usize;
+        let total = total_chunks as usize;
+
+        let mut cm = self.chunk_map.lock().await;
+        let mut co = self.chunk_offsets.lock().await;
+        let mut nim = self.node_id_to_addr.lock().await;
+        let mut lr = self.last_map_refresh.lock().await;
+
+        // Build updated map: start from existing, resize to total_chunks if needed.
+        let mut new_map = (*cm).as_ref().clone();
+        let nil_id = dfs_common::ChunkId::from_hash([0u8; 32]);
+        if new_map.len() < total {
+            new_map.resize(total, ChunkLocation {
+                chunk_id: nil_id,
+                nodes: Vec::new(),
+                size: 0,
+                checksum: [0u8; 32],
+                file_offset: None,
+                written_at: None,
+            });
+        }
+        // Overwrite the refreshed window.
+        for (i, loc) in window.into_iter().enumerate() {
+            let idx = from + i;
+            if idx < new_map.len() {
+                new_map[idx] = loc;
+            }
+        }
+        // Drop placeholder slots at the tail that were never filled.
+        while new_map.last().map(|l| l.chunk_id.hash == [0u8; 32]).unwrap_or(false) {
+            new_map.pop();
+        }
+
+        let offsets = build_offsets(&new_map);
+        info!("Engine inode={}: chunk map window merged ({} chunks, {} bytes, window from={})",
+              self.inode, new_map.len(), file_size, from_chunk);
+        *cm = Arc::new(new_map);
+        *co = Arc::new(offsets);
+        *nim = node_map;
+        *lr = std::time::Instant::now();
+        self.known_size.store(file_size as usize, Ordering::Relaxed);
+    }
+
     /// Cheap snapshot — does not block writers.
     pub async fn snapshot(&self) -> (Arc<Vec<ChunkLocation>>, ChunkOffsets,
                                     Arc<std::collections::HashMap<dfs_common::NodeId, SocketAddr>>) {

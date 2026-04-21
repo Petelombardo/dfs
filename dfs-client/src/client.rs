@@ -1194,20 +1194,22 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let engine = self.read_engines.get_or_create(inode);
 
-        // Refresh chunk map if stale or file grew.
-        // refresh_engine() is a no-op if another refresh (e.g. from open()) is already running,
-        // so after the call we spin-wait for the flag to clear before taking a snapshot.
+        // Refresh chunk map if stale or file grew — but do it in the background so the
+        // current read is never blocked by a leader round-trip (~50-100ms). The stale
+        // snapshot is safe to use: it has valid chunk locations; the next read after the
+        // refresh completes will get the updated map. Only block when the map is empty
+        // (handled below in the empty-map retry loop).
+        // Compute the chunk index for the current read position — used to request only
+        // the window of chunks we actually need from the leader.
+        const CHUNK_SIZE_USIZE: usize = 4 * 1024 * 1024;
+        let current_chunk = (offset / CHUNK_SIZE_USIZE) as u32;
+
         if engine.needs_refresh(file_size).await {
-            self.refresh_engine(&engine, file_id, file_size).await;
-        }
-        // Whether we refreshed or skipped, wait for any in-progress refresh to finish
-        // (could have been started by open() prefetch) before taking the snapshot.
-        if engine.refresh_in_progress.load(std::sync::atomic::Ordering::Acquire) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            while engine.refresh_in_progress.load(std::sync::atomic::Ordering::Acquire) {
-                if std::time::Instant::now() >= deadline { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
+            let engine_clone = engine.clone();
+            let client_clone = self.clone();
+            tokio::spawn(async move {
+                client_clone.refresh_engine(&engine_clone, file_id, file_size, current_chunk).await;
+            });
         }
 
         let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot().await;
@@ -1221,7 +1223,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
             while std::time::Instant::now() < deadline {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                self.refresh_engine(&engine, file_id, file_size).await;
+                self.refresh_engine(&engine, file_id, file_size, 0).await;
                 let snap = engine.snapshot().await;
                 chunk_map = snap.0; chunk_offsets = snap.1; nim = snap.2;
                 if !chunk_map.is_empty() { break; }
@@ -1471,11 +1473,15 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Refresh the engine's chunk map from the leader.
+    /// `from_chunk` is the first chunk index the reader currently needs; the server
+    /// returns a window of CHUNK_MAP_WINDOW chunks starting there so the response
+    /// stays small even for multi-hour recordings.
     pub async fn refresh_engine(
         &self,
         engine: &InodeReadEngine,
         file_id: FileId,
         file_size: u64,
+        from_chunk: u32,
     ) {
         use std::sync::atomic::Ordering;
         if engine.refresh_in_progress.compare_exchange(
@@ -1483,7 +1489,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         ).is_err() {
             return;
         }
-        self.refresh_engine_flagged(engine, file_id, file_size).await;
+        self.refresh_engine_flagged(engine, file_id, file_size, from_chunk).await;
     }
 
     /// Like `refresh_engine` but assumes the caller already set `refresh_in_progress = true`.
@@ -1493,6 +1499,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         engine: &InodeReadEngine,
         file_id: FileId,
         file_size: u64,
+        from_chunk: u32,
     ) {
         use std::sync::atomic::Ordering;
         let nim: std::collections::HashMap<dfs_common::NodeId, SocketAddr> = {
@@ -1500,10 +1507,15 @@ leader_addr: Arc::new(RwLock::new(None)),
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
         };
 
-        match self.get_file_chunk_map(file_id).await {
-            Ok((locs, _)) if !locs.is_empty() => {
-                info!("refresh_engine: inode={} got {} chunks from leader", engine.inode, locs.len());
-                engine.update_chunk_map(locs, Arc::new(nim), file_size).await;
+        // Request a window of chunks ahead of the current read position.
+        // 64 chunks = 256MB of lookahead — enough for smooth playback without
+        // sending the full map of a multi-hour recording on every refresh.
+        const CHUNK_MAP_WINDOW: u32 = 64;
+        match self.get_file_chunk_map(file_id, from_chunk, CHUNK_MAP_WINDOW).await {
+            Ok((locs, window_from, total_chunks, _)) if !locs.is_empty() => {
+                info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader",
+                      engine.inode, locs.len(), window_from, total_chunks);
+                engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size).await;
             }
             Ok(_) | Err(_) => {
                 info!("refresh_engine: inode={} no chunk map from leader", engine.inode);
@@ -2114,7 +2126,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
     /// Query the leader for the full chunk location map of a file.
     /// Returns (locations, modified_at). Falls back to any node if leader is unknown.
-    pub async fn get_file_chunk_map(&self, file_id: FileId) -> Result<(Vec<dfs_common::ChunkLocation>, u64)> {
+    pub async fn get_file_chunk_map(&self, file_id: FileId, from_chunk: u32, count: u32) -> Result<(Vec<dfs_common::ChunkLocation>, u32, u32, u64)> {
         let target = {
             let leader = self.leader_addr.read().await;
             match *leader {
@@ -2126,20 +2138,19 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         };
 
-        let request = Request::GetFileChunkMap { file_id };
+        let request = Request::GetFileChunkMap { file_id, from_chunk, count };
         let response = self.send_request(target, request).await;
 
         let response = match response {
             Ok(r) => r,
             Err(e) => {
-                // Leader may have changed — fall back to first available node
                 warn!("GetFileChunkMap to leader failed ({}), retrying any node", e);
                 let nodes = self.cluster_nodes.read().await.clone();
                 let mut last_err = e;
                 let mut found = None;
                 for addr in &nodes {
                     if *addr == target { continue; }
-                    match self.send_request(*addr, Request::GetFileChunkMap { file_id }).await {
+                    match self.send_request(*addr, Request::GetFileChunkMap { file_id, from_chunk, count }).await {
                         Ok(r) => { found = Some(r); break; }
                         Err(e) => { last_err = e; }
                     }
@@ -2149,7 +2160,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         match response {
-            Response::FileChunkMap { locations, modified_at, .. } => Ok((locations, modified_at)),
+            Response::FileChunkMap { locations, from_chunk, total_chunks, modified_at, .. } => {
+                Ok((locations, from_chunk, total_chunks, modified_at))
+            }
             Response::Error { message, .. } => anyhow::bail!("GetFileChunkMap error: {}", message),
             _ => anyhow::bail!("Unexpected response to GetFileChunkMap"),
         }

@@ -896,8 +896,8 @@ impl Server {
             Request::PurgeFileMetadataById { file_id, propagate } => {
                 self.handle_purge_file_metadata_by_id(file_id, propagate).await
             }
-            Request::GetFileChunkMap { file_id } => {
-                self.handle_get_file_chunk_map(file_id).await
+            Request::GetFileChunkMap { file_id, from_chunk, count } => {
+                self.handle_get_file_chunk_map(file_id, from_chunk, count).await
             }
 
             Request::AppendFile { file_id, data, expected_offset } => {
@@ -3714,16 +3714,25 @@ impl Server {
         }
     }
 
-    /// Handle GetFileChunkMap — returns the full chunk location map for a file.
+    /// Handle GetFileChunkMap — returns a windowed slice of the chunk location map.
     /// Served from the in-memory chunk map maintained by all nodes (leader-authoritative).
-    async fn handle_get_file_chunk_map(&self, file_id: FileId) -> Response {
+    async fn handle_get_file_chunk_map(&self, file_id: FileId, from_chunk: u32, count: u32) -> Response {
+        let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, modified_at: u64| {
+            let total_chunks = locations.len() as u32;
+            let start = (from_chunk as usize).min(locations.len());
+            let end = (start + count as usize).min(locations.len());
+            Response::FileChunkMap {
+                file_id,
+                locations: locations[start..end].to_vec(),
+                from_chunk,
+                total_chunks,
+                modified_at,
+            }
+        };
+
         if let Some(entry) = self.chunk_map.get(&file_id) {
             let (locations, modified_at) = entry.value();
-            return Response::FileChunkMap {
-                file_id,
-                locations: locations.clone(),
-                modified_at: *modified_at,
-            };
+            return slice_response(locations, *modified_at);
         }
 
         // Cache miss — fall back to sled (chunk map may still be rebuilding after restart,
@@ -3734,11 +3743,7 @@ impl Server {
             Ok(Ok(Some(metadata))) if !metadata.chunk_locations.is_empty() => {
                 // Populate cache for future lookups.
                 self.chunk_map.insert(file_id, (metadata.chunk_locations.clone(), metadata.modified_at));
-                Response::FileChunkMap {
-                    file_id,
-                    locations: metadata.chunk_locations,
-                    modified_at: metadata.modified_at,
-                }
+                slice_response(&metadata.chunk_locations, metadata.modified_at)
             }
             _ => Response::Error {
                 message: format!("No chunk map entry for file {}", file_id),

@@ -322,10 +322,14 @@ pub enum Request {
         file_id: FileId,
     },
 
-    /// Get the full chunk location map for a file from the leader.
+    /// Get a windowed slice of the chunk location map for a file from the leader.
     /// Only the leader maintains this in-memory map; followers serve chunk data.
+    /// `from_chunk` is the first chunk index to return; `count` is the max number
+    /// of chunks to return. Use from_chunk=0, count=u32::MAX for the full map.
     GetFileChunkMap {
         file_id: FileId,
+        from_chunk: u32,
+        count: u32,
     },
 
     /// Append data to an existing file. The server handles chunk alignment:
@@ -493,11 +497,15 @@ pub enum Response {
         total_count: usize,
     },
 
-    /// Full chunk location map for a file (leader-served)
+    /// Windowed chunk location map for a file (leader-served)
     FileChunkMap {
         file_id: FileId,
-        /// All chunk locations for the file, in order
+        /// Chunk locations for the requested window, in order
         locations: Vec<ChunkLocation>,
+        /// Index of the first chunk in `locations` (matches the requested from_chunk)
+        from_chunk: u32,
+        /// Total number of chunks in the file (so client knows the full extent)
+        total_chunks: u32,
         /// Server-side modified_at timestamp so client can detect changes
         modified_at: u64,
     },

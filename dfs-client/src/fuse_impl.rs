@@ -1546,7 +1546,7 @@ impl Filesystem for DfsFilesystem {
                     std::sync::atomic::Ordering::Relaxed).is_ok()
             {
                 self.runtime.spawn(async move {
-                    client.refresh_engine_flagged(&engine, file_id, file_size).await;
+                    client.refresh_engine_flagged(&engine, file_id, file_size, 0).await;
                 });
             }
         }

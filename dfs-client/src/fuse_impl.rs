@@ -770,14 +770,14 @@ impl DfsFilesystem {
               buffer_flush_threshold / chunk_size_bytes,
               chunk_size_mb);
 
-        // Global write buffer cap: 8% of available RAM, minimum 32MB, maximum 128MB.
+        // Global write buffer cap: 30% of available RAM, minimum 64MB.
         // Applies across ALL inodes to prevent OOM when multiple recordings are active.
+        // 30% leaves the OS, tokio runtime, read caches, and chunk I/O with the remaining 70%.
         let available_mb = dfs_common::get_available_memory()
             .map(|b| b / (1024 * 1024))
             .unwrap_or(512) as usize;
-        let global_write_buffer_cap = (available_mb * 1024 * 1024 / 12)
-            .max(32 * 1024 * 1024)
-            .min(128 * 1024 * 1024);
+        let global_write_buffer_cap = (available_mb * 30 / 100 * 1024 * 1024)
+            .max(64 * 1024 * 1024);
         info!("Global write buffer cap: {}MB (available RAM: {}MB)",
               global_write_buffer_cap / (1024 * 1024), available_mb);
 

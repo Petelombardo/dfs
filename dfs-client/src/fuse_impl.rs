@@ -95,10 +95,7 @@ impl ChunkSlot {
         Self {
             data: Vec::with_capacity(CHUNK_SIZE),
             last_modified: SystemTime::now(),
-            // Pre-seed gap_filled_prefix so that is_append_extend correctly identifies
-            // new bytes written into this slot as an extension of the server's committed
-            // data, rather than treating them as a fresh WriteData.
-            gap_filled_prefix: server_bytes,
+            gap_filled_prefix: 0,
             server_prefix: server_bytes,
         }
     }
@@ -368,8 +365,11 @@ impl FlushHandle {
                     // Send only the new appended bytes, starting at the old chunk boundary.
                     (existing_chunk_size, slot_data[existing_chunk_size..].to_vec())
                 } else {
-                    // Full overlay from byte 0 (DVR header / in-place overwrite).
-                    (0, slot_data.clone())
+                    // In-place overwrite: skip any synthetic zero-fill prefix (gap_filled_prefix
+                    // is pre-seeded to server_prefix in new_post_flush, meaning bytes 0..gap are
+                    // zeros we never actually wrote). Only send the real app-written bytes.
+                    let real_start = gap_filled_prefix;
+                    (real_start, slot_data[real_start..].to_vec())
                 };
                 info!("flush_buffer_async: slot {} ({} bytes) — PatchChunk intra={} patch_len={}",
                       chunk_idx, slot_len, patch_intra, patch_bytes.len());

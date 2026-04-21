@@ -71,6 +71,10 @@ struct ChunkSlot {
     data: Vec<u8>,
     /// When this slot was last written to
     last_modified: SystemTime,
+    /// Bytes at the front of `data` that were zero-filled by our gap logic, not written
+    /// by the application. Used to distinguish a real all-zero write from a synthetic gap
+    /// prefix — prevents PatchChunk from overwriting real server data with our zeros.
+    gap_filled_prefix: usize,
 }
 
 impl ChunkSlot {
@@ -78,6 +82,7 @@ impl ChunkSlot {
         Self {
             data: Vec::with_capacity(CHUNK_SIZE),
             last_modified: SystemTime::now(),
+            gap_filled_prefix: 0,
         }
     }
 
@@ -302,13 +307,20 @@ impl FlushHandle {
                 .unwrap_or(0);
             let chunk_exists = max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false)
                 && existing_chunk_size > 0;
-            // Detect append: the slot has existing prefix (nulls 0..existing_size) followed
-            // by new bytes (existing_size..slot_len). We identify this by checking whether
-            // slot_data[0..existing_size] is all zeros (the unfilled prefix from write_at).
+            // Detect append: the slot was gap-zero-filled up to existing_chunk_size, then
+            // real data was appended beyond. Use gap_filled_prefix (set explicitly when we
+            // zero-fill) rather than checking for all-zeros — the all-zeros heuristic was
+            // wrong when the server's real chunk 0 data happened to start with zeros.
+            let gap_filled_prefix = {
+                let state_lock = self.write_buffers.get(&ino);
+                state_lock.and_then(|s| s.try_lock().ok()
+                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| sl.gap_filled_prefix)))
+                    .unwrap_or(0)
+            };
             let is_append_extend = chunk_exists
                 && slot_len < CHUNK_SIZE
                 && slot_len > existing_chunk_size
-                && slot_data[..existing_chunk_size].iter().all(|&b| b == 0);
+                && gap_filled_prefix >= existing_chunk_size;
             let is_overwrite = chunk_exists && slot_len < CHUNK_SIZE && slot_len <= existing_chunk_size;
             let needs_patch = is_overwrite || is_append_extend;
 
@@ -2261,6 +2273,13 @@ impl Filesystem for DfsFilesystem {
                             .clone();
                         let mut state = state_arc.lock().await;
                         state.write_at(gap_write_offset, &padded);
+                        // Mark the gap bytes as synthetic so flush doesn't mistake them
+                        // for real app data when deciding whether to PatchChunk.
+                        let gap_chunk_idx = InodeWriteState::chunk_index(gap_write_offset);
+                        let gap_intra = InodeWriteState::intra_offset(gap_write_offset);
+                        if let Some(slot) = state.slots.get_mut(&gap_chunk_idx) {
+                            slot.gap_filled_prefix = gap_intra + gap;
+                        }
                         drop(state);
 
                         {

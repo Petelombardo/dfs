@@ -123,6 +123,34 @@ READ_RC=$?
 wait $DVR_PID
 [ $READ_RC -eq 0 ] && pass || fail "DVR playback stalled (exit=$READ_RC)"
 
+echo "== Test: DVR header survives concurrent reader (chunk 0 corruption regression) =="
+TEST=$((TEST+1))
+# Write a known JSON-like header at offset 0 (small, like hdhomerun DVR metadata),
+# then stream body data. Open a concurrent reader that seeks into the middle of the
+# file. Verify chunk 0 header bytes are intact after the reader closes.
+HEADER='{"Title":"Test Recording","EpisodeID":"20260421","Size":0}'
+HEADER_LEN=${#HEADER}
+printf '%s' "$HEADER" > "$MOUNT/test-hdr.img"
+# Append 12MB of body data (3 chunks) at 2MB/s to simulate live recording
+pv --size 12M -S -L 2M < /dev/urandom >> "$MOUNT/test-hdr.img" &
+HDR_PID=$!
+sleep 3  # let 3 chunks land
+# Concurrent reader seeks into the middle of the file (simulates fast-forward)
+dd if="$MOUNT/test-hdr.img" bs=1M skip=1 count=2 of=/dev/null status=none 2>/dev/null
+sleep 1
+# Read more — simulates continued playback then close
+dd if="$MOUNT/test-hdr.img" bs=1M count=1 of=/dev/null status=none 2>/dev/null
+wait $HDR_PID
+sleep 2  # allow flush
+# Verify header is intact
+ACTUAL=$(dd if="$MOUNT/test-hdr.img" bs=1 count=$HEADER_LEN 2>/dev/null)
+if [ "$ACTUAL" = "$HEADER" ]; then
+    pass
+else
+    fail "chunk 0 header corrupted: got '${ACTUAL:0:40}...'"
+fi
+sleep 1
+
 # Wait for background write to finish
 echo "Waiting for background 128MB write to complete..."
 wait $BG_PID

@@ -75,6 +75,10 @@ struct ChunkSlot {
     /// by the application. Used to distinguish a real all-zero write from a synthetic gap
     /// prefix — prevents PatchChunk from overwriting real server data with our zeros.
     gap_filled_prefix: usize,
+    /// How many bytes were already flushed to the server for this chunk before this slot
+    /// was created (i.e. the slot was recreated after a flush). Reads within 0..server_prefix
+    /// should be served from the server, not from our zero-filled slot data.
+    server_prefix: usize,
 }
 
 impl ChunkSlot {
@@ -83,6 +87,19 @@ impl ChunkSlot {
             data: Vec::with_capacity(CHUNK_SIZE),
             last_modified: SystemTime::now(),
             gap_filled_prefix: 0,
+            server_prefix: 0,
+        }
+    }
+
+    fn new_post_flush(server_bytes: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(CHUNK_SIZE),
+            last_modified: SystemTime::now(),
+            // Pre-seed gap_filled_prefix so that is_append_extend correctly identifies
+            // new bytes written into this slot as an extension of the server's committed
+            // data, rather than treating them as a fresh WriteData.
+            gap_filled_prefix: server_bytes,
+            server_prefix: server_bytes,
         }
     }
 
@@ -101,6 +118,11 @@ impl ChunkSlot {
 struct InodeWriteState {
     /// Dirty chunk slots: chunk_index -> buffered bytes
     slots: HashMap<u64, ChunkSlot>,
+    /// Tracks how many bytes were flushed for each chunk index. When a slot is removed after
+    /// a successful flush and later re-created (e.g. DVR appending into a partially-flushed
+    /// chunk), write_at uses this to set server_prefix so the read path can fall through to
+    /// the network for bytes already on the server.
+    flushed_sizes: HashMap<u64, usize>,
     /// If true, every fsync() must flush immediately (O_SYNC / O_DSYNC was set on open).
     /// If false, fsyncs within the coalescing window are absorbed (DVR / streaming mode).
     sync_on_fsync: bool,
@@ -110,6 +132,7 @@ impl InodeWriteState {
     fn new(sync_on_fsync: bool) -> Self {
         Self {
             slots: HashMap::new(),
+            flushed_sizes: HashMap::new(),
             sync_on_fsync,
         }
     }
@@ -132,10 +155,17 @@ impl InodeWriteState {
         while !remaining.is_empty() {
             let idx = Self::chunk_index(cur_offset);
             let intra = Self::intra_offset(cur_offset);
-            let slot = self.slots.entry(idx).or_insert_with(ChunkSlot::new);
+            let flushed = self.flushed_sizes.get(&idx).copied().unwrap_or(0);
+            let slot = self.slots.entry(idx).or_insert_with(|| ChunkSlot::new_post_flush(flushed));
 
             // Grow slot to cover intra_offset (may need zero-fill for sparse-within-chunk)
             if slot.data.len() < intra {
+                // Track how far the zero-fill extends so the read path can fall through
+                // to the server for this range rather than serving synthetic zeros.
+                let fill_end = intra;
+                if slot.gap_filled_prefix < fill_end {
+                    slot.gap_filled_prefix = fill_end;
+                }
                 slot.data.resize(intra, 0u8);
             }
 
@@ -242,15 +272,13 @@ impl FlushHandle {
                         // fsync/release: flush everything including partial tail
                         state.all_slot_indices()
                     } else {
-                        // Background tick: flush full slots + all idle partial slots.
-                        // The background flusher already verified no active write fds exist
-                        // before calling force=false, so any idle partial slot is safe to flush.
+                        // Background tick: flush full (4MB) slots only.
+                        // Partial slots must not be flushed here — doing so creates small stub
+                        // chunks on the server while the DVR is still writing into them. When
+                        // the client later reads back those positions it only gets the stub bytes,
+                        // causing the player to stall or exit. Partial slots are flushed on
+                        // fsync/release (force=true) only.
                         let mut indices = state.full_slot_indices();
-                        for (idx, slot) in &state.slots {
-                            if !indices.contains(idx) && slot.is_idle() && !slot.data.is_empty() {
-                                indices.push(*idx);
-                            }
-                        }
                         indices.sort_unstable();
                         indices
                     }
@@ -302,11 +330,22 @@ impl FlushHandle {
             //   2. Append/extend: slot starts with existing data at intra=0..existing_size,
             //      and new bytes extend the chunk. We send only the NEW bytes at intra=existing_size.
             // Both require the chunk to already exist on the server and the slot to be partial (<4MB).
-            let existing_chunk_size = self.metadata_cache.get(&ino)
-                .and_then(|m| m.chunk_locations.get(*chunk_idx as usize).map(|l| l.size))
-                .unwrap_or(0);
-            let chunk_exists = max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false)
-                && existing_chunk_size > 0;
+            // Prefer flushed_sizes (authoritative for this session) over metadata_cache
+            // (which may lag by a flush cycle). This prevents a stale metadata_cache from
+            // causing chunk_exists=false and triggering a full WriteData that overwrites
+            // the server's real header bytes with our zero-prefixed slot.
+            let existing_chunk_size = {
+                let from_flushed = self.write_buffers.get(&ino)
+                    .and_then(|s| s.try_lock().ok()
+                        .and_then(|st| st.flushed_sizes.get(chunk_idx).copied()));
+                from_flushed.unwrap_or_else(|| {
+                    self.metadata_cache.get(&ino)
+                        .and_then(|m| m.chunk_locations.get(*chunk_idx as usize).map(|l| l.size))
+                        .unwrap_or(0)
+                })
+            };
+            let chunk_exists = existing_chunk_size > 0
+                || max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false);
             // Detect append: the slot was gap-zero-filled up to existing_chunk_size, then
             // real data was appended beyond. Use gap_filled_prefix (set explicitly when we
             // zero-fill) rather than checking for all-zeros — the all-zeros heuristic was
@@ -428,7 +467,12 @@ impl FlushHandle {
                     // Remove slot now that it's safely on disk.
                     if let Some(state_lock) = self.write_buffers.get(&ino) {
                         let mut state = state_lock.lock().await;
-                        state.slots.remove(chunk_idx);
+                        if let Some(removed) = state.slots.remove(chunk_idx) {
+                            // Remember how many bytes this chunk has on the server so that
+                            // if the slot is recreated (e.g. DVR appending into a partial
+                            // chunk), the read path can bypass our zero-fill prefix.
+                            state.flushed_sizes.insert(*chunk_idx, removed.data.len());
+                        }
                     }
                     if let Some(locations) = locations_opt {
                         all_locations.extend(locations);
@@ -1657,6 +1701,7 @@ impl Filesystem for DfsFilesystem {
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
         let last_metadata_update = self.last_metadata_update.clone();
+        let size_high_water = self.size_high_water.clone();
 
         self.runtime.spawn(async move {
             let start = std::time::Instant::now();
@@ -1713,6 +1758,13 @@ impl Filesystem for DfsFilesystem {
                             let need = (read_end - pos).min(CHUNK_SIZE - intra);
 
                             if let Some(slot) = state.slots.get(&chunk_idx) {
+                                // If the requested range falls within bytes already committed to
+                                // the server (server_prefix) or within a synthetic gap-fill prefix,
+                                // fall through to the network so the server's real data is returned.
+                                let bypass_prefix = slot.server_prefix.max(slot.gap_filled_prefix);
+                                if intra + need <= bypass_prefix {
+                                    break;
+                                }
                                 if intra + need <= slot.data.len() {
                                     buf_data.extend_from_slice(&slot.data[intra..intra + need]);
                                     pos += need;
@@ -1741,6 +1793,14 @@ impl Filesystem for DfsFilesystem {
 
             // --- EOF check: refresh metadata if file may have grown. ---
             let effective_size = if offset >= file_size as usize {
+                // If the file is actively being written, use the size_high_water mark before
+                // hitting the leader. This avoids a network round-trip on every read near the
+                // write head — the DVR player reads are much slower than they need to be
+                // because getattr advances the HWM but the read path ignores it.
+                let hwm = size_high_water.get(&ino).map(|v| *v).unwrap_or(0);
+                if write_buffer_enabled && write_buffers.contains_key(&ino) && offset < hwm as usize {
+                    hwm
+                } else {
                 let should_refresh = match last_metadata_update.get(&ino) {
                     None => true,
                     Some(last) => last.elapsed() >= std::time::Duration::from_secs(1),
@@ -1771,6 +1831,7 @@ impl Filesystem for DfsFilesystem {
                     Ok(None) => { reply.error(libc::ENOENT); return; }
                     Err(_)   => { reply.data(&[]); return; }
                 }
+                } // end hwm-miss else
             } else {
                 file_size
             };
@@ -2119,6 +2180,7 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let path_to_inode = self.path_to_inode.clone();
         let flush_handle = self.flush_handle.clone();
+        let size_high_water = self.size_high_water.clone();
         let data_vec = data.to_vec();
         let req_uid = _req.uid();
         let req_gid = _req.gid();
@@ -2209,7 +2271,11 @@ impl Filesystem for DfsFilesystem {
                                 .unwrap_or(0);
                             buffered_end.max(cache_size)
                         } else {
-                            cache_size // flush in progress; use server-committed size
+                            // Flush in progress — use the high-water mark so that an incoming
+                            // write just past the currently-flushing boundary isn't misclassified
+                            // as a sparse write (which would create a tiny chunk on the server).
+                            let hwm = size_high_water.get(&ino).map(|v| *v as usize).unwrap_or(0);
+                            hwm.max(cache_size)
                         }
                     } else {
                         cache_size
@@ -2224,36 +2290,6 @@ impl Filesystem for DfsFilesystem {
                 let is_overwrite = offset_usize < current_size;
                 let is_sparse_write = offset_usize > current_size;
 
-                // Only flush before an overwrite if it overlaps dirty buffered data.
-                let overwrite_overlaps_buffer = if is_overwrite {
-                    if let Some(state_lock) = write_buffers.get(&ino) {
-                        if let Ok(state) = state_lock.try_lock() {
-                            let write_end = offset_usize + data_vec.len();
-                            state.slots.iter().any(|(idx, slot)| {
-                                let slot_start = (idx * CHUNK_SIZE as u64) as usize;
-                                let slot_end = slot_start + slot.data.len();
-                                write_end > slot_start && offset_usize < slot_end
-                            })
-                        } else {
-                            // Can't check overlap (flush in progress); assume no overlap.
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if is_overwrite && write_buffers.contains_key(&ino) && overwrite_overlaps_buffer {
-                    info!("Overwrite at offset={} overlaps buffer (current_size={}): flushing buffer first",
-                          offset_usize, current_size);
-                    if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
-                        error!("Failed to flush buffer before overwrite for inode {}: {}", ino, e);
-                        reply.error(libc::EIO);
-                        return;
-                    }
-                }
 
                 if is_sparse_write {
                     let gap = offset_usize - current_size;
@@ -2290,31 +2326,69 @@ impl Filesystem for DfsFilesystem {
                         return;
                     }
 
-                    // TRUE SPARSE WRITE: large gap, write directly.
+                    // TRUE SPARSE WRITE: large gap.
+                    // If the target offset falls within an already-committed chunk (e.g. a DVR
+                    // metadata update jumping back into the video stream), use PatchChunk so we
+                    // update the existing chunk in-place rather than creating a new tiny chunk
+                    // that corrupts the chunk map's contiguous layout.
                     info!("Sparse write: offset {} > current_size {} (gap: {} bytes)",
                            offset_usize, current_size, gap);
 
-                    match client.write_data_with_cache(&data_vec, ino, offset as u64).await {
-                        Ok((_, _, chunk_locations_opt)) => {
-                            let new_size = (offset_usize + data_vec.len()).max(current_size);
-                            let mut metadata = metadata_cache.get(&ino).map(|m| m.clone()).unwrap_or_else(|| metadata.clone());
-                            if let Some(chunk_locations) = chunk_locations_opt {
-                                metadata.chunk_locations.extend(chunk_locations);
+                    let target_chunk_idx = InodeWriteState::chunk_index(offset as u64);
+                    let target_intra = InodeWriteState::intra_offset(offset as u64);
+                    let meta_snap = metadata_cache.get(&ino).map(|m| m.clone());
+                    let existing_loc = meta_snap.as_ref()
+                        .and_then(|m| m.chunk_locations.get(target_chunk_idx as usize).cloned());
+
+                    if let Some(old_loc) = existing_loc {
+                        // Target offset is within an existing chunk — patch it in-place.
+                        info!("Sparse write at offset={} lands in existing chunk {} (size={}) — using PatchChunk",
+                              offset_usize, target_chunk_idx, old_loc.size);
+                        match client.patch_chunk_on_replicas(
+                            old_loc.chunk_id, offset as u64, target_intra, data_vec.clone(), &old_loc,
+                        ).await {
+                            Ok(new_loc) => {
+                                let new_size = (offset_usize + data_vec.len()).max(current_size);
+                                let mut meta = meta_snap.unwrap();
+                                if let Some(loc) = meta.chunk_locations.get_mut(target_chunk_idx as usize) {
+                                    *loc = new_loc;
+                                }
+                                meta.size = new_size as u64;
+                                meta.modified_at = SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                                client.enqueue_metadata(&meta).await;
+                                metadata_cache.insert(ino, meta);
+                                info!("Sparse write complete (patch): ino={}, offset={}, len={}, new_size={}",
+                                      ino, offset, data_vec.len(), new_size);
+                                reply.written(data_vec.len() as u32);
                             }
-                            metadata.size = new_size as u64;
-                            metadata.modified_at = SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            client.enqueue_metadata(&metadata).await;
-                            metadata_cache.insert(ino, metadata);
-                            info!("Sparse write complete: ino={}, offset={}, len={}, new_size={}",
-                                  ino, offset, data_vec.len(), new_size);
-                            reply.written(data_vec.len() as u32);
+                            Err(e) => {
+                                error!("Sparse write PatchChunk failed for inode {}: {}", ino, e);
+                                reply.error(libc::EIO);
+                            }
                         }
-                        Err(e) => {
-                            error!("Sparse write failed for inode {}: {}", ino, e);
-                            reply.error(libc::EIO);
+                    } else {
+                        // Target is beyond all committed chunks — new chunk, write directly.
+                        match client.write_data_with_cache(&data_vec, ino, offset as u64).await {
+                            Ok((_, _, chunk_locations_opt)) => {
+                                let new_size = (offset_usize + data_vec.len()).max(current_size);
+                                let mut metadata = meta_snap.unwrap_or_else(|| metadata.clone());
+                                if let Some(chunk_locations) = chunk_locations_opt {
+                                    metadata.chunk_locations.extend(chunk_locations);
+                                }
+                                metadata.size = new_size as u64;
+                                metadata.modified_at = SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                                client.enqueue_metadata(&metadata).await;
+                                metadata_cache.insert(ino, metadata);
+                                info!("Sparse write complete: ino={}, offset={}, len={}, new_size={}",
+                                      ino, offset, data_vec.len(), new_size);
+                                reply.written(data_vec.len() as u32);
+                            }
+                            Err(e) => {
+                                error!("Sparse write failed for inode {}: {}", ino, e);
+                                reply.error(libc::EIO);
+                            }
                         }
                     }
                     return;
@@ -2336,6 +2410,15 @@ impl Filesystem for DfsFilesystem {
                     let mut state = state_arc.lock().await;
                     state.write_at(write_offset, &data_vec);
                     drop(state);
+
+                    // Update size_high_water immediately so concurrent writes that hit
+                    // try_lock() failure see the correct write position and don't misclassify
+                    // this buffered range as a sparse gap.
+                    let new_end = (offset as u64) + data_vec.len() as u64;
+                    {
+                        let mut hwm = size_high_water.entry(ino).or_insert(0);
+                        if new_end > *hwm { *hwm = new_end; }
+                    }
 
                     {
                         let mut counters = write_counters.write().unwrap();
@@ -2725,9 +2808,12 @@ impl Filesystem for DfsFilesystem {
                     reply.ok();
                 });
             } else {
-                // Read-only close: if buffered data exists (e.g. from a rename-based
-                // save where we missed the write open), flush it now.
-                let has_buffer = self.write_buffers.get(&ino)
+                // Read-only close: only flush if there are no active writers still holding
+                // the file open. If a writer is still recording, do NOT touch its buffer —
+                // flushing a partial slot here creates a tiny chunk mid-recording (the
+                // "rename-based save" fallback only applies when there are no writers).
+                let has_writers = self.write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
+                let has_buffer = !has_writers && self.write_buffers.get(&ino)
                     .map(|s| s.try_lock().map(|s| !s.slots.is_empty()).unwrap_or(false))
                     .unwrap_or(false);
                 let flush_handle = self.flush_handle.clone();

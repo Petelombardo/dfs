@@ -71,10 +71,17 @@ impl InodeReadEngine {
         })
     }
 
-    /// Returns true if the chunk map needs a refresh (too old or file grew).
+    /// Returns true if the chunk map needs a refresh (too old or file grew by a full chunk).
     pub async fn needs_refresh(&self, current_size: u64) -> bool {
         let known = self.known_size.load(Ordering::Relaxed) as u64;
-        if current_size > known {
+        // Only refresh when the file has grown by at least one full chunk boundary since
+        // the last refresh — not on every byte change. For live recordings the file grows
+        // continuously; refreshing on every size tick causes a leader round-trip on nearly
+        // every read, which is the primary cause of stutter during live playback.
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let new_chunk_count = (current_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let known_chunk_count = (known + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        if new_chunk_count > known_chunk_count {
             return true;
         }
         let last = self.last_map_refresh.lock().await;
@@ -174,8 +181,17 @@ impl InodeReadEngine {
     ) -> Vec<(usize, ChunkId)> {
         let target = current_idx + 1;
         let old = self.pipeline_head.load(Ordering::Relaxed);
-        // Only advance forward
-        let start = old.max(target);
+        // Reset pipeline head on backward seek or large forward jump (e.g. seek to live edge).
+        // A jump of more than pipeline_depth*4 chunks means we're somewhere new; reset so
+        // prefetch resumes from the actual read position instead of the old position.
+        let start = if old > target + self.pipeline_depth * 4 || target > old + self.pipeline_depth * 4 {
+            self.pipeline_head.store(target, Ordering::Relaxed);
+            debug!("Engine inode={}: pipeline head reset {} → {} (seek detected)",
+                   self.inode, old, target);
+            target
+        } else {
+            old.max(target)
+        };
         let end = (start + self.pipeline_depth).min(chunk_map_len);
 
         if start >= end {

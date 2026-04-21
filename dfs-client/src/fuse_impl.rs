@@ -2216,7 +2216,6 @@ impl Filesystem for DfsFilesystem {
         let flush_handle = self.flush_handle.clone();
         let size_high_water = self.size_high_water.clone();
         let global_buffered_bytes = self.global_buffered_bytes.clone();
-        let global_write_buffer_cap = self.global_write_buffer_cap;
         let data_vec = data.to_vec();
         let req_uid = _req.uid();
         let req_gid = _req.gid();
@@ -2431,24 +2430,9 @@ impl Filesystem for DfsFilesystem {
                 }
 
                 // BUFFERED WRITE — write into the slot and return immediately.
-                // Back-pressure: if total buffered bytes across all inodes exceeds the
-                // global cap, spin with a 5ms sleep until the background flusher drains
-                // enough. This prevents OOM when storage nodes are slow and multiple
-                // recordings are active simultaneously.
+                // The background flusher drains full slots every 100ms; global_buffered_bytes
+                // is tracked for observability but does not block writes.
                 {
-                    const BACKPRESSURE_SLEEP_MS: u64 = 5;
-                    let mut waited = 0u64;
-                    while global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed) >= global_write_buffer_cap {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(BACKPRESSURE_SLEEP_MS)).await;
-                        waited += BACKPRESSURE_SLEEP_MS;
-                        if waited % 500 == 0 {
-                            warn!("write back-pressure: ino={} waiting for buffer drain ({}MB buffered, cap={}MB)",
-                                  ino,
-                                  global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed) / (1024*1024),
-                                  global_write_buffer_cap / (1024*1024));
-                        }
-                    }
-
                     let write_offset = offset as u64;
 
                     let state_arc = write_buffers

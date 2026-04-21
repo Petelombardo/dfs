@@ -1563,18 +1563,21 @@ impl Filesystem for DfsFilesystem {
         }
 
         // Pre-warm the read engine so the first read() hits the chunk map immediately.
-        // For read-mode opens after waiting for in-flight flush tasks, always refresh
-        // so we pick up the newly committed chunk locations (not the stale size=0 cache).
+        // Always expire the TTL on open so that read_file()'s needs_refresh() check
+        // triggers a fresh fetch — this catches files that finished recording since the
+        // engine was last populated, where the stale map is missing tail chunks.
         if let Some(meta) = self.metadata_cache.get(&ino) {
             let file_id = meta.id;
             let file_size = meta.size;
             drop(meta);
             let client = self.client.clone();
             let engine = client.read_engines.get_or_create(ino);
+            // Expire the TTL so the next read_file() call unconditionally refreshes.
+            engine.expire_chunk_map();
             let is_read_open = (flags & libc::O_ACCMODE) == libc::O_RDONLY;
-            let needs_refresh = is_read_open  // always refresh on read-open after flush drain
+            let needs_prefetch = is_read_open
                 || engine.known_size.load(std::sync::atomic::Ordering::Relaxed) == 0;
-            if needs_refresh && engine.refresh_in_progress
+            if needs_prefetch && engine.refresh_in_progress
                 .compare_exchange(false, true,
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Relaxed).is_ok()

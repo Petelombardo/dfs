@@ -78,6 +78,17 @@ impl InodeReadEngine {
         })
     }
 
+    /// Force-expire the chunk map TTL so the next needs_refresh() call returns true.
+    /// Called on open() to guarantee a fresh fetch after recording finishes.
+    pub fn expire_chunk_map(&self) {
+        if let Ok(mut last) = self.last_map_refresh.try_lock() {
+            *last = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        }
+        // Also reset window bounds so needs_refresh triggers on chunk position too.
+        self.last_window_start.store(u32::MAX, Ordering::Relaxed);
+        self.last_window_end.store(0, Ordering::Relaxed);
+    }
+
     /// Returns true if the chunk map needs a refresh.
     /// Triggers on: file grew by a chunk, TTL expired, or current read position is outside
     /// the last-fetched window (e.g. seek backward past the window start).

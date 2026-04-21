@@ -627,6 +627,10 @@ pub struct DfsFilesystem {
     /// close must not touch the write buffer of a concurrently writing fd.
     write_open_counts: Arc<DashMap<u64, usize>>,
 
+    /// Total open file handle count per inode (read + write).
+    /// When this reaches zero on release(), the read engine is dropped to free memory.
+    open_counts: Arc<DashMap<u64, usize>>,
+
     /// High-water mark of reported file size per inode.
     /// Prevents getattr from reporting a smaller size during the window between a
     /// slot being flushed (removed from write_buffers) and the metadata being committed.
@@ -734,6 +738,7 @@ impl DfsFilesystem {
             Arc::new(DashMap::new());
 
         let write_open_counts: Arc<DashMap<u64, usize>> = Arc::new(DashMap::new());
+        let open_counts: Arc<DashMap<u64, usize>> = Arc::new(DashMap::new());
 
         let dir_cache_shared: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>> =
             Arc::new(DashMap::new());
@@ -894,6 +899,7 @@ impl DfsFilesystem {
             lock_manager: Arc::new(LockManager::new()),
             buffer_flush_threshold,
             write_open_counts,
+            open_counts,
             size_high_water: Arc::new(DashMap::new()),
             truncated_inodes: truncated_inodes_shared,
             flush_in_flight: flush_in_flight_shared,
@@ -1400,6 +1406,9 @@ impl Filesystem for DfsFilesystem {
         // The read engine refreshes chunk locations lazily on first read, so a read that
         // opens slightly before the flush commits will simply fetch fresh metadata from the
         // leader — correct behavior with no blocking required.
+
+        // Track all opens for read-engine lifecycle management.
+        *self.open_counts.entry(ino).or_insert(0) += 1;
 
         // Track write-mode opens so flush() can skip the write buffer for read-only closes.
         // O_RDONLY == 0; any flag with the low two bits set (O_WRONLY=1, O_RDWR=2) is a write open.
@@ -2586,6 +2595,21 @@ impl Filesystem for DfsFilesystem {
         let pid = req.pid();
         let is_write_flag = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
         info!("release: ino={}, pid={}, is_write={}", ino, pid, is_write_flag);
+
+        // Decrement total open count; drop read engine when last fd closes.
+        let is_last_open = {
+            let mut remove = false;
+            let mut last = false;
+            if let Some(mut count) = self.open_counts.get_mut(&ino) {
+                if *count > 0 { *count -= 1; }
+                if *count == 0 { remove = true; last = true; }
+            }
+            if remove { self.open_counts.remove(&ino); }
+            last
+        };
+        if is_last_open {
+            self.client.read_engines.engines.remove(&ino);
+        }
 
         // Decrement write-mode open count when a write-mode fd is closed
         let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;

@@ -1387,23 +1387,48 @@ impl HealingManager {
 
     /// Scrub all chunks (verify checksums)
     async fn scrub_all_chunks(&self) -> Result<()> {
+        // Chunks whose on-disk mtime is more than MTIME_TOLERANCE_SECS newer than
+        // ChunkLocation.written_at were likely overwritten after the original write
+        // (e.g. a crash during PatchChunk). Only verify hash on those suspicious chunks,
+        // avoiding a full re-hash of every chunk on every scrub cycle.
+        const MTIME_TOLERANCE_SECS: u64 = 300;
+
         let chunks = self.storage.list_chunks()?;
+        info!("Scrubbing {} chunks (mtime heuristic)", chunks.len());
 
-        info!("Scrubbing {} chunks", chunks.len());
-
-        let mut verified = 0;
-        let mut errors = 0;
+        let mut skipped = 0usize;
+        let mut verified = 0usize;
+        let mut errors = 0usize;
 
         for chunk_id in chunks {
+            let mtime = self.storage.get_chunk_mtime(&chunk_id);
+            let written_at = self.metadata
+                .get_chunk_location(&chunk_id)
+                .ok()
+                .flatten()
+                .and_then(|loc| loc.written_at);
+
+            let suspicious = match (mtime, written_at) {
+                (Some(mt), Some(wa)) => mt > wa.saturating_add(MTIME_TOLERANCE_SECS),
+                // No written_at recorded (old chunk) — always verify
+                (Some(_), None) => true,
+                // Can't stat the file — verify so we detect missing chunks
+                (None, _) => true,
+            };
+
+            if !suspicious {
+                skipped += 1;
+                continue;
+            }
+
             match self.storage.read_and_verify_chunk(&chunk_id) {
                 Ok(_) => {
                     verified += 1;
                 }
                 Err(e) => {
-                    warn!("Scrubbing error for chunk {}: {}", chunk_id, e);
+                    warn!("Scrub hash mismatch for chunk {} (mtime={:?} written_at={:?}): {}",
+                        chunk_id, mtime, written_at, e);
                     errors += 1;
-
-                    // Mark for healing
                     self.pending_healing
                         .write()
                         .await
@@ -1413,8 +1438,8 @@ impl HealingManager {
         }
 
         info!(
-            "Scrubbing complete: verified={}, errors={}",
-            verified, errors
+            "Scrubbing complete: skipped={}, verified={}, errors={}",
+            skipped, verified, errors
         );
 
         Ok(())

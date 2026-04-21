@@ -1,0 +1,134 @@
+#!/bin/bash
+MOUNT=/tmp/dfs-mount
+mountpoint "$MOUNT"
+if [ $? -eq 0 ]; then
+	echo "DFS is mounted.  Let's test."
+else
+	echo "Not a mountpoint"
+	exit 1
+fi
+
+PASS=0; FAIL=0
+pass() { echo "Test $TEST: PASS"; PASS=$((PASS+1)); echo ""; }
+fail() { echo "Test $TEST: FAIL ($1)"; FAIL=$((FAIL+1)); echo ""; }
+
+echo "Cleaning up previous files"
+rm -f "$MOUNT/test.img" "$MOUNT/test-20M.img" "$MOUNT/test-50M.img" /tmp/test-20K.img
+sleep 2
+
+# Pre-create test-50M.img for the uncached-read test
+echo "Pre-creating test-50M.img..."
+dd if=/dev/urandom bs=1M count=50 of="$MOUNT/test-50M.img" status=none
+echo ""
+
+TEST=0
+echo "==========  Write THEN Read Test ==========="
+
+echo "Testing Writing a file (20MB @ 2MB/s)"
+TEST=$((TEST+1))
+pv --size 20M -S -L 2M < /dev/urandom > "$MOUNT/test-20M.img"
+[ $? -eq 0 ] && pass || fail "pv exit $?"
+sleep 10
+
+echo "Testing Reading the file"
+TEST=$((TEST+1))
+pv < "$MOUNT/test-20M.img" > /dev/null
+[ $? -eq 0 ] && pass || fail "pv exit $?"
+sleep 2
+
+echo "===========  Concurrency Tests =========="
+echo "Spawning long-running write (128MB @ 2MB/s) in background..."
+pv --size 128M -S -L 2M < /dev/urandom > "$MOUNT/test.img" &
+BG_PID=$!
+
+# Wait for background write to create the file and flush first chunk
+sleep 4
+
+echo "== Test: Write a local file while DFS write is in progress =="
+TEST=$((TEST+1))
+dd if=/dev/urandom bs=20K count=1 of=/tmp/test-20K.img status=none
+[ $? -eq 0 ] && pass || fail "dd exit $?"
+sleep 1
+
+echo "== Test: Read an uncached DFS file while another is being written =="
+TEST=$((TEST+1))
+dd if="$MOUNT/test-50M.img" of=/dev/null bs=1M status=progress
+[ $? -eq 0 ] && pass || fail "dd exit $?"
+sleep 1
+
+echo "== Test: Read a cached DFS file while another is being written =="
+TEST=$((TEST+1))
+dd if="$MOUNT/test-20M.img" of=/dev/null bs=1M status=progress
+[ $? -eq 0 ] && pass || fail "dd exit $?"
+sleep 1
+
+echo "== Test: Read a file while it is being written =="
+TEST=$((TEST+1))
+# Verify background write is still running before attempting read
+if ! kill -0 $BG_PID 2>/dev/null; then
+	fail "background write already finished before test ran"
+else
+	dd if="$MOUNT/test.img" of=/dev/null bs=1M status=progress
+	[ $? -eq 0 ] && pass || fail "dd exit $?"
+fi
+sleep 1
+
+echo "== Test: Patch (notrunc overwrite) head of file being written =="
+TEST=$((TEST+1))
+if ! kill -0 $BG_PID 2>/dev/null; then
+	fail "background write already finished before test ran"
+else
+	dd if=/tmp/test-20K.img of="$MOUNT/test.img" conv=notrunc status=progress
+	[ $? -eq 0 ] && pass || fail "dd exit $?"
+fi
+sleep 1
+
+echo "== Test: Rapid small writes to same file (DVR header-patch pattern) =="
+TEST=$((TEST+1))
+# Simulate DVR: interleave small overwrite at offset 0 with sequential appends
+dd if=/dev/urandom bs=1M count=4 of="$MOUNT/test-patch.img" status=none
+PATCH_OK=true
+for i in $(seq 1 10); do
+	# Small overwrite at head (like DVR updates its file header)
+	dd if=/dev/urandom bs=4K count=1 of="$MOUNT/test-patch.img" conv=notrunc status=none 2>/dev/null
+	[ $? -ne 0 ] && PATCH_OK=false && break
+	# Concurrent append
+	dd if=/dev/urandom bs=64K count=1 >> "$MOUNT/test-patch.img" status=none 2>/dev/null
+done
+$PATCH_OK && pass || fail "small concurrent writes stalled"
+sleep 1
+
+echo "== Test: Concurrent reads during rapid small writes =="
+TEST=$((TEST+1))
+dd if=/dev/urandom bs=1M count=8 of="$MOUNT/test-concurrent.img" status=none
+(for i in $(seq 1 20); do
+	dd if=/dev/urandom bs=8K count=1 of="$MOUNT/test-concurrent.img" conv=notrunc oflag=seek_bytes seek=$((RANDOM * 128)) status=none 2>/dev/null
+	sleep 0.05
+done) &
+WRITER=$!
+dd if="$MOUNT/test-concurrent.img" of=/dev/null bs=1M status=none
+READ_RC=$?
+wait $WRITER
+[ $READ_RC -eq 0 ] && pass || fail "read during concurrent writes failed"
+
+echo "== Test: DVR playback simulation (reader chases slow writer) =="
+TEST=$((TEST+1))
+# Write at 1MB/s (slow, like a live TV stream), read at full speed.
+# The reader will reach the current write position and must not hang at EOF.
+pv --size 16M -S -L 1M < /dev/urandom > "$MOUNT/test-dvr-sim.img" &
+DVR_PID=$!
+sleep 2  # let writer get 2MB ahead
+timeout 30 dd if="$MOUNT/test-dvr-sim.img" of=/dev/null bs=256K status=none
+READ_RC=$?
+wait $DVR_PID
+[ $READ_RC -eq 0 ] && pass || fail "DVR playback stalled (exit=$READ_RC)"
+
+# Wait for background write to finish
+echo "Waiting for background 128MB write to complete..."
+wait $BG_PID
+BG_RC=$?
+echo "Background write exit: $BG_RC"
+
+echo ""
+echo "========== Results: $PASS passed, $FAIL failed =========="
+[ $FAIL -eq 0 ] && exit 0 || exit 1

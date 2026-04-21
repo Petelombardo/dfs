@@ -75,11 +75,10 @@ pub struct Server {
     chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
 
     /// Permanently-missing chunk blocklist.
-    /// A chunk is added here when ALL nodes listed in its location record are online
-    /// but none of them actually has the data — meaning it's unrecoverable.
-    /// Once blocklisted, read_chunk returns NotFound immediately without opening
-    /// any connections, preventing the connection storm caused by repeated retries.
-    missing_chunks: Arc<RwLock<std::collections::HashSet<ChunkId>>>,
+    /// Chunks that recently failed reads from all online nodes. Prevents connection
+    /// storms on repeated retries. TTL-based: entries expire after 5 minutes so chunks
+    /// become retryable after a node recovers. Never grows unboundedly.
+    missing_chunks: Arc<RwLock<std::collections::HashMap<ChunkId, std::time::Instant>>>,
 
     /// Reference to the healing manager — set after construction via set_healing_manager().
     /// Used by admin handlers to query status and trigger immediate heal cycles.
@@ -137,7 +136,7 @@ impl Server {
             broadcast_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
             delete_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             chunk_map: Arc::new(DashMap::new()),
-            missing_chunks: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            missing_chunks: Arc::new(RwLock::new(std::collections::HashMap::new())),
             healing: Arc::new(RwLock::new(None)),
             leader_forward_queue: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
             leader_forward_notify: Arc::new(tokio::sync::Notify::new()),
@@ -811,7 +810,8 @@ impl Server {
                 chunk_id,
                 data,
                 checksum,
-            } => self.handle_replicate_chunk(chunk_id, data, checksum).await,
+                written_at,
+            } => self.handle_replicate_chunk(chunk_id, data, checksum, written_at).await,
             Request::PushChunkTo { chunk_id, target_addr, leader_id } => {
                 self.handle_push_chunk_to(chunk_id, target_addr, leader_id).await
             }
@@ -886,6 +886,7 @@ impl Server {
             Request::DisableHealing => self.handle_disable_healing().await,
             Request::TriggerHealing => self.handle_trigger_healing().await,
             Request::TriggerMetadataRepair => self.handle_trigger_metadata_repair().await,
+            Request::QueryChunkSizes { chunk_ids } => self.handle_query_chunk_sizes(chunk_ids).await,
             Request::HealFile { path } => self.handle_heal_file(path).await,
             Request::GetFileInfo { path } => self.handle_get_file_info(path).await,
             Request::GetFileInfoById { file_id } => self.handle_get_file_info_by_id(file_id).await,
@@ -1023,15 +1024,21 @@ impl Server {
         chunk_id: ChunkId,
         data: Vec<u8>,
         checksum: [u8; 32],
+        written_at: Option<u64>,
     ) -> Response {
-        debug!(
-            "Handling replicate chunk: {} ({} bytes)",
-            chunk_id,
-            data.len()
-        );
+        debug!("Handling replicate chunk: {} ({} bytes)", chunk_id, data.len());
 
-        // Same as write, but this is a replication request
-        self.handle_write_chunk(chunk_id, data, checksum).await
+        let response = self.handle_write_chunk(chunk_id, data, checksum).await;
+
+        // Preserve the original write timestamp so scrub can detect corruption
+        // by comparing chunk mtime against ChunkLocation.written_at.
+        if matches!(response, Response::Ok { .. }) {
+            if let Some(ts) = written_at {
+                self.storage.set_chunk_mtime(&chunk_id, ts);
+            }
+        }
+
+        response
     }
 
     /// Validate that the given node_id is actually the current leader per our gossip view.
@@ -1071,10 +1078,17 @@ impl Server {
             }
         };
 
+        // Fetch the original write timestamp so the receiving node can preserve mtime.
+        let written_at = self.metadata.get_chunk_location(&chunk_id)
+            .ok()
+            .flatten()
+            .and_then(|loc| loc.written_at);
+
         let request = Request::ReplicateChunk {
             chunk_id,
             data,
             checksum: chunk_id.hash,
+            written_at,
         };
 
         match self.client.send_message(target_addr, Message::Request(request)).await {
@@ -1695,6 +1709,7 @@ impl Server {
                                     chunk_id,
                                     data: chunk_data,
                                     checksum: chunk_id.hash,
+                                    written_at: None,
                                 };
 
                                 match client
@@ -1926,9 +1941,16 @@ impl Server {
             return Ok(data);
         }
 
-        // Fast path: chunk is permanently missing, don't open any connections
-        if self.missing_chunks.read().await.contains(chunk_id) {
-            anyhow::bail!("Chunk {} is permanently missing (blocklisted)", chunk_id);
+        // Fast path: chunk recently failed from all online nodes — skip until TTL expires.
+        const MISSING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        {
+            let map = self.missing_chunks.read().await;
+            if let Some(&blocklisted_at) = map.get(chunk_id) {
+                if blocklisted_at.elapsed() < MISSING_TTL {
+                    anyhow::bail!("Chunk {} is temporarily unavailable (blocklisted)", chunk_id);
+                }
+                // TTL expired — fall through and retry
+            }
         }
 
         // Get chunk location from metadata
@@ -1984,12 +2006,16 @@ impl Server {
             }
         }
 
-        // If every online node we tried failed, this chunk is unrecoverable — blocklist it
-        // so future requests don't open connections trying to fetch it.
+        // If every online node we tried failed, temporarily blocklist this chunk
+        // to avoid connection storms. TTL expires after 5 minutes (node may recover).
         if online_nodes_tried > 0 && online_nodes_tried >= online_nodes_total {
-            warn!("Chunk {} is permanently missing — blocklisting (tried {}/{} online nodes)",
-                  chunk_id, online_nodes_tried, online_nodes_total);
-            self.missing_chunks.write().await.insert(*chunk_id);
+            warn!("Chunk {} unavailable from all {} online nodes — blocklisting for 5m",
+                  chunk_id, online_nodes_tried);
+            let mut map = self.missing_chunks.write().await;
+            map.insert(*chunk_id, std::time::Instant::now());
+            // Prune stale entries while we hold the write lock.
+            const MISSING_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+            map.retain(|_, t| t.elapsed() < MISSING_TTL);
         }
 
         anyhow::bail!("Failed to read chunk {} from any node", chunk_id)
@@ -2618,6 +2644,7 @@ impl Server {
                                     chunk_id,
                                     data: chunk_data,
                                     checksum: chunk_id.hash,
+                                    written_at: None,
                                 };
                                 matches!(
                                     client.send_message(node_info.addr, Message::Request(request)).await,
@@ -3198,6 +3225,15 @@ impl Server {
         }
     }
 
+    /// Return the physical on-disk size of each requested chunk.
+    /// Chunks not present on this node get size=0. Used by quorum-based metadata repair.
+    async fn handle_query_chunk_sizes(&self, chunk_ids: Vec<dfs_common::ChunkId>) -> Response {
+        let sizes: Vec<u64> = chunk_ids.iter()
+            .map(|id| self.storage.get_chunk_size(id).unwrap_or(0))
+            .collect();
+        Response::ChunkSizes { sizes }
+    }
+
     /// Handle trigger scrub request
     async fn handle_trigger_scrub(&self) -> Response {
         // Scrubber runs on its own interval loop; no immediate trigger implemented yet.
@@ -3251,7 +3287,7 @@ impl Server {
         let local_id = self.cluster.local_node_id();
         tokio::spawn(async move {
             // Step 1: local repair on this node (runs in blocking thread — sled scans).
-            let (live_file_ids, repaired_files): (Vec<dfs_common::FileId>, Vec<dfs_common::FileMetadata>) =
+            let (live_file_ids, files_to_check): (Vec<dfs_common::FileId>, Vec<dfs_common::FileMetadata>) =
                 tokio::task::spawn_blocking({
                     let metadata = metadata.clone();
                     let chunk_map = chunk_map.clone();
@@ -3287,12 +3323,8 @@ impl Server {
                                 warn!("Metadata repair: chunk location rebuild failed: {}", e),
                         }
 
-                        // File size repair: recompute size from chunk_locations and fix
-                        // any mismatch. This corrects files where a client crash or
-                        // out-of-order metadata delivery left a stale size on disk.
-                        let mut size_fixed = 0usize;
-                        let mut size_errors = 0usize;
-                        let mut repaired_files: Vec<dfs_common::FileMetadata> = Vec::new();
+                        // Collect files needing size verification (deferred — quorum query
+                        // happens after the blocking task, on the async side).
                         let files_to_check: Vec<dfs_common::FileMetadata> = {
                             let mut v = Vec::new();
                             let _ = metadata.scan_files(|file| {
@@ -3303,43 +3335,6 @@ impl Server {
                             });
                             v
                         };
-                        for mut file in files_to_check {
-                            let computed_size: u64 = file.chunk_locations.iter()
-                                .map(|loc| loc.size as u64)
-                                .sum();
-                            if computed_size != file.size && computed_size > 0 {
-                                warn!(
-                                    "Metadata repair: size mismatch for {} ({}): \
-                                     metadata={} computed={} — fixing",
-                                    file.path, file.id, file.size, computed_size
-                                );
-                                file.size = computed_size;
-                                file.modified_at = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs();
-                                // Bump write_seq so put_file's stale-drop guard never
-                                // rejects this repair write. Without this, any existing
-                                // record with write_seq=N silently wins over our repair
-                                // (which also has write_seq=N), and the fixed size is lost.
-                                file.write_seq = file.write_seq.saturating_add(1);
-                                match metadata.put_file(&file) {
-                                    Ok(_) => {
-                                        repaired_files.push(file);
-                                        size_fixed += 1;
-                                    }
-                                    Err(e) => {
-                                        warn!("Metadata repair: failed to fix size for {}: {}", file.path, e);
-                                        size_errors += 1;
-                                    }
-                                }
-                            }
-                        }
-                        if size_fixed > 0 || size_errors > 0 {
-                            info!("Metadata repair: fixed size for {} files ({} errors)", size_fixed, size_errors);
-                        } else {
-                            info!("Metadata repair: all file sizes are correct");
-                        }
 
                         // Collect the authoritative live file ID set from this node's
                         // now-repaired file: records. Sent to followers for reconciliation.
@@ -3349,7 +3344,7 @@ impl Server {
                             Ok(())
                         });
                         info!("Metadata repair: collected {} live file IDs for follower reconciliation", ids.len());
-                        Ok((ids, repaired_files))
+                        Ok((ids, files_to_check))
                     }
                 })
                 .await
@@ -3361,15 +3356,197 @@ impl Server {
                 return;
             }
 
-            // Step 2: send ReconcileMetadata to every online follower.
-            // Each follower removes file: and path: records not in this set.
-            // Only the leader should initiate this — followers receiving
-            // TriggerMetadataRepair run only their local repair (step 1 above),
-            // not the reconciliation broadcast, to avoid storms.
+            // Only the leader runs reconciliation and quorum repair.
             if !cluster.is_leader().await {
                 return;
             }
             let nodes = cluster.get_all_nodes().await;
+            let online_nodes: Vec<_> = nodes.iter()
+                .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                .collect();
+
+            // Step 2: quorum-based file size repair.
+            //
+            // Strategy: per-chunk voting. For each chunk in a file, query all nodes
+            // listed as holding it and ask for the physical on-disk byte count.
+            // If ≥ majority of replica nodes agree on a size, that size is authoritative.
+            // A node that disagrees has a corrupt/truncated copy — mark it for healing.
+            // The file's authoritative size = sum of per-chunk authoritative sizes.
+            //
+            // This is correct even when stored metadata sizes are corrupted: we read
+            // from the physical layer and take the majority view.
+            let mut repaired_files: Vec<dfs_common::FileMetadata> = Vec::new();
+            let mut chunks_to_heal: Vec<dfs_common::ChunkId> = Vec::new();
+
+            // Build a cache of QueryChunkSizes responses per node, per file, so we
+            // issue at most one RPC per (node, file) pair.
+            // node_id → { chunk_id → physical_size }
+            // We'll populate this lazily as we process each file.
+
+            for file in &files_to_check {
+                // Collect all unique node IDs referenced by this file's chunks.
+                let mut node_ids_for_file: std::collections::HashSet<dfs_common::NodeId> =
+                    std::collections::HashSet::new();
+                for loc in &file.chunk_locations {
+                    for &nid in &loc.nodes {
+                        node_ids_for_file.insert(nid);
+                    }
+                }
+
+                let all_chunk_ids: Vec<dfs_common::ChunkId> =
+                    file.chunk_locations.iter().map(|l| l.chunk_id).collect();
+
+                // Query each node that holds chunks of this file once,
+                // getting physical sizes for all chunks in the file in one RPC.
+                // node_id → Vec<u64> parallel to all_chunk_ids
+                let mut node_chunk_sizes: std::collections::HashMap<dfs_common::NodeId, Vec<u64>> =
+                    std::collections::HashMap::new();
+
+                for node_info in &online_nodes {
+                    if !node_ids_for_file.contains(&node_info.id) {
+                        continue;
+                    }
+                    let req = dfs_common::Request::QueryChunkSizes {
+                        chunk_ids: all_chunk_ids.clone(),
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        client.send_message(node_info.addr, dfs_common::Message::Request(req)),
+                    ).await {
+                        Ok(Ok(envelope)) => {
+                            if let dfs_common::Message::Response(
+                                dfs_common::Response::ChunkSizes { sizes }
+                            ) = envelope.message {
+                                node_chunk_sizes.insert(node_info.id, sizes);
+                            }
+                        }
+                        Ok(Err(e)) => warn!("Metadata repair: QueryChunkSizes to {} failed: {}", node_info.id, e),
+                        Err(_) => warn!("Metadata repair: QueryChunkSizes to {} timed out", node_info.id),
+                    }
+                }
+
+                if node_chunk_sizes.is_empty() {
+                    debug!("Metadata repair: no nodes responded for file {} — skipping", file.path);
+                    continue;
+                }
+
+                // Per-chunk voting: for each chunk, find the majority physical size
+                // among nodes that are listed as holding it.
+                let mut authoritative_file_size: u64 = 0;
+                let mut any_chunk_ambiguous = false;
+
+                for (chunk_idx, loc) in file.chunk_locations.iter().enumerate() {
+                    // Collect physical sizes from nodes listed as holding this chunk.
+                    let mut size_votes: std::collections::HashMap<u64, Vec<dfs_common::NodeId>> =
+                        std::collections::HashMap::new();
+                    for &nid in &loc.nodes {
+                        if let Some(sizes) = node_chunk_sizes.get(&nid) {
+                            let phys = sizes.get(chunk_idx).copied().unwrap_or(0);
+                            size_votes.entry(phys).or_default().push(nid);
+                        }
+                        // If node didn't respond, we simply don't count it.
+                    }
+
+                    if size_votes.is_empty() {
+                        // No replica node responded — can't determine authoritative size.
+                        authoritative_file_size += loc.size as u64;
+                        any_chunk_ambiguous = true;
+                        continue;
+                    }
+
+                    // Majority = group with the most votes; tie-break by largest size.
+                    let (majority_size, majority_nodes) = size_votes.iter()
+                        .max_by_key(|(size, nodes)| (nodes.len(), *size))
+                        .map(|(&size, nodes)| (size, nodes.clone()))
+                        .unwrap();
+
+                    if majority_size == 0 {
+                        // Majority says chunk is absent — file may still be recording.
+                        // Don't trust this for size repair; use stored loc.size.
+                        authoritative_file_size += loc.size as u64;
+                        any_chunk_ambiguous = true;
+                        continue;
+                    }
+
+                    authoritative_file_size += majority_size;
+
+                    // Mark nodes whose physical size disagrees with the majority.
+                    for (&reported_size, bad_nodes) in &size_votes {
+                        if reported_size != majority_size {
+                            for &bad_node in bad_nodes {
+                                warn!(
+                                    "Metadata repair: chunk {} on node {} has wrong physical size \
+                                     (got {}, majority={}): queuing for re-healing",
+                                    loc.chunk_id, bad_node, reported_size, majority_size
+                                );
+                                if !chunks_to_heal.contains(&loc.chunk_id) {
+                                    chunks_to_heal.push(loc.chunk_id);
+                                }
+                            }
+                        }
+                    }
+
+                    // If the stored chunk_location size is wrong, log it (we don't update
+                    // chunk_location sizes here — the healer will fix via re-replication).
+                    if loc.size as u64 != majority_size && majority_size > 0 {
+                        debug!(
+                            "Metadata repair: chunk {} location size {} ≠ physical majority {} for file {}",
+                            loc.chunk_id, loc.size, majority_size, file.path
+                        );
+                    }
+                    let _ = majority_nodes; // used for logging above
+                }
+
+                // If authoritative size differs from stored file.size, fix the metadata.
+                if !any_chunk_ambiguous && authoritative_file_size != file.size && authoritative_file_size > 0 {
+                    let mut fixed = file.clone();
+                    fixed.size = authoritative_file_size;
+                    fixed.modified_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    fixed.write_seq = fixed.write_seq.saturating_add(1);
+                    warn!(
+                        "Metadata repair: file {} size corrected by chunk quorum: metadata={} → physical={}",
+                        file.path, file.size, authoritative_file_size
+                    );
+                    match metadata.put_file(&fixed) {
+                        Ok(_) => repaired_files.push(fixed),
+                        Err(e) => warn!("Metadata repair: failed to write corrected size for {}: {}", file.path, e),
+                    }
+                }
+            }
+
+            // Queue corrupt chunks for re-healing (bypasses the normal delay).
+            if !chunks_to_heal.is_empty() {
+                info!("Metadata repair: queuing {} corrupt chunks for immediate re-healing", chunks_to_heal.len());
+                if let Some(healing) = {
+                    // Can't hold the healing RwLock across await; just clone the Arc.
+                    // The healing manager is available via a shared reference on the server,
+                    // but here we're in a spawned task without self. Re-heal via HealFile
+                    // admin message to the local node instead.
+                    None::<()>
+                } {
+                    let _: () = healing; // unreachable, just for type inference
+                }
+                // Send HealFile for each affected file via local loopback.
+                let local_addr = cluster.local_addr();
+                let affected_files: std::collections::HashSet<dfs_common::FileId> = files_to_check.iter()
+                    .filter(|f| f.chunk_locations.iter().any(|l| chunks_to_heal.contains(&l.chunk_id)))
+                    .map(|f| f.id)
+                    .collect();
+                for fid in affected_files {
+                    let req = dfs_common::Request::HealFile { path: fid.to_string() };
+                    if let Err(e) = client.send_message(local_addr, dfs_common::Message::Request(req)).await {
+                        warn!("Metadata repair: failed to trigger HealFile for {}: {}", fid, e);
+                    }
+                }
+            }
+
+            info!("Metadata repair: size repair complete ({} files corrected, {} corrupt chunks queued)",
+                  repaired_files.len(), chunks_to_heal.len());
+
+            // Step 3: send ReconcileMetadata to every online follower.
             for node in &nodes {
                 if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                     continue;
@@ -3384,8 +3561,7 @@ impl Server {
             }
             info!("Metadata repair: follower reconciliation complete");
 
-            // Step 3: push repaired metadata to followers so they get the corrected sizes.
-            // ReconcileMetadata only prunes orphans — it doesn't update existing records.
+            // Step 4: push repaired metadata to followers so they get corrected sizes.
             if !repaired_files.is_empty() {
                 info!("Metadata repair: broadcasting {} repaired files to followers", repaired_files.len());
                 for node in &nodes {

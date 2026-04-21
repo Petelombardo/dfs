@@ -163,6 +163,11 @@ pub enum Request {
         chunk_id: ChunkId,
         data: Vec<u8>,
         checksum: [u8; 32],
+        /// Original write timestamp (Unix seconds) from ChunkLocation.written_at.
+        /// Receiver sets the chunk file's mtime to this value so all replicas share
+        /// the same mtime, enabling scrub-time corruption detection via mtime comparison.
+        #[serde(default)]
+        written_at: Option<u64>,
     },
 
     /// Instruct this node to push a chunk it holds to a target node.
@@ -275,6 +280,15 @@ pub enum Request {
     /// Trigger metadata repair: rebuild path index and chunk map from file records.
     /// Safe to run at any time; runs in background and does not block responses.
     TriggerMetadataRepair,
+
+    /// Query a node for the physical sizes of chunks it owns.
+    /// Used by quorum-based metadata repair to determine the authoritative file size
+    /// from physical consensus rather than trusting any single node's metadata.
+    /// Returns only chunks this node actually has on disk; missing entries mean
+    /// the node does not hold that chunk.
+    QueryChunkSizes {
+        chunk_ids: Vec<ChunkId>,
+    },
 
     /// Get file information with chunk locations
     GetFileInfo {
@@ -404,6 +418,13 @@ pub enum Response {
     /// Success with directory listing
     DirectoryListing {
         entries: Vec<FileMetadata>,
+    },
+
+    /// Response to QueryChunkSizes: physical size of each chunk on this node.
+    /// Only chunks present on disk are included; absent chunks are omitted.
+    ChunkSizes {
+        /// Parallel to request chunk_ids: actual on-disk byte count, or 0 if not present.
+        sizes: Vec<u64>,
     },
 
     /// Boolean response (for HasChunk, etc.)

@@ -1560,37 +1560,35 @@ impl Filesystem for DfsFilesystem {
                     // returns short/zero data and makes players jump back to the start.
                     let has_active_writer = write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
                     if write_buffer_enabled && has_active_writer {
-                        // Compute the logical end of any buffered-but-not-yet-flushed data
+                        // Use try_lock() — never block a main-runtime thread on a flush-runtime mutex.
+                        // If locked, fall back to the high-water mark from a previous successful read.
                         let buffered_end = if let Some(state_lock) = write_buffers.get(&ino) {
-                            let state = state_lock.lock().await;
-                            state.slots.iter()
-                                .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
-                                .max()
-                                .unwrap_or(0)
+                            if let Ok(state) = state_lock.try_lock() {
+                                state.slots.iter()
+                                    .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
+                                    .max()
+                                    .unwrap_or(0)
+                            } else { 0 } // flush in progress; hwm covers us
                         } else { 0 };
 
-                        // Apply high-water mark: never report a size smaller than previously
-                        // reported. This prevents the visible size oscillating down during the
-                        // window between a slot being flushed and metadata being committed.
+                        // High-water mark: never report a size smaller than previously seen.
                         let hwm = size_high_water.get(&ino).map(|v| *v).unwrap_or(0);
                         let reported = metadata.size.max(buffered_end).max(hwm);
                         if reported > metadata.size {
                             metadata.size = reported;
                         }
-                        // Update high-water mark
                         if reported > hwm {
                             size_high_water.insert(ino, reported);
                         }
                     } else if write_buffer_enabled {
                         // No active writer, but the release flush task may still be running.
-                        // Check the write buffer and size_high_water so getattr doesn't report
-                        // size=0 to a reader racing with the flush (post-close/pre-flush window).
                         let buffered_end = if let Some(state_lock) = write_buffers.get(&ino) {
-                            let state = state_lock.lock().await;
-                            state.slots.iter()
-                                .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
-                                .max()
-                                .unwrap_or(0)
+                            if let Ok(state) = state_lock.try_lock() {
+                                state.slots.iter()
+                                    .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
+                                    .max()
+                                    .unwrap_or(0)
+                            } else { 0 }
                         } else { 0 };
                         let hwm = size_high_water.get(&ino).map(|v| *v).unwrap_or(0);
                         let reported = metadata.size.max(buffered_end).max(hwm);
@@ -1657,41 +1655,66 @@ impl Filesystem for DfsFilesystem {
             let offset = offset as usize;
             let size = size as usize;
 
+            // Include buffered-but-not-yet-flushed bytes in the effective file size.
+            // Use try_lock() — never block a main-runtime thread waiting for the flush
+            // runtime to release the mutex. If the buffer is locked, fall through to the
+            // server-committed size; the reader will fetch from the network instead.
+            let file_size = if write_buffer_enabled {
+                if let Some(state_lock) = write_buffers.get(&ino) {
+                    if let Ok(state) = state_lock.try_lock() {
+                        let buffered_end = state.slots.iter()
+                            .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
+                            .max()
+                            .unwrap_or(0);
+                        file_size.max(buffered_end)
+                    } else {
+                        file_size // flush in progress; use server-committed size
+                    }
+                } else {
+                    file_size
+                }
+            } else {
+                file_size
+            };
+
             // --- Write buffer: serve from dirty slots without any network I/O. ---
+            // Use try_lock() to avoid blocking main runtime threads on flush-runtime mutex.
             if write_buffer_enabled {
                 if let Some(state_lock) = write_buffers.get(&ino) {
-                    let state = state_lock.lock().await;
-                    let read_end = offset + size;
-                    let mut buf_data: Vec<u8> = Vec::with_capacity(size);
-                    let mut pos = offset;
+                    if let Ok(state) = state_lock.try_lock() {
+                        let read_end = offset + size;
+                        let mut buf_data: Vec<u8> = Vec::with_capacity(size);
+                        let mut pos = offset;
 
-                    while pos < read_end {
-                        let chunk_idx = InodeWriteState::chunk_index(pos as u64);
-                        let intra = InodeWriteState::intra_offset(pos as u64);
-                        let need = (read_end - pos).min(CHUNK_SIZE - intra);
+                        while pos < read_end {
+                            let chunk_idx = InodeWriteState::chunk_index(pos as u64);
+                            let intra = InodeWriteState::intra_offset(pos as u64);
+                            let need = (read_end - pos).min(CHUNK_SIZE - intra);
 
-                        if let Some(slot) = state.slots.get(&chunk_idx) {
-                            if intra + need <= slot.data.len() {
-                                buf_data.extend_from_slice(&slot.data[intra..intra + need]);
-                                pos += need;
-                            } else if intra < slot.data.len() {
-                                let avail = slot.data.len() - intra;
-                                buf_data.extend_from_slice(&slot.data[intra..intra + avail]);
-                                pos += avail;
-                                break;
+                            if let Some(slot) = state.slots.get(&chunk_idx) {
+                                if intra + need <= slot.data.len() {
+                                    buf_data.extend_from_slice(&slot.data[intra..intra + need]);
+                                    pos += need;
+                                } else if intra < slot.data.len() {
+                                    let avail = slot.data.len() - intra;
+                                    buf_data.extend_from_slice(&slot.data[intra..intra + avail]);
+                                    pos += avail;
+                                    break;
+                                } else {
+                                    break;
+                                }
                             } else {
                                 break;
                             }
-                        } else {
-                            break;
+                        }
+
+                        if !buf_data.is_empty() {
+                            debug!("FUSE read from write buffer: ino={}, {} bytes", ino, buf_data.len());
+                            reply.data(&buf_data);
+                            return;
                         }
                     }
-
-                    if !buf_data.is_empty() {
-                        debug!("FUSE read from write buffer: ino={}, {} bytes", ino, buf_data.len());
-                        reply.data(&buf_data);
-                        return;
-                    }
+                    // If try_lock failed (flush in progress), fall through to network read.
                 }
             }
 
@@ -2158,12 +2181,15 @@ impl Filesystem for DfsFilesystem {
                         .unwrap_or(metadata.size as usize);
 
                     if let Some(state_lock) = write_buffers.get(&ino) {
-                        let state = state_lock.lock().await;
-                        let buffered_end = state.slots.iter()
-                            .map(|(idx, slot)| (idx * CHUNK_SIZE as u64 + slot.data.len() as u64) as usize)
-                            .max()
-                            .unwrap_or(0);
-                        buffered_end.max(cache_size)
+                        if let Ok(state) = state_lock.try_lock() {
+                            let buffered_end = state.slots.iter()
+                                .map(|(idx, slot)| (idx * CHUNK_SIZE as u64 + slot.data.len() as u64) as usize)
+                                .max()
+                                .unwrap_or(0);
+                            buffered_end.max(cache_size)
+                        } else {
+                            cache_size // flush in progress; use server-committed size
+                        }
                     } else {
                         cache_size
                     }
@@ -2180,13 +2206,17 @@ impl Filesystem for DfsFilesystem {
                 // Only flush before an overwrite if it overlaps dirty buffered data.
                 let overwrite_overlaps_buffer = if is_overwrite {
                     if let Some(state_lock) = write_buffers.get(&ino) {
-                        let state = state_lock.lock().await;
-                        let write_end = offset_usize + data_vec.len();
-                        state.slots.iter().any(|(idx, slot)| {
-                            let slot_start = (idx * CHUNK_SIZE as u64) as usize;
-                            let slot_end = slot_start + slot.data.len();
-                            write_end > slot_start && offset_usize < slot_end
-                        })
+                        if let Ok(state) = state_lock.try_lock() {
+                            let write_end = offset_usize + data_vec.len();
+                            state.slots.iter().any(|(idx, slot)| {
+                                let slot_start = (idx * CHUNK_SIZE as u64) as usize;
+                                let slot_end = slot_start + slot.data.len();
+                                write_end > slot_start && offset_usize < slot_end
+                            })
+                        } else {
+                            // Can't check overlap (flush in progress); assume no overlap.
+                            false
+                        }
                     } else {
                         false
                     }
@@ -2297,11 +2327,12 @@ impl Filesystem for DfsFilesystem {
                 let cache_size = metadata_cache.get(&ino)
                     .map(|m| m.size as usize).unwrap_or(metadata.size as usize);
                 let buffered_end = if let Some(state_lock) = write_buffers.get(&ino) {
-                    let state = state_lock.lock().await;
-                    state.slots.iter()
-                        .map(|(idx, slot)| (idx * CHUNK_SIZE as u64 + slot.data.len() as u64) as usize)
-                        .max()
-                        .unwrap_or(0)
+                    if let Ok(state) = state_lock.try_lock() {
+                        state.slots.iter()
+                            .map(|(idx, slot)| (idx * CHUNK_SIZE as u64 + slot.data.len() as u64) as usize)
+                            .max()
+                            .unwrap_or(0)
+                    } else { 0 }
                 } else { 0 };
                 buffered_end.max(cache_size)
             } else {

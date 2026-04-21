@@ -1210,7 +1210,23 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        let (chunk_map, chunk_offsets, nim) = engine.snapshot().await;
+        let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot().await;
+
+        // If the chunk map is empty but the file has a non-zero size, the leader may not
+        // have received the first ReplicateChunkLocation yet (write in progress, first 4MB
+        // chunk still accumulating in the write buffer).  Retry for up to 8s so that a
+        // reader who opens a live-recording file during the first chunk's fill window
+        // doesn't get a permanent empty read.
+        if chunk_map.is_empty() && file_size > 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                self.refresh_engine(&engine, file_id, file_size).await;
+                let snap = engine.snapshot().await;
+                chunk_map = snap.0; chunk_offsets = snap.1; nim = snap.2;
+                if !chunk_map.is_empty() { break; }
+            }
+        }
 
         if chunk_map.is_empty() {
             info!("read_file: inode={} chunk map empty after refresh, returning empty", inode);
@@ -1807,18 +1823,33 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             let pipeline_results = self.sequential_pipeline_read(pipeline_input).await;
 
-            // Map results back to the common tuple format.
-            pipeline_results.into_iter().zip(resolved.iter()).map(|(res, r)| {
-                let data = match res {
-                    Ok(d) => d,
-                    Err(e) => {
-                        // Pipeline failed; could fall back to fallbacks here but keep it simple.
-                        return Err(e.context(format!("pipeline read chunk {}", r.chunk_id)));
-                    }
-                };
-                info!("✓ Chunk {} via pipeline ({} bytes)", r.chunk_id, data.len());
-                Ok((r.idx, r.chunk_id, r.file_offset, Arc::new(data), false, r.pipeline_only))
-            }).collect()
+            // Map results back to the common tuple format, retrying fallbacks on failure.
+            futures::future::join_all(pipeline_results.into_iter().zip(resolved.iter()).map(|(res, r)| {
+                let client = self.clone();
+                async move {
+                    let data = match res {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!("Pipeline read failed for chunk {}, trying {} fallback(s): {}",
+                                  r.chunk_id, r.fallbacks.len(), e);
+                            let mut fallback_data = None;
+                            let mut last_err = e;
+                            for &fb_addr in &r.fallbacks {
+                                match client.read_chunk_from_server(fb_addr, r.chunk_id).await {
+                                    Ok(d) => { fallback_data = Some(d); break; }
+                                    Err(e) => { last_err = e; }
+                                }
+                            }
+                            match fallback_data {
+                                Some(d) => d,
+                                None => return Err(last_err.context(format!("pipeline read chunk {} (all replicas failed)", r.chunk_id))),
+                            }
+                        }
+                    };
+                    info!("✓ Chunk {} via pipeline ({} bytes)", r.chunk_id, data.len());
+                    Ok((r.idx, r.chunk_id, r.file_offset, Arc::new(data), false, r.pipeline_only))
+                }
+            })).await
         } else {
             // Original parallel path.
             let tasks: Vec<_> = resolved.into_iter().map(|r| {
@@ -3060,37 +3091,44 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Deliver ChunkLocation to the leader synchronously before returning to the caller.
         // This guarantees the leader has the chunk map entry before the client's write ACK
         // lands — so any subsequent read (even from another node that queries the leader)
-        // sees the chunk. Followers get it asynchronously via the leader's own broadcast.
+        // sees the chunk. Non-leader nodes get it fire-and-forget — a slow/unresponsive
+        // follower must not stall the write pipeline; the leader's dissemination covers misses.
         let all_nodes_snapshot = all_nodes.to_vec();
         let leader_addr = *self.leader_addr.read().await;
         for location in chunk_locations.iter().cloned() {
-            // Deliver ChunkLocation to all nodes in parallel — all 3 send simultaneously,
-            // total latency = time of the slowest single send (not 3× serial).
-            // All nodes use a single attempt with a short timeout; leader gets one retry.
-            // The metadata queue will propagate any misses asynchronously.
-            let mut node_futures = Vec::new();
+            let mut leader_task = None;
             for &addr in &all_nodes_snapshot {
                 let client = self.clone();
                 let loc = location.clone();
                 let is_leader = Some(addr) == leader_addr;
-                node_futures.push(tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let req = Request::ReplicateChunkLocation { location: loc.clone() };
                     match tokio::time::timeout(Duration::from_secs(2), client.send_request(addr, req.clone())).await {
                         Ok(Ok(_)) => {}
                         Ok(Err(e)) if is_leader => {
-                            // One retry for the leader — without it a transient error loses chunk routing.
+                            // One retry for the leader, also bounded, so a flaky leader
+                            // can't hold up the write pipeline indefinitely.
                             warn!("ChunkLocation to leader {} failed: {}, retrying once", addr, e);
-                            if let Err(e2) = client.send_request(addr, req).await {
+                            if let Err(e2) = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                client.send_request(addr, req),
+                            ).await.unwrap_or_else(|_| Err(anyhow::anyhow!("timeout"))) {
                                 warn!("ChunkLocation to leader {} retry also failed: {}", addr, e2);
                             }
                         }
                         Ok(Err(e)) => debug!("ChunkLocation to {} failed (leader will catch up): {}", addr, e),
                         Err(_) => warn!("ChunkLocation to {} timed out", addr),
                     }
-                }));
+                });
+                if is_leader {
+                    leader_task = Some(task);
+                }
+                // Non-leader tasks are detached — fire-and-forget.
             }
-            // Wait for all nodes (takes as long as the slowest — same as a single serial send).
-            futures::future::join_all(node_futures).await;
+            // Only await the leader; followers run in background.
+            if let Some(t) = leader_task {
+                let _ = t.await;
+            }
         }
 
         // Populate byte-range cache for immediate read-back
@@ -3774,77 +3812,69 @@ leader_addr: Arc::new(RwLock::new(None)),
             return;
         }
 
-        // Back-pressure: if the front is stalled, rescue it before enqueueing.
-        loop {
-            match self.metadata_queue.front_age().await {
-                Some(age) if age > self.metadata_queue.max_age => {}
-                _ => break, // Queue is healthy — proceed.
-            }
+        // Back-pressure: if the front is stalled, attempt ONE rescue then return.
+        // We must not loop here — if the cluster is unreachable this would block
+        // the calling task indefinitely, starving all FUSE threads on the main runtime.
+        // The background metadata_queue worker handles persistent retries; our job is
+        // only to do a single fast rescue attempt to unblock a transiently-stalled queue.
+        if let Some(age) = self.metadata_queue.front_age().await {
+            if age > self.metadata_queue.max_age {
+                if let Some(stalled) = self.metadata_queue.pop_stalled().await {
+                    warn!(
+                        "metadata_queue: back-pressure rescue for {} (age {}ms)",
+                        stalled.metadata.path,
+                        stalled.enqueued_at.elapsed().as_millis()
+                    );
 
-            // Pop the stalled front entry and attempt emergency delivery.
-            let stalled = match self.metadata_queue.pop_stalled().await {
-                Some(e) => e,
-                None => break, // Raced with worker — queue is clear now.
-            };
+                    // Attempt 1: normal quorum write with 2s timeout.
+                    let delivered = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        self.put_file_metadata_with_quorum(&stalled.metadata, None),
+                    ).await.ok().and_then(|r| r.ok()).is_some();
 
-            warn!(
-                "metadata_queue: back-pressure rescue for {} (age {}ms)",
-                stalled.metadata.path,
-                stalled.enqueued_at.elapsed().as_millis()
-            );
+                    if delivered {
+                        debug!("metadata_queue: rescue delivered {} via quorum", stalled.metadata.path);
+                        if let Some(tx) = stalled.done_tx { let _ = tx.send(()); }
+                    } else {
+                        // Attempt 2: fan out to all nodes in parallel, take first success.
+                        *self.leader_addr.write().await = None;
+                        let nodes = self.cluster_nodes.read().await.clone();
+                        let meta = stalled.metadata.clone();
+                        let rescued = if !nodes.is_empty() {
+                            let futs: Vec<_> = nodes.iter().map(|&addr| {
+                                let client = self.clone();
+                                let m = meta.clone();
+                                async move {
+                                    let req = Request::PutFileMetadata { metadata: m };
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        client.send_request(addr, req),
+                                    ).await {
+                                        Ok(Ok(Response::Ok { .. })) => {
+                                            *client.leader_addr.write().await = Some(addr);
+                                            true
+                                        }
+                                        _ => false,
+                                    }
+                                }
+                            }).collect();
+                            let results = futures::future::join_all(futs).await;
+                            results.into_iter().any(|ok| ok)
+                        } else {
+                            false
+                        };
 
-            // Attempt 1: normal quorum write with 2s timeout.
-            let delivered = tokio::time::timeout(
-                Duration::from_secs(2),
-                self.put_file_metadata_with_quorum(&stalled.metadata, None),
-            ).await.ok().and_then(|r| r.ok()).is_some();
-
-            if delivered {
-                debug!("metadata_queue: rescue delivered {} via quorum", stalled.metadata.path);
-                if let Some(tx) = stalled.done_tx { let _ = tx.send(()); }
-                continue; // Check front again.
-            }
-
-            // Attempt 2: fan out to all nodes in parallel, take first success.
-            *self.leader_addr.write().await = None;
-            let nodes = self.cluster_nodes.read().await.clone();
-            let meta = stalled.metadata.clone();
-            let rescued = if !nodes.is_empty() {
-                let futs: Vec<_> = nodes.iter().map(|&addr| {
-                    let client = self.clone();
-                    let m = meta.clone();
-                    async move {
-                        let req = Request::PutFileMetadata { metadata: m };
-                        match tokio::time::timeout(
-                            Duration::from_secs(2),
-                            client.send_request(addr, req),
-                        ).await {
-                            Ok(Ok(Response::Ok { .. })) => {
-                                *client.leader_addr.write().await = Some(addr);
-                                true
-                            }
-                            _ => false,
+                        if rescued {
+                            warn!("metadata_queue: rescue delivered {} via fan-out", stalled.metadata.path);
+                            if let Some(tx) = stalled.done_tx { let _ = tx.send(()); }
+                        } else {
+                            // All nodes unreachable — put it back; background worker will keep trying.
+                            warn!("metadata_queue: rescue failed for {}, all nodes unreachable — requeueing",
+                                  stalled.metadata.path);
+                            self.metadata_queue.push_inner_front(stalled).await;
                         }
                     }
-                }).collect();
-
-                // Race all nodes — unblock on first success.
-                let results = futures::future::join_all(futs).await;
-                results.into_iter().any(|ok| ok)
-            } else {
-                false
-            };
-
-            if rescued {
-                warn!("metadata_queue: rescue delivered {} via fan-out", stalled.metadata.path);
-                if let Some(tx) = stalled.done_tx { let _ = tx.send(()); }
-            } else {
-                // All nodes unreachable — put it back at the front and sleep briefly.
-                warn!("metadata_queue: rescue failed for {}, all nodes unreachable — requeueing",
-                      stalled.metadata.path);
-                // Re-insert preserving the done_tx so release() is still notified eventually.
-                self.metadata_queue.push_inner_front(stalled).await;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                }
             }
         }
 

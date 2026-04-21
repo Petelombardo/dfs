@@ -257,6 +257,31 @@ impl ChunkStorage {
         path.exists()
     }
 
+    /// Return the physical on-disk size of a chunk, or None if not present.
+    pub fn get_chunk_size(&self, chunk_id: &ChunkId) -> Option<u64> {
+        let path = self.get_chunk_path(chunk_id);
+        fs::metadata(&path).ok().map(|m| m.len())
+    }
+
+    /// Return the mtime of a chunk file as Unix seconds, or None if not present.
+    pub fn get_chunk_mtime(&self, chunk_id: &ChunkId) -> Option<u64> {
+        let path = self.get_chunk_path(chunk_id);
+        fs::metadata(&path).ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+    }
+
+    /// Set the mtime of a chunk file to the given Unix timestamp.
+    /// Used after replication to preserve the original write time across replicas.
+    pub fn set_chunk_mtime(&self, chunk_id: &ChunkId, written_at_secs: u64) {
+        let path = self.get_chunk_path(chunk_id);
+        let target = std::time::UNIX_EPOCH + std::time::Duration::from_secs(written_at_secs);
+        if let Err(e) = fs::File::open(&path).and_then(|f| f.set_modified(target)) {
+            tracing::debug!("set_chunk_mtime: failed for {}: {}", chunk_id, e);
+        }
+    }
+
     /// Delete a chunk from local storage
     pub fn delete_chunk(&self, chunk_id: &ChunkId) -> Result<()> {
         let path = self.get_chunk_path(chunk_id);

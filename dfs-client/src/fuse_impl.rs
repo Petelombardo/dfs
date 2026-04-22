@@ -380,13 +380,57 @@ impl FlushHandle {
                     let chunk_idx_usize = *chunk_idx as usize;
                     let old_location_opt = meta.chunk_locations.get(chunk_idx_usize).cloned();
                     if let Some(old_location) = old_location_opt {
-                        match self.client.patch_chunk_on_replicas(
+                        let patch_result = self.client.patch_chunk_on_replicas(
                             old_location.chunk_id,
                             file_offset,
                             patch_intra,
-                            patch_bytes,
+                            patch_bytes.clone(),
                             &old_location,
-                        ).await {
+                        ).await;
+
+                        let patch_result = match patch_result {
+                            Ok(loc) => Ok(loc),
+                            Err(e) => {
+                                // PatchChunk failed — the replica locations in our cache may be
+                                // stale (chunk was healed to different nodes since we last fetched
+                                // metadata). Re-fetch from the leader and retry once before giving
+                                // up. This prevents the catastrophic fallback where we write a new
+                                // 12KB standalone chunk that overwrites the chunk map entry for an
+                                // existing multi-GB file.
+                                warn!("flush_buffer_async: PatchChunk failed for slot {} ({}), re-fetching metadata and retrying", chunk_idx, e);
+                                let path_opt = self.path_to_inode.read().unwrap()
+                                    .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                                if let Some(path) = path_opt {
+                                    match self.client.get_file_metadata(&path).await {
+                                        Ok(Some(fresh_meta)) => {
+                                            self.client.seed_write_seq(fresh_meta.id, fresh_meta.write_seq);
+                                            if let Some(fresh_loc) = fresh_meta.chunk_locations.get(chunk_idx_usize).cloned() {
+                                                info!("flush_buffer_async: retrying PatchChunk slot {} with fresh location {} (was {})",
+                                                      chunk_idx, fresh_loc.chunk_id, old_location.chunk_id);
+                                                let retry = self.client.patch_chunk_on_replicas(
+                                                    fresh_loc.chunk_id,
+                                                    file_offset,
+                                                    patch_intra,
+                                                    patch_bytes.clone(),
+                                                    &fresh_loc,
+                                                ).await;
+                                                // Update cache with fresh metadata regardless of retry outcome
+                                                self.metadata_cache.insert(ino, fresh_meta);
+                                                retry
+                                            } else {
+                                                self.metadata_cache.insert(ino, fresh_meta);
+                                                Err(e)
+                                            }
+                                        }
+                                        Ok(None) | Err(_) => Err(e),
+                                    }
+                                } else {
+                                    Err(e)
+                                }
+                            }
+                        };
+
+                        match patch_result {
                             Ok(new_location) => {
                                 info!("flush_buffer_async: PatchChunk slot {} succeeded: {} -> {}",
                                       chunk_idx, old_location.chunk_id, new_location.chunk_id);
@@ -405,8 +449,15 @@ impl FlushHandle {
                                 true
                             }
                             Err(e) => {
-                                warn!("flush_buffer_async: PatchChunk failed for slot {}: {} — falling back to full write", chunk_idx, e);
-                                false
+                                // PatchChunk failed even after metadata refresh. The chunk exists
+                                // on disk (it's part of a committed file) but we cannot reach it.
+                                // Falling back to a fresh write here would be catastrophic: it
+                                // would create a new standalone chunk at this file_offset and
+                                // overwrite the chunk map entry, silently discarding all other
+                                // chunks of the file. Return the error instead — the caller
+                                // (release/fsync) will propagate EIO and the user can retry.
+                                warn!("flush_buffer_async: PatchChunk failed for slot {} after metadata refresh — cannot safely fall back for existing chunk: {}", chunk_idx, e);
+                                return Err(e);
                             }
                         }
                     } else {
@@ -1511,6 +1562,25 @@ impl Filesystem for DfsFilesystem {
             // not from 0 (which would be treated as stale by the server).
             if let Some(meta) = self.metadata_cache.get(&ino) {
                 self.client.seed_write_seq(meta.id, meta.write_seq);
+            }
+
+            // Refresh metadata from the leader so chunk locations reflect any healer
+            // rebalancing since the last fetch. Without this, a write open on a long-lived
+            // file (e.g. a multi-hour DVR recording) uses chunk locations from hours ago,
+            // causing PatchChunk to target nodes that no longer hold the chunk.
+            {
+                let path_opt = self.path_to_inode.read().unwrap()
+                    .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                if let Some(path) = path_opt {
+                    let client = self.client.clone();
+                    let metadata_cache = self.metadata_cache.clone();
+                    self.runtime.spawn(async move {
+                        if let Ok(Some(fresh)) = client.get_file_metadata(&path).await {
+                            client.seed_write_seq(fresh.id, fresh.write_seq);
+                            metadata_cache.insert(ino, fresh);
+                        }
+                    });
+                }
             }
 
             // O_SYNC / O_DSYNC: the caller wants every fsync() to be honored immediately.

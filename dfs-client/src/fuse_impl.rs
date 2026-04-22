@@ -2593,23 +2593,28 @@ impl Filesystem for DfsFilesystem {
                 }
 
                 // BUFFERED WRITE — wait for room before buffering, then reply.
-                // Checking before we add prevents us from blowing past the cap and then
-                // trying to drain an already-overwhelming buffer.  Delaying reply.written()
+                // Backpressure is per-inode: each inode gets its own 2×pipeline budget so
+                // concurrent writers (e.g. multiple DVR recordings) don't compete for a
+                // shared cap.  We check before writing — acquire the lock, peek the count,
+                // drop, sleep if over cap, then re-acquire to write.  Delaying reply.written()
                 // blocks the kernel from issuing the next write(), which is the throttle.
                 // The write task runs on self.runtime (separate from flush_runtime), so
                 // sleeping here does not starve the flush workers.
                 {
-                    // Wait until there is room in the buffer before accepting more data.
-                    while global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed) >= global_write_buffer_cap {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-
                     let write_offset = offset as u64;
 
                     let state_arc = write_buffers
                         .entry(ino)
                         .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
                         .clone();
+
+                    // Wait until this inode's buffer has room before accepting more data.
+                    loop {
+                        let current = state_arc.lock().await.buffered_bytes();
+                        if current < global_write_buffer_cap { break; }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+
                     let mut state = state_arc.lock().await;
                     state.write_at(write_offset, &data_vec);
                     drop(state);

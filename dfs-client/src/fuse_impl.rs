@@ -875,13 +875,15 @@ impl DfsFilesystem {
               buffer_flush_threshold / chunk_size_bytes,
               chunk_size_mb);
 
-        // Global write buffer cap: one full flush pipeline pass (8 workers × chunk_size).
-        // The flush runtime drains this in one parallel round; capping at exactly this size
-        // means the buffer never holds more than the pipeline can absorb in one shot.
-        const FLUSH_WORKERS: usize = 8;
-        let global_write_buffer_cap = FLUSH_WORKERS * chunk_size_bytes;
-        info!("Global write buffer cap: {}MB ({} workers × {}MB chunk)",
-              global_write_buffer_cap / (1024 * 1024), FLUSH_WORKERS, chunk_size_mb);
+        // Global write buffer cap: 2 × pipeline capacity (2 × buffer_flush_threshold).
+        // One pipeline-worth is in-flight flushing to the backend; the second pipeline-worth
+        // is accumulating in the buffer so that when the flush completes the pipeline can
+        // refill and start immediately without stalling the writer.  Cap at exactly 2×
+        // so we never accumulate a third batch — the writer blocks until the flush round
+        // finishes and the first batch's bytes are freed.
+        let global_write_buffer_cap = 2 * buffer_flush_threshold;
+        info!("Global write buffer cap: {}MB (2 × {}MB pipeline)",
+              global_write_buffer_cap / (1024 * 1024), buffer_flush_threshold / (1024 * 1024));
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
         if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {

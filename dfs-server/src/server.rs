@@ -2257,10 +2257,22 @@ impl Server {
         let server = self.clone();
         tokio::spawn(async move {
             const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+            let node_notify = server.cluster.node_recovered_notify.clone();
             // Stagger first run by 60s to avoid reconcile storm at cluster startup.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             loop {
-                tokio::time::sleep(RECONCILE_INTERVAL).await;
+                // Wake on either the periodic timer or a node recovery event.
+                // Node recovery is the primary trigger for ghost-file resurrection:
+                // a node that was offline during a delete still has the file in its DB,
+                // and reconciliation is the only mechanism that purges it.
+                tokio::select! {
+                    _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+                    _ = node_notify.notified() => {
+                        // Brief delay so the recovering node finishes its handshake
+                        // and is marked Online before we send the ReconcileMetadata.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
 
                 if !server.cluster.is_leader().await {
                     continue;
@@ -2417,6 +2429,16 @@ impl Server {
         let mut corrections: Vec<FileMetadata> = Vec::new();
 
         for metadata in &items {
+            // Tombstone check: if this node already processed a delete for this file,
+            // reject the disseminated create/update rather than resurrecting it.
+            // Without this, a follower that was offline during a delete receives the
+            // file via catch-up dissemination, writes it, and then the corrections path
+            // pushes it back to the leader — resurrecting a deleted file cluster-wide.
+            if self.delete_tombstones.contains_key(&metadata.id) {
+                debug!("disseminate: tombstone-reject path={} id={}", metadata.path, metadata.id);
+                continue;
+            }
+
             match self.metadata.put_file(metadata) {
                 Ok(crate::metadata::PutFileResult::Stored) => {
                     self.chunk_map_update(metadata).await;

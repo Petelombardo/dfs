@@ -1363,14 +1363,16 @@ leader_addr: Arc::new(RwLock::new(None)),
             };
 
             // Collect results; cache full chunks; remove from in-flight.
+            // Always remove from in_flight before propagating errors — a leaked entry
+            // causes every subsequent read for that chunk to wait 1s for a timeout.
             for (idx, cid, res) in fetch_results {
+                engine.in_flight.lock().await.remove(&cid);
                 let data = res.with_context(|| format!("Failed to fetch chunk {}", cid))?;
                 let arc = Arc::new(data);
                 if !bypass_cache {
                     self.chunk_cache.write().await.put(cid, Arc::clone(&arc));
                 }
                 result_chunks.push((idx, arc));
-                engine.in_flight.lock().await.remove(&cid);
             }
         }
 

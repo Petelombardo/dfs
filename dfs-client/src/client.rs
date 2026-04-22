@@ -415,7 +415,7 @@ pub struct DfsClient {
 
     /// LRU cache for chunks (ChunkId -> data)
     /// Cache up to 256 chunks (~1GB at 4MB/chunk)
-    chunk_cache: Arc<tokio::sync::RwLock<LruCache<ChunkId, Arc<Vec<u8>>>>>,
+    pub chunk_cache: Arc<tokio::sync::RwLock<LruCache<ChunkId, Arc<Vec<u8>>>>>,
 
     /// Byte-range cache for recently-accessed chunks (inode, offset) -> chunk data
     /// This solves the problem of content-addressed chunks changing during live DVR recording
@@ -1545,6 +1545,19 @@ leader_addr: Arc::new(RwLock::new(None)),
             return;
         }
         let engine = self.read_engines.get_or_create(inode);
+
+        // Snapshot old chunk IDs for the slots we're about to update so we can evict
+        // them from the chunk cache. Without this, a reader near the write edge can get
+        // a cache hit on the old (shorter) chunk ID and return stale partial data — the
+        // classic read-near-write-edge artifact.
+        let old_chunk_ids: Vec<dfs_common::ChunkId> = {
+            let (old_map, _, _) = engine.snapshot().await;
+            let base = 0usize;
+            (0..locations.len())
+                .filter_map(|i| old_map.get(base + i).map(|l| l.chunk_id))
+                .collect()
+        };
+
         let nim: std::collections::HashMap<dfs_common::NodeId, std::net::SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
@@ -1558,6 +1571,19 @@ leader_addr: Arc::new(RwLock::new(None)),
             file_size,
         ).await;
         engine.clear_failed_refresh();
+
+        // Evict stale chunk IDs from the cache. Any reader that already holds an Arc to
+        // the old data is unaffected; only future cache lookups miss and fetch fresh data.
+        {
+            let new_ids: std::collections::HashSet<dfs_common::ChunkId> =
+                locations.iter().map(|l| l.chunk_id).collect();
+            let mut cache = self.chunk_cache.write().await;
+            for old_id in old_chunk_ids {
+                if !new_ids.contains(&old_id) {
+                    cache.pop(&old_id);
+                }
+            }
+        }
     }
 
     /// all_file_chunks: Complete list of chunk IDs for the file (for prefetch - can be same as chunk_ids)

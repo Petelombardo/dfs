@@ -1,7 +1,7 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use libc;
-use dfs_common::{ChunkId, FileMetadata, FileType};
+use dfs_common::{ChunkId, ChunkLocation, FileMetadata, FileType, compute_chunk_hash_at};
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyStatfs, Request as FuseRequest,
@@ -493,6 +493,40 @@ impl FlushHandle {
 
         info!("flush_buffer_async: flushing {} chunks in parallel for inode {}", slots_to_write.len(), ino);
 
+        // Pre-seed the chunk cache and read engine with locally-computed chunk IDs and data.
+        // Reads that arrive during the server write RPC can be served from cache immediately
+        // without waiting for the network round-trip to complete.  The chunk ID is deterministic
+        // (compute_chunk_hash_at = blake3(offset || data)) so the ID we compute here is exactly
+        // what the server will assign.  If the write fails we evict the pre-seeded entry.
+        let pre_seeded_ids: Vec<(u64, ChunkId)> = {
+            let mut cache = self.client.chunk_cache.write().await;
+            slots_to_write.iter().map(|(chunk_idx, slot_data, file_offset)| {
+                let hash = compute_chunk_hash_at(slot_data, *file_offset);
+                let cid = ChunkId::from_hash(hash);
+                cache.put(cid, Arc::new(slot_data.clone()));
+                (*chunk_idx, cid)
+            }).collect()
+        };
+        // Also push stub locations into the read engine so the chunk map reflects the new IDs
+        // before the server acks. The location has no node list yet — reads that miss the local
+        // cache will fall back to a leader refresh, which is the same as before this change.
+        if !pre_seeded_ids.is_empty() {
+            let stub_locations: Vec<ChunkLocation> = pre_seeded_ids.iter()
+                .zip(slots_to_write.iter())
+                .map(|((_, cid), (chunk_idx, slot_data, file_offset))| ChunkLocation {
+                    chunk_id: *cid,
+                    nodes: Vec::new(),
+                    size: slot_data.len(),
+                    checksum: [0u8; 32],
+                    file_offset: Some(*file_offset),
+                    written_at: None,
+                })
+                .collect();
+            let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0)
+                .max(slots_to_write.last().map(|(_, d, o)| o + d.len() as u64).unwrap_or(0));
+            self.client.feed_chunk_locations_to_read_engine(ino, &stub_locations, current_size).await;
+        }
+
         // Flush all slots in parallel. When flush_buffer_async runs on the flush_runtime
         // (as dispatched by the background flusher and release/fsync callers), these
         // tokio::spawn calls land on flush_runtime workers — isolated from the main runtime.
@@ -513,6 +547,7 @@ impl FlushHandle {
         // Process results: remove flushed slots, collect locations.
         let mut all_locations: Vec<dfs_common::ChunkLocation> = Vec::new();
         let mut first_err: Option<anyhow::Error> = None;
+        let mut failed_chunk_indices: Vec<usize> = Vec::new();
 
         for (join_result, (chunk_idx, _, _)) in results.into_iter().zip(slots_to_write.iter()) {
             match join_result {
@@ -537,10 +572,23 @@ impl FlushHandle {
                     }
                 }
                 Ok(Err(e)) => {
+                    failed_chunk_indices.push(*chunk_idx as usize);
                     if first_err.is_none() { first_err = Some(e); }
                 }
                 Err(e) => {
+                    failed_chunk_indices.push(*chunk_idx as usize);
                     if first_err.is_none() { first_err = Some(anyhow::anyhow!("flush task panicked: {}", e)); }
+                }
+            }
+        }
+
+        // Evict pre-seeded cache entries for any chunks that failed to reach the server.
+        // Readers would otherwise get a cache hit on data that was never durably written.
+        if !failed_chunk_indices.is_empty() {
+            let mut cache = self.client.chunk_cache.write().await;
+            for (chunk_idx, cid) in &pre_seeded_ids {
+                if failed_chunk_indices.contains(&(*chunk_idx as usize)) {
+                    cache.pop(cid);
                 }
             }
         }
@@ -622,17 +670,15 @@ impl FlushHandle {
             }
         }
 
-        // Feed freshly-written chunk locations into the read engine so concurrent readers
-        // on the same client see new chunks immediately without a leader round-trip.
+        // Feed freshly-written chunk locations into the read engine synchronously so that
+        // reads issued immediately after a write (e.g. cat after cp) see the chunk map.
+        // flush_buffer_async runs on the flush runtime so awaiting here is safe.
         if !all_locations.is_empty() {
             let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0);
             let all_locs = self.metadata_cache.get(&ino)
                 .map(|m| m.chunk_locations.clone())
                 .unwrap_or_default();
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                client.feed_chunk_locations_to_read_engine(ino, &all_locs, current_size).await;
-            });
+            self.client.feed_chunk_locations_to_read_engine(ino, &all_locs, current_size).await;
         }
 
         let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
@@ -3373,14 +3419,21 @@ impl Filesystem for DfsFilesystem {
                 // may be unavailable due to garbage collection or incomplete replication
                 if new_size == 0 {
                     // Truncate to zero: clear metadata and discard any buffered write data.
-                    // FUSE converts O_TRUNC into a setattr(size=0) before open(), so this
-                    // is the canonical place to reset the write buffer for overwrite scenarios.
                     metadata.chunk_locations = Vec::new();
                     metadata.size = 0;
                     self.write_buffers.remove(&ino);
                     self.size_high_water.remove(&ino);
-                    // Mark inode truncated so any in-flight flush discards its stale locations.
-                    self.truncated_inodes.insert(ino);
+                    // Only set the truncated flag when there are no active writers.
+                    // For O_TRUNC opens, FUSE sends open() first then setattr(size=0) — by then
+                    // write_open_count is already ≥1, so this is the current session truncating
+                    // itself (not a race from an old session). Setting the flag in that case
+                    // would poison the current session's flush.
+                    // Only set it when write_open_count==0: a concurrent truncate racing a
+                    // previous session's still-in-flight flush — the original intended use.
+                    let active_writers = self.write_open_counts.get(&ino).map(|c| *c).unwrap_or(0);
+                    if active_writers == 0 {
+                        self.truncated_inodes.insert(ino);
+                    }
                 } else if new_size > metadata.size {
                     // Growing file - just update metadata to extend with zeros
                     info!("Truncate growing: {} -> {} bytes (keeping {} chunks)",

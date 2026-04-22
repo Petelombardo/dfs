@@ -20,5 +20,6 @@ clap = { workspace = true }
 blake3 = { workspace = true }
 uuid = { workspace = true }
 lru = "0.12"
+moka = { version = "0.12", features = ["future"] }
 futures = "0.3"
 dashmap = "6.1"

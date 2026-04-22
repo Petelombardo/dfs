@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use moka::future::Cache as MokaCache;
 
 use dashmap::DashMap;
 use dfs_common::{ChunkId, ChunkLocation};
@@ -295,7 +296,7 @@ impl InodeReadEngine {
         &self,
         current_idx: usize,
         chunk_map_len: usize,
-        chunk_cache: &tokio::sync::RwLock<lru::LruCache<ChunkId, Arc<Vec<u8>>>>,
+        chunk_cache: &MokaCache<ChunkId, Arc<Vec<u8>>>,
         chunk_map: &[ChunkLocation],
     ) -> Vec<(usize, ChunkId)> {
         let target = current_idx + 1;
@@ -317,13 +318,12 @@ impl InodeReadEngine {
             return Vec::new();
         }
 
-        let cache = chunk_cache.read().await;
         let mut in_flight = self.in_flight.lock().await;
         let mut result = Vec::new();
 
         for idx in start..end {
             let cid = chunk_map[idx].chunk_id;
-            if cache.peek(&cid).is_none() && !in_flight.contains(&cid) {
+            if chunk_cache.get(&cid).await.is_none() && !in_flight.contains(&cid) {
                 in_flight.insert(cid);
                 result.push((idx, cid));
             }

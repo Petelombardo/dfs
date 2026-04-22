@@ -3,6 +3,7 @@ use blake3;
 use dashmap::DashMap;
 use dfs_common::{ChunkId, ErrorCode, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
 use lru::LruCache;
+use moka::future::Cache as MokaCache;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -415,7 +416,7 @@ pub struct DfsClient {
 
     /// LRU cache for chunks (ChunkId -> data)
     /// Cache up to 256 chunks (~1GB at 4MB/chunk)
-    pub chunk_cache: Arc<tokio::sync::RwLock<LruCache<ChunkId, Arc<Vec<u8>>>>>,
+    pub chunk_cache: MokaCache<ChunkId, Arc<Vec<u8>>>,
 
     /// Byte-range cache for recently-accessed chunks (inode, offset) -> chunk data
     /// This solves the problem of content-addressed chunks changing during live DVR recording
@@ -569,7 +570,9 @@ impl DfsClient {
             NonZeroUsize::new(32).unwrap()
         });
 
-        let cache = LruCache::new(cache_capacity);
+        let cache = MokaCache::builder()
+            .max_capacity(cache_capacity.get() as u64)
+            .build();
 
         // Byte-range cache uses same conservative limits (both caches hold same data!)
         let byte_cache_capacity = dfs_common::calculate_cache_capacity(
@@ -618,7 +621,7 @@ impl DfsClient {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes.clone())),
             seed_nodes: cluster_nodes,
             current_node: Arc::new(RwLock::new(0)),
-            chunk_cache: Arc::new(tokio::sync::RwLock::new(cache)),
+            chunk_cache: cache,
             byte_range_cache: Arc::new(Mutex::new(byte_range_cache)),
             connection_pool: Arc::new(DashMap::new()),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -1187,6 +1190,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         file_path: &str,
         offset: usize,
         size: usize,
+        has_active_writer: bool,
     ) -> Result<Vec<u8>> {
         if size == 0 || offset >= file_size as usize {
             return Ok(Vec::new());
@@ -1203,14 +1207,30 @@ leader_addr: Arc::new(RwLock::new(None)),
         let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot().await;
 
         if chunk_map.is_empty() {
-            // Engine is cold — do a synchronous refresh so this read doesn't return empty.
+            // Engine is cold. If there's an active writer the chunk hasn't been flushed to
+            // the server yet — a leader refresh will return nothing and record a 1s backoff,
+            // causing every subsequent read to stall. Return empty immediately; the FUSE
+            // write-buffer path handles reads within buffered data, and the flush path will
+            // feed the engine once the chunk is committed.
+            if has_active_writer {
+                return Ok(Vec::new());
+            }
+            // No active writer — do a synchronous refresh so this read doesn't return empty.
             // Force-clear refresh_in_progress in case open() already set it (open() spawned
             // a background prefetch which may still be in flight; we override it here so we
             // don't skip the refresh and return 0 bytes).
+            let sync_start = std::time::Instant::now();
             engine.refresh_in_progress.store(false, Ordering::Release);
             self.refresh_engine(&engine, file_id, file_size, current_chunk).await;
+            info!("read_file: inode={} synchronous chunk map refresh took {:?}", inode, sync_start.elapsed());
             let snap = engine.snapshot().await;
             chunk_map = snap.0; chunk_offsets = snap.1; nim = snap.2;
+        } else if current_chunk as usize >= chunk_map.len() && has_active_writer {
+            // Read is past the committed chunk map end on a live-written file.
+            // The chunk is still being written into the buffer — going to the leader returns
+            // nothing and triggers the 1s backoff. Return empty; the write-buffer path or
+            // the next flush will make this data available.
+            return Ok(Vec::new());
         } else if engine.needs_refresh(file_size, current_chunk).await {
             // Non-empty but stale — refresh in background, serve this read from current snapshot.
             let engine_clone = engine.clone();
@@ -1253,9 +1273,8 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             // 1. Chunk cache (skip for SQLite).
             if !bypass_cache {
-                let cache = self.chunk_cache.read().await;
-                if let Some(data) = cache.peek(&cid) {
-                    result_chunks.push((idx, Arc::clone(data)));
+                if let Some(data) = self.chunk_cache.get(&cid).await {
+                    result_chunks.push((idx, data));
                     continue;
                 }
             }
@@ -1312,7 +1331,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     match result {
                         Ok(data) => {
                             let arc = Arc::new(data);
-                            client.chunk_cache.write().await.put(la_cid, arc);
+                            client.chunk_cache.insert(la_cid, arc).await;
                         }
                         Err(e) => debug!("Pipeline lookahead fetch failed for {}: {}", la_cid, e),
                     }
@@ -1370,7 +1389,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let data = res.with_context(|| format!("Failed to fetch chunk {}", cid))?;
                 let arc = Arc::new(data);
                 if !bypass_cache {
-                    self.chunk_cache.write().await.put(cid, Arc::clone(&arc));
+                    self.chunk_cache.insert(cid, Arc::clone(&arc)).await;
                 }
                 result_chunks.push((idx, arc));
             }
@@ -1444,11 +1463,8 @@ leader_addr: Arc::new(RwLock::new(None)),
     ) -> Result<Arc<Vec<u8>>> {
         for _ in 0..20 {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            {
-                let cache = self.chunk_cache.read().await;
-                if let Some(data) = cache.peek(&cid) {
-                    return Ok(Arc::clone(data));
-                }
+            if let Some(data) = self.chunk_cache.get(&cid).await {
+                return Ok(data);
             }
             // If the other fetcher removed it from in-flight without caching, it failed.
             let inf = engine.in_flight.lock().await;
@@ -1506,15 +1522,17 @@ leader_addr: Arc::new(RwLock::new(None)),
         // locations without a second round-trip. Backward seeks still trigger a
         // re-fetch (needs_refresh detects out-of-window), but those are rare.
         const CHUNK_MAP_WINDOW: u32 = u32::MAX;
+        let rpc_start = std::time::Instant::now();
         match self.get_file_chunk_map(file_id, from_chunk, CHUNK_MAP_WINDOW).await {
             Ok((locs, window_from, total_chunks, _)) if !locs.is_empty() => {
-                info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader",
-                      engine.inode, locs.len(), window_from, total_chunks);
+                info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader in {:?}",
+                      engine.inode, locs.len(), window_from, total_chunks, rpc_start.elapsed());
                 engine.clear_failed_refresh();
                 engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size).await;
             }
             Ok(_) | Err(_) => {
-                info!("refresh_engine: inode={} no chunk map from leader", engine.inode);
+                info!("refresh_engine: inode={} no chunk map from leader (took {:?})",
+                      engine.inode, rpc_start.elapsed());
                 engine.record_failed_refresh();
             }
         }
@@ -1577,10 +1595,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         {
             let new_ids: std::collections::HashSet<dfs_common::ChunkId> =
                 locations.iter().map(|l| l.chunk_id).collect();
-            let mut cache = self.chunk_cache.write().await;
             for old_id in old_chunk_ids {
                 if !new_ids.contains(&old_id) {
-                    cache.pop(&old_id);
+                    self.chunk_cache.invalidate(&old_id).await;
                 }
             }
         }
@@ -1661,15 +1678,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             let mut found = false;
 
             // Check chunk cache first — it's the primary cache for pipeline reads.
-            {
-                let chunk_hit = {
-                    let chunk_cache = self.chunk_cache.read().await;
-                    chunk_cache.peek(chunk_id).map(|data| (idx, Arc::clone(data)))
-                };
-                if let Some(cached) = chunk_hit {
-                    cached_chunks.push(cached);
-                    found = true;
-                }
+            if let Some(data) = self.chunk_cache.get(chunk_id).await {
+                cached_chunks.push((idx, data));
+                found = true;
             }
 
             // Only check byte-range cache (live DVR segments) if chunk cache missed.
@@ -1745,12 +1756,11 @@ leader_addr: Arc::new(RwLock::new(None)),
             if lookahead_needed > 0 {
                 let mut pipeline_chunks: Vec<ChunkId> = Vec::with_capacity(lookahead_needed);
                 {
-                    let cache = self.chunk_cache.read().await;
                     let in_flight = self.prefetch_in_flight.lock().await;
                     let mut file_idx = last_required_file_idx + 1;
                     while pipeline_chunks.len() < lookahead_needed && file_idx < all_file_chunks.len() {
                         let cid = all_file_chunks[file_idx];
-                        if cache.peek(&cid).is_none() && !in_flight.contains(&cid) {
+                        if self.chunk_cache.get(&cid).await.is_none() && !in_flight.contains(&cid) {
                             pipeline_chunks.push(cid);
                         }
                         file_idx += 1;
@@ -1975,8 +1985,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Partial results are still stored in the byte-range cache below, which
             // is keyed by (inode, offset) and is safe for partial use.
             if !was_partial {
-                let mut chunk_cache = self.chunk_cache.write().await;
-                chunk_cache.put(chunk_id, Arc::clone(&data_arc));
+                self.chunk_cache.insert(chunk_id, Arc::clone(&data_arc)).await;
                 debug!("Cached chunk {} ({} bytes)", chunk_id, data_arc.len());
             }
 
@@ -2031,14 +2040,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
                     // Check chunk cache
-                    let chunk_cache = self.chunk_cache.read().await;
-                    if let Some(data) = chunk_cache.peek(&chunk_id) {
+                    if let Some(data) = self.chunk_cache.get(&chunk_id).await {
                         debug!("Waited chunk {} now available after {:?}", chunk_id, wait_start.elapsed());
-                        fetched_chunks.push((idx, Arc::clone(data)));
+                        fetched_chunks.push((idx, data));
                         data_found = true;
                         break;
                     }
-                    drop(chunk_cache);
 
                     if attempt % 20 == 0 && attempt > 0 {
                         debug!("Still waiting for chunk {} ({}ms elapsed)", chunk_id, attempt * 50);
@@ -2070,8 +2077,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 let data_arc = Arc::new(data);
 
                                 // Cache it
-                                let mut chunk_cache = self.chunk_cache.write().await;
-                                chunk_cache.put(chunk_id, Arc::clone(&data_arc));
+                                self.chunk_cache.insert(chunk_id, Arc::clone(&data_arc)).await;
 
                                 fetched_chunks.push((idx, data_arc));
                                 fetch_succeeded = true;

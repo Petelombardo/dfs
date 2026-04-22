@@ -498,15 +498,13 @@ impl FlushHandle {
         // without waiting for the network round-trip to complete.  The chunk ID is deterministic
         // (compute_chunk_hash_at = blake3(offset || data)) so the ID we compute here is exactly
         // what the server will assign.  If the write fails we evict the pre-seeded entry.
-        let pre_seeded_ids: Vec<(u64, ChunkId)> = {
-            let mut cache = self.client.chunk_cache.write().await;
-            slots_to_write.iter().map(|(chunk_idx, slot_data, file_offset)| {
-                let hash = compute_chunk_hash_at(slot_data, *file_offset);
-                let cid = ChunkId::from_hash(hash);
-                cache.put(cid, Arc::new(slot_data.clone()));
-                (*chunk_idx, cid)
-            }).collect()
-        };
+        let mut pre_seeded_ids: Vec<(u64, ChunkId)> = Vec::new();
+        for (chunk_idx, slot_data, file_offset) in &slots_to_write {
+            let hash = compute_chunk_hash_at(slot_data, *file_offset);
+            let cid = ChunkId::from_hash(hash);
+            self.client.chunk_cache.insert(cid, Arc::new(slot_data.clone())).await;
+            pre_seeded_ids.push((*chunk_idx, cid));
+        }
         // Also push stub locations into the read engine so the chunk map reflects the new IDs
         // before the server acks. The location has no node list yet — reads that miss the local
         // cache will fall back to a leader refresh, which is the same as before this change.
@@ -584,12 +582,9 @@ impl FlushHandle {
 
         // Evict pre-seeded cache entries for any chunks that failed to reach the server.
         // Readers would otherwise get a cache hit on data that was never durably written.
-        if !failed_chunk_indices.is_empty() {
-            let mut cache = self.client.chunk_cache.write().await;
-            for (chunk_idx, cid) in &pre_seeded_ids {
-                if failed_chunk_indices.contains(&(*chunk_idx as usize)) {
-                    cache.pop(cid);
-                }
+        for (chunk_idx, cid) in &pre_seeded_ids {
+            if failed_chunk_indices.contains(&(*chunk_idx as usize)) {
+                self.client.chunk_cache.invalidate(cid).await;
             }
         }
 
@@ -1911,12 +1906,15 @@ impl Filesystem for DfsFilesystem {
 
             // --- Write buffer: serve from dirty slots without any network I/O. ---
             // Use try_lock() to avoid blocking main runtime threads on flush-runtime mutex.
+            // committed_size is the metadata size (server-side only, no buffer).
+            let committed_size = metadata_cache.get(&ino).map(|m| m.size as usize).unwrap_or(0);
             if write_buffer_enabled {
                 if let Some(state_lock) = write_buffers.get(&ino) {
                     if let Ok(state) = state_lock.try_lock() {
                         let read_end = offset + size;
                         let mut buf_data: Vec<u8> = Vec::with_capacity(size);
                         let mut pos = offset;
+                        let mut hit_unbuffered_write_edge = false;
 
                         while pos < read_end {
                             let chunk_idx = InodeWriteState::chunk_index(pos as u64);
@@ -1943,6 +1941,18 @@ impl Filesystem for DfsFilesystem {
                                     break;
                                 }
                             } else {
+                                // No slot for this chunk. If the offset is beyond committed server
+                                // data AND the buffer still exists (active writer), the DVR hasn't
+                                // written here yet — return what we have (possibly empty) rather
+                                // than going to the network where the leader will return "no chunk
+                                // map" and trigger a 1s backoff loop.
+                                // Only set this flag if the buffer is non-empty (has at least one
+                                // slot), confirming an active write session. An empty buffer after
+                                // flush has been cleared means we should fall through to network.
+                                let has_active_slots = !state.slots.is_empty();
+                                if pos >= committed_size && has_active_slots {
+                                    hit_unbuffered_write_edge = true;
+                                }
                                 break;
                             }
                         }
@@ -1950,6 +1960,15 @@ impl Filesystem for DfsFilesystem {
                         if !buf_data.is_empty() {
                             debug!("FUSE read from write buffer: ino={}, {} bytes", ino, buf_data.len());
                             reply.data(&buf_data);
+                            return;
+                        }
+                        if hit_unbuffered_write_edge {
+                            // Read is at the live write edge but data isn't buffered yet.
+                            // Return empty (short read) — the player will retry shortly.
+                            // Going to the network here triggers a leader refresh that returns
+                            // nothing and causes a multi-second backoff stall.
+                            debug!("FUSE read at write edge (not yet buffered): ino={}, offset={}", ino, offset);
+                            reply.data(&[]);
                             return;
                         }
                     }
@@ -2003,9 +2022,21 @@ impl Filesystem for DfsFilesystem {
             };
 
             // --- Delegate to the read engine (chunk map + pipeline + cache). ---
+            // True only when there are dirty (unflushed) slots in the write buffer.
+            // A stale empty-buffer key must not suppress the synchronous chunk map refresh —
+            // that would cause reads on a just-closed file to return empty instead of data.
+            // True only when there are dirty (unflushed) slots in the write buffer.
+            // A stale empty-buffer key must not suppress the synchronous chunk map refresh —
+            // that would cause reads on a just-closed file to return empty instead of data.
+            let has_active_writer = write_buffer_enabled && {
+                let has_slots = write_buffers.get(&ino)
+                    .and_then(|arc| arc.try_lock().ok().map(|s| !s.slots.is_empty()))
+                    .unwrap_or(false);
+                has_slots
+            };
             info!("FUSE read: ino={}, offset={}, size={}, file_size={}", ino, offset, size, effective_size);
             let result = client.read_file(
-                ino, effective_size, file_id, &file_path, offset, size,
+                ino, effective_size, file_id, &file_path, offset, size, has_active_writer,
             ).await;
 
             let elapsed = start.elapsed();

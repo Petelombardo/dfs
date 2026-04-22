@@ -1517,10 +1517,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             Ok((locs, window_from, total_chunks, _)) if !locs.is_empty() => {
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader",
                       engine.inode, locs.len(), window_from, total_chunks);
+                engine.clear_failed_refresh();
                 engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size).await;
             }
             Ok(_) | Err(_) => {
                 info!("refresh_engine: inode={} no chunk map from leader", engine.inode);
+                engine.record_failed_refresh();
             }
         }
 

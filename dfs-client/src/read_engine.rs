@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use dfs_common::{ChunkId, ChunkLocation};
@@ -53,6 +53,10 @@ pub struct InodeReadEngine {
     /// Set while a refresh is in progress; prevents duplicate concurrent refreshes.
     pub refresh_in_progress: AtomicBool,
 
+    /// Monotonic ms timestamp of the last refresh that returned no chunk map from the leader.
+    /// Prevents hammering the leader when a file is being written and chunks aren't committed yet.
+    pub last_failed_refresh_ms: AtomicU64,
+
     /// Chunk index range [window_start, window_end) covered by the last windowed fetch.
     /// Used to detect when a seek lands outside the cached window and force a re-fetch.
     pub last_window_start: AtomicU32,
@@ -73,6 +77,7 @@ impl InodeReadEngine {
             pipeline_head: AtomicUsize::new(0),
             pipeline_depth: 2,
             refresh_in_progress: AtomicBool::new(false),
+            last_failed_refresh_ms: AtomicU64::new(0),
             last_window_start: AtomicU32::new(0),
             last_window_end: AtomicU32::new(0),
         })
@@ -93,6 +98,21 @@ impl InodeReadEngine {
     /// Triggers on: file grew by a chunk, TTL expired, or current read position is outside
     /// the last-fetched window (e.g. seek backward past the window start).
     pub async fn needs_refresh(&self, current_size: u64, current_chunk: u32) -> bool {
+        // If the last refresh returned nothing from the leader, back off for 1 second before
+        // trying again. Without this, concurrent reads on a live-recording file (where the
+        // leader has no committed chunk map yet) spawn dozens of refresh RPCs per second.
+        const FAILED_BACKOFF_MS: u64 = 1000;
+        let last_fail = self.last_failed_refresh_ms.load(Ordering::Relaxed);
+        if last_fail > 0 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if now_ms.saturating_sub(last_fail) < FAILED_BACKOFF_MS {
+                return false;
+            }
+        }
+
         let known = self.known_size.load(Ordering::Relaxed) as u64;
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let new_chunk_count = (current_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -108,6 +128,21 @@ impl InodeReadEngine {
         }
         let last = self.last_map_refresh.lock().await;
         last.elapsed() > std::time::Duration::from_secs(5)
+    }
+
+    /// Record that a refresh attempt returned no chunk map from the leader.
+    /// Causes needs_refresh() to suppress retries for 1 second.
+    pub fn record_failed_refresh(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_failed_refresh_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Clear the failed-refresh backoff (called when a refresh succeeds).
+    pub fn clear_failed_refresh(&self) {
+        self.last_failed_refresh_ms.store(0, Ordering::Relaxed);
     }
 
     /// Replace the chunk map snapshot with fresh data from the leader.

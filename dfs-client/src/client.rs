@@ -1194,17 +1194,25 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let engine = self.read_engines.get_or_create(inode);
 
-        // Refresh chunk map if stale or file grew — but do it in the background so the
-        // current read is never blocked by a leader round-trip (~50-100ms). The stale
-        // snapshot is safe to use: it has valid chunk locations; the next read after the
-        // refresh completes will get the updated map. Only block when the map is empty
-        // (handled below in the empty-map retry loop).
-        // Compute the chunk index for the current read position — used to request only
-        // the window of chunks we actually need from the leader.
+        // Refresh chunk map if stale or file grew — always in the background so reads are
+        // never blocked by a leader round-trip. The stale snapshot is safe: it has valid
+        // chunk locations; the next read after refresh completes will pick up the new map.
         const CHUNK_SIZE_USIZE: usize = 4 * 1024 * 1024;
         let current_chunk = (offset / CHUNK_SIZE_USIZE) as u32;
 
-        if engine.needs_refresh(file_size, current_chunk).await {
+        let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot().await;
+
+        if chunk_map.is_empty() {
+            // Engine is cold — do a synchronous refresh so this read doesn't return empty.
+            // Force-clear refresh_in_progress in case open() already set it (open() spawned
+            // a background prefetch which may still be in flight; we override it here so we
+            // don't skip the refresh and return 0 bytes).
+            engine.refresh_in_progress.store(false, Ordering::Release);
+            self.refresh_engine(&engine, file_id, file_size, current_chunk).await;
+            let snap = engine.snapshot().await;
+            chunk_map = snap.0; chunk_offsets = snap.1; nim = snap.2;
+        } else if engine.needs_refresh(file_size, current_chunk).await {
+            // Non-empty but stale — refresh in background, serve this read from current snapshot.
             let engine_clone = engine.clone();
             let client_clone = self.clone();
             tokio::spawn(async move {
@@ -1212,26 +1220,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             });
         }
 
-        let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot().await;
-
-        // If the chunk map is empty but the file has a non-zero size, the leader may not
-        // have received the first ReplicateChunkLocation yet (write in progress, first 4MB
-        // chunk still accumulating in the write buffer).  Retry for up to 8s so that a
-        // reader who opens a live-recording file during the first chunk's fill window
-        // doesn't get a permanent empty read.
-        if chunk_map.is_empty() && file_size > 0 {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-            while std::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                self.refresh_engine(&engine, file_id, file_size, 0).await;
-                let snap = engine.snapshot().await;
-                chunk_map = snap.0; chunk_offsets = snap.1; nim = snap.2;
-                if !chunk_map.is_empty() { break; }
-            }
-        }
-
         if chunk_map.is_empty() {
-            info!("read_file: inode={} chunk map empty after refresh, returning empty", inode);
+            // Still empty — leader has no chunk map yet (file is being written, first chunk
+            // not yet committed). Return empty; player will retry naturally.
             return Ok(Vec::new());
         }
 
@@ -1537,6 +1528,34 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Set known_size to 0 so needs_refresh() returns true on the next read.
             engine.known_size.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// Feed freshly-written chunk locations directly into the read engine for `inode`,
+    /// bypassing the leader.  Called from the write flush path so concurrent readers on
+    /// the same client see new chunks immediately without a leader round-trip.
+    pub async fn feed_chunk_locations_to_read_engine(
+        &self,
+        inode: u64,
+        locations: &[dfs_common::ChunkLocation],
+        file_size: u64,
+    ) {
+        if locations.is_empty() {
+            return;
+        }
+        let engine = self.read_engines.get_or_create(inode);
+        let nim: std::collections::HashMap<dfs_common::NodeId, std::net::SocketAddr> = {
+            let addr_map = self.addr_to_node_id.read().await;
+            addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
+        };
+        // Use from_chunk=0 and total=locations.len() to do a full merge.
+        engine.update_chunk_map_window(
+            locations.to_vec(),
+            0,
+            locations.len() as u32,
+            Arc::new(nim),
+            file_size,
+        ).await;
+        engine.clear_failed_refresh();
     }
 
     /// all_file_chunks: Complete list of chunk IDs for the file (for prefetch - can be same as chunk_ids)

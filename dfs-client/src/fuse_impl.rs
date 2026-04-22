@@ -622,6 +622,19 @@ impl FlushHandle {
             }
         }
 
+        // Feed freshly-written chunk locations into the read engine so concurrent readers
+        // on the same client see new chunks immediately without a leader round-trip.
+        if !all_locations.is_empty() {
+            let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0);
+            let all_locs = self.metadata_cache.get(&ino)
+                .map(|m| m.chunk_locations.clone())
+                .unwrap_or_default();
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                client.feed_chunk_locations_to_read_engine(ino, &all_locs, current_size).await;
+            });
+        }
+
         let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
         if let Some(meta) = meta_to_persist {
             // Update the parent directory cache with our current metadata so readdir

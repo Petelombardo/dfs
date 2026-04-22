@@ -840,12 +840,12 @@ pub struct DfsFilesystem {
     write_tasks_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
 
     /// Total bytes currently held across all per-inode write buffers.
-    /// Updated atomically on every buffered write and on every flush completion.
-    /// The write path spins with a 5ms sleep when this exceeds global_write_buffer_cap
-    /// to prevent unbounded memory growth when the storage nodes are slow.
+    /// Incremented on every buffered write; decremented by flush_buffer_async on success.
+    /// Shared with FlushHandle so both sides see the same counter.
     global_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
 
-    /// Hard cap on total write buffer bytes. Set to ~8% of available RAM at init.
+    /// Hard cap on total write buffer bytes (~30% of available RAM, min 64MB).
+    /// The write task delays reply.written() while this is exceeded, throttling the kernel.
     global_write_buffer_cap: usize,
 }
 
@@ -875,16 +875,13 @@ impl DfsFilesystem {
               buffer_flush_threshold / chunk_size_bytes,
               chunk_size_mb);
 
-        // Global write buffer cap: 30% of available RAM, minimum 64MB.
-        // Applies across ALL inodes to prevent OOM when multiple recordings are active.
-        // 30% leaves the OS, tokio runtime, read caches, and chunk I/O with the remaining 70%.
-        let available_mb = dfs_common::get_available_memory()
-            .map(|b| b / (1024 * 1024))
-            .unwrap_or(512) as usize;
-        let global_write_buffer_cap = (available_mb * 30 / 100 * 1024 * 1024)
-            .max(64 * 1024 * 1024);
-        info!("Global write buffer cap: {}MB (available RAM: {}MB)",
-              global_write_buffer_cap / (1024 * 1024), available_mb);
+        // Global write buffer cap: one full flush pipeline pass (8 workers × chunk_size).
+        // The flush runtime drains this in one parallel round; capping at exactly this size
+        // means the buffer never holds more than the pipeline can absorb in one shot.
+        const FLUSH_WORKERS: usize = 8;
+        let global_write_buffer_cap = FLUSH_WORKERS * chunk_size_bytes;
+        info!("Global write buffer cap: {}MB ({} workers × {}MB chunk)",
+              global_write_buffer_cap / (1024 * 1024), FLUSH_WORKERS, chunk_size_mb);
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
         if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {
@@ -1101,7 +1098,7 @@ impl DfsFilesystem {
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
             release_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             write_tasks_in_flight: Arc::new(DashMap::new()),
-            global_buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            global_buffered_bytes,
             global_write_buffer_cap,
         })
     }
@@ -2379,6 +2376,7 @@ impl Filesystem for DfsFilesystem {
         let flush_handle = self.flush_handle.clone();
         let size_high_water = self.size_high_water.clone();
         let global_buffered_bytes = self.global_buffered_bytes.clone();
+        let global_write_buffer_cap = self.global_write_buffer_cap;
         let data_vec = data.to_vec();
         let req_uid = _req.uid();
         let req_gid = _req.gid();
@@ -2592,10 +2590,18 @@ impl Filesystem for DfsFilesystem {
                     return;
                 }
 
-                // BUFFERED WRITE — write into the slot and return immediately.
-                // The background flusher drains full slots every 100ms; global_buffered_bytes
-                // is tracked for observability but does not block writes.
+                // BUFFERED WRITE — wait for room before buffering, then reply.
+                // Checking before we add prevents us from blowing past the cap and then
+                // trying to drain an already-overwhelming buffer.  Delaying reply.written()
+                // blocks the kernel from issuing the next write(), which is the throttle.
+                // The write task runs on self.runtime (separate from flush_runtime), so
+                // sleeping here does not starve the flush workers.
                 {
+                    // Wait until there is room in the buffer before accepting more data.
+                    while global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed) >= global_write_buffer_cap {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+
                     let write_offset = offset as u64;
 
                     let state_arc = write_buffers
@@ -2620,6 +2626,7 @@ impl Filesystem for DfsFilesystem {
                         let mut counters = write_counters.write().unwrap();
                         *counters.entry(ino).or_insert(0) += 1;
                     }
+
                     let total_elapsed = start.elapsed();
                     debug!("write REPLY: ino={} offset={} len={} took={:?}",
                            ino, offset, data_vec.len(), total_elapsed);

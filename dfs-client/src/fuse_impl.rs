@@ -205,7 +205,12 @@ impl InodeWriteState {
 
     /// How many dirty bytes are buffered across all slots
     fn buffered_bytes(&self) -> usize {
-        self.slots.values().map(|s| s.data.len()).sum()
+        // Only count bytes that haven't been committed to the server yet.
+        // Slots kept alive after flush (server_prefix == data.len()) don't
+        // consume write bandwidth and must not block the backpressure gate.
+        self.slots.values()
+            .map(|s| s.data.len().saturating_sub(s.server_prefix))
+            .sum()
     }
 
     /// Slots that are full and not yet claimed by a flush task
@@ -585,15 +590,19 @@ impl FlushHandle {
         for (join_result, (chunk_idx, _, _)) in results.into_iter().zip(slots_to_write.iter()) {
             match join_result {
                 Ok(Ok((_, locations_opt))) => {
-                    // Remove slot now that it's safely on disk.
+                    // Mark slot as fully committed to the server but keep the data
+                    // in memory so concurrent readers can still serve from the buffer
+                    // during the window between chunk flush and metadata commit.
+                    // Slots are removed in flush_all_pipelined after metadata_sync confirms
+                    // the server has the full chunk map — closing the read gap.
                     if let Some(state_lock) = self.write_buffers.get(&ino) {
                         let mut state = state_lock.lock().await;
-                        if let Some(removed) = state.slots.remove(chunk_idx) {
-                            // Remember how many bytes this chunk has on the server so that
-                            // if the slot is recreated (e.g. DVR appending into a partial
-                            // chunk), the read path can bypass our zero-fill prefix.
-                            let flushed_len = removed.data.len();
+                        if let Some(slot) = state.slots.get_mut(chunk_idx) {
+                            let flushed_len = slot.data.len();
+                            slot.server_prefix = flushed_len;
                             state.flushed_sizes.insert(*chunk_idx, flushed_len);
+                            // Decrement global counter now — these bytes are on the server
+                            // and no longer count against backpressure.
                             self.global_buffered_bytes.fetch_sub(
                                 flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
                                 std::sync::atomic::Ordering::Relaxed,
@@ -681,6 +690,13 @@ impl FlushHandle {
                         // misses this — we must also dedup by file_offset.
                         if let Some(offset) = loc.file_offset {
                             if let Some(pos) = meta.chunk_locations.iter().position(|l| l.file_offset == Some(offset)) {
+                                let old_cid = meta.chunk_locations[pos].chunk_id;
+                                if old_cid != loc.chunk_id {
+                                    let client = self.client.clone();
+                                    tokio::spawn(async move {
+                                        client.chunk_cache.invalidate(&old_cid).await;
+                                    });
+                                }
                                 meta.chunk_locations[pos] = loc.clone();
                                 continue;
                             }
@@ -890,11 +906,13 @@ impl FlushHandle {
                                     meta_entry.size = new_size;
                                 }
                             }
-                            // Remove slot and update flushed_sizes
+                            // Mark slot as server-committed but keep data alive for readers
+                            // until metadata is synced (flush_all_pipelined cleans up after sync).
                             if let Some(state_arc) = self.write_buffers.get(&ino) {
                                 let mut state = state_arc.lock().await;
-                                if let Some(removed) = state.slots.remove(&chunk_idx) {
-                                    let flushed_len = removed.data.len();
+                                if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                    let flushed_len = slot.data.len();
+                                    slot.server_prefix = flushed_len;
                                     state.flushed_sizes.insert(chunk_idx, flushed_len);
                                     self.global_buffered_bytes.fetch_sub(
                                         flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
@@ -954,11 +972,13 @@ impl FlushHandle {
         let result = self.client.write_data_with_cache(&slot_data, ino, file_offset).await;
         match result {
             Ok((_, _, Some(locations))) => {
-                // Remove slot
+                // Mark slot as server-committed but keep data alive for readers
+                // until metadata is synced (flush_all_pipelined cleans up after sync).
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     let mut state = state_arc.lock().await;
-                    if let Some(removed) = state.slots.remove(&chunk_idx) {
-                        let flushed_len = removed.data.len();
+                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                        let flushed_len = slot.data.len();
+                        slot.server_prefix = flushed_len;
                         state.flushed_sizes.insert(chunk_idx, flushed_len);
                         self.global_buffered_bytes.fetch_sub(
                             flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
@@ -987,6 +1007,16 @@ impl FlushHandle {
                         if !meta.chunk_locations.iter().any(|l| l.chunk_id == loc.chunk_id) {
                             if let Some(offset) = loc.file_offset {
                                 if let Some(pos) = meta.chunk_locations.iter().position(|l| l.file_offset == Some(offset)) {
+                                    // Evict the old chunk_id from the read cache so stale partial
+                                    // data can't be served after the slot is replaced with a larger
+                                    // (or different) flush of the same chunk offset.
+                                    let old_cid = meta.chunk_locations[pos].chunk_id;
+                                    if old_cid != loc.chunk_id {
+                                        let client = self.client.clone();
+                                        tokio::spawn(async move {
+                                            client.chunk_cache.invalidate(&old_cid).await;
+                                        });
+                                    }
                                     meta.chunk_locations[pos] = loc.clone();
                                     continue;
                                 }
@@ -1147,6 +1177,21 @@ impl FlushHandle {
         if let Some(meta) = meta_to_persist {
             self.client.flush_metadata_sync(&meta).await;
             self.last_metadata_update.insert(ino, std::time::Instant::now());
+        }
+
+        // Now that metadata is committed on the server, remove all slots that were
+        // marked server_prefix == data.len() (fully flushed but kept alive for readers).
+        // global_buffered_bytes was already decremented when server_prefix was set,
+        // so don't subtract again here.
+        if let Some(state_arc) = self.write_buffers.get(&ino) {
+            let mut state = state_arc.lock().await;
+            let to_remove: Vec<u64> = state.slots.iter()
+                .filter(|(_, slot)| slot.server_prefix >= slot.data.len() && !slot.data.is_empty())
+                .map(|(&idx, _)| idx)
+                .collect();
+            for idx in to_remove {
+                state.slots.remove(&idx);
+            }
         }
         Ok(())
     }
@@ -1722,9 +1767,17 @@ impl Filesystem for DfsFilesystem {
         // Disable kernel readahead — our pipeline (depth=2) handles lookahead explicitly.
         // Kernel readahead would race our pipeline with extra concurrent fetches.
         let _ = config.set_max_readahead(0);
+        // Raise max_background so reads are never starved by concurrent release/write ops.
+        // Default is 16 with congestion threshold at 12; under heavy write load (4 releases +
+        // 2 pipeline writes in-flight) the kernel stops dispatching reads. 64 gives reads
+        // headroom without risking memory pressure (each slot is just a request descriptor).
+        let _ = config.set_max_background(64);
+        let _ = config.set_congestion_threshold(48);
 
         // Warm metadata and directory caches from the leader on startup so that the
         // first ls/find/DVR index scan sees all files immediately without round-trips.
+        // Run as a background task — block_on here would stall the FUSE dispatch thread
+        // on staging with many files, hanging the first write until warm-up completes.
         {
             let client = self.client.clone();
             let metadata_cache = self.metadata_cache.clone();
@@ -1740,11 +1793,9 @@ impl Filesystem for DfsFilesystem {
                 };
                 let now = std::time::Instant::now();
                 let count = files.len();
-                // Group into dir-cache entries as we go.
                 let mut dir_entries: std::collections::HashMap<String, Vec<dfs_common::FileMetadata>> =
                     std::collections::HashMap::new();
                 for file in files {
-                    // Allocate inode
                     let ino = {
                         let path_map = path_to_inode.read().unwrap();
                         if let Some(&existing) = path_map.get(&file.path) {
@@ -1768,13 +1819,11 @@ impl Filesystem for DfsFilesystem {
                     metadata_cache.insert(ino, file.clone());
                     last_metadata_update.insert(ino, now);
 
-                    // Bucket into parent dir for dir_cache population.
                     if let Some(slash) = file.path.rfind('/') {
                         let parent = if slash == 0 { "/".to_string() } else { file.path[..slash].to_string() };
                         dir_entries.entry(parent).or_default().push(file);
                     }
                 }
-                // Populate dir_cache for every parent directory seen.
                 for (dir, entries) in dir_entries {
                     dir_cache.insert(dir, (entries, now));
                 }
@@ -2387,8 +2436,11 @@ impl Filesystem for DfsFilesystem {
                                 // If the requested range falls within bytes already committed to
                                 // the server (server_prefix) or within a synthetic gap-fill prefix,
                                 // fall through to the network so the server's real data is returned.
+                                // But only do this if the network metadata has caught up (committed_size
+                                // covers the range) — otherwise the metadata is stale and the network
+                                // read will return 0 bytes even though the chunk data is on the server.
                                 let bypass_prefix = slot.server_prefix.max(slot.gap_filled_prefix);
-                                if intra + need <= bypass_prefix {
+                                if intra + need <= bypass_prefix && committed_size >= read_end {
                                     break;
                                 }
                                 if intra + need <= slot.data.len() {
@@ -2806,7 +2858,7 @@ impl Filesystem for DfsFilesystem {
                     } else {
                         0
                     };
-                    reply.created(&Duration::from_secs(300), &attr, 0, 0, open_flags);
+                    reply.created(&Duration::ZERO, &attr, 0, 0, open_flags);
                 }
                 Err(e) => {
                     error!("Failed to create file {}: {}", path, e);

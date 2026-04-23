@@ -7,7 +7,7 @@ BASE=/tmp/dfs-test
 MOUNT=/tmp/dfs-mount
 LOG=/tmp/dfs-test-logs
 CLUSTER="127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902"
-BIN="$REPO/target/debug"
+BIN="$REPO/target/release"
 PASS=0; FAIL=0; T=/tmp/dfs-suite-tmp-$$
 
 check() {
@@ -25,7 +25,7 @@ rm -rf $BASE $LOG $MOUNT $T
 mkdir -p $MOUNT $LOG $T
 
 echo "=== Building ==="
-cd "$REPO" && cargo build 2>&1 | tail -2
+cd "$REPO" && cargo build --release 2>&1 | tail -2
 
 echo "=== Starting 3-node cluster ==="
 bash "$REPO/scripts/setup-cluster.sh" 3 2>/dev/null
@@ -294,7 +294,7 @@ m2=$(md5sum "$T/t16_read.bin"  | cut -d' ' -f1)
 echo "=== T17: concurrent read while writing (deadlock regression) ==="
 dd if=/dev/urandom of="$T/t17_seed.bin" bs=1M count=8 2>/dev/null
 cp "$T/t17_seed.bin" "$MOUNT/t17_concurrent.bin"
-sleep 0.2
+sleep 0.5
 
 # Generate writer chunks locally (no FUSE blocking), then cp each to mount.
 # Using cp rather than dd-append avoids a stuck kernel write if FUSE deadlocks —

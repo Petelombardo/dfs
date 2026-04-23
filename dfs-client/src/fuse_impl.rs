@@ -2196,7 +2196,9 @@ impl Filesystem for DfsFilesystem {
         // in-flight write tasks on the same runtime.
         let is_read_open = (flags & libc::O_ACCMODE) == libc::O_RDONLY;
         let has_active_writer = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
-        if is_read_open && !has_active_writer {
+        let has_inflight_flush = self.flush_in_flight.read().unwrap()
+            .as_ref().map(|m| m.get(&ino).map(|v| *v > 0).unwrap_or(false)).unwrap_or(false);
+        if is_read_open && !has_active_writer && !has_inflight_flush {
             if let Some(meta) = self.metadata_cache.get(&ino) {
                 let file_id = meta.id;
                 let file_size = meta.size;

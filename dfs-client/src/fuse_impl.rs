@@ -79,6 +79,10 @@ struct ChunkSlot {
     /// was created (i.e. the slot was recreated after a flush). Reads within 0..server_prefix
     /// should be served from the server, not from our zero-filled slot data.
     server_prefix: usize,
+    /// Set to true by flush_one_chunk when it claims this slot for network I/O.
+    /// Prevents a second concurrent flush task from picking the same slot.
+    /// Cleared on success (slot removed) or failure (so it can be retried).
+    flushing: bool,
 }
 
 impl ChunkSlot {
@@ -88,6 +92,7 @@ impl ChunkSlot {
             last_modified: SystemTime::now(),
             gap_filled_prefix: 0,
             server_prefix: 0,
+            flushing: false,
         }
     }
 
@@ -97,6 +102,7 @@ impl ChunkSlot {
             last_modified: SystemTime::now(),
             gap_filled_prefix: 0,
             server_prefix: server_bytes,
+            flushing: false,
         }
     }
 
@@ -198,10 +204,10 @@ impl InodeWriteState {
         self.slots.values().map(|s| s.data.len()).sum()
     }
 
-    /// Slots that are full (ready for background flush without waiting for fsync)
+    /// Slots that are full and not yet claimed by a flush task
     fn full_slot_indices(&self) -> Vec<u64> {
         self.slots.iter()
-            .filter(|(_, s)| s.is_full())
+            .filter(|(_, s)| s.is_full() && !s.flushing)
             .map(|(idx, _)| *idx)
             .collect()
     }
@@ -215,6 +221,16 @@ impl InodeWriteState {
 }
 
 
+/// Number of chunk-flush tasks that may run concurrently per inode.
+/// 2 means 2 × 2 replica connections = 4 simultaneous node connections,
+/// which fits a 5-node cluster without thrashing.
+const PIPELINE_CHUNKS: usize = 2;
+
+/// Number of full chunk slots the writer may buffer ahead of the pipeline.
+/// With PIPELINE_CHUNKS=2 flushing and BUFFER_CHUNKS=8 in the buffer, the
+/// writer is always filling the next slots while the current ones are in-flight.
+const BUFFER_CHUNKS: usize = 8;
+
 /// Cheaply-cloneable handle to the fields needed by flush_buffer_async.
 /// Extracted so fsync() can clone it and spawn a background flush task without
 /// holding a reference to DfsFilesystem (which is !Clone due to &mut self callbacks).
@@ -223,7 +239,9 @@ struct FlushHandle {
     client: Arc<DfsClient>,
     write_buffers: Arc<DashMap<u64, Arc<Mutex<InodeWriteState>>>>,
     metadata_cache: Arc<DashMap<u64, FileMetadata>>,
-    flush_in_flight: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>>,
+    /// Tracks how many chunk-flush tasks are currently in-flight per inode.
+    /// Capped at PIPELINE_CHUNKS by the background ticker.
+    flush_in_flight: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>>,
     last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
     dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
     path_to_inode: Arc<RwLock<HashMap<String, u64>>>,
@@ -250,10 +268,10 @@ impl FlushHandle {
         // background tick flush can race: both snapshot the same slots, both try to
         // write the same chunk hash, and the second write fails with "already exists".
         if force {
-            let in_flight_set = self.flush_in_flight.read().unwrap().as_ref().cloned();
-            if let Some(in_flight_set) = in_flight_set {
+            let in_flight_map = self.flush_in_flight.read().unwrap().as_ref().cloned();
+            if let Some(in_flight_map) = in_flight_map {
                 let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-                while in_flight_set.contains(&ino) {
+                while in_flight_map.get(&ino).map(|v| *v).unwrap_or(0) > 0 {
                     if tokio::time::Instant::now() >= deadline {
                         break; // don't block forever; proceed and let the write deduplicate
                     }
@@ -492,6 +510,7 @@ impl FlushHandle {
         }
 
         info!("flush_buffer_async: flushing {} chunks in parallel for inode {}", slots_to_write.len(), ino);
+        let t_flush_start = std::time::Instant::now();
 
         // Pre-seed the chunk cache and read engine with locally-computed chunk IDs and data.
         // Reads that arrive during the server write RPC can be served from cache immediately
@@ -505,6 +524,7 @@ impl FlushHandle {
             self.client.chunk_cache.insert(cid, Arc::new(slot_data.clone())).await;
             pre_seeded_ids.push((*chunk_idx, cid));
         }
+        let t_preseed = t_flush_start.elapsed();
         // Also push stub locations into the read engine so the chunk map reflects the new IDs
         // before the server acks. The location has no node list yet — reads that miss the local
         // cache will fall back to a leader refresh, which is the same as before this change.
@@ -540,7 +560,9 @@ impl FlushHandle {
             })
         }).collect();
 
+        let t_net_start = std::time::Instant::now();
         let results = futures::future::join_all(handles).await;
+        let t_net = t_net_start.elapsed();
 
         // Process results: remove flushed slots, collect locations.
         let mut all_locations: Vec<dfs_common::ChunkLocation> = Vec::new();
@@ -592,7 +614,9 @@ impl FlushHandle {
             return Err(e);
         }
 
-        info!("flush_buffer_async: got {} chunk locations from {} slot writes", all_locations.len(), slots_to_write.len());
+        let t_meta_start = std::time::Instant::now();
+        info!("flush ino={} chunks={} | preseed={:?} net={:?} (so far {:?})",
+              ino, slots_to_write.len(), t_preseed, t_net, t_flush_start.elapsed());
         if all_locations.is_empty() && !patch_metadata_dirty {
             return Ok(());
         }
@@ -725,7 +749,298 @@ impl FlushHandle {
             }
         }
 
+        info!("flush ino={} complete | preseed={:?} net={:?} meta={:?} total={:?}",
+              ino, t_preseed, t_net, t_meta_start.elapsed(), t_flush_start.elapsed());
         Ok(())
+    }
+
+    /// Flush exactly one full (or idle) chunk slot for `ino`.
+    /// Called by the background ticker; each call handles one chunk so the pipeline
+    /// drains one slot at a time rather than batch-flushing all full slots at once.
+    async fn flush_one_chunk(&self, ino: u64) -> Result<()> {
+        // Pick the lowest-index unclaimed full slot, falling back to the lowest idle slot.
+        // Atomically set flushing=true while holding the mutex so no second concurrent
+        // task can claim the same slot.
+        let (chunk_idx, slot_data, file_offset) = {
+            let Some(state_arc) = self.write_buffers.get(&ino) else { return Ok(()); };
+            let mut state = state_arc.lock().await;
+
+            // Full slots first (lowest index, not already claimed)
+            let mut full: Vec<u64> = state.slots.iter()
+                .filter(|(_, s)| s.is_full() && !s.flushing)
+                .map(|(idx, _)| *idx)
+                .collect();
+            full.sort_unstable();
+
+            let idx = if let Some(i) = full.into_iter().next() {
+                i
+            } else {
+                // No full unclaimed slot — try the oldest idle partial slot.
+                let mut idle: Vec<(u64, SystemTime)> = state.slots.iter()
+                    .filter(|(_, s)| s.is_idle() && !s.data.is_empty() && !s.flushing)
+                    .map(|(idx, s)| (*idx, s.last_modified))
+                    .collect();
+                idle.sort_by_key(|&(_, t)| t);
+                match idle.into_iter().next() {
+                    Some((i, _)) => i,
+                    None => return Ok(()),
+                }
+            };
+
+            // Claim the slot and snapshot its data — all while holding the lock.
+            let slot = match state.slots.get_mut(&idx) {
+                Some(s) if !s.data.is_empty() => s,
+                _ => return Ok(()),
+            };
+            slot.flushing = true;
+            let data = slot.data.clone();
+            let offset = idx * CHUNK_SIZE as u64;
+            (idx, data, offset)
+            // mutex released here
+        };
+
+        self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset).await
+    }
+
+    /// Internal: flush exactly the chunk at `chunk_idx` for `ino`.
+    /// Slot data and file offset are pre-snapshotted by flush_one_chunk (which also
+    /// set slot.flushing=true to prevent a concurrent task from claiming the same slot).
+    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, slot_data: Vec<u8>, file_offset: u64) -> Result<()> {
+
+        // Check whether this slot needs PatchChunk or a fresh write.
+        let existing_chunk_size = {
+            let from_flushed = self.write_buffers.get(&ino)
+                .and_then(|s| s.try_lock().ok()
+                    .and_then(|st| st.flushed_sizes.get(&chunk_idx).copied()));
+            from_flushed.unwrap_or_else(|| {
+                self.metadata_cache.get(&ino)
+                    .and_then(|m| m.chunk_locations.get(chunk_idx as usize).map(|l| l.size))
+                    .unwrap_or(0)
+            })
+        };
+        let max_flushed_idx: Option<u64> = {
+            let meta_chunk_count = self.metadata_cache.get(&ino)
+                .map(|m| m.chunk_locations.len() as u64)
+                .unwrap_or(0);
+            if meta_chunk_count > 0 { Some(meta_chunk_count - 1) } else { None }
+        };
+        let chunk_exists = existing_chunk_size > 0
+            || max_flushed_idx.map(|max| chunk_idx <= max).unwrap_or(false);
+        let gap_filled_prefix = {
+            self.write_buffers.get(&ino)
+                .and_then(|s| s.try_lock().ok()
+                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| sl.gap_filled_prefix)))
+                .unwrap_or(0)
+        };
+        let slot_len = slot_data.len();
+        let is_append_extend = chunk_exists
+            && slot_len < CHUNK_SIZE
+            && slot_len > existing_chunk_size
+            && gap_filled_prefix >= existing_chunk_size;
+        let is_overwrite = chunk_exists && slot_len < CHUNK_SIZE && slot_len <= existing_chunk_size;
+        let needs_patch = is_overwrite || is_append_extend;
+
+        if needs_patch {
+            let (patch_intra, patch_bytes) = if is_append_extend {
+                (existing_chunk_size, slot_data[existing_chunk_size..].to_vec())
+            } else {
+                let real_start = gap_filled_prefix;
+                (real_start, slot_data[real_start..].to_vec())
+            };
+            let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
+            if let Some(meta) = meta {
+                let chunk_idx_usize = chunk_idx as usize;
+                if let Some(old_location) = meta.chunk_locations.get(chunk_idx_usize).cloned() {
+                    let patch_result = self.client.patch_chunk_on_replicas(
+                        old_location.chunk_id,
+                        file_offset,
+                        patch_intra,
+                        patch_bytes,
+                        &old_location,
+                    ).await;
+                    match patch_result {
+                        Ok(new_location) => {
+                            if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                                if let Some(loc) = meta_entry.chunk_locations.get_mut(chunk_idx_usize) {
+                                    *loc = new_location;
+                                }
+                                if let Some(new_size) = meta_entry.chunk_locations.iter()
+                                    .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
+                                    .reduce(u64::max)
+                                {
+                                    meta_entry.size = new_size;
+                                }
+                            }
+                            // Remove slot and update flushed_sizes
+                            if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                let mut state = state_arc.lock().await;
+                                if let Some(removed) = state.slots.remove(&chunk_idx) {
+                                    let flushed_len = removed.data.len();
+                                    state.flushed_sizes.insert(chunk_idx, flushed_len);
+                                    self.global_buffered_bytes.fetch_sub(
+                                        flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                            }
+                            let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
+                            if let Some(meta) = meta_to_persist {
+                                const METADATA_FLUSH_INTERVAL_SECS: u64 = 5;
+                                let should_enqueue = match self.last_metadata_update.get(&ino) {
+                                    None => true,
+                                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(METADATA_FLUSH_INTERVAL_SECS),
+                                };
+                                if should_enqueue {
+                                    self.last_metadata_update.insert(ino, std::time::Instant::now());
+                                    let stamped = self.client.stamp_write_seq_pub(&meta);
+                                    self.client.metadata_queue.push(stamped).await;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!("flush_one_chunk: PatchChunk failed for slot {} — {}", chunk_idx, e);
+                            if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                if let Ok(mut state) = state_arc.try_lock() {
+                                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                        slot.flushing = false;
+                                    }
+                                }
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            // No metadata or location — fall through to normal write
+        }
+
+        // Normal write path: pre-seed cache, write, update metadata.
+        let hash = compute_chunk_hash_at(&slot_data, file_offset);
+        let cid = dfs_common::ChunkId::from_hash(hash);
+        self.client.chunk_cache.insert(cid, Arc::new(slot_data.clone())).await;
+
+        let stub = dfs_common::ChunkLocation {
+            chunk_id: cid,
+            nodes: Vec::new(),
+            size: slot_data.len(),
+            checksum: [0u8; 32],
+            file_offset: Some(file_offset),
+            written_at: None,
+        };
+        let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0)
+            .max(file_offset + slot_data.len() as u64);
+        self.client.feed_chunk_locations_to_read_engine(ino, &[stub], current_size).await;
+
+        let result = self.client.write_data_with_cache(&slot_data, ino, file_offset).await;
+        match result {
+            Ok((_, _, Some(locations))) => {
+                // Remove slot
+                if let Some(state_arc) = self.write_buffers.get(&ino) {
+                    let mut state = state_arc.lock().await;
+                    if let Some(removed) = state.slots.remove(&chunk_idx) {
+                        let flushed_len = removed.data.len();
+                        state.flushed_sizes.insert(chunk_idx, flushed_len);
+                        self.global_buffered_bytes.fetch_sub(
+                            flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+
+                // Fetch metadata if not cached
+                if !self.metadata_cache.contains_key(&ino) {
+                    let path_opt = self.path_to_inode.read().unwrap()
+                        .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                    if let Some(path) = path_opt {
+                        if let Ok(Some(fetched)) = self.client.get_file_metadata(&path).await {
+                            self.client.seed_write_seq(fetched.id, fetched.write_seq);
+                            self.metadata_cache.insert(ino, fetched);
+                        }
+                    }
+                }
+
+                if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
+                    if self.truncated_inodes.contains(&ino) {
+                        return Ok(());
+                    }
+                    for loc in &locations {
+                        if !meta.chunk_locations.iter().any(|l| l.chunk_id == loc.chunk_id) {
+                            if let Some(offset) = loc.file_offset {
+                                if let Some(pos) = meta.chunk_locations.iter().position(|l| l.file_offset == Some(offset)) {
+                                    meta.chunk_locations[pos] = loc.clone();
+                                    continue;
+                                }
+                            }
+                            meta.chunk_locations.push(loc.clone());
+                        }
+                    }
+                    if let Some(last) = meta.chunk_locations.iter()
+                        .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
+                        .reduce(u64::max)
+                    {
+                        meta.size = last;
+                    }
+                    meta.modified_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                }
+
+                let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0);
+                let all_locs = self.metadata_cache.get(&ino)
+                    .map(|m| m.chunk_locations.clone())
+                    .unwrap_or_default();
+                self.client.feed_chunk_locations_to_read_engine(ino, &all_locs, current_size).await;
+
+                let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
+                if let Some(meta) = meta_to_persist {
+                    let parent_path = meta.path.rfind('/').map(|i| {
+                        let p = &meta.path[..i];
+                        if p.is_empty() { "/".to_string() } else { p.to_string() }
+                    });
+                    if let Some(parent) = parent_path {
+                        if let Some(mut dir_entry) = self.dir_cache.get_mut(&parent) {
+                            let (entries, _) = &mut *dir_entry;
+                            if let Some(pos) = entries.iter().position(|e| e.id == meta.id) {
+                                entries[pos] = meta.clone();
+                            } else {
+                                entries.push(meta.clone());
+                            }
+                        } else {
+                            self.dir_cache.remove(&parent);
+                        }
+                    }
+                    const METADATA_FLUSH_INTERVAL_SECS: u64 = 5;
+                    let should_enqueue = match self.last_metadata_update.get(&ino) {
+                        None => true,
+                        Some(last) => last.elapsed() >= std::time::Duration::from_secs(METADATA_FLUSH_INTERVAL_SECS),
+                    };
+                    if should_enqueue {
+                        self.last_metadata_update.insert(ino, std::time::Instant::now());
+                        let stamped = self.client.stamp_write_seq_pub(&meta);
+                        self.client.metadata_queue.push(stamped).await;
+                    }
+                }
+                Ok(())
+            }
+            Ok((_, _, None)) => {
+                // Write succeeded but returned no locations — evict the pre-seeded entry.
+                self.client.chunk_cache.invalidate(&cid).await;
+                Ok(())
+            }
+            Err(e) => {
+                self.client.chunk_cache.invalidate(&cid).await;
+                if let Some(state_arc) = self.write_buffers.get(&ino) {
+                    if let Ok(mut state) = state_arc.try_lock() {
+                        if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                            slot.flushing = false;
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -809,11 +1124,11 @@ pub struct DfsFilesystem {
     /// See FlushHandle::truncated_inodes for details.
     truncated_inodes: Arc<dashmap::DashSet<u64>>,
 
-    /// Shared reference to the background flusher's in-flight set.
+    /// Shared reference to the background flusher's in-flight count map.
     /// Set by the background flusher task after spawn; flush_buffer_async (fsync/close)
-    /// waits for any in-flight background flush to complete before sending its own flush
+    /// waits until the count reaches zero before sending its own flush
     /// to avoid concurrent flushes that would produce OffsetMismatch.
-    flush_in_flight: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>>,
+    flush_in_flight: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>>,
 
     /// Dedicated runtime for chunk network I/O. Isolated from the main runtime.
     flush_runtime: Arc<tokio::runtime::Runtime>,
@@ -875,15 +1190,13 @@ impl DfsFilesystem {
               buffer_flush_threshold / chunk_size_bytes,
               chunk_size_mb);
 
-        // Global write buffer cap: 2 × pipeline capacity (2 × buffer_flush_threshold).
-        // One pipeline-worth is in-flight flushing to the backend; the second pipeline-worth
-        // is accumulating in the buffer so that when the flush completes the pipeline can
-        // refill and start immediately without stalling the writer.  Cap at exactly 2×
-        // so we never accumulate a third batch — the writer blocks until the flush round
-        // finishes and the first batch's bytes are freed.
-        let global_write_buffer_cap = 2 * buffer_flush_threshold;
-        info!("Global write buffer cap: {}MB (2 × {}MB pipeline)",
-              global_write_buffer_cap / (1024 * 1024), buffer_flush_threshold / (1024 * 1024));
+        // Global write buffer cap: BUFFER_CHUNKS × CHUNK_SIZE.
+        // The writer may buffer up to BUFFER_CHUNKS full slots per inode before blocking.
+        // With PIPELINE_CHUNKS=2 flushing concurrently, BUFFER_CHUNKS=4 slots in the buffer,
+        // the writer always has room to fill the next slot while prior ones are in-flight.
+        let global_write_buffer_cap = BUFFER_CHUNKS * CHUNK_SIZE;
+        info!("Global write buffer cap: {}MB ({} buffer chunks × {}MB)",
+              global_write_buffer_cap / (1024 * 1024), BUFFER_CHUNKS, CHUNK_SIZE / (1024 * 1024));
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
         if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {
@@ -917,7 +1230,7 @@ impl DfsFilesystem {
         let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
         let write_buffers_for_cleanup = Arc::new(DashMap::<u64, Arc<Mutex<InodeWriteState>>>::new());
-        let flush_in_flight_shared: Arc<RwLock<Option<Arc<dashmap::DashSet<u64>>>>> =
+        let flush_in_flight_shared: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>> =
             Arc::new(RwLock::new(None));
         let truncated_inodes_shared: Arc<dashmap::DashSet<u64>> = Arc::new(dashmap::DashSet::new());
         let last_metadata_update_shared: Arc<DashMap<u64, std::time::Instant>> =
@@ -952,12 +1265,11 @@ impl DfsFilesystem {
             let metadata_cache_for_cleanup = metadata_cache.clone();
             let write_open_counts_for_bg = write_open_counts.clone();
             let path_to_inode_for_bg = path_to_inode.clone();
-            // in_flight: tracks inodes with an active background flush task.
-            // Prevents launching a second flush while the first is still in flight,
-            // which would produce OffsetMismatch. Also used by flush_buffer_async
-            // (fsync/close) to wait for any in-flight background flush to complete.
-            let in_flight: Arc<dashmap::DashSet<u64>> = Arc::new(dashmap::DashSet::new());
-            // Share the in_flight set with flush_buffer_async via the struct field
+            // in_flight: per-inode count of chunk-flush tasks currently running.
+            // The ticker keeps this at most PIPELINE_CHUNKS per inode, so each
+            // flush task handles exactly one chunk and decrements on completion.
+            // flush_buffer_async (fsync/close) waits for the count to reach zero.
+            let in_flight: Arc<DashMap<u64, usize>> = Arc::new(DashMap::new());
             *flush_in_flight_shared.write().unwrap() = Some(in_flight.clone());
 
             let flush_handle_for_bg = FlushHandle {
@@ -977,56 +1289,70 @@ impl DfsFilesystem {
                 loop {
                     interval.tick().await;
 
-                    // Find inodes with full chunk slots ready for background flush.
-                    // A full slot (exactly 4MB) is safe to flush without waiting for fsync.
-                    // Partial slots are also flushed if they haven't been written to for 2s
-                    // (file may have stopped growing — drain it rather than holding memory).
-                    // Collect keys first (brief DashMap read lock, no await held).
-                    // Holding a DashMap shard lock across an .await is a deadlock:
-                    // write() calls .entry().or_insert_with() (needs DashMap write lock)
-                    // while holding the buffer mutex — if the ticker holds the shard read
-                    // lock while awaiting the buffer mutex, both tasks block each other.
+                    // For each inode: if it has full slots and fewer than PIPELINE_CHUNKS
+                    // tasks in-flight, dispatch one more chunk-flush task.  Each task flushes
+                    // exactly one chunk (max_chunks=1) and decrements the counter on completion.
+                    // This gives continuous single-chunk pipelining: as soon as one chunk
+                    // finishes, the slot is freed (unblocking the writer) and the next tick
+                    // can dispatch a replacement — no need to wait for the whole batch.
                     let inodes: Vec<u64> = write_buffers_clone.iter()
                         .map(|e| *e.key())
                         .collect();
 
-                    let mut flush_inodes: Vec<u64> = Vec::new();
                     for ino in inodes {
-                        if in_flight.contains(&ino) { continue; }
+                        let current_in_flight = in_flight.get(&ino).map(|v| *v).unwrap_or(0);
+                        if current_in_flight >= PIPELINE_CHUNKS { continue; }
+
                         let state_arc = match write_buffers_clone.get(&ino) {
                             Some(a) => a.clone(),
                             None => continue,
                         };
                         let state = state_arc.lock().await;
                         let has_full = !state.full_slot_indices().is_empty();
-                        // A partial/idle slot is safe to flush only when there are no
-                        // active write-mode fds — i.e. the writer has already closed the
-                        // file but the buffer wasn't flushed in release() for some reason
-                        // (e.g. rename-based save). DVR always has an open fd, so it is
-                        // never flushed prematurely here.
                         let no_active_writers = write_open_counts_for_bg
                             .get(&ino).map(|c| *c == 0).unwrap_or(true);
                         let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
-                            s.is_idle() && !s.data.is_empty()
+                            s.is_idle() && !s.data.is_empty() && !s.flushing
                         });
-                        if has_full || has_idle {
-                            flush_inodes.push(ino);
-                        }
-                    }
+                        drop(state);
+                        if !has_full && !has_idle { continue; }
 
-                    for ino in flush_inodes {
-                        in_flight.insert(ino);
+                        // Increment before spawning to prevent a second dispatch racing
+                        // in the same tick before the task starts.
+                        *in_flight.entry(ino).or_insert(0) += 1;
+
                         let handle = flush_handle_for_bg.clone();
                         let in_flight_task = in_flight.clone();
                         let flush_rt = handle.flush_runtime.clone();
 
-                        // Spawn on flush_runtime so chunk network I/O runs isolated from
-                        // the main runtime, preventing worker starvation of write reply tasks.
                         flush_rt.spawn(async move {
-                            if let Err(e) = handle.flush_buffer_async(ino, false).await {
-                                tracing::error!("Background flush failed for inode {}: {}", ino, e);
+                            // Flush one chunk, then keep looping as long as:
+                            //   - more full slots exist for this inode, AND
+                            //   - we are the only task holding the in_flight slot
+                            //     (i.e. we haven't been displaced by a concurrent task).
+                            // This self-refilling loop is what keeps the pipeline truly full:
+                            // each task fills its own pipeline slot back-to-back without
+                            // waiting up to 100ms for the ticker to notice the vacancy.
+                            loop {
+                                if let Err(e) = handle.flush_one_chunk(ino).await {
+                                    tracing::error!("Background flush failed for inode {}: {}", ino, e);
+                                    break;
+                                }
+                                // Check whether more full slots remain.
+                                let has_more = handle.write_buffers.get(&ino).map(|s| {
+                                    s.try_lock().map(|st| !st.full_slot_indices().is_empty()).unwrap_or(false)
+                                }).unwrap_or(false);
+                                if !has_more { break; }
+                                // Only continue if there's a spare pipeline slot for us.
+                                // If another task already filled it (ticker dispatched a sibling),
+                                // exit so we don't over-subscribe.
+                                let current = in_flight_task.get(&ino).map(|v| *v).unwrap_or(0);
+                                if current > PIPELINE_CHUNKS { break; }
                             }
-                            in_flight_task.remove(&ino);
+                            // Decrement; remove entry when it reaches zero.
+                            let mut entry = in_flight_task.entry(ino).or_insert(0);
+                            if *entry > 0 { *entry -= 1; }
+                            if *entry == 0 { drop(entry); in_flight_task.remove(&ino); }
                         });
                     }
                 }
@@ -2608,17 +2934,26 @@ impl Filesystem for DfsFilesystem {
                         .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
                         .clone();
 
+                    // t_sched: time from FUSE write() call to reaching the backpressure gate
+                    // (runtime scheduling + metadata cache lookup overhead).
+                    let t_sched = start.elapsed();
+
                     // Wait until this inode's buffer has room before accepting more data.
+                    let t_bp_start = std::time::Instant::now();
                     loop {
                         let current = state_arc.lock().await.buffered_bytes();
                         if current < global_write_buffer_cap { break; }
                         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     }
+                    let t_bp = t_bp_start.elapsed();
 
+                    // t_buf: time to acquire the slot lock and copy bytes into the buffer.
+                    let t_buf_start = std::time::Instant::now();
                     let mut state = state_arc.lock().await;
                     state.write_at(write_offset, &data_vec);
                     drop(state);
                     global_buffered_bytes.fetch_add(data_vec.len(), std::sync::atomic::Ordering::Relaxed);
+                    let t_buf = t_buf_start.elapsed();
 
                     // Update size_high_water immediately so concurrent writes that hit
                     // try_lock() failure see the correct write position and don't misclassify
@@ -2634,9 +2969,9 @@ impl Filesystem for DfsFilesystem {
                         *counters.entry(ino).or_insert(0) += 1;
                     }
 
-                    let total_elapsed = start.elapsed();
-                    debug!("write REPLY: ino={} offset={} len={} took={:?}",
-                           ino, offset, data_vec.len(), total_elapsed);
+                    info!("write ino={} off={} len={} | sched={:?} bp_wait={:?} buf={:?} total={:?}",
+                          ino, offset, data_vec.len(),
+                          t_sched, t_bp, t_buf, start.elapsed());
                     reply.written(data_vec.len() as u32);
                     return;
                 }

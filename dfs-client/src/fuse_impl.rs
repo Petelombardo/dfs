@@ -129,6 +129,9 @@ struct InodeWriteState {
     /// If true, every fsync() must flush immediately (O_SYNC / O_DSYNC was set on open).
     /// If false, fsyncs within the coalescing window are absorbed (DVR / streaming mode).
     sync_on_fsync: bool,
+    /// True when the file was opened with O_TRUNC (full replacement). PatchChunk must not
+    /// be used in this session — the caller is writing a new file, not patching an old one.
+    is_truncated_session: bool,
 }
 
 impl InodeWriteState {
@@ -137,6 +140,7 @@ impl InodeWriteState {
             slots: HashMap::new(),
             flushed_sizes: HashMap::new(),
             sync_on_fsync,
+            is_truncated_session: false,
         }
     }
 
@@ -377,19 +381,16 @@ impl FlushHandle {
                 && slot_len < CHUNK_SIZE
                 && slot_len > existing_chunk_size
                 && gap_filled_prefix >= existing_chunk_size;
-            // Only use PatchChunk for a genuine partial in-place edit: the slot is smaller
-            // than the existing chunk AND the file has more than one chunk (meaning this slot
-            // is truly patching part of a multi-chunk file).  For a single-chunk file being
-            // replaced with a shorter single-chunk file (e.g. cp small over large), do a
-            // fresh write — PatchChunk would leave the tail of the old chunk intact on the
-            // server, producing a file that reads back as the old (larger) size.
-            let existing_chunk_count = self.metadata_cache.get(&ino)
-                .map(|m| m.chunk_locations.len())
-                .unwrap_or(0);
+            // Use PatchChunk for a genuine partial in-place edit (conv=notrunc style), but NOT
+            // when the session was opened with O_TRUNC — that is a full replacement and must
+            // emit a fresh WriteChunk so the old tail bytes are not left on the server.
+            let is_truncated_session = self.write_buffers.get(&ino)
+                .and_then(|s| s.try_lock().ok().map(|st| st.is_truncated_session))
+                .unwrap_or(false);
             let is_overwrite = chunk_exists
                 && slot_len < CHUNK_SIZE
                 && slot_len <= existing_chunk_size
-                && existing_chunk_count > 1;
+                && !is_truncated_session;
             let needs_patch = is_overwrite || is_append_extend;
 
             if needs_patch {
@@ -849,13 +850,13 @@ impl FlushHandle {
             && slot_len < CHUNK_SIZE
             && slot_len > existing_chunk_size
             && gap_filled_prefix >= existing_chunk_size;
-        let existing_chunk_count = self.metadata_cache.get(&ino)
-            .map(|m| m.chunk_locations.len())
-            .unwrap_or(0);
+        let is_truncated_session = self.write_buffers.get(&ino)
+            .and_then(|s| s.try_lock().ok().map(|st| st.is_truncated_session))
+            .unwrap_or(false);
         let is_overwrite = chunk_exists
             && slot_len < CHUNK_SIZE
             && slot_len <= existing_chunk_size
-            && existing_chunk_count > 1;
+            && !is_truncated_session;
         let needs_patch = is_overwrite || is_append_extend;
 
         if needs_patch {
@@ -1059,6 +1060,95 @@ impl FlushHandle {
                 Err(e)
             }
         }
+    }
+
+    /// Drain ALL dirty slots for `ino` (including partial tail) through the
+    /// same PIPELINE_CHUNKS-capped pipeline used by the background ticker.
+    /// Used by release() and fsync() so close/sync never exceeds 2 concurrent
+    /// writes — keeping total cluster connections at 2×2=4 on a 5-node cluster.
+    async fn flush_all_pipelined(&self, ino: u64) -> Result<()> {
+        // Wait for any background pipeline tasks to finish first so we don't
+        // race with them on slot ownership.
+        let in_flight_map = self.flush_in_flight.read().unwrap().as_ref().cloned();
+        if let Some(ref map) = in_flight_map {
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            while map.get(&ino).map(|v| *v).unwrap_or(0) > 0 {
+                if tokio::time::Instant::now() >= deadline { break; }
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        // Make partial slots eligible for flush_one_chunk by temporarily marking
+        // them as idle (last_modified = old enough). They're already no longer
+        // being written to (release/fsync caller guarantees this).
+        if let Some(state_arc) = self.write_buffers.get(&ino) {
+            let mut state = state_arc.lock().await;
+            let epoch = SystemTime::UNIX_EPOCH; // far in the past → is_idle() = true
+            for (_, slot) in state.slots.iter_mut() {
+                if !slot.data.is_empty() {
+                    slot.last_modified = epoch;
+                }
+            }
+        }
+
+        let mut first_err: Option<anyhow::Error> = None;
+
+        // Keep dispatching up to PIPELINE_CHUNKS concurrent flush_one_chunk calls
+        // until no unclaimed slots remain.
+        loop {
+            // Count how many slots are still pending (unclaimed and non-empty).
+            let pending = self.write_buffers.get(&ino).map(|s| {
+                s.try_lock().map(|st| {
+                    st.slots.values().filter(|sl| !sl.data.is_empty() && !sl.flushing).count()
+                }).unwrap_or(1) // if locked, assume work remains
+            }).unwrap_or(0);
+
+            if pending == 0 { break; }
+
+            // Count currently in-flight slots for this inode (claimed, flushing=true).
+            let in_flight_count = self.write_buffers.get(&ino).map(|s| {
+                s.try_lock().map(|st| st.slots.values().filter(|sl| sl.flushing).count()).unwrap_or(0)
+            }).unwrap_or(0);
+
+            // Dispatch up to PIPELINE_CHUNKS tasks total.
+            let to_dispatch = PIPELINE_CHUNKS.saturating_sub(in_flight_count).min(pending);
+            if to_dispatch == 0 {
+                // Pipeline is full — wait a bit for a slot to complete.
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                continue;
+            }
+
+            let mut handles = Vec::new();
+            for _ in 0..to_dispatch {
+                let handle = self.clone();
+                handles.push(tokio::spawn(async move {
+                    handle.flush_one_chunk(ino).await
+                }));
+            }
+
+            for h in handles {
+                match h.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => { if first_err.is_none() { first_err = Some(e); } }
+                    Err(e) => { if first_err.is_none() {
+                        first_err = Some(anyhow::anyhow!("flush task panicked: {}", e));
+                    }}
+                }
+            }
+
+            if first_err.is_some() { break; }
+        }
+
+        if let Some(e) = first_err { return Err(e); }
+
+        // Final metadata sync — flush_one_chunk enqueues to the metadata queue,
+        // but release/fsync need a synchronous commit so the file survives restart.
+        let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
+        if let Some(meta) = meta_to_persist {
+            self.client.flush_metadata_sync(&meta).await;
+            self.last_metadata_update.insert(ino, std::time::Instant::now());
+        }
+        Ok(())
     }
 }
 
@@ -1535,6 +1625,11 @@ impl DfsFilesystem {
     /// Flush the write buffer for `ino`. Delegates to FlushHandle::flush_buffer_async.
     async fn flush_buffer_async(&self, ino: u64, force: bool) -> Result<()> {
         self.flush_handle.flush_buffer_async(ino, force).await
+    }
+
+    /// Flush all dirty chunks for `ino` using a pipelined approach capped at PIPELINE_CHUNKS.
+    async fn flush_all_pipelined(&self, ino: u64) -> Result<()> {
+        self.flush_handle.flush_all_pipelined(ino).await
     }
 
     /// Convert FileMetadata to FUSE FileAttr
@@ -2031,6 +2126,9 @@ impl Filesystem for DfsFilesystem {
                     .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(sync_on_fsync))));
                 if sync_on_fsync {
                     if let Ok(mut st) = state_entry.try_lock() { st.sync_on_fsync = true; }
+                }
+                if is_trunc {
+                    if let Ok(mut st) = state_entry.try_lock() { st.is_truncated_session = true; }
                 }
             }
         }
@@ -3008,7 +3106,7 @@ impl Filesystem for DfsFilesystem {
                         *counters.entry(ino).or_insert(0) += 1;
                     }
 
-                    info!("write ino={} off={} len={} | sched={:?} bp_wait={:?} buf={:?} total={:?}",
+                    debug!("write ino={} off={} len={} | sched={:?} bp_wait={:?} buf={:?} total={:?}",
                           ino, offset, data_vec.len(),
                           t_sched, t_bp, t_buf, start.elapsed());
                     reply.written(data_vec.len() as u32);
@@ -3370,7 +3468,7 @@ impl Filesystem for DfsFilesystem {
                         release_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
-                    if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
+                    if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                         error!("release: flush failed for inode {}: {}", ino, e);
                     }
                     // Invalidate the read engine's chunk map so the next reader
@@ -3413,7 +3511,7 @@ impl Filesystem for DfsFilesystem {
                 flush_rt.spawn(async move {
                     if has_buffer {
                         debug!("release: read-only close for ino={} has buffered data — flushing", ino);
-                        if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
+                        if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
                         write_buffers.remove(&ino);
@@ -3715,7 +3813,7 @@ impl Filesystem for DfsFilesystem {
             // Flush the source file's write buffer to the server before renaming,
             // so the server has the current metadata for old_path.
             if write_buffers.contains_key(&old_ino) {
-                if let Err(e) = flush_handle.flush_buffer_async(old_ino, true).await {
+                if let Err(e) = flush_handle.flush_all_pipelined(old_ino).await {
                     error!("rename: flush failed for ino={}: {}", old_ino, e);
                     reply.error(libc::EIO);
                     return;
@@ -4065,7 +4163,7 @@ impl Filesystem for DfsFilesystem {
                 // O_SYNC / O_DSYNC: flush synchronously and wait for network ack.
                 let handle = self.flush_handle.clone();
                 let result = self.block_on(async move {
-                    handle.flush_buffer_async(ino, true).await
+                    handle.flush_all_pipelined(ino).await
                 });
                 match result {
                     Ok(_) => reply.ok(),
@@ -4078,7 +4176,7 @@ impl Filesystem for DfsFilesystem {
                 // causing the well-known nano close hang.
                 let handle = self.flush_handle.clone();
                 self.runtime.spawn(async move {
-                    if let Err(e) = handle.flush_buffer_async(ino, true).await {
+                    if let Err(e) = handle.flush_all_pipelined(ino).await {
                         error!("fsync background flush failed for inode {}: {}", ino, e);
                     }
                 });

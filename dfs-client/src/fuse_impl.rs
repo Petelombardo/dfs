@@ -2218,10 +2218,24 @@ impl Filesystem for DfsFilesystem {
                 }
             }
         } else if is_read_open {
-            // Live recording — expire the map so needs_refresh() triggers an async fetch
-            // on the first read, but don't block open() waiting for it.
-            if let Some(engine) = self.client.read_engines.engines.get(&ino) {
+            // Live recording — kick off a full chunk map fetch from chunk 0 in the
+            // background so backward seeks have the complete history available.
+            if let Some(meta) = self.metadata_cache.get(&ino) {
+                let file_id = meta.id;
+                let file_size = meta.size;
+                drop(meta);
+                let client = self.client.clone();
+                let engine = client.read_engines.get_or_create(ino);
                 engine.expire_chunk_map();
+                if engine.refresh_in_progress
+                    .compare_exchange(false, true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed).is_ok()
+                {
+                    self.runtime.spawn(async move {
+                        client.refresh_engine_flagged(&engine, file_id, file_size, 0).await;
+                    });
+                }
             }
         }
 

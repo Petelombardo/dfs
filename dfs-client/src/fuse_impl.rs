@@ -2187,40 +2187,37 @@ impl Filesystem for DfsFilesystem {
             .map(|m| is_sqlite_direct_io(&m.path))
             .unwrap_or(false);
 
+        // For read-only opens, fetch the full chunk map synchronously before returning
+        // the file handle. This guarantees the map covers the entire file from byte 0
+        // so any seek position works immediately without a second round-trip.
+        // Cost is one leader RPC (~5ms). Write opens skip this; they get the map via
+        // the write flush path.
+        let is_read_open = (flags & libc::O_ACCMODE) == libc::O_RDONLY;
+        if is_read_open {
+            if let Some(meta) = self.metadata_cache.get(&ino) {
+                let file_id = meta.id;
+                let file_size = meta.size;
+                drop(meta);
+                let client = self.client.clone();
+                let engine = client.read_engines.get_or_create(ino);
+                engine.expire_chunk_map();
+                if engine.refresh_in_progress
+                    .compare_exchange(false, true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed).is_ok()
+                {
+                    self.runtime.block_on(async move {
+                        client.refresh_engine_flagged(&engine, file_id, file_size, 0).await;
+                    });
+                }
+            }
+        }
+
         if is_sqlite {
-            // For SQLite files: Use direct I/O to bypass page cache
-            // This ensures lock consistency and prevents cache coherency issues
             info!("open: ino={} - SQLite database detected, using direct I/O", ino);
             reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
         } else {
-            // For regular files: Use page cache for better performance
             reply.opened(0, fuser::consts::FOPEN_KEEP_CACHE);
-        }
-
-        // Pre-warm the read engine so the first read() hits the chunk map immediately.
-        // Always expire the TTL on open so that read_file()'s needs_refresh() check
-        // triggers a fresh fetch — this catches files that finished recording since the
-        // engine was last populated, where the stale map is missing tail chunks.
-        if let Some(meta) = self.metadata_cache.get(&ino) {
-            let file_id = meta.id;
-            let file_size = meta.size;
-            drop(meta);
-            let client = self.client.clone();
-            let engine = client.read_engines.get_or_create(ino);
-            // Expire the TTL so the next read_file() call unconditionally refreshes.
-            engine.expire_chunk_map();
-            let is_read_open = (flags & libc::O_ACCMODE) == libc::O_RDONLY;
-            let needs_prefetch = is_read_open
-                || engine.known_size.load(std::sync::atomic::Ordering::Relaxed) == 0;
-            if needs_prefetch && engine.refresh_in_progress
-                .compare_exchange(false, true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed).is_ok()
-            {
-                self.runtime.spawn(async move {
-                    client.refresh_engine_flagged(&engine, file_id, file_size, 0).await;
-                });
-            }
         }
         info!("open: ino={} DONE — reply sent", ino);
     }

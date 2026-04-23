@@ -3024,6 +3024,11 @@ impl Server {
                             // Delete chunks from ALL online nodes — not just loc.nodes.
                             // The healer may have replicated to nodes not listed in loc.nodes;
                             // those copies cause corruption after delete+rewrite.
+                            //
+                            // Send all DeleteChunk RPCs concurrently — sequential sends for a
+                            // 381-chunk file × 4 nodes = 1,524 sequential awaits stalled the
+                            // entire cluster for ~110 seconds. Each chunk's remote sends are
+                            // fire-and-forget; the healer cleans up any stragglers.
                             info!("Deleting {} chunks from all nodes for file: {}", chunk_locations.len(), path_clone);
 
                             for loc in &chunk_locations {
@@ -3037,19 +3042,24 @@ impl Server {
                                 }
                                 let _ = metadata_store.delete_chunk_location(chunk_id);
 
-                                // Send DeleteChunk to every other online node
+                                // Fire-and-forget DeleteChunk to every other online node.
                                 for node in &nodes {
                                     if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                                         continue;
                                     }
-                                    let request = Request::DeleteChunk { chunk_id: *chunk_id };
-                                    if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
-                                        warn!("Failed to delete chunk {} from node {}: {}", chunk_id, node.id, e);
-                                    }
+                                    let client2 = client.clone();
+                                    let addr = node.addr;
+                                    let chunk_id_copy = *chunk_id;
+                                    tokio::spawn(async move {
+                                        let request = Request::DeleteChunk { chunk_id: chunk_id_copy };
+                                        if let Err(e) = client2.send_message(addr, Message::Request(request)).await {
+                                            warn!("Failed to delete chunk {} from node {}: {}", chunk_id_copy, addr, e);
+                                        }
+                                    });
                                 }
                             }
 
-                            info!("Chunk deletion complete for file: {}", path_clone);
+                            info!("Chunk deletion dispatched for file: {}", path_clone);
                         });
 
                         Response::Ok { data: None }

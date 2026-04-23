@@ -227,9 +227,9 @@ impl InodeWriteState {
 const PIPELINE_CHUNKS: usize = 2;
 
 /// Number of full chunk slots the writer may buffer ahead of the pipeline.
-/// With PIPELINE_CHUNKS=2 flushing and BUFFER_CHUNKS=8 in the buffer, the
+/// With PIPELINE_CHUNKS=2 flushing and BUFFER_CHUNKS=4 in the buffer, the
 /// writer is always filling the next slots while the current ones are in-flight.
-const BUFFER_CHUNKS: usize = 8;
+const BUFFER_CHUNKS: usize = 4;
 
 /// Cheaply-cloneable handle to the fields needed by flush_buffer_async.
 /// Extracted so fsync() can clone it and spawn a background flush task without
@@ -377,7 +377,19 @@ impl FlushHandle {
                 && slot_len < CHUNK_SIZE
                 && slot_len > existing_chunk_size
                 && gap_filled_prefix >= existing_chunk_size;
-            let is_overwrite = chunk_exists && slot_len < CHUNK_SIZE && slot_len <= existing_chunk_size;
+            // Only use PatchChunk for a genuine partial in-place edit: the slot is smaller
+            // than the existing chunk AND the file has more than one chunk (meaning this slot
+            // is truly patching part of a multi-chunk file).  For a single-chunk file being
+            // replaced with a shorter single-chunk file (e.g. cp small over large), do a
+            // fresh write — PatchChunk would leave the tail of the old chunk intact on the
+            // server, producing a file that reads back as the old (larger) size.
+            let existing_chunk_count = self.metadata_cache.get(&ino)
+                .map(|m| m.chunk_locations.len())
+                .unwrap_or(0);
+            let is_overwrite = chunk_exists
+                && slot_len < CHUNK_SIZE
+                && slot_len <= existing_chunk_size
+                && existing_chunk_count > 1;
             let needs_patch = is_overwrite || is_append_extend;
 
             if needs_patch {
@@ -837,7 +849,13 @@ impl FlushHandle {
             && slot_len < CHUNK_SIZE
             && slot_len > existing_chunk_size
             && gap_filled_prefix >= existing_chunk_size;
-        let is_overwrite = chunk_exists && slot_len < CHUNK_SIZE && slot_len <= existing_chunk_size;
+        let existing_chunk_count = self.metadata_cache.get(&ino)
+            .map(|m| m.chunk_locations.len())
+            .unwrap_or(0);
+        let is_overwrite = chunk_exists
+            && slot_len < CHUNK_SIZE
+            && slot_len <= existing_chunk_size
+            && existing_chunk_count > 1;
         let needs_patch = is_overwrite || is_append_extend;
 
         if needs_patch {
@@ -1933,6 +1951,7 @@ impl Filesystem for DfsFilesystem {
         // Track write-mode opens so flush() can skip the write buffer for read-only closes.
         // O_RDONLY == 0; any flag with the low two bits set (O_WRONLY=1, O_RDWR=2) is a write open.
         let is_write = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
+        let is_trunc = (flags & libc::O_TRUNC) != 0;
         if is_write {
             *self.write_open_counts.entry(ino).or_insert(0) += 1;
 
@@ -1947,7 +1966,14 @@ impl Filesystem for DfsFilesystem {
             // rebalancing since the last fetch. Without this, a write open on a long-lived
             // file (e.g. a multi-hour DVR recording) uses chunk locations from hours ago,
             // causing PatchChunk to target nodes that no longer hold the chunk.
-            {
+            // Skip for first-writer opens: the writer is about to replace file content, so
+            // stale chunk locations are irrelevant.  A background refresh that completes
+            // after the write session flushes will overwrite the freshly-committed metadata
+            // with old server data, causing the file to revert to its pre-write size.
+            // For subsequent writers on the same inode (write_open_count > 1), the metadata
+            // is already fresh from the first writer's open, so skip there too.
+            let is_first_writer = self.write_open_counts.get(&ino).map(|c| *c == 1).unwrap_or(true);
+            if !is_first_writer {
                 let path_opt = self.path_to_inode.read().unwrap()
                     .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
                 if let Some(path) = path_opt {
@@ -1975,13 +2001,26 @@ impl Filesystem for DfsFilesystem {
                 // discard any stale buffer left over from a previous session — e.g. after
                 // a client restart where release() never ran. Without this, the background
                 // flusher immediately flushes the stale data as a small first chunk.
-                let is_first_writer = self.write_open_counts.get(&ino).map(|c| *c == 1).unwrap_or(true);
                 if is_first_writer {
+                    // For O_TRUNC opens, drain any background flush tasks from the
+                    // previous write session before discarding the buffer.  Without this,
+                    // a still-running flush_one_chunk task completes after open() returns
+                    // and re-inserts stale chunk locations into the metadata, making the
+                    // new (smaller) file appear as the old (larger) one.
+                    if is_trunc {
+                        let in_flight_map = self.flush_in_flight.read().unwrap().as_ref().cloned();
+                        if let Some(map) = in_flight_map {
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            self.runtime.block_on(async {
+                                while map.get(&ino).map(|v| *v).unwrap_or(0) > 0 {
+                                    if std::time::Instant::now() >= deadline { break; }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                                }
+                            });
+                        }
+                    }
                     self.write_buffers.remove(&ino);
                     // Clear any pending truncate flag — new write session starts clean.
-                    // The flag was set by setattr(size=0) to block the old session's
-                    // in-flight flush; now that open() has started a fresh session, allow
-                    // this session's flushes through.
                     self.truncated_inodes.remove(&ino);
                 }
 

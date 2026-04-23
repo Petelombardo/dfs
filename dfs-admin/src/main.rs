@@ -97,8 +97,8 @@ enum FileCommands {
         /// File path
         path: String,
     },
-    /// Show chunk replica locations
-    Replicas {
+    /// Find which file(s) own a given chunk ID
+    FindChunk {
         /// Chunk ID (hex string)
         chunk_id: String,
     },
@@ -662,12 +662,32 @@ async fn handle_file_command(
                 }
             }
         }
-        FileCommands::Replicas { chunk_id } => {
-            anyhow::bail!(
-                "The 'replicas' command has been removed. \
-                 Use 'file info <path>' to see chunk locations for a file."
-            );
-            let _ = chunk_id; // suppress unused warning
+        FileCommands::FindChunk { chunk_id } => {
+            let response = send_request(cluster_addrs[0], Request::ListAllFiles).await?;
+            let files = match response {
+                Response::FileList { files, .. } => files,
+                _ => anyhow::bail!("Unexpected response"),
+            };
+
+            let needle = chunk_id.to_lowercase();
+            let mut found = false;
+            for file in &files {
+                for (idx, loc) in file.chunk_locations.iter().enumerate() {
+                    if loc.chunk_id.to_string().to_lowercase().contains(&needle) {
+                        found = true;
+                        println!("File:    {}", file.path);
+                        println!("File ID: {}", file.id);
+                        println!("Chunk:   index={} offset={} nodes={:?}",
+                            idx,
+                            idx as u64 * 4 * 1024 * 1024,
+                            loc.nodes);
+                        println!();
+                    }
+                }
+            }
+            if !found {
+                println!("Chunk {} not found in any file's metadata.", chunk_id);
+            }
         }
         FileCommands::List => {
             let response = send_request(cluster_addrs[0], Request::ListAllFiles).await?;

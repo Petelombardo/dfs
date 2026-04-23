@@ -2187,13 +2187,16 @@ impl Filesystem for DfsFilesystem {
             .map(|m| is_sqlite_direct_io(&m.path))
             .unwrap_or(false);
 
-        // For read-only opens, fetch the full chunk map synchronously before returning
-        // the file handle. This guarantees the map covers the entire file from byte 0
-        // so any seek position works immediately without a second round-trip.
-        // Cost is one leader RPC (~5ms). Write opens skip this; they get the map via
-        // the write flush path.
+        // For read-only opens of finished files, fetch the full chunk map synchronously
+        // before returning the file handle. This guarantees the map covers the entire
+        // file from byte 0 so any seek position works immediately without a second
+        // round-trip. Cost is one leader RPC (~5ms).
+        // Live recordings (has an active writer) use the async path — their chunk map
+        // is changing continuously and blocking open() on them would deadlock with
+        // in-flight write tasks on the same runtime.
         let is_read_open = (flags & libc::O_ACCMODE) == libc::O_RDONLY;
-        if is_read_open {
+        let has_active_writer = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
+        if is_read_open && !has_active_writer {
             if let Some(meta) = self.metadata_cache.get(&ino) {
                 let file_id = meta.id;
                 let file_size = meta.size;
@@ -2206,10 +2209,19 @@ impl Filesystem for DfsFilesystem {
                         std::sync::atomic::Ordering::AcqRel,
                         std::sync::atomic::Ordering::Relaxed).is_ok()
                 {
-                    self.runtime.block_on(async move {
+                    let handle = self.runtime.spawn(async move {
                         client.refresh_engine_flagged(&engine, file_id, file_size, 0).await;
                     });
+                    tokio::task::block_in_place(|| {
+                        self.runtime.block_on(handle).ok();
+                    });
                 }
+            }
+        } else if is_read_open {
+            // Live recording — expire the map so needs_refresh() triggers an async fetch
+            // on the first read, but don't block open() waiting for it.
+            if let Some(engine) = self.client.read_engines.engines.get(&ino) {
+                engine.expire_chunk_map();
             }
         }
 

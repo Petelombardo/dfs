@@ -549,10 +549,10 @@ impl FlushHandle {
         if !pre_seeded_ids.is_empty() {
             let stub_locations: Vec<ChunkLocation> = pre_seeded_ids.iter()
                 .zip(slots_to_write.iter())
-                .map(|((_, cid), (chunk_idx, slot_data, file_offset))| ChunkLocation {
+                .map(|((_, cid), (_chunk_idx, _slot_data, file_offset))| ChunkLocation {
                     chunk_id: *cid,
                     nodes: Vec::new(),
-                    size: slot_data.len(),
+                    size: CHUNK_SIZE, // full extent so chunk_offsets covers the whole 4MB range
                     checksum: [0u8; 32],
                     file_offset: Some(*file_offset),
                     written_at: None,
@@ -897,7 +897,7 @@ impl FlushHandle {
                         Ok(new_location) => {
                             if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
                                 if let Some(loc) = meta_entry.chunk_locations.get_mut(chunk_idx_usize) {
-                                    *loc = new_location;
+                                    *loc = new_location.clone();
                                 }
                                 if let Some(new_size) = meta_entry.chunk_locations.iter()
                                     .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
@@ -906,6 +906,14 @@ impl FlushHandle {
                                     meta_entry.size = new_size;
                                 }
                             }
+                            // Update read engine with the new chunk ID and evict any pre-seed
+                            // cache entry. PatchChunk creates a new server-side chunk with a
+                            // different hash than the client's pre-seeded guess, so the engine
+                            // and cache must be updated to prevent stale reads.
+                            let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0);
+                            self.client.feed_chunk_locations_to_read_engine(
+                                ino, &[new_location], current_size,
+                            ).await;
                             // Mark slot as server-committed but keep data alive for readers
                             // until metadata is synced (flush_all_pipelined cleans up after sync).
                             if let Some(state_arc) = self.write_buffers.get(&ino) {
@@ -960,7 +968,12 @@ impl FlushHandle {
         let stub = dfs_common::ChunkLocation {
             chunk_id: cid,
             nodes: Vec::new(),
-            size: slot_data.len(),
+            // Use CHUNK_SIZE so the engine slot covers the full 4MB range even for a
+            // partial (idle-flushed) slot.  Reads beyond slot_data.len() miss the cache
+            // and fall through to the server or write buffer — correct live-write behavior.
+            // Using slot_data.len() here left a hole: chunk_offsets[1] = (4MB, 2MB), so
+            // reads at offset ≥ 6MB found no covering chunk and returned zeros.
+            size: CHUNK_SIZE,
             checksum: [0u8; 32],
             file_offset: Some(file_offset),
             written_at: None,
@@ -2198,6 +2211,24 @@ impl Filesystem for DfsFilesystem {
         let has_active_writer = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
         let has_inflight_flush = self.flush_in_flight.read().unwrap()
             .as_ref().map(|m| m.get(&ino).map(|v| *v > 0).unwrap_or(false)).unwrap_or(false);
+        // write_buffers entry is removed by release()'s flush task only after flush_all_pipelined
+        // and expire_chunk_map complete.  If present, wait briefly for the release flush to land
+        // so the sync refresh below fetches the final committed metadata, not the pre-write version.
+        // flush_runtime is independent of main runtime so block_on here does not deadlock.
+        // Cap at 2s — if flush takes longer (large file, slow nodes) fall through; read_file's
+        // sync refresh on an empty/stale chunk map will retry from the leader on first read.
+        if is_read_open && !has_active_writer && self.write_buffers.contains_key(&ino) {
+            let write_buffers = self.write_buffers.clone();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            tokio::task::block_in_place(|| {
+                self.runtime.block_on(async {
+                    while write_buffers.contains_key(&ino) {
+                        if std::time::Instant::now() >= deadline { break; }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                    }
+                });
+            });
+        }
         if is_read_open && !has_active_writer && !has_inflight_flush {
             if let Some(meta) = self.metadata_cache.get(&ino) {
                 let file_id = meta.id;
@@ -2431,7 +2462,12 @@ impl Filesystem for DfsFilesystem {
                             .unwrap_or(0);
                         file_size.max(buffered_end)
                     } else {
-                        file_size // flush in progress; use server-committed size
+                        // try_lock failed — flush runtime holds the mutex.
+                        // Use size_high_water so reads concurrent with a flush don't see
+                        // file_size=0 (metadata not yet committed) and fall into the EOF
+                        // refresh path, which returns 0 bytes from the leader.
+                        let hwm = size_high_water.get(&ino).map(|v| *v).unwrap_or(0);
+                        file_size.max(hwm)
                     }
                 } else {
                     file_size
@@ -2496,12 +2532,21 @@ impl Filesystem for DfsFilesystem {
                             }
                         }
 
-                        if !buf_data.is_empty() {
-                            debug!("FUSE read from write buffer: ino={}, {} bytes", ino, buf_data.len());
+                        // Only serve from the write buffer if it satisfies the full request
+                        // OR we're at the live write edge (nothing on the server either).
+                        // A partial buffer hit that stops at a chunk boundary (next slot not
+                        // yet buffered but already committed to the server) causes a short read
+                        // — the caller's dd/pv interprets that as EOF and skips ahead, creating
+                        // a gap in the output.  Fall through to the network path instead; it
+                        // will assemble the full reply from the chunk cache + leader.
+                        let buf_full = buf_data.len() == size;
+                        if !buf_data.is_empty() && (buf_full || hit_unbuffered_write_edge) {
+                            debug!("FUSE read from write buffer: ino={}, {} bytes (full={})",
+                                   ino, buf_data.len(), buf_full);
                             reply.data(&buf_data);
                             return;
                         }
-                        if hit_unbuffered_write_edge {
+                        if hit_unbuffered_write_edge && buf_data.is_empty() {
                             // Read is at the live write edge but data isn't buffered yet.
                             // Return empty (short read) — the player will retry shortly.
                             // Going to the network here triggers a leader refresh that returns
@@ -3468,7 +3513,13 @@ impl Filesystem for DfsFilesystem {
             if remove { self.open_counts.remove(&ino); }
             last
         };
-        if is_last_open {
+        // Keep the read engine alive while a writer is still active — it holds pre-seeded
+        // chunk locations for in-flight chunks.  Destroying it when the last reader closes
+        // (but the writer is still open) drops those entries; the next reader's open() creates
+        // a fresh engine from the leader which may only know about committed chunks, causing
+        // holes for the range currently being written.
+        let has_active_writer = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
+        if is_last_open && !has_active_writer {
             self.client.read_engines.engines.remove(&ino);
         }
 

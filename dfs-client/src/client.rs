@@ -1564,13 +1564,23 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
         let engine = self.read_engines.get_or_create(inode);
 
+        // Derive from_chunk from the file_offset of the first location so that a single
+        // chunk N stub is placed at slot N, not slot 0.  Callers from the flush path pass
+        // one location at a time (file_offset = chunk_idx * CHUNK_SIZE); using from_chunk=0
+        // was overwriting lower-indexed committed chunks with the new stub.
+        const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
+        let from_chunk = locations.first()
+            .and_then(|l| l.file_offset)
+            .map(|o| (o / CHUNK_SIZE_U64) as u32)
+            .unwrap_or(0);
+        let total_chunks = from_chunk + locations.len() as u32;
+
         // Snapshot old chunk IDs for the slots we're about to update so we can evict
         // them from the chunk cache. Without this, a reader near the write edge can get
-        // a cache hit on the old (shorter) chunk ID and return stale partial data — the
-        // classic read-near-write-edge artifact.
+        // a cache hit on the old (shorter) chunk ID and return stale partial data.
         let old_chunk_ids: Vec<dfs_common::ChunkId> = {
             let (old_map, _, _) = engine.snapshot().await;
-            let base = 0usize;
+            let base = from_chunk as usize;
             (0..locations.len())
                 .filter_map(|i| old_map.get(base + i).map(|l| l.chunk_id))
                 .collect()
@@ -1580,11 +1590,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             let addr_map = self.addr_to_node_id.read().await;
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
         };
-        // Use from_chunk=0 and total=locations.len() to do a full merge.
         engine.update_chunk_map_window(
             locations.to_vec(),
-            0,
-            locations.len() as u32,
+            from_chunk,
+            total_chunks,
             Arc::new(nim),
             file_size,
         ).await;

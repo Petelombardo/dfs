@@ -324,6 +324,82 @@ wait $WRITER_PID 2>/dev/null || true
 $READ_OK && check "T17 concurrent read while writing (no deadlock)" PASS \
          || check "T17 concurrent read while writing (DEADLOCK or timeout)" FAIL
 
+# ── Test 18: DVR concurrent-read integrity ────────────────────────────────────
+# Write a 20MB file at ~4MB/s while concurrently reading from offset 0.
+# Verifies: no short reads that skip data, read copy matches written data.
+echo "=== T18: DVR concurrent-read integrity ==="
+WRITE_SIZE_MB=20
+CHUNK_SIZE_BYTES=$((4 * 1024 * 1024))
+T18_SRC="$T/t18_src.bin"
+T18_DST="$MOUNT/t18_dvr.bin"
+T18_REF="$T/t18_ref.bin"
+T18_COPY="$T/t18_copy.bin"
+
+# Generate source data locally
+dd if=/dev/urandom of="$T18_SRC" bs=1M count="$WRITE_SIZE_MB" 2>/dev/null
+cp "$T18_SRC" "$T18_REF"
+
+# Writer: copy source to DFS using dd in 128KB blocks at ~4MB/s
+(
+    dd if="$T18_SRC" of="$T18_DST" bs=131072 2>/dev/null
+) &
+T18_WRITER=$!
+
+# Reader: start after 1s, read sequentially tracking actual bytes received
+sleep 1
+(
+    BYTES_READ=0
+    TOTAL=$(( WRITE_SIZE_MB * 1024 * 1024 ))
+    DEADLINE=$(( $(date +%s) + 30 ))
+    while [ "$BYTES_READ" -lt "$TOTAL" ] && [ "$(date +%s)" -lt "$DEADLINE" ]; do
+        DFS_SIZE=$(stat -c%s "$T18_DST" 2>/dev/null || echo 0)
+        AVAIL=$(( DFS_SIZE - BYTES_READ ))
+        if [ "$AVAIL" -ge 4096 ]; then
+            PAGES=$(( AVAIL / 4096 ))
+            BEFORE=$(stat -c%s "$T18_COPY" 2>/dev/null || echo 0)
+            dd if="$T18_DST" bs=4096 skip=$(( BYTES_READ / 4096 )) count="$PAGES" \
+               2>/dev/null >> "$T18_COPY"
+            AFTER=$(stat -c%s "$T18_COPY" 2>/dev/null || echo 0)
+            BYTES_READ=$(( BYTES_READ + AFTER - BEFORE ))
+        else
+            sleep 0.05
+        fi
+    done
+    # drain tail after writer
+    sleep 0.5
+    DFS_SIZE=$(stat -c%s "$T18_DST" 2>/dev/null || echo 0)
+    REMAINING=$(( DFS_SIZE - BYTES_READ ))
+    if [ "$REMAINING" -gt 0 ]; then
+        dd if="$T18_DST" bs=4096 skip=$(( BYTES_READ / 4096 )) \
+           count=$(( (REMAINING + 4095) / 4096 )) 2>/dev/null >> "$T18_COPY"
+    fi
+) &
+T18_READER=$!
+
+wait "$T18_WRITER"
+wait "$T18_READER"
+
+# Compare first N complete chunks of the reference vs read copy
+REF_SIZE=$(stat -c%s "$T18_REF" 2>/dev/null || echo 0)
+COPY_SIZE=$(stat -c%s "$T18_COPY" 2>/dev/null || echo 0)
+CMP_BYTES=$(( (COPY_SIZE / CHUNK_SIZE_BYTES) * CHUNK_SIZE_BYTES ))
+
+if [ "$CMP_BYTES" -eq 0 ]; then
+    check "T18 DVR concurrent-read (read copy empty)" FAIL
+else
+    T18_MD5_REF=$(dd if="$T18_REF"  bs="$CHUNK_SIZE_BYTES" count=$(( CMP_BYTES / CHUNK_SIZE_BYTES )) 2>/dev/null | md5sum | cut -d' ' -f1)
+    T18_MD5_CPY=$(dd if="$T18_COPY" bs="$CHUNK_SIZE_BYTES" count=$(( CMP_BYTES / CHUNK_SIZE_BYTES )) 2>/dev/null | md5sum | cut -d' ' -f1)
+    # size check: copy should be within one chunk of reference
+    SIZE_OK=false
+    [ "$COPY_SIZE" -ge $(( REF_SIZE - CHUNK_SIZE_BYTES )) ] && SIZE_OK=true
+    if [ "$T18_MD5_REF" = "$T18_MD5_CPY" ] && $SIZE_OK; then
+        check "T18 DVR concurrent-read integrity" PASS
+    else
+        check "T18 DVR concurrent-read integrity (ref_size=$REF_SIZE copy_size=$COPY_SIZE cmp_bytes=$CMP_BYTES)" FAIL
+    fi
+fi
+rm -f "$T18_DST"
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

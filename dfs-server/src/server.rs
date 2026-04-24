@@ -868,7 +868,7 @@ impl Server {
             }
             Request::ListDirectory { path } => self.handle_list_directory(path).await,
             Request::WriteFile { data } => self.handle_write_file(data).await,
-            Request::WriteFileLocalOnly { data, .. } => self.handle_write_file_local_only(data).await,
+            Request::WriteFileLocalOnly { data, file_offset } => self.handle_write_file_local_only(data, file_offset).await,
             Request::PatchChunk { chunk_id, chunk_file_offset, intra_offset, data } => {
                 self.handle_patch_chunk(chunk_id, chunk_file_offset, intra_offset, data).await
             }
@@ -1915,6 +1915,59 @@ impl Server {
         Ok(chunk_ids_with_sizes)
     }
 
+    pub async fn write_data_local_only_at(&self, data: &[u8], file_offset: u64) -> Result<Vec<(ChunkId, u64)>> {
+        let total_start = std::time::Instant::now();
+        info!("Writing {} bytes locally (no replication) at offset {}", data.len(), file_offset);
+
+        let chunks = self.chunker.chunk_data_at(data, file_offset);
+        info!("Chunked into {} chunks (local write only)", chunks.len());
+
+        let local_node_id = self.cluster.local_node_id();
+        let mut chunk_tasks = Vec::new();
+
+        for (chunk_id, chunk_data) in chunks {
+            let storage = self.storage.clone();
+            let metadata = self.metadata.clone();
+
+            let task = tokio::spawn(async move {
+                storage.write_chunk(&chunk_id, &chunk_data)
+                    .context(format!("Failed to write chunk {} locally", chunk_id))?;
+
+                let location = ChunkLocation {
+                    chunk_id,
+                    nodes: vec![local_node_id],
+                    size: chunk_data.len(),
+                    checksum: chunk_id.hash,
+                    file_offset: None,
+                    written_at: None,
+                };
+
+                metadata.put_chunk_location(&location)
+                    .context("Failed to store chunk location")?;
+
+                Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
+            });
+
+            chunk_tasks.push(task);
+        }
+
+        let mut chunk_ids_with_sizes = Vec::new();
+        for task in chunk_tasks {
+            match task.await {
+                Ok(Ok(chunk_id_with_size)) => chunk_ids_with_sizes.push(chunk_id_with_size),
+                Ok(Err(e)) => return Err(e),
+                Err(e) => anyhow::bail!("Chunk task panicked: {}", e),
+            }
+        }
+
+        let total_time = total_start.elapsed();
+        let throughput = (data.len() as f64 / 1024.0 / 1024.0) / total_time.as_secs_f64();
+        info!("Local write complete: {} bytes in {:?} ({:.2} MB/s) - {} chunks",
+              data.len(), total_time, throughput, chunk_ids_with_sizes.len());
+
+        Ok(chunk_ids_with_sizes)
+    }
+
     /// Read data from the cluster by chunk IDs
     pub async fn read_data(&self, chunk_ids: &[ChunkId]) -> Result<Vec<u8>> {
         info!("Reading {} chunks from cluster", chunk_ids.len());
@@ -2827,11 +2880,11 @@ impl Server {
 
     /// Handle write file request (local only, no replication)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
-    async fn handle_write_file_local_only(&self, data: Vec<u8>) -> Response {
-        debug!("Handling write file local only: {} bytes", data.len());
+    async fn handle_write_file_local_only(&self, data: Vec<u8>, file_offset: u64) -> Response {
+        debug!("Handling write file local only: {} bytes at offset {}", data.len(), file_offset);
 
         let local_node_id = self.cluster.local_node_id();
-        match self.write_data_local_only(&data).await {
+        match self.write_data_local_only_at(&data, file_offset).await {
             Ok(chunk_ids_with_sizes) => {
                 let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
                 let chunk_sizes: Vec<u64> = chunk_ids_with_sizes.iter().map(|(_, size)| *size).collect();
@@ -2939,10 +2992,13 @@ impl Server {
             };
         }
 
-        // Unlink the old chunk file — it's been superseded by the renamed new file.
-        if let Err(e) = fs::remove_file(&old_path) {
-            // Non-fatal: orphan GC will catch it.
-            warn!("PatchChunk: failed to remove old chunk file {}: {}", chunk_id, e);
+        // Unlink the old chunk file only if the hash changed — if old == new the rename
+        // above was a no-op (same path) and removing it would delete the chunk we just wrote.
+        if old_path != new_path {
+            if let Err(e) = fs::remove_file(&old_path) {
+                // Non-fatal: orphan GC will catch it.
+                warn!("PatchChunk: failed to remove old chunk file {}: {}", chunk_id, e);
+            }
         }
 
         info!("PatchChunk: {} -> {} ({} bytes patched at intra_offset={})", chunk_id, new_chunk_id, patch_data.len(), intra_offset);

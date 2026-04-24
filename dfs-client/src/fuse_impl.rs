@@ -224,9 +224,13 @@ impl InodeWriteState {
             .collect()
     }
 
-    /// All dirty slot indices, sorted ascending (for ordered flush on fsync/release)
+    /// All slot indices that still need flushing (server_prefix < data.len()), sorted ascending.
+    /// Used by fsync/release to flush everything including partial tail slots.
     fn all_slot_indices(&self) -> Vec<u64> {
-        let mut indices: Vec<u64> = self.slots.keys().copied().collect();
+        let mut indices: Vec<u64> = self.slots.iter()
+            .filter(|(_, s)| s.server_prefix < s.data.len())
+            .map(|(idx, _)| *idx)
+            .collect();
         indices.sort_unstable();
         indices
     }
@@ -558,7 +562,7 @@ impl FlushHandle {
         let mut first_err: Option<anyhow::Error> = None;
         let mut failed_chunk_indices: Vec<usize> = Vec::new();
 
-        for (join_result, (chunk_idx, _, _)) in results.into_iter().zip(slots_to_write.iter()) {
+        for (join_result, (chunk_idx, slot_data_snap, _)) in results.into_iter().zip(slots_to_write.iter()) {
             match join_result {
                 Ok(Ok((_, locations_opt))) => {
                     // Mark slot as fully committed to the server but keep the data
@@ -566,10 +570,12 @@ impl FlushHandle {
                     // during the window between chunk flush and metadata commit.
                     // Slots are removed in flush_all_pipelined after metadata_sync confirms
                     // the server has the full chunk map — closing the read gap.
+                    // Use the snapshot size, not slot.data.len() — the slot may have grown
+                    // while the write was in flight.
+                    let flushed_len = slot_data_snap.len();
                     if let Some(state_lock) = self.write_buffers.get(&ino) {
                         let mut state = state_lock.lock().await;
                         if let Some(slot) = state.slots.get_mut(chunk_idx) {
-                            let flushed_len = slot.data.len();
                             slot.server_prefix = flushed_len;
                             state.flushed_sizes.insert(*chunk_idx, flushed_len);
                             // Decrement global counter now — these bytes are on the server
@@ -930,10 +936,16 @@ impl FlushHandle {
             Ok((_, _, Some(locations))) => {
                 // Mark slot as server-committed but keep data alive for readers
                 // until metadata is synced (flush_all_pipelined cleans up after sync).
+                // Use slot_data.len() (snapshot at flush time), NOT slot.data.len()
+                // (current — may be larger if the writer extended the slot while the
+                // network write was in flight). Setting server_prefix to the current
+                // size would tell the next flush that bytes never actually sent are
+                // already on the server, causing is_append_extend to send only the
+                // tail and creating a gap in the stored chunk.
+                let flushed_len = slot_data.len();
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     let mut state = state_arc.lock().await;
                     if let Some(slot) = state.slots.get_mut(&chunk_idx) {
-                        let flushed_len = slot.data.len();
                         slot.server_prefix = flushed_len;
                         state.flushed_sizes.insert(chunk_idx, flushed_len);
                         self.global_buffered_bytes.fetch_sub(

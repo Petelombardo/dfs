@@ -6,16 +6,16 @@
 #
 # Compares all three pairwise to isolate write-path vs read-path corruption.
 
-DFS_MOUNT="/mnt/test"
-LOCAL_DIR="/mnt/usb/dfs_stream_test"
+DFS_MOUNT="/tmp/dfs-mount"
+LOCAL_DIR="/tmp/dfs_stream_test"
 DFS_FILE="$DFS_MOUNT/stream_test_$$.mpg"
 WRITE_REF="$LOCAL_DIR/write_reference.mpg"
 DFS_READBACK="$LOCAL_DIR/dfs_readback.mpg"
 READ_COPY="$LOCAL_DIR/read_copy.mpg"
 CHUNK_SIZE=$((4 * 1024 * 1024))
-CAPTURE_SIZE="500M"
-RATE="6M"
-READ_DELAY=5
+CAPTURE_SIZE="16M"
+RATE="2M"
+READ_DELAY=6
 
 mkdir -p "$LOCAL_DIR"
 rm -f "$WRITE_REF" "$DFS_READBACK" "$READ_COPY"

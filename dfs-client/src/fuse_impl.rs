@@ -65,6 +65,8 @@ impl Drop for WriteTaskGuard {
 /// A single 4MB-aligned write buffer slot for one chunk.
 /// Writes land in the slot at `file_offset % CHUNK_SIZE`.
 /// The slot is flushed when it fills (exactly CHUNK_SIZE) or on fsync/release/timer.
+/// Once flushed successfully, the slot is removed immediately — reads for committed
+/// chunks go to the network, which holds the authoritative data.
 #[derive(Clone)]
 struct ChunkSlot {
     /// Buffered bytes for this chunk; capacity is at most CHUNK_SIZE
@@ -75,13 +77,9 @@ struct ChunkSlot {
     /// by the application. Used to distinguish a real all-zero write from a synthetic gap
     /// prefix — prevents PatchChunk from overwriting real server data with our zeros.
     gap_filled_prefix: usize,
-    /// How many bytes were already flushed to the server for this chunk before this slot
-    /// was created (i.e. the slot was recreated after a flush). Reads within 0..server_prefix
-    /// should be served from the server, not from our zero-filled slot data.
-    server_prefix: usize,
     /// Set to true by flush_one_chunk when it claims this slot for network I/O.
     /// Prevents a second concurrent flush task from picking the same slot.
-    /// Cleared on success (slot removed) or failure (so it can be retried).
+    /// Cleared on failure (so it can be retried); on success the slot is removed.
     flushing: bool,
 }
 
@@ -91,17 +89,6 @@ impl ChunkSlot {
             data: Vec::with_capacity(CHUNK_SIZE),
             last_modified: SystemTime::now(),
             gap_filled_prefix: 0,
-            server_prefix: 0,
-            flushing: false,
-        }
-    }
-
-    fn new_post_flush(server_bytes: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(CHUNK_SIZE),
-            last_modified: SystemTime::now(),
-            gap_filled_prefix: 0,
-            server_prefix: server_bytes,
             flushing: false,
         }
     }
@@ -121,10 +108,9 @@ impl ChunkSlot {
 struct InodeWriteState {
     /// Dirty chunk slots: chunk_index -> buffered bytes
     slots: HashMap<u64, ChunkSlot>,
-    /// Tracks how many bytes were flushed for each chunk index. When a slot is removed after
-    /// a successful flush and later re-created (e.g. DVR appending into a partially-flushed
-    /// chunk), write_at uses this to set server_prefix so the read path can fall through to
-    /// the network for bytes already on the server.
+    /// Tracks how many bytes were flushed for each chunk index. Used by the PatchChunk
+    /// logic to detect append-extend: if a slot was partially flushed, flushed_sizes[idx]
+    /// tells us how many bytes the server already has for that chunk.
     flushed_sizes: HashMap<u64, usize>,
     /// If true, every fsync() must flush immediately (O_SYNC / O_DSYNC was set on open).
     /// If false, fsyncs within the coalescing window are absorbed (DVR / streaming mode).
@@ -163,7 +149,17 @@ impl InodeWriteState {
             let idx = Self::chunk_index(cur_offset);
             let intra = Self::intra_offset(cur_offset);
             let flushed = self.flushed_sizes.get(&idx).copied().unwrap_or(0);
-            let slot = self.slots.entry(idx).or_insert_with(|| ChunkSlot::new_post_flush(flushed));
+            let slot = self.slots.entry(idx).or_insert_with(|| {
+                let mut s = ChunkSlot::new();
+                // Gap-fill bytes already on the server so the slot accurately represents
+                // the full chunk state. Without this, is_append_extend PatchChunk would
+                // send only the tail, missing the first flushed_sizes bytes.
+                if flushed > 0 {
+                    s.data.resize(flushed, 0u8);
+                    s.gap_filled_prefix = flushed;
+                }
+                s
+            });
 
             // Grow slot to cover intra_offset (may need zero-fill for sparse-within-chunk)
             if slot.data.len() < intra {
@@ -205,30 +201,21 @@ impl InodeWriteState {
 
     /// How many dirty bytes are buffered across all slots
     fn buffered_bytes(&self) -> usize {
-        // Only count bytes that haven't been committed to the server yet.
-        // Slots kept alive after flush (server_prefix == data.len()) don't
-        // consume write bandwidth and must not block the backpressure gate.
-        self.slots.values()
-            .map(|s| s.data.len().saturating_sub(s.server_prefix))
-            .sum()
+        self.slots.values().map(|s| s.data.len()).sum()
     }
 
-    /// Slots that are full, not yet claimed by a flush task, and not already
-    /// fully committed to the server (server_prefix < data.len()).
-    /// Slots with server_prefix == data.len() are kept alive for concurrent
-    /// readers but must not be re-flushed — they are already on the server.
+    /// Slots that are full and not yet claimed by a flush task.
     fn full_slot_indices(&self) -> Vec<u64> {
         self.slots.iter()
-            .filter(|(_, s)| s.is_full() && !s.flushing && s.server_prefix < s.data.len())
+            .filter(|(_, s)| s.is_full() && !s.flushing)
             .map(|(idx, _)| *idx)
             .collect()
     }
 
-    /// All slot indices that still need flushing (server_prefix < data.len()), sorted ascending.
-    /// Used by fsync/release to flush everything including partial tail slots.
+    /// All slot indices sorted ascending. Used by fsync/release.
     fn all_slot_indices(&self) -> Vec<u64> {
         let mut indices: Vec<u64> = self.slots.iter()
-            .filter(|(_, s)| s.server_prefix < s.data.len())
+            .filter(|(_, s)| !s.flushing)
             .map(|(idx, _)| *idx)
             .collect();
         indices.sort_unstable();
@@ -411,8 +398,8 @@ impl FlushHandle {
                     (existing_chunk_size, slot_data[existing_chunk_size..].to_vec())
                 } else {
                     // In-place overwrite: skip any synthetic zero-fill prefix (gap_filled_prefix
-                    // is pre-seeded to server_prefix in new_post_flush, meaning bytes 0..gap are
-                    // zeros we never actually wrote). Only send the real app-written bytes.
+                    // marks bytes that were zero-filled, not written by the app). Only send
+                    // the real app-written bytes.
                     let real_start = gap_filled_prefix;
                     (real_start, slot_data[real_start..].to_vec())
                 };
@@ -569,22 +556,16 @@ impl FlushHandle {
                     // in memory so concurrent readers can still serve from the buffer
                     // during the window between chunk flush and metadata commit.
                     // Slots are removed in flush_all_pipelined after metadata_sync confirms
-                    // the server has the full chunk map — closing the read gap.
-                    // Use the snapshot size, not slot.data.len() — the slot may have grown
-                    // while the write was in flight.
+                    // Chunk is on the server — remove slot immediately so reads go to network.
                     let flushed_len = slot_data_snap.len();
                     if let Some(state_lock) = self.write_buffers.get(&ino) {
                         let mut state = state_lock.lock().await;
-                        if let Some(slot) = state.slots.get_mut(chunk_idx) {
-                            slot.server_prefix = flushed_len;
-                            state.flushed_sizes.insert(*chunk_idx, flushed_len);
-                            // Decrement global counter now — these bytes are on the server
-                            // and no longer count against backpressure.
-                            self.global_buffered_bytes.fetch_sub(
-                                flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
+                        state.flushed_sizes.insert(*chunk_idx, flushed_len);
+                        state.slots.remove(chunk_idx);
+                        self.global_buffered_bytes.fetch_sub(
+                            flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     if let Some(locations) = locations_opt {
                         all_locations.extend(locations);
@@ -688,17 +669,6 @@ impl FlushHandle {
             }
         }
 
-        // Feed freshly-written chunk locations into the read engine synchronously so that
-        // reads issued immediately after a write (e.g. cat after cp) see the chunk map.
-        // flush_buffer_async runs on the flush runtime so awaiting here is safe.
-        if !all_locations.is_empty() {
-            let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0);
-            let all_locs = self.metadata_cache.get(&ino)
-                .map(|m| m.chunk_locations.clone())
-                .unwrap_or_default();
-            self.client.feed_chunk_locations_to_read_engine(ino, &all_locs, current_size).await;
-        }
-
         let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
         if let Some(meta) = meta_to_persist {
             // Update the parent directory cache with our current metadata so readdir
@@ -724,11 +694,17 @@ impl FlushHandle {
             }
 
             if force {
-                // release/fsync: flush metadata synchronously so new chunk IDs survive restart.
+                // release/fsync: commit metadata to leader, THEN update read engine.
+                // Ordering matters: readers must not see chunk IDs before the leader
+                // has them — otherwise a leader refresh overwrites our engine update
+                // with stale data and readers get the wrong chunks.
                 self.client.flush_metadata_sync(&meta).await;
-                // Record the update time so getattr returns TTL=0 for the post-close window
-                // (O_APPEND openers need the current size before their open() call).
                 self.last_metadata_update.insert(ino, std::time::Instant::now());
+                // Now the leader has the metadata — safe to populate the read engine.
+                let current_size = meta.size;
+                self.client.feed_chunk_locations_to_read_engine(
+                    ino, &meta.chunk_locations, current_size,
+                ).await;
             } else {
                 // Background tick: push directly into the queue (no back-pressure wait).
                 // enqueue_metadata() may block waiting to rescue a stalled queue entry,
@@ -766,7 +742,7 @@ impl FlushHandle {
 
             // Full slots first (lowest index, not already claimed, not already on server)
             let mut full: Vec<u64> = state.slots.iter()
-                .filter(|(_, s)| s.is_full() && !s.flushing && s.server_prefix < s.data.len())
+                .filter(|(_, s)| s.is_full() && !s.flushing)
                 .map(|(idx, _)| *idx)
                 .collect();
             full.sort_unstable();
@@ -774,9 +750,9 @@ impl FlushHandle {
             let idx = if let Some(i) = full.into_iter().next() {
                 i
             } else {
-                // No full unclaimed slot — try the oldest idle partial slot not yet on server.
+                // No full unclaimed slot — try the oldest idle partial slot.
                 let mut idle: Vec<(u64, SystemTime)> = state.slots.iter()
-                    .filter(|(_, s)| s.is_idle() && !s.data.is_empty() && !s.flushing && s.server_prefix < s.data.len())
+                    .filter(|(_, s)| s.is_idle() && !s.data.is_empty() && !s.flushing)
                     .map(|(idx, s)| (*idx, s.last_modified))
                     .collect();
                 idle.sort_by_key(|&(_, t)| t);
@@ -876,40 +852,27 @@ impl FlushHandle {
                                     meta_entry.size = new_size;
                                 }
                             }
-                            // Update read engine with the new chunk ID and evict any pre-seed
-                            // cache entry. PatchChunk creates a new server-side chunk with a
-                            // different hash than the client's pre-seeded guess, so the engine
-                            // and cache must be updated to prevent stale reads.
-                            let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0);
-                            self.client.feed_chunk_locations_to_read_engine(
-                                ino, &[new_location], current_size,
-                            ).await;
-                            // Mark slot as server-committed but keep data alive for readers
-                            // until metadata is synced (flush_all_pipelined cleans up after sync).
+                            // Remove slot — data is on the server.
                             if let Some(state_arc) = self.write_buffers.get(&ino) {
                                 let mut state = state_arc.lock().await;
-                                if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                if let Some(slot) = state.slots.get(&chunk_idx) {
                                     let flushed_len = slot.data.len();
-                                    slot.server_prefix = flushed_len;
                                     state.flushed_sizes.insert(chunk_idx, flushed_len);
                                     self.global_buffered_bytes.fetch_sub(
                                         flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
                                 }
+                                state.slots.remove(&chunk_idx);
                             }
+                            // Commit metadata to leader FIRST, then update read engine.
                             let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
                             if let Some(meta) = meta_to_persist {
-                                const METADATA_FLUSH_INTERVAL_SECS: u64 = 5;
-                                let should_enqueue = match self.last_metadata_update.get(&ino) {
-                                    None => true,
-                                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(METADATA_FLUSH_INTERVAL_SECS),
-                                };
-                                if should_enqueue {
-                                    self.last_metadata_update.insert(ino, std::time::Instant::now());
-                                    let stamped = self.client.stamp_write_seq_pub(&meta);
-                                    self.client.metadata_queue.push(stamped).await;
-                                }
+                                self.client.flush_metadata_sync(&meta).await;
+                                self.last_metadata_update.insert(ino, std::time::Instant::now());
+                                self.client.feed_chunk_locations_to_read_engine(
+                                    ino, &meta.chunk_locations, meta.size,
+                                ).await;
                             }
                             return Ok(());
                         }
@@ -934,25 +897,16 @@ impl FlushHandle {
         let result = self.client.write_data_with_cache(&slot_data, ino, file_offset).await;
         match result {
             Ok((_, _, Some(locations))) => {
-                // Mark slot as server-committed but keep data alive for readers
-                // until metadata is synced (flush_all_pipelined cleans up after sync).
-                // Use slot_data.len() (snapshot at flush time), NOT slot.data.len()
-                // (current — may be larger if the writer extended the slot while the
-                // network write was in flight). Setting server_prefix to the current
-                // size would tell the next flush that bytes never actually sent are
-                // already on the server, causing is_append_extend to send only the
-                // tail and creating a gap in the stored chunk.
+                // Chunk is on the server — remove slot so reads go to network.
                 let flushed_len = slot_data.len();
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     let mut state = state_arc.lock().await;
-                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
-                        slot.server_prefix = flushed_len;
-                        state.flushed_sizes.insert(chunk_idx, flushed_len);
-                        self.global_buffered_bytes.fetch_sub(
-                            flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
+                    state.flushed_sizes.insert(chunk_idx, flushed_len);
+                    state.slots.remove(&chunk_idx);
+                    self.global_buffered_bytes.fetch_sub(
+                        flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
 
                 // Fetch metadata if not cached
@@ -1004,12 +958,6 @@ impl FlushHandle {
                         .as_secs();
                 }
 
-                let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0);
-                let all_locs = self.metadata_cache.get(&ino)
-                    .map(|m| m.chunk_locations.clone())
-                    .unwrap_or_default();
-                self.client.feed_chunk_locations_to_read_engine(ino, &all_locs, current_size).await;
-
                 let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
                 if let Some(meta) = meta_to_persist {
                     let parent_path = meta.path.rfind('/').map(|i| {
@@ -1035,8 +983,14 @@ impl FlushHandle {
                     };
                     if should_enqueue {
                         self.last_metadata_update.insert(ino, std::time::Instant::now());
-                        let stamped = self.client.stamp_write_seq_pub(&meta);
-                        self.client.metadata_queue.push(stamped).await;
+                        // Commit metadata to leader first, then update the read engine.
+                        // This ensures leader refreshes never overwrite our engine update
+                        // with stale data — the leader has the chunk map before we expose it.
+                        self.client.flush_metadata_sync(&meta).await;
+                        let current_size = meta.size;
+                        self.client.feed_chunk_locations_to_read_engine(
+                            ino, &meta.chunk_locations, current_size,
+                        ).await;
                     }
                 }
                 Ok(())
@@ -1094,7 +1048,7 @@ impl FlushHandle {
             // Count how many slots are still pending (unclaimed and non-empty).
             let pending = self.write_buffers.get(&ino).map(|s| {
                 s.try_lock().map(|st| {
-                    st.slots.values().filter(|sl| !sl.data.is_empty() && !sl.flushing && sl.server_prefix < sl.data.len()).count()
+                    st.slots.values().filter(|sl| !sl.data.is_empty() && !sl.flushing).count()
                 }).unwrap_or(1) // if locked, assume work remains
             }).unwrap_or(0);
 
@@ -1144,20 +1098,7 @@ impl FlushHandle {
             self.last_metadata_update.insert(ino, std::time::Instant::now());
         }
 
-        // Now that metadata is committed on the server, remove all slots that were
-        // marked server_prefix == data.len() (fully flushed but kept alive for readers).
-        // global_buffered_bytes was already decremented when server_prefix was set,
-        // so don't subtract again here.
-        if let Some(state_arc) = self.write_buffers.get(&ino) {
-            let mut state = state_arc.lock().await;
-            let to_remove: Vec<u64> = state.slots.iter()
-                .filter(|(_, slot)| slot.server_prefix >= slot.data.len() && !slot.data.is_empty())
-                .map(|(&idx, _)| idx)
-                .collect();
-            for idx in to_remove {
-                state.slots.remove(&idx);
-            }
-        }
+        // Slots are removed immediately on flush success, so nothing to clean up here.
         Ok(())
     }
 }
@@ -1430,7 +1371,7 @@ impl DfsFilesystem {
                         let no_active_writers = write_open_counts_for_bg
                             .get(&ino).map(|c| *c == 0).unwrap_or(true);
                         let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
-                            s.is_idle() && !s.data.is_empty() && !s.flushing && s.server_prefix < s.data.len()
+                            s.is_idle() && !s.data.is_empty() && !s.flushing
                         });
                         drop(state);
                         if !has_full && !has_idle { continue; }
@@ -2224,8 +2165,16 @@ impl Filesystem for DfsFilesystem {
             }
         }
 
-        if is_sqlite {
-            info!("open: ino={} - SQLite database detected, using direct I/O", ino);
+        // Use direct I/O for SQLite (required for correctness) and for files with an
+        // active writer (live recordings). With KEEP_CACHE the kernel page cache fills
+        // gaps with zeros when FUSE returns a short/empty read — e.g. when the write
+        // buffer doesn't have the data yet. Direct I/O bypasses the cache so short reads
+        // are passed through as-is without being cached as zeros.
+        let has_active_writer_for_open = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
+        if is_sqlite || has_active_writer_for_open {
+            if is_sqlite {
+                info!("open: ino={} - SQLite database detected, using direct I/O", ino);
+            }
             reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
         } else {
             reply.opened(0, fuser::consts::FOPEN_KEEP_CACHE);
@@ -2401,114 +2350,65 @@ impl Filesystem for DfsFilesystem {
             let offset = offset as usize;
             let size = size as usize;
 
-            // Include buffered-but-not-yet-flushed bytes in the effective file size.
-            // Use try_lock() — never block a main-runtime thread waiting for the flush
-            // runtime to release the mutex. If the buffer is locked, fall through to the
-            // server-committed size; the reader will fetch from the network instead.
+            // Extend file_size to include buffered-but-uncommitted bytes so the EOF
+            // check below doesn't gate out reads that are within the write buffer.
             let file_size = if write_buffer_enabled {
                 if let Some(state_lock) = write_buffers.get(&ino) {
                     if let Ok(state) = state_lock.try_lock() {
                         let buffered_end = state.slots.iter()
                             .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
-                            .max()
-                            .unwrap_or(0);
+                            .max().unwrap_or(0);
                         file_size.max(buffered_end)
                     } else {
-                        // try_lock failed — flush runtime holds the mutex.
-                        // Use size_high_water so reads concurrent with a flush don't see
-                        // file_size=0 (metadata not yet committed) and fall into the EOF
-                        // refresh path, which returns 0 bytes from the leader.
                         let hwm = size_high_water.get(&ino).map(|v| *v).unwrap_or(0);
                         file_size.max(hwm)
                     }
-                } else {
-                    file_size
-                }
-            } else {
-                file_size
-            };
+                } else { file_size }
+            } else { file_size };
 
-            // --- Write buffer: serve from dirty slots without any network I/O. ---
-            // Use try_lock() to avoid blocking main runtime threads on flush-runtime mutex.
-            // committed_size is the metadata size (server-side only, no buffer).
-            let committed_size = metadata_cache.get(&ino).map(|m| m.size as usize).unwrap_or(0);
+            // --- Write buffer: serve uncommitted data without a network round-trip. ---
+            // Slots are present only while data is uncommitted (removed immediately on flush).
+            // Slot exists → serve from buffer (uncommitted live data).
+            // Slot absent → fall through to network (committed data on server).
+            // This prevents 0-byte returns during the pre-commit window that cause
+            // concurrent dd readers to get offset-shifted data in READ_COPY.
             if write_buffer_enabled {
                 if let Some(state_lock) = write_buffers.get(&ino) {
                     if let Ok(state) = state_lock.try_lock() {
-                        let read_end = offset + size;
-                        let mut buf_data: Vec<u8> = Vec::with_capacity(size);
-                        let mut pos = offset;
-                        let mut hit_unbuffered_write_edge = false;
-
-                        while pos < read_end {
-                            let chunk_idx = InodeWriteState::chunk_index(pos as u64);
-                            let intra = InodeWriteState::intra_offset(pos as u64);
-                            let need = (read_end - pos).min(CHUNK_SIZE - intra);
-
-                            if let Some(slot) = state.slots.get(&chunk_idx) {
-                                // If the requested range falls within bytes already committed to
-                                // the server (server_prefix) or within a synthetic gap-fill prefix,
-                                // fall through to the network so the server's real data is returned.
-                                // But only do this if the network metadata has caught up (committed_size
-                                // covers the range) — otherwise the metadata is stale and the network
-                                // read will return 0 bytes even though the chunk data is on the server.
-                                let bypass_prefix = slot.server_prefix.max(slot.gap_filled_prefix);
-                                if intra + need <= bypass_prefix && committed_size >= read_end {
-                                    break;
-                                }
-                                if intra + need <= slot.data.len() {
-                                    buf_data.extend_from_slice(&slot.data[intra..intra + need]);
-                                    pos += need;
-                                } else if intra < slot.data.len() {
-                                    let avail = slot.data.len() - intra;
-                                    buf_data.extend_from_slice(&slot.data[intra..intra + avail]);
-                                    pos += avail;
-                                    break;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                // No slot for this chunk. If the offset is beyond committed server
-                                // data AND the buffer still exists (active writer), the DVR hasn't
-                                // written here yet — return what we have (possibly empty) rather
-                                // than going to the network where the leader will return "no chunk
-                                // map" and trigger a 1s backoff loop.
-                                // Only set this flag if the buffer is non-empty (has at least one
-                                // slot), confirming an active write session. An empty buffer after
-                                // flush has been cleared means we should fall through to network.
-                                let has_active_slots = !state.slots.is_empty();
-                                if pos >= committed_size && has_active_slots {
-                                    hit_unbuffered_write_edge = true;
-                                }
-                                break;
+                        let chunk_idx = InodeWriteState::chunk_index(offset as u64);
+                        let intra = InodeWriteState::intra_offset(offset as u64);
+                        if let Some(slot) = state.slots.get(&chunk_idx) {
+                            // Slot present — data is buffered and not yet fully committed.
+                            // The gap_filled_prefix range (0..gap_filled_prefix) is a synthetic
+                            // zero-fill for bytes already on the server from a prior partial
+                            // flush. The real new data starts at gap_filled_prefix.
+                            // For reads within 0..gap_filled_prefix: the server has this data,
+                            // fall through to the network.
+                            // For reads within gap_filled_prefix..data.len(): serve from buffer.
+                            // For reads at or beyond data.len(): write edge, return empty.
+                            if intra >= slot.data.len() {
+                                // At or beyond the write frontier.
+                                reply.data(&[]);
+                                return;
+                            } else if intra >= slot.gap_filled_prefix {
+                                // Real buffered data — serve it.
+                                let avail = slot.data.len() - intra;
+                                let n = avail.min(size);
+                                reply.data(&slot.data[intra..intra + n]);
+                                return;
                             }
-                        }
-
-                        // Only serve from the write buffer if it satisfies the full request
-                        // OR we're at the live write edge (nothing on the server either).
-                        // A partial buffer hit that stops at a chunk boundary (next slot not
-                        // yet buffered but already committed to the server) causes a short read
-                        // — the caller's dd/pv interprets that as EOF and skips ahead, creating
-                        // a gap in the output.  Fall through to the network path instead; it
-                        // will assemble the full reply from the chunk cache + leader.
-                        let buf_full = buf_data.len() == size;
-                        if !buf_data.is_empty() && (buf_full || hit_unbuffered_write_edge) {
-                            debug!("FUSE read from write buffer: ino={}, {} bytes (full={})",
-                                   ino, buf_data.len(), buf_full);
-                            reply.data(&buf_data);
-                            return;
-                        }
-                        if hit_unbuffered_write_edge && buf_data.is_empty() {
-                            // Read is at the live write edge but data isn't buffered yet.
-                            // Return empty (short read) — the player will retry shortly.
-                            // Going to the network here triggers a leader refresh that returns
-                            // nothing and causes a multi-second backoff stall.
-                            debug!("FUSE read at write edge (not yet buffered): ino={}, offset={}", ino, offset);
-                            reply.data(&[]);
-                            return;
+                            // intra < gap_filled_prefix: server has this range, fall through.
+                        } else {
+                            // No slot — check if we're at the live write edge.
+                            let committed_size = metadata_cache.get(&ino).map(|m| m.size as usize).unwrap_or(0);
+                            if !state.slots.is_empty() && offset >= committed_size {
+                                reply.data(&[]);
+                                return;
+                            }
+                            // Fall through to network for committed data.
                         }
                     }
-                    // If try_lock failed (flush in progress), fall through to network read.
+                    // try_lock failed — fall through to network.
                 }
             }
 

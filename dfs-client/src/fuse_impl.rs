@@ -1,7 +1,7 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use libc;
-use dfs_common::{ChunkId, ChunkLocation, FileMetadata, FileType, compute_chunk_hash_at};
+use dfs_common::{ChunkLocation, FileMetadata, FileType};
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyStatfs, Request as FuseRequest,
@@ -213,10 +213,13 @@ impl InodeWriteState {
             .sum()
     }
 
-    /// Slots that are full and not yet claimed by a flush task
+    /// Slots that are full, not yet claimed by a flush task, and not already
+    /// fully committed to the server (server_prefix < data.len()).
+    /// Slots with server_prefix == data.len() are kept alive for concurrent
+    /// readers but must not be re-flushed — they are already on the server.
     fn full_slot_indices(&self) -> Vec<u64> {
         self.slots.iter()
-            .filter(|(_, s)| s.is_full() && !s.flushing)
+            .filter(|(_, s)| s.is_full() && !s.flushing && s.server_prefix < s.data.len())
             .map(|(idx, _)| *idx)
             .collect()
     }
@@ -529,39 +532,7 @@ impl FlushHandle {
 
         info!("flush_buffer_async: flushing {} chunks in parallel for inode {}", slots_to_write.len(), ino);
         let t_flush_start = std::time::Instant::now();
-
-        // Pre-seed the chunk cache and read engine with locally-computed chunk IDs and data.
-        // Reads that arrive during the server write RPC can be served from cache immediately
-        // without waiting for the network round-trip to complete.  The chunk ID is deterministic
-        // (compute_chunk_hash_at = blake3(offset || data)) so the ID we compute here is exactly
-        // what the server will assign.  If the write fails we evict the pre-seeded entry.
-        let mut pre_seeded_ids: Vec<(u64, ChunkId)> = Vec::new();
-        for (chunk_idx, slot_data, file_offset) in &slots_to_write {
-            let hash = compute_chunk_hash_at(slot_data, *file_offset);
-            let cid = ChunkId::from_hash(hash);
-            self.client.chunk_cache.insert(cid, Arc::new(slot_data.clone())).await;
-            pre_seeded_ids.push((*chunk_idx, cid));
-        }
         let t_preseed = t_flush_start.elapsed();
-        // Also push stub locations into the read engine so the chunk map reflects the new IDs
-        // before the server acks. The location has no node list yet — reads that miss the local
-        // cache will fall back to a leader refresh, which is the same as before this change.
-        if !pre_seeded_ids.is_empty() {
-            let stub_locations: Vec<ChunkLocation> = pre_seeded_ids.iter()
-                .zip(slots_to_write.iter())
-                .map(|((_, cid), (_chunk_idx, _slot_data, file_offset))| ChunkLocation {
-                    chunk_id: *cid,
-                    nodes: Vec::new(),
-                    size: CHUNK_SIZE, // full extent so chunk_offsets covers the whole 4MB range
-                    checksum: [0u8; 32],
-                    file_offset: Some(*file_offset),
-                    written_at: None,
-                })
-                .collect();
-            let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0)
-                .max(slots_to_write.last().map(|(_, d, o)| o + d.len() as u64).unwrap_or(0));
-            self.client.feed_chunk_locations_to_read_engine(ino, &stub_locations, current_size).await;
-        }
 
         // Flush all slots in parallel. When flush_buffer_async runs on the flush_runtime
         // (as dispatched by the background flusher and release/fsync callers), these
@@ -624,13 +595,6 @@ impl FlushHandle {
             }
         }
 
-        // Evict pre-seeded cache entries for any chunks that failed to reach the server.
-        // Readers would otherwise get a cache hit on data that was never durably written.
-        for (chunk_idx, cid) in &pre_seeded_ids {
-            if failed_chunk_indices.contains(&(*chunk_idx as usize)) {
-                self.client.chunk_cache.invalidate(cid).await;
-            }
-        }
 
         if let Some(e) = first_err {
             return Err(e);
@@ -794,9 +758,9 @@ impl FlushHandle {
             let Some(state_arc) = self.write_buffers.get(&ino) else { return Ok(()); };
             let mut state = state_arc.lock().await;
 
-            // Full slots first (lowest index, not already claimed)
+            // Full slots first (lowest index, not already claimed, not already on server)
             let mut full: Vec<u64> = state.slots.iter()
-                .filter(|(_, s)| s.is_full() && !s.flushing)
+                .filter(|(_, s)| s.is_full() && !s.flushing && s.server_prefix < s.data.len())
                 .map(|(idx, _)| *idx)
                 .collect();
             full.sort_unstable();
@@ -804,9 +768,9 @@ impl FlushHandle {
             let idx = if let Some(i) = full.into_iter().next() {
                 i
             } else {
-                // No full unclaimed slot — try the oldest idle partial slot.
+                // No full unclaimed slot — try the oldest idle partial slot not yet on server.
                 let mut idle: Vec<(u64, SystemTime)> = state.slots.iter()
-                    .filter(|(_, s)| s.is_idle() && !s.data.is_empty() && !s.flushing)
+                    .filter(|(_, s)| s.is_idle() && !s.data.is_empty() && !s.flushing && s.server_prefix < s.data.len())
                     .map(|(idx, s)| (*idx, s.last_modified))
                     .collect();
                 idle.sort_by_key(|&(_, t)| t);
@@ -960,28 +924,7 @@ impl FlushHandle {
             // No metadata or location — fall through to normal write
         }
 
-        // Normal write path: pre-seed cache, write, update metadata.
-        let hash = compute_chunk_hash_at(&slot_data, file_offset);
-        let cid = dfs_common::ChunkId::from_hash(hash);
-        self.client.chunk_cache.insert(cid, Arc::new(slot_data.clone())).await;
-
-        let stub = dfs_common::ChunkLocation {
-            chunk_id: cid,
-            nodes: Vec::new(),
-            // Use CHUNK_SIZE so the engine slot covers the full 4MB range even for a
-            // partial (idle-flushed) slot.  Reads beyond slot_data.len() miss the cache
-            // and fall through to the server or write buffer — correct live-write behavior.
-            // Using slot_data.len() here left a hole: chunk_offsets[1] = (4MB, 2MB), so
-            // reads at offset ≥ 6MB found no covering chunk and returned zeros.
-            size: CHUNK_SIZE,
-            checksum: [0u8; 32],
-            file_offset: Some(file_offset),
-            written_at: None,
-        };
-        let current_size = self.metadata_cache.get(&ino).map(|m| m.size).unwrap_or(0)
-            .max(file_offset + slot_data.len() as u64);
-        self.client.feed_chunk_locations_to_read_engine(ino, &[stub], current_size).await;
-
+        // Write path: send data to server, then update read engine with real location.
         let result = self.client.write_data_with_cache(&slot_data, ino, file_offset).await;
         match result {
             Ok((_, _, Some(locations))) => {
@@ -1087,12 +1030,9 @@ impl FlushHandle {
                 Ok(())
             }
             Ok((_, _, None)) => {
-                // Write succeeded but returned no locations — evict the pre-seeded entry.
-                self.client.chunk_cache.invalidate(&cid).await;
                 Ok(())
             }
             Err(e) => {
-                self.client.chunk_cache.invalidate(&cid).await;
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     if let Ok(mut state) = state_arc.try_lock() {
                         if let Some(slot) = state.slots.get_mut(&chunk_idx) {
@@ -1142,7 +1082,7 @@ impl FlushHandle {
             // Count how many slots are still pending (unclaimed and non-empty).
             let pending = self.write_buffers.get(&ino).map(|s| {
                 s.try_lock().map(|st| {
-                    st.slots.values().filter(|sl| !sl.data.is_empty() && !sl.flushing).count()
+                    st.slots.values().filter(|sl| !sl.data.is_empty() && !sl.flushing && sl.server_prefix < sl.data.len()).count()
                 }).unwrap_or(1) // if locked, assume work remains
             }).unwrap_or(0);
 
@@ -1478,7 +1418,7 @@ impl DfsFilesystem {
                         let no_active_writers = write_open_counts_for_bg
                             .get(&ino).map(|c| *c == 0).unwrap_or(true);
                         let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
-                            s.is_idle() && !s.data.is_empty() && !s.flushing
+                            s.is_idle() && !s.data.is_empty() && !s.flushing && s.server_prefix < s.data.len()
                         });
                         drop(state);
                         if !has_full && !has_idle { continue; }
@@ -3561,6 +3501,7 @@ impl Filesystem for DfsFilesystem {
                 let path_to_inode_for_release = self.path_to_inode.clone();
                 let size_high_water_for_release = self.size_high_water.clone();
                 let read_engines_for_release = self.client.read_engines.engines.clone();
+                let open_counts_for_release = self.open_counts.clone();
                 release_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Reply to FUSE immediately — release() errors are informational only
                 // and the kernel ignores them. Parking a main-runtime worker for the
@@ -3601,8 +3542,17 @@ impl Filesystem for DfsFilesystem {
                     }
                     // Invalidate the read engine's chunk map so the next reader
                     // immediately picks up the newly flushed chunks.
+                    // If no fds remain open, drop the engine entirely — it holds
+                    // a Vec<ChunkLocation> that grows with the file and is never
+                    // needed again once the file is closed for writing.
                     if let Some(engine) = read_engines_for_release.get(&ino) {
                         engine.expire_chunk_map();
+                    }
+                    // Check open_counts: if no readers are still open, free the engine.
+                    // open_counts was decremented synchronously in release() before this
+                    // task was spawned, so 0 here means truly no fds remain.
+                    if !open_counts_for_release.get(&ino).map(|c| *c > 0).unwrap_or(false) {
+                        read_engines_for_release.remove(&ino);
                     }
                     write_buffers.remove(&ino);
                     size_high_water_for_release.remove(&ino);

@@ -322,6 +322,38 @@ m2=$(md5sum "$T/t16_read.bin"  | cut -d' ' -f1)
 #$READ_OK && check "T17 concurrent read while writing (no deadlock)" PASS \
 #         || check "T17 concurrent read while writing (DEADLOCK or timeout)" FAIL
 
+# ── Test 17: DVR header-update pattern (full-chunk gap-fill corruption) ───────
+# Write exactly 4MB (one full chunk). Then do a small header update at offset 0
+# (conv=notrunc). The tail of the file must not be zeroed out.
+# This catches the gap_filled_prefix bug: when the slot fills to CHUNK_SIZE,
+# needs_patch was false and the full slot (with gap-fill zeros) was sent as a
+# fresh WriteData, overwriting real server data with zeros.
+echo ""
+echo "=== T17: DVR header-update (4MB file, small patch at offset 0) ==="
+dd if=/dev/urandom of="$T/t17_orig.bin" bs=1M count=4 2>/dev/null
+dd if=/dev/urandom of="$T/t17_hdr.bin"  bs=1K count=12 2>/dev/null
+
+# Expected: first 12KB = header, rest = original tail
+cp "$T/t17_orig.bin" "$T/t17_expected.bin"
+dd if="$T/t17_hdr.bin" of="$T/t17_expected.bin" bs=1K count=12 conv=notrunc 2>/dev/null
+
+# Write 4MB to DFS, flush, then update header
+cp "$T/t17_orig.bin" "$MOUNT/t17_dvr.bin"
+sleep 2  # ensure chunk 0 is flushed and flushed_sizes[0] is set
+dd if="$T/t17_hdr.bin" of="$MOUNT/t17_dvr.bin" bs=1K count=12 conv=notrunc 2>/dev/null
+sleep 1
+cp "$MOUNT/t17_dvr.bin" "$T/t17_read.bin"
+
+READ_SIZE=$(stat -c%s "$T/t17_read.bin")
+EXP_SIZE=$(stat -c%s "$T/t17_expected.bin")
+[ "$READ_SIZE" = "$EXP_SIZE" ] && check "T17a DVR header-update size correct (4MB)" PASS \
+    || check "T17a DVR header-update size (got $READ_SIZE, exp $EXP_SIZE)" FAIL
+
+m1=$(md5sum "$T/t17_expected.bin" | cut -d' ' -f1)
+m2=$(md5sum "$T/t17_read.bin"     | cut -d' ' -f1)
+[ "$m1" = "$m2" ] && check "T17b DVR header-update data intact (tail not zeroed)" PASS \
+    || check "T17b DVR header-update data (exp $m1 got $m2)" FAIL
+
 # ── Test 18: DVR concurrent-read integrity ────────────────────────────────────
 # Write a 20MB file at ~4MB/s while concurrently reading from offset 0.
 # Verifies: no short reads that skip data, read copy matches written data.

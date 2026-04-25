@@ -382,8 +382,14 @@ impl FlushHandle {
                     .and_then(|st| st.slots.get(&chunk_idx).map(|sl| sl.gap_filled_prefix)))
                     .unwrap_or(0)
             };
+            // is_append_extend also covers the full-chunk case: if the slot grew to exactly
+            // 4MB but started with a gap-filled prefix (bytes already on server), we must
+            // still PatchChunk rather than doing a fresh WriteData. A fresh write would
+            // send the gap-fill zeros as real data, overwriting the server's existing bytes
+            // (e.g. the 12KB JSON header) with zeros. This is the root cause of broken
+            // recordings: the release flush writes a full 4MB slot containing gap-fill
+            // zeros at the start, replacing the real header content on the server.
             let is_append_extend = chunk_exists
-                && slot_len < CHUNK_SIZE
                 && slot_len > existing_chunk_size
                 && gap_filled_prefix >= existing_chunk_size;
             // Use PatchChunk for a genuine partial in-place edit (conv=notrunc style), but NOT

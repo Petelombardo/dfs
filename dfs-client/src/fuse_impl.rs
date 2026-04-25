@@ -2208,14 +2208,22 @@ impl Filesystem for DfsFilesystem {
             }
         }
 
-        // Always use direct I/O — we maintain our own chunk LRU cache, so the kernel
-        // page cache is redundant and wastes memory. Direct I/O also prevents the kernel
-        // from filling short reads with zeros (write-edge returns on live recordings)
-        // and avoids stale cached data when chunk IDs change after PatchChunk.
-        if is_sqlite {
-            info!("open: ino={} - SQLite database detected, using direct I/O", ino);
+        // Use direct I/O for SQLite (required for correctness) and for files with an
+        // active writer (live recordings). With KEEP_CACHE the kernel page cache fills
+        // gaps with zeros when FUSE returns a short/empty read — e.g. when the write
+        // buffer doesn't have the data yet. Direct I/O bypasses the cache so short reads
+        // are passed through as-is without being cached as zeros.
+        // Finished files use KEEP_CACHE — direct I/O causes EAGAIN when readers open
+        // with O_NONBLOCK and our FUSE handler blocks on a network fetch.
+        let has_active_writer_for_open = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
+        if is_sqlite || has_active_writer_for_open {
+            if is_sqlite {
+                info!("open: ino={} - SQLite database detected, using direct I/O", ino);
+            }
+            reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
+        } else {
+            reply.opened(0, fuser::consts::FOPEN_KEEP_CACHE);
         }
-        reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
         info!("open: ino={} DONE — reply sent", ino);
     }
 

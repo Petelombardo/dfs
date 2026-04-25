@@ -354,6 +354,36 @@ m2=$(md5sum "$T/t17_read.bin"     | cut -d' ' -f1)
 [ "$m1" = "$m2" ] && check "T17b DVR header-update data intact (tail not zeroed)" PASS \
     || check "T17b DVR header-update data (exp $m1 got $m2)" FAIL
 
+# ── Test 17c: DVR exact write pattern (12KB header then fill to 4MB) ──────────
+# Simulates exact HDHomeRun DVR sequence: write 12KB header first (fresh chunk),
+# then write recording data that fills chunk 0 to exactly 4MB via background ticker.
+# Verifies the tail is not zeroed when the slot fills to CHUNK_SIZE with gap-fill.
+echo ""
+echo "=== T17c: DVR exact pattern (12KB header + fill to 4MB via background ticker) ==="
+HEADER_SIZE=12032
+CHUNK_BYTES=$((4*1024*1024))
+TAIL_SIZE=$((CHUNK_BYTES - HEADER_SIZE))
+
+dd if=/dev/urandom of="$T/t17c_header.bin"    bs=1 count=$HEADER_SIZE 2>/dev/null
+dd if=/dev/urandom of="$T/t17c_recording.bin" bs=1 count=$TAIL_SIZE   2>/dev/null
+cat "$T/t17c_header.bin" "$T/t17c_recording.bin" > "$T/t17c_expected.bin"
+
+# Step 1: write 12KB header — creates fresh 12032-byte chunk on server
+dd if="$T/t17c_header.bin" of="$MOUNT/t17c_dvr.bin" bs=1 count=$HEADER_SIZE 2>/dev/null
+sleep 1  # let background ticker flush the 12KB, setting flushed_sizes[0]=12032
+
+# Step 2: write recording data at offset 12032 — slot grows to 4MB, ticker flushes via PatchChunk
+dd if="$T/t17c_recording.bin" of="$MOUNT/t17c_dvr.bin" bs=1 seek=$HEADER_SIZE count=$TAIL_SIZE conv=notrunc 2>/dev/null
+sleep 2  # let background ticker flush the extended slot
+
+sync
+cp "$MOUNT/t17c_dvr.bin" "$T/t17c_read.bin"
+
+m1=$(md5sum "$T/t17c_expected.bin" | cut -d' ' -f1)
+m2=$(md5sum "$T/t17c_read.bin"     | cut -d' ' -f1)
+[ "$m1" = "$m2" ] && check "T17c DVR exact pattern: header+recording intact" PASS \
+    || check "T17c DVR exact pattern: data mismatch (exp $m1 got $m2)" FAIL
+
 # ── Test 18: DVR concurrent-read integrity ────────────────────────────────────
 # Write a 20MB file at ~4MB/s while concurrently reading from offset 0.
 # Verifies: no short reads that skip data, read copy matches written data.

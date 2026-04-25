@@ -864,7 +864,6 @@ impl FlushHandle {
         };
         let slot_len = slot_data.len();
         let is_append_extend = chunk_exists
-            && slot_len < CHUNK_SIZE
             && slot_len > existing_chunk_size
             && gap_filled_prefix >= existing_chunk_size;
         let is_truncated_session = self.write_buffers.get(&ino)

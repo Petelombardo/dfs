@@ -462,6 +462,50 @@ rm -f "$T18_DST"
 
 ./scripts/test_dvr_stream.sh
 
+# ── Test 20: partial overwrite integrity — first, middle, and last chunk ───────
+# Write a 12MB file (3 chunks). Write a 2MB patch file.
+# Apply the 2MB patch to: first 2MB of chunk 0, first 2MB of chunk 1, first 2MB of chunk 2.
+# Mirror every operation on the local filesystem, then compare MD5s chunk-by-chunk.
+echo ""
+echo "=== T20: partial overwrite — start, middle, end chunk ==="
+CHUNK=$((4*1024*1024))
+PATCH_SIZE=$((2*1024*1024))
+
+dd if=/dev/urandom of="$T/t20_orig.bin"  bs=1M count=12 2>/dev/null
+dd if=/dev/urandom of="$T/t20_patch.bin" bs=1M count=2  2>/dev/null
+
+# Build expected result locally
+cp "$T/t20_orig.bin" "$T/t20_expected.bin"
+dd if="$T/t20_patch.bin" of="$T/t20_expected.bin" bs=1M count=2 seek=0            conv=notrunc 2>/dev/null  # chunk 0
+dd if="$T/t20_patch.bin" of="$T/t20_expected.bin" bs=1M count=2 seek=4            conv=notrunc 2>/dev/null  # chunk 1 start
+dd if="$T/t20_patch.bin" of="$T/t20_expected.bin" bs=1M count=2 seek=8            conv=notrunc 2>/dev/null  # chunk 2 start
+
+# Write original to DFS
+cp "$T/t20_orig.bin" "$MOUNT/t20_test.bin"
+sleep 1
+
+# Apply same patches to DFS file
+dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=0            conv=notrunc 2>/dev/null  # chunk 0
+dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=4            conv=notrunc 2>/dev/null  # chunk 1 start
+dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=8            conv=notrunc 2>/dev/null  # chunk 2 start
+sleep 1
+
+cp "$MOUNT/t20_test.bin" "$T/t20_read.bin"
+
+m1=$(md5sum "$T/t20_expected.bin" | cut -d' ' -f1)
+m2=$(md5sum "$T/t20_read.bin"     | cut -d' ' -f1)
+if [ "$m1" = "$m2" ]; then
+    check "T20 partial overwrite: start/middle/end chunks intact" PASS
+else
+    check "T20 partial overwrite: mismatch — checking per-chunk" FAIL
+    for chunk in 0 1 2; do
+        off=$(( chunk * 4 ))
+        e=$(dd if="$T/t20_expected.bin" bs=1M skip=$off count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+        g=$(dd if="$T/t20_read.bin"     bs=1M skip=$off count=4 2>/dev/null | md5sum | cut -d' ' -f1)
+        [ "$e" = "$g" ] && echo "  chunk $chunk: OK" || echo "  chunk $chunk: MISMATCH (exp $e got $g)"
+    done
+fi
+
 # ── Test 19: large-file delete — non-blocking rm + async chunk cleanup ────────
 echo ""
 echo "=== T19: large-file delete (400MB / ~100 chunks) ==="

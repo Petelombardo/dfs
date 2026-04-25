@@ -182,10 +182,74 @@ else
     exit 1
 fi
 
-# Cleanup
+# Cleanup existing test files
 echo ""
-echo "Cleaning up..."
+echo "Cleaning up earlier test files..."
 rm -rf "$MOUNT_POINT/test_"* "$MOUNT_POINT/small_"* "$MOUNT_POINT/testdir"
+
+echo ""
+echo "Test 11: Large file delete (400MB / ~100 chunks)"
+echo "Writing 400MB file to DFS..."
+dd if=/dev/urandom of="$TEST_DIR/test_400mb.bin" bs=1M count=400 2>/dev/null
+LOCAL_MD5=$(md5sum "$TEST_DIR/test_400mb.bin" | awk '{print $1}')
+echo "Local MD5: $LOCAL_MD5"
+
+cp "$TEST_DIR/test_400mb.bin" "$MOUNT_POINT/test_400mb.bin"
+DFS_MD5=$(md5sum "$MOUNT_POINT/test_400mb.bin" | awk '{print $1}')
+echo "DFS MD5:   $DFS_MD5"
+
+if [ "$LOCAL_MD5" != "$DFS_MD5" ]; then
+    echo "✗ FAILED: MD5 mismatch before delete"
+    exit 1
+fi
+echo "✓ 400MB file written and verified"
+
+# Record which chunk files exist on the local nodes before delete
+CHUNK_DIR_1="/mnt/storage/dfs1/data/chunks"
+CHUNK_DIR_2="/mnt/storage/dfs2/data/chunks"
+CHUNK_DIR_3="/mnt/storage/dfs3/data/chunks"
+CHUNKS_BEFORE=$(find "$CHUNK_DIR_1" "$CHUNK_DIR_2" "$CHUNK_DIR_3" -type f 2>/dev/null | wc -l)
+echo "Chunk files on disk before delete: $CHUNKS_BEFORE"
+
+echo "Deleting 400MB file..."
+DELETE_START=$(date +%s%3N)
+rm "$MOUNT_POINT/test_400mb.bin"
+DELETE_END=$(date +%s%3N)
+DELETE_MS=$((DELETE_END - DELETE_START))
+echo "rm returned in ${DELETE_MS}ms (should be fast — async delete)"
+
+# Verify file is gone from namespace immediately
+if [ -f "$MOUNT_POINT/test_400mb.bin" ]; then
+    echo "✗ FAILED: File still visible in namespace after delete"
+    exit 1
+fi
+echo "✓ File gone from namespace immediately"
+
+# Verify rm was non-blocking (should complete in well under 5 seconds even for large files)
+if [ "$DELETE_MS" -gt 5000 ]; then
+    echo "✗ FAILED: rm blocked for ${DELETE_MS}ms — delete should be non-blocking"
+    exit 1
+fi
+echo "✓ Delete was non-blocking (${DELETE_MS}ms)"
+
+# Wait for the async drain worker to complete chunk deletion
+echo "Waiting for async chunk deletion to complete (up to 60s)..."
+WAITED=0
+while [ $WAITED -lt 60 ]; do
+    sleep 2
+    WAITED=$((WAITED + 2))
+    CHUNKS_AFTER=$(find "$CHUNK_DIR_1" "$CHUNK_DIR_2" "$CHUNK_DIR_3" -type f 2>/dev/null | wc -l)
+    if [ "$CHUNKS_AFTER" -lt "$CHUNKS_BEFORE" ]; then
+        echo "✓ Chunks deleted from disk after ${WAITED}s (${CHUNKS_BEFORE} -> ${CHUNKS_AFTER} chunk files)"
+        break
+    fi
+done
+
+if [ "$CHUNKS_AFTER" -ge "$CHUNKS_BEFORE" ]; then
+    echo "✗ FAILED: Chunk count did not decrease after ${WAITED}s (before=$CHUNKS_BEFORE after=$CHUNKS_AFTER)"
+    exit 1
+fi
+
 rm -rf "$TEST_DIR"
 
 echo ""
@@ -202,5 +266,6 @@ echo "  ✓ File deletion"
 echo "  ✓ Nested directories"
 echo "  ✓ Directory listing"
 echo "  ✓ File size verification"
+echo "  ✓ Large file delete (400MB, non-blocking, async chunk cleanup)"
 echo ""
-echo "Total data tested: ~61MB"
+echo "Total data tested: ~461MB"

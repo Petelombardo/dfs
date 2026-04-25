@@ -239,6 +239,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_chunk_location_sync_loop();
     server.clone().start_metadata_gossip_loop();
     server.clone().start_periodic_reconciliation_loop();
+    server.clone().start_delete_drain_loop();
     info!("✓ Healing manager started");
 
     // Start network server

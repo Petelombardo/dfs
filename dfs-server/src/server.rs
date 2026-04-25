@@ -105,6 +105,9 @@ pub struct Server {
     /// is rejected so that in-flight seq=0 creates can't resurrect a deleted file.
     /// Entries are expired lazily on each put check.
     delete_tombstones: Arc<DashMap<FileId, std::time::Instant>>,
+
+    /// Notifier for the delete drain worker — fired when a new DeleteQueueEntry is added.
+    delete_drain_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Server {
@@ -142,6 +145,7 @@ impl Server {
             leader_forward_notify: Arc::new(tokio::sync::Notify::new()),
             recent_writes: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
             delete_tombstones: Arc::new(DashMap::new()),
+            delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
         };
 
         server
@@ -804,6 +808,13 @@ impl Server {
                 checksum,
             } => self.handle_write_chunk(chunk_id, data, checksum).await,
             Request::DeleteChunk { chunk_id } => self.handle_delete_chunk(chunk_id).await,
+            Request::DeleteChunksBatch { file_id, path, chunk_ids } => {
+                self.handle_delete_chunks_batch(file_id, path, chunk_ids).await
+            }
+            Request::ClearDeleteQueueEntry { file_id } => {
+                self.handle_clear_delete_queue_entry(file_id).await
+            }
+            Request::GetDeleteQueue => self.handle_get_delete_queue().await,
             Request::HasChunk { chunk_id } => self.handle_has_chunk(chunk_id).await,
             Request::HasChunks { chunk_ids } => self.handle_has_chunks(chunk_ids).await,
             Request::ReplicateChunk {
@@ -3006,192 +3017,321 @@ impl Server {
         Response::PatchChunkResult { new_chunk_id, size }
     }
 
-    /// Handle delete file request
+    /// Handle delete file request.
+    ///
+    /// The client fans out DeleteFile to the leader + 2 other nodes simultaneously
+    /// and waits for all 3 acks. Each recipient:
+    ///   1. Looks up metadata → gets chunk list
+    ///   2. Writes DeleteQueueEntry to sled (crash-safe, before any metadata removal)
+    ///   3. Deletes local metadata (file record, path index, chunk locations)
+    ///   4. Inserts tombstone + removes from chunk_map
+    ///   5. Acks the client
+    ///
+    /// The leader's drain worker then handles all actual chunk deletion asynchronously.
     async fn handle_delete_file(&self, path: String) -> Response {
         debug!("Handling delete file: {}", path);
 
-        // Get file metadata first to find chunks and their locations before anything is deleted
-        match self.metadata.get_file_by_path(&path) {
-            Ok(Some(metadata)) => {
-                // Collect chunk locations NOW, before deleting metadata.
-                let chunk_locations = metadata.chunk_locations.clone();
+        let metadata = match self.metadata.get_file_by_path(&path) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                return Response::Error {
+                    message: "File not found".to_string(),
+                    code: ErrorCode::NotFound,
+                };
+            }
+            Err(e) => {
+                warn!("Failed to look up file {}: {}", path, e);
+                return Response::Error {
+                    message: format!("Failed to delete file: {}", e),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        };
 
-                // Delete the file metadata
-                match self.metadata.delete_file(&metadata.id) {
-                    Ok(_) => {
-                        // Record tombstone immediately so in-flight seq=0 creates can't
-                        // resurrect this file before the delete replicates to all nodes.
-                        self.delete_tombstones.insert(metadata.id, std::time::Instant::now());
+        let chunk_ids: Vec<ChunkId> = metadata.chunk_locations.iter()
+            .map(|loc| loc.chunk_id)
+            .collect();
 
-                        // Remove from chunk map
-                        self.chunk_map_remove(&metadata.id).await;
+        // Step 1: persist chunk list to delete queue BEFORE removing metadata.
+        let entry = dfs_common::DeleteQueueEntry {
+            file_id: metadata.id,
+            path: path.clone(),
+            chunk_ids: chunk_ids.clone(),
+        };
+        if let Err(e) = self.metadata.enqueue_delete(&entry) {
+            warn!("Failed to enqueue delete for {}: {}", path, e);
+            return Response::Error {
+                message: format!("Failed to enqueue delete: {}", e),
+                code: ErrorCode::InternalError,
+            };
+        }
 
-                        // No pending_metadata_replication queue to purge — the sled
-                        // meta_queue is deduped by FileId on drain, and deleted files are
-                        // absent from the DB so they'll be skipped in the catchup scan.
+        // Step 2: remove metadata now that the chunk list is safely queued.
+        if let Err(e) = self.metadata.delete_file(&metadata.id) {
+            warn!("Failed to delete file metadata for {}: {}", path, e);
+            // Queue entry is already written — drain worker will retry.
+            // Still return error so client knows metadata removal may have failed.
+            return Response::Error {
+                message: format!("Failed to delete file: {}", e),
+                code: ErrorCode::InternalError,
+            };
+        }
+        if let Err(e) = self.metadata.delete_path_index(&path) {
+            warn!("Failed to delete path index for {}: {}", path, e);
+        }
+        for chunk_id in &chunk_ids {
+            if let Err(e) = self.metadata.delete_chunk_location(chunk_id) {
+                warn!("Failed to delete chunk location {}: {}", chunk_id, e);
+            }
+        }
 
-                        // Delete chunk location records from local metadata DB immediately.
-                        // This is the critical step that was missing — without it, chunk: keys
-                        // accumulate forever and the healer spins on thousands of ghost chunks.
-                        for loc in &chunk_locations {
-                            if let Err(e) = self.metadata.delete_chunk_location(&loc.chunk_id) {
-                                warn!("Failed to delete chunk location record {}: {}", loc.chunk_id, e);
-                            }
-                        }
+        // Step 3: tombstone + in-memory chunk_map removal.
+        self.delete_tombstones.insert(metadata.id, std::time::Instant::now());
+        self.chunk_map_remove(&metadata.id).await;
 
-                        // Replicate metadata deletion and chunk cleanup to all other nodes asynchronously
-                        let cluster = self.cluster.clone();
-                        let client = self.client.clone();
-                        let storage = self.storage.clone();
-                        let metadata_store = self.metadata.clone();
-                        let file_id = metadata.id;
-                        let path_clone = path.clone();
-                        let sem = self.delete_semaphore.clone();
+        // Notify the drain worker that there's a new entry (leader only acts on it,
+        // but the notify is harmless on followers).
+        self.delete_drain_notify.notify_one();
 
-                        tokio::spawn(async move {
-                            let _permit = sem.acquire().await.ok();
-                            // First, replicate the metadata deletion to all nodes
-                            let nodes = cluster.get_all_nodes().await;
-                            let local_id = cluster.local_node_id();
+        info!("DeleteFile: queued {} chunks for async deletion: {}", chunk_ids.len(), path);
+        Response::Ok { data: None }
+    }
 
-                            info!("Replicating metadata deletion for file: {}", path_clone);
+    /// Handle DeleteChunksBatch — leader sends one of these per peer during drain.
+    /// Recipient deletes all listed chunks from local storage + metadata, then acks.
+    async fn handle_delete_chunks_batch(
+        &self,
+        file_id: FileId,
+        path: String,
+        chunk_ids: Vec<ChunkId>,
+    ) -> Response {
+        info!("DeleteChunksBatch: {} chunks for {} ({})", chunk_ids.len(), path, file_id);
 
-                            for node in &nodes {
-                                // Skip self and offline nodes
-                                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                                    continue;
-                                }
+        // Tombstone so in-flight replicates can't resurrect the file.
+        self.delete_tombstones.insert(file_id, std::time::Instant::now());
 
-                                let chunk_ids_for_delete: Vec<ChunkId> = chunk_locations.iter()
-                                    .map(|loc| loc.chunk_id)
-                                    .collect();
-                                let request = Request::DeleteMetadata {
-                                    file_id,
-                                    path: path_clone.clone(),
-                                    chunk_ids: chunk_ids_for_delete,
-                                    ttl: 1,
-                                };
+        // Wipe metadata (idempotent — already gone on quorum nodes).
+        let _ = self.metadata.delete_file(&file_id);
+        let _ = self.metadata.delete_path_index(&path);
+        self.chunk_map_remove(&file_id).await;
 
-                                if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
-                                    warn!("Failed to replicate metadata deletion to node {}: {}", node.id, e);
-                                }
-                            }
+        for chunk_id in &chunk_ids {
+            let _ = self.metadata.delete_chunk_location(chunk_id);
+            if let Err(e) = self.storage.delete_chunk(chunk_id) {
+                // Not present locally — fine, log at debug.
+                debug!("DeleteChunksBatch: chunk {} not local: {}", chunk_id, e);
+            }
+        }
 
-                            // Delete chunks from ALL online nodes — not just loc.nodes.
-                            // The healer may have replicated to nodes not listed in loc.nodes;
-                            // those copies cause corruption after delete+rewrite.
-                            //
-                            // Send all DeleteChunk RPCs concurrently then join — sequential
-                            // sends for a 381-chunk file × 4 nodes = 1,524 sequential awaits
-                            // stalled the entire cluster for ~110 seconds.
-                            info!("Deleting {} chunks from all nodes for file: {}", chunk_locations.len(), path_clone);
+        Response::Ok { data: None }
+    }
 
-                            let mut handles = Vec::new();
+    /// Handle ClearDeleteQueueEntry — leader broadcasts this after all nodes ack.
+    async fn handle_clear_delete_queue_entry(&self, file_id: FileId) -> Response {
+        if let Err(e) = self.metadata.dequeue_delete(&file_id) {
+            warn!("ClearDeleteQueueEntry: failed to remove {} from queue: {}", file_id, e);
+        }
+        Response::Ok { data: None }
+    }
 
-                            for loc in &chunk_locations {
-                                let chunk_id = &loc.chunk_id;
-
-                                // Delete locally if this node holds it
-                                if loc.nodes.contains(&local_id) {
-                                    if let Err(e) = storage.delete_chunk(chunk_id) {
-                                        warn!("Failed to delete local chunk {}: {}", chunk_id, e);
-                                    }
-                                }
-                                let _ = metadata_store.delete_chunk_location(chunk_id);
-
-                                // Spawn one task per (chunk, node) pair — all run concurrently.
-                                for node in &nodes {
-                                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                                        continue;
-                                    }
-                                    let client2 = client.clone();
-                                    let addr = node.addr;
-                                    let chunk_id_copy = *chunk_id;
-                                    handles.push(tokio::spawn(async move {
-                                        let request = Request::DeleteChunk { chunk_id: chunk_id_copy };
-                                        if let Err(e) = client2.send_message(addr, Message::Request(request)).await {
-                                            warn!("Failed to delete chunk {} from node {}: {}", chunk_id_copy, addr, e);
-                                            return false;
-                                        }
-                                        true
-                                    }));
-                                }
-                            }
-
-                            // Await all in parallel — gives us confirmation without serialising.
-                            let total = handles.len();
-                            let mut failed = 0usize;
-                            for h in handles {
-                                match h.await {
-                                    Ok(true) => {}
-                                    _ => failed += 1,
-                                }
-                            }
-                            if failed > 0 {
-                                warn!("Chunk deletion for {}: {}/{} remote deletes failed (healer will clean up)", path_clone, failed, total);
-                            } else {
-                                info!("Chunk deletion complete for file: {} ({} remote deletes confirmed)", path_clone, total);
-                            }
-                        });
-
-                        Response::Ok { data: None }
-                    }
-                    Err(e) => {
-                        warn!("Failed to delete file metadata: {}", e);
-                        Response::Error {
-                            message: format!("Failed to delete file: {}", e),
-                            code: ErrorCode::InternalError,
-                        }
-                    }
+    /// Handle GetDeleteQueue — leader polls all nodes on startup/election to merge queues.
+    async fn handle_get_delete_queue(&self) -> Response {
+        match self.metadata.get_all_pending_deletes() {
+            Ok(entries) => Response::DeleteQueue { entries },
+            Err(e) => {
+                warn!("GetDeleteQueue: failed to read delete queue: {}", e);
+                Response::Error {
+                    message: format!("Failed to read delete queue: {}", e),
+                    code: ErrorCode::InternalError,
                 }
             }
-            Ok(None) => {
-                // File not found on this node.
-                // Only the leader fans out to peers — followers return NotFound so the
-                // client can redirect to the leader. This prevents the N×N cascade where
-                // every follower forwards to every other node on a burst of deletes,
-                // saturating thread pools and starving heartbeats.
-                if !self.cluster.is_leader().await {
-                    return Response::Error {
-                        message: "File not found".to_string(),
-                        code: ErrorCode::NotFound,
-                    };
+        }
+    }
+
+    /// Send a Request to a node and extract the Response from the envelope.
+    async fn send_req(&self, addr: std::net::SocketAddr, req: Request) -> Result<Response> {
+        let envelope = self.client.send_message(addr, Message::Request(req)).await?;
+        match envelope.message {
+            Message::Response(r) => Ok(r),
+            other => anyhow::bail!("unexpected message type: {:?}", other),
+        }
+    }
+
+    /// Leader-only background worker: drains the delete queue.
+    ///
+    /// On becoming leader, polls all nodes for their queues and merges them locally,
+    /// then continuously drains: for each queued deletion, sends DeleteChunksBatch to
+    /// every node that holds at least one chunk, waits for all acks, then broadcasts
+    /// ClearDeleteQueueEntry to all nodes.
+    pub fn start_delete_drain_loop(self: Arc<Self>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut was_leader = false;
+            loop {
+                // Wait for a notify (new delete enqueued) or periodic poll.
+                tokio::select! {
+                    _ = server.delete_drain_notify.notified() => {}
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {}
                 }
-                // Leader: broadcast to all peers so every node's path: index is cleaned.
-                // Spawned fire-and-forget — handler returns immediately.
-                // Uses delete_semaphore (4 permits) not broadcast_semaphore so delete
-                // bursts don't starve metadata replication.
-                let sem = self.delete_semaphore.clone();
-                let cluster = self.cluster.clone();
-                let client = self.client.clone();
-                let local_id = self.cluster.local_node_id();
-                let path_clone = path.clone();
-                tokio::spawn(async move {
-                    let _permit = sem.acquire().await.ok();
-                    let nodes = cluster.get_all_nodes().await;
+
+                let is_leader = server.cluster.is_leader().await;
+
+                // On leadership acquisition: poll all nodes, merge their queues into ours.
+                if is_leader && !was_leader {
+                    info!("delete_drain: became leader — merging delete queues from all nodes");
+                    let nodes = server.cluster.get_all_nodes().await;
+                    let local_id = server.cluster.local_node_id();
                     for node in &nodes {
                         if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                             continue;
                         }
-                        let req = Request::DeleteFile { path: path_clone.clone() };
-                        let result = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(5),
-                            client.send_message(node.addr, Message::Request(req)),
-                        ).await;
-                        if let Err(e) = result.map_err(|_| anyhow::anyhow!("timeout")).and_then(|r| r) {
-                            warn!("Failed to forward DeleteFile to node {}: {}", node.id, e);
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(10),
+                            server.send_req(node.addr, Request::GetDeleteQueue),
+                        ).await {
+                            Ok(Ok(Response::DeleteQueue { entries })) => {
+                                let existing = server.metadata.get_all_pending_deletes().unwrap_or_default();
+                                for entry in entries {
+                                    if !existing.iter().any(|e| e.file_id == entry.file_id) {
+                                        if let Err(e) = server.metadata.enqueue_delete(&entry) {
+                                            warn!("delete_drain: failed to merge entry from {}: {}", node.id, e);
+                                        } else {
+                                            info!("delete_drain: merged queued delete for {} from {}", entry.path, node.id);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Ok(_)) => warn!("delete_drain: unexpected response from {} for GetDeleteQueue", node.id),
+                            Ok(Err(e)) => warn!("delete_drain: GetDeleteQueue from {} failed: {}", node.id, e),
+                            Err(_) => warn!("delete_drain: GetDeleteQueue from {} timed out", node.id),
                         }
                     }
-                });
-                Response::Ok { data: None }
-            }
-            Err(e) => {
-                warn!("Failed to find file: {}", e);
-                Response::Error {
-                    message: format!("Failed to delete file: {}", e),
-                    code: ErrorCode::InternalError,
+                }
+
+                was_leader = is_leader;
+                if !is_leader {
+                    continue;
+                }
+
+                // Drain all pending entries.
+                let entries = match server.metadata.get_all_pending_deletes() {
+                    Ok(e) => e,
+                    Err(e) => { warn!("delete_drain: failed to read queue: {}", e); continue; }
+                };
+
+                if entries.is_empty() {
+                    continue;
+                }
+
+                info!("delete_drain: {} entries to process", entries.len());
+
+                for entry in entries {
+                    server.drain_one_delete(entry).await;
                 }
             }
+        });
+    }
+
+    /// Drain a single delete queue entry: send DeleteChunksBatch to all nodes that hold
+    /// at least one chunk, wait for acks, then clear the entry from all queues.
+    async fn drain_one_delete(&self, entry: dfs_common::DeleteQueueEntry) {
+        let nodes = self.cluster.get_all_nodes().await;
+        let local_id = self.cluster.local_node_id();
+
+        // Determine which nodes hold at least one chunk from the chunk map.
+        // Fall back to all online nodes if the chunk map entry is gone (already cleaned).
+        let chunk_holders: std::collections::HashSet<dfs_common::NodeId> = {
+            if let Some(map_entry) = self.chunk_map.get(&entry.file_id) {
+                map_entry.0.iter()
+                    .flat_map(|loc| loc.nodes.iter().copied())
+                    .collect()
+            } else {
+                // Chunk map entry already gone — send to all online nodes to be safe.
+                nodes.iter()
+                    .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                    .map(|n| n.id)
+                    .collect()
+            }
+        };
+
+        // Delete locally if this node is a chunk holder.
+        if chunk_holders.contains(&local_id) {
+            for chunk_id in &entry.chunk_ids {
+                let _ = self.metadata.delete_chunk_location(chunk_id);
+                if let Err(e) = self.storage.delete_chunk(chunk_id) {
+                    debug!("drain_one_delete: local chunk {} not present: {}", chunk_id, e);
+                }
+            }
+            let _ = self.metadata.delete_file(&entry.file_id);
+            let _ = self.metadata.delete_path_index(&entry.path);
+            self.chunk_map_remove(&entry.file_id).await;
+        }
+
+        // Send DeleteChunksBatch to each peer that holds chunks, collect acks.
+        let mut all_acked = true;
+        for node in &nodes {
+            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+            if !chunk_holders.contains(&node.id) {
+                continue;
+            }
+
+            let req = Request::DeleteChunksBatch {
+                file_id: entry.file_id,
+                path: entry.path.clone(),
+                chunk_ids: entry.chunk_ids.clone(),
+            };
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                self.send_req(node.addr, req),
+            ).await {
+                Ok(Ok(Response::Ok { .. })) => {
+                    debug!("drain_one_delete: node {} acked delete of {}", node.id, entry.path);
+                }
+                Ok(Ok(_)) => {
+                    warn!("drain_one_delete: unexpected response from {} for {}", node.id, entry.path);
+                    all_acked = false;
+                }
+                Ok(Err(e)) => {
+                    warn!("drain_one_delete: node {} failed for {}: {}", node.id, entry.path, e);
+                    all_acked = false;
+                }
+                Err(_) => {
+                    warn!("drain_one_delete: node {} timed out for {}", node.id, entry.path);
+                    all_acked = false;
+                }
+            }
+        }
+
+        if !all_acked {
+            // Leave in queue — will retry on next drain cycle.
+            info!("drain_one_delete: some nodes failed for {} — will retry", entry.path);
+            return;
+        }
+
+        // All chunk-holding nodes acked. Clear the queue entry from all nodes.
+        info!("drain_one_delete: all nodes acked deletion of {} — clearing queue", entry.path);
+        if let Err(e) = self.metadata.dequeue_delete(&entry.file_id) {
+            warn!("drain_one_delete: failed to clear local queue entry for {}: {}", entry.path, e);
+        }
+
+        // Fire-and-forget ClearDeleteQueueEntry to all peers.
+        for node in &nodes {
+            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+            let req = Request::ClearDeleteQueueEntry { file_id: entry.file_id };
+            let client = self.client.clone();
+            let addr = node.addr;
+            let path_clone = entry.path.clone();
+            let node_id = node.id;
+            tokio::spawn(async move {
+                let msg = Message::Request(req);
+                if let Err(e) = client.send_message(addr, msg).await {
+                    warn!("drain_one_delete: ClearDeleteQueueEntry to {} failed for {}: {}", node_id, path_clone, e);
+                }
+            });
         }
     }
 

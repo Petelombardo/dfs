@@ -38,6 +38,11 @@ pub struct MetadataStore {
     /// Last sequence number received from the leader (follower-only).
     /// Key: b"follower_seq". Used by new leaders for catch-up calculation.
     pub follower_seq_tree: sled::Tree,
+
+    /// Durable delete queue — survives restarts so chunk cleanup is never lost.
+    /// Key: `del:{file_id_hex}` — Value: bincode-serialized DeleteQueueEntry.
+    /// Written BEFORE metadata is deleted; cleared by leader after all nodes ack.
+    pub delete_queue: sled::Tree,
 }
 
 impl MetadataStore {
@@ -71,10 +76,12 @@ impl MetadataStore {
             .context("Failed to open meta_seq tree")?;
         let follower_seq_tree = db.open_tree(b"follower_seq")
             .context("Failed to open follower_seq tree")?;
+        let delete_queue = db.open_tree(b"delete_queue")
+            .context("Failed to open delete_queue tree")?;
 
         info!("Initialized metadata store at {:?} (cache: {}MB)", metadata_dir, cache_capacity_mb);
 
-        Ok(Self { db, meta_queue, meta_queue_idx, meta_seq_tree, follower_seq_tree })
+        Ok(Self { db, meta_queue, meta_queue_idx, meta_seq_tree, follower_seq_tree, delete_queue })
     }
 
     /// Scan all `file:` records and re-create any missing `path:` index entries.
@@ -778,6 +785,36 @@ impl MetadataStore {
             file_count,
             size_on_disk,
         })
+    }
+
+    /// Enqueue a pending deletion. Written BEFORE metadata is removed so the
+    /// chunk list is never lost even on a crash mid-delete.
+    pub fn enqueue_delete(&self, entry: &dfs_common::DeleteQueueEntry) -> Result<()> {
+        let key = format!("del:{}", entry.file_id).into_bytes();
+        let value = bincode::serialize(entry)
+            .context("Failed to serialize DeleteQueueEntry")?;
+        self.delete_queue.insert(key, value)?;
+        Ok(())
+    }
+
+    /// Remove a completed deletion from the queue (called after all nodes ack).
+    pub fn dequeue_delete(&self, file_id: &FileId) -> Result<()> {
+        let key = format!("del:{}", file_id).into_bytes();
+        self.delete_queue.remove(key)?;
+        Ok(())
+    }
+
+    /// Return all pending delete queue entries (for GetDeleteQueue / leader merge).
+    pub fn get_all_pending_deletes(&self) -> Result<Vec<dfs_common::DeleteQueueEntry>> {
+        let mut entries = Vec::new();
+        for item in self.delete_queue.scan_prefix(b"del:") {
+            let (_, value) = item?;
+            match bincode::deserialize::<dfs_common::DeleteQueueEntry>(&value) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => warn!("Skipping corrupt delete queue entry: {}", e),
+            }
+        }
+        Ok(entries)
     }
 
     /// Key for file metadata

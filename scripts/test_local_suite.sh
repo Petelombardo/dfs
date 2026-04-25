@@ -400,6 +400,44 @@ rm -f "$T18_DST"
 
 ./scripts/test_dvr_stream.sh
 
+# ── Test 19: large-file delete — non-blocking rm + async chunk cleanup ────────
+echo ""
+echo "=== T19: large-file delete (400MB / ~100 chunks) ==="
+dd if=/dev/urandom of="$T/t19_large.bin" bs=1M count=400 2>/dev/null
+cp "$T/t19_large.bin" "$MOUNT/t19_large.bin"
+sync
+sleep 3
+# Drop the kernel page cache so the read-back goes to the DFS servers cold,
+# not the write-path chunk cache which may hold intermediate chunk states.
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+T19_MD5_LOCAL=$(md5sum "$T/t19_large.bin" | cut -d' ' -f1)
+T19_MD5_DFS=$(md5sum "$MOUNT/t19_large.bin" | cut -d' ' -f1)
+[ "$T19_MD5_LOCAL" = "$T19_MD5_DFS" ] && check "T19a 400MB write+read integrity" PASS \
+    || check "T19a 400MB write+read integrity (exp $T19_MD5_LOCAL got $T19_MD5_DFS)" FAIL
+
+CHUNKS_BEFORE=$(find /tmp/dfs-test/node{1,2,3}/data/chunks -type f 2>/dev/null | wc -l)
+
+T19_START=$(date +%s%3N)
+rm "$MOUNT/t19_large.bin"
+T19_MS=$(( $(date +%s%3N) - T19_START ))
+
+[ ! -f "$MOUNT/t19_large.bin" ] && check "T19b file gone from namespace immediately" PASS \
+    || check "T19b file still visible after rm" FAIL
+
+[ "$T19_MS" -lt 5000 ] && check "T19c rm non-blocking (${T19_MS}ms)" PASS \
+    || check "T19c rm blocked too long (${T19_MS}ms, expected <5000ms)" FAIL
+
+# Wait up to 60s for drain worker to delete chunks from disk
+T19_WAITED=0
+while [ $T19_WAITED -lt 60 ]; do
+    sleep 2; T19_WAITED=$((T19_WAITED + 2))
+    CHUNKS_AFTER=$(find /tmp/dfs-test/node{1,2,3}/data/chunks -type f 2>/dev/null | wc -l)
+    [ "$CHUNKS_AFTER" -lt "$CHUNKS_BEFORE" ] && break
+done
+[ "$CHUNKS_AFTER" -lt "$CHUNKS_BEFORE" ] \
+    && check "T19d chunks deleted from disk within ${T19_WAITED}s (${CHUNKS_BEFORE}→${CHUNKS_AFTER})" PASS \
+    || check "T19d chunks not deleted after ${T19_WAITED}s (before=$CHUNKS_BEFORE after=$CHUNKS_AFTER)" FAIL
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="
@@ -410,7 +448,7 @@ pkill -f "dfs-server" 2>/dev/null || true
 rm -rf "$T"
 
 echo ""
-echo "══════════════════════════════════════"
+echo "════════════════════════════════════════════"
 echo "  Results: $PASS passed, $FAIL failed"
-echo "══════════════════════════════════════"
+echo "════════════════════════════════════════════"
 [ $FAIL -eq 0 ] && exit 0 || exit 1

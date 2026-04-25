@@ -80,7 +80,7 @@ pub enum Request {
         checksum: [u8; 32],
     },
 
-    /// Delete a chunk
+    /// Delete a chunk (legacy — kept for DeleteChunkReplica compat; prefer DeleteChunksBatch)
     DeleteChunk {
         chunk_id: ChunkId,
     },
@@ -92,6 +92,24 @@ pub enum Request {
         chunk_id: ChunkId,
         leader_id: NodeId,
     },
+
+    /// Leader-to-follower: delete all listed chunks from local storage and metadata.
+    /// Sent once per peer by the delete drain worker. Recipient acks after all chunks
+    /// are deleted (missing chunks are not an error — already gone is fine).
+    DeleteChunksBatch {
+        file_id: FileId,
+        path: String,
+        chunk_ids: Vec<ChunkId>,
+    },
+
+    /// Leader-to-all: the queued deletion for file_id is fully complete — remove it
+    /// from the local sled delete queue. Fire-and-forget; idempotent.
+    ClearDeleteQueueEntry {
+        file_id: FileId,
+    },
+
+    /// Leader polls all nodes for their pending delete queues on startup/election.
+    GetDeleteQueue,
 
     /// Check if a chunk exists
     HasChunk {
@@ -545,6 +563,11 @@ pub enum Response {
         sequence: u64,
     },
 
+    /// Response to GetDeleteQueue — all pending delete queue entries on this node.
+    DeleteQueue {
+        entries: Vec<DeleteQueueEntry>,
+    },
+
     /// Response to GetFileInventory — compact list of all known files.
     FileInventory {
         /// (file_id, modified_at) for every file record on this node.
@@ -561,6 +584,15 @@ pub enum Response {
         message: String,
         code: ErrorCode,
     },
+}
+
+/// A pending file deletion entry — stored in each node's sled delete queue.
+/// Chunk data is not deleted until the leader drains this entry to all peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteQueueEntry {
+    pub file_id: FileId,
+    pub path: String,
+    pub chunk_ids: Vec<ChunkId>,
 }
 
 /// Error codes for protocol operations

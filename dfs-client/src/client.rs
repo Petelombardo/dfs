@@ -4056,43 +4056,77 @@ leader_addr: Arc::new(RwLock::new(None)),
 
     /// Delete file
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let request = Request::DeleteFile {
-            path: path.to_string(),
-        };
+        // Fan out to quorum (leader + 2 other online nodes) simultaneously.
+        // Each recipient enqueues the deletion durably to sled and wipes local
+        // metadata before acking — so the file disappears from the namespace
+        // on all 3 nodes before this call returns. Chunk cleanup happens
+        // asynchronously via the leader's drain worker; it never blocks the client.
+        //
+        // If the leader is down, pick any 3 online nodes. The new leader will
+        // poll all nodes for their delete queues on election and resume the drain.
+        let request = Request::DeleteFile { path: path.to_string() };
 
-        // Always send deletes to the leader. If sent to a follower that doesn't hold
-        // the file, the follower broadcasts to all peers — with a glob delete of
-        // hundreds of files this fans out to thousands of concurrent connections and
-        // exhausts file descriptors on every node. The leader always has the authoritative
-        // metadata and handles the broadcast itself under the broadcast_semaphore.
-        let response = {
-            let leader = self.leader_addr.read().await;
-            match *leader {
-                Some(addr) => match self.send_request(addr, request.clone()).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("delete_file to leader failed ({}), retrying any node", e);
-                        self.send_request_with_retry(request).await?
-                    }
-                },
-                None => self.send_request_with_retry(request).await?,
-            }
-        };
+        let all_nodes = self.cluster_nodes.read().await.clone();
+        let leader = *self.leader_addr.read().await;
 
-        match response {
-            Response::Ok { .. } => Ok(()),
-            Response::Error { code: ErrorCode::NotFound, .. } => {
-                // File already gone — treat as success (idempotent delete).
-                // This can happen when a glob delete races: the first rm succeeds,
-                // the kernel dentry cache still has the inode, and the second rm
-                // fires before the kernel notices it's gone.
-                Ok(())
-            }
-            Response::Error { message, .. } => {
-                anyhow::bail!("Failed to delete file: {}", message);
-            }
-            _ => anyhow::bail!("Unexpected response type"),
+        // Build quorum: leader first, then up to 2 others.
+        let mut quorum: Vec<SocketAddr> = Vec::with_capacity(3);
+        if let Some(leader_addr) = leader {
+            quorum.push(leader_addr);
         }
+        for &addr in &all_nodes {
+            if quorum.len() >= 3 { break; }
+            if !quorum.contains(&addr) {
+                quorum.push(addr);
+            }
+        }
+        if quorum.is_empty() {
+            anyhow::bail!("No nodes available for delete");
+        }
+
+        // Fire all quorum RPCs concurrently via independent tasks.
+        // Each task gets its own Arc clone so no lifetime issues.
+        let handles: Vec<_> = quorum.iter().map(|&addr| {
+            let req = request.clone();
+            let this = self.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    this.send_request(addr, req),
+                ).await
+            })
+        }).collect();
+
+        let mut not_found_count = 0usize;
+        let mut success_count = 0usize;
+        let quorum_len = quorum.len();
+        for h in handles {
+            // h.await: Result<Result<Result<Response, Error>, Elapsed>, JoinError>
+            match h.await {
+                Ok(Ok(Ok(Response::Ok { .. }))) => { success_count += 1; }
+                Ok(Ok(Ok(Response::Error { code: ErrorCode::NotFound, .. }))) => {
+                    not_found_count += 1;
+                    success_count += 1;
+                }
+                Ok(Ok(Ok(Response::Error { message, .. }))) => {
+                    warn!("delete_file: node returned error for {}: {}", path, message);
+                }
+                Ok(Ok(Ok(_))) => { warn!("delete_file: unexpected response for {}", path); }
+                Ok(Ok(Err(e))) => { warn!("delete_file: RPC failed for {}: {}", path, e); }
+                Ok(Err(_)) => { warn!("delete_file: RPC timed out for {}", path); }
+                Err(e) => { warn!("delete_file: task panicked for {}: {}", path, e); }
+            }
+        }
+
+        if not_found_count == quorum_len {
+            // Every node said NotFound — file was already gone.
+            return Ok(());
+        }
+        if success_count == 0 {
+            anyhow::bail!("delete_file: all quorum nodes failed for {}", path);
+        }
+
+        Ok(())
     }
 
     /// Purge file metadata without deleting chunks (for rename operations)

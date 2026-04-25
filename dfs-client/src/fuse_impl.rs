@@ -491,8 +491,51 @@ impl FlushHandle {
                             }
                         }
                     } else {
-                        warn!("flush_buffer_async: no chunk_location for slot {} — cannot patch, falling back to full write", chunk_idx);
-                        false
+                        // chunk_locations[chunk_idx] is missing — our local cache is stale.
+                        // This happens during long live recordings when the server has committed
+                        // more chunks than the client's metadata_cache reflects. Fetching fresh
+                        // metadata here prevents a ghost chunk accumulation: without this, we
+                        // fall through to a fresh write that appends a duplicate tail entry
+                        // instead of patching the existing one, producing hundreds of spurious
+                        // partial chunk_location records that break Kodi seekability.
+                        warn!("flush_buffer_async: no chunk_location for slot {} in local cache — fetching fresh metadata before deciding", chunk_idx);
+                        let path_opt = self.path_to_inode.read().unwrap()
+                            .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                        let mut refreshed = false;
+                        if let Some(path) = path_opt {
+                            if let Ok(Some(fresh_meta)) = self.client.get_file_metadata(&path).await {
+                                self.client.seed_write_seq(fresh_meta.id, fresh_meta.write_seq);
+                                let fresh_loc = fresh_meta.chunk_locations.get(chunk_idx_usize).cloned();
+                                self.metadata_cache.insert(ino, fresh_meta);
+                                if let Some(old_location) = fresh_loc {
+                                    info!("flush_buffer_async: retrying PatchChunk slot {} after cache refresh (loc={})", chunk_idx, old_location.chunk_id);
+                                    let retry = self.client.patch_chunk_on_replicas(
+                                        old_location.chunk_id,
+                                        file_offset,
+                                        patch_intra,
+                                        patch_bytes.clone(),
+                                        &old_location,
+                                    ).await;
+                                    match retry {
+                                        Ok(new_location) => {
+                                            info!("flush_buffer_async: PatchChunk slot {} succeeded after cache refresh: {} -> {}",
+                                                  chunk_idx, old_location.chunk_id, new_location.chunk_id);
+                                            if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                                                if let Some(loc) = meta_entry.chunk_locations.get_mut(chunk_idx_usize) {
+                                                    *loc = new_location.clone();
+                                                }
+                                            }
+                                            patch_metadata_dirty = true;
+                                            refreshed = true;
+                                        }
+                                        Err(e) => {
+                                            warn!("flush_buffer_async: PatchChunk slot {} failed after cache refresh: {}", chunk_idx, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        refreshed
                     }
                 } else {
                     false
@@ -2165,20 +2208,14 @@ impl Filesystem for DfsFilesystem {
             }
         }
 
-        // Use direct I/O for SQLite (required for correctness) and for files with an
-        // active writer (live recordings). With KEEP_CACHE the kernel page cache fills
-        // gaps with zeros when FUSE returns a short/empty read — e.g. when the write
-        // buffer doesn't have the data yet. Direct I/O bypasses the cache so short reads
-        // are passed through as-is without being cached as zeros.
-        let has_active_writer_for_open = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
-        if is_sqlite || has_active_writer_for_open {
-            if is_sqlite {
-                info!("open: ino={} - SQLite database detected, using direct I/O", ino);
-            }
-            reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
-        } else {
-            reply.opened(0, fuser::consts::FOPEN_KEEP_CACHE);
+        // Always use direct I/O — we maintain our own chunk LRU cache, so the kernel
+        // page cache is redundant and wastes memory. Direct I/O also prevents the kernel
+        // from filling short reads with zeros (write-edge returns on live recordings)
+        // and avoids stale cached data when chunk IDs change after PatchChunk.
+        if is_sqlite {
+            info!("open: ino={} - SQLite database detected, using direct I/O", ino);
         }
+        reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
         info!("open: ino={} DONE — reply sent", ino);
     }
 

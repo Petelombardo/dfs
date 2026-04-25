@@ -14,7 +14,7 @@ echo "Setting up ${NUM_NODES}-node DFS cluster..."
 echo "Cleaning up existing cluster..."
 pkill -f "dfs-server" || true
 fusermount -u /tmp/dfs-mount 2>/dev/null || true
-rm -rf "${BASE_DIR}"
+sudo rm -rf "${BASE_DIR}" 2>/dev/null || rm -rf "${BASE_DIR}" 2>/dev/null || true
 mkdir -p "${BASE_DIR}"
 
 # Initialize nodes

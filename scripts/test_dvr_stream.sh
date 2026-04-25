@@ -13,8 +13,8 @@ WRITE_REF="$LOCAL_DIR/write_reference.mpg"
 DFS_READBACK="$LOCAL_DIR/dfs_readback.mpg"
 READ_COPY="$LOCAL_DIR/read_copy.mpg"
 CHUNK_SIZE=$((4 * 1024 * 1024))
-CAPTURE_SIZE="16M"
-RATE="2M"
+CAPTURE_SIZE="32M"
+RATE="5M"
 READ_DELAY=6
 
 mkdir -p "$LOCAL_DIR"

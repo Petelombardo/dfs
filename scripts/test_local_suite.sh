@@ -21,7 +21,7 @@ pkill -f "dfs-server" 2>/dev/null || true
 pkill -f "dfs-client" 2>/dev/null || true
 sleep 0.5
 fusermount -u $MOUNT 2>/dev/null || true
-rm -rf $BASE $LOG $MOUNT $T
+sudo rm -rf $BASE $LOG $MOUNT $T 2>/dev/null || rm -rf $BASE $LOG $MOUNT $T 2>/dev/null || true
 mkdir -p $MOUNT $LOG $T
 
 echo "=== Building ==="

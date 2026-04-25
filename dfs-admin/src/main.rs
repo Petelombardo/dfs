@@ -50,6 +50,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: FileCommands,
     },
+
+    /// Delete queue management commands
+    Delete {
+        #[command(subcommand)]
+        cmd: DeleteCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,6 +128,12 @@ enum FileCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum DeleteCommands {
+    /// Show pending delete queue entries across all nodes
+    Queue,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Reset SIGPIPE to default so piping to `head`, `grep`, etc. terminates cleanly
@@ -163,6 +175,7 @@ async fn main() -> Result<()> {
             handle_healing_command(cmd, &cluster_addrs, json_output).await?
         }
         Commands::File { cmd } => handle_file_command(cmd, &cluster_addrs, json_output).await?,
+        Commands::Delete { cmd } => handle_delete_command(cmd, &cluster_addrs, json_output).await?,
     }
 
     Ok(())
@@ -1108,6 +1121,64 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.2} {}", size, UNITS[unit_index])
     }
+}
+
+async fn handle_delete_command(
+    cmd: DeleteCommands,
+    cluster_addrs: &[SocketAddr],
+    json_output: bool,
+) -> Result<()> {
+    match cmd {
+        DeleteCommands::Queue => {
+            // Poll every node for its pending delete queue and display the union.
+            // Entries may appear on multiple nodes (quorum write); we dedup by file_id.
+            let mut seen: std::collections::HashMap<dfs_common::FileId, (String, usize, Vec<SocketAddr>)> = std::collections::HashMap::new();
+
+            for &addr in cluster_addrs {
+                match send_request(addr, Request::GetDeleteQueue).await {
+                    Ok(Response::DeleteQueue { entries }) => {
+                        for entry in entries {
+                            seen.entry(entry.file_id)
+                                .and_modify(|e| e.2.push(addr))
+                                .or_insert((entry.path, entry.chunk_ids.len(), vec![addr]));
+                        }
+                    }
+                    Ok(_) => eprintln!("Unexpected response from {}", addr),
+                    Err(e) => eprintln!("Failed to query {}: {}", addr, e),
+                }
+            }
+
+            if seen.is_empty() {
+                if json_output {
+                    println!("[]");
+                } else {
+                    println!("Delete queue is empty.");
+                }
+                return Ok(());
+            }
+
+            if json_output {
+                let entries: Vec<_> = seen.values().map(|(path, chunks, nodes)| {
+                    serde_json::json!({
+                        "path": path,
+                        "chunks": chunks,
+                        "queued_on_nodes": nodes.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                println!("{} pending deletion(s):", seen.len());
+                println!("{:<6} {:<10} {}", "Chunks", "Nodes", "Path");
+                println!("{}", "-".repeat(70));
+                let mut entries: Vec<_> = seen.values().collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (path, chunks, nodes) in entries {
+                    println!("{:<6} {:<10} {}", chunks, nodes.len(), path);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {

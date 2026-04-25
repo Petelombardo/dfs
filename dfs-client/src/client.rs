@@ -1443,11 +1443,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let msg = e.to_string();
                     warn!("{} failed for chunk {}: {}", addr, cid, msg);
                     self.node_health.record_failure(addr).await;
-                    if msg.contains("permanently missing") || msg.contains("blocklisted")
-                        || msg.contains("location not found")
-                    {
+                    if msg.contains("permanently missing") || msg.contains("location not found") {
                         anyhow::bail!("Chunk {} is permanently missing", cid);
                     }
+                    // "blocklisted" or "temporarily unavailable" — try next replica.
                 }
             }
         }

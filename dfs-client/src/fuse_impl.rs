@@ -186,6 +186,12 @@ impl InodeWriteState {
                 }
                 slot.data[intra..intra + n].copy_from_slice(&remaining[..n]);
             }
+            // If the app writes at or before the gap-filled prefix, real data now covers
+            // that region — shrink gap_filled_prefix so PatchChunk sends the real bytes
+            // rather than treating the entire gap-fill as already-on-server data.
+            if intra < slot.gap_filled_prefix {
+                slot.gap_filled_prefix = intra;
+            }
             slot.last_modified = SystemTime::now();
 
             if slot.is_full() {

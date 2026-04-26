@@ -76,7 +76,7 @@ impl InodeReadEngine {
             node_id_to_addr: Mutex::new(Arc::new(std::collections::HashMap::new())),
             in_flight: Mutex::new(HashSet::new()),
             pipeline_head: AtomicUsize::new(0),
-            pipeline_depth: 2,
+            pipeline_depth: 0,  // Prefetch disabled - on-demand fetching only
             refresh_in_progress: AtomicBool::new(false),
             last_failed_refresh_ms: AtomicU64::new(0),
             last_window_start: AtomicU32::new(0),

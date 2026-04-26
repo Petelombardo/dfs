@@ -37,6 +37,27 @@ where
     Ok(buf)
 }
 
+/// Write a write request using split-frame encoding:
+///   [4B envelope len][bincode envelope (data=empty)][4B raw len][raw bytes]
+/// This avoids bincode serialization overhead on large write payloads.
+pub async fn write_split_frame_request<W>(
+    stream: &mut W,
+    encoded_envelope: &[u8],
+    raw_data: &[u8],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let envelope_len = encoded_envelope.len() as u32;
+    let data_len = raw_data.len() as u32;
+
+    stream.write_all(&envelope_len.to_be_bytes()).await?;
+    stream.write_all(encoded_envelope).await?;
+    stream.write_all(&data_len.to_be_bytes()).await?;
+    stream.write_all(raw_data).await?;
+    stream.flush().await
+}
+
 /// Messages exchanged between nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {

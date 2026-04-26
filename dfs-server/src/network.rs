@@ -203,6 +203,30 @@ async fn read_message(
                     }
                 }
 
+                // Split-frame WriteFileLocalOnly: raw payload follows the envelope.
+                if let dfs_common::Message::Request(dfs_common::Request::WriteFileLocalOnly { ref mut data, .. }) = envelope.message {
+                    if data.is_empty() {
+                        // Drain raw payload from buf then stream.
+                        while buf.len() < 4 {
+                            if stream.read_buf(buf).await? == 0 {
+                                anyhow::bail!("Connection closed reading write payload length");
+                            }
+                        }
+                        let mut plen_bytes = [0u8; 4];
+                        plen_bytes.copy_from_slice(&buf[..4]);
+                        buf.advance(4);
+                        let plen = u32::from_be_bytes(plen_bytes) as usize;
+
+                        while buf.len() < plen {
+                            if stream.read_buf(buf).await? == 0 {
+                                anyhow::bail!("Connection closed reading write payload");
+                            }
+                        }
+                        *data = buf.split_to(plen).to_vec();
+                        debug!("Received split-frame write request: {} bytes", plen);
+                    }
+                }
+
                 return Ok(Some(envelope));
             }
         }

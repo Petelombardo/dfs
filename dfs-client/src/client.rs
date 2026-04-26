@@ -966,6 +966,376 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok(response)
     }
 
+    /// Send pre-serialized request bytes to a specific address
+    /// This is an optimization for cases where the same request needs to be sent to multiple servers
+    /// (e.g., dual-replica writes) - serialize once, send multiple times.
+    async fn send_encoded_request(&self, addr: SocketAddr, encoded: &[u8]) -> Result<Response> {
+        debug!("Sending pre-serialized request to {} ({} bytes)", addr, encoded.len());
+
+        // Try pooled connection first; on failure (stale) fall back to a fresh one.
+        let pooled = {
+            let mutex_opt = self.connection_pool.get(&addr).map(|e| Arc::clone(&*e));
+            if let Some(mutex) = mutex_opt {
+                mutex.lock().await.pop_front()
+            } else {
+                None
+            }
+        };
+
+        let mut stream = match pooled {
+            Some(s) => {
+                // Check if the server closed this connection while it was pooled.
+                let mut buf = [0u8; 1];
+                let peer_closed = match s.try_read(&mut buf) {
+                    Ok(0) => true,
+                    Ok(_) => true,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(_) => true,
+                };
+
+                if peer_closed {
+                    debug!("Pooled connection to {} closed by peer, reconnecting", addr);
+                    let mut s = s;
+                    let _ = s.shutdown().await;
+                    let fresh = tokio::time::timeout(
+                        tokio::time::Duration::from_millis(1000),
+                        TcpStream::connect(addr),
+                    ).await
+                        .map_err(|_| anyhow::anyhow!("Connect timeout to {}", addr))?
+                        .context("Failed to connect to node")?;
+                    let _ = fresh.set_nodelay(true);
+                    fresh
+                } else {
+                    s
+                }
+            }
+            None => {
+                let fresh = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await
+                    .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
+                    .context("Failed to connect to node")?;
+                let _ = fresh.set_nodelay(true);
+                fresh
+            }
+        };
+
+        // Send and receive with a 3s timeout
+        let io_future = async {
+            let len = encoded.len() as u32;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(encoded).await?;
+            stream.flush().await?;
+
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        };
+
+        let buf = match tokio::time::timeout(tokio::time::Duration::from_secs(3), io_future).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe
+                        || e.kind() == std::io::ErrorKind::ConnectionReset
+                        || e.kind() == std::io::ErrorKind::ConnectionAborted
+                        || e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!("Stale pooled connection to {} ({}), retrying with fresh connection", addr, e);
+                let mut fresh = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await {
+                    Ok(Ok(s)) => { let _ = s.set_nodelay(true); s }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node {}: {}", addr, e));
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
+                    }
+                };
+                let len = encoded.len() as u32;
+                let retry_result = async {
+                    fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
+                    fresh.write_all(encoded).await.context("write body")?;
+                    fresh.flush().await.context("flush")?;
+                    let mut len_buf = [0u8; 4];
+                    fresh.read_exact(&mut len_buf).await.context("read len")?;
+                    let rlen = u32::from_be_bytes(len_buf) as usize;
+                    let mut buf = vec![0u8; rlen];
+                    fresh.read_exact(&mut buf).await.context("read body")?;
+                    Ok::<Vec<u8>, anyhow::Error>(buf)
+                };
+                match tokio::time::timeout(tokio::time::Duration::from_secs(3), retry_result).await {
+                    Ok(Ok(buf)) => {
+                        stream = fresh;
+                        buf
+                    }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Timeout reading from {}", addr));
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                self.node_health.record_failure(addr).await;
+                return Err(anyhow::anyhow!("I/O error talking to {}: {}", addr, e));
+            }
+            Err(_) => {
+                let mut fresh = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await {
+                    Ok(Ok(s)) => { let _ = s.set_nodelay(true); s }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node {}: {}", addr, e));
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
+                    }
+                };
+
+                let len = encoded.len() as u32;
+                let retry_result = async {
+                    fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
+                    fresh.write_all(encoded).await.context("write body")?;
+                    fresh.flush().await.context("flush")?;
+                    let mut len_buf = [0u8; 4];
+                    fresh.read_exact(&mut len_buf).await.context("read len")?;
+                    let rlen = u32::from_be_bytes(len_buf) as usize;
+                    let mut buf = vec![0u8; rlen];
+                    fresh.read_exact(&mut buf).await.context("read body")?;
+                    Ok::<Vec<u8>, anyhow::Error>(buf)
+                };
+                match tokio::time::timeout(tokio::time::Duration::from_secs(3), retry_result).await {
+                    Ok(Ok(buf)) => {
+                        stream = fresh;
+                        buf
+                    }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Timeout reading from {}", addr));
+                    }
+                }
+            }
+        };
+
+        let response_envelope = MessageEnvelope::from_bytes(&buf)
+            .context("Failed to deserialize response")?;
+
+        let response = match response_envelope.message {
+            Message::Response(Response::ChunkData { data, chunk_id, cache_stats }) => {
+                // Split-frame: if data is empty, raw payload follows on the stream.
+                let data = if data.is_empty() {
+                    dfs_common::protocol::read_chunk_payload(&mut stream).await
+                        .context("read split-frame chunk payload")?
+                } else {
+                    data
+                };
+                Response::ChunkData { chunk_id, data, cache_stats }
+            }
+            Message::Response(response) => response,
+            _ => anyhow::bail!("Expected Response message"),
+        };
+
+        // Return connection to pool after all bytes are drained.
+        {
+            let mutex = {
+                let entry = self.connection_pool
+                    .entry(addr)
+                    .or_insert_with(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
+                Arc::clone(&*entry)
+            };
+            let mut queue = mutex.lock().await;
+            if queue.len() < 8 {
+                queue.push_back(stream);
+            }
+        }
+
+        self.node_health.record_success(addr).await;
+        Ok(response)
+    }
+
+    /// Send a write request using split-frame encoding to avoid bincode serialization overhead.
+    /// The envelope contains an empty data field; raw bytes are sent separately.
+    async fn send_split_frame_write_request(&self, addr: SocketAddr, encoded_envelope: &[u8], raw_data: &[u8]) -> Result<Response> {
+        debug!("Sending split-frame write request to {} ({} bytes data)", addr, raw_data.len());
+
+        // Try pooled connection first
+        let pooled = {
+            let mutex_opt = self.connection_pool.get(&addr).map(|e| Arc::clone(&*e));
+            if let Some(mutex) = mutex_opt {
+                mutex.lock().await.pop_front()
+            } else {
+                None
+            }
+        };
+
+        let mut stream = match pooled {
+            Some(s) => {
+                let mut buf = [0u8; 1];
+                let peer_closed = match s.try_read(&mut buf) {
+                    Ok(0) => true,
+                    Ok(_) => true,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(_) => true,
+                };
+
+                if peer_closed {
+                    debug!("Pooled connection to {} closed by peer, reconnecting", addr);
+                    let mut s = s;
+                    let _ = s.shutdown().await;
+                    let fresh = tokio::time::timeout(
+                        tokio::time::Duration::from_millis(1000),
+                        TcpStream::connect(addr),
+                    ).await
+                        .map_err(|_| anyhow::anyhow!("Connect timeout to {}", addr))?
+                        .context("Failed to connect to node")?;
+                    let _ = fresh.set_nodelay(true);
+                    fresh
+                } else {
+                    s
+                }
+            }
+            None => {
+                let fresh = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await
+                    .map_err(|_| anyhow::anyhow!("Failed to connect to node: connect timeout"))?
+                    .context("Failed to connect to node")?;
+                let _ = fresh.set_nodelay(true);
+                fresh
+            }
+        };
+
+        // Send using split-frame encoding (envelope with empty data + raw bytes)
+        let io_future = dfs_common::protocol::write_split_frame_request(&mut stream, encoded_envelope, raw_data);
+
+        match tokio::time::timeout(tokio::time::Duration::from_secs(3), io_future).await {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe
+                        || e.kind() == std::io::ErrorKind::ConnectionReset
+                        || e.kind() == std::io::ErrorKind::ConnectionAborted
+                        || e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!("Stale pooled connection to {} ({}), retrying with fresh connection", addr, e);
+                let mut fresh = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await {
+                    Ok(Ok(s)) => { let _ = s.set_nodelay(true); s }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node {}: {}", addr, e));
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
+                    }
+                };
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(3),
+                    dfs_common::protocol::write_split_frame_request(&mut fresh, encoded_envelope, raw_data)
+                ).await {
+                    Ok(Ok(())) => { stream = fresh; }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("I/O error on retry: {}", e));
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Timeout writing to {}", addr));
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                self.node_health.record_failure(addr).await;
+                return Err(anyhow::anyhow!("I/O error talking to {}: {}", addr, e));
+            }
+            Err(_) => {
+                let mut fresh = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(addr),
+                ).await {
+                    Ok(Ok(s)) => { let _ = s.set_nodelay(true); s }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node {}: {}", addr, e));
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
+                    }
+                };
+
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(3),
+                    dfs_common::protocol::write_split_frame_request(&mut fresh, encoded_envelope, raw_data)
+                ).await {
+                    Ok(Ok(())) => { stream = fresh; }
+                    Ok(Err(e)) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(e.into());
+                    }
+                    Err(_) => {
+                        self.node_health.record_failure(addr).await;
+                        return Err(anyhow::anyhow!("Timeout writing to {}", addr));
+                    }
+                }
+            }
+        }
+
+        // Read response
+        let recv_start = std::time::Instant::now();
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await?;
+        let recv_time = recv_start.elapsed();
+        debug!("Split-frame write response received in {:?}", recv_time);
+
+        let response_envelope = MessageEnvelope::from_bytes(&buf)
+            .context("Failed to deserialize response")?;
+
+        let response = match response_envelope.message {
+            Message::Response(response) => response,
+            _ => anyhow::bail!("Expected Response message"),
+        };
+
+        // Return connection to pool
+        {
+            let mutex = {
+                let entry = self.connection_pool
+                    .entry(addr)
+                    .or_insert_with(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
+                Arc::clone(&*entry)
+            };
+            let mut queue = mutex.lock().await;
+            if queue.len() < 8 {
+                queue.push_back(stream);
+            }
+        }
+
+        self.node_health.record_success(addr).await;
+        Ok(response)
+    }
+
     /// Get file metadata from cluster with optional conditional fetch
     /// Returns Ok(Some(metadata)) if found and modified, Ok(None) if not found, Err if error
     /// If if_modified_since is provided and metadata hasn't changed, returns Ok(None) with NotModified indicator
@@ -3063,15 +3433,25 @@ leader_addr: Arc::new(RwLock::new(None)),
         if candidates.len() >= 2 {
             let n1 = candidates[0];
             let n2 = candidates[1];
-            let req1 = Request::WriteFileLocalOnly { data: data.to_vec(), file_offset };
-            let req2 = Request::WriteFileLocalOnly { data: data.to_vec(), file_offset };
+
+            // Optimize: Use split-frame encoding to avoid bincode serialization of 4MB payload.
+            // Serialize a small envelope (data=empty) once, send to both replicas with raw bytes.
+            // This eliminates bincode overhead (~20-40ms) plus one 4MB copy (~25ms) = ~45-65ms savings.
+            let request = Request::WriteFileLocalOnly {
+                data: Vec::new(),  // Empty = split-frame indicator
+                file_offset
+            };
+            let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+            let envelope = MessageEnvelope::new(request_id, Message::Request(request));
+            let encoded = envelope.to_bytes().context("Failed to serialize write request")?;
+
             let t1 = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
-                self.send_request(n1, req1),
+                self.send_split_frame_write_request(n1, &encoded, data),
             );
             let t2 = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
-                self.send_request(n2, req2),
+                self.send_split_frame_write_request(n2, &encoded, data),
             );
             let (r1, r2) = tokio::join!(t1, t2);
             match r1 {
@@ -3097,10 +3477,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                 ),
             };
 
-            let request = Request::WriteFileLocalOnly { data: data.to_vec(), file_offset };
+            // Use split-frame encoding for serial fallback too
+            let request = Request::WriteFileLocalOnly {
+                data: Vec::new(),  // Empty = split-frame indicator
+                file_offset
+            };
+            let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+            let envelope = MessageEnvelope::new(request_id, Message::Request(request));
+            let encoded = envelope.to_bytes().context("Failed to serialize write request")?;
+
             let result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
-                self.send_request(node, request),
+                self.send_split_frame_write_request(node, &encoded, data),
             ).await;
 
             match result {

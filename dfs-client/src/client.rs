@@ -1577,15 +1577,16 @@ leader_addr: Arc::new(RwLock::new(None)),
         let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot().await;
 
         if chunk_map.is_empty() {
-            // Engine is cold. If there's an active writer the chunk hasn't been flushed to
-            // the server yet — a leader refresh will return nothing and record a 1s backoff,
-            // causing every subsequent read to stall. Return empty immediately; the FUSE
-            // write-buffer path handles reads within buffered data, and the flush path will
-            // feed the engine once the chunk is committed.
-            if has_active_writer {
+            // Engine is cold. Check if this read is beyond the committed file size.
+            // - If offset < file_size: data is committed on server, safe to refresh
+            // - If offset >= file_size: data might be in write buffer only, return empty
+            if has_active_writer && offset >= file_size as usize {
+                // Read is beyond committed size with active writer — data is in write buffer.
+                // The FUSE write-buffer path should have served this, but didn't (no slot).
+                // Return empty; the flush path will feed the engine once chunk is committed.
                 return Ok(Vec::new());
             }
-            // No active writer — do a synchronous refresh so this read doesn't return empty.
+            // Either no active writer, or read is within committed size — do synchronous refresh.
             // Force-clear refresh_in_progress in case open() already set it (open() spawned
             // a background prefetch which may still be in flight; we override it here so we
             // don't skip the refresh and return 0 bytes).
@@ -1595,12 +1596,6 @@ leader_addr: Arc::new(RwLock::new(None)),
             info!("read_file: inode={} synchronous chunk map refresh took {:?}", inode, sync_start.elapsed());
             let snap = engine.snapshot().await;
             chunk_map = snap.0; chunk_offsets = snap.1; nim = snap.2;
-        } else if current_chunk as usize >= chunk_map.len() && has_active_writer {
-            // Read is past the committed chunk map end on a live-written file.
-            // The chunk is still being written into the buffer — going to the leader returns
-            // nothing and triggers the 1s backoff. Return empty; the write-buffer path or
-            // the next flush will make this data available.
-            return Ok(Vec::new());
         } else if engine.needs_refresh(file_size, current_chunk).await {
             // Non-empty but stale — refresh in background, serve this read from current snapshot.
             let engine_clone = engine.clone();

@@ -94,12 +94,25 @@ impl InodeReadEngine {
     /// Force-expire the chunk map TTL so the next needs_refresh() call returns true.
     /// Called on open() to guarantee a fresh fetch after recording finishes.
     pub fn expire_chunk_map(&self) {
+        // Simply expire the TTL to force a refresh on next read.
+        // Don't clear the maps or reset known_size, as that causes needs_refresh()
+        // to trigger incorrectly during active writes (breaking T18/T19/T20).
         if let Ok(mut last) = self.last_map_refresh.try_lock() {
             *last = std::time::Instant::now() - std::time::Duration::from_secs(60);
         }
-        // Also reset window bounds so needs_refresh triggers on chunk position too.
+    }
+
+    /// Async version of expire_chunk_map that properly awaits async Mutex locks.
+    /// Guarantees chunk map is cleared (no try_lock failures).
+    pub async fn expire_chunk_map_async(&self) {
+        // Clear chunk maps with proper async locks - no try_lock, guaranteed to succeed
+        *self.chunk_map.lock().await = Arc::new(Vec::new());
+        *self.chunk_offsets.lock().await = Arc::new(Vec::new());
+        *self.last_map_refresh.lock().await = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        // Reset atomics
         self.last_window_start.store(u32::MAX, Ordering::Relaxed);
         self.last_window_end.store(0, Ordering::Relaxed);
+        self.known_size.store(0, Ordering::Relaxed);
     }
 
     /// Returns true if the chunk map needs a refresh.

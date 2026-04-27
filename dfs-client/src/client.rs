@@ -1803,8 +1803,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                         ) {
                             engine.in_flight.lock().await.insert(swarm_cid);
 
-                            // Stagger the second fetch by 10ms to avoid contention
-                            let stagger_ms = swarm_offset as u64 * 10;
+                            // Stagger the second fetch by 20ms to avoid contention
+                            let stagger_ms = swarm_offset as u64 * 20;
 
                             let client = self.clone();
                             let eng = engine.clone();
@@ -1820,7 +1820,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
                                         // Chain reaction: spawn the next chunk in sequence to maintain pipeline
                                         // But limit to MAX_AHEAD chunks beyond the pipeline_head to avoid runaway prefetch
-                                        const MAX_AHEAD: usize = 3;
+                                        const MAX_AHEAD: usize = 4;
                                         let next_idx = idx_copy + 2;
                                         let pipeline_pos = eng.pipeline_head.load(Ordering::Relaxed);
 

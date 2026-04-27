@@ -1,6 +1,8 @@
 # Debugging scripts
 debug_sqlite.sh
 test_sqlite_sync.sh
+deploy-to-clients
+deploy-to-servers
 
 # Deployment scripts (contain staging hostnames/paths)
 deploy-build

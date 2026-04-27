@@ -1771,6 +1771,101 @@ leader_addr: Arc::new(RwLock::new(None)),
             result_chunks.push((idx, data));
         }
 
+        // --- Staggered 2-chunk swarming for sequential reads ---
+        // If we just fetched chunks and they look sequential, proactively fetch the next
+        // 2 chunks with a 10ms stagger to avoid connection/disk/network contention.
+        // This keeps the pipeline full without the overhead of continuous prefetching.
+        if !to_fetch.is_empty() && !bypass_cache && needed.len() > 0 {
+            let last_fetched_idx = needed.last().map(|(i, _, _)| *i).unwrap_or(0);
+            let is_sequential = needed.len() == 1 || needed.windows(2).all(|w| w[1].0 == w[0].0 + 1);
+
+            if is_sequential && last_fetched_idx + 1 < chunk_map.len() {
+                // Spawn staggered fetches for next 2 chunks
+                let swarm_indices = vec![last_fetched_idx + 1, last_fetched_idx + 2]
+                    .into_iter()
+                    .filter(|&idx| idx < chunk_map.len())
+                    .collect::<Vec<_>>();
+
+                for (swarm_offset, swarm_idx) in swarm_indices.iter().enumerate() {
+                    let swarm_cid = chunk_map[*swarm_idx].chunk_id;
+
+                    // Only fetch if not already cached or in-flight
+                    let should_swarm = self.chunk_cache.get(&swarm_cid).await.is_none() && {
+                        let inf = engine.in_flight.lock().await;
+                        !inf.contains(&swarm_cid)
+                    };
+
+                    if should_swarm {
+                        let swarm_loc = &chunk_map[*swarm_idx];
+                        if let Some((primary, fallbacks)) = InodeReadEngine::resolve_primary(
+                            swarm_loc, &nim, &nodes, selector + *swarm_idx as u64,
+                        ) {
+                            engine.in_flight.lock().await.insert(swarm_cid);
+
+                            // Stagger the second fetch by 10ms to avoid contention
+                            let stagger_ms = swarm_offset as u64 * 10;
+
+                            let client = self.clone();
+                            let eng = engine.clone();
+                            let idx_copy = *swarm_idx;
+                            tokio::spawn(async move {
+                                if stagger_ms > 0 {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(stagger_ms)).await;
+                                }
+                                match client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks).await {
+                                    Ok(data) => {
+                                        client.chunk_cache.insert(swarm_cid, Arc::new(data)).await;
+                                        debug!("Swarming: fetched chunk {} (stagger {}ms)", idx_copy, stagger_ms);
+
+                                        // Chain reaction: spawn the next chunk in sequence to maintain pipeline
+                                        // But limit to MAX_AHEAD chunks beyond the pipeline_head to avoid runaway prefetch
+                                        const MAX_AHEAD: usize = 4;
+                                        let next_idx = idx_copy + 2;
+                                        let pipeline_pos = eng.pipeline_head.load(Ordering::Relaxed);
+
+                                        // Only chain if we're not too far ahead of the read position
+                                        if next_idx < pipeline_pos + MAX_AHEAD {
+                                            if let Some(e) = client.read_engines.engines.get(&eng.inode) {
+                                                let (cm, _co, nim) = e.snapshot().await;
+                                                if next_idx < cm.len() {
+                                                    let next_cid = cm[next_idx].chunk_id;
+                                                    let should_chain = client.chunk_cache.get(&next_cid).await.is_none() && {
+                                                        let inf = eng.in_flight.lock().await;
+                                                        !inf.contains(&next_cid)
+                                                    };
+                                                    if should_chain {
+                                                        if let Some((next_primary, next_fallbacks)) = InodeReadEngine::resolve_primary(
+                                                            &cm[next_idx], &nim, &[], 0
+                                                        ) {
+                                                            eng.in_flight.lock().await.insert(next_cid);
+                                                            let chain_client = client.clone();
+                                                            let chain_eng = eng.clone();
+                                                            tokio::spawn(async move {
+                                                                match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks).await {
+                                                                    Ok(chain_data) => {
+                                                                        chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
+                                                                        debug!("Swarming: chained chunk {}", next_idx);
+                                                                    }
+                                                                    Err(e) => debug!("Swarming: chain failed for chunk {}: {}", next_idx, e),
+                                                                }
+                                                                chain_eng.in_flight.lock().await.remove(&next_cid);
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => debug!("Swarming failed for chunk {}: {}", idx_copy, e),
+                                }
+                                eng.in_flight.lock().await.remove(&swarm_cid);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Assemble the response ---
         result_chunks.sort_by_key(|(i, _)| *i);
 

@@ -1775,11 +1775,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         // If we just fetched chunks and they look sequential, proactively fetch the next
         // 2 chunks with a 10ms stagger to avoid connection/disk/network contention.
         // This keeps the pipeline full without the overhead of continuous prefetching.
+        // Don't start swarming on the very first chunk to keep initial latency minimal.
         if !to_fetch.is_empty() && !bypass_cache && needed.len() > 0 {
             let last_fetched_idx = needed.last().map(|(i, _, _)| *i).unwrap_or(0);
             let is_sequential = needed.len() == 1 || needed.windows(2).all(|w| w[1].0 == w[0].0 + 1);
 
-            if is_sequential && last_fetched_idx + 1 < chunk_map.len() {
+            if is_sequential && last_fetched_idx > 0 && last_fetched_idx + 1 < chunk_map.len() {
                 // Spawn staggered fetches for next 2 chunks
                 let swarm_indices = vec![last_fetched_idx + 1, last_fetched_idx + 2]
                     .into_iter()

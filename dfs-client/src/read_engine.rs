@@ -62,6 +62,12 @@ pub struct InodeReadEngine {
     /// Used to detect when a seek lands outside the cached window and force a re-fetch.
     pub last_window_start: AtomicU32,
     pub last_window_end: AtomicU32,
+
+    /// Last chunk fetch duration in milliseconds. Used to calculate adaptive stagger delay.
+    /// The stagger for the next chunk pair is set to last_chunk_fetch_ms / 2 to ensure
+    /// chunk N+2 starts when chunk N+1 is ~50% complete, automatically adapting to any
+    /// network speed (1G, 10G, etc).
+    pub last_chunk_fetch_ms: AtomicU64,
 }
 
 impl InodeReadEngine {
@@ -81,6 +87,7 @@ impl InodeReadEngine {
             last_failed_refresh_ms: AtomicU64::new(0),
             last_window_start: AtomicU32::new(0),
             last_window_end: AtomicU32::new(0),
+            last_chunk_fetch_ms: AtomicU64::new(50), // Default 50ms (~gigabit speed)
         })
     }
 

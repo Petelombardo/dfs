@@ -1722,6 +1722,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 })
             };
 
+            // Measure fetch time for chunk 0 to adaptively set stagger delay
+            let start_time = std::time::Instant::now();
+            let first_idx_in_batch = to_fetch.first().map(|(idx, _, _, _)| *idx);
+
             let fetch_results: Vec<(usize, ChunkId, Result<Vec<u8>>)> =
             if is_sequential_full && to_fetch.len() > 0 {
                 // Use the pipelined path: overlap connection setup with body drain.
@@ -1751,6 +1755,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                     .collect()
             };
 
+            // Store fetch timing for chunk 0 to enable adaptive stagger
+            if first_idx_in_batch == Some(0) && !fetch_results.is_empty() {
+                let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                engine.last_chunk_fetch_ms.store(elapsed_ms, Ordering::Relaxed);
+                debug!("Measured chunk 0 fetch time: {}ms (adaptive stagger will be {}ms)",
+                       elapsed_ms, elapsed_ms / 2);
+            }
+
             // Collect results; cache full chunks; remove from in-flight.
             // Always remove from in_flight before propagating errors — a leaked entry
             // causes every subsequent read for that chunk to wait 1s for a timeout.
@@ -1771,9 +1783,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             result_chunks.push((idx, data));
         }
 
-        // --- Staggered 2-chunk swarming for sequential reads ---
+        // --- Adaptive staggered 2-chunk swarming for sequential reads ---
         // If we just fetched chunks and they look sequential, proactively fetch the next
-        // 2 chunks with a 10ms stagger to avoid connection/disk/network contention.
+        // 2 chunks with an adaptive stagger (based on chunk 0's fetch time / 2) to avoid
+        // connection/disk/network contention while auto-adapting to any network speed.
         // This keeps the pipeline full without the overhead of continuous prefetching.
         // Don't start swarming on the very first chunk to keep initial latency minimal.
         if !to_fetch.is_empty() && !bypass_cache && needed.len() > 0 {
@@ -1803,8 +1816,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                         ) {
                             engine.in_flight.lock().await.insert(swarm_cid);
 
-                            // Stagger the second fetch by 20ms to avoid contention
-                            let stagger_ms = swarm_offset as u64 * 20;
+                            // Adaptive stagger: use half of chunk 0's fetch time to ensure chunk N+2
+                            // starts when chunk N+1 is ~50% complete. This auto-adapts to any network
+                            // speed (1G, 10G, etc.) without manual tuning.
+                            let base_stagger_ms = engine.last_chunk_fetch_ms.load(Ordering::Relaxed) / 2;
+                            let stagger_ms = swarm_offset as u64 * base_stagger_ms;
 
                             let client = self.clone();
                             let eng = engine.clone();

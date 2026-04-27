@@ -1820,7 +1820,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
                                         // Chain reaction: spawn the next chunk in sequence to maintain pipeline
                                         // But limit to MAX_AHEAD chunks beyond the pipeline_head to avoid runaway prefetch
-                                        const MAX_AHEAD: usize = 4;
+                                        const MAX_AHEAD: usize = 3;
                                         let next_idx = idx_copy + 2;
                                         let pipeline_pos = eng.pipeline_head.load(Ordering::Relaxed);
 

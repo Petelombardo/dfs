@@ -2176,12 +2176,13 @@ impl Filesystem for DfsFilesystem {
                 // a client restart where release() never ran. Without this, the background
                 // flusher immediately flushes the stale data as a small first chunk.
                 if is_first_writer {
-                    // For O_TRUNC opens, drain any background flush tasks from the
-                    // previous write session before discarding the buffer.  Without this,
-                    // a still-running flush_one_chunk task completes after open() returns
+                    // For O_TRUNC opens, drain any background flush tasks AND release() flush
+                    // tasks from the previous write session before discarding the buffer.
+                    // Without this, a still-running flush task completes after open() returns
                     // and re-inserts stale chunk locations into the metadata, making the
                     // new (smaller) file appear as the old (larger) one.
                     if is_trunc {
+                        // Wait for background ticker flush tasks
                         let in_flight_map = self.flush_in_flight.read().unwrap().as_ref().cloned();
                         if let Some(map) = in_flight_map {
                             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2192,14 +2193,30 @@ impl Filesystem for DfsFilesystem {
                                 }
                             });
                         }
-                        // Clear metadata cache chunk_locations so reads don't get old data
-                        if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
-                            meta.chunk_locations.clear();
-                            meta.size = 0;
-                        }
-                        // Invalidate read engine so subsequent reads get new file content
+                        // CRITICAL: Also wait for release() flush tasks, which aren't tracked
+                        // by flush_in_flight. Without this, O_TRUNC can race with the async
+                        // flush from a previous write's release(), causing reads to return
+                        // stale data (the original content before overwrite).
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        self.runtime.block_on(async {
+                            while self.release_in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                                if std::time::Instant::now() >= deadline { break; }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                            }
+                        });
+                        // CRITICAL: Remove entire metadata cache entry (not just clear fields).
+                        // If we only clear chunk_locations, the entry remains with size=0,
+                        // causing reads to fail. Removing forces fresh metadata fetch with
+                        // new chunk locations and correct file size.
+                        self.metadata_cache.remove(&ino);
+
+                        // Invalidate read engine so subsequent reads get new file content.
+                        // Use async version to guarantee clearing (try_lock can fail silently).
                         if let Some(engine) = self.client.read_engines.engines.get(&ino) {
-                            engine.expire_chunk_map();
+                            let engine_clone = engine.clone();
+                            self.runtime.block_on(async move {
+                                engine_clone.expire_chunk_map_async().await;
+                            });
                         }
                     }
                     self.write_buffers.remove(&ino);
@@ -2298,20 +2315,26 @@ impl Filesystem for DfsFilesystem {
             }
         }
 
-        // Use direct I/O for SQLite (required for correctness) and for files with an
-        // active writer (live recordings). With KEEP_CACHE the kernel page cache fills
-        // gaps with zeros when FUSE returns a short/empty read — e.g. when the write
-        // buffer doesn't have the data yet. Direct I/O bypasses the cache so short reads
-        // are passed through as-is without being cached as zeros.
-        // Finished files use KEEP_CACHE — direct I/O causes EAGAIN when readers open
-        // with O_NONBLOCK and our FUSE handler blocks on a network fetch.
-        // Always use direct I/O to bypass kernel page cache.
+        // Use direct I/O for SQLite database files (required for correctness).
+        // With KEEP_CACHE the kernel page cache fills gaps with zeros when FUSE returns
+        // a short/empty read — e.g. when the write buffer doesn't have the data yet.
+        // Direct I/O bypasses the cache so short reads are passed through as-is without
+        // being cached as zeros.
         // Application-level chunk cache (Moka) is more efficient than kernel page cache
         // for our 4MB chunk workload: 56 MB/s (direct) vs 27 MB/s (page cache).
+        //
+        // EXCEPTION: SQLite .db-shm files need kernel page cache enabled to support mmap.
+        // The .db-shm file is SQLite's shared memory coordination file for WAL mode.
+        // It must be mmap'd with MAP_SHARED for inter-process coordination. If we use
+        // FOPEN_DIRECT_IO, mmap fails with ENODEV and SQLite falls back to sparse writes
+        // at high offsets (e.g., 309GB), causing allocation errors.
         if is_sqlite {
             info!("open: ino={} - SQLite database detected, using direct I/O", ino);
+            reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
+        } else {
+            // .db-shm and other files use kernel page cache to enable mmap support
+            reply.opened(0, 0);
         }
-        reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
         info!("open: ino={} DONE — reply sent", ino);
     }
 
@@ -2909,8 +2932,13 @@ impl Filesystem for DfsFilesystem {
                     *write_open_counts.entry(ino).or_insert(0) += 1;
 
                     let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
-                    // Always use direct I/O for newly created files
-                    reply.created(&Duration::ZERO, &attr, 0, 0, fuser::consts::FOPEN_DIRECT_IO);
+                    // Use direct I/O for SQLite database files, but NOT for .db-shm (needs mmap)
+                    let is_sqlite = is_sqlite_direct_io(&path);
+                    if is_sqlite {
+                        reply.created(&Duration::ZERO, &attr, 0, 0, fuser::consts::FOPEN_DIRECT_IO);
+                    } else {
+                        reply.created(&Duration::ZERO, &attr, 0, 0, 0);
+                    }
                 }
                 Err(e) => {
                     error!("Failed to create file {}: {}", path, e);

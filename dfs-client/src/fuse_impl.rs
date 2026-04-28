@@ -21,17 +21,20 @@ use crate::locks::LockManager;
 /// Used to decide: direct I/O mode, write buffering bypass, immediate metadata flush.
 /// Matches .db/.sqlite/.sqlite3 and their -wal/-journal/-shm sidecars,
 /// plus _temp variants (e.g. gravity.db_temp used by pihole during gravity updates).
+/// Check if file should bypass chunk cache (includes all SQLite-related files).
 pub fn is_sqlite_for_cache(path: &str) -> bool {
     is_sqlite_path(path)
 }
 
+/// Check if path is a SQLite file that needs immediate synchronous writes.
+/// Includes .db-shm because it's a sparse mmap'd file - buffering causes huge gaps.
 fn is_sqlite_path(path: &str) -> bool {
     path.ends_with(".db")
         || path.ends_with(".sqlite")
         || path.ends_with(".sqlite3")
         || path.ends_with(".db-wal")
         || path.ends_with(".db-journal")
-        || path.ends_with(".db-shm")
+        || path.ends_with(".db-shm")  // Sparse mmap file - must bypass write buffer
         || path.ends_with(".db_temp")
         || path.ends_with(".sqlite_temp")
         || path.ends_with(".sqlite3_temp")
@@ -602,29 +605,25 @@ impl FlushHandle {
         let results = futures::future::join_all(handles).await;
         let t_net = t_net_start.elapsed();
 
-        // Process results: remove flushed slots, collect locations.
+        // Process results: track flushed sizes and collect locations.
+        // DO NOT remove slots yet - wait until read engine is updated to avoid race.
         let mut all_locations: Vec<dfs_common::ChunkLocation> = Vec::new();
         let mut first_err: Option<anyhow::Error> = None;
         let mut failed_chunk_indices: Vec<usize> = Vec::new();
+        let mut flushed_chunks: Vec<(u64, usize)> = Vec::new(); // (chunk_idx, flushed_len)
 
         for (join_result, (chunk_idx, slot_data_snap, _)) in results.into_iter().zip(slots_to_write.iter()) {
             match join_result {
                 Ok(Ok((_, locations_opt))) => {
-                    // Mark slot as fully committed to the server but keep the data
-                    // in memory so concurrent readers can still serve from the buffer
-                    // during the window between chunk flush and metadata commit.
-                    // Slots are removed in flush_all_pipelined after metadata_sync confirms
-                    // Chunk is on the server — remove slot immediately so reads go to network.
+                    // Mark slot as flushed but DON'T remove yet. Slots will be removed
+                    // after read engine is updated to prevent race where reads fall through
+                    // to network with stale chunk_map.
                     let flushed_len = slot_data_snap.len();
                     if let Some(state_lock) = self.write_buffers.get(&ino) {
                         let mut state = state_lock.lock().await;
                         state.flushed_sizes.insert(*chunk_idx, flushed_len);
-                        state.slots.remove(chunk_idx);
-                        self.global_buffered_bytes.fetch_sub(
-                            flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
                     }
+                    flushed_chunks.push((*chunk_idx, flushed_len));
                     if let Some(locations) = locations_opt {
                         all_locations.extend(locations);
                     }
@@ -779,6 +778,27 @@ impl FlushHandle {
                     let stamped = self.client.stamp_write_seq_pub(&meta);
                     self.client.metadata_queue.push(stamped).await;
                 }
+                // For background flushes, update read engine immediately (not queued)
+                // so reads see fresh chunk_map before slots are removed below.
+                let current_size = meta.size;
+                self.client.feed_chunk_locations_to_read_engine(
+                    ino, &meta.chunk_locations, current_size,
+                ).await;
+            }
+        }
+
+        // Now that read engine is updated, safe to remove flushed slots.
+        // This ordering prevents race where reads fall through to network with stale chunk_map.
+        if !flushed_chunks.is_empty() {
+            if let Some(state_lock) = self.write_buffers.get(&ino) {
+                let mut state = state_lock.lock().await;
+                for (chunk_idx, flushed_len) in flushed_chunks {
+                    state.slots.remove(&chunk_idx);
+                    self.global_buffered_bytes.fetch_sub(
+                        flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
             }
         }
 
@@ -909,11 +929,28 @@ impl FlushHandle {
                                     meta_entry.size = new_size;
                                 }
                             }
-                            // Remove slot — data is on the server.
+                            // Commit metadata to leader FIRST, then update read engine, THEN remove slot.
+                            // This ordering prevents race where reads fall through to network with stale chunk_map.
+                            let (flushed_len, meta_to_persist) = {
+                                if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                    let state = state_arc.lock().await;
+                                    let len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                                    (len, self.metadata_cache.get(&ino).map(|m| m.clone()))
+                                } else {
+                                    (0, None)
+                                }
+                            };
+                            if let Some(meta) = meta_to_persist {
+                                self.client.flush_metadata_sync(&meta).await;
+                                self.last_metadata_update.insert(ino, std::time::Instant::now());
+                                self.client.feed_chunk_locations_to_read_engine(
+                                    ino, &meta.chunk_locations, meta.size,
+                                ).await;
+                            }
+                            // Now that read engine is updated, safe to remove slot.
                             if let Some(state_arc) = self.write_buffers.get(&ino) {
                                 let mut state = state_arc.lock().await;
-                                if let Some(slot) = state.slots.get(&chunk_idx) {
-                                    let flushed_len = slot.data.len();
+                                if flushed_len > 0 {
                                     state.flushed_sizes.insert(chunk_idx, flushed_len);
                                     self.global_buffered_bytes.fetch_sub(
                                         flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
@@ -921,15 +958,6 @@ impl FlushHandle {
                                     );
                                 }
                                 state.slots.remove(&chunk_idx);
-                            }
-                            // Commit metadata to leader FIRST, then update read engine.
-                            let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
-                            if let Some(meta) = meta_to_persist {
-                                self.client.flush_metadata_sync(&meta).await;
-                                self.last_metadata_update.insert(ino, std::time::Instant::now());
-                                self.client.feed_chunk_locations_to_read_engine(
-                                    ino, &meta.chunk_locations, meta.size,
-                                ).await;
                             }
                             return Ok(());
                         }
@@ -950,20 +978,16 @@ impl FlushHandle {
             // No metadata or location — fall through to normal write
         }
 
-        // Write path: send data to server, then update read engine with real location.
+        // Write path: send data to server, update metadata & read engine, THEN remove slot.
         let result = self.client.write_data_with_cache(&slot_data, ino, file_offset).await;
         match result {
             Ok((_, _, Some(locations))) => {
-                // Chunk is on the server — remove slot so reads go to network.
                 let flushed_len = slot_data.len();
+
+                // Track flushed size but DON'T remove slot yet.
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     let mut state = state_arc.lock().await;
                     state.flushed_sizes.insert(chunk_idx, flushed_len);
-                    state.slots.remove(&chunk_idx);
-                    self.global_buffered_bytes.fetch_sub(
-                        flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
                 }
 
                 // Fetch metadata if not cached
@@ -999,8 +1023,17 @@ impl FlushHandle {
                                     meta.chunk_locations[pos] = loc.clone();
                                     continue;
                                 }
+                                // Insert at the correct position based on file_offset to keep
+                                // chunk_locations sorted. This prevents out-of-order chunks when
+                                // concurrent flush tasks complete in non-sequential order.
+                                let insert_pos = meta.chunk_locations.iter()
+                                    .position(|l| l.file_offset.map(|o| o > offset).unwrap_or(false))
+                                    .unwrap_or(meta.chunk_locations.len());
+                                meta.chunk_locations.insert(insert_pos, loc.clone());
+                            } else {
+                                // No file_offset — append to end (shouldn't happen in normal operation)
+                                meta.chunk_locations.push(loc.clone());
                             }
-                            meta.chunk_locations.push(loc.clone());
                         }
                     }
                     if let Some(last) = meta.chunk_locations.iter()
@@ -1044,11 +1077,22 @@ impl FlushHandle {
                         // This ensures leader refreshes never overwrite our engine update
                         // with stale data — the leader has the chunk map before we expose it.
                         self.client.flush_metadata_sync(&meta).await;
-                        let current_size = meta.size;
-                        self.client.feed_chunk_locations_to_read_engine(
-                            ino, &meta.chunk_locations, current_size,
-                        ).await;
                     }
+                    // ALWAYS update read engine (even if we skip metadata sync due to rate limit).
+                    // This ensures reads see fresh chunk_map before slot is removed below.
+                    let current_size = meta.size;
+                    self.client.feed_chunk_locations_to_read_engine(
+                        ino, &meta.chunk_locations, current_size,
+                    ).await;
+                }
+                // Now that read engine is updated, safe to remove slot.
+                if let Some(state_arc) = self.write_buffers.get(&ino) {
+                    let mut state = state_arc.lock().await;
+                    state.slots.remove(&chunk_idx);
+                    self.global_buffered_bytes.fetch_sub(
+                        flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 Ok(())
             }
@@ -2148,6 +2192,15 @@ impl Filesystem for DfsFilesystem {
                                 }
                             });
                         }
+                        // Clear metadata cache chunk_locations so reads don't get old data
+                        if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
+                            meta.chunk_locations.clear();
+                            meta.size = 0;
+                        }
+                        // Invalidate read engine so subsequent reads get new file content
+                        if let Some(engine) = self.client.read_engines.engines.get(&ino) {
+                            engine.expire_chunk_map();
+                        }
                     }
                     self.write_buffers.remove(&ino);
                     // Clear any pending truncate flag — new write session starts clean.
@@ -2432,17 +2485,15 @@ impl Filesystem for DfsFilesystem {
 
             // Extend file_size to include buffered-but-uncommitted bytes so the EOF
             // check below doesn't gate out reads that are within the write buffer.
+            // Use blocking lock (not try_lock) to wait for flush completion, ensuring
+            // we see the final buffer state before falling through to network.
             let file_size = if write_buffer_enabled {
                 if let Some(state_lock) = write_buffers.get(&ino) {
-                    if let Ok(state) = state_lock.try_lock() {
-                        let buffered_end = state.slots.iter()
-                            .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
-                            .max().unwrap_or(0);
-                        file_size.max(buffered_end)
-                    } else {
-                        let hwm = size_high_water.get(&ino).map(|v| *v).unwrap_or(0);
-                        file_size.max(hwm)
-                    }
+                    let state = state_lock.lock().await;
+                    let buffered_end = state.slots.iter()
+                        .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
+                        .max().unwrap_or(0);
+                    file_size.max(buffered_end)
                 } else { file_size }
             } else { file_size };
 
@@ -2452,43 +2503,46 @@ impl Filesystem for DfsFilesystem {
             // Slot absent → fall through to network (committed data on server).
             // This prevents 0-byte returns during the pre-commit window that cause
             // concurrent dd readers to get offset-shifted data in READ_COPY.
+            // CRITICAL: Use blocking lock (not try_lock) to wait for flush completion.
+            // If try_lock fails, flush is in progress, and falling through to network
+            // would fetch stale chunk_id (PatchChunk creates new chunk_id, metadata
+            // not updated until flush completes). Blocking ensures we either serve from
+            // buffer or fall through only after flush completes and metadata is fresh.
             if write_buffer_enabled {
                 if let Some(state_lock) = write_buffers.get(&ino) {
-                    if let Ok(state) = state_lock.try_lock() {
-                        let chunk_idx = InodeWriteState::chunk_index(offset as u64);
-                        let intra = InodeWriteState::intra_offset(offset as u64);
-                        if let Some(slot) = state.slots.get(&chunk_idx) {
-                            // Slot present — data is buffered and not yet fully committed.
-                            // The gap_filled_prefix range (0..gap_filled_prefix) is a synthetic
-                            // zero-fill for bytes already on the server from a prior partial
-                            // flush. The real new data starts at gap_filled_prefix.
-                            // For reads within 0..gap_filled_prefix: the server has this data,
-                            // fall through to the network.
-                            // For reads within gap_filled_prefix..data.len(): serve from buffer.
-                            // For reads at or beyond data.len(): write edge, return empty.
-                            if intra >= slot.data.len() {
-                                // At or beyond the write frontier.
-                                reply.data(&[]);
-                                return;
-                            } else if intra >= slot.gap_filled_prefix {
-                                // Real buffered data — serve it.
-                                let avail = slot.data.len() - intra;
-                                let n = avail.min(size);
-                                reply.data(&slot.data[intra..intra + n]);
-                                return;
-                            }
-                            // intra < gap_filled_prefix: server has this range, fall through.
-                        } else {
-                            // No slot — check if we're at the live write edge.
-                            let committed_size = metadata_cache.get(&ino).map(|m| m.size as usize).unwrap_or(0);
-                            if !state.slots.is_empty() && offset >= committed_size {
-                                reply.data(&[]);
-                                return;
-                            }
-                            // Fall through to network for committed data.
+                    let state = state_lock.lock().await;
+                    let chunk_idx = InodeWriteState::chunk_index(offset as u64);
+                    let intra = InodeWriteState::intra_offset(offset as u64);
+                    if let Some(slot) = state.slots.get(&chunk_idx) {
+                        // Slot present — data is buffered and not yet fully committed.
+                        // The gap_filled_prefix range (0..gap_filled_prefix) is a synthetic
+                        // zero-fill for bytes already on the server from a prior partial
+                        // flush. The real new data starts at gap_filled_prefix.
+                        // For reads within 0..gap_filled_prefix: the server has this data,
+                        // fall through to the network.
+                        // For reads within gap_filled_prefix..data.len(): serve from buffer.
+                        // For reads at or beyond data.len(): write edge, return empty.
+                        if intra >= slot.data.len() {
+                            // At or beyond the write frontier.
+                            reply.data(&[]);
+                            return;
+                        } else if intra >= slot.gap_filled_prefix {
+                            // Real buffered data — serve it.
+                            let avail = slot.data.len() - intra;
+                            let n = avail.min(size);
+                            reply.data(&slot.data[intra..intra + n]);
+                            return;
                         }
+                        // intra < gap_filled_prefix: server has this range, fall through.
+                    } else {
+                        // No slot — check if we're at the live write edge.
+                        let committed_size = metadata_cache.get(&ino).map(|m| m.size as usize).unwrap_or(0);
+                        if !state.slots.is_empty() && offset >= committed_size {
+                            reply.data(&[]);
+                            return;
+                        }
+                        // Fall through to network for committed data.
                     }
-                    // try_lock failed — fall through to network.
                 }
             }
 
@@ -2967,6 +3021,8 @@ impl Filesystem for DfsFilesystem {
             let is_sqlite = is_sqlite_path(&metadata.path);
             let cache_inode = if is_sqlite { 0 } else { ino };
 
+            // SQLite files bypass write buffer - they need immediate synchronous writes
+            // with strict ordering (WAL before main DB). Buffering causes corruption.
             if write_buffer_enabled && !is_sqlite {
                 let offset_usize = offset as usize;
                 let current_size = {
@@ -3075,6 +3131,10 @@ impl Filesystem for DfsFilesystem {
                                 meta.modified_at = SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
                                 client.enqueue_metadata(&meta).await;
+                                // Update read engine immediately for SQLite read-after-write consistency
+                                client.feed_chunk_locations_to_read_engine(
+                                    ino, &meta.chunk_locations, meta.size,
+                                ).await;
                                 metadata_cache.insert(ino, meta);
                                 info!("Sparse write complete (patch): ino={}, offset={}, len={}, new_size={}",
                                       ino, offset, data_vec.len(), new_size);
@@ -3098,6 +3158,10 @@ impl Filesystem for DfsFilesystem {
                                 metadata.modified_at = SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
                                 client.enqueue_metadata(&metadata).await;
+                                // Update read engine immediately for SQLite read-after-write consistency
+                                client.feed_chunk_locations_to_read_engine(
+                                    ino, &metadata.chunk_locations, metadata.size,
+                                ).await;
                                 metadata_cache.insert(ino, metadata);
                                 info!("Sparse write complete: ino={}, offset={}, len={}, new_size={}",
                                       ino, offset, data_vec.len(), new_size);
@@ -3328,6 +3392,10 @@ impl Filesystem for DfsFilesystem {
                         .as_secs();
 
                     client.enqueue_metadata(&metadata).await;
+                    // Update read engine immediately for SQLite read-after-write consistency
+                    client.feed_chunk_locations_to_read_engine(
+                        ino, &metadata.chunk_locations, metadata.size,
+                    ).await;
                     metadata_cache.insert(ino, metadata);
                     let total_elapsed = start.elapsed();
                     debug!("TOTAL write() took {:?} for {} bytes ({:.2} MB/s)",
@@ -3414,6 +3482,10 @@ impl Filesystem for DfsFilesystem {
                         if has_pending {
                             debug!("flush: enqueueing pending metadata for ino={}", ino);
                             client.enqueue_metadata(&metadata).await;
+                            // Update read engine for SQLite read-after-write consistency
+                            client.feed_chunk_locations_to_read_engine(
+                                ino, &metadata.chunk_locations, metadata.size,
+                            ).await;
                             write_counters.write().unwrap().insert(ino, 0);
                         }
                     }

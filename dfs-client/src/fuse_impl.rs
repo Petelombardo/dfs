@@ -1305,10 +1305,11 @@ pub struct DfsFilesystem {
     /// Prevents unbounded spawning of concurrent refresh tasks (one per inode max).
     refreshing_inodes: Arc<dashmap::DashSet<u64>>,
 
-    /// Count of release() flush tasks still in flight.
-    /// destroy() waits for this to reach zero before exiting so no in-progress
-    /// release flush is interrupted mid-write by process shutdown.
-    release_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-inode count of release() flush tasks still in flight.
+    /// Sequential writes wait for this to reach zero for the specific inode
+    /// before opening, ensuring the previous release() has fully committed.
+    /// destroy() waits for all to reach zero before exiting.
+    release_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
 
     /// Per-inode count of write() tasks still running (spawned but not yet written into the slot).
     /// release() waits for this to reach zero before flush so we don't flush an incomplete slot.
@@ -1605,7 +1606,7 @@ impl DfsFilesystem {
             flush_handle,
             pending_deletes: Arc::new(dashmap::DashSet::new()),
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
-            release_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            release_in_flight: Arc::new(DashMap::new()),
             write_tasks_in_flight: Arc::new(DashMap::new()),
             global_buffered_bytes,
             flush_notify,
@@ -1904,7 +1905,10 @@ impl Filesystem for DfsFilesystem {
             // may be interrupted mid-write, losing the final metadata commit.
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
             loop {
-                if release_in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0 { break; }
+                let total: usize = release_in_flight.iter()
+                    .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                    .sum();
+                if total == 0 { break; }
                 if tokio::time::Instant::now() > deadline {
                     warn!("destroy: timed out waiting for release tasks");
                     break;
@@ -2107,9 +2111,10 @@ impl Filesystem for DfsFilesystem {
     }
 
     fn open(&mut self, _req: &FuseRequest, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        let release_count = self.release_in_flight.get(&ino)
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
         info!("open: ino={} flags=0x{:x} release_in_flight={} write_tasks_in_flight={:?}",
-              ino, flags,
-              self.release_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+              ino, flags, release_count,
               self.write_tasks_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)));
 
         // NOTE: We intentionally do NOT block here waiting for write_tasks_in_flight or
@@ -2176,42 +2181,15 @@ impl Filesystem for DfsFilesystem {
                 // a client restart where release() never ran. Without this, the background
                 // flusher immediately flushes the stale data as a small first chunk.
                 if is_first_writer {
-                    // For O_TRUNC opens, drain any background flush tasks AND release() flush
-                    // tasks from the previous write session before discarding the buffer.
-                    // Without this, a still-running flush task completes after open() returns
-                    // and re-inserts stale chunk locations into the metadata, making the
-                    // new (smaller) file appear as the old (larger) one.
+                    // For O_TRUNC opens, clear metadata cache and read engine so the file
+                    // starts fresh. The general open() wait for write_buffers (lines 2265-2275)
+                    // already ensures any previous write session has completed.
                     if is_trunc {
-                        // Wait for background ticker flush tasks
-                        let in_flight_map = self.flush_in_flight.read().unwrap().as_ref().cloned();
-                        if let Some(map) = in_flight_map {
-                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                            self.runtime.block_on(async {
-                                while map.get(&ino).map(|v| *v).unwrap_or(0) > 0 {
-                                    if std::time::Instant::now() >= deadline { break; }
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                                }
-                            });
-                        }
-                        // CRITICAL: Also wait for release() flush tasks, which aren't tracked
-                        // by flush_in_flight. Without this, O_TRUNC can race with the async
-                        // flush from a previous write's release(), causing reads to return
-                        // stale data (the original content before overwrite).
-                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                        self.runtime.block_on(async {
-                            while self.release_in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                                if std::time::Instant::now() >= deadline { break; }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                            }
-                        });
-                        // CRITICAL: Remove entire metadata cache entry (not just clear fields).
-                        // If we only clear chunk_locations, the entry remains with size=0,
-                        // causing reads to fail. Removing forces fresh metadata fetch with
-                        // new chunk locations and correct file size.
+                        // Remove entire metadata cache entry (not just clear fields).
+                        // Removing forces fresh metadata fetch with new chunk locations.
                         self.metadata_cache.remove(&ino);
 
                         // Invalidate read engine so subsequent reads get new file content.
-                        // Use async version to guarantee clearing (try_lock can fail silently).
                         if let Some(engine) = self.client.read_engines.engines.get(&ino) {
                             let engine_clone = engine.clone();
                             self.runtime.block_on(async move {
@@ -2254,18 +2232,26 @@ impl Filesystem for DfsFilesystem {
         let has_active_writer = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
         let has_inflight_flush = self.flush_in_flight.read().unwrap()
             .as_ref().map(|m| m.get(&ino).map(|v| *v > 0).unwrap_or(false)).unwrap_or(false);
-        // write_buffers entry is removed by release()'s flush task only after flush_all_pipelined
-        // and expire_chunk_map complete.  If present, wait briefly for the release flush to land
-        // so the sync refresh below fetches the final committed metadata, not the pre-write version.
-        // flush_runtime is independent of main runtime so block_on here does not deadlock.
-        // Cap at 2s — if flush takes longer (large file, slow nodes) fall through; read_file's
-        // sync refresh on an empty/stale chunk map will retry from the leader on first read.
-        if is_read_open && !has_active_writer && self.write_buffers.contains_key(&ino) {
+        // CRITICAL: Wait for ALL in-flight release() tasks to complete before proceeding.
+        // release() spawns async flush tasks that update metadata. If we don't wait,
+        // sequential writes (T7 overwrite test) will race: the second release() reads
+        // stale cached metadata (size=9) while the first release() is still calculating
+        // the correct size (size=12), causing data loss.
+        //
+        // We wait for BOTH write_buffers removal AND PER-INODE release_in_flight to hit zero.
+        // write_buffers tracks active write sessions, release_in_flight tracks flush tasks.
+        let had_inflight = !has_active_writer && (
+            self.write_buffers.contains_key(&ino) ||
+            self.release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0
+        );
+        if had_inflight {
             let write_buffers = self.write_buffers.clone();
+            let release_in_flight = self.release_in_flight.clone();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             tokio::task::block_in_place(|| {
                 self.runtime.block_on(async {
-                    while write_buffers.contains_key(&ino) {
+                    while write_buffers.contains_key(&ino) ||
+                          release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0 {
                         if std::time::Instant::now() >= deadline { break; }
                         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                     }
@@ -3606,7 +3592,9 @@ impl Filesystem for DfsFilesystem {
                 let size_high_water_for_release = self.size_high_water.clone();
                 let read_engines_for_release = self.client.read_engines.engines.clone();
                 let open_counts_for_release = self.open_counts.clone();
-                release_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Increment per-inode release counter
+                release_in_flight.entry(ino).or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Reply to FUSE immediately — release() errors are informational only
                 // and the kernel ignores them. Parking a main-runtime worker for the
                 // full flush duration (up to 10s for metadata delivery) starves all
@@ -3638,7 +3626,9 @@ impl Filesystem for DfsFilesystem {
                         debug!("release: ino={} path={:?} deleted (pending={} path_gone={}) — skipping flush",
                                ino, release_path, is_pending_delete, path_gone);
                         write_buffers.remove(&ino);
-                        release_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(counter) = release_in_flight.get(&ino) {
+                            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         return;
                     }
                     if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
@@ -3665,7 +3655,9 @@ impl Filesystem for DfsFilesystem {
                             error!("release: lock release failed for inode {}: {}", ino, e);
                         }
                     }
-                    release_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(counter) = release_in_flight.get(&ino) {
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 });
             } else if is_write {
                 // Intermediate write close: release locks only, leave buffer intact.
@@ -3983,7 +3975,11 @@ impl Filesystem for DfsFilesystem {
             // the server returns NotFound for old_path and the rename fails.
             {
                 let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-                while release_in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                loop {
+                    let total: usize = release_in_flight.iter()
+                        .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                        .sum();
+                    if total == 0 { break; }
                     if tokio::time::Instant::now() > deadline {
                         warn!("rename: timed out waiting for release flush for ino={}", old_ino);
                         break;

@@ -490,7 +490,7 @@ impl FlushHandle {
                                         .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
                                         .reduce(u64::max)
                                     {
-                                        meta_entry.size = new_size;
+                                        meta_entry.size = meta_entry.size.max(new_size);
                                     }
                                 }
                                 patch_metadata_dirty = true;
@@ -928,7 +928,7 @@ impl FlushHandle {
                                     .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
                                     .reduce(u64::max)
                                 {
-                                    meta_entry.size = new_size;
+                                    meta_entry.size = meta_entry.size.max(new_size);
                                 }
                             }
                             // Commit metadata to leader FIRST, then update read engine, THEN remove slot.
@@ -3157,8 +3157,8 @@ impl Filesystem for DfsFilesystem {
                             old_loc.chunk_id, offset as u64, target_intra, data_vec.clone(), &old_loc,
                         ).await {
                             Ok(new_loc) => {
-                                let new_size = (offset_usize + data_vec.len()).max(current_size);
                                 let mut meta = meta_snap.unwrap();
+                                let new_size = (offset_usize + data_vec.len()).max(current_size).max(meta.size as usize);
                                 if let Some(loc) = meta.chunk_locations.get_mut(target_chunk_idx as usize) {
                                     *loc = new_loc;
                                 }
@@ -3184,8 +3184,8 @@ impl Filesystem for DfsFilesystem {
                         // Target is beyond all committed chunks — new chunk, write directly.
                         match client.write_data_with_cache(&data_vec, ino, offset as u64).await {
                             Ok((_, _, chunk_locations_opt)) => {
-                                let new_size = (offset_usize + data_vec.len()).max(current_size);
                                 let mut metadata = meta_snap.unwrap_or_else(|| metadata.clone());
+                                let new_size = (offset_usize + data_vec.len()).max(current_size).max(metadata.size as usize);
                                 if let Some(chunk_locations) = chunk_locations_opt {
                                     metadata.chunk_locations.extend(chunk_locations);
                                 }
@@ -3614,6 +3614,7 @@ impl Filesystem for DfsFilesystem {
                 let size_high_water_for_release = self.size_high_water.clone();
                 let read_engines_for_release = self.client.read_engines.engines.clone();
                 let open_counts_for_release = self.open_counts.clone();
+                let write_open_counts_for_release = self.write_open_counts.clone();
                 // Increment per-inode release counter
                 release_in_flight.entry(ino).or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3670,8 +3671,16 @@ impl Filesystem for DfsFilesystem {
                     if !open_counts_for_release.get(&ino).map(|c| *c > 0).unwrap_or(false) {
                         read_engines_for_release.remove(&ino);
                     }
-                    write_buffers.remove(&ino);
-                    size_high_water_for_release.remove(&ino);
+                    // Only remove the write buffer if no new writer has opened the file
+                    // since this release task was spawned. A new O_TRUNC open races with
+                    // this cleanup — if we remove here, we destroy the new session's buffer
+                    // and its data is silently lost (T7 race).
+                    let has_new_writer = write_open_counts_for_release
+                        .get(&ino).map(|c| *c > 0).unwrap_or(false);
+                    if !has_new_writer {
+                        write_buffers.remove(&ino);
+                        size_high_water_for_release.remove(&ino);
+                    }
                     if let Some(owner) = lock_owner {
                         if let Err(e) = lock_manager.release_all(ino, owner).await {
                             error!("release: lock release failed for inode {}: {}", ino, e);

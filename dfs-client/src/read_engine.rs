@@ -360,6 +360,7 @@ impl InodeReadEngine {
 }
 
 pub fn build_offsets(locations: &[ChunkLocation]) -> Vec<(usize, usize)> {
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
     // Prefer explicit file_offset when all chunks have it (sparse support).
     let all_have = !locations.is_empty() && locations.iter().all(|l| l.file_offset.is_some());
     if all_have {
@@ -367,12 +368,26 @@ pub fn build_offsets(locations: &[ChunkLocation]) -> Vec<(usize, usize)> {
             .map(|l| (l.file_offset.unwrap() as usize, l.size))
             .collect()
     } else {
-        let mut cur = 0usize;
-        locations.iter().map(|l| {
-            let start = cur;
-            cur += l.size;
-            (start, l.size)
-        }).collect()
+        // Mixed: some have file_offset, some don't (e.g. nil placeholders from sparse
+        // chunk maps). Use file_offset when available; for nil placeholders use the
+        // chunk index position (idx * CHUNK_SIZE) so sparse chunks land at the right offset.
+        let any_have = locations.iter().any(|l| l.file_offset.is_some());
+        if any_have {
+            locations.iter().enumerate()
+                .map(|(idx, l)| {
+                    let start = l.file_offset.map(|o| o as usize)
+                        .unwrap_or(idx * CHUNK_SIZE);
+                    (start, l.size)
+                })
+                .collect()
+        } else {
+            let mut cur = 0usize;
+            locations.iter().map(|l| {
+                let start = cur;
+                cur += l.size;
+                (start, l.size)
+            }).collect()
+        }
     }
 }
 

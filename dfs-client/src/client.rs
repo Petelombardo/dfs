@@ -1881,7 +1881,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         // --- Assemble the response ---
         result_chunks.sort_by_key(|(i, _)| *i);
 
-        let mut out = Vec::with_capacity(size);
+        // Pre-fill with zeros so sparse gaps within the read range are correct.
+        // Without this, reads that span a physical chunk boundary into a sparse
+        // hole return a short buffer — FUSE interprets that as EOF.
+        let clamped_size = size.min((file_size as usize).saturating_sub(offset));
+        let mut out = vec![0u8; clamped_size];
         for (chunk_idx, data) in &result_chunks {
             let (chunk_start, chunk_size) = chunk_offsets[*chunk_idx];
             let read_start = offset.max(chunk_start);
@@ -1889,13 +1893,15 @@ leader_addr: Arc::new(RwLock::new(None)),
             if read_end <= read_start { continue; }
             let local_start = read_start - chunk_start;
             let local_end = read_end - chunk_start;
+            let out_start = read_start - offset;
+            let out_end = read_end - offset;
             if local_end > data.len() {
-                // Partial/corrupt chunk — return what we have.
                 if local_start < data.len() {
-                    out.extend_from_slice(&data[local_start..]);
+                    let copy_len = data.len() - local_start;
+                    out[out_start..out_start + copy_len].copy_from_slice(&data[local_start..]);
                 }
             } else {
-                out.extend_from_slice(&data[local_start..local_end]);
+                out[out_start..out_end].copy_from_slice(&data[local_start..local_end]);
             }
         }
 

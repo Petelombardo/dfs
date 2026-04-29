@@ -712,12 +712,14 @@ impl FlushHandle {
                         meta.chunk_locations.push(loc.clone());
                     }
                 }
-                // File size = end of last chunk_location
+                // File size = max of logical size (set by truncate) and physical chunk end.
+                // A sparse file grown via truncate has a logical size larger than its written
+                // chunks; clobbering with the physical end would shrink the reported size.
                 if let Some(last) = meta.chunk_locations.iter()
                     .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
                     .reduce(u64::max)
                 {
-                    meta.size = last;
+                    meta.size = meta.size.max(last);
                 }
                 meta.modified_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1040,7 +1042,7 @@ impl FlushHandle {
                         .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
                         .reduce(u64::max)
                     {
-                        meta.size = last;
+                        meta.size = meta.size.max(last);
                     }
                     meta.modified_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1846,6 +1848,14 @@ impl Filesystem for DfsFilesystem {
                         }
                     };
                     client.seed_write_seq(file.id, file.write_seq);
+                    // Preserve any larger in-memory size (e.g. truncate-grown sparse file)
+                    // so that a stale server record doesn't clobber the logical size.
+                    let mut file = file;
+                    if let Some(cached) = metadata_cache.get(&ino) {
+                        if cached.size > file.size {
+                            file.size = cached.size;
+                        }
+                    }
                     metadata_cache.insert(ino, file.clone());
                     last_metadata_update.insert(ino, now);
 
@@ -2532,9 +2542,16 @@ impl Filesystem for DfsFilesystem {
                         // For reads within gap_filled_prefix..data.len(): serve from buffer.
                         // For reads at or beyond data.len(): write edge, return empty.
                         if intra >= slot.data.len() {
-                            // At or beyond the write frontier.
-                            reply.data(&[]);
-                            return;
+                            // Beyond this slot's buffered frontier. The server may have
+                            // committed data here from a prior flush (e.g. mkfs.ext4 writes
+                            // non-sequentially within a chunk). Fall through to the network
+                            // unless we're past the committed metadata size (true live edge).
+                            let committed_size = metadata_cache.get(&ino).map(|m| m.size as usize).unwrap_or(0);
+                            if offset >= committed_size {
+                                reply.data(&[]);
+                                return;
+                            }
+                            // Fall through to network — server has data here.
                         } else if intra >= slot.gap_filled_prefix {
                             // Real buffered data — serve it.
                             let avail = slot.data.len() - intra;
@@ -2576,7 +2593,11 @@ impl Filesystem for DfsFilesystem {
                 last_metadata_update.insert(ino, std::time::Instant::now());
 
                 match client.get_file_metadata(&file_path).await {
-                    Ok(Some(fresh)) => {
+                    Ok(Some(mut fresh)) => {
+                        // Never let a stale server size shrink the cached logical size.
+                        if let Some(cached) = metadata_cache.get(&ino) {
+                            if cached.size > fresh.size { fresh.size = cached.size; }
+                        }
                         if offset >= fresh.size as usize {
                             client.seed_write_seq(fresh.id, fresh.write_seq);
                             // Invalidate the read engine so next read picks up new chunk map.
@@ -3392,13 +3413,14 @@ impl Filesystem for DfsFilesystem {
                             updated_locations.extend_from_slice(&metadata.chunk_locations[last_idx + 1..]);
                         }
                         metadata.chunk_locations = updated_locations;
-                        metadata.size = metadata.chunk_locations.iter().map(|l| l.size as u64).sum();
+                        let physical_size = metadata.chunk_locations.iter().map(|l| l.size as u64).sum();
+                        metadata.size = metadata.size.max(physical_size);
                         info!("After splice: {} total chunks, {} total bytes",
                               metadata.chunk_locations.len(), metadata.size);
                     } else {
                         warn!("Full file rewrite with {} bytes", new_data.len());
                         metadata.chunk_locations = chunk_locations_opt.unwrap_or_default();
-                        metadata.size = new_data.len() as u64;
+                        metadata.size = metadata.size.max(new_data.len() as u64);
                     }
                     metadata.modified_at = SystemTime::now()
                         .duration_since(UNIX_EPOCH)

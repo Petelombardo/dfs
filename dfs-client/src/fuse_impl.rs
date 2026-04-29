@@ -80,6 +80,11 @@ struct ChunkSlot {
     /// by the application. Used to distinguish a real all-zero write from a synthetic gap
     /// prefix — prevents PatchChunk from overwriting real server data with our zeros.
     gap_filled_prefix: usize,
+    /// The highest byte offset (exclusive) in `data` that contains real app-written data.
+    /// Bytes beyond this point are synthetic gap-fill zeros representing data already on
+    /// the server. Used to bound PatchChunk so we don't send gap-fill zeros as real data
+    /// when the slot is padded to CHUNK_SIZE but only a small region was actually written.
+    real_data_end: usize,
     /// Set to true by flush_one_chunk when it claims this slot for network I/O.
     /// Prevents a second concurrent flush task from picking the same slot.
     /// Cleared on failure (so it can be retried); on success the slot is removed.
@@ -92,6 +97,7 @@ impl ChunkSlot {
             data: Vec::with_capacity(CHUNK_SIZE),
             last_modified: SystemTime::now(),
             gap_filled_prefix: 0,
+            real_data_end: 0,
             flushing: false,
         }
     }
@@ -194,6 +200,13 @@ impl InodeWriteState {
             // rather than treating the entire gap-fill as already-on-server data.
             if intra < slot.gap_filled_prefix {
                 slot.gap_filled_prefix = intra;
+            }
+            // Track the furthest byte of real app-written data. Bytes beyond this in the
+            // slot are synthetic gap-fill zeros (representing data already on the server)
+            // and must not be sent as real patch data.
+            let write_end = intra + n;
+            if write_end > slot.real_data_end {
+                slot.real_data_end = write_end;
             }
             slot.last_modified = SystemTime::now();
 
@@ -382,11 +395,11 @@ impl FlushHandle {
             // real data was appended beyond. Use gap_filled_prefix (set explicitly when we
             // zero-fill) rather than checking for all-zeros — the all-zeros heuristic was
             // wrong when the server's real chunk 0 data happened to start with zeros.
-            let gap_filled_prefix = {
+            let (gap_filled_prefix, real_data_end) = {
                 let state_lock = self.write_buffers.get(&ino);
                 state_lock.and_then(|s| s.try_lock().ok()
-                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| sl.gap_filled_prefix)))
-                    .unwrap_or(0)
+                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| (sl.gap_filled_prefix, sl.real_data_end))))
+                    .unwrap_or((0, 0))
             };
             // is_append_extend also covers the full-chunk case: if the slot grew to exactly
             // 4MB but started with a gap-filled prefix (bytes already on server), we must
@@ -404,9 +417,12 @@ impl FlushHandle {
             let is_truncated_session = self.write_buffers.get(&ino)
                 .and_then(|s| s.try_lock().ok().map(|st| st.is_truncated_session))
                 .unwrap_or(false);
+            // Use real_data_end to detect a small overwrite into a full-sized slot.
+            // A slot padded to CHUNK_SIZE with gap-fill zeros must not be sent as a fresh
+            // write — only the real written bytes should be patched onto the server.
+            let effective_write_end = if real_data_end > 0 { real_data_end } else { slot_len };
             let is_overwrite = chunk_exists
-                && slot_len < CHUNK_SIZE
-                && slot_len <= existing_chunk_size
+                && effective_write_end <= existing_chunk_size
                 && !is_truncated_session;
             let needs_patch = is_overwrite || is_append_extend;
 
@@ -415,11 +431,12 @@ impl FlushHandle {
                     // Send only the new appended bytes, starting at the old chunk boundary.
                     (existing_chunk_size, slot_data[existing_chunk_size..].to_vec())
                 } else {
-                    // In-place overwrite: skip any synthetic zero-fill prefix (gap_filled_prefix
-                    // marks bytes that were zero-filled, not written by the app). Only send
-                    // the real app-written bytes.
+                    // In-place overwrite: send only the real app-written bytes.
+                    // Use real_data_end to bound the patch so gap-fill zeros beyond the
+                    // last real write are not sent (they would overwrite real server data).
                     let real_start = gap_filled_prefix;
-                    (real_start, slot_data[real_start..].to_vec())
+                    let real_end = effective_write_end;
+                    (real_start, slot_data[real_start..real_end].to_vec())
                 };
                 info!("flush_buffer_async: slot {} ({} bytes) — PatchChunk intra={} patch_len={}",
                       chunk_idx, slot_len, patch_intra, patch_bytes.len());
@@ -881,11 +898,11 @@ impl FlushHandle {
         };
         let chunk_exists = existing_chunk_size > 0
             || max_flushed_idx.map(|max| chunk_idx <= max).unwrap_or(false);
-        let gap_filled_prefix = {
+        let (gap_filled_prefix, real_data_end) = {
             self.write_buffers.get(&ino)
                 .and_then(|s| s.try_lock().ok()
-                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| sl.gap_filled_prefix)))
-                .unwrap_or(0)
+                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| (sl.gap_filled_prefix, sl.real_data_end))))
+                .unwrap_or((0, 0))
         };
         let slot_len = slot_data.len();
         let is_append_extend = chunk_exists
@@ -894,9 +911,13 @@ impl FlushHandle {
         let is_truncated_session = self.write_buffers.get(&ino)
             .and_then(|s| s.try_lock().ok().map(|st| st.is_truncated_session))
             .unwrap_or(false);
+        // A slot is an overwrite if: chunk exists on server, not a truncated session, and
+        // the real written data doesn't exceed what's already there. We use real_data_end
+        // (not slot_len) because a full-sized slot may be padded with gap-fill zeros that
+        // represent data already on the server — those must NOT be sent as patch data.
+        let effective_write_end = if real_data_end > 0 { real_data_end } else { slot_len };
         let is_overwrite = chunk_exists
-            && slot_len < CHUNK_SIZE
-            && slot_len <= existing_chunk_size
+            && effective_write_end <= existing_chunk_size
             && !is_truncated_session;
         let needs_patch = is_overwrite || is_append_extend;
 
@@ -904,8 +925,10 @@ impl FlushHandle {
             let (patch_intra, patch_bytes) = if is_append_extend {
                 (existing_chunk_size, slot_data[existing_chunk_size..].to_vec())
             } else {
+                // Overwrite: send only the real written bytes, not gap-fill zeros
                 let real_start = gap_filled_prefix;
-                (real_start, slot_data[real_start..].to_vec())
+                let real_end = effective_write_end;
+                (real_start, slot_data[real_start..real_end].to_vec())
             };
             let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
             if let Some(meta) = meta {
@@ -2507,11 +2530,18 @@ impl Filesystem for DfsFilesystem {
             // Use blocking lock (not try_lock) to wait for flush completion, ensuring
             // we see the final buffer state before falling through to network.
             let file_size = if write_buffer_enabled {
-                if let Some(state_lock) = write_buffers.get(&ino) {
-                    let state = state_lock.lock().await;
-                    let buffered_end = state.slots.iter()
-                        .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
-                        .max().unwrap_or(0);
+                if let Some(state_arc) = write_buffers.get(&ino).map(|r| r.clone()) {
+                    // Use a timeout on the lock so a slow flush (e.g. node failure causing
+                    // TCP timeout) doesn't freeze all reads at the live edge for 17+ seconds.
+                    let buffered_end = match tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        state_arc.lock(),
+                    ).await {
+                        Ok(state) => state.slots.iter()
+                            .map(|(idx, slot)| idx * CHUNK_SIZE as u64 + slot.data.len() as u64)
+                            .max().unwrap_or(0),
+                        Err(_) => 0, // flush taking too long — fall through to network
+                    };
                     file_size.max(buffered_end)
                 } else { file_size }
             } else { file_size };
@@ -2522,14 +2552,33 @@ impl Filesystem for DfsFilesystem {
             // Slot absent → fall through to network (committed data on server).
             // This prevents 0-byte returns during the pre-commit window that cause
             // concurrent dd readers to get offset-shifted data in READ_COPY.
-            // CRITICAL: Use blocking lock (not try_lock) to wait for flush completion.
-            // If try_lock fails, flush is in progress, and falling through to network
-            // would fetch stale chunk_id (PatchChunk creates new chunk_id, metadata
-            // not updated until flush completes). Blocking ensures we either serve from
-            // buffer or fall through only after flush completes and metadata is fresh.
+            // Use a 500ms timeout on the lock so a slow flush (node failure, TCP timeout)
+            // doesn't freeze reads at the live edge. If we can't acquire within 500ms,
+            // fall through to the network — slightly stale chunk_id risk is acceptable
+            // compared to a 17-second player freeze.
             if write_buffer_enabled {
-                if let Some(state_lock) = write_buffers.get(&ino) {
-                    let state = state_lock.lock().await;
+                if let Some(state_arc) = write_buffers.get(&ino).map(|r| r.clone()) {
+                    let lock_result = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        state_arc.lock(),
+                    ).await;
+                    if lock_result.is_err() {
+                        // Flush is stuck (likely slow node) — fall through to network
+                        let result = client.read_file(
+                            ino, file_size, file_id, &file_path, offset, size, false,
+                        ).await;
+                        let elapsed = start.elapsed();
+                        match result {
+                            Ok(data) => {
+                                let reply_data = if data.len() > size { &data[..size] } else { &data[..] };
+                                info!("FUSE read done: ino={}, {} bytes in {:?}", ino, reply_data.len(), elapsed);
+                                reply.data(reply_data);
+                            }
+                            Err(e) => { error!("read failed: {}", e); reply.error(libc::EIO); }
+                        }
+                        return;
+                    }
+                    let state = lock_result.unwrap();
                     let chunk_idx = InodeWriteState::chunk_index(offset as u64);
                     let intra = InodeWriteState::intra_offset(offset as u64);
                     if let Some(slot) = state.slots.get(&chunk_idx) {

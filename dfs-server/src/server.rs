@@ -4015,6 +4015,15 @@ impl Server {
         match list_result {
             Ok(files) => {
                 let total_count = files.len();
+                // Strip chunk_locations before sending — the client startup warm only
+                // needs scalar fields (path, size, id, mode, timestamps) for getattr
+                // and dir cache. Sending full chunk arrays for hundreds of recordings
+                // serializes gigabytes and blocks the leader's tokio workers.
+                // Chunk locations are fetched lazily on open() via GetFileChunkMap.
+                let files: Vec<_> = files.into_iter().map(|mut f| {
+                    f.chunk_locations.clear();
+                    f
+                }).collect();
                 Response::FileList { files, total_count }
             }
             Err(e) => {

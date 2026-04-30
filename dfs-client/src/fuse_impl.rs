@@ -343,15 +343,6 @@ impl FlushHandle {
         // the full combined chunk. Without this, a DVR-style header write (small write to offset 0
         // at recording start, followed by the full stream body) produces a 12032-byte stub chunk
         // that replaces the correct 4MB first chunk when the file is closed.
-        let max_flushed_idx: Option<u64> = {
-            // The highest chunk index already committed to the server = max chunk in metadata
-            // that is NOT currently in the write buffer (already flushed).
-            let meta_chunk_count = self.metadata_cache.get(&ino)
-                .map(|m| m.chunk_locations.len() as u64)
-                .unwrap_or(0);
-            if meta_chunk_count > 0 { Some(meta_chunk_count - 1) } else { None }
-        };
-
         let mut slots_to_write: Vec<(u64, Vec<u8>, u64)> = Vec::new(); // (chunk_idx, data, file_offset)
         let mut patch_metadata_dirty = false; // true if any PatchChunk succeeded (needs metadata flush)
         for chunk_idx in &indices_to_flush {
@@ -385,12 +376,11 @@ impl FlushHandle {
                         .and_then(|st| st.flushed_sizes.get(chunk_idx).copied()));
                 from_flushed.unwrap_or_else(|| {
                     self.metadata_cache.get(&ino)
-                        .and_then(|m| m.chunk_locations.get(*chunk_idx as usize).map(|l| l.size))
+                        .and_then(|m| m.chunk_location_for_idx(*chunk_idx).map(|l| l.size))
                         .unwrap_or(0)
                 })
             };
-            let chunk_exists = existing_chunk_size > 0
-                || max_flushed_idx.map(|max| *chunk_idx <= max).unwrap_or(false);
+            let chunk_exists = existing_chunk_size > 0;
             // Detect append: the slot was gap-zero-filled up to existing_chunk_size, then
             // real data was appended beyond. Use gap_filled_prefix (set explicitly when we
             // zero-fill) rather than checking for all-zeros — the all-zeros heuristic was
@@ -442,8 +432,7 @@ impl FlushHandle {
                       chunk_idx, slot_len, patch_intra, patch_bytes.len());
                 let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
                 let patched = if let Some(meta) = meta {
-                    let chunk_idx_usize = *chunk_idx as usize;
-                    let old_location_opt = meta.chunk_locations.get(chunk_idx_usize).cloned();
+                    let old_location_opt = meta.chunk_location_for_idx(*chunk_idx).cloned();
                     if let Some(old_location) = old_location_opt {
                         let patch_result = self.client.patch_chunk_on_replicas(
                             old_location.chunk_id,
@@ -469,7 +458,7 @@ impl FlushHandle {
                                     match self.client.get_file_metadata(&path).await {
                                         Ok(Some(fresh_meta)) => {
                                             self.client.seed_write_seq(fresh_meta.id, fresh_meta.write_seq);
-                                            if let Some(fresh_loc) = fresh_meta.chunk_locations.get(chunk_idx_usize).cloned() {
+                                            if let Some(fresh_loc) = fresh_meta.chunk_location_for_idx(*chunk_idx).cloned() {
                                                 info!("flush_buffer_async: retrying PatchChunk slot {} with fresh location {} (was {})",
                                                       chunk_idx, fresh_loc.chunk_id, old_location.chunk_id);
                                                 let retry = self.client.patch_chunk_on_replicas(
@@ -500,7 +489,7 @@ impl FlushHandle {
                                 info!("flush_buffer_async: PatchChunk slot {} succeeded: {} -> {}",
                                       chunk_idx, old_location.chunk_id, new_location.chunk_id);
                                 if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
-                                    if let Some(loc) = meta_entry.chunk_locations.get_mut(chunk_idx_usize) {
+                                    if let Some(loc) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
                                         *loc = new_location.clone();
                                     }
                                     if let Some(new_size) = meta_entry.chunk_locations.iter()
@@ -540,7 +529,7 @@ impl FlushHandle {
                         if let Some(path) = path_opt {
                             if let Ok(Some(fresh_meta)) = self.client.get_file_metadata(&path).await {
                                 self.client.seed_write_seq(fresh_meta.id, fresh_meta.write_seq);
-                                let fresh_loc = fresh_meta.chunk_locations.get(chunk_idx_usize).cloned();
+                                let fresh_loc = fresh_meta.chunk_location_for_idx(*chunk_idx).cloned();
                                 self.metadata_cache.insert(ino, fresh_meta);
                                 if let Some(old_location) = fresh_loc {
                                     info!("flush_buffer_async: retrying PatchChunk slot {} after cache refresh (loc={})", chunk_idx, old_location.chunk_id);
@@ -556,7 +545,7 @@ impl FlushHandle {
                                             info!("flush_buffer_async: PatchChunk slot {} succeeded after cache refresh: {} -> {}",
                                                   chunk_idx, old_location.chunk_id, new_location.chunk_id);
                                             if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
-                                                if let Some(loc) = meta_entry.chunk_locations.get_mut(chunk_idx_usize) {
+                                                if let Some(loc) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
                                                     *loc = new_location.clone();
                                                 }
                                             }
@@ -833,7 +822,7 @@ impl FlushHandle {
         // Pick the lowest-index unclaimed full slot, falling back to the lowest idle slot.
         // Atomically set flushing=true while holding the mutex so no second concurrent
         // task can claim the same slot.
-        let (chunk_idx, slot_data, file_offset) = {
+        let (chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end) = {
             let Some(state_arc) = self.write_buffers.get(&ino) else { return Ok(()); };
             let mut state = state_arc.lock().await;
 
@@ -866,18 +855,21 @@ impl FlushHandle {
             };
             slot.flushing = true;
             let data = slot.data.clone();
+            let gap_filled_prefix = slot.gap_filled_prefix;
+            let real_data_end = slot.real_data_end;
             let offset = idx * CHUNK_SIZE as u64;
-            (idx, data, offset)
+            (idx, data, offset, gap_filled_prefix, real_data_end)
             // mutex released here
         };
 
-        self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset).await
+        self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end).await
     }
 
     /// Internal: flush exactly the chunk at `chunk_idx` for `ino`.
-    /// Slot data and file offset are pre-snapshotted by flush_one_chunk (which also
-    /// set slot.flushing=true to prevent a concurrent task from claiming the same slot).
-    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, slot_data: Vec<u8>, file_offset: u64) -> Result<()> {
+    /// Slot data, file offset, gap_filled_prefix, and real_data_end are all pre-snapshotted
+    /// by flush_one_chunk while holding the mutex. Reading these from the live slot after
+    /// release is wrong — the slot may have been removed and recreated by a concurrent writer.
+    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, slot_data: Vec<u8>, file_offset: u64, gap_filled_prefix: usize, real_data_end: usize) -> Result<()> {
 
         // Check whether this slot needs PatchChunk or a fresh write.
         let existing_chunk_size = {
@@ -886,24 +878,11 @@ impl FlushHandle {
                     .and_then(|st| st.flushed_sizes.get(&chunk_idx).copied()));
             from_flushed.unwrap_or_else(|| {
                 self.metadata_cache.get(&ino)
-                    .and_then(|m| m.chunk_locations.get(chunk_idx as usize).map(|l| l.size))
+                    .and_then(|m| m.chunk_location_for_idx(chunk_idx).map(|l| l.size))
                     .unwrap_or(0)
             })
         };
-        let max_flushed_idx: Option<u64> = {
-            let meta_chunk_count = self.metadata_cache.get(&ino)
-                .map(|m| m.chunk_locations.len() as u64)
-                .unwrap_or(0);
-            if meta_chunk_count > 0 { Some(meta_chunk_count - 1) } else { None }
-        };
-        let chunk_exists = existing_chunk_size > 0
-            || max_flushed_idx.map(|max| chunk_idx <= max).unwrap_or(false);
-        let (gap_filled_prefix, real_data_end) = {
-            self.write_buffers.get(&ino)
-                .and_then(|s| s.try_lock().ok()
-                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| (sl.gap_filled_prefix, sl.real_data_end))))
-                .unwrap_or((0, 0))
-        };
+        let chunk_exists = existing_chunk_size > 0;
         let slot_len = slot_data.len();
         let is_append_extend = chunk_exists
             && slot_len > existing_chunk_size
@@ -932,8 +911,7 @@ impl FlushHandle {
             };
             let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
             if let Some(meta) = meta {
-                let chunk_idx_usize = chunk_idx as usize;
-                if let Some(old_location) = meta.chunk_locations.get(chunk_idx_usize).cloned() {
+                if let Some(old_location) = meta.chunk_location_for_idx(chunk_idx).cloned() {
                     let patch_result = self.client.patch_chunk_on_replicas(
                         old_location.chunk_id,
                         file_offset,
@@ -944,7 +922,7 @@ impl FlushHandle {
                     match patch_result {
                         Ok(new_location) => {
                             if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
-                                if let Some(loc) = meta_entry.chunk_locations.get_mut(chunk_idx_usize) {
+                                if let Some(loc) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
                                     *loc = new_location.clone();
                                 }
                                 if let Some(new_size) = meta_entry.chunk_locations.iter()
@@ -1110,14 +1088,28 @@ impl FlushHandle {
                         ino, &meta.chunk_locations, current_size,
                     ).await;
                 }
-                // Now that read engine is updated, safe to remove slot.
+                // Now that read engine is updated, safe to remove slot — unless new data
+                // arrived while the flush was in flight (concurrent writer added bytes).
+                // In that case, keep the slot so the next flush cycle sends the new data.
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     let mut state = state_arc.lock().await;
-                    state.slots.remove(&chunk_idx);
-                    self.global_buffered_bytes.fetch_sub(
-                        flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    let current_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                    if current_len <= flushed_len {
+                        state.slots.remove(&chunk_idx);
+                        self.global_buffered_bytes.fetch_sub(
+                            flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    } else {
+                        // New data arrived during flush — clear flushing flag so next cycle picks it up.
+                        if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                            slot.flushing = false;
+                        }
+                        self.global_buffered_bytes.fetch_sub(
+                            flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -2266,26 +2258,26 @@ impl Filesystem for DfsFilesystem {
         let has_inflight_flush = self.flush_in_flight.read().unwrap()
             .as_ref().map(|m| m.get(&ino).map(|v| *v > 0).unwrap_or(false)).unwrap_or(false);
         // CRITICAL: Wait for ALL in-flight release() tasks to complete before proceeding.
-        // release() spawns async flush tasks that update metadata. If we don't wait,
-        // sequential writes (T7 overwrite test) will race: the second release() reads
-        // stale cached metadata (size=9) while the first release() is still calculating
-        // the correct size (size=12), causing data loss.
-        //
-        // We wait for BOTH write_buffers removal AND PER-INODE release_in_flight to hit zero.
-        // write_buffers tracks active write sessions, release_in_flight tracks flush tasks.
-        let had_inflight = !has_active_writer && (
-            self.write_buffers.contains_key(&ino) ||
-            self.release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0
-        );
+        // release() increments release_in_flight before reply.ok(), so a counter > 0 means
+        // a prior session's flush and metadata commit is still running. We must wait for it
+        // so metadata_cache reflects the prior session's chunks before this open tries to
+        // write — otherwise rapid sequential writers (no pause between them) can flush
+        // before the prior session's metadata lands, see chunk_exists=false, and overwrite
+        // an existing chunk with gap-fill zeros.
+        // We check release_in_flight only (not write_buffers) because when a new writer
+        // registers, write_buffers is intentionally kept alive and would deadlock the wait.
+        let had_inflight = !has_active_writer &&
+            self.release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0;
         if had_inflight {
-            let write_buffers = self.write_buffers.clone();
             let release_in_flight = self.release_in_flight.clone();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             tokio::task::block_in_place(|| {
                 self.runtime.block_on(async {
-                    while write_buffers.contains_key(&ino) ||
-                          release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0 {
-                        if std::time::Instant::now() >= deadline { break; }
+                    while release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0 {
+                        if std::time::Instant::now() >= deadline {
+                            warn!("open: timed out waiting for release_in_flight on ino={}", ino);
+                            break;
+                        }
                         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                     }
                 });
@@ -3196,7 +3188,7 @@ impl Filesystem for DfsFilesystem {
                     let target_intra = InodeWriteState::intra_offset(offset as u64);
                     let meta_snap = metadata_cache.get(&ino).map(|m| m.clone());
                     let existing_loc = meta_snap.as_ref()
-                        .and_then(|m| m.chunk_locations.get(target_chunk_idx as usize).cloned());
+                        .and_then(|m| m.chunk_location_for_idx(target_chunk_idx).cloned());
 
                     if let Some(old_loc) = existing_loc {
                         // Target offset is within an existing chunk — patch it in-place.
@@ -3208,7 +3200,7 @@ impl Filesystem for DfsFilesystem {
                             Ok(new_loc) => {
                                 let mut meta = meta_snap.unwrap();
                                 let new_size = (offset_usize + data_vec.len()).max(current_size).max(meta.size as usize);
-                                if let Some(loc) = meta.chunk_locations.get_mut(target_chunk_idx as usize) {
+                                if let Some(loc) = meta.chunk_location_for_idx_mut(target_chunk_idx) {
                                     *loc = new_loc;
                                 }
                                 meta.size = new_size as u64;

@@ -225,11 +225,14 @@ impl InodeReadEngine {
                 written_at: None,
             });
         }
-        // Overwrite the refreshed window.
+        // Overwrite the refreshed window. Skip nil/placeholder entries (chunk_id all-zeros)
+        // from sparse-file expansions — they represent unwritten slots and must not
+        // overwrite valid entries already in the engine.
+        let nil_hash = [0u8; 32];
         let window_len = window.len() as u32;
         for (i, loc) in window.into_iter().enumerate() {
             let idx = from + i;
-            if idx < new_map.len() {
+            if idx < new_map.len() && loc.chunk_id.hash != nil_hash {
                 new_map[idx] = loc;
             }
         }

@@ -257,6 +257,22 @@ impl FileMetadata {
     pub fn get_chunk_sizes(&self) -> Vec<u64> {
         self.chunk_locations.iter().map(|loc| loc.size as u64).collect()
     }
+
+    /// Look up a chunk location by chunk index (chunk_idx * CHUNK_SIZE = file_offset).
+    /// chunk_locations is a sparse list sorted by file_offset, NOT a dense array —
+    /// indexing by chunk_idx as usize gives wrong results for sparse files with gaps.
+    pub fn chunk_location_for_idx(&self, chunk_idx: u64) -> Option<&ChunkLocation> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let target_offset = chunk_idx * CHUNK_SIZE;
+        self.chunk_locations.iter().find(|l| l.file_offset == Some(target_offset))
+    }
+
+    /// Mutable version of chunk_location_for_idx.
+    pub fn chunk_location_for_idx_mut(&mut self, chunk_idx: u64) -> Option<&mut ChunkLocation> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let target_offset = chunk_idx * CHUNK_SIZE;
+        self.chunk_locations.iter_mut().find(|l| l.file_offset == Some(target_offset))
+    }
 }
 
 /// Type of file system entry

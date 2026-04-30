@@ -3961,13 +3961,42 @@ impl Server {
     /// Handle GetFileChunkMap — returns a windowed slice of the chunk location map.
     /// Served from the in-memory chunk map maintained by all nodes (leader-authoritative).
     async fn handle_get_file_chunk_map(&self, file_id: FileId, from_chunk: u32, count: u32) -> Response {
+        // chunk_locations is a sparse list (only written chunks, sorted by file_offset).
+        // We must expand it to a dense positional array so the client's
+        // update_chunk_map_window places each entry at the correct slot index.
+        // total_chunks = max chunk index + 1 (not list length).
         let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, modified_at: u64| {
-            let total_chunks = locations.len() as u32;
-            let start = (from_chunk as usize).min(locations.len());
-            let end = start.saturating_add(count as usize).min(locations.len());
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+            let max_chunk_idx = locations.iter()
+                .filter_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE) as u32))
+                .max()
+                .unwrap_or(locations.len().saturating_sub(1) as u32);
+            let total_chunks = max_chunk_idx + 1;
+
+            // Build dense array indexed by chunk position, nil for unwritten slots.
+            let nil = dfs_common::ChunkLocation {
+                chunk_id: dfs_common::ChunkId::from_hash([0u8; 32]),
+                nodes: vec![],
+                size: 0,
+                checksum: [0u8; 32],
+                file_offset: None,
+                written_at: None,
+            };
+            let mut dense: Vec<dfs_common::ChunkLocation> = vec![nil; total_chunks as usize];
+            for loc in locations {
+                let idx = loc.file_offset
+                    .map(|o| (o / CHUNK_SIZE) as usize)
+                    .unwrap_or_else(|| dense.len().saturating_sub(1));
+                if idx < dense.len() {
+                    dense[idx] = loc.clone();
+                }
+            }
+
+            let start = (from_chunk as usize).min(dense.len());
+            let end = start.saturating_add(count as usize).min(dense.len());
             Response::FileChunkMap {
                 file_id,
-                locations: locations[start..end].to_vec(),
+                locations: dense[start..end].to_vec(),
                 from_chunk,
                 total_chunks,
                 modified_at,

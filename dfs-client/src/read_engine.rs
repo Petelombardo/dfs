@@ -225,14 +225,19 @@ impl InodeReadEngine {
                 written_at: None,
             });
         }
-        // Overwrite the refreshed window. Skip nil/placeholder entries (chunk_id all-zeros)
-        // from sparse-file expansions — they represent unwritten slots and must not
-        // overwrite valid entries already in the engine.
-        let nil_hash = [0u8; 32];
+        // Place each entry at its correct position using file_offset (sparse-safe).
+        // The server returns a sparse list — positional indexing would place chunk N at
+        // slot i, corrupting the map for files with gaps between written chunks.
+        const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
         let window_len = window.len() as u32;
-        for (i, loc) in window.into_iter().enumerate() {
-            let idx = from + i;
-            if idx < new_map.len() && loc.chunk_id.hash != nil_hash {
+        for loc in window.into_iter() {
+            let idx = if let Some(offset) = loc.file_offset {
+                (offset / CHUNK_SIZE_U64) as usize
+            } else {
+                // No file_offset (legacy): fall back to positional within the window.
+                from
+            };
+            if idx < new_map.len() {
                 new_map[idx] = loc;
             }
         }

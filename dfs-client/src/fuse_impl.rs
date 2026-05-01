@@ -865,11 +865,17 @@ impl FlushHandle {
             // mutex released here
         };
 
-        // Wait for any in-flight write() tasks for this inode to finish before flushing.
-        // A full slot triggers the background flusher immediately, but if the slot became
-        // full from a single write that was the last byte of a dd-bs=1 sequence, more
-        // write() calls may still be in flight on the main runtime. Without this wait,
-        // the snapshot captures a partially-written slot and sends zeros for the remainder.
+        // Wait for any in-flight write() tasks to finish before flushing — but ONLY when
+        // the slot has a gap-filled prefix. This is the sparse-file case: a write at a
+        // high intra-offset zero-fills the preceding region, making the slot full on the
+        // first byte. The remaining bytes of that write are still queued. Without waiting,
+        // the snapshot sends zeros for the unfinished tail.
+        //
+        // Sequential appends (DVR) have gap_filled_prefix=0 — they fill slots incrementally
+        // and the flusher fires after the slot is complete. No wait needed, and waiting
+        // would stall on write_tasks_in_flight>0 (continuous incoming writes), breaking
+        // throughput completely.
+        if gap_filled_prefix > 0 {
         if let Some(counter) = self.write_tasks_in_flight.get(&ino) {
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
             while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -892,7 +898,8 @@ impl FlushHandle {
                 }
                 info!("flush_one_chunk: ino={} chunk={} slot gone after wait — already flushed elsewhere", ino, chunk_idx);
             }
-        }
+        } // write_tasks_in_flight guard
+        } // gap_filled_prefix guard
 
         self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end).await
     }

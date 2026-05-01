@@ -931,11 +931,11 @@ impl Server {
         // the client's fallback logic will retry a different replica. Proxying
         // causes cascading timeouts: a node under load holds up all its request
         // handlers waiting for remote fetches, starving heartbeats.
-        match self.storage.read_chunk(&chunk_id) {
-            Ok(data) => {
+        match self.storage.read_chunk_arc(&chunk_id) {
+            Ok(arc) => {
                 let (capacity, size) = self.storage.get_cache_stats();
                 let cache_stats = Some((0, capacity, size));
-                Response::ChunkData { chunk_id, data, cache_stats }
+                Response::ChunkData { chunk_id, data: vec![], cache_stats, arc_data: Some(arc) }
             }
             Err(_) => {
                 Response::Error {
@@ -950,23 +950,11 @@ impl Server {
     async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64) -> Response {
         debug!("Handling read chunk range: {} offset={} length={}", chunk_id, offset, length);
 
-        match self.storage.read_chunk(&chunk_id).map_err(|e| anyhow::anyhow!(e)) {
-            Ok(data) => {
-                let start = offset as usize;
-                let end = std::cmp::min(start + length as usize, data.len());
-
-                if start >= data.len() {
-                    return Response::Error {
-                        message: format!("Offset {} beyond chunk size {}", offset, data.len()),
-                        code: ErrorCode::InvalidRequest,
-                    };
-                }
-
-                let range_data = data[start..end].to_vec();
+        match self.storage.read_chunk_range(&chunk_id, offset as usize, length as usize) {
+            Ok(range_data) => {
                 debug!("Returning {} bytes from chunk {} (requested {}, offset {})",
                        range_data.len(), chunk_id, length, offset);
 
-                // Get cache stats for flow control
                 let (capacity, size) = self.storage.get_cache_stats();
                 let cache_stats = Some((0, capacity, size));
 
@@ -974,6 +962,7 @@ impl Server {
                     chunk_id,
                     data: range_data,
                     cache_stats,
+                    arc_data: None,
                 }
             }
             Err(e) => {

@@ -2263,7 +2263,7 @@ impl Filesystem for DfsFilesystem {
                         self.metadata_cache.remove(&ino);
 
                         // Invalidate read engine so subsequent reads get new file content.
-                        if let Some(engine) = self.client.read_engines.engines.get(&ino) {
+                        if let Some(engine) = self.client.read_engines.get(ino) {
                             let engine_clone = engine.clone();
                             self.runtime.block_on(async move {
                                 engine_clone.expire_chunk_map_async().await;
@@ -3663,7 +3663,7 @@ impl Filesystem for DfsFilesystem {
         // holes for the range currently being written.
         let has_active_writer = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
         if is_last_open && !has_active_writer {
-            self.client.read_engines.engines.remove(&ino);
+            self.client.read_engines.remove(ino);
         }
 
         // Decrement write-mode open count when a write-mode fd is closed
@@ -3703,7 +3703,7 @@ impl Filesystem for DfsFilesystem {
                 let pending_deletes_for_release = self.pending_deletes.clone();
                 let path_to_inode_for_release = self.path_to_inode.clone();
                 let size_high_water_for_release = self.size_high_water.clone();
-                let read_engines_for_release = self.client.read_engines.engines.clone();
+                let read_engines_for_release = self.client.read_engines.map.clone();
                 let open_counts_for_release = self.open_counts.clone();
                 let write_open_counts_for_release = self.write_open_counts.clone();
                 // Increment per-inode release counter

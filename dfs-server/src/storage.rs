@@ -164,44 +164,51 @@ impl ChunkStorage {
         Ok(())
     }
 
+    /// Read a chunk, returning a shared Arc — zero copy on cache hit, one copy on miss.
+    /// Use this instead of read_chunk() whenever the data will be sent to a network socket,
+    /// since the Arc can be passed directly to write_all without an intermediate clone.
+    pub fn read_chunk_arc(&self, chunk_id: &ChunkId) -> Result<Arc<Vec<u8>>> {
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(cached_data) = cache.get(chunk_id) {
+                debug!("Cache HIT for chunk {} ({} bytes)", chunk_id, cached_data.len());
+                return Ok(Arc::clone(cached_data));
+            }
+        }
+
+        debug!("Cache MISS for chunk {}, reading from disk", chunk_id);
+        let path = self.get_chunk_path(chunk_id);
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("Failed to open chunk file: {:?}", path))?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).context("Failed to read chunk data")?;
+        debug!("Read chunk {} from disk ({} bytes)", chunk_id, data.len());
+
+        let data_arc = Arc::new(data);
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(*chunk_id, Arc::clone(&data_arc));
+        }
+        Ok(data_arc)
+    }
+
     /// Read a chunk from local storage (cache-through)
     /// Checks cache first, then disk, then populates cache
     /// Does NOT verify checksum (for SBC performance) - use verify_chunk() for scrubbing
     ///
     /// CRITICAL: Never holds cache lock during disk I/O to prevent blocking other reads
     pub fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Vec<u8>> {
-        // Try cache first - hold lock only for the lookup, then release immediately
-        {
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(cached_data) = cache.get(chunk_id) {
-                debug!("Cache HIT for chunk {} ({} bytes)", chunk_id, cached_data.len());
-                return Ok((**cached_data).clone());
-            }
-            // Lock released here BEFORE disk I/O
+        Ok(Arc::try_unwrap(self.read_chunk_arc(chunk_id)?).unwrap_or_else(|arc| (*arc).clone()))
+    }
+
+    /// Read a byte range from a chunk — slices from the cached Arc, no full-chunk clone.
+    pub fn read_chunk_range(&self, chunk_id: &ChunkId, offset: usize, length: usize) -> Result<Vec<u8>> {
+        let data = self.read_chunk_arc(chunk_id)?;
+        if offset >= data.len() {
+            return Err(anyhow::anyhow!("Offset {} beyond chunk size {}", offset, data.len()));
         }
-
-        // Cache miss - read from disk WITHOUT holding cache lock
-        debug!("Cache MISS for chunk {}, reading from disk", chunk_id);
-        let path = self.get_chunk_path(chunk_id);
-
-        let mut file = fs::File::open(&path)
-            .with_context(|| format!("Failed to open chunk file: {:?}", path))?;
-
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .context("Failed to read chunk data")?;
-
-        debug!("Read chunk {} from disk ({} bytes)", chunk_id, data.len());
-
-        // Populate cache for future reads - re-acquire lock only for insertion
-        let data_arc = Arc::new(data.clone());
-        {
-            let mut cache = self.cache.lock().unwrap();
-            cache.put(*chunk_id, data_arc);
-            // Lock released here
-        }
-
-        Ok(data)
+        let end = (offset + length).min(data.len());
+        Ok(data[offset..end].to_vec())
     }
 
     /// Warm the cache with a chunk (prefetch hint handler)

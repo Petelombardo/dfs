@@ -442,12 +442,20 @@ pub enum Response {
     /// Success with chunk data
     ChunkData {
         chunk_id: ChunkId,
+        /// Always empty when transmitted over the wire (split-frame protocol sends data separately).
+        /// Populated in-process only when constructing a response for immediate network write
+        /// without going through bincode serialization.
         data: Vec<u8>,
         /// Cache statistics for flow control
         /// Format: (cache_hits, cache_capacity, cache_size)
         /// Client can use this to throttle reads if cache is under pressure
         #[serde(default)]
         cache_stats: Option<(usize, usize, usize)>,
+        /// Zero-copy payload: set by server handlers to avoid cloning chunk data into `data`.
+        /// The network layer uses this Arc directly if present, bypassing the `data` Vec.
+        /// Never serialized — always None after deserialization.
+        #[serde(skip)]
+        arc_data: Option<std::sync::Arc<Vec<u8>>>,
     },
 
     /// Success with file metadata

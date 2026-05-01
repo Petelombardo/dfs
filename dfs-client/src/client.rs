@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::read_engine::{InodeReadEngine, ReadEngineRegistry};
+use crate::read_engine::{InodeReadEngine, ReadEngineMap};
 
 /// Per-node health state used by NodeHealthTracker.
 ///
@@ -497,7 +497,7 @@ pub struct DfsClient {
 
     /// Per-inode read engines.  Each open file gets one engine that holds the chunk map
     /// snapshot and pipeline state.  Writers never touch this; engines refresh lazily.
-    pub read_engines: ReadEngineRegistry,
+    pub read_engines: ReadEngineMap,
 }
 
 impl DfsClient {
@@ -638,7 +638,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
             write_seq: Arc::new(DashMap::new()),
-            read_engines: ReadEngineRegistry::new(),
+            read_engines: ReadEngineMap::new(),
         })
     }
 
@@ -933,7 +933,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             .context("Failed to deserialize response")?;
 
         let response = match response_envelope.message {
-            Message::Response(Response::ChunkData { data, chunk_id, cache_stats }) => {
+            Message::Response(Response::ChunkData { data, chunk_id, cache_stats, .. }) => {
                 // Split-frame: if data is empty, raw payload follows on the stream.
                 let data = if data.is_empty() {
                     dfs_common::protocol::read_chunk_payload(&mut stream).await
@@ -941,7 +941,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 } else {
                     data
                 };
-                Response::ChunkData { chunk_id, data, cache_stats }
+                Response::ChunkData { chunk_id, data, cache_stats, arc_data: None }
             }
             Message::Response(response) => response,
             _ => anyhow::bail!("Expected Response message"),
@@ -1138,7 +1138,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             .context("Failed to deserialize response")?;
 
         let response = match response_envelope.message {
-            Message::Response(Response::ChunkData { data, chunk_id, cache_stats }) => {
+            Message::Response(Response::ChunkData { data, chunk_id, cache_stats, .. }) => {
                 // Split-frame: if data is empty, raw payload follows on the stream.
                 let data = if data.is_empty() {
                     dfs_common::protocol::read_chunk_payload(&mut stream).await
@@ -1146,7 +1146,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 } else {
                     data
                 };
-                Response::ChunkData { chunk_id, data, cache_stats }
+                Response::ChunkData { chunk_id, data, cache_stats, arc_data: None }
             }
             Message::Response(response) => response,
             _ => anyhow::bail!("Expected Response message"),
@@ -1574,7 +1574,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         const CHUNK_SIZE_USIZE: usize = 4 * 1024 * 1024;
         let current_chunk = (offset / CHUNK_SIZE_USIZE) as u32;
 
-        let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot().await;
+        let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot();
 
         if chunk_map.is_empty() {
             // Engine is cold. Check if this read is beyond the committed file size.
@@ -1594,9 +1594,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             engine.refresh_in_progress.store(false, Ordering::Release);
             self.refresh_engine(&engine, file_id, file_size, current_chunk).await;
             info!("read_file: inode={} synchronous chunk map refresh took {:?}", inode, sync_start.elapsed());
-            let snap = engine.snapshot().await;
+            let snap = engine.snapshot();
             chunk_map = snap.0; chunk_offsets = snap.1; nim = snap.2;
-        } else if engine.needs_refresh(file_size, current_chunk).await {
+        } else if engine.needs_refresh(file_size, current_chunk) {
             // Non-empty but stale — refresh in background, serve this read from current snapshot.
             let engine_clone = engine.clone();
             let client_clone = self.clone();
@@ -1645,12 +1645,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
 
             // 2. Another request already fetching it?
-            {
-                let inf = engine.in_flight.lock().await;
-                if inf.contains(&cid) {
-                    to_wait.push((idx, cid));
-                    continue;
-                }
+            if engine.in_flight.contains(&cid) {
+                to_wait.push((idx, cid));
+                continue;
             }
 
             // 3. Need to fetch.
@@ -1665,27 +1662,36 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
             };
 
-            engine.in_flight.lock().await.insert(cid);
+            engine.in_flight.insert(cid);
             to_fetch.push((idx, cid, primary, fallbacks));
         }
 
         // --- Pipeline lookahead: speculatively fetch the next N chunks. ---
+        // Only prefetch when we're latency-bound (last fetch took >20ms). On weak CPUs
+        // (nanopir3) or fast storage, the spawn overhead costs more than it saves.
         // Fire-and-forget — their results go into chunk_cache; we don't await them here.
-        if !to_fetch.is_empty() {
+        let fetch_ms = engine.last_chunk_fetch_ms.load(Ordering::Relaxed);
+        if !to_fetch.is_empty() && fetch_ms >= 20 {
             let last_required_idx = needed.last().map(|(i, _, _)| *i).unwrap_or(0);
-            let lookahead = engine.pipeline_lookahead(
-                last_required_idx, chunk_map.len(),
-                &self.chunk_cache, &chunk_map,
-            ).await;
+            let lookahead_candidates = engine.pipeline_lookahead(
+                last_required_idx, chunk_map.len(), &chunk_map,
+            );
 
-            for (la_idx, la_cid) in lookahead {
+            for (la_idx, la_cid) in lookahead_candidates {
+                // Skip if already cached — no need to fetch or mark in-flight.
+                if self.chunk_cache.get(&la_cid).await.is_some() {
+                    continue;
+                }
+                // Mark in-flight now (after cache check) to prevent duplicate fetches.
+                engine.in_flight.insert(la_cid);
+
                 let loc = &chunk_map[la_idx];
                 let (primary, fallbacks) = match InodeReadEngine::resolve_primary(
                     loc, &nim, &nodes, selector + la_idx as u64,
                 ) {
                     Some(pf) => pf,
                     None => {
-                        engine.in_flight.lock().await.remove(&la_cid);
+                        engine.in_flight.remove(&la_cid);
                         continue;
                     }
                 };
@@ -1700,7 +1706,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         }
                         Err(e) => debug!("Pipeline lookahead fetch failed for {}: {}", la_cid, e),
                     }
-                    eng.in_flight.lock().await.remove(&la_cid);
+                    eng.in_flight.remove(&la_cid);
                 });
             }
         }
@@ -1723,12 +1729,37 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             let fetch_results: Vec<(usize, ChunkId, Result<Vec<u8>>)> =
             if is_sequential_full && to_fetch.len() > 0 {
-                // Use the pipelined path: overlap connection setup with body drain.
-                let pipeline_input: Vec<(ChunkId, SocketAddr)> = to_fetch.iter()
-                    .map(|(_, cid, primary, _)| (*cid, *primary))
-                    .collect();
-                let results = self.sequential_pipeline_read(pipeline_input).await;
-                to_fetch.iter().zip(results).map(|((idx, cid, _, _), res)| (*idx, *cid, res)).collect()
+                // Use striped reads for full-chunk sequential fetches: split each chunk across
+                // both replicas and fetch the halves in parallel. This doubles effective read
+                // bandwidth — each replica only transfers 2MB instead of 4MB, but both transfer
+                // simultaneously, keeping both links busy.
+                let tasks: Vec<_> = to_fetch.iter().map(|(idx, cid, primary, fallbacks)| {
+                    let client = self.clone();
+                    let idx = *idx;
+                    let cid = *cid;
+                    let primary = *primary;
+                    let fallbacks = fallbacks.clone();
+                    let loc = chunk_map.get(idx).cloned();
+                    tokio::spawn(async move {
+                        let data = if let Some(loc) = loc {
+                            if loc.nodes.len() >= 2 && loc.size == 4 * 1024 * 1024 {
+                                let file_offset = loc.file_offset.unwrap_or(0);
+                                client.read_chunk_striped(cid, &loc, file_offset).await
+                            } else {
+                                client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await
+                            }
+                        } else {
+                            client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await
+                        };
+                        (idx, cid, data)
+                    })
+                }).collect();
+                futures::future::join_all(tasks).await.into_iter()
+                    .map(|r| r.unwrap_or_else(|e| {
+                        let dummy = ChunkId::from_hash([0u8; 32]);
+                        (0usize, dummy, Err(anyhow::anyhow!("task panicked: {}", e)))
+                    }))
+                    .collect()
             } else {
                 // Parallel path for random reads — fetch full chunks (cached for future reads).
                 let tasks: Vec<_> = to_fetch.iter().map(|(idx, cid, primary, fallbacks)| {
@@ -1750,19 +1781,21 @@ leader_addr: Arc::new(RwLock::new(None)),
                     .collect()
             };
 
-            // Store fetch timing for chunk 0 to enable adaptive stagger
-            if first_idx_in_batch == Some(0) && !fetch_results.is_empty() {
-                let elapsed_ms = start_time.elapsed().as_millis() as u64;
-                engine.last_chunk_fetch_ms.store(elapsed_ms, Ordering::Relaxed);
-                debug!("Measured chunk 0 fetch time: {}ms (adaptive stagger will be {}ms)",
-                       elapsed_ms, elapsed_ms / 2);
+            // Update fetch timing for adaptive pipeline gating.
+            // Exponential moving average so the estimate tracks network conditions.
+            if !fetch_results.is_empty() {
+                let elapsed_ms = (start_time.elapsed().as_millis() as u64)
+                    .max(1) / to_fetch.len().max(1) as u64; // per-chunk avg
+                let prev = engine.last_chunk_fetch_ms.load(Ordering::Relaxed);
+                let smoothed = (prev * 7 + elapsed_ms) / 8; // EMA α=0.125
+                engine.last_chunk_fetch_ms.store(smoothed, Ordering::Relaxed);
             }
 
             // Collect results; cache full chunks; remove from in-flight.
             // Always remove from in_flight before propagating errors — a leaked entry
             // causes every subsequent read for that chunk to wait 1s for a timeout.
             for (idx, cid, res) in fetch_results {
-                engine.in_flight.lock().await.remove(&cid);
+                engine.in_flight.remove(&cid);
                 let data = res.with_context(|| format!("Failed to fetch chunk {}", cid))?;
                 let arc = Arc::new(data);
                 if !bypass_cache {
@@ -1790,7 +1823,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             if is_sequential && last_fetched_idx > 0 && last_fetched_idx + 1 < chunk_map.len() {
                 // Spawn staggered fetches for next 2 chunks
-                let swarm_indices = vec![last_fetched_idx + 1, last_fetched_idx + 2]
+                let swarm_indices = vec![last_fetched_idx + 1]
                     .into_iter()
                     .filter(|&idx| idx < chunk_map.len())
                     .collect::<Vec<_>>();
@@ -1799,17 +1832,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let swarm_cid = chunk_map[*swarm_idx].chunk_id;
 
                     // Only fetch if not already cached or in-flight
-                    let should_swarm = self.chunk_cache.get(&swarm_cid).await.is_none() && {
-                        let inf = engine.in_flight.lock().await;
-                        !inf.contains(&swarm_cid)
-                    };
+                    let should_swarm = self.chunk_cache.get(&swarm_cid).await.is_none()
+                        && !engine.in_flight.contains(&swarm_cid);
 
                     if should_swarm {
                         let swarm_loc = &chunk_map[*swarm_idx];
                         if let Some((primary, fallbacks)) = InodeReadEngine::resolve_primary(
                             swarm_loc, &nim, &nodes, selector + *swarm_idx as u64,
                         ) {
-                            engine.in_flight.lock().await.insert(swarm_cid);
+                            engine.in_flight.insert(swarm_cid);
 
                             // Adaptive stagger: use half of chunk 0's fetch time to ensure chunk N+2
                             // starts when chunk N+1 is ~50% complete. This auto-adapts to any network
@@ -1837,19 +1868,17 @@ leader_addr: Arc::new(RwLock::new(None)),
 
                                         // Only chain if we're not too far ahead of the read position
                                         if next_idx < pipeline_pos + MAX_AHEAD {
-                                            if let Some(e) = client.read_engines.engines.get(&eng.inode) {
-                                                let (cm, _co, nim) = e.snapshot().await;
+                                            if let Some(e) = client.read_engines.get(eng.inode) {
+                                                let (cm, _co, nim) = e.snapshot();
                                                 if next_idx < cm.len() {
                                                     let next_cid = cm[next_idx].chunk_id;
-                                                    let should_chain = client.chunk_cache.get(&next_cid).await.is_none() && {
-                                                        let inf = eng.in_flight.lock().await;
-                                                        !inf.contains(&next_cid)
-                                                    };
+                                                    let should_chain = client.chunk_cache.get(&next_cid).await.is_none()
+                                                        && !eng.in_flight.contains(&next_cid);
                                                     if should_chain {
                                                         if let Some((next_primary, next_fallbacks)) = InodeReadEngine::resolve_primary(
                                                             &cm[next_idx], &nim, &[], 0
                                                         ) {
-                                                            eng.in_flight.lock().await.insert(next_cid);
+                                                            eng.in_flight.insert(next_cid);
                                                             let chain_client = client.clone();
                                                             let chain_eng = eng.clone();
                                                             tokio::spawn(async move {
@@ -1860,7 +1889,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                                     }
                                                                     Err(e) => debug!("Swarming: chain failed for chunk {}: {}", next_idx, e),
                                                                 }
-                                                                chain_eng.in_flight.lock().await.remove(&next_cid);
+                                                                chain_eng.in_flight.remove(&next_cid);
                                                             });
                                                         }
                                                     }
@@ -1870,7 +1899,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     }
                                     Err(e) => debug!("Swarming failed for chunk {}: {}", idx_copy, e),
                                 }
-                                eng.in_flight.lock().await.remove(&swarm_cid);
+                                eng.in_flight.remove(&swarm_cid);
                             });
                         }
                     }
@@ -1949,8 +1978,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 return Ok(data);
             }
             // If the other fetcher removed it from in-flight without caching, it failed.
-            let inf = engine.in_flight.lock().await;
-            if !inf.contains(&cid) {
+            if !engine.in_flight.contains(&cid) {
                 break;
             }
         }
@@ -2010,7 +2038,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader in {:?}",
                       engine.inode, locs.len(), window_from, total_chunks, rpc_start.elapsed());
                 engine.clear_failed_refresh();
-                engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size).await;
+                engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size);
             }
             Ok(_) | Err(_) => {
                 info!("refresh_engine: inode={} no chunk map from leader (took {:?})",
@@ -2026,7 +2054,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Called from fuse_impl after a successful WriteData completes.  Does not block
     /// writers — just bumps the engine's known_size so the next read triggers a refresh.
     pub fn invalidate_read_engine(&self, inode: u64) {
-        if let Some(engine) = self.read_engines.engines.get(&inode) {
+        if let Some(engine) = self.read_engines.get(inode) {
             // Set known_size to 0 so needs_refresh() returns true on the next read.
             engine.known_size.store(0, Ordering::Relaxed);
         }
@@ -2061,7 +2089,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // them from the chunk cache. Without this, a reader near the write edge can get
         // a cache hit on the old (shorter) chunk ID and return stale partial data.
         let old_chunk_ids: Vec<dfs_common::ChunkId> = {
-            let (old_map, _, _) = engine.snapshot().await;
+            let (old_map, _, _) = engine.snapshot();
             let base = from_chunk as usize;
             (0..locations.len())
                 .filter_map(|i| old_map.get(base + i).map(|l| l.chunk_id))
@@ -2078,7 +2106,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             total_chunks,
             Arc::new(nim),
             file_size,
-        ).await;
+        );
         engine.clear_failed_refresh();
 
         // Evict stale chunk IDs from the cache. Any reader that already holds an Arc to

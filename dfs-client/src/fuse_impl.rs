@@ -2307,7 +2307,9 @@ impl Filesystem for DfsFilesystem {
         // an existing chunk with gap-fill zeros.
         // We check release_in_flight only (not write_buffers) because when a new writer
         // registers, write_buffers is intentionally kept alive and would deadlock the wait.
-        let had_inflight = !has_active_writer &&
+        // Only wait on release_in_flight for write opens — a read open doesn't need
+        // prior session's metadata to be committed before proceeding.
+        let had_inflight = !is_read_open && !has_active_writer &&
             self.release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0;
         if had_inflight {
             let release_in_flight = self.release_in_flight.clone();
@@ -2337,11 +2339,11 @@ impl Filesystem for DfsFilesystem {
                         std::sync::atomic::Ordering::AcqRel,
                         std::sync::atomic::Ordering::Relaxed).is_ok()
                 {
-                    let handle = self.runtime.spawn(async move {
+                    // Fire-and-forget: the read path handles a stale/empty engine gracefully
+                    // by refreshing on first read. Blocking here stalls the FUSE dispatch
+                    // thread and can deadlock under concurrent opens (e.g. kdiskmark prep).
+                    self.runtime.spawn(async move {
                         client.refresh_engine_flagged(&engine, file_id, file_size, 0).await;
-                    });
-                    tokio::task::block_in_place(|| {
-                        self.runtime.block_on(handle).ok();
                     });
                 }
             }

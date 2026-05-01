@@ -283,6 +283,9 @@ struct FlushHandle {
     /// Notification channel to wake up flush workers immediately when chunks become full.
     /// This eliminates the 0-50ms polling delay from the ticker-based approach.
     flush_notify: Arc<tokio::sync::Notify>,
+    /// Per-inode count of in-flight FUSE write() tasks. Used by flush_one_chunk to wait
+    /// for all writes to land before snapshotting a full slot.
+    write_tasks_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
 }
 
 impl FlushHandle {
@@ -862,6 +865,35 @@ impl FlushHandle {
             // mutex released here
         };
 
+        // Wait for any in-flight write() tasks for this inode to finish before flushing.
+        // A full slot triggers the background flusher immediately, but if the slot became
+        // full from a single write that was the last byte of a dd-bs=1 sequence, more
+        // write() calls may still be in flight on the main runtime. Without this wait,
+        // the snapshot captures a partially-written slot and sends zeros for the remainder.
+        if let Some(counter) = self.write_tasks_in_flight.get(&ino) {
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+            while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if tokio::time::Instant::now() > deadline {
+                    warn!("flush_one_chunk: timed out waiting for write tasks for ino={}", ino);
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+            // Re-snapshot the slot now that all writes have landed.
+            if let Some(state_arc) = self.write_buffers.get(&ino) {
+                let mut state = state_arc.lock().await;
+                if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                    let data = slot.data.clone();
+                    let gap_filled_prefix = slot.gap_filled_prefix;
+                    let real_data_end = slot.real_data_end;
+                    let file_offset = chunk_idx * CHUNK_SIZE as u64;
+                    drop(state);
+                    return self.flush_buffer_async_one(ino, chunk_idx, data, file_offset, gap_filled_prefix, real_data_end).await;
+                }
+                info!("flush_one_chunk: ino={} chunk={} slot gone after wait — already flushed elsewhere", ino, chunk_idx);
+            }
+        }
+
         self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end).await
     }
 
@@ -1101,7 +1133,9 @@ impl FlushHandle {
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     } else {
-                        // New data arrived during flush — clear flushing flag so next cycle picks it up.
+                        // New data arrived during flush — clear flushing flag and record the
+                        // committed size so the next flush knows what's already on the server.
+                        state.flushed_sizes.insert(chunk_idx, flushed_len);
                         if let Some(slot) = state.slots.get_mut(&chunk_idx) {
                             slot.flushing = false;
                         }
@@ -1444,6 +1478,10 @@ impl DfsFilesystem {
         // Notification channel for immediate flush triggering when chunks become full
         let flush_notify: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
 
+        // Shared write_tasks_in_flight — used by flush_one_chunk to wait for in-flight
+        // write() tasks before snapshotting a full slot.
+        let write_tasks_in_flight_shared: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>> = Arc::new(DashMap::new());
+
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
             let write_buffers_clone = write_buffers_for_cleanup.clone();
@@ -1470,6 +1508,7 @@ impl DfsFilesystem {
                 flush_runtime: flush_runtime.clone(),
                 global_buffered_bytes: global_buffered_bytes.clone(),
                 flush_notify: flush_notify.clone(),
+                write_tasks_in_flight: write_tasks_in_flight_shared.clone(),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
@@ -1594,6 +1633,7 @@ impl DfsFilesystem {
             flush_runtime: flush_runtime.clone(),
             global_buffered_bytes: global_buffered_bytes.clone(),
             flush_notify: flush_notify.clone(),
+            write_tasks_in_flight: write_tasks_in_flight_shared.clone(),
         };
 
         Ok(Self {
@@ -1624,7 +1664,7 @@ impl DfsFilesystem {
             pending_deletes: Arc::new(dashmap::DashSet::new()),
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
             release_in_flight: Arc::new(DashMap::new()),
-            write_tasks_in_flight: Arc::new(DashMap::new()),
+            write_tasks_in_flight: write_tasks_in_flight_shared,
             global_buffered_bytes,
             flush_notify,
             global_write_buffer_cap,
@@ -1921,6 +1961,7 @@ impl Filesystem for DfsFilesystem {
             flush_runtime: self.flush_runtime.clone(),
             global_buffered_bytes: self.global_buffered_bytes.clone(),
             flush_notify: self.flush_notify.clone(),
+            write_tasks_in_flight: self.write_tasks_in_flight.clone(),
         };
 
         self.block_on(async move {

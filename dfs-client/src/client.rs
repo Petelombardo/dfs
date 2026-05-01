@@ -442,6 +442,11 @@ pub struct DfsClient {
     /// Limited to 256 entries to prevent unbounded growth
     last_prefetch_position: Arc<Mutex<LruCache<ChunkId, usize>>>,
 
+    /// Inodes currently open for writing. Reads on these inodes bypass the chunk cache
+    /// so the writer always sees fresh server-side content (e.g. HDHomeRun reading chunk 0
+    /// to update seek offsets must not get a stale cached version of the previous patch).
+    pub write_open_inodes: Arc<dashmap::DashSet<u64>>,
+
     /// Round-robin counter for replica selection (for load balancing)
     replica_selector: Arc<AtomicU64>,
 
@@ -627,6 +632,7 @@ impl DfsClient {
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(tokio::sync::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
             last_prefetch_position: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            write_open_inodes: Arc::new(dashmap::DashSet::new()),
             replica_selector: Arc::new(AtomicU64::new(0)),
             replica_cache: Arc::new(Mutex::new(replica_cache)),
             sqlite_write_tracker: Arc::new(Mutex::new(sqlite_write_tracker)),
@@ -1611,8 +1617,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             return Ok(Vec::new());
         }
 
-        // SQLite files: bypass chunk_cache to prevent stale-read corruption.
-        let bypass_cache = crate::fuse_impl::is_sqlite_for_cache(file_path);
+        // Bypass cache for write-open inodes and SQLite files.
+        // Write-open bypass: the writer (e.g. HDHomeRun seek table update) reads chunk 0
+        // to get current content before patching. A cache hit here returns the pre-patch
+        // content from a prior session, causing the new patch to embed stale seek offsets.
+        let bypass_cache = crate::fuse_impl::is_sqlite_for_cache(file_path)
+            || self.write_open_inodes.contains(&inode);
 
         let end = offset + size;
         let needed = InodeReadEngine::chunks_for_range(&chunk_offsets, offset, size);

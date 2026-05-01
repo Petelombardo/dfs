@@ -2224,6 +2224,11 @@ impl Filesystem for DfsFilesystem {
             // with old server data, causing the file to revert to its pre-write size.
             // For subsequent writers on the same inode (write_open_count > 1), the metadata
             // is already fresh from the first writer's open, so skip there too.
+            // Mark inode as write-open so reads bypass the chunk cache for this session.
+            // Synchronous — happens before open() returns, so the app's first read
+            // after open always fetches fresh data from the server.
+            self.client.write_open_inodes.insert(ino);
+
             let is_first_writer = self.write_open_counts.get(&ino).map(|c| *c == 1).unwrap_or(true);
             if !is_first_writer {
                 let path_opt = self.path_to_inode.read().unwrap()
@@ -3677,6 +3682,7 @@ impl Filesystem for DfsFilesystem {
             }
             if remove {
                 self.write_open_counts.remove(&ino);
+                self.client.write_open_inodes.remove(&ino);
                 // size_high_water is cleared after the flush completes (in the release task)
                 // so that getattr during the flush window still reports the correct size.
             }

@@ -13,21 +13,23 @@ use tracing::{debug, info};
 /// Built once from chunk_locations and reused for all reads.
 pub type ChunkOffsets = Arc<Vec<(usize, usize)>>;
 
+/// Chunk map + parallel offsets, always updated together under one lock.
+/// Bundling them prevents a reader from seeing new chunk_map with old chunk_offsets
+/// (or vice versa) between two separate write-lock acquisitions.
+struct ChunkMapSnapshot {
+    map:     Arc<Vec<ChunkLocation>>,
+    offsets: Arc<Vec<(usize, usize)>>,
+}
+
 /// Per-inode read engine. One instance lives as long as any fd has the file open.
 ///
-/// Lock-free design: all read-path fields use ArcSwap (atomic pointer swap) or atomics.
-/// Writers swap in new Arcs; concurrent readers load without blocking or sleeping.
-/// `in_flight` uses DashSet (sharded lock-free hash set) to avoid a single hot Mutex.
+/// `chunk_state` is a single RwLock covering both map and offsets so they are
+/// always swapped atomically.  All other read-path fields use atomics or DashSet.
 pub struct InodeReadEngine {
     pub inode: u64,
 
-    /// Current chunk location snapshot. RwLock: many concurrent readers, rare writer.
-    /// std::sync::RwLock (not tokio's) — readers acquire a shared read lock without
-    /// incrementing any Arc refcount, avoiding cache-line bounce under high concurrency.
-    chunk_map: RwLock<Arc<Vec<ChunkLocation>>>,
-
-    /// Precomputed (file_byte_offset, chunk_byte_size) parallel to chunk_map.
-    chunk_offsets: RwLock<Arc<Vec<(usize, usize)>>>,
+    /// Chunk locations + precomputed offsets, always consistent with each other.
+    chunk_state: RwLock<ChunkMapSnapshot>,
 
     /// Cached file size at the time chunk_map was last built. Used to detect growth.
     pub known_size: AtomicUsize,
@@ -35,7 +37,8 @@ pub struct InodeReadEngine {
     /// When chunk_map was last fetched (ms since UNIX epoch).
     last_map_refresh_ms: AtomicU64,
 
-    /// NodeId -> SocketAddr snapshot taken at engine-init / refresh time.
+    /// NodeId → SocketAddr mapping. Updated alongside chunk_state but separately
+    /// (node map changes are rare and harmless if briefly inconsistent with the chunk map).
     node_id_to_addr: RwLock<Arc<HashMap<dfs_common::NodeId, SocketAddr>>>,
 
     /// Chunks currently being fetched by this engine (prevents duplicate concurrent fetches).
@@ -75,8 +78,10 @@ impl InodeReadEngine {
         let stale_ms = now_ms().saturating_sub(60_000);
         Arc::new(Self {
             inode,
-            chunk_map: RwLock::new(Arc::new(Vec::new())),
-            chunk_offsets: RwLock::new(Arc::new(Vec::new())),
+            chunk_state: RwLock::new(ChunkMapSnapshot {
+                map:     Arc::new(Vec::new()),
+                offsets: Arc::new(Vec::new()),
+            }),
             known_size: AtomicUsize::new(0),
             last_map_refresh_ms: AtomicU64::new(stale_ms),
             node_id_to_addr: RwLock::new(Arc::new(HashMap::new())),
@@ -99,8 +104,11 @@ impl InodeReadEngine {
 
     /// Async version — also clears the map data (for open() after recording finishes).
     pub async fn expire_chunk_map_async(&self) {
-        *self.chunk_map.write().unwrap() = Arc::new(Vec::new());
-        *self.chunk_offsets.write().unwrap() = Arc::new(Vec::new());
+        {
+            let mut s = self.chunk_state.write().unwrap();
+            s.map     = Arc::new(Vec::new());
+            s.offsets = Arc::new(Vec::new());
+        }
         self.expire_chunk_map();
         self.last_window_start.store(u32::MAX, Ordering::Relaxed);
         self.last_window_end.store(0, Ordering::Relaxed);
@@ -150,8 +158,11 @@ impl InodeReadEngine {
     ) {
         let offsets = build_offsets(&locations);
         let loc_len = locations.len() as u32;
-        *self.chunk_map.write().unwrap() = Arc::new(locations);
-        *self.chunk_offsets.write().unwrap() = Arc::new(offsets);
+        {
+            let mut s = self.chunk_state.write().unwrap();
+            s.map     = Arc::new(locations);
+            s.offsets = Arc::new(offsets);
+        }
         *self.node_id_to_addr.write().unwrap() = node_map;
         self.last_map_refresh_ms.store(now_ms(), Ordering::Relaxed);
         self.known_size.store(file_size as usize, Ordering::Relaxed);
@@ -172,7 +183,7 @@ impl InodeReadEngine {
         let from = from_chunk as usize;
         let total = total_chunks as usize;
 
-        let mut new_map: Vec<ChunkLocation> = (**self.chunk_map.read().unwrap()).clone();
+        let mut new_map: Vec<ChunkLocation> = (*self.chunk_state.read().unwrap().map).clone();
 
         let nil_id = dfs_common::ChunkId::from_hash([0u8; 32]);
         if new_map.len() < total {
@@ -207,8 +218,11 @@ impl InodeReadEngine {
         info!("Engine inode={}: chunk map window merged ({} chunks, {} bytes, window from={} end={})",
               self.inode, new_map.len(), file_size, from_chunk, window_end);
 
-        *self.chunk_map.write().unwrap() = Arc::new(new_map);
-        *self.chunk_offsets.write().unwrap() = Arc::new(offsets);
+        {
+            let mut s = self.chunk_state.write().unwrap();
+            s.map     = Arc::new(new_map);
+            s.offsets = Arc::new(offsets);
+        }
         *self.node_id_to_addr.write().unwrap() = node_map;
         self.last_map_refresh_ms.store(now_ms(), Ordering::Relaxed);
         self.known_size.store(file_size as usize, Ordering::Relaxed);
@@ -216,20 +230,21 @@ impl InodeReadEngine {
         self.last_window_end.store(window_end, Ordering::Relaxed);
     }
 
-    /// Cheap snapshot: acquires three read locks, clones three Arcs, releases locks.
-    /// Read locks are shared — many concurrent readers proceed without blocking each other.
-    /// Writers (refresh path) are rare and brief; they hold write locks only while swapping Arcs.
+    /// Cheap snapshot: one read lock for (map, offsets) atomically, one for nim.
+    /// Readers always see map and offsets from the same write — never a torn state.
     pub fn snapshot(&self) -> (Arc<Vec<ChunkLocation>>, Arc<Vec<(usize, usize)>>,
                                Arc<HashMap<dfs_common::NodeId, SocketAddr>>) {
-        let cm = self.chunk_map.read().unwrap().clone();
-        let co = self.chunk_offsets.read().unwrap().clone();
+        let s = self.chunk_state.read().unwrap();
+        let cm  = Arc::clone(&s.map);
+        let co  = Arc::clone(&s.offsets);
+        drop(s);
         let nim = self.node_id_to_addr.read().unwrap().clone();
         (cm, co, nim)
     }
 
     /// Returns true if the chunk map is currently empty.
     pub fn is_chunk_map_empty(&self) -> bool {
-        self.chunk_map.read().unwrap().is_empty()
+        self.chunk_state.read().unwrap().map.is_empty()
     }
 
     /// Find all chunk indices that overlap [offset, offset+size).

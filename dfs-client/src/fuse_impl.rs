@@ -943,7 +943,6 @@ impl FlushHandle {
             let (patch_intra, patch_bytes) = if is_append_extend {
                 (existing_chunk_size, slot_data[existing_chunk_size..].to_vec())
             } else {
-                // Overwrite: send only the real written bytes, not gap-fill zeros
                 let real_start = gap_filled_prefix;
                 let real_end = effective_write_end;
                 (real_start, slot_data[real_start..real_end].to_vec())
@@ -2275,7 +2274,29 @@ impl Filesystem for DfsFilesystem {
                             });
                         }
                     }
-                    self.write_buffers.remove(&ino);
+                    // Only remove the write buffer if it has no unflushed data.
+                    // If a slot with real data exists (flushing=false, non-empty), a
+                    // concurrent flush task wrote data that hasn't been sent to the server yet.
+                    // Removing the buffer here would silently discard that data.
+                    // If flushing=true, a flush is in progress — leave it; that task will
+                    // clean up the slot after the network call completes.
+                    let safe_to_remove = if let Some(state_arc) = self.write_buffers.get(&ino) {
+                        if let Ok(st) = state_arc.try_lock() {
+                            let has_unflushed = st.slots.values().any(|s| !s.data.is_empty() && !s.flushing);
+                            if has_unflushed {
+                                info!("open: ino={} is_first_writer — NOT removing write_buffers, has unflushed data", ino);
+                            }
+                            !has_unflushed
+                        } else {
+                            // Lock held by flush task — don't remove
+                            false
+                        }
+                    } else {
+                        true // doesn't exist, nothing to remove
+                    };
+                    if safe_to_remove {
+                        self.write_buffers.remove(&ino);
+                    }
                     // Clear any pending truncate flag — new write session starts clean.
                     self.truncated_inodes.remove(&ino);
                 }
@@ -3751,6 +3772,13 @@ impl Filesystem for DfsFilesystem {
                         }
                         return;
                     }
+                    // Only flush if this session actually has slots with real data.
+                    // A write-mode open that reads but never writes (HDHomeRun scan,
+                    // Kodi seek-probe) has no slots — calling flush_all_pipelined would
+                    // pick up a flushing=true slot from a concurrent session, wait for it
+                    // to finish, then dispatch a second PatchChunk with stale data.
+                    // Checking under try_lock: if locked, something is actively flushing
+                    // for this inode already — no need for us to flush too.
                     if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                         error!("release: flush failed for inode {}: {}", ino, e);
                     }

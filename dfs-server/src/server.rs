@@ -935,7 +935,7 @@ impl Server {
             Ok(arc) => {
                 let (capacity, size) = self.storage.get_cache_stats();
                 let cache_stats = Some((0, capacity, size));
-                Response::ChunkData { chunk_id, data: vec![], cache_stats, arc_data: Some(arc) }
+                Response::ChunkData { chunk_id, data: vec![], cache_stats, arc_data: Some(arc), arc_range: None }
             }
             Err(_) => {
                 Response::Error {
@@ -950,19 +950,22 @@ impl Server {
     async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64) -> Response {
         debug!("Handling read chunk range: {} offset={} length={}", chunk_id, offset, length);
 
-        match self.storage.read_chunk_range(&chunk_id, offset as usize, length as usize) {
-            Ok(range_data) => {
+        match self.storage.read_chunk_range_arc(&chunk_id, offset as usize, length as usize) {
+            Ok((arc, start, end)) => {
                 debug!("Returning {} bytes from chunk {} (requested {}, offset {})",
-                       range_data.len(), chunk_id, length, offset);
+                       end - start, chunk_id, length, offset);
 
                 let (capacity, size) = self.storage.get_cache_stats();
                 let cache_stats = Some((0, capacity, size));
 
+                // Zero-copy: hand the Arc + range to the network layer, which writes
+                // arc[start..end] on the wire without ever cloning the bytes.
                 Response::ChunkData {
                     chunk_id,
-                    data: range_data,
+                    data: vec![],
                     cache_stats,
-                    arc_data: None,
+                    arc_data: Some(arc),
+                    arc_range: Some((start, end)),
                 }
             }
             Err(e) => {

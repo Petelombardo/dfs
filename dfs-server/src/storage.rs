@@ -201,14 +201,18 @@ impl ChunkStorage {
         Ok(Arc::try_unwrap(self.read_chunk_arc(chunk_id)?).unwrap_or_else(|arc| (*arc).clone()))
     }
 
-    /// Read a byte range from a chunk — slices from the cached Arc, no full-chunk clone.
-    pub fn read_chunk_range(&self, chunk_id: &ChunkId, offset: usize, length: usize) -> Result<Vec<u8>> {
+    /// Read a byte range from a chunk — returns the cached Arc + clamped range so the
+    /// caller can write the slice on the wire without ever cloning the bytes.
+    /// Returns (arc, start, end) where start..end is the requested sub-range within the chunk.
+    pub fn read_chunk_range_arc(&self, chunk_id: &ChunkId, offset: usize, length: usize)
+        -> Result<(Arc<Vec<u8>>, usize, usize)>
+    {
         let data = self.read_chunk_arc(chunk_id)?;
         if offset >= data.len() {
             return Err(anyhow::anyhow!("Offset {} beyond chunk size {}", offset, data.len()));
         }
         let end = (offset + length).min(data.len());
-        Ok(data[offset..end].to_vec())
+        Ok((data, offset, end))
     }
 
     /// Warm the cache with a chunk (prefetch hint handler)

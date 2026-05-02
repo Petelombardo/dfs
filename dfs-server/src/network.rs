@@ -246,12 +246,18 @@ async fn read_message(
 ///   [4B envelope len][bincode envelope (data=empty)][4B raw len][raw bytes]
 /// All other messages use standard framing: [4B len][bincode bytes]
 async fn write_message(stream: &mut TcpStream, envelope: &MessageEnvelope) -> Result<()> {
-    if let dfs_common::Message::Response(dfs_common::Response::ChunkData { ref data, ref chunk_id, ref cache_stats, ref arc_data }) = envelope.message {
+    if let dfs_common::Message::Response(dfs_common::Response::ChunkData { ref data, ref chunk_id, ref cache_stats, ref arc_data, ref arc_range }) = envelope.message {
         let stub = MessageEnvelope::new(envelope.request_id, dfs_common::Message::Response(
-            dfs_common::Response::ChunkData { chunk_id: *chunk_id, data: vec![], cache_stats: *cache_stats, arc_data: None }
+            dfs_common::Response::ChunkData { chunk_id: *chunk_id, data: vec![], cache_stats: *cache_stats, arc_data: None, arc_range: None }
         ));
-        // Use arc_data directly if present (zero extra copy), otherwise fall back to data slice.
-        let payload: &[u8] = if let Some(arc) = arc_data { arc.as_slice() } else { data };
+        // Use arc_data directly if present (zero extra copy). When arc_range is also
+        // set, write only the requested sub-slice — used by striped half-fetches to
+        // avoid cloning the slice out of the cached chunk Arc.
+        let payload: &[u8] = match (arc_data, arc_range) {
+            (Some(arc), Some((start, end))) => &arc[*start..*end],
+            (Some(arc), None) => arc.as_slice(),
+            (None, _) => data,
+        };
         dfs_common::protocol::write_chunk_response(stream, &stub, payload).await?;
         return Ok(());
     }

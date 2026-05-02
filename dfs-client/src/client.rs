@@ -197,6 +197,13 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Maximum number of recent SQLite file writes to track for read-after-write consistency
 const SQLITE_WRITE_TRACKER_SIZE: usize = 256;
 
+/// Toggle for striped reads (split a 4MB chunk across 2 replicas, fetch halves in parallel).
+/// Striped reads halve transfer time on saturated links but cost an extra 4MB allocation +
+/// memcpy per chunk to reassemble. On weak ARM CPUs (Cortex-A55) the reassembly cost can
+/// exceed the bandwidth win on a 1Gbps LAN. Flip to `false` to use single-replica whole-chunk
+/// reads instead — easy A/B test, easy to revert.
+const STRIPED_READ_ENABLED: bool = true;
+
 /// Get the SQLite consistency window duration in milliseconds
 /// Can be overridden via DFS_SQLITE_CONSISTENCY_WINDOW_MS environment variable
 /// Default: 500ms (conservative, allows time for async replication)
@@ -954,7 +961,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 } else {
                     data
                 };
-                Response::ChunkData { chunk_id, data, cache_stats, arc_data: None }
+                Response::ChunkData { chunk_id, data, cache_stats, arc_data: None, arc_range: None }
             }
             Message::Response(response) => response,
             _ => anyhow::bail!("Expected Response message"),
@@ -1159,7 +1166,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 } else {
                     data
                 };
-                Response::ChunkData { chunk_id, data, cache_stats, arc_data: None }
+                Response::ChunkData { chunk_id, data, cache_stats, arc_data: None, arc_range: None }
             }
             Message::Response(response) => response,
             _ => anyhow::bail!("Expected Response message"),
@@ -1760,14 +1767,19 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let fallbacks = fallbacks.clone();
                     let loc = chunk_map.get(idx).cloned();
                     tokio::spawn(async move {
-                        let data = if let Some(loc) = loc {
-                            if loc.nodes.len() >= 2 && loc.size == 4 * 1024 * 1024 {
-                                let file_offset = loc.file_offset.unwrap_or(0);
-                                client.read_chunk_striped(cid, &loc, file_offset).await
+                        let data = if STRIPED_READ_ENABLED {
+                            if let Some(loc) = loc {
+                                if loc.nodes.len() >= 2 && loc.size == 4 * 1024 * 1024 {
+                                    let file_offset = loc.file_offset.unwrap_or(0);
+                                    client.read_chunk_striped(cid, &loc, file_offset).await
+                                } else {
+                                    client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await
+                                }
                             } else {
                                 client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await
                             }
                         } else {
+                            let _ = loc; // keep capture warning quiet without changing closure shape
                             client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await
                         };
                         (idx, cid, data)

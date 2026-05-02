@@ -456,6 +456,12 @@ pub enum Response {
         /// Never serialized — always None after deserialization.
         #[serde(skip)]
         arc_data: Option<std::sync::Arc<Vec<u8>>>,
+        /// Optional sub-range (start, end) into `arc_data`.  When `Some`, the network
+        /// layer writes only `arc_data[start..end]` on the wire — used by ranged reads
+        /// (striped half-chunk fetches) to avoid cloning the slice out of the cached Arc.
+        /// Ignored when `arc_data` is None. Never serialized.
+        #[serde(skip)]
+        arc_range: Option<(usize, usize)>,
     },
 
     /// Success with file metadata

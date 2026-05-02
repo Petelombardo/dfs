@@ -1894,9 +1894,14 @@ impl Filesystem for DfsFilesystem {
     ) -> Result<(), libc::c_int> {
         info!("Initializing DFS filesystem");
 
-        // Disable kernel readahead — our pipeline (depth=2) handles lookahead explicitly.
-        // Kernel readahead would race our pipeline with extra concurrent fetches.
-        let _ = config.set_max_readahead(0);
+        // Allow generous kernel readahead so dd-style sequential workloads can issue
+        // many parallel FUSE reads against the same chunk.  The userspace path
+        // deduplicates concurrent fetches via chunk_cache + in_flight, and waiters
+        // wake on a Notify the moment the chunk lands — so extra FUSE reads
+        // coalesce on a single network fetch instead of racing the pipeline.
+        // The kernel only fires readahead on sequential patterns, so random-read
+        // workloads (SQLite, seek-heavy) are unaffected.
+        let _ = config.set_max_readahead(4 * 1024 * 1024);
         // Raise max_background so reads are never starved by concurrent release/write ops.
         // Default is 16 with congestion threshold at 12; under heavy write load (4 releases +
         // 2 pipeline writes in-flight) the kernel stops dispatching reads. 64 gives reads

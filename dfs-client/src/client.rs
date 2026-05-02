@@ -481,6 +481,12 @@ pub struct DfsClient {
     /// exhausting server file descriptors.
     fetch_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// Single broadcast notify woken every time a chunk lands in chunk_cache.
+    /// Lets waiters in `wait_for_chunk_in_cache` resume immediately rather than
+    /// polling on a 50 ms timer — the polling delay was the dominant source of
+    /// dead air at chunk boundaries on the sequential read path.
+    chunk_landed: Arc<Notify>,
+
     /// Per-node health tracker.  Penalizes nodes that time out repeatedly and
     /// automatically re-admits them after a back-off period.
     node_health: NodeHealthTracker,
@@ -640,6 +646,7 @@ impl DfsClient {
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
 leader_addr: Arc::new(RwLock::new(None)),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            chunk_landed: Arc::new(Notify::new()),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
@@ -1713,10 +1720,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                         Ok(data) => {
                             let arc = Arc::new(data);
                             client.chunk_cache.insert(la_cid, arc).await;
+                            client.chunk_landed.notify_waiters();
                         }
                         Err(e) => debug!("Pipeline lookahead fetch failed for {}: {}", la_cid, e),
                     }
                     eng.in_flight.remove(&la_cid);
+                    client.chunk_landed.notify_waiters();
                 });
             }
         }
@@ -1806,10 +1815,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             // causes every subsequent read for that chunk to wait 1s for a timeout.
             for (idx, cid, res) in fetch_results {
                 engine.in_flight.remove(&cid);
+                // Wake any waiter regardless of success — a failure also unblocks
+                // the waiter (which falls back to fetching directly).
+                self.chunk_landed.notify_waiters();
                 let data = res.with_context(|| format!("Failed to fetch chunk {}", cid))?;
                 let arc = Arc::new(data);
                 if !bypass_cache {
                     self.chunk_cache.insert(cid, Arc::clone(&arc)).await;
+                    self.chunk_landed.notify_waiters();
                 }
                 result_chunks.push((idx, arc));
             }
@@ -1868,6 +1881,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 match client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks).await {
                                     Ok(data) => {
                                         client.chunk_cache.insert(swarm_cid, Arc::new(data)).await;
+                                        client.chunk_landed.notify_waiters();
                                         debug!("Swarming: fetched chunk {} (stagger {}ms)", idx_copy, stagger_ms);
 
                                         // Chain reaction: spawn the next chunk in sequence to maintain pipeline
@@ -1895,6 +1909,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                                 match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks).await {
                                                                     Ok(chain_data) => {
                                                                         chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
+                                                                        chain_client.chunk_landed.notify_waiters();
                                                                         debug!("Swarming: chained chunk {}", next_idx);
                                                                     }
                                                                     Err(e) => debug!("Swarming: chain failed for chunk {}: {}", next_idx, e),
@@ -1982,16 +1997,36 @@ leader_addr: Arc::new(RwLock::new(None)),
         cid: ChunkId,
         engine: &InodeReadEngine,
     ) -> Result<Arc<Vec<u8>>> {
-        for _ in 0..20 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Arm the notified() future BEFORE checking the cache so we never miss
+        // a notify_waiters() that fires between the check and the wait.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
+        loop {
+            let notified = self.chunk_landed.notified();
+            tokio::pin!(notified);
+            // Enable so any subsequent notify_waiters() will wake us.
+            notified.as_mut().enable();
+
             if let Some(data) = self.chunk_cache.get(&cid).await {
                 return Ok(data);
             }
-            // If the other fetcher removed it from in-flight without caching, it failed.
             if !engine.in_flight.contains(&cid) {
+                // Other fetcher dropped in_flight without caching → it failed.
+                break;
+            }
+
+            // Wait for either a chunk-landed notification or the overall deadline.
+            // notified() is a single-shot future; we re-arm at the top of each loop.
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if timeout.is_zero() {
+                break;
+            }
+            if tokio::time::timeout(timeout, notified).await.is_err() {
+                // Hit the 1s deadline without any chunk landing — give up and
+                // fall through to fetching directly.
                 break;
             }
         }
+
         // Fall back — fetch ourselves.
         warn!("Timeout waiting for concurrent fetch of chunk {}, fetching directly", cid);
         let nodes = self.cluster_nodes.read().await.clone();
@@ -2515,6 +2550,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             // is keyed by (inode, offset) and is safe for partial use.
             if !was_partial {
                 self.chunk_cache.insert(chunk_id, Arc::clone(&data_arc)).await;
+                self.chunk_landed.notify_waiters();
                 debug!("Cached chunk {} ({} bytes)", chunk_id, data_arc.len());
             }
 
@@ -2607,6 +2643,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
                                 // Cache it
                                 self.chunk_cache.insert(chunk_id, Arc::clone(&data_arc)).await;
+                                self.chunk_landed.notify_waiters();
 
                                 fetched_chunks.push((idx, data_arc));
                                 fetch_succeeded = true;
@@ -3292,48 +3329,58 @@ leader_addr: Arc::new(RwLock::new(None)),
         location: &dfs_common::ChunkLocation,
         file_offset: u64,
     ) -> Result<Vec<u8>> {
+        let _ = file_offset;
         let chunk_size = location.size;
 
-        // Map NodeIds to SocketAddrs
+        // Map ALL replica NodeIds to SocketAddrs (not just first 2) so we have
+        // real fallback candidates if either striped half-fetch fails.
         let node_id_map = self.addr_to_node_id.read().await;
-        let node_addrs: Vec<SocketAddr> = location.nodes.iter()
+        let all_replica_addrs: Vec<SocketAddr> = location.nodes.iter()
             .filter_map(|node_id| {
                 node_id_map.iter()
                     .find(|(_, &id)| id == *node_id)
                     .map(|(&addr, _)| addr)
             })
-            .take(2)  // Only use first 2 replicas for striping
             .collect();
         drop(node_id_map);
 
-        if node_addrs.is_empty() {
-            // None of the chunk_locations nodes exist in current cluster
-            // Fall back to normal replica discovery path
-            warn!("Striped read requested but none of the chunk_location nodes are in current cluster, falling back to all nodes");
-
-            let replicas = self.cluster_nodes.read().await.clone();
-
-            for node_addr in &replicas {
-                match self.read_chunk_from_server(*node_addr, chunk_id).await {
-                    Ok(data) => return Ok(data),
-                    Err(e) => {
-                        debug!("Failed to read chunk from {}: {}", node_addr, e);
-                        continue;
+        // Helper: full-chunk read trying every available replica in order, then
+        // any other cluster node as a last resort (covers ghost-record / drift).
+        let whole_chunk_fallback = |replicas: Vec<SocketAddr>| {
+            let client = self.clone();
+            async move {
+                let cluster_nodes = client.cluster_nodes.read().await.clone();
+                let mut tried = std::collections::HashSet::<SocketAddr>::new();
+                let mut last_err: Option<anyhow::Error> = None;
+                for addr in replicas.iter().copied().chain(cluster_nodes.iter().copied()) {
+                    if !tried.insert(addr) { continue; }
+                    match client.read_chunk_from_server(addr, chunk_id).await {
+                        Ok(data) => return Ok(data),
+                        Err(e) => {
+                            debug!("Whole-chunk fallback: {} failed for chunk {}: {}", addr, chunk_id, e);
+                            last_err = Some(e);
+                        }
                     }
                 }
+                Err(last_err.unwrap_or_else(|| anyhow::anyhow!(
+                    "No replicas available for chunk {}", chunk_id)))
             }
+        };
 
-            anyhow::bail!("Failed to read chunk {} from any node", chunk_id);
+        if all_replica_addrs.is_empty() {
+            // None of the chunk_locations nodes resolve in the current cluster —
+            // fall back to whole-chunk reads against every cluster node.
+            warn!("Striped read: chunk {} has no resolvable replicas, falling back to cluster-wide whole-chunk fetch", chunk_id);
+            return whole_chunk_fallback(Vec::new()).await;
         }
 
-        if node_addrs.len() < 2 {
-            // Only 1 address available, use single-node read
-            warn!("Striped read requested but only 1 address available, falling back to single-node");
-            return self.read_chunk_from_server(node_addrs[0], chunk_id).await;
+        if all_replica_addrs.len() < 2 {
+            // Only 1 address available, single-node read with cluster-wide fallback.
+            return whole_chunk_fallback(all_replica_addrs).await;
         }
 
-        let node1 = node_addrs[0];
-        let node2 = node_addrs[1];
+        let node1 = all_replica_addrs[0];
+        let node2 = all_replica_addrs[1];
 
         // Split chunk in half
         let mid_point = chunk_size / 2;
@@ -3357,21 +3404,32 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let (result1, result2) = tokio::join!(task1, task2);
 
-        // Handle results
-        let first_half = result1
-            .context("Task1 panicked")??;
-        let second_half = result2
-            .context("Task2 panicked")??;
+        // Unwrap join errors first; treat panicked tasks the same as a failed half.
+        let half1 = result1.unwrap_or_else(|e| Err(anyhow::anyhow!("striped task1 panicked: {}", e)));
+        let half2 = result2.unwrap_or_else(|e| Err(anyhow::anyhow!("striped task2 panicked: {}", e)));
 
-        // Reassemble data
-        let mut combined = Vec::with_capacity(chunk_size);
-        combined.extend_from_slice(&first_half);
-        combined.extend_from_slice(&second_half);
-
-        debug!("Striped read complete: chunk {} ({} + {} = {} bytes)",
-               chunk_id, first_half.len(), second_half.len(), combined.len());
-
-        Ok(combined)
+        match (half1, half2) {
+            (Ok(first_half), Ok(second_half)) => {
+                let mut combined = Vec::with_capacity(chunk_size);
+                combined.extend_from_slice(&first_half);
+                combined.extend_from_slice(&second_half);
+                debug!("Striped read complete: chunk {} ({} + {} = {} bytes)",
+                       chunk_id, first_half.len(), second_half.len(), combined.len());
+                Ok(combined)
+            }
+            (half1_res, half2_res) => {
+                // At least one half failed.  The failing node may be a ghost replica
+                // (metadata says it has the chunk, but it doesn't), so don't EIO —
+                // fall back to whole-chunk reads against every replica + cluster node.
+                if let Err(e) = &half1_res {
+                    warn!("Striped read: half1 from {} failed for chunk {}: {}", node1, chunk_id, e);
+                }
+                if let Err(e) = &half2_res {
+                    warn!("Striped read: half2 from {} failed for chunk {}: {}", node2, chunk_id, e);
+                }
+                whole_chunk_fallback(all_replica_addrs).await
+            }
+        }
     }
 
     /// Read a single chunk by ID, resolving node IDs to addresses.

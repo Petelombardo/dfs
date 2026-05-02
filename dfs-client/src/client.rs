@@ -525,57 +525,54 @@ impl DfsClient {
             anyhow::bail!("No cluster nodes provided");
         }
 
-        // Initialize LRU cache with CONSERVATIVE limits to prevent OOM on large sequential reads
-        // CRITICAL: Both chunk_cache and byte_range_cache store the SAME data (doubled memory usage!)
-        // Target: 2-3% of available RAM per cache (~128-256MB total at 4MB chunks)
-        // min 8 chunks (~32MB), max 64 chunks (~256MB) PER CACHE
+        // The chunk_cache is a single shared LRU keyed by ChunkId — every inode hits
+        // the same pool, so a working set spanning multiple files competes fairly for
+        // slots.  Sizing strategy: target a fraction of available RAM, but cap so the
+        // write buffer + in-flight pipeline always have headroom.
+        //
+        // The byte_range_cache is a smaller secondary cache keyed by (inode, offset)
+        // used by the legacy read_data path for partial-chunk DVR seeks.  It can hold
+        // the same data as chunk_cache, so we keep its budget significantly smaller
+        // than chunk_cache to avoid duplication eating most of RAM.
         let available_mb = dfs_common::get_available_memory()
             .map(|bytes| bytes / (1024 * 1024))
             .unwrap_or(1024);
 
-        // Check for environment variable override
-        // Default max based on available RAM. On write-heavy low-RAM clients (e.g. nanopir3
-        // 1.9GB) the write buffer + in-flight pipeline data consumes 50-100MB during writes,
-        // so cache sizes must leave headroom. Cap byte_range_cache tightly on < 2GB systems.
-        let default_max_chunks = if available_mb < 512 {
-            8    // Very low RAM: 32MB per cache
+        // chunk_cache target: target_pct of available RAM, bounded by [min, max].
+        // Sub-1GB clients still cap aggressively; 1-2GB clients now get a real cache
+        // (was previously stuck at 32MB regardless of how much RAM was available).
+        let (chunk_target_pct, min_chunks, default_max_chunks) = if available_mb < 256 {
+            // Extremely low memory: minimum viable cache (~8MB).
+            (4, 2, 4)
+        } else if available_mb < 512 {
+            // Very low: ~32MB max so the write path has headroom.
+            (8, 4, 8)
+        } else if available_mb < 1024 {
+            // Low (512MB-1GB): aim for ~120MB so a sequential read working set fits.
+            // Bumping this tier was a key fix — the previous max of 8 chunks (32MB)
+            // caused thrash on the nanopir3 (2GB total, ~900MB available) for any
+            // sequential read of a file larger than the cache.
+            (12, 8, 32)
         } else if available_mb < 2048 {
-            8    // Low-to-medium RAM (< 2GB): 32MB per cache — write buffer needs the headroom
+            // 1-2GB: aim for ~150MB.
+            (12, 12, 48)
         } else if available_mb < 4096 {
-            64   // Good RAM (2-4GB): 256MB per cache
+            (15, 16, 96)
         } else {
-            128  // High RAM (4GB+): 512MB per cache
+            (18, 24, 128)
         };
+
+        // byte_range_cache: a quarter of chunk_cache target, since the new
+        // read_file path doesn't touch it and it largely duplicates chunk_cache
+        // for live-DVR partial reads.
+        let byte_target_pct = (chunk_target_pct / 4).max(2);
 
         let max_chunks = std::env::var("DFS_MAX_CACHE_CHUNKS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(default_max_chunks);
 
-        let (chunk_target_pct, byte_target_pct, min_chunks) = if available_mb < 256 {
-            // Extremely low memory systems (<256MB available): minimal cache
-            // chunk: 4%, byte: 4%, min 2 chunks (~10MB + ~10MB = ~20MB total)
-            // Just enough to avoid OOM on very constrained devices
-            (4, 4, 2)
-        } else if available_mb < 512 {
-            // Very low memory systems (256-512MB available): conservative but usable
-            // chunk: 8%, byte: 8%, min 4 chunks (~20MB + ~20MB = ~40MB total)
-            // Enough for basic live streaming caching on ARM devices
-            (8, 8, 4)
-        } else if available_mb < 1024 {
-            // Low memory systems (512MB-1GB available): moderate cache
-            // chunk: 12%, byte: 12%, min 8 chunks (~60MB + ~60MB = ~120MB total)
-            (12, 12, 8)
-        } else if available_mb < 1536 {
-            // Medium memory systems (1-1.5GB available): good cache
-            // chunk: 15%, byte: 15%, min 12 chunks (~115MB + ~115MB = ~230MB total)
-            (15, 15, 12)
-        } else {
-            // Normal systems (>1.5GB available): generous cache sizes
-            // chunk: 18%, byte: 18%, min 16 chunks (~140MB + ~140MB = ~280MB total)
-            // Larger cache prevents thrashing during high-speed sequential reads
-            (18, 18, 16)
-        };
+        let byte_max_chunks = (max_chunks / 4).max(2);
 
         let cache_capacity = dfs_common::calculate_cache_capacity(
             4 * 1024 * 1024, // 4MB chunk size
@@ -592,16 +589,17 @@ impl DfsClient {
             .max_capacity(cache_capacity.get() as u64)
             .build();
 
-        // Byte-range cache uses same conservative limits (both caches hold same data!)
+        // Byte-range cache: smaller secondary cache for the legacy partial-read path.
+        // Sized at a fraction of chunk_cache so it doesn't duplicate the working set.
         let byte_cache_capacity = dfs_common::calculate_cache_capacity(
             4 * 1024 * 1024, // 4MB chunk size
             byte_target_pct,
-            min_chunks,
-            max_chunks,
+            (min_chunks / 4).max(2),
+            byte_max_chunks,
         )
         .unwrap_or_else(|e| {
             tracing::warn!("Failed to calculate byte-range cache capacity: {}, using default", e);
-            NonZeroUsize::new(16).unwrap()
+            NonZeroUsize::new(4).unwrap()
         });
 
         let byte_range_cache = LruCache::new(byte_cache_capacity);

@@ -3001,6 +3001,16 @@ impl Server {
             }
         }
 
+        // CRITICAL: invalidate the in-memory chunk cache for both old and new IDs.
+        // Without this, subsequent reads (and the next PatchChunk's read-modify-write)
+        // get stale pre-patch bytes from the LRU cache. When old==new (idempotent
+        // overwrite), this is the only thing that prevents the next PatchChunk from
+        // operating on stale base data — losing intervening writes.
+        self.storage.invalidate_cache(&chunk_id);
+        if new_chunk_id != chunk_id {
+            self.storage.invalidate_cache(&new_chunk_id);
+        }
+
         info!("PatchChunk: {} -> {} ({} bytes patched at intra_offset={})", chunk_id, new_chunk_id, patch_data.len(), intra_offset);
 
         Response::PatchChunkResult { new_chunk_id, size }

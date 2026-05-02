@@ -299,8 +299,20 @@ impl ChunkStorage {
 
             debug!("Deleted chunk {}", chunk_id);
         }
+        // Invalidate cache regardless of file presence — a previous PatchChunk may have
+        // left stale bytes here.
+        self.invalidate_cache(chunk_id);
 
         Ok(())
+    }
+
+    /// Remove a chunk from the in-memory cache. Must be called whenever the on-disk
+    /// content for a chunk_id is rewritten (PatchChunk same→same, repair, etc.) or the
+    /// chunk is deleted. Without this, read_chunk_arc returns stale bytes and subsequent
+    /// PatchChunks read-modify-write the wrong base data.
+    pub fn invalidate_cache(&self, chunk_id: &ChunkId) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.pop(chunk_id);
     }
 
     /// Get the filesystem path for a chunk

@@ -121,6 +121,11 @@ struct InodeWriteState {
     /// logic to detect append-extend: if a slot was partially flushed, flushed_sizes[idx]
     /// tells us how many bytes the server already has for that chunk.
     flushed_sizes: HashMap<u64, usize>,
+    /// Chunk IDs that were current when this write session opened the file.
+    /// Used by PatchChunk to detect a stale-write race: if another session already
+    /// patched chunk N between our open() and flush, chunk_ids_at_open[N] will no
+    /// longer match metadata_cache — discard this flush rather than reverting.
+    chunk_ids_at_open: HashMap<u64, dfs_common::ChunkId>,
     /// If true, every fsync() must flush immediately (O_SYNC / O_DSYNC was set on open).
     /// If false, fsyncs within the coalescing window are absorbed (DVR / streaming mode).
     sync_on_fsync: bool,
@@ -134,6 +139,7 @@ impl InodeWriteState {
         Self {
             slots: HashMap::new(),
             flushed_sizes: HashMap::new(),
+            chunk_ids_at_open: HashMap::new(),
             sync_on_fsync,
             is_truncated_session: false,
         }
@@ -437,6 +443,16 @@ impl FlushHandle {
                 let patched = if let Some(meta) = meta {
                     let old_location_opt = meta.chunk_location_for_idx(*chunk_idx).cloned();
                     if let Some(old_location) = old_location_opt {
+                        // Stale-write guard: discard if another session patched this chunk after our open().
+                        let id_at_open = self.write_buffers.get(&ino)
+                            .and_then(|s| s.try_lock().ok()
+                                .and_then(|st| st.chunk_ids_at_open.get(chunk_idx).copied()));
+                        if let Some(open_id) = id_at_open {
+                            if open_id != old_location.chunk_id {
+                                info!("flush_buffer_async: ino={} chunk={} chunk_id changed since open — discarding stale write", ino, chunk_idx);
+                                continue;
+                            }
+                        }
                         let patch_result = self.client.patch_chunk_on_replicas(
                             old_location.chunk_id,
                             file_offset,
@@ -950,6 +966,27 @@ impl FlushHandle {
             let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
             if let Some(meta) = meta {
                 if let Some(old_location) = meta.chunk_location_for_idx(chunk_idx).cloned() {
+                    // Stale-write guard: if another session already patched this chunk
+                    // between our open() and now, the current chunk_id will differ from
+                    // what we snapshotted at open time. Our write buffer contains bytes
+                    // read at open time — applying them now would revert the newer write.
+                    let id_at_open = self.write_buffers.get(&ino)
+                        .and_then(|s| s.try_lock().ok()
+                            .and_then(|st| st.chunk_ids_at_open.get(&chunk_idx).copied()));
+                    info!("flush_buffer_async_one: ino={} chunk={} id_at_open={:?} current_id={}",
+                        ino, chunk_idx, id_at_open, old_location.chunk_id);
+                    if let Some(open_id) = id_at_open {
+                        if open_id != old_location.chunk_id {
+                            info!("flush_buffer_async_one: ino={} chunk={} chunk_id changed since open ({} -> {}) — discarding stale write",
+                                ino, chunk_idx, open_id, old_location.chunk_id);
+                            if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                if let Ok(mut state) = state_arc.try_lock() {
+                                    state.slots.remove(&chunk_idx);
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
                     let patch_result = self.client.patch_chunk_on_replicas(
                         old_location.chunk_id,
                         file_offset,
@@ -2311,6 +2348,21 @@ impl Filesystem for DfsFilesystem {
                 }
                 if is_trunc {
                     if let Ok(mut st) = state_entry.try_lock() { st.is_truncated_session = true; }
+                }
+                // Snapshot chunk IDs at open time for stale-write detection.
+                // If another session patches chunk N between our open() and flush(),
+                // the chunk_id in metadata_cache will no longer match chunk_ids_at_open[N]
+                // and we skip the PatchChunk rather than reverting the newer write.
+                if let Some(meta) = self.metadata_cache.get(&ino) {
+                    if let Ok(mut st) = state_entry.try_lock() {
+                        for loc in &meta.chunk_locations {
+                            if let Some(offset) = loc.file_offset {
+                                let idx = offset / CHUNK_SIZE as u64;
+                                let prev = st.chunk_ids_at_open.entry(idx).or_insert(loc.chunk_id);
+                                info!("open: ino={} chunk_ids_at_open[{}] = {} (prev={})", ino, idx, loc.chunk_id, prev);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3777,10 +3829,17 @@ impl Filesystem for DfsFilesystem {
                     // Kodi seek-probe) has no slots — calling flush_all_pipelined would
                     // pick up a flushing=true slot from a concurrent session, wait for it
                     // to finish, then dispatch a second PatchChunk with stale data.
-                    // Checking under try_lock: if locked, something is actively flushing
-                    // for this inode already — no need for us to flush too.
-                    if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
-                        error!("release: flush failed for inode {}: {}", ino, e);
+                    let has_unflushed = write_buffers.get(&ino)
+                        .map(|s| s.try_lock().map(|s| {
+                            s.slots.values().any(|sl| !sl.data.is_empty() && !sl.flushing)
+                        }).unwrap_or(true))
+                        .unwrap_or(false);
+                    if has_unflushed {
+                        if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
+                            error!("release: flush failed for inode {}: {}", ino, e);
+                        }
+                    } else {
+                        debug!("release: ino={} last writer — no unflushed data, skipping flush", ino);
                     }
                     // Invalidate the read engine's chunk map so the next reader
                     // immediately picks up the newly flushed chunks.
@@ -3832,7 +3891,9 @@ impl Filesystem for DfsFilesystem {
                 // "rename-based save" fallback only applies when there are no writers).
                 let has_writers = self.write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
                 let has_buffer = !has_writers && self.write_buffers.get(&ino)
-                    .map(|s| s.try_lock().map(|s| !s.slots.is_empty()).unwrap_or(false))
+                    .map(|s| s.try_lock().map(|s| {
+                        s.slots.values().any(|sl| !sl.data.is_empty() && !sl.flushing)
+                    }).unwrap_or(false))
                     .unwrap_or(false);
                 let flush_handle = self.flush_handle.clone();
                 let flush_rt = flush_handle.flush_runtime.clone();

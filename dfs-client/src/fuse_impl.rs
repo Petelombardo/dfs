@@ -2391,15 +2391,14 @@ impl Filesystem for DfsFilesystem {
         // CRITICAL: Wait for ALL in-flight release() tasks to complete before proceeding.
         // release() increments release_in_flight before reply.ok(), so a counter > 0 means
         // a prior session's flush and metadata commit is still running. We must wait for it
-        // so metadata_cache reflects the prior session's chunks before this open tries to
-        // write — otherwise rapid sequential writers (no pause between them) can flush
-        // before the prior session's metadata lands, see chunk_exists=false, and overwrite
-        // an existing chunk with gap-fill zeros.
+        // so metadata_cache reflects the prior session's chunks before any subsequent open
+        // (read or write) fetches the chunk map. Without this, a read-open immediately
+        // after a write session (e.g. `cp` right after a DVR stream write) may get a stale
+        // chunk map that only has the first chunk committed, causing all later chunks to
+        // read back as zeros.
         // We check release_in_flight only (not write_buffers) because when a new writer
         // registers, write_buffers is intentionally kept alive and would deadlock the wait.
-        // Only wait on release_in_flight for write opens — a read open doesn't need
-        // prior session's metadata to be committed before proceeding.
-        let had_inflight = !is_read_open && !has_active_writer &&
+        let had_inflight = !has_active_writer &&
             self.release_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) > 0;
         if had_inflight {
             let release_in_flight = self.release_in_flight.clone();
@@ -3844,7 +3843,17 @@ impl Filesystem for DfsFilesystem {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
                     } else {
-                        debug!("release: ino={} last writer — no unflushed data, skipping flush", ino);
+                        // All chunks were already flushed to the servers by the background
+                        // tick, but the tick's 5-second metadata throttle may not have
+                        // committed the latest chunk map to the leader yet. Do a final
+                        // synchronous metadata sync so the leader knows about all chunks
+                        // before any reader can open the file.
+                        debug!("release: ino={} last writer — no unflushed data, syncing metadata", ino);
+                        let meta_to_persist = flush_handle.metadata_cache.get(&ino).map(|m| m.clone());
+                        if let Some(meta) = meta_to_persist {
+                            flush_handle.client.flush_metadata_sync(&meta).await;
+                            flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                        }
                     }
                     // Invalidate the read engine's chunk map so the next reader
                     // immediately picks up the newly flushed chunks.

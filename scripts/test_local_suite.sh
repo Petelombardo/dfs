@@ -387,6 +387,7 @@ m2=$(md5sum "$T/t17c_read.bin"     | cut -d' ' -f1)
 # ── Test 18: DVR concurrent-read integrity ────────────────────────────────────
 # Write a 20MB file at ~4MB/s while concurrently reading from offset 0.
 # Verifies: no short reads that skip data, read copy matches written data.
+sleep 2
 echo "=== T18: DVR concurrent-read integrity ==="
 WRITE_SIZE_MB=16
 CHUNK_SIZE_BYTES=$((4 * 1024 * 1024))
@@ -460,7 +461,8 @@ else
 fi
 rm -f "$T18_DST"
 
-./scripts/test_dvr_stream.sh
+./scripts/test_dvr_stream.sh && check "DVR stream integrity (write+live read)" PASS \
+    || check "DVR stream integrity (write+live read)" FAIL
 
 # ── Test 20: partial overwrite integrity — first, middle, and last chunk ───────
 # Write a 12MB file (3 chunks). Write a 2MB patch file.

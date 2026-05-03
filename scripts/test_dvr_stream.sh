@@ -127,13 +127,15 @@ compare_files() {
     return 1
 }
 
+RESULT=0
 echo "=== Comparison 1: write path (write_ref vs dfs_readback) ==="
-compare_files "write_ref vs dfs_readback" "$WRITE_REF" "$DFS_READBACK"
+compare_files "write_ref vs dfs_readback" "$WRITE_REF" "$DFS_READBACK" || RESULT=1
 echo ""
 echo "=== Comparison 2: live read path (write_ref vs read_copy) ==="
-compare_files "write_ref vs read_copy" "$WRITE_REF" "$READ_COPY"
+compare_files "write_ref vs read_copy" "$WRITE_REF" "$READ_COPY" || RESULT=1
 echo ""
 echo "=== Comparison 3: dfs vs concurrent read (dfs_readback vs read_copy) ==="
-compare_files "dfs_readback vs read_copy" "$DFS_READBACK" "$READ_COPY"
+compare_files "dfs_readback vs read_copy" "$DFS_READBACK" "$READ_COPY" || RESULT=1
 echo ""
 echo "Done. Files in $LOCAL_DIR"
+exit $RESULT

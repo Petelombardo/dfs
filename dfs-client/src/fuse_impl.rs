@@ -795,16 +795,9 @@ impl FlushHandle {
                 // which would hold the in_flight slot and prevent new background flushes
                 // from starting — starving the write pipeline. We stamp the seq and push
                 // directly; the queue worker handles delivery and retries independently.
-                const METADATA_FLUSH_INTERVAL_SECS: u64 = 5;
-                let should_enqueue = match self.last_metadata_update.get(&ino) {
-                    None => true,
-                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(METADATA_FLUSH_INTERVAL_SECS),
-                };
-                if should_enqueue {
-                    self.last_metadata_update.insert(ino, std::time::Instant::now());
-                    let stamped = self.client.stamp_write_seq_pub(&meta);
-                    self.client.metadata_queue.push(stamped).await;
-                }
+                self.last_metadata_update.insert(ino, std::time::Instant::now());
+                let stamped = self.client.stamp_write_seq_pub(&meta);
+                self.client.metadata_queue.push(stamped).await;
                 // For background flushes, update read engine immediately (not queued)
                 // so reads see fresh chunk_map before slots are removed below.
                 let current_size = meta.size;
@@ -1144,20 +1137,12 @@ impl FlushHandle {
                             self.dir_cache.remove(&parent);
                         }
                     }
-                    const METADATA_FLUSH_INTERVAL_SECS: u64 = 5;
-                    let should_enqueue = match self.last_metadata_update.get(&ino) {
-                        None => true,
-                        Some(last) => last.elapsed() >= std::time::Duration::from_secs(METADATA_FLUSH_INTERVAL_SECS),
-                    };
-                    if should_enqueue {
-                        self.last_metadata_update.insert(ino, std::time::Instant::now());
-                        // Commit metadata to leader first, then update the read engine.
-                        // This ensures leader refreshes never overwrite our engine update
-                        // with stale data — the leader has the chunk map before we expose it.
-                        self.client.flush_metadata_sync(&meta).await;
-                    }
-                    // ALWAYS update read engine (even if we skip metadata sync due to rate limit).
-                    // This ensures reads see fresh chunk_map before slot is removed below.
+                    self.last_metadata_update.insert(ino, std::time::Instant::now());
+                    // Commit metadata to leader first, then update the read engine.
+                    // This ensures leader refreshes never overwrite our engine update
+                    // with stale data — the leader has the chunk map before we expose it.
+                    self.client.flush_metadata_sync(&meta).await;
+                    // Update read engine after leader has the metadata.
                     let current_size = meta.size;
                     self.client.feed_chunk_locations_to_read_engine(
                         ino, &meta.chunk_locations, current_size,

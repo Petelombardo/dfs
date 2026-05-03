@@ -215,6 +215,12 @@ impl InodeWriteState {
                 slot.real_data_end = write_end;
             }
             slot.last_modified = SystemTime::now();
+            // A real write() supersedes the open-time snapshot for this chunk.
+            // The stale-write guard uses chunk_ids_at_open to detect sessions that
+            // buffered content at open time and would revert a competing write — but
+            // once an actual write() has landed here, the slot has newer data than
+            // anything on the server and must not be discarded.
+            self.chunk_ids_at_open.remove(&idx);
 
             if slot.is_full() {
                 full_slots.push(idx);
@@ -3389,12 +3395,37 @@ impl Filesystem for DfsFilesystem {
                     // (runtime scheduling + metadata cache lookup overhead).
                     let t_sched = start.elapsed();
 
-                    // Wait until this inode's buffer has room before accepting more data.
+                    // Graduated back-pressure: slow writes proportionally as the buffer
+                    // fills so the pipeline never actually hits the cap under normal load.
+                    // Early pressure keeps the buffer low and flush latency spikes from
+                    // causing a full stall. Hard cap is still enforced with a 30s timeout
+                    // as a safety net against a permanently stuck flush pipeline.
                     let t_bp_start = std::time::Instant::now();
+                    const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
                     loop {
                         let current = state_arc.lock().await.buffered_bytes();
-                        if current < global_write_buffer_cap { break; }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        let fill_pct = current * 100 / global_write_buffer_cap.max(1);
+                        let delay_ms: u64 = if fill_pct < 25 {
+                            0
+                        } else if fill_pct < 50 {
+                            1
+                        } else if fill_pct < 75 {
+                            5
+                        } else if fill_pct < 100 {
+                            20
+                        } else {
+                            // At cap — check timeout before blocking.
+                            if t_bp_start.elapsed() >= BP_TIMEOUT {
+                                error!("write: ino={} back-pressure timeout after {:?} — flush pipeline stuck, returning EIO",
+                                       ino, t_bp_start.elapsed());
+                                reply.error(libc::EIO);
+                                return;
+                            }
+                            10
+                        };
+                        if delay_ms == 0 { break; }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        if fill_pct < 100 { break; }
                     }
                     let t_bp = t_bp_start.elapsed();
 

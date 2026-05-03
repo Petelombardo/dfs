@@ -3400,10 +3400,20 @@ impl Filesystem for DfsFilesystem {
                     // Early pressure keeps the buffer low and flush latency spikes from
                     // causing a full stall. Hard cap is still enforced with a 30s timeout
                     // as a safety net against a permanently stuck flush pipeline.
+                    //
+                    // CRITICAL: use try_lock() rather than lock().await to read the buffer
+                    // level. Under high write concurrency all 8 runtime threads can end up
+                    // waiting on state_arc.lock().await simultaneously, starving the runtime
+                    // and deadlocking the flush tasks that need to run to drain the buffer.
+                    // If try_lock fails (flush task holds the lock), fall back to the
+                    // size_high_water mark as a conservative estimate — it's always >= real
+                    // buffered bytes so back-pressure is applied safely.
                     let t_bp_start = std::time::Instant::now();
                     const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
                     loop {
-                        let current = state_arc.lock().await.buffered_bytes();
+                        let current = state_arc.try_lock()
+                            .map(|s| s.buffered_bytes())
+                            .unwrap_or_else(|_| global_write_buffer_cap);
                         let fill_pct = current * 100 / global_write_buffer_cap.max(1);
                         let delay_ms: u64 = if fill_pct < 25 {
                             0

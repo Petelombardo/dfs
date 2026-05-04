@@ -26,31 +26,29 @@ pub fn is_sqlite_for_cache(path: &str) -> bool {
     is_sqlite_path(path)
 }
 
-/// Check if path is a SQLite file that needs immediate synchronous writes.
-/// Includes .db-shm because it's a sparse mmap'd file - buffering causes huge gaps.
-fn is_sqlite_path(path: &str) -> bool {
+/// SQLite files that go through the write buffer with sync_on_fsync=true.
+/// Excludes .db-shm: it is mmap'd MAP_SHARED and must stay on the unbuffered path.
+fn is_sqlite_buffered(path: &str) -> bool {
     path.ends_with(".db")
         || path.ends_with(".sqlite")
         || path.ends_with(".sqlite3")
         || path.ends_with(".db-wal")
         || path.ends_with(".db-journal")
-        || path.ends_with(".db-shm")  // Sparse mmap file - must bypass write buffer
         || path.ends_with(".db_temp")
         || path.ends_with(".sqlite_temp")
         || path.ends_with(".sqlite3_temp")
 }
 
+/// All SQLite-related paths — used for chunk-data cache bypass and FOPEN_DIRECT_IO.
+/// Includes .db-shm (for cache bypass) but .db-shm must NOT get FOPEN_DIRECT_IO.
+fn is_sqlite_path(path: &str) -> bool {
+    is_sqlite_buffered(path) || path.ends_with(".db-shm")
+}
+
 /// Same as is_sqlite_path but excludes .db-shm, which must NOT use FOPEN_DIRECT_IO
 /// because SQLite mmaps it (MAP_SHARED) for WAL index coordination.
 fn is_sqlite_direct_io(path: &str) -> bool {
-    path.ends_with(".db")
-        || path.ends_with(".sqlite")
-        || path.ends_with(".sqlite3")
-        || path.ends_with(".db-wal")
-        || path.ends_with(".db-journal")
-        || path.ends_with(".db_temp")
-        || path.ends_with(".sqlite_temp")
-        || path.ends_with(".sqlite3_temp")
+    is_sqlite_buffered(path)
 }
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
@@ -1405,6 +1403,7 @@ pub struct DfsFilesystem {
     /// release() waits for this to reach zero before flush so we don't flush an incomplete slot.
     write_tasks_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
 
+
     /// Total bytes currently held across all per-inode write buffers.
     /// Incremented on every buffered write; decremented by flush_buffer_async on success.
     /// Shared with FlushHandle so both sides see the same counter.
@@ -2300,9 +2299,14 @@ impl Filesystem for DfsFilesystem {
             // SQLite, databases, and write-journaling apps use this. DVR/streaming apps don't.
             // We propagate this flag into the InodeWriteState so fsync() knows whether to
             // coalesce (DVR mode) or flush immediately (database mode).
-            let sync_on_fsync = (flags & (libc::O_SYNC | libc::O_DSYNC)) != 0;
+            // Also force sync_on_fsync for SQLite files regardless of open flags — SQLite
+            // doesn't set O_SYNC but its fdatasync() calls must flush immediately so that
+            // WAL checkpoint reads see the committed data.
+            let path_for_sync_check = self.metadata_cache.get(&ino).map(|m| m.path.clone());
+            let is_sqlite_buf = path_for_sync_check.as_deref().map(is_sqlite_buffered).unwrap_or(false);
+            let sync_on_fsync = (flags & (libc::O_SYNC | libc::O_DSYNC)) != 0 || is_sqlite_buf;
             if sync_on_fsync {
-                info!("open: ino={} opened with O_SYNC/O_DSYNC — fsyncs will flush immediately", ino);
+                info!("open: ino={} sync_on_fsync=true (O_SYNC/O_DSYNC or SQLite)", ino);
             }
             if self.write_buffer_enabled {
                 // If this is the first writer (count was 0 before incrementing above),
@@ -3182,8 +3186,12 @@ impl Filesystem for DfsFilesystem {
         // waiting for a reply that never comes.
         let path_for_sqlite_check = path_to_inode.read().unwrap()
             .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
-        let is_sqlite = path_for_sqlite_check.as_deref().map(is_sqlite_path).unwrap_or(false);
-        if write_buffer_enabled && !is_sqlite {
+        // .db-shm is mmap'd MAP_SHARED — keep it on the unbuffered path.
+        // All other SQLite files (.db, .db-wal, .db-journal, etc.) now go through
+        // the write buffer with sync_on_fsync=true, giving coherent chunk accumulation
+        // and correct PatchChunk behaviour on fdatasync.
+        let is_shm_only = path_for_sqlite_check.as_deref().map(|p| p.ends_with(".db-shm")).unwrap_or(false);
+        if write_buffer_enabled && !is_shm_only {
             if let Some(meta) = metadata_cache.get(&ino) {
                 if meta.file_type == FileType::RegularFile {
                     let offset_usize = offset as usize;
@@ -3194,7 +3202,8 @@ impl Filesystem for DfsFilesystem {
                     let is_sequential = offset_usize <= current_size;
                     if is_sequential {
                         if !write_buffers.contains_key(&ino) {
-                            write_buffers.insert(ino, Arc::new(Mutex::new(InodeWriteState::new(false))));
+                            let sync = path_for_sqlite_check.as_deref().map(is_sqlite_buffered).unwrap_or(false);
+                            write_buffers.insert(ino, Arc::new(Mutex::new(InodeWriteState::new(sync))));
                         }
                         let state_arc = write_buffers.get(&ino).map(|e| e.clone());
                         if let Some(state_arc) = state_arc {
@@ -3339,11 +3348,13 @@ impl Filesystem for DfsFilesystem {
             }
 
             let is_sqlite = is_sqlite_path(&metadata.path);
+            let is_sqlite_buf = is_sqlite_buffered(&metadata.path);
             let cache_inode = if is_sqlite { 0 } else { ino };
+            // .db-shm stays unbuffered (mmap'd MAP_SHARED); all other SQLite files use the
+            // write buffer with sync_on_fsync=true for coherent chunk accumulation.
+            let is_shm = metadata.path.ends_with(".db-shm");
 
-            // SQLite files bypass write buffer - they need immediate synchronous writes
-            // with strict ordering (WAL before main DB). Buffering causes corruption.
-            if write_buffer_enabled && !is_sqlite {
+            if write_buffer_enabled && !is_shm {
                 let offset_usize = offset as usize;
                 let current_size = {
                     let cache_size = metadata_cache.get(&ino)
@@ -3392,7 +3403,7 @@ impl Filesystem for DfsFilesystem {
 
                         let state_arc = write_buffers
                             .entry(ino)
-                            .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
+                            .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(is_sqlite_buf))))
                             .clone();
                         let mut state = state_arc.lock().await;
                         let bytes_before = state.buffered_bytes();
@@ -3514,7 +3525,7 @@ impl Filesystem for DfsFilesystem {
 
                     let state_arc = write_buffers
                         .entry(ino)
-                        .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
+                        .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(is_sqlite_buf))))
                         .clone();
 
                     // t_sched: time from FUSE write() call to reaching the backpressure gate
@@ -3608,7 +3619,7 @@ impl Filesystem for DfsFilesystem {
                 }
             }
 
-            // Non-buffered write path (SQLite or write_buffer_enabled=false).
+            // Non-buffered write path (write_buffer_enabled=false, or .db-shm).
             let offset = offset as usize;
             let current_size = if write_buffer_enabled {
                 let cache_size = metadata_cache.get(&ino)
@@ -3628,12 +3639,18 @@ impl Filesystem for DfsFilesystem {
 
             let mut affected_chunk_range: Option<(usize, usize)> = None;
 
+            // write_file_offset: the byte offset passed to write_data_with_cache.
+            // For appends and gap writes this is the actual write position (not current_size).
+            let mut write_file_offset_override: Option<u64> = None;
+
             let (new_data, is_append) = if offset == current_size {
                 (data_vec.clone(), true)
             } else if offset > current_size {
-                let mut padded = vec![0u8; offset - current_size];
-                padded.extend_from_slice(&data_vec);
-                (padded, true)
+                // Write starts past EOF — send only the real data at its actual offset.
+                // The gap is implicit zero space; zero-padding it would write content that
+                // was never written by the application and creates unnecessary chunks.
+                write_file_offset_override = Some(offset as u64);
+                (data_vec.clone(), true)
             } else {
                 info!("Random write detected: offset={}, size={}, file_size={}",
                       offset, data_vec.len(), current_size);
@@ -3713,7 +3730,8 @@ impl Filesystem for DfsFilesystem {
 
             let write_start = std::time::Instant::now();
             let result = if is_append {
-                client.write_data_with_cache(&new_data, cache_inode, current_size as u64).await
+                let file_offset = write_file_offset_override.unwrap_or(current_size as u64);
+                client.write_data_with_cache(&new_data, cache_inode, file_offset).await
             } else {
                 let write_file_offset = if let Some((first_idx, _)) = affected_chunk_range {
                     metadata.chunk_locations[..first_idx].iter().map(|l| l.size as u64).sum::<u64>()
@@ -3730,7 +3748,10 @@ impl Filesystem for DfsFilesystem {
                         if let Some(chunk_locations) = chunk_locations_opt {
                             metadata.chunk_locations.extend(chunk_locations);
                         }
-                        metadata.size = current_size as u64 + new_data.len() as u64;
+                        // For gap writes, the actual end is offset + len, not current_size + len.
+                        let write_end = write_file_offset_override
+                            .unwrap_or(current_size as u64) + new_data.len() as u64;
+                        metadata.size = metadata.size.max(write_end);
                     } else if let Some((first_idx, last_idx)) = affected_chunk_range {
                         let new_locations = chunk_locations_opt.unwrap_or_default();
                         info!("Splicing {} new chunks into range {}-{} (was {} chunks)",
@@ -3804,13 +3825,32 @@ impl Filesystem for DfsFilesystem {
         let write_counters = self.write_counters.clone();
         let last_metadata_update = self.last_metadata_update.clone();
         let runtime = self.runtime.clone();
+        let flush_handle = self.flush_handle.clone();
+        // For SQLite-buffered files, flush() must drain synchronously — SQLite's WAL
+        // checkpoint reads data back immediately after flush and must see committed chunks.
+        let is_sqlite_flush = self.metadata_cache.get(&ino)
+            .map(|m| is_sqlite_buffered(&m.path))
+            .unwrap_or(false);
 
         // Spawn flush operation on tokio's blocking thread pool
         runtime.clone().spawn_blocking(move || {
             debug!("flush: ino={}", ino);
 
             if write_buffer_enabled {
-                // When write-buffering is enabled, flush() must NOT drain the write buffer.
+                if is_sqlite_flush {
+                    // SQLite: flush everything now so the fdatasync ordering guarantee holds.
+                    debug!("flush: ino={} - SQLite file, flushing buffer synchronously", ino);
+                    let result = flush_handle.flush_runtime.block_on(
+                        flush_handle.flush_all_pipelined(ino)
+                    );
+                    match result {
+                        Ok(_) => reply.ok(),
+                        Err(e) => { error!("flush (SQLite) failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
+                    }
+                    return;
+                }
+                // When write-buffering is enabled, flush() must NOT drain the write buffer
+                // for DVR/streaming files.
                 //
                 // flush() fires on every close() — including read-only fds (e.g. Kodi seeking
                 // while the DVR is still recording) and the DVR's own file descriptor between

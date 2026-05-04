@@ -4796,13 +4796,16 @@ impl Filesystem for DfsFilesystem {
         debug!("fsync: ino={}, datasync={}", ino, datasync);
 
         if self.write_buffer_enabled {
-            // Check whether this inode was opened with O_SYNC/O_DSYNC.
-            // If so, flush immediately (database/journaling mode).
-            // If not, spawn the flush as a background task so the FUSE dispatch thread is
-            // not blocked (DVR/streaming mode — coalesced fsyncs are fine).
-            let sync_on_fsync = self.write_buffers.get(&ino)
+            // Check whether this inode needs synchronous fsyncs (SQLite or O_SYNC/O_DSYNC).
+            // SQLite files always flush synchronously — check the path first (fast, no lock
+            // needed) before falling back to the buffer state flag. This avoids the race where
+            // try_lock() returns false because a write holds the buffer, causing fsync to go
+            // async and reads after fdatasync to see stale data (SQLITE_CORRUPT).
+            let is_sqlite_ino = self.metadata_cache.get(&ino)
+                .map(|m| is_sqlite_buffered(&m.path))
+                .unwrap_or(false);
+            let sync_on_fsync = is_sqlite_ino || self.write_buffers.get(&ino)
                 .map(|state_lock| {
-                    // Try non-blocking read; if locked just default to async flush
                     state_lock.try_lock().map(|s| s.sync_on_fsync).unwrap_or(false)
                 })
                 .unwrap_or(false);

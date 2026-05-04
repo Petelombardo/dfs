@@ -118,8 +118,16 @@ impl LockManager {
 
         let new_lock = FileLock::new(owner, pid, lock_type, start, len);
 
-        // Check for conflicts with locks from OTHER owners
+        // Check for conflicts with locks from OTHER owners.
+        // Locks from the same PID (different lock_owner = different thread/fd) are skipped:
+        // within a single process SQLite manages its own internal mutex coordination,
+        // so OS-level lock conflicts between threads of the same process are not meaningful.
+        // Returning EAGAIN to a same-process thread trying to upgrade to WAL exclusive mode
+        // causes SQLite to fall back to rollback journal, breaking WAL mode for the process.
         for existing in file_locks.iter() {
+            if existing.pid != 0 && pid != 0 && existing.pid == pid {
+                continue; // Same process — SQLite handles intra-process locking internally
+            }
             if new_lock.conflicts_with(existing) {
                 debug!(
                     "Lock conflict: owner={} pid={} {:?} [{}, {}] conflicts with owner={} pid={} {:?} [{}, {}]",
@@ -228,6 +236,9 @@ impl LockManager {
             let test_lock = FileLock::new(owner, pid, lock_type, start, len);
 
             for existing in file_locks.iter() {
+                if existing.pid != 0 && pid != 0 && existing.pid == pid {
+                    continue; // Same process — not a real conflict
+                }
                 if test_lock.conflicts_with(existing) {
                     return Some(existing.clone());
                 }

@@ -3202,12 +3202,11 @@ impl Filesystem for DfsFilesystem {
                         // on the FUSE dispatch thread rather than falling through to spawn an
                         // async task. Blocking the FUSE thread here is correct and desirable:
                         // it throttles the writer naturally without consuming a runtime slot.
-                        let mut state = state_arc.blocking_lock();
+                        //
+                        // CRITICAL: apply back-pressure BEFORE acquiring the lock.
+                        // Holding the slot mutex while spinning would prevent the flush task
+                        // from acquiring it to drain the buffer — permanent deadlock.
                         {
-                            // Graduated back-pressure on the FUSE dispatch thread.
-                            // Sleeping here is safe — FUSE dispatch threads are regular OS
-                            // threads, not tokio workers. This throttles the writer without
-                            // consuming a runtime thread slot for the duration of the delay.
                             let t_bp = std::time::Instant::now();
                             const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
                             loop {
@@ -3230,7 +3229,12 @@ impl Filesystem for DfsFilesystem {
                                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                                 if fill_pct < 100 { break; }
                             }
+                        }
+                        let mut state = state_arc.blocking_lock();
+                        {
+                            let bytes_before = state.buffered_bytes();
                             state.write_at(offset as u64, &data_vec);
+                            let bytes_after = state.buffered_bytes();
                             let has_full = !state.full_slot_indices().is_empty();
                             drop(state);
                             let new_end = (offset as u64) + data_vec.len() as u64;
@@ -3238,7 +3242,14 @@ impl Filesystem for DfsFilesystem {
                                 let mut hwm = size_high_water.entry(ino).or_insert(0);
                                 if new_end > *hwm { *hwm = new_end; }
                             }
-                            global_buffered_bytes.fetch_add(data_vec.len(), std::sync::atomic::Ordering::Relaxed);
+                            // Only count bytes actually added to the buffer, not the write
+                            // size. Overlapping writes don't grow the slot, so adding
+                            // data_vec.len() unconditionally causes the counter to drift up
+                            // and never come back down, triggering false back-pressure.
+                            let added = bytes_after.saturating_sub(bytes_before);
+                            if added > 0 {
+                                global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+                            }
                             {
                                 let mut counters = write_counters.write().unwrap();
                                 *counters.entry(ino).or_insert(0) += 1;
@@ -3378,6 +3389,7 @@ impl Filesystem for DfsFilesystem {
                             .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(false))))
                             .clone();
                         let mut state = state_arc.lock().await;
+                        let bytes_before = state.buffered_bytes();
                         state.write_at(gap_write_offset, &padded);
                         // Mark the gap bytes as synthetic so flush doesn't mistake them
                         // for real app data when deciding whether to PatchChunk.
@@ -3386,10 +3398,14 @@ impl Filesystem for DfsFilesystem {
                         if let Some(slot) = state.slots.get_mut(&gap_chunk_idx) {
                             slot.gap_filled_prefix = gap_intra + gap;
                         }
+                        let added = state.buffered_bytes().saturating_sub(bytes_before);
 
                         // Notify flush worker if chunks are now full (event-driven flush)
                         let has_full_chunks = !state.full_slot_indices().is_empty();
                         drop(state);
+                        if added > 0 {
+                            global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+                        }
 
                         if has_full_chunks {
                             flush_handle.flush_notify.notify_one();
@@ -3546,7 +3562,9 @@ impl Filesystem for DfsFilesystem {
                     // t_buf: time to acquire the slot lock and copy bytes into the buffer.
                     let t_buf_start = std::time::Instant::now();
                     let mut state = state_arc.lock().await;
+                    let bytes_before = state.buffered_bytes();
                     state.write_at(write_offset, &data_vec);
+                    let added = state.buffered_bytes().saturating_sub(bytes_before);
 
                     // Check if this write completed any 4MB chunks. If so, notify the flush
                     // worker immediately (event-driven) instead of waiting for the 50ms ticker.
@@ -3557,7 +3575,9 @@ impl Filesystem for DfsFilesystem {
                         flush_handle.flush_notify.notify_one();
                     }
 
-                    global_buffered_bytes.fetch_add(data_vec.len(), std::sync::atomic::Ordering::Relaxed);
+                    if added > 0 {
+                        global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let t_buf = t_buf_start.elapsed();
 
                     // Update size_high_water immediately so concurrent writes that hit

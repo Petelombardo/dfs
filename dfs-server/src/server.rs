@@ -3969,6 +3969,13 @@ impl Server {
             const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             // total_chunks = max chunk index + 1 (not list length) so the client knows
             // the true density of the file and can size its engine map correctly.
+            // total_chunks = max chunk index + 1 so the client engine map covers
+            // the full sparse extent. For dense/sequential files this equals
+            // locations.len(); for sparse files (e.g. VM disk images) it equals
+            // the highest written chunk index + 1, which may be much larger.
+            // The client window tracking uses this to know when it has fetched
+            // the complete map — returning locations.len() would cause constant
+            // re-fetches for sparse files where reads land beyond the last chunk.
             let max_chunk_idx = locations.iter()
                 .filter_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE) as u32))
                 .max()

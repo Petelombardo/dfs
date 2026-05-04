@@ -2081,14 +2081,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
         };
 
-        // Fetch all chunks from the current read position to EOF.
-        // u32::MAX tells the server "give me everything from from_chunk onward".
-        // This ensures any forward seek — even 10+ minutes ahead — has valid chunk
-        // locations without a second round-trip. Backward seeks still trigger a
-        // re-fetch (needs_refresh detects out-of-window), but those are rare.
+        // Always fetch from chunk 0 with u32::MAX window to get the complete map
+        // in one RPC. Fetching from from_chunk causes constant re-fetches for sparse
+        // files (e.g. VM disk images) where reads jump to high chunk indices that fall
+        // outside the previously fetched window. One full fetch covers all positions.
         const CHUNK_MAP_WINDOW: u32 = u32::MAX;
         let rpc_start = std::time::Instant::now();
-        match self.get_file_chunk_map(file_id, from_chunk, CHUNK_MAP_WINDOW).await {
+        match self.get_file_chunk_map(file_id, 0, CHUNK_MAP_WINDOW).await {
             Ok((locs, window_from, total_chunks, _)) if !locs.is_empty() => {
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader in {:?}",
                       engine.inode, locs.len(), window_from, total_chunks, rpc_start.elapsed());

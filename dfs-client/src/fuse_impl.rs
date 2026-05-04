@@ -1306,8 +1306,13 @@ pub struct DfsFilesystem {
     /// Root inode is always 1 (FUSE convention)
     root_inode: u64,
 
-    /// Tokio runtime handle for async operations
+    /// Tokio runtime handle for async operations (writes, metadata, misc FUSE ops)
     runtime: tokio::runtime::Handle,
+
+    /// Dedicated runtime for read operations — isolated from writes so a burst
+    /// of slow reads (network cache misses) can't starve write reply tasks and
+    /// vice versa, preventing FUSE request deadlocks under concurrent I/O.
+    read_runtime: Arc<tokio::runtime::Runtime>,
 
     /// Write counter per inode for batching metadata updates
     write_counters: Arc<RwLock<HashMap<u64, usize>>>,
@@ -1506,6 +1511,19 @@ impl DfsFilesystem {
                 .expect("Failed to build flush runtime")
         );
 
+        // Dedicated runtime for FUSE read operations.
+        // Isolated from writes so a burst of slow reads (network cache misses, ~40ms
+        // each) can't fill the write runtime and cause write reply tasks to queue up,
+        // which would deadlock QEMU waiting for write acknowledgements.
+        let read_runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(32)
+                .enable_all()
+                .thread_name("dfs-read")
+                .build()
+                .expect("Failed to build read runtime")
+        );
+
         let global_buffered_bytes: Arc<std::sync::atomic::AtomicUsize> =
             Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -1694,6 +1712,7 @@ impl DfsFilesystem {
             truncated_inodes: truncated_inodes_shared,
             flush_in_flight: flush_in_flight_shared,
             flush_runtime,
+            read_runtime,
             flush_handle,
             pending_deletes: Arc::new(dashmap::DashSet::new()),
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
@@ -2622,7 +2641,7 @@ impl Filesystem for DfsFilesystem {
         let last_metadata_update = self.last_metadata_update.clone();
         let size_high_water = self.size_high_water.clone();
 
-        self.runtime.spawn(async move {
+        self.read_runtime.spawn(async move {
             let start = std::time::Instant::now();
             debug!("FUSE read: ino={}, offset={}, size={}", ino, offset, size);
 
@@ -3154,6 +3173,91 @@ impl Filesystem for DfsFilesystem {
             .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
             .clone();
         write_task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Fast path: if metadata is cached, buffer is not full, and this is a
+        // sequential (non-sparse) buffered write, handle it synchronously on the
+        // FUSE dispatch thread via block_in_place. This avoids spawning a runtime
+        // task entirely — critical because all 8 runtime threads can be occupied
+        // by concurrent reads, causing write tasks to queue up and QEMU to deadlock
+        // waiting for a reply that never comes.
+        let path_for_sqlite_check = path_to_inode.read().unwrap()
+            .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+        let is_sqlite = path_for_sqlite_check.as_deref().map(is_sqlite_path).unwrap_or(false);
+        if write_buffer_enabled && !is_sqlite {
+            if let Some(meta) = metadata_cache.get(&ino) {
+                if meta.file_type == FileType::RegularFile {
+                    let offset_usize = offset as usize;
+                    let cache_size = meta.size as usize;
+                    drop(meta);
+                    let hwm = size_high_water.get(&ino).map(|v| *v as usize).unwrap_or(0);
+                    let current_size = hwm.max(cache_size);
+                    let is_sequential = offset_usize <= current_size;
+                    if is_sequential {
+                        if !write_buffers.contains_key(&ino) {
+                            write_buffers.insert(ino, Arc::new(Mutex::new(InodeWriteState::new(false))));
+                        }
+                        let state_arc = write_buffers.get(&ino).map(|e| e.clone());
+                        if let Some(state_arc) = state_arc {
+                        // Use blocking_lock() — if the flush thread holds the mutex we wait
+                        // on the FUSE dispatch thread rather than falling through to spawn an
+                        // async task. Blocking the FUSE thread here is correct and desirable:
+                        // it throttles the writer naturally without consuming a runtime slot.
+                        let mut state = state_arc.blocking_lock();
+                        {
+                            // Graduated back-pressure on the FUSE dispatch thread.
+                            // Sleeping here is safe — FUSE dispatch threads are regular OS
+                            // threads, not tokio workers. This throttles the writer without
+                            // consuming a runtime thread slot for the duration of the delay.
+                            let t_bp = std::time::Instant::now();
+                            const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+                            loop {
+                                let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                                let fill_pct = current * 100 / global_write_buffer_cap.max(1);
+                                let delay_ms: u64 = if fill_pct < 25 { 0 }
+                                    else if fill_pct < 50 { 1 }
+                                    else if fill_pct < 75 { 5 }
+                                    else if fill_pct < 100 { 20 }
+                                    else {
+                                        if t_bp.elapsed() >= BP_TIMEOUT {
+                                            error!("write fast-path: ino={} bp timeout — EIO", ino);
+                                            write_task_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                            reply.error(libc::EIO);
+                                            return;
+                                        }
+                                        10
+                                    };
+                                if delay_ms == 0 { break; }
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                                if fill_pct < 100 { break; }
+                            }
+                            state.write_at(offset as u64, &data_vec);
+                            let has_full = !state.full_slot_indices().is_empty();
+                            drop(state);
+                            let new_end = (offset as u64) + data_vec.len() as u64;
+                            {
+                                let mut hwm = size_high_water.entry(ino).or_insert(0);
+                                if new_end > *hwm { *hwm = new_end; }
+                            }
+                            global_buffered_bytes.fetch_add(data_vec.len(), std::sync::atomic::Ordering::Relaxed);
+                            {
+                                let mut counters = write_counters.write().unwrap();
+                                *counters.entry(ino).or_insert(0) += 1;
+                            }
+                            if has_full {
+                                flush_handle.flush_notify.notify_one();
+                            }
+                            write_task_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            debug!("write fast-path: ino={} off={} len={}", ino, offset, data_vec.len());
+                            reply.written(data_vec.len() as u32);
+                            return;
+                        } // blocking_lock scope
+                        } // if let Some(state_arc)
+                    }
+                } else {
+                    drop(meta);
+                }
+            }
+        }
 
         self.runtime.spawn(async move {
             let _write_guard = WriteTaskGuard(write_task_counter);

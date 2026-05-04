@@ -3233,8 +3233,12 @@ impl Filesystem for DfsFilesystem {
         // task entirely — critical because all 8 runtime threads can be occupied
         // by concurrent reads, causing write tasks to queue up and QEMU to deadlock
         // waiting for a reply that never comes.
-        let path_for_sqlite_check = path_to_inode.read().unwrap()
-            .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+        // Determine the file path for SQLite routing decisions.
+        // Prefer metadata_cache (always populated before reply.created() returns) over
+        // path_to_inode (populated async, may not be visible yet on first write).
+        let path_for_sqlite_check = metadata_cache.get(&ino).map(|m| m.path.clone())
+            .or_else(|| path_to_inode.read().unwrap()
+                .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone()));
         // Route through the write buffer only for non-SQLite files and .db-wal files.
         // .db, .sqlite, .db-journal: use direct writes (rollback journal ordering requires it).
         // .db-shm: unbuffered (mmap'd MAP_SHARED).

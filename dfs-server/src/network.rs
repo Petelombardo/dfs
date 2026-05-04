@@ -60,6 +60,14 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
 
         info!("Network server listening on {}", self.listen_addr);
 
+        // Limit concurrent in-flight connections. Each connection holds a permit for
+        // its lifetime, so the runtime never has more than MAX_CONNECTIONS tasks
+        // simultaneously blocked in read/write. Without this cap, a burst of connections
+        // (e.g. rapid-fire small writes from a SQLite WAL session) can exhaust the tokio
+        // thread pool, leaving no threads to service new requests and causing a deadlock.
+        const MAX_CONNECTIONS: usize = 512;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
 
@@ -67,15 +75,43 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, peer_addr)) => {
+                        Ok((mut stream, peer_addr)) => {
                             debug!("Accepted connection from {}", peer_addr);
                             let _ = stream.set_nodelay(true);
                             let handler = self.handler.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_connection(stream, peer_addr, handler).await {
-                                    error!("Connection error from {}: {}", peer_addr, e);
+                            let sem = semaphore.clone();
+
+                            // Try to acquire a permit without blocking the accept loop.
+                            // If at capacity, send a busy error and close immediately so
+                            // the client gets a fast failure rather than a silent hang.
+                            match sem.clone().try_acquire_owned() {
+                                Ok(permit) => {
+                                    tokio::spawn(async move {
+                                        let _permit = permit; // released on drop
+                                        if let Err(e) = handle_connection(stream, peer_addr, handler).await {
+                                            error!("Connection error from {}: {}", peer_addr, e);
+                                        }
+                                    });
                                 }
-                            });
+                                Err(_) => {
+                                    let in_use = MAX_CONNECTIONS - sem.available_permits();
+                                    warn!("Connection limit reached ({}/{}) — rejecting {}", in_use, MAX_CONNECTIONS, peer_addr);
+                                    tokio::spawn(async move {
+                                        let response = MessageEnvelope::new(
+                                            RequestId::new(0),
+                                            dfs_common::Message::Response(dfs_common::Response::Error {
+                                                message: "Server busy — connection limit reached".to_string(),
+                                                code: ErrorCode::ServerBusy,
+                                            }),
+                                        );
+                                        if let Ok(encoded) = response.to_bytes() {
+                                            let len = (encoded.len() as u32).to_be_bytes();
+                                            let _ = stream.write_all(&len).await;
+                                            let _ = stream.write_all(&encoded).await;
+                                        }
+                                    });
+                                }
+                            }
                         }
                         Err(e) => {
                             error!("Failed to accept connection: {}", e);
@@ -168,6 +204,11 @@ async fn read_message(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
 ) -> Result<Option<MessageEnvelope>> {
+    // Per-read-operation timeout. Applied to every read_buf call so a client that
+    // dies mid-transfer (e.g. after sending the length prefix but before the payload)
+    // doesn't hold the connection open forever and leak the fd / task slot.
+    const READ_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
     loop {
         if buf.len() >= 4 {
             let mut length_bytes = [0u8; 4];
@@ -185,9 +226,10 @@ async fn read_message(
                     if data.is_empty() {
                         // Drain raw payload from buf then stream.
                         while buf.len() < 4 {
-                            if stream.read_buf(buf).await? == 0 {
-                                anyhow::bail!("Connection closed reading chunk payload length");
-                            }
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                                .map_err(|_| anyhow::anyhow!("Timeout reading chunk payload length"))?
+                                .context("IO error reading chunk payload length")?;
+                            if n == 0 { anyhow::bail!("Connection closed reading chunk payload length"); }
                         }
                         let mut plen_bytes = [0u8; 4];
                         plen_bytes.copy_from_slice(&buf[..4]);
@@ -195,9 +237,10 @@ async fn read_message(
                         let plen = u32::from_be_bytes(plen_bytes) as usize;
 
                         while buf.len() < plen {
-                            if stream.read_buf(buf).await? == 0 {
-                                anyhow::bail!("Connection closed reading chunk payload");
-                            }
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                                .map_err(|_| anyhow::anyhow!("Timeout reading chunk payload"))?
+                                .context("IO error reading chunk payload")?;
+                            if n == 0 { anyhow::bail!("Connection closed reading chunk payload"); }
                         }
                         *data = buf.split_to(plen).to_vec();
                     }
@@ -208,9 +251,10 @@ async fn read_message(
                     if data.is_empty() {
                         // Drain raw payload from buf then stream.
                         while buf.len() < 4 {
-                            if stream.read_buf(buf).await? == 0 {
-                                anyhow::bail!("Connection closed reading write payload length");
-                            }
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                                .map_err(|_| anyhow::anyhow!("Timeout reading write payload length"))?
+                                .context("IO error reading write payload length")?;
+                            if n == 0 { anyhow::bail!("Connection closed reading write payload length"); }
                         }
                         let mut plen_bytes = [0u8; 4];
                         plen_bytes.copy_from_slice(&buf[..4]);
@@ -218,9 +262,10 @@ async fn read_message(
                         let plen = u32::from_be_bytes(plen_bytes) as usize;
 
                         while buf.len() < plen {
-                            if stream.read_buf(buf).await? == 0 {
-                                anyhow::bail!("Connection closed reading write payload");
-                            }
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                                .map_err(|_| anyhow::anyhow!("Timeout reading write payload"))?
+                                .context("IO error reading write payload")?;
+                            if n == 0 { anyhow::bail!("Connection closed reading write payload"); }
                         }
                         *data = buf.split_to(plen).to_vec();
                         debug!("Received split-frame write request: {} bytes", plen);
@@ -231,7 +276,10 @@ async fn read_message(
             }
         }
 
-        if stream.read_buf(buf).await? == 0 {
+        let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+            .map_err(|_| anyhow::anyhow!("Timeout reading message frame"))?
+            .context("IO error reading message frame")?;
+        if n == 0 {
             if buf.is_empty() {
                 return Ok(None);
             } else {

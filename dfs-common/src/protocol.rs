@@ -643,6 +643,8 @@ pub enum ErrorCode {
     InternalError,
     /// AppendFile: file.size != expected_offset
     OffsetMismatch,
+    /// Server is at connection limit and cannot accept more work right now
+    ServerBusy,
 }
 
 /// Cluster management messages

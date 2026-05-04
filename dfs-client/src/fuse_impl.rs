@@ -27,16 +27,22 @@ pub fn is_sqlite_for_cache(path: &str) -> bool {
 }
 
 /// SQLite files that go through the write buffer with sync_on_fsync=true.
-/// Excludes .db-shm: it is mmap'd MAP_SHARED and must stay on the unbuffered path.
+///
+/// Only WAL files benefit from buffering — they are append-only streams of frames
+/// that accumulate correctly in-memory before a single flush. Buffering is correct
+/// because WAL readers replay from the beginning so ordering within the buffer is
+/// preserved when flushed.
+///
+/// Main .db files and rollback journals must NOT be buffered:
+/// - Rollback journal mode requires strict per-fdatasync durability. The journal
+///   must be fully durable before any db page is written. Buffering merges writes
+///   across fdatasync boundaries, corrupting the rollback ordering.
+/// - WAL-mode .db files are only written during checkpoints (clean, infrequent),
+///   where per-write ordering also matters for page consistency.
+///
+/// .db-shm is excluded separately — it is mmap'd MAP_SHARED.
 fn is_sqlite_buffered(path: &str) -> bool {
-    path.ends_with(".db")
-        || path.ends_with(".sqlite")
-        || path.ends_with(".sqlite3")
-        || path.ends_with(".db-wal")
-        || path.ends_with(".db-journal")
-        || path.ends_with(".db_temp")
-        || path.ends_with(".sqlite_temp")
-        || path.ends_with(".sqlite3_temp")
+    path.ends_with(".db-wal")
 }
 
 /// All SQLite-related paths — used for chunk-data cache bypass and FOPEN_DIRECT_IO.

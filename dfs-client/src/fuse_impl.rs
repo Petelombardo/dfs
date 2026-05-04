@@ -3067,6 +3067,32 @@ impl Filesystem for DfsFilesystem {
             }
         };
 
+        // O_CREAT without O_EXCL: if the file already exists (concurrent create from another
+        // thread, or a race between lookup and create), behave like open() rather than
+        // creating a second inode. Without this check, two threads racing on the same path
+        // both succeed at creating the file and write independent schemas — corrupting the db.
+        let o_excl = (_flags & libc::O_EXCL) != 0;
+        if !o_excl {
+            let existing_ino = self.path_to_inode.read().unwrap().get(&path).copied();
+            if let Some(ino) = existing_ino {
+                if let Some(meta) = self.metadata_cache.get(&ino) {
+                    let is_write = (_flags & libc::O_ACCMODE) != libc::O_RDONLY;
+                    if is_write {
+                        *self.write_open_counts.entry(ino).or_insert(0) += 1;
+                        self.client.write_open_inodes.insert(ino);
+                    }
+                    *self.open_counts.entry(ino).or_insert(0) += 1;
+                    let attr = DfsFilesystem::metadata_to_attr_static(ino, &meta);
+                    let is_sqlite = is_sqlite_direct_io(&meta.path);
+                    let open_flags = if is_sqlite { fuser::consts::FOPEN_DIRECT_IO } else { 0 };
+                    drop(meta);
+                    info!("create: path={} already exists (ino={}) — opening existing file", path, ino);
+                    reply.created(&Duration::ZERO, &attr, 0, 0, open_flags);
+                    return;
+                }
+            }
+        }
+
         // Create file metadata
         let metadata = FileMetadata {
             id: dfs_common::FileId::new(),

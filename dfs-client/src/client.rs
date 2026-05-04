@@ -1629,12 +1629,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             return Ok(Vec::new());
         }
 
-        // Bypass cache for write-open inodes and SQLite files.
-        // Write-open bypass: the writer (e.g. HDHomeRun seek table update) reads chunk 0
-        // to get current content before patching. A cache hit here returns the pre-patch
-        // content from a prior session, causing the new patch to embed stale seek offsets.
-        let bypass_cache = crate::fuse_impl::is_sqlite_for_cache(file_path)
-            || self.write_open_inodes.contains(&inode);
+        // Bypass cache for SQLite files (always) and for chunks that are currently
+        // dirty in the write buffer (not yet flushed). Bypassing the entire inode
+        // when write-open kills read performance for large files like VM disk images
+        // where QEMU holds the file open O_RDWR but reads and writes are to completely
+        // different regions. Only the unflushed chunks need bypass — flushed chunks
+        // have current chunk IDs and are safe to serve from cache.
+        let bypass_cache = crate::fuse_impl::is_sqlite_for_cache(file_path);
 
         let end = offset + size;
         let needed = InodeReadEngine::chunks_for_range(&chunk_offsets, offset, size);

@@ -3122,6 +3122,8 @@ impl Filesystem for DfsFilesystem {
         let path_to_inode = self.path_to_inode.clone();
         let next_inode = self.next_inode.clone();
         let write_open_counts = self.write_open_counts.clone();
+        let write_buffers = self.write_buffers.clone();
+        let write_buffer_enabled = self.write_buffer_enabled;
 
         self.runtime.spawn(async move {
             match client.put_file_metadata(&metadata_clone).await {
@@ -3150,6 +3152,21 @@ impl Filesystem for DfsFilesystem {
 
                     // create() always opens for writing — count it
                     *write_open_counts.entry(ino).or_insert(0) += 1;
+
+                    // Pre-create the write buffer with sync_on_fsync=true for SQLite files
+                    // so that the first fdatasync after the first write flushes synchronously.
+                    // Without this, the InodeWriteState is created lazily on the first write()
+                    // call, which races with path_to_inode insertion — the path may not be
+                    // visible yet, is_sqlite_buffered returns false, and sync_on_fsync stays
+                    // false, causing fdatasync to run in the background and reads after fsync
+                    // to see stale data (SQLite corruption).
+                    let is_sqlite_buf = is_sqlite_buffered(&path);
+                    if write_buffer_enabled && is_sqlite_buf {
+                        write_buffers
+                            .entry(ino)
+                            .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(true))));
+                        info!("create: ino={} pre-created SQLite write buffer (sync_on_fsync=true)", ino);
+                    }
 
                     let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
                     // Use direct I/O for SQLite database files, but NOT for .db-shm (needs mmap)

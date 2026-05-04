@@ -3210,13 +3210,13 @@ impl Filesystem for DfsFilesystem {
                             let t_bp = std::time::Instant::now();
                             const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
                             loop {
-                                // Use per-inode buffered bytes (try_lock, fall back to cap)
-                                // to match the async slow-path. The global counter tracks all
-                                // inodes combined and would hit the per-inode cap immediately
-                                // on large files, causing false back-pressure on other inodes.
+                                // Use per-inode buffered bytes. If the lock is held by the
+                                // flush task, fall back to global_buffered_bytes (not cap) —
+                                // returning cap would cause 10ms sleeps during every flush,
+                                // turning a 130ms flush into 260ms and halving throughput.
                                 let current = state_arc.try_lock()
                                     .map(|s| s.buffered_bytes())
-                                    .unwrap_or(global_write_buffer_cap);
+                                    .unwrap_or_else(|_| global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed));
                                 let fill_pct = current * 100 / global_write_buffer_cap.max(1);
                                 let delay_ms: u64 = if fill_pct < 25 { 0 }
                                     else if fill_pct < 50 { 1 }

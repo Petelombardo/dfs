@@ -3235,12 +3235,14 @@ impl Filesystem for DfsFilesystem {
         // waiting for a reply that never comes.
         let path_for_sqlite_check = path_to_inode.read().unwrap()
             .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
-        // .db-shm is mmap'd MAP_SHARED — keep it on the unbuffered path.
-        // All other SQLite files (.db, .db-wal, .db-journal, etc.) now go through
-        // the write buffer with sync_on_fsync=true, giving coherent chunk accumulation
-        // and correct PatchChunk behaviour on fdatasync.
-        let is_shm_only = path_for_sqlite_check.as_deref().map(|p| p.ends_with(".db-shm")).unwrap_or(false);
-        if write_buffer_enabled && !is_shm_only {
+        // Route through the write buffer only for non-SQLite files and .db-wal files.
+        // .db, .sqlite, .db-journal: use direct writes (rollback journal ordering requires it).
+        // .db-shm: unbuffered (mmap'd MAP_SHARED).
+        // .db-wal: buffered (append-only frames accumulate correctly).
+        let use_buffer = path_for_sqlite_check.as_deref()
+            .map(|p| !is_sqlite_path(p) || is_sqlite_buffered(p))
+            .unwrap_or(true); // unknown path → assume bufferable (non-SQLite)
+        if write_buffer_enabled && use_buffer {
             if let Some(meta) = metadata_cache.get(&ino) {
                 if meta.file_type == FileType::RegularFile {
                     let offset_usize = offset as usize;
@@ -3399,11 +3401,12 @@ impl Filesystem for DfsFilesystem {
             let is_sqlite = is_sqlite_path(&metadata.path);
             let is_sqlite_buf = is_sqlite_buffered(&metadata.path);
             let cache_inode = if is_sqlite { 0 } else { ino };
-            // .db-shm stays unbuffered (mmap'd MAP_SHARED); all other SQLite files use the
-            // write buffer with sync_on_fsync=true for coherent chunk accumulation.
-            let is_shm = metadata.path.ends_with(".db-shm");
+            // Buffer only non-SQLite files and .db-wal (is_sqlite_buffered).
+            // .db/.db-journal use direct writes for rollback journal ordering correctness.
+            // .db-shm is mmap'd MAP_SHARED — unbuffered.
+            let use_write_buffer = !is_sqlite || is_sqlite_buf;
 
-            if write_buffer_enabled && !is_shm {
+            if write_buffer_enabled && use_write_buffer {
                 let offset_usize = offset as usize;
                 let current_size = {
                     let cache_size = metadata_cache.get(&ino)

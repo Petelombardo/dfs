@@ -201,6 +201,14 @@ impl ChunkStorage {
         Ok(Arc::try_unwrap(self.read_chunk_arc(chunk_id)?).unwrap_or_else(|arc| (*arc).clone()))
     }
 
+    /// Return the chunk from cache only — no disk read. Returns None on cache miss.
+    /// Used by PatchChunk / MultiPatch: if the chunk is warm we RMW; if cold we
+    /// start from zeros and let the patches carry all the real content.
+    pub fn read_chunk_cached_only(&self, chunk_id: &ChunkId) -> Option<Vec<u8>> {
+        let mut cache = self.cache.lock().unwrap();
+        cache.get(chunk_id).map(|arc| (**arc).clone())
+    }
+
     /// Read a byte range from a chunk — returns the cached Arc + clamped range so the
     /// caller can write the slice on the wire without ever cloning the bytes.
     /// Returns (arc, start, end) where start..end is the requested sub-range within the chunk.

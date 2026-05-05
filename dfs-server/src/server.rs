@@ -883,6 +883,9 @@ impl Server {
             Request::PatchChunk { chunk_id, chunk_file_offset, intra_offset, data } => {
                 self.handle_patch_chunk(chunk_id, chunk_file_offset, intra_offset, data).await
             }
+            Request::MultiPatch { chunk_id, chunk_file_offset, patches } => {
+                self.handle_multi_patch(chunk_id, chunk_file_offset, patches).await
+            }
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
             Request::RenameFile { old_path, new_path } => {
                 self.handle_rename_file(old_path, new_path).await
@@ -2928,7 +2931,7 @@ impl Server {
             healing.evict_from_pending(&chunk_id).await;
         }
 
-        // Read existing chunk
+        // Read existing chunk from cache first, then disk on miss.
         let mut chunk_bytes = match self.storage.read_chunk(&chunk_id) {
             Ok(data) => data,
             Err(e) => {
@@ -3017,6 +3020,108 @@ impl Server {
         info!("PatchChunk: {} -> {} ({} bytes patched at intra_offset={})", chunk_id, new_chunk_id, patch_data.len(), intra_offset);
 
         Response::PatchChunkResult { new_chunk_id, size }
+    }
+
+    async fn handle_multi_patch(
+        &self,
+        chunk_id: ChunkId,
+        chunk_file_offset: u64,
+        patches: Vec<(usize, Vec<u8>)>,
+    ) -> Response {
+        use std::fs;
+
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            healing.evict_from_pending(&chunk_id).await;
+        }
+
+        // The chunk_id passed in is the "current" chunk from the client's metadata.
+        // On this replica it may not exist yet (e.g. new file, sparse chunk, or the
+        // chunk hasn't been replicated here yet). In that case, start from an empty
+        // (zero-filled) baseline — the patches carry the only real data, so zeros are
+        // the correct uninitialized bytes for any position not covered by a patch.
+        // Read existing chunk from cache first, then disk on miss.
+        // If not found at all (brand-new chunk), start from zeros — patches carry
+        // the only real content and the client waits for our reply before reading.
+        let needed_if_new = patches.iter()
+            .map(|(off, d)| off + d.len())
+            .max()
+            .unwrap_or(0)
+            .min(4 * 1024 * 1024);
+        let mut chunk_bytes = match self.storage.read_chunk(&chunk_id) {
+            Ok(data) => data,
+            Err(_) => {
+                debug!("MultiPatch: chunk {} not on disk — starting from {} zero bytes", chunk_id, needed_if_new);
+                vec![0u8; needed_if_new]
+            }
+        };
+
+        // Apply all patches in one pass. Extend with zeros only as far as needed
+        // to accommodate any patch that writes beyond the current end.
+        for (intra_offset, patch_data) in &patches {
+            let patch_end = intra_offset + patch_data.len();
+            if patch_end > chunk_bytes.len() {
+                chunk_bytes.resize(patch_end, 0u8);
+            }
+            chunk_bytes[*intra_offset..patch_end].copy_from_slice(patch_data);
+        }
+
+        let new_hash = compute_chunk_hash_at(&chunk_bytes, chunk_file_offset);
+        let new_chunk_id = ChunkId::from_hash(new_hash);
+        let size = chunk_bytes.len();
+
+        let old_path = self.storage.get_chunk_path(&chunk_id);
+        let new_path = self.storage.get_chunk_path(&new_chunk_id);
+
+        if let Some(parent) = new_path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                warn!("MultiPatch: failed to create dir for {}: {}", new_chunk_id, e);
+                return Response::Error {
+                    message: format!("Failed to create chunk directory: {}", e),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        }
+
+        let seq = crate::storage::next_write_seq();
+        let temp_name = format!("{}.{}.mptmp", new_chunk_id, seq);
+        let temp_path = old_path.parent().unwrap_or(old_path.as_path()).join(temp_name);
+
+        let write_result = (|| -> Result<(), anyhow::Error> {
+            use std::io::Write;
+            let mut f = fs::File::create(&temp_path)?;
+            f.write_all(&chunk_bytes)?;
+            f.sync_all()?;
+            fs::rename(&temp_path, &new_path)?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            warn!("MultiPatch: failed to write/rename patched chunk {}: {}", new_chunk_id, e);
+            return Response::Error {
+                message: format!("Failed to write patched chunk: {}", e),
+                code: ErrorCode::InternalError,
+            };
+        }
+
+        if old_path != new_path {
+            if let Err(e) = fs::remove_file(&old_path) {
+                warn!("MultiPatch: failed to remove old chunk file {}: {}", chunk_id, e);
+            }
+        }
+
+        self.storage.invalidate_cache(&chunk_id);
+        if new_chunk_id != chunk_id {
+            self.storage.invalidate_cache(&new_chunk_id);
+        }
+
+        let patch_summary: Vec<(usize, usize)> = patches.iter()
+            .map(|(off, d)| (*off, off + d.len()))
+            .collect();
+        info!("MultiPatch: {} -> {} ({} patches, final size={}): {:?}",
+            chunk_id, new_chunk_id, patches.len(), size, patch_summary);
+
+        Response::MultiPatchResult { new_chunk_id, size }
     }
 
     /// Handle delete file request.

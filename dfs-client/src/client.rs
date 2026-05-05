@@ -4214,6 +4214,21 @@ leader_addr: Arc::new(RwLock::new(None)),
         for (addr, result) in results {
             match result {
                 Ok(Response::PatchChunkResult { new_chunk_id: ncid, size }) => {
+                    // A non-empty patch that returns the same chunk_id means the node read stale
+                    // base data and the patch landed on wrong content. Skip this result so
+                    // the stale node doesn't contaminate the consensus hash.
+                    if ncid == old_chunk_id {
+                        warn!("PatchChunk replica {} returned unchanged chunk_id {} after patch — stale base, skipping this replica", addr, ncid);
+                        continue;
+                    }
+                    if let Some(existing) = new_chunk_id {
+                        if existing != ncid {
+                            warn!("PatchChunk REPLICA DISAGREEMENT: {} returned {} but previous returned {} — stale base chunk on one replica",
+                                addr, ncid, existing);
+                            // Don't overwrite new_chunk_id — keep the first (leader-preferred) value.
+                            continue;
+                        }
+                    }
                     new_chunk_id = Some(ncid);
                     new_size = size;
                     if let Some(&nid) = addr_to_node_id_snap.get(&addr) {
@@ -4291,6 +4306,227 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         info!("PatchChunk: {} -> {} ({} replicas patched)", old_chunk_id, new_chunk_id, patched_node_ids.len());
+        Ok(new_location)
+    }
+
+    /// Apply multiple non-contiguous byte-range patches to a chunk in a single RPC.
+    /// Equivalent to patch_chunk_on_replicas but sends all dirty ranges in one request,
+    /// so the server applies them atomically without serial round-trips or gap zero-fills.
+    pub async fn multi_patch_chunk_on_replicas(
+        &self,
+        old_chunk_id: ChunkId,
+        chunk_file_offset: u64,
+        patches: Vec<(usize, Vec<u8>)>,
+        old_location: &dfs_common::ChunkLocation,
+    ) -> Result<dfs_common::ChunkLocation> {
+        let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
+            let addr_map = self.addr_to_node_id.read().await;
+            addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
+        };
+        let all_cluster_nodes = self.cluster_nodes.read().await.clone();
+
+        let replica_addrs: Vec<SocketAddr> = if old_location.nodes.is_empty() {
+            all_cluster_nodes.clone()
+        } else {
+            old_location.nodes.iter()
+                .filter_map(|nid| node_id_to_addr.get(nid).copied())
+                .collect()
+        };
+
+        if replica_addrs.is_empty() {
+            anyhow::bail!("MultiPatch: no replica addresses resolved for chunk {}", old_chunk_id);
+        }
+
+        let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
+
+        let patch_req = Request::MultiPatch {
+            chunk_id: old_chunk_id,
+            chunk_file_offset,
+            patches,
+        };
+
+        let futures: Vec<_> = replica_addrs.iter().map(|&addr| {
+            let client = self.clone();
+            let req = patch_req.clone();
+            async move { (addr, client.send_request(addr, req).await) }
+        }).collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        let leader_addr = *self.leader_addr.read().await;
+
+        // Collect per-replica results before any disagreement logic.
+        // (addr, Ok(ncid, size)) for success, (addr, Err) for failure.
+        let mut replica_results: Vec<(SocketAddr, Result<(ChunkId, usize)>)> = Vec::new();
+        for (addr, result) in results {
+            match result {
+                Ok(Response::MultiPatchResult { new_chunk_id: ncid, size }) => {
+                    // If a replica returns the same chunk_id as the old one after a non-empty
+                    // patch, it applied the patch to stale (already-matching) data. Treat it
+                    // as a stale-base error so we re-push the correct chunk to this node.
+                    if ncid == old_chunk_id {
+                        warn!("MultiPatch replica {} returned unchanged chunk_id {} after non-empty patch — stale base detected, will re-push", addr, ncid);
+                        replica_results.push((addr, Err(anyhow::anyhow!("unchanged chunk_id after patch (stale base)"))));
+                    } else {
+                        replica_results.push((addr, Ok((ncid, size))));
+                    }
+                }
+                Ok(Response::Error { message, .. }) => {
+                    warn!("MultiPatch replica {} error: {}", addr, message);
+                    replica_results.push((addr, Err(anyhow::anyhow!("{}", message))));
+                }
+                Err(e) => {
+                    warn!("MultiPatch replica {} failed: {}", addr, e);
+                    replica_results.push((addr, Err(e)));
+                }
+                _ => {
+                    replica_results.push((addr, Err(anyhow::anyhow!("unexpected response"))));
+                }
+            }
+        }
+
+        // Determine authoritative new_chunk_id: prefer the leader's result.
+        // If the leader wasn't in replica_addrs or failed, fall back to any agreeing majority.
+        let leader_result = leader_addr.and_then(|la| {
+            replica_results.iter().find(|(a, _)| *a == la)
+                .and_then(|(_, r)| r.as_ref().ok().copied())
+        });
+
+        let authoritative: Option<(ChunkId, usize)> = if let Some(lr) = leader_result {
+            Some(lr)
+        } else {
+            // No leader result — use the first successful result (they should all agree).
+            replica_results.iter().find_map(|(_, r)| r.as_ref().ok().copied())
+        };
+
+        let (authoritative_chunk_id, authoritative_size) = match authoritative {
+            Some(x) => x,
+            None => anyhow::bail!("MultiPatch: all replicas failed for chunk {}", old_chunk_id),
+        };
+
+        // For any replica that disagreed (stale base chunk), recover it by fetching the
+        // correct chunk from the leader and re-writing it to the stale node directly.
+        // This avoids a multi-round-trip retry and immediately brings stale nodes current.
+        let new_size: usize = authoritative_size;
+        let mut patched_node_ids: Vec<dfs_common::NodeId> = Vec::new();
+        let mut stale_addrs: Vec<SocketAddr> = Vec::new();
+
+        for (addr, result) in &replica_results {
+            match result {
+                Ok((ncid, _)) if *ncid == authoritative_chunk_id => {
+                    if let Some(&nid) = addr_to_node_id_snap.get(addr) {
+                        patched_node_ids.push(nid);
+                    }
+                }
+                Ok((ncid, _)) => {
+                    warn!("MultiPatch REPLICA DISAGREEMENT: {} returned {} but leader/majority returned {} — stale base chunk; will re-push correct data",
+                        addr, ncid, authoritative_chunk_id);
+                    stale_addrs.push(*addr);
+                }
+                Err(_) => {} // already logged above
+            }
+        }
+
+        // Re-push the correct chunk to any stale replicas.
+        if !stale_addrs.is_empty() {
+            // Fetch the correct chunk bytes from the leader (or any good replica).
+            let leader_or_good: SocketAddr = leader_addr
+                .filter(|&la| replica_results.iter().any(|(a, r)| *a == la && r.as_ref().ok().map(|(id,_)| *id) == Some(authoritative_chunk_id)))
+                .unwrap_or_else(|| {
+                    replica_results.iter()
+                        .find(|(_, r)| r.as_ref().ok().map(|(id,_)| *id) == Some(authoritative_chunk_id))
+                        .map(|(a, _)| *a)
+                        .unwrap_or_else(|| all_cluster_nodes[0])
+                });
+
+            match self.read_chunk_from_server(leader_or_good, authoritative_chunk_id).await {
+                Ok(correct_data) => {
+                    for &stale_addr in &stale_addrs {
+                        let data_clone = correct_data.clone();
+                        let file_offset = old_location.file_offset.unwrap_or(0);
+                        match Self::write_chunk_to_server_local_only(stale_addr, data_clone, file_offset).await {
+                            Ok((written_ids, _)) => {
+                                if written_ids.first().copied() == Some(authoritative_chunk_id) {
+                                    info!("MultiPatch: re-pushed correct chunk {} to stale replica {}", authoritative_chunk_id, stale_addr);
+                                    // Delete the wrong chunk the stale node wrote from its bad base.
+                                    let client = self.clone();
+                                    let old_id = old_chunk_id;
+                                    let stale = stale_addr;
+                                    tokio::spawn(async move {
+                                        let _ = client.send_request(stale, Request::DeleteChunk { chunk_id: old_id }).await;
+                                    });
+                                    if let Some(&nid) = addr_to_node_id_snap.get(&stale_addr) {
+                                        patched_node_ids.push(nid);
+                                    }
+                                } else {
+                                    warn!("MultiPatch: re-push to stale {} produced unexpected chunk_id {:?}, skipping", stale_addr, written_ids.first());
+                                }
+                            }
+                            Err(e) => {
+                                warn!("MultiPatch: failed to re-push correct chunk to stale {}: {}", stale_addr, e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("MultiPatch: could not fetch correct chunk from {}: {}; stale replicas {} will self-heal", leader_or_good, e, stale_addrs.len());
+                }
+            }
+        }
+
+        let new_chunk_id = authoritative_chunk_id;
+
+        let new_location = dfs_common::ChunkLocation {
+            chunk_id: new_chunk_id,
+            nodes: patched_node_ids.clone(),
+            size: new_size,
+            checksum: new_chunk_id.hash,
+            file_offset: old_location.file_offset,
+            written_at: None,
+        };
+
+        let leader_addr = *self.leader_addr.read().await;
+        if let Some(leader) = leader_addr {
+            let req = Request::ReplicateChunkLocation { location: new_location.clone() };
+            let mut backoff_ms = 250u64;
+            for attempt in 1u32..=4 {
+                match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    self.send_request(leader, req.clone()),
+                ).await {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(e)) => warn!("MultiPatch: ChunkLocation to leader {} failed (attempt {}): {}", leader, attempt, e),
+                    Err(_)    => warn!("MultiPatch: ChunkLocation to leader {} timed out (attempt {})", leader, attempt),
+                }
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(4_000);
+            }
+        }
+        for &addr in &all_cluster_nodes {
+            if Some(addr) == leader_addr { continue; }
+            let client = self.clone();
+            let req = Request::ReplicateChunkLocation { location: new_location.clone() };
+            tokio::spawn(async move {
+                if let Err(e) = client.send_request(addr, req).await {
+                    debug!("MultiPatch: location to follower {} failed (leader will catch up): {}", addr, e);
+                }
+            });
+        }
+
+        let replica_addr_set: std::collections::HashSet<SocketAddr> = replica_addrs.into_iter().collect();
+        for addr in all_cluster_nodes.iter().filter(|a| !replica_addr_set.contains(a)) {
+            let client = self.clone();
+            let req = Request::DeleteChunk { chunk_id: old_chunk_id };
+            let addr = *addr;
+            tokio::spawn(async move {
+                if let Err(e) = client.send_request(addr, req).await {
+                    debug!("MultiPatch: delete old chunk on {} failed: {}", addr, e);
+                }
+            });
+        }
+
+        let n_patches = if let Request::MultiPatch { ref patches, .. } = patch_req { patches.len() } else { 0 };
+        info!("MultiPatch: {} -> {} ({} replicas, {} patches)", old_chunk_id, new_chunk_id, patched_node_ids.len(), n_patches);
         Ok(new_location)
     }
 

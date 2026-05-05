@@ -37,12 +37,20 @@ pub fn is_sqlite_for_cache(path: &str) -> bool {
 /// - Rollback journal mode requires strict per-fdatasync durability. The journal
 ///   must be fully durable before any db page is written. Buffering merges writes
 ///   across fdatasync boundaries, corrupting the rollback ordering.
-/// - WAL-mode .db files are only written during checkpoints (clean, infrequent),
-///   where per-write ordering also matters for page consistency.
+/// All SQLite database files use the write buffer with sync_on_fsync=true so that:
+/// 1. Sequential page writes are serialized (no concurrent-task metadata race).
+/// 2. fdatasync flushes synchronously, preserving rollback-journal atomicity.
 ///
 /// .db-shm is excluded separately — it is mmap'd MAP_SHARED.
 fn is_sqlite_buffered(path: &str) -> bool {
-    path.ends_with(".db-wal")
+    path.ends_with(".db")
+        || path.ends_with(".sqlite")
+        || path.ends_with(".sqlite3")
+        || path.ends_with(".db-wal")
+        || path.ends_with(".db-journal")
+        || path.ends_with(".db_temp")
+        || path.ends_with(".sqlite_temp")
+        || path.ends_with(".sqlite3_temp")
 }
 
 /// All SQLite-related paths — used for chunk-data cache bypass and FOPEN_DIRECT_IO.
@@ -103,6 +111,13 @@ struct ChunkSlot {
     /// the server. Used to bound PatchChunk so we don't send gap-fill zeros as real data
     /// when the slot is padded to CHUNK_SIZE but only a small region was actually written.
     real_data_end: usize,
+    /// Exact byte ranges written by the application in this session, as (start, end) pairs.
+    /// Maintained as a sorted, merged list. Used by the overwrite PatchChunk path to issue
+    /// one patch per contiguous dirty range, skipping gap-fill zeros between them.
+    /// Without this, a non-contiguous SQLite write (e.g. pages 1, 4, 5 but not 2-3) would
+    /// patch a single range [0..real_data_end] that includes synthetic zeros at positions
+    /// 2-3, silently overwriting correct server data with zeros.
+    dirty_ranges: Vec<(usize, usize)>,
     /// Set to true by flush_one_chunk when it claims this slot for network I/O.
     /// Prevents a second concurrent flush task from picking the same slot.
     /// Cleared on failure (so it can be retried); on success the slot is removed.
@@ -116,8 +131,28 @@ impl ChunkSlot {
             last_modified: SystemTime::now(),
             gap_filled_prefix: 0,
             real_data_end: 0,
+            dirty_ranges: Vec::new(),
             flushing: false,
         }
+    }
+
+    /// Record a write at [start, end) into dirty_ranges, merging with adjacent ranges.
+    fn mark_dirty(&mut self, start: usize, end: usize) {
+        if start >= end { return; }
+        let mut new_start = start;
+        let mut new_end = end;
+        // Merge with any existing ranges that overlap or are adjacent.
+        self.dirty_ranges.retain(|&(s, e)| {
+            if e < new_start || s > new_end {
+                true // no overlap, keep separate
+            } else {
+                new_start = new_start.min(s);
+                new_end = new_end.max(e);
+                false // absorbed into the new range
+            }
+        });
+        self.dirty_ranges.push((new_start, new_end));
+        self.dirty_ranges.sort_unstable();
     }
 
     fn is_full(&self) -> bool {
@@ -150,6 +185,10 @@ struct InodeWriteState {
     /// True when the file was opened with O_TRUNC (full replacement). PatchChunk must not
     /// be used in this session — the caller is writing a new file, not patching an old one.
     is_truncated_session: bool,
+    /// File ID set at create() or open() time. flush_buffer_async_one uses this to verify
+    /// that metadata_cache still refers to the same file — if it changed (delete+recreate
+    /// with inode reuse), existing_chunk_size from the old file must be ignored.
+    expected_file_id: Option<dfs_common::FileId>,
 }
 
 impl InodeWriteState {
@@ -160,6 +199,7 @@ impl InodeWriteState {
             chunk_ids_at_open: HashMap::new(),
             sync_on_fsync,
             is_truncated_session: false,
+            expected_file_id: None,
         }
     }
 
@@ -232,6 +272,9 @@ impl InodeWriteState {
             if write_end > slot.real_data_end {
                 slot.real_data_end = write_end;
             }
+            // Record the exact dirty range so the overwrite PatchChunk path can issue
+            // one patch per contiguous written region, skipping gaps of synthetic zeros.
+            slot.mark_dirty(intra, write_end);
             slot.last_modified = SystemTime::now();
             // A real write() supersedes the open-time snapshot for this chunk.
             // The stale-write guard uses chunk_ids_at_open to detect sessions that
@@ -858,7 +901,7 @@ impl FlushHandle {
         // Pick the lowest-index unclaimed full slot, falling back to the lowest idle slot.
         // Atomically set flushing=true while holding the mutex so no second concurrent
         // task can claim the same slot.
-        let (chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end) = {
+        let (chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges) = {
             let Some(state_arc) = self.write_buffers.get(&ino) else { return Ok(()); };
             let mut state = state_arc.lock().await;
 
@@ -893,8 +936,9 @@ impl FlushHandle {
             let data = slot.data.clone();
             let gap_filled_prefix = slot.gap_filled_prefix;
             let real_data_end = slot.real_data_end;
+            let dirty_ranges = slot.dirty_ranges.clone();
             let offset = idx * CHUNK_SIZE as u64;
-            (idx, data, offset, gap_filled_prefix, real_data_end)
+            (idx, data, offset, gap_filled_prefix, real_data_end, dirty_ranges)
             // mutex released here
         };
 
@@ -925,37 +969,61 @@ impl FlushHandle {
                     let data = slot.data.clone();
                     let gap_filled_prefix = slot.gap_filled_prefix;
                     let real_data_end = slot.real_data_end;
+                    let dirty_ranges = slot.dirty_ranges.clone();
                     let file_offset = chunk_idx * CHUNK_SIZE as u64;
                     drop(state);
-                    return self.flush_buffer_async_one(ino, chunk_idx, data, file_offset, gap_filled_prefix, real_data_end).await;
+                    return self.flush_buffer_async_one(ino, chunk_idx, data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges).await;
                 }
                 info!("flush_one_chunk: ino={} chunk={} slot gone after wait — already flushed elsewhere", ino, chunk_idx);
             }
         } // write_tasks_in_flight guard
         } // gap_filled_prefix guard
 
-        self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end).await
+        self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges).await
     }
 
     /// Internal: flush exactly the chunk at `chunk_idx` for `ino`.
-    /// Slot data, file offset, gap_filled_prefix, and real_data_end are all pre-snapshotted
-    /// by flush_one_chunk while holding the mutex. Reading these from the live slot after
-    /// release is wrong — the slot may have been removed and recreated by a concurrent writer.
-    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, slot_data: Vec<u8>, file_offset: u64, gap_filled_prefix: usize, real_data_end: usize) -> Result<()> {
+    /// Slot data, file offset, gap_filled_prefix, real_data_end, and dirty_ranges are all
+    /// pre-snapshotted by flush_one_chunk while holding the mutex. Reading these from the
+    /// live slot after release is wrong — the slot may have been removed and recreated.
+    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, slot_data: Vec<u8>, file_offset: u64, gap_filled_prefix: usize, real_data_end: usize, dirty_ranges: Vec<(usize, usize)>) -> Result<()> {
+
+        // Snapshot the file ID now. After the network write we'll verify it hasn't changed —
+        // a delete+create can replace the file while the flush is in flight, and the new
+        // file's metadata_cache must not be contaminated with old chunk locations.
+        let file_id_at_flush_start = self.metadata_cache.get(&ino).map(|m| m.id);
+        let buf_expected_id = self.write_buffers.get(&ino)
+            .and_then(|s| s.try_lock().ok().and_then(|st| st.expected_file_id));
 
         // Check whether this slot needs PatchChunk or a fresh write.
         let existing_chunk_size = {
+            // Check if the buffer has a file_id expectation. If metadata_cache now refers
+            // to a different file (inode reuse after delete+create), any chunk size from
+            // metadata is stale and must be ignored to prevent PatchChunk on the wrong chunk.
+            let expected_id = self.write_buffers.get(&ino)
+                .and_then(|s| s.try_lock().ok().and_then(|st| st.expected_file_id));
+            let meta_id_matches = expected_id.map(|eid|
+                self.metadata_cache.get(&ino).map(|m| m.id == eid).unwrap_or(false)
+            ).unwrap_or(true); // no expectation = trust metadata
+
             let from_flushed = self.write_buffers.get(&ino)
                 .and_then(|s| s.try_lock().ok()
                     .and_then(|st| st.flushed_sizes.get(&chunk_idx).copied()));
-            from_flushed.unwrap_or_else(|| {
+            if let Some(flushed) = from_flushed {
+                flushed // flushed_sizes is always authoritative (same session)
+            } else if meta_id_matches {
                 self.metadata_cache.get(&ino)
                     .and_then(|m| m.chunk_location_for_idx(chunk_idx).map(|l| l.size))
                     .unwrap_or(0)
-            })
+            } else {
+                debug!("flush_buffer_async_one: ino={} chunk={} metadata file_id mismatch (expected={:?}) — treating as new file", ino, chunk_idx, expected_id);
+                0
+            }
         };
-        let chunk_exists = existing_chunk_size > 0;
         let slot_len = slot_data.len();
+        debug!("flush_buffer_async_one: ino={} chunk={} existing_chunk_size={} slot_len={} meta_file_id={:?} buf_expected_id={:?}",
+            ino, chunk_idx, existing_chunk_size, slot_len, file_id_at_flush_start, buf_expected_id);
+        let chunk_exists = existing_chunk_size > 0;
         let is_append_extend = chunk_exists
             && slot_len > existing_chunk_size
             && gap_filled_prefix >= existing_chunk_size;
@@ -970,15 +1038,35 @@ impl FlushHandle {
         let is_overwrite = chunk_exists
             && effective_write_end <= existing_chunk_size
             && !is_truncated_session;
-        let needs_patch = is_overwrite || is_append_extend;
+        // Mixed-extend: slot extends beyond the server chunk but gap_filled_prefix < existing_chunk_size.
+        // This means the app wrote some new pages BEYOND the old end while also rewriting some earlier
+        // pages. We can't do a fresh write (zeros in gaps would corrupt server pages 2-N), and
+        // is_append_extend is false because gap_filled_prefix < existing_chunk_size. Treat as MultiPatch
+        // using dirty_ranges — the server already has correct data for the gap bytes.
+        let is_mixed_extend = chunk_exists
+            && slot_len > existing_chunk_size
+            && gap_filled_prefix < existing_chunk_size
+            && !dirty_ranges.is_empty()
+            && !is_truncated_session;
+        let needs_patch = is_overwrite || is_append_extend || is_mixed_extend;
 
         if needs_patch {
-            let (patch_intra, patch_bytes) = if is_append_extend {
-                (existing_chunk_size, slot_data[existing_chunk_size..].to_vec())
+            // Build the patch list:
+            // Always use dirty_ranges when available — send only what the app actually
+            // wrote, nothing more. For append_extend, dirty_ranges already contains only
+            // the new bytes (all >= existing_chunk_size or crossing the boundary). The
+            // legacy single-tail patch sent slot_data[existing_size..] which included
+            // zero-filled gaps between the old end and the first real write, corrupting
+            // server pages that were never touched by the application.
+            let patches: Vec<(usize, Vec<u8>)> = if !dirty_ranges.is_empty() {
+                dirty_ranges.iter()
+                    .map(|&(s, e)| (s, slot_data[s..e.min(slot_data.len())].to_vec()))
+                    .collect()
             } else {
+                // Fallback: use the legacy single-range approach.
                 let real_start = gap_filled_prefix;
                 let real_end = effective_write_end;
-                (real_start, slot_data[real_start..real_end].to_vec())
+                vec![(real_start, slot_data[real_start..real_end].to_vec())]
             };
             let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
             if let Some(meta) = meta {
@@ -990,8 +1078,9 @@ impl FlushHandle {
                     let id_at_open = self.write_buffers.get(&ino)
                         .and_then(|s| s.try_lock().ok()
                             .and_then(|st| st.chunk_ids_at_open.get(&chunk_idx).copied()));
-                    info!("flush_buffer_async_one: ino={} chunk={} id_at_open={:?} current_id={}",
-                        ino, chunk_idx, id_at_open, old_location.chunk_id);
+                    info!("flush_buffer_async_one: ino={} chunk={} id_at_open={:?} current_id={} patches={} ranges={:?}",
+                        ino, chunk_idx, id_at_open, old_location.chunk_id, patches.len(),
+                        patches.iter().map(|(s, b)| (*s, s + b.len())).collect::<Vec<_>>());
                     if let Some(open_id) = id_at_open {
                         if open_id != old_location.chunk_id {
                             info!("flush_buffer_async_one: ino={} chunk={} chunk_id changed since open ({} -> {}) — discarding stale write",
@@ -1004,60 +1093,18 @@ impl FlushHandle {
                             return Ok(());
                         }
                     }
-                    let patch_result = self.client.patch_chunk_on_replicas(
+                    // Send all dirty ranges in a single MultiPatch RPC — one round trip,
+                    // atomic server-side read-modify-write, no serial dependency chain.
+                    let patch_result = self.client.multi_patch_chunk_on_replicas(
                         old_location.chunk_id,
                         file_offset,
-                        patch_intra,
-                        patch_bytes,
+                        patches,
                         &old_location,
                     ).await;
-                    match patch_result {
-                        Ok(new_location) => {
-                            if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
-                                if let Some(loc) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
-                                    *loc = new_location.clone();
-                                }
-                                if let Some(new_size) = meta_entry.chunk_locations.iter()
-                                    .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
-                                    .reduce(u64::max)
-                                {
-                                    meta_entry.size = meta_entry.size.max(new_size);
-                                }
-                            }
-                            // Commit metadata to leader FIRST, then update read engine, THEN remove slot.
-                            // This ordering prevents race where reads fall through to network with stale chunk_map.
-                            let (flushed_len, meta_to_persist) = {
-                                if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                    let state = state_arc.lock().await;
-                                    let len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
-                                    (len, self.metadata_cache.get(&ino).map(|m| m.clone()))
-                                } else {
-                                    (0, None)
-                                }
-                            };
-                            if let Some(meta) = meta_to_persist {
-                                self.client.flush_metadata_sync(&meta).await;
-                                self.last_metadata_update.insert(ino, std::time::Instant::now());
-                                self.client.feed_chunk_locations_to_read_engine(
-                                    ino, &meta.chunk_locations, meta.size,
-                                ).await;
-                            }
-                            // Now that read engine is updated, safe to remove slot.
-                            if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                let mut state = state_arc.lock().await;
-                                if flushed_len > 0 {
-                                    state.flushed_sizes.insert(chunk_idx, flushed_len);
-                                    self.global_buffered_bytes.fetch_sub(
-                                        flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                }
-                                state.slots.remove(&chunk_idx);
-                            }
-                            return Ok(());
-                        }
+                    let new_location = match patch_result {
+                        Ok(loc) => loc,
                         Err(e) => {
-                            warn!("flush_one_chunk: PatchChunk failed for slot {} — {}", chunk_idx, e);
+                            warn!("flush_buffer_async_one: MultiPatch failed for ino={} chunk={}: {}", ino, chunk_idx, e);
                             if let Some(state_arc) = self.write_buffers.get(&ino) {
                                 if let Ok(mut state) = state_arc.try_lock() {
                                     if let Some(slot) = state.slots.get_mut(&chunk_idx) {
@@ -1067,13 +1114,81 @@ impl FlushHandle {
                             }
                             return Err(e);
                         }
+                    };
+                    if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                        if file_id_at_flush_start.map(|id| id != meta_entry.id).unwrap_or(false) {
+                            info!("flush_buffer_async_one: ino={} chunk={} file replaced during patch flush — discarding metadata update", ino, chunk_idx);
+                            if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                if let Ok(mut state) = state_arc.try_lock() {
+                                    state.slots.remove(&chunk_idx);
+                                }
+                            }
+                            return Ok(());
+                        }
+                        if let Some(loc) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
+                            *loc = new_location.clone();
+                        }
+                        if let Some(new_size) = meta_entry.chunk_locations.iter()
+                            .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
+                            .reduce(u64::max)
+                        {
+                            meta_entry.size = meta_entry.size.max(new_size);
+                        }
                     }
+                    // Commit metadata to leader FIRST, then update read engine, THEN remove slot.
+                    // This ordering prevents race where reads fall through to network with stale chunk_map.
+                    let (flushed_len, meta_to_persist) = {
+                        if let Some(state_arc) = self.write_buffers.get(&ino) {
+                            let state = state_arc.lock().await;
+                            let len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                            (len, self.metadata_cache.get(&ino).map(|m| m.clone()))
+                        } else {
+                            (0, None)
+                        }
+                    };
+                    if let Some(meta) = meta_to_persist {
+                        self.client.flush_metadata_sync(&meta).await;
+                        self.last_metadata_update.insert(ino, std::time::Instant::now());
+                        self.client.feed_chunk_locations_to_read_engine(
+                            ino, &meta.chunk_locations, meta.size,
+                        ).await;
+                    }
+                    // Now that read engine is updated, safe to remove slot.
+                    // Guard: don't update a buffer that was replaced by a new create().
+                    if let Some(state_arc) = self.write_buffers.get(&ino) {
+                        let mut state = state_arc.lock().await;
+                        let buf_id = state.expected_file_id;
+                        let id_ok = match (file_id_at_flush_start, buf_id) {
+                            (Some(fid), Some(bid)) => fid == bid,
+                            _ => true,
+                        };
+                        if id_ok {
+                            if flushed_len > 0 {
+                                state.flushed_sizes.insert(chunk_idx, flushed_len);
+                                self.global_buffered_bytes.fetch_sub(
+                                    flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            state.slots.remove(&chunk_idx);
+                        }
+                    }
+                    return Ok(());
                 }
             }
             // No metadata or location — fall through to normal write
         }
 
         // Write path: send data to server, update metadata & read engine, THEN remove slot.
+        // Log when a fresh write has non-contiguous dirty ranges — the zeros between ranges
+        // will be written to the server, which may corrupt data if the chunk already exists.
+        if chunk_exists && !dirty_ranges.is_empty() {
+            let covered: usize = dirty_ranges.iter().map(|&(s, e)| e - s).sum();
+            if covered < slot_len {
+                warn!("flush_buffer_async_one: ino={} chunk={} FRESH WRITE with gaps: slot_len={} covered={} dirty={:?} existing={} — zeros will overwrite server data",
+                    ino, chunk_idx, slot_len, covered, dirty_ranges, existing_chunk_size);
+            }
+        }
         let result = self.client.write_data_with_cache(&slot_data, ino, file_offset).await;
         match result {
             Ok((_, _, Some(locations))) => {
@@ -1098,6 +1213,18 @@ impl FlushHandle {
                 }
 
                 if let Some(mut meta) = self.metadata_cache.get_mut(&ino) {
+                    // If the file was deleted and recreated while the flush was in flight,
+                    // the metadata_cache entry now belongs to the new file. Don't contaminate
+                    // it with the old file's chunk locations.
+                    if file_id_at_flush_start.map(|id| id != meta.id).unwrap_or(false) {
+                        info!("flush_buffer_async_one: ino={} chunk={} file replaced during flush (old_id={:?} new_id={}) — discarding", ino, chunk_idx, file_id_at_flush_start, meta.id);
+                        if let Some(state_arc) = self.write_buffers.get(&ino) {
+                            if let Ok(mut state) = state_arc.try_lock() {
+                                state.slots.remove(&chunk_idx);
+                            }
+                        }
+                        return Ok(());
+                    }
                     if self.truncated_inodes.contains(&ino) {
                         return Ok(());
                     }
@@ -1175,26 +1302,35 @@ impl FlushHandle {
                 // Now that read engine is updated, safe to remove slot — unless new data
                 // arrived while the flush was in flight (concurrent writer added bytes).
                 // In that case, keep the slot so the next flush cycle sends the new data.
+                // Guard: if the buffer was replaced by a new create() while this flush was
+                // in flight, don't write flushed_sizes into the new session's buffer.
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     let mut state = state_arc.lock().await;
-                    let current_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
-                    if current_len <= flushed_len {
-                        state.slots.remove(&chunk_idx);
-                        self.global_buffered_bytes.fetch_sub(
-                            flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                    let buf_id = state.expected_file_id;
+                    let id_ok = match (file_id_at_flush_start, buf_id) {
+                        (Some(fid), Some(bid)) => fid == bid,
+                        _ => true,
+                    };
+                    if !id_ok {
+                        debug!("flush_buffer_async_one: ino={} chunk={} buffer replaced during flush (flush_id={:?} buf_id={:?}) — skipping slot update", ino, chunk_idx, file_id_at_flush_start, buf_id);
                     } else {
-                        // New data arrived during flush — clear flushing flag and record the
-                        // committed size so the next flush knows what's already on the server.
-                        state.flushed_sizes.insert(chunk_idx, flushed_len);
-                        if let Some(slot) = state.slots.get_mut(&chunk_idx) {
-                            slot.flushing = false;
+                        let current_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                        if current_len <= flushed_len {
+                            state.slots.remove(&chunk_idx);
+                            self.global_buffered_bytes.fetch_sub(
+                                flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        } else {
+                            state.flushed_sizes.insert(chunk_idx, flushed_len);
+                            if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                slot.flushing = false;
+                            }
+                            self.global_buffered_bytes.fetch_sub(
+                                flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
-                        self.global_buffered_bytes.fetch_sub(
-                            flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
                     }
                 }
                 Ok(())
@@ -1408,6 +1544,10 @@ pub struct DfsFilesystem {
     /// lookup() returns ENOENT for these paths so that a concurrent create/open
     /// does not race with the still-pending server-side delete.
     pending_deletes: Arc<dashmap::DashSet<String>>,
+
+    /// Paths for which a create() is currently in flight. lookup() must not overwrite
+    /// metadata_cache for these paths — the create()'s fresh metadata is authoritative.
+    pending_creates: Arc<dashmap::DashSet<String>>,
 
     /// Inodes for which a background getattr refresh is already in flight.
     /// Prevents unbounded spawning of concurrent refresh tasks (one per inode max).
@@ -1740,6 +1880,7 @@ impl DfsFilesystem {
             read_runtime,
             flush_handle,
             pending_deletes: Arc::new(dashmap::DashSet::new()),
+            pending_creates: Arc::new(dashmap::DashSet::new()),
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
             direct_write_inodes: Arc::new(dashmap::DashSet::new()),
             release_in_flight: Arc::new(DashMap::new()),
@@ -2183,6 +2324,8 @@ impl Filesystem for DfsFilesystem {
         let path_to_inode = self.path_to_inode.clone();
         let next_inode = self.next_inode.clone();
         let last_metadata_update = self.last_metadata_update.clone();
+        let write_open_counts = self.write_open_counts.clone();
+        let pending_creates = self.pending_creates.clone();
 
         self.runtime.spawn(async move {
             let result = client.get_file_metadata_conditional(&path, cached_modified_at).await;
@@ -2205,8 +2348,16 @@ impl Filesystem for DfsFilesystem {
                         }
                     };
                     client.seed_write_seq(metadata.id, metadata.write_seq);
-                    metadata_cache.insert(ino, metadata.clone());
-                    last_metadata_update.insert(ino, std::time::Instant::now());
+                    // Don't overwrite metadata for an inode currently open for writing,
+                    // or a path whose create() is still in flight. In both cases our local
+                    // metadata is authoritative and the server may have stale chunk data.
+                    let is_open_for_write = write_open_counts.get(&ino)
+                        .map(|c| *c > 0).unwrap_or(false);
+                    let create_in_flight = pending_creates.contains(&path);
+                    if !is_open_for_write && !create_in_flight {
+                        metadata_cache.insert(ino, metadata.clone());
+                        last_metadata_update.insert(ino, std::time::Instant::now());
+                    }
 
                     let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
                     reply.entry(&Duration::ZERO, &attr, 0);
@@ -2244,8 +2395,13 @@ impl Filesystem for DfsFilesystem {
                                 }
                             };
                             client.seed_write_seq(metadata.id, metadata.write_seq);
-                            metadata_cache.insert(ino, metadata.clone());
-                            last_metadata_update.insert(ino, std::time::Instant::now());
+                            let is_open_for_write = write_open_counts.get(&ino)
+                                .map(|c| *c > 0).unwrap_or(false);
+                            let create_in_flight = pending_creates.contains(&path);
+                            if !is_open_for_write && !create_in_flight {
+                                metadata_cache.insert(ino, metadata.clone());
+                                last_metadata_update.insert(ino, std::time::Instant::now());
+                            }
                             let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
                             reply.entry(&Duration::ZERO, &attr, 0);
                         }
@@ -2342,6 +2498,7 @@ impl Filesystem for DfsFilesystem {
                 .unwrap_or(false);
             if needs_direct {
                 self.direct_write_inodes.insert(ino);
+                debug!("open: ino={} inserted into direct_write_inodes", ino);
             }
             if self.write_buffer_enabled {
                 // If this is the first writer (count was 0 before incrementing above),
@@ -3160,6 +3317,13 @@ impl Filesystem for DfsFilesystem {
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
         let direct_write_inodes = self.direct_write_inodes.clone();
+        let last_metadata_update = self.last_metadata_update.clone();
+        let pending_creates = self.pending_creates.clone();
+
+        // Block lookups from overwriting metadata_cache for this path until the create
+        // async task inserts the fresh metadata. Set on the FUSE dispatch thread (before
+        // spawn) so it's visible to any lookup task that fires while we're in flight.
+        pending_creates.insert(path.clone());
 
         self.runtime.spawn(async move {
             match client.put_file_metadata(&metadata_clone).await {
@@ -3178,8 +3342,15 @@ impl Filesystem for DfsFilesystem {
                         }
                     };
 
-                    // Cache metadata
+                    // Mark as open-for-write BEFORE inserting metadata so the lookup
+                    // guard (which checks write_open_counts) is already set when we
+                    // insert fresh metadata — preventing any concurrent lookup from
+                    // overwriting it with stale server data.
+                    *write_open_counts.entry(ino).or_insert(0) += 1;
+
+                    // Cache metadata and stamp it as fresh.
                     metadata_cache.insert(ino, metadata.clone());
+                    last_metadata_update.insert(ino, std::time::Instant::now());
 
                     // Clear any stale read engine for this inode. Inode numbers are reused
                     // within a mount session, so a previously-deleted file's chunk map may
@@ -3197,13 +3368,14 @@ impl Filesystem for DfsFilesystem {
                     let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
                     dir_cache.remove(parent_path);
 
-                    // create() always opens for writing — count it
-                    *write_open_counts.entry(ino).or_insert(0) += 1;
+                    // Fresh metadata is now in cache — lift the lookup guard.
+                    pending_creates.remove(&path);
 
                     // Mark inodes that must bypass the write buffer (set before reply.created()
                     // so the routing decision is available on the first write()).
                     if is_sqlite_path(&path) && !is_sqlite_buffered(&path) {
                         direct_write_inodes.insert(ino);
+                        debug!("create: ino={} inserted into direct_write_inodes for path={}", ino, path);
                     }
 
                     // Pre-create the write buffer with sync_on_fsync=true for SQLite files
@@ -3215,10 +3387,13 @@ impl Filesystem for DfsFilesystem {
                     // to see stale data (SQLite corruption).
                     let is_sqlite_buf = is_sqlite_buffered(&path);
                     if write_buffer_enabled && is_sqlite_buf {
-                        write_buffers
-                            .entry(ino)
-                            .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(true))));
-                        info!("create: ino={} pre-created SQLite write buffer (sync_on_fsync=true)", ino);
+                        // Always replace — create() means a new file, so any existing buffer
+                        // for this inode (from a deleted predecessor) has stale flushed_sizes
+                        // that would cause flush_buffer_async_one to PatchChunk the wrong chunk.
+                        let mut state = InodeWriteState::new(true);
+                        state.expected_file_id = Some(metadata.id);
+                        write_buffers.insert(ino, Arc::new(Mutex::new(state)));
+                        info!("create: ino={} pre-created SQLite write buffer (sync_on_fsync=true, file_id={})", ino, metadata.id);
                     }
 
                     let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
@@ -3231,6 +3406,7 @@ impl Filesystem for DfsFilesystem {
                     }
                 }
                 Err(e) => {
+                    pending_creates.remove(&path);
                     error!("Failed to create file {}: {}", path, e);
                     reply.error(libc::EIO);
                 }
@@ -3294,6 +3470,7 @@ impl Filesystem for DfsFilesystem {
         let use_buffer = !force_direct && path_for_sqlite_check.as_deref()
             .map(|p| !is_sqlite_path(p) || is_sqlite_buffered(p))
             .unwrap_or(true);
+        debug!("write routing: ino={} path={:?} force_direct={} use_buffer={}", ino, path_for_sqlite_check, force_direct, use_buffer);
         if write_buffer_enabled && use_buffer {
             if let Some(meta) = metadata_cache.get(&ino) {
                 if meta.file_type == FileType::RegularFile {
@@ -4855,6 +5032,32 @@ impl Filesystem for DfsFilesystem {
         reply: fuser::ReplyEmpty,
     ) {
         debug!("fsync: ino={}, datasync={}", ino, datasync);
+
+        // Direct-write inodes (SQLite .db / .db-journal) bypass the write buffer.
+        // Their writes are async tasks — fsync must wait for all of them to land
+        // before replying, otherwise reads after fdatasync see stale/zero data.
+        if self.direct_write_inodes.contains(&ino) {
+            if let Some(counter) = self.write_tasks_in_flight.get(&ino) {
+                let counter = counter.clone();
+                let result = self.block_on(async move {
+                    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+                    while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        if tokio::time::Instant::now() > deadline {
+                            return Err(anyhow::anyhow!("fsync: timed out waiting for direct write tasks for ino={}", ino));
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                    Ok(())
+                });
+                if let Err(e) = result {
+                    error!("{}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
+            reply.ok();
+            return;
+        }
 
         if self.write_buffer_enabled {
             // Check whether this inode needs synchronous fsyncs (SQLite or O_SYNC/O_DSYNC).

@@ -285,6 +285,19 @@ pub enum Request {
         data: Vec<u8>,
     },
 
+    /// Apply multiple non-contiguous byte-range patches to a chunk in a single RPC.
+    /// The server reads the chunk once, applies all patches in order, writes the
+    /// result. Avoids serial round-trips and server-side zero-fill gaps that occur
+    /// when issuing separate PatchChunk calls for disjoint dirty ranges.
+    MultiPatch {
+        /// Existing chunk to patch
+        chunk_id: ChunkId,
+        /// Absolute file offset of the start of this chunk (for position-aware hash)
+        chunk_file_offset: u64,
+        /// Patches to apply: (intra_chunk_offset, data) pairs, applied in order.
+        patches: Vec<(usize, Vec<u8>)>,
+    },
+
     // Admin requests
     /// Get cluster status
     GetClusterStatus,
@@ -583,7 +596,13 @@ pub enum Response {
     PatchChunkResult {
         /// Blake3 hash of the patched content (position-aware, same scheme as WriteFileLocalOnly)
         new_chunk_id: ChunkId,
-        /// Chunk size in bytes (unchanged by the patch)
+        /// Chunk size in bytes after patch
+        size: usize,
+    },
+
+    /// Response to MultiPatch — new chunk identity after all patches applied
+    MultiPatchResult {
+        new_chunk_id: ChunkId,
         size: usize,
     },
 

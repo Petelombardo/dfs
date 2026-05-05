@@ -1,7 +1,7 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use libc;
-use dfs_common::{ChunkLocation, FileMetadata, FileType};
+use dfs_common::{ChunkId, ChunkLocation, FileMetadata, FileType};
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyStatfs, Request as FuseRequest,
@@ -1093,13 +1093,48 @@ impl FlushHandle {
                             return Ok(());
                         }
                     }
+                    // Try to compute the post-patch hash locally so the server can skip
+                    // its read-back pass entirely (write patches + rename, no read).
+                    //
+                    // We have two sources for the full pre-patch chunk content:
+                    //   1. chunk_cache — warm if this chunk was recently read
+                    //   2. slot_data — always available, but only covers the dirty ranges
+                    //      plus gap-fill zeros; it may not reflect bytes the server has
+                    //      beyond real_data_end that we never loaded into the buffer.
+                    //
+                    // We use the cache hit path: apply the same patches to the cached
+                    // bytes, compute the hash, update the cache with the new entry.
+                    // Cache miss: pass None and let the server do the read-back.
+                    let expected_new_chunk_id = {
+                        let cached = self.client.chunk_cache.get(&old_location.chunk_id).await;
+                        if let Some(cached_arc) = cached {
+                            let mut patched = (*cached_arc).clone();
+                            for (intra, data) in &patches {
+                                let end = intra + data.len();
+                                if end > patched.len() {
+                                    patched.resize(end, 0u8);
+                                }
+                                patched[*intra..end].copy_from_slice(data);
+                            }
+                            let new_hash = dfs_common::compute_chunk_hash_at(&patched, file_offset);
+                            let new_cid = ChunkId::from_hash(new_hash);
+                            // Update cache: evict old entry, insert patched bytes under new id.
+                            self.client.chunk_cache.invalidate(&old_location.chunk_id).await;
+                            self.client.chunk_cache.insert(new_cid, std::sync::Arc::new(patched)).await;
+                            Some(new_cid)
+                        } else {
+                            None
+                        }
+                    };
+
                     // Send all dirty ranges in a single MultiPatch RPC — one round trip,
-                    // atomic server-side read-modify-write, no serial dependency chain.
+                    // atomic server-side write+rename, no read-back when hash is pre-computed.
                     let patch_result = self.client.multi_patch_chunk_on_replicas(
                         old_location.chunk_id,
                         file_offset,
                         patches,
                         &old_location,
+                        expected_new_chunk_id,
                     ).await;
                     let new_location = match patch_result {
                         Ok(loc) => loc,

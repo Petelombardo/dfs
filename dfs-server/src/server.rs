@@ -883,8 +883,8 @@ impl Server {
             Request::PatchChunk { chunk_id, chunk_file_offset, intra_offset, data } => {
                 self.handle_patch_chunk(chunk_id, chunk_file_offset, intra_offset, data).await
             }
-            Request::MultiPatch { chunk_id, chunk_file_offset, patches } => {
-                self.handle_multi_patch(chunk_id, chunk_file_offset, patches).await
+            Request::MultiPatch { chunk_id, chunk_file_offset, patches, expected_new_chunk_id } => {
+                self.handle_multi_patch(chunk_id, chunk_file_offset, patches, expected_new_chunk_id).await
             }
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
             Request::RenameFile { old_path, new_path } => {
@@ -3025,6 +3025,7 @@ impl Server {
         chunk_id: ChunkId,
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
+        expected_new_chunk_id: Option<dfs_common::ChunkId>,
     ) -> Response {
         use std::fs;
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -3087,36 +3088,39 @@ impl Server {
             }
         };
 
-        // Compute new hash by streaming the file — avoids loading the full chunk into memory.
-        // Blake3 is prepended with the file_offset so position-aware hashing matches WriteFile.
-        let new_hash: Result<[u8; 32], anyhow::Error> = (|| {
-            let mut f = fs::File::open(&old_path)?;
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&chunk_file_offset.to_le_bytes());
-            let mut buf = [0u8; 65536];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 { break; }
-                hasher.update(&buf[..n]);
-            }
-            Ok(*hasher.finalize().as_bytes())
-        })();
-
-        let new_hash = match new_hash {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("MultiPatch: failed to hash patched chunk {}: {}", chunk_id, e);
-                return Response::Error {
-                    message: format!("Failed to hash patched chunk: {}", e),
-                    code: ErrorCode::InternalError,
-                };
+        // Determine the new chunk_id.
+        // If the client pre-computed the hash (from its local cache/buffer), trust it and
+        // skip the read-back entirely — write + sync + rename, no read. This eliminates
+        // the full-chunk read from the patch hot path on the server.
+        // If no hint, fall back to streaming the file to compute the hash ourselves.
+        let new_chunk_id = if let Some(expected) = expected_new_chunk_id {
+            expected
+        } else {
+            let new_hash: Result<[u8; 32], anyhow::Error> = (|| {
+                let mut f = fs::File::open(&old_path)?;
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&chunk_file_offset.to_le_bytes());
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 { break; }
+                    hasher.update(&buf[..n]);
+                }
+                Ok(*hasher.finalize().as_bytes())
+            })();
+            match new_hash {
+                Ok(h) => ChunkId::from_hash(h),
+                Err(e) => {
+                    warn!("MultiPatch: failed to hash patched chunk {}: {}", chunk_id, e);
+                    return Response::Error {
+                        message: format!("Failed to hash patched chunk: {}", e),
+                        code: ErrorCode::InternalError,
+                    };
+                }
             }
         };
 
-        let new_chunk_id = ChunkId::from_hash(new_hash);
-
         // Rename old_path → new_path (atomic on same filesystem).
-        // If the hash didn't change the rename is a no-op path-wise.
         if new_chunk_id != chunk_id {
             let new_path = self.storage.get_chunk_path(&new_chunk_id);
             if let Some(parent) = new_path.parent() {

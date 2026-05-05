@@ -296,6 +296,12 @@ pub enum Request {
         chunk_file_offset: u64,
         /// Patches to apply: (intra_chunk_offset, data) pairs, applied in order.
         patches: Vec<(usize, Vec<u8>)>,
+        /// Client-computed hash of the post-patch content. When Some, the server skips
+        /// the read-back pass and renames directly to this hash — eliminating the full
+        /// chunk read from the patch hot path. The server still writes and syncs the
+        /// patch bytes; only the hash verification read is skipped.
+        #[serde(default)]
+        expected_new_chunk_id: Option<ChunkId>,
     },
 
     // Admin requests

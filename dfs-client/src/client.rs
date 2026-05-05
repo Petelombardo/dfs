@@ -4318,6 +4318,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
         old_location: &dfs_common::ChunkLocation,
+        expected_new_chunk_id: Option<ChunkId>,
     ) -> Result<dfs_common::ChunkLocation> {
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
@@ -4343,6 +4344,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             chunk_id: old_chunk_id,
             chunk_file_offset,
             patches,
+            expected_new_chunk_id,
         };
 
         let futures: Vec<_> = replica_addrs.iter().map(|&addr| {

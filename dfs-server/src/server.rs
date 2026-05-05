@@ -6,7 +6,7 @@ use crate::network::{MessageHandler, NetworkClient};
 use crate::storage::ChunkStorage;
 use anyhow::{Context, Result};
 use dfs_common::{
-    compute_chunk_hash_at, ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
+    ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
     Message, NodeId, Request, Response,
 };
 use dashmap::DashMap;
@@ -2921,105 +2921,103 @@ impl Server {
         patch_data: Vec<u8>,
     ) -> Response {
         use std::fs;
+        use std::io::{Read, Seek, SeekFrom, Write};
 
-        // Evict old chunk from the healer's pending queue before we begin. The old chunk
-        // file stays on disk until the rename completes, and if the healer fires in that
-        // window it would replicate the stale version to another node. Removing it here
-        // means the healer won't act on it; after the client broadcasts the new location
-        // the healer will discover new_chunk_id as under-replicated and heal that instead.
         if let Some(healing) = self.healing.read().await.as_ref() {
             healing.evict_from_pending(&chunk_id).await;
         }
 
-        // Read existing chunk from cache first, then disk on miss.
-        let mut chunk_bytes = match self.storage.read_chunk(&chunk_id) {
-            Ok(data) => data,
+        let old_path = self.storage.get_chunk_path(&chunk_id);
+        if !old_path.exists() {
+            warn!("PatchChunk: chunk {} not found locally", chunk_id);
+            return Response::Error {
+                message: format!("Chunk not found: {}", chunk_id),
+                code: ErrorCode::NotFound,
+            };
+        }
+
+        // Write the patch in-place — no full-chunk read required.
+        // Extend the file if the patch writes beyond current EOF (append case).
+        let patch_end = (intra_offset + patch_data.len()) as u64;
+        let write_result: Result<u64, anyhow::Error> = (|| {
+            let mut f = fs::OpenOptions::new().write(true).open(&old_path)?;
+            let current_len = f.metadata()?.len();
+            if patch_end > current_len {
+                f.set_len(patch_end)?;
+            }
+            f.seek(SeekFrom::Start(intra_offset as u64))?;
+            f.write_all(&patch_data)?;
+            f.sync_data()?;
+            Ok(patch_end.max(current_len))
+        })();
+
+        let final_size = match write_result {
+            Ok(s) => s as usize,
             Err(e) => {
-                warn!("PatchChunk: chunk {} not found locally: {}", chunk_id, e);
+                warn!("PatchChunk: failed to write patch for {}: {}", chunk_id, e);
                 return Response::Error {
-                    message: format!("Chunk not found: {}", e),
-                    code: ErrorCode::NotFound,
+                    message: format!("Failed to write patch: {}", e),
+                    code: ErrorCode::InternalError,
                 };
             }
         };
 
-        let patch_end = intra_offset + patch_data.len();
-        // Allow extending the chunk for append-style writes (patch_end > current size).
-        // Zero-fill any gap between the old end and intra_offset, then extend.
-        if patch_end > chunk_bytes.len() {
-            chunk_bytes.resize(patch_end, 0u8);
-        }
+        // Stream-hash the file to compute the new chunk_id — no full in-memory load.
+        let new_hash: Result<[u8; 32], anyhow::Error> = (|| {
+            let mut f = fs::File::open(&old_path)?;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&chunk_file_offset.to_le_bytes());
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 { break; }
+                hasher.update(&buf[..n]);
+            }
+            Ok(*hasher.finalize().as_bytes())
+        })();
 
-        // Apply patch in memory
-        chunk_bytes[intra_offset..patch_end].copy_from_slice(&patch_data);
-
-        let new_hash = compute_chunk_hash_at(&chunk_bytes, chunk_file_offset);
-        let new_chunk_id = ChunkId::from_hash(new_hash);
-        let size = chunk_bytes.len();
-
-        // Write patched bytes to a temp file in the same directory as the old chunk,
-        // then rename temp → new_path. Finally unlink old_path.
-        // This means only a single full-chunk write touches disk (the temp file);
-        // the rename and unlink are metadata-only ops — much cheaper than write+delete.
-        let old_path = self.storage.get_chunk_path(&chunk_id);
-        let new_path = self.storage.get_chunk_path(&new_chunk_id);
-
-        // Ensure new chunk's parent directory exists
-        if let Some(parent) = new_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                warn!("PatchChunk: failed to create dir for {}: {}", new_chunk_id, e);
+        let new_hash = match new_hash {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("PatchChunk: failed to hash patched chunk {}: {}", chunk_id, e);
                 return Response::Error {
-                    message: format!("Failed to create chunk directory: {}", e),
+                    message: format!("Failed to hash patched chunk: {}", e),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        };
+
+        let new_chunk_id = ChunkId::from_hash(new_hash);
+
+        // Atomic rename: old hash path → new hash path. Same filesystem guaranteed.
+        if new_chunk_id != chunk_id {
+            let new_path = self.storage.get_chunk_path(&new_chunk_id);
+            if let Some(parent) = new_path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    warn!("PatchChunk: failed to create dir for {}: {}", new_chunk_id, e);
+                    return Response::Error {
+                        message: format!("Failed to create chunk directory: {}", e),
+                        code: ErrorCode::InternalError,
+                    };
+                }
+            }
+            if let Err(e) = fs::rename(&old_path, &new_path) {
+                warn!("PatchChunk: failed to rename {} -> {}: {}", chunk_id, new_chunk_id, e);
+                return Response::Error {
+                    message: format!("Failed to rename patched chunk: {}", e),
                     code: ErrorCode::InternalError,
                 };
             }
         }
 
-        // Write to uniquely-named temp file in same dir as old chunk (same filesystem → cheap rename)
-        let seq = crate::storage::next_write_seq();
-        let temp_name = format!("{}.{}.ptmp", new_chunk_id, seq);
-        let temp_path = old_path.parent().unwrap_or(old_path.as_path()).join(temp_name);
-
-        let write_result = (|| -> Result<(), anyhow::Error> {
-            use std::io::Write;
-            let mut f = fs::File::create(&temp_path)?;
-            f.write_all(&chunk_bytes)?;
-            f.sync_all()?;
-            fs::rename(&temp_path, &new_path)?;
-            Ok(())
-        })();
-
-        if let Err(e) = write_result {
-            let _ = fs::remove_file(&temp_path); // clean up temp on failure
-            warn!("PatchChunk: failed to write/rename patched chunk {}: {}", new_chunk_id, e);
-            return Response::Error {
-                message: format!("Failed to write patched chunk: {}", e),
-                code: ErrorCode::InternalError,
-            };
-        }
-
-        // Unlink the old chunk file only if the hash changed — if old == new the rename
-        // above was a no-op (same path) and removing it would delete the chunk we just wrote.
-        if old_path != new_path {
-            if let Err(e) = fs::remove_file(&old_path) {
-                // Non-fatal: orphan GC will catch it.
-                warn!("PatchChunk: failed to remove old chunk file {}: {}", chunk_id, e);
-            }
-        }
-
-        // CRITICAL: invalidate the in-memory chunk cache for both old and new IDs.
-        // Without this, subsequent reads (and the next PatchChunk's read-modify-write)
-        // get stale pre-patch bytes from the LRU cache. When old==new (idempotent
-        // overwrite), this is the only thing that prevents the next PatchChunk from
-        // operating on stale base data — losing intervening writes.
         self.storage.invalidate_cache(&chunk_id);
         if new_chunk_id != chunk_id {
             self.storage.invalidate_cache(&new_chunk_id);
         }
 
-        info!("PatchChunk: {} -> {} ({} bytes patched at intra_offset={})", chunk_id, new_chunk_id, patch_data.len(), intra_offset);
+        info!("PatchChunk: {} -> {} ({} bytes at intra_offset={})", chunk_id, new_chunk_id, patch_data.len(), intra_offset);
 
-        Response::PatchChunkResult { new_chunk_id, size }
+        Response::PatchChunkResult { new_chunk_id, size: final_size }
     }
 
     async fn handle_multi_patch(
@@ -3029,84 +3027,113 @@ impl Server {
         patches: Vec<(usize, Vec<u8>)>,
     ) -> Response {
         use std::fs;
+        use std::io::{Read, Seek, SeekFrom, Write};
 
         if let Some(healing) = self.healing.read().await.as_ref() {
             healing.evict_from_pending(&chunk_id).await;
         }
 
-        // The chunk_id passed in is the "current" chunk from the client's metadata.
-        // On this replica it may not exist yet (e.g. new file, sparse chunk, or the
-        // chunk hasn't been replicated here yet). In that case, start from an empty
-        // (zero-filled) baseline — the patches carry the only real data, so zeros are
-        // the correct uninitialized bytes for any position not covered by a patch.
-        // Read existing chunk from cache first, then disk on miss.
-        // If not found at all (brand-new chunk), start from zeros — patches carry
-        // the only real content and the client waits for our reply before reading.
-        let needed_if_new = patches.iter()
-            .map(|(off, d)| off + d.len())
-            .max()
-            .unwrap_or(0)
-            .min(4 * 1024 * 1024);
-        let mut chunk_bytes = match self.storage.read_chunk(&chunk_id) {
-            Ok(data) => data,
-            Err(_) => {
-                debug!("MultiPatch: chunk {} not on disk — starting from {} zero bytes", chunk_id, needed_if_new);
-                vec![0u8; needed_if_new]
-            }
-        };
-
-        // Apply all patches in one pass. Extend with zeros only as far as needed
-        // to accommodate any patch that writes beyond the current end.
-        for (intra_offset, patch_data) in &patches {
-            let patch_end = intra_offset + patch_data.len();
-            if patch_end > chunk_bytes.len() {
-                chunk_bytes.resize(patch_end, 0u8);
-            }
-            chunk_bytes[*intra_offset..patch_end].copy_from_slice(patch_data);
-        }
-
-        let new_hash = compute_chunk_hash_at(&chunk_bytes, chunk_file_offset);
-        let new_chunk_id = ChunkId::from_hash(new_hash);
-        let size = chunk_bytes.len();
-
         let old_path = self.storage.get_chunk_path(&chunk_id);
-        let new_path = self.storage.get_chunk_path(&new_chunk_id);
+        let chunk_exists = old_path.exists();
 
-        if let Some(parent) = new_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                warn!("MultiPatch: failed to create dir for {}: {}", new_chunk_id, e);
+        // Write patches in-place — no full-chunk read needed.
+        //
+        // Existing chunk: open O_RDWR, seek to each patch offset, write bytes.
+        //   Extending beyond current size: set_len() to zero-fill the gap (OS sparse).
+        //
+        // New chunk (not on this replica yet): create the file, seek+write each patch.
+        //   Gaps between patches are left as holes — the OS zero-fills on read.
+        //   This is correct: the client only sends non-zero dirty ranges, so
+        //   unpatched positions are legitimately zero for a brand-new chunk.
+        let patch_result: Result<u64, anyhow::Error> = (|| {
+            let mut f = if chunk_exists {
+                fs::OpenOptions::new().read(false).write(true).open(&old_path)?
+            } else {
+                if let Some(parent) = old_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::OpenOptions::new().write(true).create(true).open(&old_path)?
+            };
+
+            // Apply all patches. Extend file length if any patch writes beyond EOF.
+            let current_len = f.metadata()?.len();
+            let needed_len = patches.iter()
+                .map(|(off, d)| (off + d.len()) as u64)
+                .max()
+                .unwrap_or(0)
+                .max(current_len);
+
+            if needed_len > current_len {
+                f.set_len(needed_len)?;
+            }
+
+            for (intra_offset, patch_data) in &patches {
+                f.seek(SeekFrom::Start(*intra_offset as u64))?;
+                f.write_all(patch_data)?;
+            }
+
+            f.sync_data()?;
+            Ok(needed_len)
+        })();
+
+        let final_size = match patch_result {
+            Ok(s) => s as usize,
+            Err(e) => {
+                warn!("MultiPatch: failed to write patches for {}: {}", chunk_id, e);
                 return Response::Error {
-                    message: format!("Failed to create chunk directory: {}", e),
+                    message: format!("Failed to write patch: {}", e),
                     code: ErrorCode::InternalError,
                 };
             }
-        }
+        };
 
-        let seq = crate::storage::next_write_seq();
-        let temp_name = format!("{}.{}.mptmp", new_chunk_id, seq);
-        let temp_path = old_path.parent().unwrap_or(old_path.as_path()).join(temp_name);
-
-        let write_result = (|| -> Result<(), anyhow::Error> {
-            use std::io::Write;
-            let mut f = fs::File::create(&temp_path)?;
-            f.write_all(&chunk_bytes)?;
-            f.sync_all()?;
-            fs::rename(&temp_path, &new_path)?;
-            Ok(())
+        // Compute new hash by streaming the file — avoids loading the full chunk into memory.
+        // Blake3 is prepended with the file_offset so position-aware hashing matches WriteFile.
+        let new_hash: Result<[u8; 32], anyhow::Error> = (|| {
+            let mut f = fs::File::open(&old_path)?;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&chunk_file_offset.to_le_bytes());
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 { break; }
+                hasher.update(&buf[..n]);
+            }
+            Ok(*hasher.finalize().as_bytes())
         })();
 
-        if let Err(e) = write_result {
-            let _ = fs::remove_file(&temp_path);
-            warn!("MultiPatch: failed to write/rename patched chunk {}: {}", new_chunk_id, e);
-            return Response::Error {
-                message: format!("Failed to write patched chunk: {}", e),
-                code: ErrorCode::InternalError,
-            };
-        }
+        let new_hash = match new_hash {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("MultiPatch: failed to hash patched chunk {}: {}", chunk_id, e);
+                return Response::Error {
+                    message: format!("Failed to hash patched chunk: {}", e),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        };
 
-        if old_path != new_path {
-            if let Err(e) = fs::remove_file(&old_path) {
-                warn!("MultiPatch: failed to remove old chunk file {}: {}", chunk_id, e);
+        let new_chunk_id = ChunkId::from_hash(new_hash);
+
+        // Rename old_path → new_path (atomic on same filesystem).
+        // If the hash didn't change the rename is a no-op path-wise.
+        if new_chunk_id != chunk_id {
+            let new_path = self.storage.get_chunk_path(&new_chunk_id);
+            if let Some(parent) = new_path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    warn!("MultiPatch: failed to create dir for {}: {}", new_chunk_id, e);
+                    return Response::Error {
+                        message: format!("Failed to create chunk directory: {}", e),
+                        code: ErrorCode::InternalError,
+                    };
+                }
+            }
+            if let Err(e) = fs::rename(&old_path, &new_path) {
+                warn!("MultiPatch: failed to rename {} -> {}: {}", chunk_id, new_chunk_id, e);
+                return Response::Error {
+                    message: format!("Failed to rename patched chunk: {}", e),
+                    code: ErrorCode::InternalError,
+                };
             }
         }
 
@@ -3119,9 +3146,9 @@ impl Server {
             .map(|(off, d)| (*off, off + d.len()))
             .collect();
         info!("MultiPatch: {} -> {} ({} patches, final size={}): {:?}",
-            chunk_id, new_chunk_id, patches.len(), size, patch_summary);
+            chunk_id, new_chunk_id, patches.len(), final_size, patch_summary);
 
-        Response::MultiPatchResult { new_chunk_id, size }
+        Response::MultiPatchResult { new_chunk_id, size: final_size }
     }
 
     /// Handle delete file request.

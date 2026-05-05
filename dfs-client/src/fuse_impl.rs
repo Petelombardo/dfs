@@ -48,13 +48,27 @@ fn is_sqlite_buffered(path: &str) -> bool {
 /// All SQLite-related paths — used for chunk-data cache bypass and FOPEN_DIRECT_IO.
 /// Includes .db-shm (for cache bypass) but .db-shm must NOT get FOPEN_DIRECT_IO.
 fn is_sqlite_path(path: &str) -> bool {
-    is_sqlite_buffered(path) || path.ends_with(".db-shm")
+    path.ends_with(".db")
+        || path.ends_with(".sqlite")
+        || path.ends_with(".sqlite3")
+        || path.ends_with(".db-wal")
+        || path.ends_with(".db-journal")
+        || path.ends_with(".db-shm")
+        || path.ends_with(".db_temp")
+        || path.ends_with(".sqlite_temp")
+        || path.ends_with(".sqlite3_temp")
 }
 
-/// Same as is_sqlite_path but excludes .db-shm, which must NOT use FOPEN_DIRECT_IO
-/// because SQLite mmaps it (MAP_SHARED) for WAL index coordination.
+/// SQLite paths that use FOPEN_DIRECT_IO — all except .db-shm (which needs mmap).
 fn is_sqlite_direct_io(path: &str) -> bool {
-    is_sqlite_buffered(path)
+    path.ends_with(".db")
+        || path.ends_with(".sqlite")
+        || path.ends_with(".sqlite3")
+        || path.ends_with(".db-wal")
+        || path.ends_with(".db-journal")
+        || path.ends_with(".db_temp")
+        || path.ends_with(".sqlite_temp")
+        || path.ends_with(".sqlite3_temp")
 }
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
@@ -1399,6 +1413,12 @@ pub struct DfsFilesystem {
     /// Prevents unbounded spawning of concurrent refresh tasks (one per inode max).
     refreshing_inodes: Arc<dashmap::DashSet<u64>>,
 
+    /// Inodes that must use the direct (non-buffered) write path.
+    /// Set at create()/open() time for .db and .db-journal files so the routing
+    /// decision is available immediately when the first write() arrives — before
+    /// path_to_inode or metadata_cache is populated by the async create task.
+    direct_write_inodes: Arc<dashmap::DashSet<u64>>,
+
     /// Per-inode count of release() flush tasks still in flight.
     /// Sequential writes wait for this to reach zero for the specific inode
     /// before opening, ensuring the previous release() has fully committed.
@@ -1721,6 +1741,7 @@ impl DfsFilesystem {
             flush_handle,
             pending_deletes: Arc::new(dashmap::DashSet::new()),
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
+            direct_write_inodes: Arc::new(dashmap::DashSet::new()),
             release_in_flight: Arc::new(DashMap::new()),
             write_tasks_in_flight: write_tasks_in_flight_shared,
             global_buffered_bytes,
@@ -2313,6 +2334,14 @@ impl Filesystem for DfsFilesystem {
             let sync_on_fsync = (flags & (libc::O_SYNC | libc::O_DSYNC)) != 0 || is_sqlite_buf;
             if sync_on_fsync {
                 info!("open: ino={} sync_on_fsync=true (O_SYNC/O_DSYNC or SQLite)", ino);
+            }
+            // Mark non-buffered SQLite inodes so write() fast-path can route correctly
+            // without needing a path lookup (which may not be available yet on first write).
+            let needs_direct = path_for_sync_check.as_deref()
+                .map(|p| is_sqlite_path(p) && !is_sqlite_buffered(p))
+                .unwrap_or(false);
+            if needs_direct {
+                self.direct_write_inodes.insert(ino);
             }
             if self.write_buffer_enabled {
                 // If this is the first writer (count was 0 before incrementing above),
@@ -3130,6 +3159,7 @@ impl Filesystem for DfsFilesystem {
         let write_open_counts = self.write_open_counts.clone();
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
+        let direct_write_inodes = self.direct_write_inodes.clone();
 
         self.runtime.spawn(async move {
             match client.put_file_metadata(&metadata_clone).await {
@@ -3151,6 +3181,17 @@ impl Filesystem for DfsFilesystem {
                     // Cache metadata
                     metadata_cache.insert(ino, metadata.clone());
 
+                    // Clear any stale read engine for this inode. Inode numbers are reused
+                    // within a mount session, so a previously-deleted file's chunk map may
+                    // still be present. Without this, the first read of a newly-created file
+                    // returns data from the old file — causing SQLITE_NOTADB.
+                    if let Some(engine) = client.read_engines.get(ino) {
+                        let engine_clone = engine.clone();
+                        tokio::spawn(async move {
+                            engine_clone.expire_chunk_map_async().await;
+                        });
+                    }
+
                     // Invalidate parent directory cache so 'ls' shows new file immediately
                     let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
                     let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
@@ -3158,6 +3199,12 @@ impl Filesystem for DfsFilesystem {
 
                     // create() always opens for writing — count it
                     *write_open_counts.entry(ino).or_insert(0) += 1;
+
+                    // Mark inodes that must bypass the write buffer (set before reply.created()
+                    // so the routing decision is available on the first write()).
+                    if is_sqlite_path(&path) && !is_sqlite_buffered(&path) {
+                        direct_write_inodes.insert(ino);
+                    }
 
                     // Pre-create the write buffer with sync_on_fsync=true for SQLite files
                     // so that the first fdatasync after the first write flushes synchronously.
@@ -3220,6 +3267,7 @@ impl Filesystem for DfsFilesystem {
         let data_vec = data.to_vec();
         let req_uid = _req.uid();
         let req_gid = _req.gid();
+        let direct_write_inodes = self.direct_write_inodes.clone();
 
         let write_task_counter = self.write_tasks_in_flight
             .entry(ino)
@@ -3233,19 +3281,19 @@ impl Filesystem for DfsFilesystem {
         // task entirely — critical because all 8 runtime threads can be occupied
         // by concurrent reads, causing write tasks to queue up and QEMU to deadlock
         // waiting for a reply that never comes.
-        // Determine the file path for SQLite routing decisions.
-        // Prefer metadata_cache (always populated before reply.created() returns) over
-        // path_to_inode (populated async, may not be visible yet on first write).
-        let path_for_sqlite_check = metadata_cache.get(&ino).map(|m| m.path.clone())
-            .or_else(|| path_to_inode.read().unwrap()
-                .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone()));
-        // Route through the write buffer only for non-SQLite files and .db-wal files.
-        // .db, .sqlite, .db-journal: use direct writes (rollback journal ordering requires it).
-        // .db-shm: unbuffered (mmap'd MAP_SHARED).
-        // .db-wal: buffered (append-only frames accumulate correctly).
-        let use_buffer = path_for_sqlite_check.as_deref()
+        // Check direct_write_inodes first — set at create()/open() time before reply returns,
+        // so this is race-free even when metadata_cache/path_to_inode aren't populated yet.
+        let force_direct = direct_write_inodes.contains(&ino);
+
+        // Fall back to path-based check for files not in direct_write_inodes.
+        let path_for_sqlite_check = if force_direct { None } else {
+            metadata_cache.get(&ino).map(|m| m.path.clone())
+                .or_else(|| path_to_inode.read().unwrap()
+                    .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone()))
+        };
+        let use_buffer = !force_direct && path_for_sqlite_check.as_deref()
             .map(|p| !is_sqlite_path(p) || is_sqlite_buffered(p))
-            .unwrap_or(true); // unknown path → assume bufferable (non-SQLite)
+            .unwrap_or(true);
         if write_buffer_enabled && use_buffer {
             if let Some(meta) = metadata_cache.get(&ino) {
                 if meta.file_type == FileType::RegularFile {
@@ -3406,9 +3454,9 @@ impl Filesystem for DfsFilesystem {
             let is_sqlite_buf = is_sqlite_buffered(&metadata.path);
             let cache_inode = if is_sqlite { 0 } else { ino };
             // Buffer only non-SQLite files and .db-wal (is_sqlite_buffered).
-            // .db/.db-journal use direct writes for rollback journal ordering correctness.
-            // .db-shm is mmap'd MAP_SHARED — unbuffered.
-            let use_write_buffer = !is_sqlite || is_sqlite_buf;
+            // Also check direct_write_inodes which is set race-free at create()/open() time.
+            let use_write_buffer = !direct_write_inodes.contains(&ino)
+                && (!is_sqlite || is_sqlite_buf);
 
             if write_buffer_enabled && use_write_buffer {
                 let offset_usize = offset as usize;

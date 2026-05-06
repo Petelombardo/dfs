@@ -22,6 +22,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 clap = { workspace = true }
 nix = { version = "0.29", features = ["fs"] }
+libc = { workspace = true }
 dashmap = "6.1"
 lru = "0.12"
 uuid = { workspace = true }

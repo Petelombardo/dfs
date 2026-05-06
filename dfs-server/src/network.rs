@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
+use std::os::unix::io::AsRawFd;
 
 /// Handler trait for processing messages
 pub trait MessageHandler: Send + Sync {
@@ -65,7 +66,12 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
         // simultaneously blocked in read/write. Without this cap, a burst of connections
         // (e.g. rapid-fire small writes from a SQLite WAL session) can exhaust the tokio
         // thread pool, leaving no threads to service new requests and causing a deadlock.
-        const MAX_CONNECTIONS: usize = 512;
+        //
+        // 128 is sufficient: the client uses connection pooling and never needs hundreds
+        // of simultaneous connections to a single node. 512 was too high — during a DVR
+        // startup scan, 359 CLOSE-WAIT connections each held a permit permanently, starving
+        // the scheduler and preventing the 30s idle timeout from ever firing.
+        const MAX_CONNECTIONS: usize = 128;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -78,6 +84,32 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                         Ok((mut stream, peer_addr)) => {
                             debug!("Accepted connection from {}", peer_addr);
                             let _ = stream.set_nodelay(true);
+                            // Enable TCP keepalive so the kernel detects dead peers
+                            // (CLOSE-WAIT, network partition) in ~11s rather than waiting
+                            // for the 30s application-level idle timeout. Without this,
+                            // a burst of dead connections each hold a semaphore permit
+                            // permanently — the idle timeout tasks can't be polled when
+                            // the runtime is saturated, causing a permanent hang.
+                            // Settings: idle=5s, interval=2s, retries=3 → detect in ~11s.
+                            unsafe {
+                                let fd = stream.as_raw_fd();
+                                let one: libc::c_int = 1;
+                                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+                                    &one as *const _ as *const libc::c_void,
+                                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                                let secs: libc::c_int = 5;
+                                libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
+                                    &secs as *const _ as *const libc::c_void,
+                                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                                let interval: libc::c_int = 2;
+                                libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+                                    &interval as *const _ as *const libc::c_void,
+                                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                                let retries: libc::c_int = 3;
+                                libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+                                    &retries as *const _ as *const libc::c_void,
+                                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                            }
                             let handler = self.handler.clone();
                             let sem = semaphore.clone();
 

@@ -443,6 +443,7 @@ dependencies = [
  "clap",
  "dashmap",
  "dfs-common",
+ "libc",
  "lru",
  "nix",
  "rusqlite",

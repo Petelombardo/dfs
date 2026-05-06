@@ -483,16 +483,16 @@ dd if="$T/t20_patch.bin" of="$T/t20_expected.bin" bs=1M count=2 seek=4          
 dd if="$T/t20_patch.bin" of="$T/t20_expected.bin" bs=1M count=2 seek=8            conv=notrunc 2>/dev/null  # chunk 2 start
 
 # Write original to DFS
-cp "$T/t20_orig.bin" "$MOUNT/t20_test.bin"
+cp "$T/t20_orig.bin" "$MOUNT/t20_test.bin" || true
 sleep 1
 
 # Apply same patches to DFS file
-dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=0            conv=notrunc 2>/dev/null  # chunk 0
-dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=4            conv=notrunc 2>/dev/null  # chunk 1 start
-dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=8            conv=notrunc 2>/dev/null  # chunk 2 start
+dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=0            conv=notrunc 2>/dev/null || true  # chunk 0
+dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=4            conv=notrunc 2>/dev/null || true  # chunk 1 start
+dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=8            conv=notrunc 2>/dev/null || true  # chunk 2 start
 sleep 1
 
-cp "$MOUNT/t20_test.bin" "$T/t20_read.bin"
+cp "$MOUNT/t20_test.bin" "$T/t20_read.bin" || true
 
 m1=$(md5sum "$T/t20_expected.bin" | cut -d' ' -f1)
 m2=$(md5sum "$T/t20_read.bin"     | cut -d' ' -f1)

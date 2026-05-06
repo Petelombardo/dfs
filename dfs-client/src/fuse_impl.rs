@@ -3550,22 +3550,23 @@ impl Filesystem for DfsFilesystem {
                         // CRITICAL: apply back-pressure BEFORE acquiring the lock.
                         // Holding the slot mutex while spinning would prevent the flush task
                         // from acquiring it to drain the buffer — permanent deadlock.
+                        //
+                        // Graduated back-pressure reading global_buffered_bytes directly.
+                        // This avoids try_lock on the slot (which fails under high concurrency
+                        // and falls back to cap, causing false pressure) without introducing
+                        // CAS loops that cause spurious sleeps on the FUSE dispatch thread.
+                        // The cap is soft: concurrent writers can overshoot by at most
+                        // N×write_size before the next check catches it — acceptable given
+                        // write_size ≤ 1MB and the flusher drains continuously.
                         {
                             let t_bp = std::time::Instant::now();
                             const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
                             loop {
-                                // Use per-inode buffered bytes. If the lock is held by the
-                                // flush task, fall back to global_buffered_bytes (not cap) —
-                                // returning cap would cause 10ms sleeps during every flush,
-                                // turning a 130ms flush into 260ms and halving throughput.
-                                let current = state_arc.try_lock()
-                                    .map(|s| s.buffered_bytes())
-                                    .unwrap_or_else(|_| global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed));
+                                let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
                                 let fill_pct = current * 100 / global_write_buffer_cap.max(1);
-                                let delay_ms: u64 = if fill_pct < 25 { 0 }
-                                    else if fill_pct < 50 { 1 }
-                                    else if fill_pct < 75 { 5 }
-                                    else if fill_pct < 100 { 20 }
+                                let delay_ms: u64 = if fill_pct < 75 { 0 }
+                                    else if fill_pct < 90 { 1 }
+                                    else if fill_pct < 100 { 5 }
                                     else {
                                         if t_bp.elapsed() >= BP_TIMEOUT {
                                             error!("write fast-path: ino={} bp timeout — EIO (global_buffered={}  cap={})", ino, current, global_write_buffer_cap);
@@ -3594,8 +3595,7 @@ impl Filesystem for DfsFilesystem {
                             }
                             // Only count bytes actually added to the buffer, not the write
                             // size. Overlapping writes don't grow the slot, so adding
-                            // data_vec.len() unconditionally causes the counter to drift up
-                            // and never come back down, triggering false back-pressure.
+                            // data_vec.len() unconditionally causes the counter to drift up.
                             let added = bytes_after.saturating_sub(bytes_before);
                             if added > 0 {
                                 global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
@@ -3868,36 +3868,22 @@ impl Filesystem for DfsFilesystem {
                     // (runtime scheduling + metadata cache lookup overhead).
                     let t_sched = start.elapsed();
 
-                    // Graduated back-pressure: slow writes proportionally as the buffer
-                    // fills so the pipeline never actually hits the cap under normal load.
-                    // Early pressure keeps the buffer low and flush latency spikes from
-                    // causing a full stall. Hard cap is still enforced with a 30s timeout
-                    // as a safety net against a permanently stuck flush pipeline.
-                    //
-                    // CRITICAL: use try_lock() rather than lock().await to read the buffer
-                    // level. Under high write concurrency all 8 runtime threads can end up
-                    // waiting on state_arc.lock().await simultaneously, starving the runtime
-                    // and deadlocking the flush tasks that need to run to drain the buffer.
-                    // If try_lock fails (flush task holds the lock), fall back to the
-                    // size_high_water mark as a conservative estimate — it's always >= real
-                    // buffered bytes so back-pressure is applied safely.
+                    // Graduated back-pressure reading global_buffered_bytes directly.
+                    // CRITICAL: do not use try_lock on the slot — under high concurrency all
+                    // runtime threads can wait on lock().await simultaneously, starving the
+                    // flush tasks needed to drain the buffer.
                     let t_bp_start = std::time::Instant::now();
                     const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
                     loop {
-                        let current = state_arc.try_lock()
-                            .map(|s| s.buffered_bytes())
-                            .unwrap_or_else(|_| global_write_buffer_cap);
+                        let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
                         let fill_pct = current * 100 / global_write_buffer_cap.max(1);
-                        let delay_ms: u64 = if fill_pct < 25 {
+                        let delay_ms: u64 = if fill_pct < 75 {
                             0
-                        } else if fill_pct < 50 {
+                        } else if fill_pct < 90 {
                             1
-                        } else if fill_pct < 75 {
-                            5
                         } else if fill_pct < 100 {
-                            20
+                            5
                         } else {
-                            // At cap — check timeout before blocking.
                             if t_bp_start.elapsed() >= BP_TIMEOUT {
                                 error!("write: ino={} back-pressure timeout after {:?} — flush pipeline stuck, returning EIO",
                                        ino, t_bp_start.elapsed());
@@ -4483,18 +4469,21 @@ impl Filesystem for DfsFilesystem {
                         }
                     }
                     // Invalidate the read engine's chunk map so the next reader
-                    // immediately picks up the newly flushed chunks.
-                    // If no fds remain open, drop the engine entirely — it holds
-                    // a Vec<ChunkLocation> that grows with the file and is never
-                    // needed again once the file is closed for writing.
-                    if let Some(engine) = read_engines_for_release.get(&ino) {
-                        engine.expire_chunk_map();
-                    }
-                    // Check open_counts: if no readers are still open, free the engine.
-                    // open_counts was decremented synchronously in release() before this
-                    // task was spawned, so 0 here means truly no fds remain.
-                    if !open_counts_for_release.get(&ino).map(|c| *c > 0).unwrap_or(false) {
-                        read_engines_for_release.remove(&ino);
+                    // immediately picks up the newly flushed chunks — but only if no new
+                    // writer has opened since this release task was spawned. A new O_TRUNC
+                    // open pre-seeds the engine with the new session's chunk_id; expiring
+                    // it here would wipe that out, causing the next cat to fall through to
+                    // the server and read stale data (T7 race).
+                    let has_new_writer = write_open_counts_for_release
+                        .get(&ino).map(|c| *c > 0).unwrap_or(false);
+                    if !has_new_writer {
+                        if let Some(engine) = read_engines_for_release.get(&ino) {
+                            engine.expire_chunk_map();
+                        }
+                        // No readers left either — free the engine entirely.
+                        if !open_counts_for_release.get(&ino).map(|c| *c > 0).unwrap_or(false) {
+                            read_engines_for_release.remove(&ino);
+                        }
                     }
                     // Only remove the write buffer if no new writer has opened the file
                     // since this release task was spawned. A new O_TRUNC open races with
@@ -5181,7 +5170,15 @@ impl Filesystem for DfsFilesystem {
         datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!("fsync: ino={}, datasync={}", ino, datasync);
+        let path = self.metadata_cache.get(&ino).map(|m| m.path.clone()).unwrap_or_default();
+        let active_writers = self.write_open_counts.get(&ino).map(|c| *c).unwrap_or(0);
+        let tasks_in_flight = self.write_tasks_in_flight.get(&ino)
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+        let buffered_slots = self.write_buffers.get(&ino)
+            .and_then(|s| s.try_lock().ok().map(|st| st.slots.len()))
+            .unwrap_or(0);
+        info!("fsync: ino={} datasync={} path={:?} active_writers={} tasks_in_flight={} buffered_slots={}",
+              ino, datasync, path, active_writers, tasks_in_flight, buffered_slots);
 
         // Direct-write inodes (SQLite .db / .db-journal) bypass the write buffer.
         // Their writes are async tasks — fsync must wait for all of them to land
@@ -5205,6 +5202,7 @@ impl Filesystem for DfsFilesystem {
                     return;
                 }
             }
+            info!("fsync: ino={} path={:?} → direct-write path, done", ino, path);
             reply.ok();
             return;
         }
@@ -5226,6 +5224,7 @@ impl Filesystem for DfsFilesystem {
 
             if sync_on_fsync {
                 // O_SYNC / O_DSYNC: flush synchronously and wait for network ack.
+                info!("fsync: ino={} path={:?} → sync flush (O_SYNC/SQLite)", ino, path);
                 let handle = self.flush_handle.clone();
                 let result = self.block_on(async move {
                     handle.flush_all_pipelined(ino).await
@@ -5234,11 +5233,26 @@ impl Filesystem for DfsFilesystem {
                     Ok(_) => reply.ok(),
                     Err(e) => { error!("fsync (O_SYNC) failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
                 }
+            } else if active_writers == 0 {
+                // No active writers — file is closed (e.g. mkfs, QEMU, VM tools fsyncing
+                // after close). Flush synchronously so the caller's durability guarantee
+                // holds. DVR always has active_writers > 0 during recording so it never
+                // hits this branch.
+                info!("fsync: ino={} path={:?} → sync flush (no active writers)", ino, path);
+                let handle = self.flush_handle.clone();
+                let result = self.block_on(async move {
+                    handle.flush_all_pipelined(ino).await
+                });
+                match result {
+                    Ok(_) => reply.ok(),
+                    Err(e) => { error!("fsync (no-writers) failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
+                }
             } else {
-                // Async flush: spawn and reply immediately. Do NOT insert into in_flight —
-                // that set is only for background-ticker vs force-flush races. If we insert
-                // here, a concurrent release flush will wait 30s for this task to start,
-                // causing the well-known nano close hang.
+                // Active writers present — this is a live recording or similar streaming
+                // write. Async flush: spawn and reply immediately. Do NOT insert into
+                // in_flight — that set is only for background-ticker vs force-flush races;
+                // inserting here causes a concurrent release flush to wait 30s.
+                info!("fsync: ino={} path={:?} → async flush (active_writers={})", ino, path, active_writers);
                 let handle = self.flush_handle.clone();
                 self.runtime.spawn(async move {
                     if let Err(e) = handle.flush_all_pipelined(ino).await {

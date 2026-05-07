@@ -1177,58 +1177,53 @@ impl Server {
             }
         }
 
-        match self.metadata.put_file(&metadata) {
-            Ok(_) => {
-                self.chunk_map_update(&metadata).await;
-                // TTL>0: forward to all other nodes with ttl-1 so every node gets
-                // every write regardless of which node the client contacted first.
-                if ttl > 0 {
-                    let cluster = self.cluster.clone();
-                    let client = self.client.clone();
-                    let local_id = self.cluster.local_node_id();
-                    let metadata_clone = metadata.clone();
-                    let sem = self.broadcast_semaphore.clone();
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire().await.ok();
-                        let nodes = cluster.get_all_nodes().await;
-                        for node in &nodes {
-                            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                                continue;
-                            }
-                            let req = Request::ReplicateMetadata { metadata: metadata_clone.clone(), ttl: ttl - 1 };
-                            if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
-                                warn!("TTL forward ReplicateMetadata to {} failed: {}", node.id, e);
-                            }
-                        }
-                    });
-                }
-                // Only enqueue toward leader if ttl > 0, meaning this write came
-                // from a client directly to this follower (not from a leader broadcast).
-                // When ttl == 0 the leader is the sender — forwarding back creates a storm.
-                if ttl > 0 && !self.cluster.is_leader().await {
-                    let leader_addr = self.cluster.get_leader_addr().await;
-                    let local_addr = self.cluster.local_addr();
-                    // Only enqueue if the leader is a different node (not us).
-                    if leader_addr.map(|a| a != local_addr).unwrap_or(true) {
-                        let mut queue = self.leader_forward_queue.lock().await;
-                        // Deduplicate: replace any existing entry for the same file_id
-                        // so only the latest snapshot is in-flight.
-                        queue.retain(|(m, _)| m.id != metadata.id);
-                        queue.push_back((metadata.clone(), std::time::Instant::now()));
-                        self.leader_forward_notify.notify_one();
+        // Update in-memory state immediately, then hand the sled write to the
+        // dedicated worker so we never block an async thread on sled I/O.
+        // Under a 5000-file touch storm the leader broadcasts ~20k RPCs; without
+        // this, every follower's Tokio runtime stalls on concurrent sled writes.
+        self.chunk_map_update(&metadata).await;
+        let _ = self.sled_write_tx.send(metadata.clone());
+
+        // TTL>0: forward to all other nodes with ttl-1 so every node gets
+        // every write regardless of which node the client contacted first.
+        if ttl > 0 {
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            let local_id = self.cluster.local_node_id();
+            let metadata_clone = metadata.clone();
+            let sem = self.broadcast_semaphore.clone();
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok();
+                let nodes = cluster.get_all_nodes().await;
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let req = Request::ReplicateMetadata { metadata: metadata_clone.clone(), ttl: ttl - 1 };
+                    if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
+                        warn!("TTL forward ReplicateMetadata to {} failed: {}", node.id, e);
                     }
                 }
-                debug!("Successfully replicated metadata for {}", metadata.path);
-                Response::Ok { data: None }
-            }
-            Err(e) => {
-                warn!("Failed to replicate metadata: {}", e);
-                Response::Error {
-                    message: format!("Failed to replicate metadata: {}", e),
-                    code: ErrorCode::InternalError,
-                }
+            });
+        }
+        // Only enqueue toward leader if ttl > 0, meaning this write came
+        // from a client directly to this follower (not from a leader broadcast).
+        // When ttl == 0 the leader is the sender — forwarding back creates a storm.
+        if ttl > 0 && !self.cluster.is_leader().await {
+            let leader_addr = self.cluster.get_leader_addr().await;
+            let local_addr = self.cluster.local_addr();
+            // Only enqueue if the leader is a different node (not us).
+            if leader_addr.map(|a| a != local_addr).unwrap_or(true) {
+                let mut queue = self.leader_forward_queue.lock().await;
+                // Deduplicate: replace any existing entry for the same file_id
+                // so only the latest snapshot is in-flight.
+                queue.retain(|(m, _)| m.id != metadata.id);
+                queue.push_back((metadata.clone(), std::time::Instant::now()));
+                self.leader_forward_notify.notify_one();
             }
         }
+        debug!("Successfully replicated metadata for {}", metadata.path);
+        Response::Ok { data: None }
     }
 
     /// Handle delete metadata replication (internal cluster operation)
@@ -1527,26 +1522,11 @@ impl Server {
 
     async fn handle_replicate_metadata_batch(&self, items: Vec<FileMetadata>) -> Response {
         debug!("Handling batch replicate of {} metadata items", items.len());
-        let mut failed = 0usize;
         for metadata in &items {
-            match self.metadata.put_file(metadata) {
-                Ok(_) => {
-                    self.chunk_map_update(metadata).await;
-                }
-                Err(e) => {
-                    warn!("Failed to replicate metadata '{}': {}", metadata.path, e);
-                    failed += 1;
-                }
-            }
+            self.chunk_map_update(metadata).await;
+            let _ = self.sled_write_tx.send(metadata.clone());
         }
-        if failed == 0 {
-            Response::Ok { data: None }
-        } else {
-            Response::Error {
-                message: format!("Failed to replicate {}/{} metadata items", failed, items.len()),
-                code: ErrorCode::InternalError,
-            }
-        }
+        Response::Ok { data: None }
     }
 
     /// Handle prefetch hint - warm cache with requested chunks (best-effort, low priority)
@@ -2317,21 +2297,26 @@ impl Server {
 
                 debug!("[META GOSSIP] broadcasting {} recent writes to {} peers", batch.len(), targets.len());
 
+                // Send all gossip items to each peer in a single DisseminateMetadata RPC
+                // (up_to_sequence=0 sentinel so followers don't bump their sequence bookkeeping).
+                // Previously each item was a separate spawn+connection — 512 items × 4 peers =
+                // 2048 concurrent connections, filling followers' MAX_CONNECTIONS=128 semaphore
+                // and causing health-check failures. One batch RPC per peer fixes this.
                 for addr in targets {
-                    for metadata in &batch {
-                        // TTL=0: recipient stores and does NOT rebroadcast.
-                        let req = dfs_common::Request::ReplicateMetadata {
-                            metadata: metadata.clone(),
-                            ttl: 0,
-                        };
-                        let client = server.client.clone();
-                        tokio::spawn(async move {
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                client.send_message(addr, dfs_common::Message::Request(req)),
-                            ).await;
+                    let client = server.client.clone();
+                    let batch_clone = batch.clone();
+                    let sem = server.broadcast_semaphore.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await.ok();
+                        let req = dfs_common::Message::Request(dfs_common::Request::DisseminateMetadata {
+                            items: batch_clone,
+                            up_to_sequence: 0, // sentinel: don't advance follower sequence
                         });
-                    }
+                        let _ = tokio::time::timeout(
+                            tokio::time::Duration::from_secs(5),
+                            client.send_message(addr, req),
+                        ).await;
+                    });
                 }
             }
         });
@@ -2495,42 +2480,69 @@ impl Server {
     /// sends its newer version back to the leader to converge the cluster.
     async fn handle_disseminate_metadata(&self, items: Vec<FileMetadata>, up_to_sequence: u64) -> Response {
         debug!("Handling disseminate metadata: {} items up to seq={}", items.len(), up_to_sequence);
-        let mut failed = 0usize;
-        let mut corrections: Vec<FileMetadata> = Vec::new();
 
-        for metadata in &items {
-            // Tombstone check: if this node already processed a delete for this file,
-            // reject the disseminated create/update rather than resurrecting it.
-            // Without this, a follower that was offline during a delete receives the
-            // file via catch-up dissemination, writes it, and then the corrections path
-            // pushes it back to the leader — resurrecting a deleted file cluster-wide.
-            if self.delete_tombstones.contains_key(&metadata.id) {
-                debug!("disseminate: tombstone-reject path={} id={}", metadata.path, metadata.id);
-                continue;
+        // Pre-filter tombstoned items on the async thread (DashMap lookup is cheap).
+        let tombstones = self.delete_tombstones.clone();
+        let live_items: Vec<FileMetadata> = items.into_iter().filter(|m| {
+            if tombstones.contains_key(&m.id) {
+                debug!("disseminate: tombstone-reject path={} id={}", m.path, m.id);
+                false
+            } else {
+                true
             }
+        }).collect();
 
-            match self.metadata.put_file(metadata) {
-                Ok(crate::metadata::PutFileResult::Stored) => {
-                    self.chunk_map_update(metadata).await;
-                }
-                Ok(crate::metadata::PutFileResult::Stale(newer)) => {
-                    // Follower has a newer version — queue it to send back to leader.
-                    debug!(
-                        "disseminate: follower has newer write_seq={} for {}, will correct leader",
-                        newer.write_seq, newer.path
-                    );
-                    corrections.push(newer);
-                }
-                Err(e) => {
-                    warn!("disseminate: failed to store '{}': {}", metadata.path, e);
-                    failed += 1;
+        // Run all sled writes in spawn_blocking so we never block the async runtime.
+        // Under a write storm the 5000-item batch would otherwise stall the follower.
+        let meta_store = self.metadata.clone();
+        let block_result = tokio::task::spawn_blocking(move || {
+            let mut stored: Vec<FileMetadata> = Vec::new();
+            let mut corrections: Vec<FileMetadata> = Vec::new();
+            let mut failed = 0usize;
+            for metadata in &live_items {
+                match meta_store.put_file(metadata) {
+                    Ok(crate::metadata::PutFileResult::Stored) => {
+                        stored.push(metadata.clone());
+                    }
+                    Ok(crate::metadata::PutFileResult::Stale(newer)) => {
+                        debug!(
+                            "disseminate: follower has newer write_seq={} for {}, will correct leader",
+                            newer.write_seq, newer.path
+                        );
+                        corrections.push(newer);
+                    }
+                    Err(e) => {
+                        warn!("disseminate: failed to store '{}': {}", metadata.path, e);
+                        failed += 1;
+                    }
                 }
             }
+            // Record follower sequence inside spawn_blocking to keep it off the async thread.
+            (stored, corrections, failed)
+        }).await;
+
+        let (stored, corrections, failed) = match block_result {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("disseminate: spawn_blocking panicked: {}", e);
+                return Response::Error {
+                    message: "disseminate: internal error".to_string(),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        };
+
+        // Update in-memory chunk map for stored items (cheap, async-safe).
+        for metadata in &stored {
+            self.chunk_map_update(metadata).await;
         }
 
         // Record the highest sequence we've received.
-        if let Err(e) = self.metadata.set_follower_sequence(up_to_sequence) {
-            warn!("disseminate: failed to record follower sequence {}: {}", up_to_sequence, e);
+        // up_to_sequence=0 is the gossip sentinel — don't overwrite the real sequence.
+        if up_to_sequence > 0 {
+            if let Err(e) = self.metadata.set_follower_sequence(up_to_sequence) {
+                warn!("disseminate: failed to record follower sequence {}: {}", up_to_sequence, e);
+            }
         }
 
         // Send corrections back to leader in the background — don't block the response.

@@ -1307,8 +1307,12 @@ impl FlushHandle {
                             meta_entry.size = meta_entry.size.max(new_size);
                         }
                     }
-                    // Commit metadata to leader FIRST, then update read engine, THEN remove slot.
-                    // This ordering prevents race where reads fall through to network with stale chunk_map.
+                    // Update read engine, THEN remove slot.
+                    // Do NOT call flush_metadata_sync here — flush_all_pipelined does a single
+                    // final sync after ALL chunks are done. Calling it per-chunk causes a race:
+                    // concurrent patches for chunks 0/1/2 each read metadata_cache mid-flight
+                    // and the highest-seq write wins in the queue dedup, potentially recording
+                    // stale chunk_ids for chunks whose patch hadn't updated metadata_cache yet.
                     let (flushed_len, meta_to_persist) = {
                         if let Some(state_arc) = self.write_buffers.get(&ino) {
                             let state = state_arc.lock().await;
@@ -1319,8 +1323,6 @@ impl FlushHandle {
                         }
                     };
                     if let Some(meta) = meta_to_persist {
-                        self.client.flush_metadata_sync(&meta).await;
-                        self.last_metadata_update.insert(ino, std::time::Instant::now());
                         self.client.feed_chunk_locations_to_read_engine(
                             ino, &meta.chunk_locations, meta.size,
                         ).await;

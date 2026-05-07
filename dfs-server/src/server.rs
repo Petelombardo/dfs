@@ -2138,18 +2138,28 @@ impl Server {
             }
             Ok(result) => match result {
             Ok(Some(mut metadata)) => {
+                // Always prefer the in-memory chunk_map over sled for chunk_locations.
+                // The sled write worker is async — reads immediately after a write will
+                // hit sled before the worker commits, returning stale chunk IDs (T7/T20).
+                // The chunk_map is updated synchronously in handle_put_file_metadata
+                // before the client gets its Ok response, so it's always current.
+                if let Some(entry) = self.chunk_map.get(&metadata.id) {
+                    let (map_locs, map_modified_at) = entry.value();
+                    if !map_locs.is_empty() {
+                        metadata.chunk_locations = map_locs.clone();
+                        if *map_modified_at > metadata.modified_at {
+                            metadata.modified_at = *map_modified_at;
+                        }
+                    }
+                }
+
                 // Check if client has provided if_modified_since timestamp
                 if let Some(cached_timestamp) = if_modified_since {
-                    // Return NotModified if metadata hasn't changed
                     if metadata.modified_at <= cached_timestamp {
                         debug!("Metadata not modified for {}: {} <= {}", path, metadata.modified_at, cached_timestamp);
                         return Response::NotModified;
                     }
                 }
-
-                // DO NOT backfill chunk_locations here - it causes massive metadata bloat
-                // Instead, let client query chunk locations on-demand or use replica cache
-                // The "No chunk_locations" warnings are expected for legacy files and handled gracefully
 
                 Response::FileMetadata { metadata }
             }

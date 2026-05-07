@@ -516,6 +516,13 @@ pub struct DfsClient {
     /// Per-inode read engines.  Each open file gets one engine that holds the chunk map
     /// snapshot and pipeline state.  Writers never touch this; engines refresh lazily.
     pub read_engines: ReadEngineMap,
+
+    /// Recently-patched chunk IDs keyed by (inode, chunk_idx).
+    /// Written after every successful PatchChunk/MultiPatch so the next write to the same
+    /// slot can bypass a full GetFileMetadata round-trip and go straight to a single-chunk
+    /// GetFileChunkMap on failure — or use the cached id directly on the happy path.
+    /// TTL is enforced by comparing the stored Instant against a 10s window at read time.
+    pub recent_chunk_writes: Arc<DashMap<(u64, u64), (ChunkId, FileId, Instant)>>,
 }
 
 impl DfsClient {
@@ -657,6 +664,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             metadata_queue: MetadataQueue::new(),
             write_seq: Arc::new(DashMap::new()),
             read_engines: ReadEngineMap::new(),
+            recent_chunk_writes: Arc::new(DashMap::new()),
         })
     }
 
@@ -2801,6 +2809,50 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
+    /// Fetch a chunk from one of its known replicas, apply patches, return the patched
+    /// bytes and the new ChunkId. Used by the flush path to pre-compute the post-patch
+    /// hash client-side so MultiPatch can skip its server-side read-back entirely.
+    /// Returns None if the replica fetch fails (caller falls back to server read-back).
+    pub async fn fetch_and_patch_chunk(
+        &self,
+        location: &dfs_common::ChunkLocation,
+        file_offset: u64,
+        patches: &[(usize, Vec<u8>)],
+    ) -> Option<(ChunkId, Vec<u8>)> {
+        let addr = {
+            let addr_map = self.addr_to_node_id.read().await;
+            let id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> =
+                addr_map.iter().map(|(&a, &id)| (id, a)).collect();
+            location.nodes.iter().find_map(|nid| id_to_addr.get(nid).copied())
+        }?;
+        let base = self.read_chunk_from_server(addr, location.chunk_id).await.ok()?;
+        let mut patched: Vec<u8> = base;
+        for (intra, data) in patches {
+            let end = intra + data.len();
+            if end > patched.len() {
+                patched.resize(end, 0u8);
+            }
+            patched[*intra..end].copy_from_slice(data);
+        }
+        let new_hash = dfs_common::compute_chunk_hash_at(&patched, file_offset);
+        let new_cid = ChunkId::from_hash(new_hash);
+        Some((new_cid, patched))
+    }
+
+    /// Remove all recent_chunk_writes entries for an inode.
+    /// Call this wherever write_buffers is removed (release, unlink, rename, truncate).
+    pub fn evict_recent_chunk_writes(&self, ino: u64) {
+        self.recent_chunk_writes.retain(|k, _| k.0 != ino);
+    }
+
+    /// Fetch a single ChunkLocation from the leader by (file_id, chunk_idx).
+    /// Uses GetFileChunkMap with count=1 — one in-memory map lookup on the server,
+    /// no full metadata scan. Call this on patch failure instead of get_file_metadata.
+    pub async fn get_single_chunk_location(&self, file_id: FileId, chunk_idx: u64) -> Result<Option<dfs_common::ChunkLocation>> {
+        let (locations, _, _, _) = self.get_file_chunk_map(file_id, chunk_idx as u32, 1).await?;
+        Ok(locations.into_iter().next())
+    }
+
     /// Select one replica from a list using round-robin for load balancing.
     /// Penalized nodes are moved to the back so healthy nodes are preferred.
     async fn select_replica(&self, replicas: &[SocketAddr]) -> Option<SocketAddr> {
@@ -3011,7 +3063,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             let envelope = MessageEnvelope::new(request_id, Message::Request(request.clone()));
             let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
-            // Send request and read response with 3-second timeout
+            // Send request and read full response (envelope + split-frame payload) under
+            // one deadline. Previously the timeout only covered the envelope header, leaving
+            // the split-frame 4MB payload read unbounded — causing indefinite hangs when the
+            // server was slow under concurrent write load (T19 regression).
             let io_future = async {
                 // Send request
                 let len = encoded.len() as u32;
@@ -3019,81 +3074,76 @@ leader_addr: Arc::new(RwLock::new(None)),
                 stream.write_all(&encoded).await?;
                 stream.flush().await?;
 
-                // Read response
+                // Read envelope
                 let mut len_buf = [0u8; 4];
                 stream.read_exact(&mut len_buf).await?;
                 let len = u32::from_be_bytes(len_buf) as usize;
-
                 let mut buf = vec![0u8; len];
                 stream.read_exact(&mut buf).await?;
 
-                Ok::<(TcpStream, Vec<u8>), std::io::Error>((stream, buf))
+                // Deserialize and read split-frame payload inside the deadline.
+                let response_envelope = MessageEnvelope::from_bytes(&buf)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let (data, cache_stats) = match response_envelope.message {
+                    Message::Response(Response::ChunkData { data, cache_stats, .. }) => {
+                        let data = if data.is_empty() {
+                            dfs_common::protocol::read_chunk_payload(&mut stream).await?
+                        } else {
+                            data
+                        };
+                        (data, cache_stats)
+                    }
+                    Message::Response(Response::Error { message, .. }) => {
+                        return Err(std::io::Error::new(std::io::ErrorKind::Other, message));
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unexpected response"));
+                    }
+                };
+
+                Ok::<(TcpStream, Vec<u8>, _), std::io::Error>((stream, data, cache_stats))
             };
 
             let result = tokio::time::timeout(
-                tokio::time::Duration::from_secs(1),
+                tokio::time::Duration::from_secs(10),
                 io_future
             ).await;
 
             let result = match result {
                 Ok(r) => r,
-                Err(_) => {
-                    // Timeout occurred
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("Timeout reading chunk from {}", server_addr)
-                    ))
-                }
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Timeout reading chunk from {}", server_addr)
+                )),
             };
 
             match result {
-                Ok((mut stream, buf)) => {
-                    // Deserialize envelope first (before returning stream to pool).
-                    let response_envelope = MessageEnvelope::from_bytes(&buf)
-                        .context("Failed to deserialize response")?;
-
-                    match response_envelope.message {
-                        Message::Response(Response::ChunkData { data, cache_stats, .. }) => {
-                            // Split-frame: read raw payload before returning stream to pool.
-                            let data = if data.is_empty() {
-                                dfs_common::protocol::read_chunk_payload(&mut stream).await
-                                    .context("read split-frame chunk payload")?
-                            } else {
-                                data
-                            };
-
-                            // Return connection to pool now that we've drained all bytes.
-                            // Clone Arc out before .await to avoid holding DashMap shard lock.
-                            {
-                                let mutex = {
-                                    let entry = self.connection_pool
-                                        .entry(server_addr)
-                                        .or_insert_with(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
-                                    Arc::clone(&*entry)
-                                };
-                                let mut queue = mutex.lock().await;
-                                if queue.len() < 8 {
-                                    queue.push_back(stream);
-                                }
-                            }
-
-                            // Flow control: Check server cache pressure and throttle if needed
-                            if let Some((_, capacity, size)) = cache_stats {
-                                let utilization = (size as f64 / capacity as f64) * 100.0;
-                                if utilization > 90.0 {
-                                    let sleep_ms = ((utilization - 90.0) * 2.0) as u64;
-                                    debug!("Server {} cache pressure: {:.1}% ({}/{}), throttling {}ms",
-                                           server_addr, utilization, size, capacity, sleep_ms);
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
-                                }
-                            }
-                            return Ok(data);
-                        },
-                        Message::Response(Response::Error { message, .. }) => {
-                            anyhow::bail!("Server error: {}", message);
+                Ok((mut stream, data, cache_stats)) => {
+                    // Return connection to pool now that we've drained all bytes.
+                    {
+                        let mutex = {
+                            let entry = self.connection_pool
+                                .entry(server_addr)
+                                .or_insert_with(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
+                            Arc::clone(&*entry)
+                        };
+                        let mut queue = mutex.lock().await;
+                        if queue.len() < 8 {
+                            queue.push_back(stream);
                         }
-                        _ => anyhow::bail!("Unexpected response type"),
                     }
+
+                    // Flow control: throttle if server cache is under pressure.
+                    if let Some((_, capacity, size)) = cache_stats {
+                        let utilization = (size as f64 / capacity as f64) * 100.0;
+                        if utilization > 90.0 {
+                            let sleep_ms = ((utilization - 90.0) * 2.0) as u64;
+                            debug!("Server {} cache pressure: {:.1}% ({}/{}), throttling {}ms",
+                                   server_addr, utilization, size, capacity, sleep_ms);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
+                        }
+                    }
+                    return Ok(data);
                 }
                 Err(e) => {
                     // Connection failed - don't return to pool

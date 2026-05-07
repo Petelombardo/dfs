@@ -508,7 +508,25 @@ impl FlushHandle {
                       chunk_idx, slot_len, patch_intra, patch_bytes.len());
                 let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
                 let patched = if let Some(meta) = meta {
-                    let old_location_opt = meta.chunk_location_for_idx(*chunk_idx).cloned();
+                    let file_id_legacy = meta.id;
+                    // Check recent_chunk_writes before using metadata_cache location.
+                    let old_location_opt = {
+                        let cached_loc = meta.chunk_location_for_idx(*chunk_idx).cloned();
+                        let recent = self.client.recent_chunk_writes.get(&(ino, *chunk_idx))
+                            .filter(|r| {
+                                let (_, fid, ts) = r.value();
+                                *fid == file_id_legacy && ts.elapsed().as_secs() < 10
+                            })
+                            .map(|r| r.value().0);
+                        match (cached_loc, recent) {
+                            (Some(mut loc), Some(recent_id)) if recent_id != loc.chunk_id => {
+                                loc.chunk_id = recent_id;
+                                loc.checksum = recent_id.hash;
+                                Some(loc)
+                            }
+                            (loc, _) => loc,
+                        }
+                    };
                     if let Some(old_location) = old_location_opt {
                         // Stale-write guard: discard if another session patched this chunk after our open().
                         let id_at_open = self.write_buffers.get(&ino)
@@ -531,41 +549,30 @@ impl FlushHandle {
                         let patch_result = match patch_result {
                             Ok(loc) => Ok(loc),
                             Err(e) => {
-                                // PatchChunk failed — the replica locations in our cache may be
-                                // stale (chunk was healed to different nodes since we last fetched
-                                // metadata). Re-fetch from the leader and retry once before giving
-                                // up. This prevents the catastrophic fallback where we write a new
-                                // 12KB standalone chunk that overwrites the chunk map entry for an
-                                // existing multi-GB file.
-                                warn!("flush_buffer_async: PatchChunk failed for slot {} ({}), re-fetching metadata and retrying", chunk_idx, e);
-                                let path_opt = self.path_to_inode.read().unwrap()
-                                    .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
-                                if let Some(path) = path_opt {
-                                    match self.client.get_file_metadata(&path).await {
-                                        Ok(Some(fresh_meta)) => {
-                                            self.client.seed_write_seq(fresh_meta.id, fresh_meta.write_seq);
-                                            if let Some(fresh_loc) = fresh_meta.chunk_location_for_idx(*chunk_idx).cloned() {
-                                                info!("flush_buffer_async: retrying PatchChunk slot {} with fresh location {} (was {})",
-                                                      chunk_idx, fresh_loc.chunk_id, old_location.chunk_id);
-                                                let retry = self.client.patch_chunk_on_replicas(
-                                                    fresh_loc.chunk_id,
-                                                    file_offset,
-                                                    patch_intra,
-                                                    patch_bytes.clone(),
-                                                    &fresh_loc,
-                                                ).await;
-                                                // Update cache with fresh metadata regardless of retry outcome
-                                                self.metadata_cache.insert(ino, fresh_meta);
-                                                retry
-                                            } else {
-                                                self.metadata_cache.insert(ino, fresh_meta);
-                                                Err(e)
+                                // PatchChunk failed — fetch just this chunk's location from the
+                                // leader (single in-memory map lookup) instead of the full metadata.
+                                warn!("flush_buffer_async: PatchChunk failed for slot {} ({}), fetching single chunk location", chunk_idx, e);
+                                match self.client.get_single_chunk_location(file_id_legacy, *chunk_idx).await {
+                                    Ok(Some(fresh_loc)) if fresh_loc.chunk_id != old_location.chunk_id => {
+                                        info!("flush_buffer_async: retrying PatchChunk slot {} with fresh location {} (was {})",
+                                              chunk_idx, fresh_loc.chunk_id, old_location.chunk_id);
+                                        if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                                            if let Some(existing) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
+                                                *existing = fresh_loc.clone();
                                             }
                                         }
-                                        Ok(None) | Err(_) => Err(e),
+                                        self.client.patch_chunk_on_replicas(
+                                            fresh_loc.chunk_id,
+                                            file_offset,
+                                            patch_intra,
+                                            patch_bytes.clone(),
+                                            &fresh_loc,
+                                        ).await
                                     }
-                                } else {
-                                    Err(e)
+                                    Ok(Some(loc)) => self.client.patch_chunk_on_replicas(
+                                        loc.chunk_id, file_offset, patch_intra, patch_bytes.clone(), &loc,
+                                    ).await,
+                                    Ok(None) | Err(_) => Err(e),
                                 }
                             }
                         };
@@ -574,6 +581,11 @@ impl FlushHandle {
                             Ok(new_location) => {
                                 info!("flush_buffer_async: PatchChunk slot {} succeeded: {} -> {}",
                                       chunk_idx, old_location.chunk_id, new_location.chunk_id);
+                                // Record the new chunk_id for fast lookup on the next write.
+                                self.client.recent_chunk_writes.insert(
+                                    (ino, *chunk_idx),
+                                    (new_location.chunk_id, file_id_legacy, std::time::Instant::now()),
+                                );
                                 // Evict the old chunk_id — the file at that hash path has been
                                 // renamed away on the server. Any cached entry for it would cause
                                 // an I/O error on the next read. The new chunk_id will be fetched
@@ -619,41 +631,50 @@ impl FlushHandle {
                         // fall through to a fresh write that appends a duplicate tail entry
                         // instead of patching the existing one, producing hundreds of spurious
                         // partial chunk_location records that break Kodi seekability.
-                        warn!("flush_buffer_async: no chunk_location for slot {} in local cache — fetching fresh metadata before deciding", chunk_idx);
-                        let path_opt = self.path_to_inode.read().unwrap()
-                            .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                        // chunk_location missing in local cache — fetch just this slot from the leader.
+                        warn!("flush_buffer_async: no chunk_location for slot {} in local cache — fetching single chunk location", chunk_idx);
                         let mut refreshed = false;
-                        if let Some(path) = path_opt {
-                            if let Ok(Some(fresh_meta)) = self.client.get_file_metadata(&path).await {
-                                self.client.seed_write_seq(fresh_meta.id, fresh_meta.write_seq);
-                                let fresh_loc = fresh_meta.chunk_location_for_idx(*chunk_idx).cloned();
-                                self.metadata_cache.insert(ino, fresh_meta);
-                                if let Some(old_location) = fresh_loc {
-                                    info!("flush_buffer_async: retrying PatchChunk slot {} after cache refresh (loc={})", chunk_idx, old_location.chunk_id);
-                                    let retry = self.client.patch_chunk_on_replicas(
-                                        old_location.chunk_id,
-                                        file_offset,
-                                        patch_intra,
-                                        patch_bytes.clone(),
-                                        &old_location,
-                                    ).await;
-                                    match retry {
-                                        Ok(new_location) => {
-                                            info!("flush_buffer_async: PatchChunk slot {} succeeded after cache refresh: {} -> {}",
-                                                  chunk_idx, old_location.chunk_id, new_location.chunk_id);
-                                            if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
-                                                if let Some(loc) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
-                                                    *loc = new_location.clone();
-                                                }
-                                            }
-                                            patch_metadata_dirty = true;
-                                            refreshed = true;
-                                        }
-                                        Err(e) => {
-                                            warn!("flush_buffer_async: PatchChunk slot {} failed after cache refresh: {}", chunk_idx, e);
-                                        }
+                        match self.client.get_single_chunk_location(file_id_legacy, *chunk_idx).await {
+                            Ok(Some(old_location)) => {
+                                info!("flush_buffer_async: retrying PatchChunk slot {} after single-chunk fetch (loc={})", chunk_idx, old_location.chunk_id);
+                                if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                                    if let Some(existing) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
+                                        *existing = old_location.clone();
                                     }
                                 }
+                                let retry = self.client.patch_chunk_on_replicas(
+                                    old_location.chunk_id,
+                                    file_offset,
+                                    patch_intra,
+                                    patch_bytes.clone(),
+                                    &old_location,
+                                ).await;
+                                match retry {
+                                    Ok(new_location) => {
+                                        info!("flush_buffer_async: PatchChunk slot {} succeeded after single-chunk fetch: {} -> {}",
+                                              chunk_idx, old_location.chunk_id, new_location.chunk_id);
+                                        self.client.recent_chunk_writes.insert(
+                                            (ino, *chunk_idx),
+                                            (new_location.chunk_id, file_id_legacy, std::time::Instant::now()),
+                                        );
+                                        if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                                            if let Some(loc) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
+                                                *loc = new_location.clone();
+                                            }
+                                        }
+                                        patch_metadata_dirty = true;
+                                        refreshed = true;
+                                    }
+                                    Err(e) => {
+                                        warn!("flush_buffer_async: PatchChunk slot {} failed after single-chunk fetch: {}", chunk_idx, e);
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                warn!("flush_buffer_async: slot {} not found on leader — treating as new chunk", chunk_idx);
+                            }
+                            Err(e) => {
+                                warn!("flush_buffer_async: single-chunk fetch failed for slot {}: {}", chunk_idx, e);
                             }
                         }
                         refreshed
@@ -1081,7 +1102,31 @@ impl FlushHandle {
             };
             let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
             if let Some(meta) = meta {
-                if let Some(old_location) = meta.chunk_location_for_idx(chunk_idx).cloned() {
+                // Before using the cached location, check if recent_chunk_writes has a
+                // fresher chunk_id for this (ino, chunk_idx) — this happens when consecutive
+                // writes to the same chunk arrive faster than metadata_cache is updated.
+                // The leader already has the new id (we sent it synchronously); using it
+                // avoids both a stale-base rejection and a round-trip on the first attempt.
+                let old_location = {
+                    let cached_loc = meta.chunk_location_for_idx(chunk_idx).cloned();
+                    let recent = self.client.recent_chunk_writes.get(&(ino, chunk_idx))
+                        .filter(|r| {
+                            let (_, fid, ts) = r.value();
+                            *fid == meta.id && ts.elapsed().as_secs() < 10
+                        })
+                        .map(|r| r.value().0);
+                    match (cached_loc, recent) {
+                        (Some(mut loc), Some(recent_id)) if recent_id != loc.chunk_id => {
+                            info!("flush_buffer_async_one: ino={} chunk={} using recent_chunk_writes id {} (cache had {})",
+                                ino, chunk_idx, recent_id, loc.chunk_id);
+                            loc.chunk_id = recent_id;
+                            loc.checksum = recent_id.hash;
+                            Some(loc)
+                        }
+                        (loc, _) => loc,
+                    }
+                };
+                if let Some(old_location) = old_location {
                     // Stale-write guard: if another session already patched this chunk
                     // between our open() and now, the current chunk_id will differ from
                     // what we snapshotted at open time. Our write buffer contains bytes
@@ -1107,15 +1152,15 @@ impl FlushHandle {
                     // Try to compute the post-patch hash locally so the server can skip
                     // its read-back pass entirely (write patches + rename, no read).
                     //
-                    // We have two sources for the full pre-patch chunk content:
-                    //   1. chunk_cache — warm if this chunk was recently read
-                    //   2. slot_data — always available, but only covers the dirty ranges
-                    //      plus gap-fill zeros; it may not reflect bytes the server has
-                    //      beyond real_data_end that we never loaded into the buffer.
-                    //
-                    // We use the cache hit path: apply the same patches to the cached
-                    // bytes, compute the hash, update the cache with the new entry.
-                    // Cache miss: pass None and let the server do the read-back.
+                    // Three sources for the full pre-patch chunk content, tried in order:
+                    //   1. chunk_cache — free if warm (recently read)
+                    //   2. Fetch from a replica — one network read of ~4MB, but eliminates
+                    //      the server read-back on *each* replica (net win for RF>=2).
+                    //      This is the key fix for "chunk evicted by the time we exit":
+                    //      chunk 0 of a fully-watched recording is always cold, so we'd
+                    //      previously pass None and pay a read-back per replica. Now we do
+                    //      one fetch here instead.
+                    //   3. None — only if the replica fetch also fails; server falls back.
                     let expected_new_chunk_id = {
                         let cached = self.client.chunk_cache.get(&old_location.chunk_id).await;
                         if let Some(cached_arc) = cached {
@@ -1129,12 +1174,24 @@ impl FlushHandle {
                             }
                             let new_hash = dfs_common::compute_chunk_hash_at(&patched, file_offset);
                             let new_cid = ChunkId::from_hash(new_hash);
-                            // Update cache: evict old entry, insert patched bytes under new id.
                             self.client.chunk_cache.invalidate(&old_location.chunk_id).await;
                             self.client.chunk_cache.insert(new_cid, std::sync::Arc::new(patched)).await;
                             Some(new_cid)
                         } else {
-                            None
+                            // Cache miss — fetch the chunk from one replica so we can
+                            // compute the hash client-side. One read here replaces one
+                            // read per replica that the server would otherwise do.
+                            match self.client.fetch_and_patch_chunk(&old_location, file_offset, &patches).await {
+                                Some((new_cid, patched)) => {
+                                    self.client.chunk_cache.invalidate(&old_location.chunk_id).await;
+                                    self.client.chunk_cache.insert(new_cid, std::sync::Arc::new(patched)).await;
+                                    Some(new_cid)
+                                }
+                                None => {
+                                    debug!("flush_buffer_async_one: ino={} chunk={} replica fetch for pre-hash failed, server will read-back", ino, chunk_idx);
+                                    None
+                                }
+                            }
                         }
                     };
 
@@ -1143,24 +1200,93 @@ impl FlushHandle {
                     let patch_result = self.client.multi_patch_chunk_on_replicas(
                         old_location.chunk_id,
                         file_offset,
-                        patches,
+                        patches.clone(),
                         &old_location,
                         expected_new_chunk_id,
                     ).await;
                     let new_location = match patch_result {
                         Ok(loc) => loc,
                         Err(e) => {
-                            warn!("flush_buffer_async_one: MultiPatch failed for ino={} chunk={}: {}", ino, chunk_idx, e);
-                            if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                if let Ok(mut state) = state_arc.try_lock() {
-                                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
-                                        slot.flushing = false;
+                            // MultiPatch failed — the chunk_id in our cache (or recent_chunk_writes)
+                            // is stale. Rather than fetching the full file metadata, ask the leader
+                            // for just this one chunk's current location. One in-memory map lookup,
+                            // no full metadata scan, no Vec<ChunkLocation> allocation for a 2GB file.
+                            warn!("flush_buffer_async_one: MultiPatch failed for ino={} chunk={} ({}), fetching single chunk location from leader", ino, chunk_idx, e);
+                            let fresh_loc = if let Some(file_id) = file_id_at_flush_start {
+                                match self.client.get_single_chunk_location(file_id, chunk_idx).await {
+                                    Ok(Some(loc)) if loc.chunk_id != old_location.chunk_id => {
+                                        info!("flush_buffer_async_one: got fresh chunk_id {} for ino={} chunk={} (was {})",
+                                            loc.chunk_id, ino, chunk_idx, old_location.chunk_id);
+                                        // Update metadata_cache so the next flush uses the correct id.
+                                        if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                                            if let Some(existing) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
+                                                *existing = loc.clone();
+                                            }
+                                        }
+                                        Some(loc)
+                                    }
+                                    Ok(Some(loc)) => Some(loc),
+                                    Ok(None) => None,
+                                    Err(fetch_err) => {
+                                        warn!("flush_buffer_async_one: single-chunk fetch failed for ino={} chunk={}: {}", ino, chunk_idx, fetch_err);
+                                        None
                                     }
                                 }
+                            } else {
+                                None
+                            };
+
+                            match fresh_loc {
+                                Some(loc) => {
+                                    // Retry the patch with the authoritative location.
+                                    match self.client.multi_patch_chunk_on_replicas(
+                                        loc.chunk_id,
+                                        file_offset,
+                                        patches,
+                                        &loc,
+                                        None, // chunk_cache was evicted above; let server hash
+                                    ).await {
+                                        Ok(retry_loc) => {
+                                            info!("flush_buffer_async_one: retry MultiPatch succeeded for ino={} chunk={}: {} -> {}",
+                                                ino, chunk_idx, loc.chunk_id, retry_loc.chunk_id);
+                                            retry_loc
+                                        }
+                                        Err(retry_err) => {
+                                            warn!("flush_buffer_async_one: retry MultiPatch failed for ino={} chunk={}: {}", ino, chunk_idx, retry_err);
+                                            if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                                if let Ok(mut state) = state_arc.try_lock() {
+                                                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                                        slot.flushing = false;
+                                                    }
+                                                }
+                                            }
+                                            return Err(retry_err);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                        if let Ok(mut state) = state_arc.try_lock() {
+                                            if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                                slot.flushing = false;
+                                            }
+                                        }
+                                    }
+                                    return Err(e);
+                                }
                             }
-                            return Err(e);
                         }
                     };
+
+                    // Record the new chunk_id so the next flush of this slot (or rapid
+                    // successive writes) can use it directly without a metadata round-trip.
+                    if let Some(file_id) = file_id_at_flush_start {
+                        self.client.recent_chunk_writes.insert(
+                            (ino, chunk_idx),
+                            (new_location.chunk_id, file_id, std::time::Instant::now()),
+                        );
+                    }
+
                     if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
                         if file_id_at_flush_start.map(|id| id != meta_entry.id).unwrap_or(false) {
                             info!("flush_buffer_async_one: ino={} chunk={} file replaced during patch flush — discarding metadata update", ino, chunk_idx);
@@ -2599,6 +2725,7 @@ impl Filesystem for DfsFilesystem {
                     };
                     if safe_to_remove {
                         self.write_buffers.remove(&ino);
+                        self.client.evict_recent_chunk_writes(ino);
                     }
                     // Clear any pending truncate flag — new write session starts clean.
                     self.truncated_inodes.remove(&ino);
@@ -4436,6 +4563,7 @@ impl Filesystem for DfsFilesystem {
                         debug!("release: ino={} path={:?} deleted (pending={} path_gone={}) — skipping flush",
                                ino, release_path, is_pending_delete, path_gone);
                         write_buffers.remove(&ino);
+                        flush_handle.client.evict_recent_chunk_writes(ino);
                         if let Some(counter) = release_in_flight.get(&ino) {
                             counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -4494,6 +4622,7 @@ impl Filesystem for DfsFilesystem {
                     if !has_new_writer {
                         write_buffers.remove(&ino);
                         size_high_water_for_release.remove(&ino);
+                        flush_handle.client.evict_recent_chunk_writes(ino);
                     }
                     if let Some(owner) = lock_owner {
                         if let Err(e) = lock_manager.release_all(ino, owner).await {
@@ -4536,6 +4665,7 @@ impl Filesystem for DfsFilesystem {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
                         write_buffers.remove(&ino);
+                        flush_handle.client.evict_recent_chunk_writes(ino);
                     }
                     if let Some(owner) = lock_owner {
                         if let Err(e) = lock_manager.release_all(ino, owner).await {
@@ -4683,6 +4813,7 @@ impl Filesystem for DfsFilesystem {
             });
             if let Some(ino) = ino_opt {
                 write_buffers.remove(&ino);
+                client.evict_recent_chunk_writes(ino);
                 write_counters.write().unwrap().remove(&ino);
                 last_metadata_update.remove(&ino);
                 last_warm_offset.remove(&ino);
@@ -4844,6 +4975,7 @@ impl Filesystem for DfsFilesystem {
                     return;
                 }
                 write_buffers.remove(&old_ino);
+                client.evict_recent_chunk_writes(old_ino);
             }
 
             // If destination exists, delete it first so the server doesn't have
@@ -4964,6 +5096,7 @@ impl Filesystem for DfsFilesystem {
                     metadata.chunk_locations = Vec::new();
                     metadata.size = 0;
                     self.write_buffers.remove(&ino);
+                    self.client.evict_recent_chunk_writes(ino);
                     self.size_high_water.remove(&ino);
                     // Only set the truncated flag when there are no active writers.
                     // For O_TRUNC opens, FUSE sends open() first then setattr(size=0) — by then

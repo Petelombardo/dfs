@@ -6,7 +6,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 BASE=/tmp/dfs-test
 MOUNT=/tmp/dfs-mount
 LOG=/tmp/dfs-test-logs
-CLUSTER="127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902"
+CLUSTER="127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904"
 BIN="$REPO/target/release"
 PASS=0; FAIL=0; T=/tmp/dfs-suite-tmp-$$
 
@@ -27,9 +27,9 @@ mkdir -p $MOUNT $LOG $T
 echo "=== Building ==="
 cd "$REPO" && cargo build --release 2>&1 | tail -2
 
-echo "=== Starting 3-node cluster ==="
-bash "$REPO/scripts/setup-cluster.sh" 3 2>/dev/null
-for i in 1 2 3; do
+echo "=== Starting 5-node cluster ==="
+bash "$REPO/scripts/setup-cluster.sh" 5 2>/dev/null
+for i in 1 2 3 4 5; do
     RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
         > "$LOG/server${i}.log" 2>&1 &
 done
@@ -204,7 +204,7 @@ sleep 3  # let dissemination propagate
 
 # Verify t12_after.txt appears on all nodes with correct path
 OK=PASS
-for port in 8900 8901 8902; do
+for port in 8900 8901 8902 8903 8904; do
     LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null)
     echo "$LIST" | grep -q "t12_after.txt" || { OK=FAIL; echo "  Node $port missing t12_after.txt"; }
     echo "$LIST" | grep -q "t12_before.txt" && { OK=FAIL; echo "  Node $port still has t12_before.txt"; }
@@ -215,21 +215,22 @@ check "T14a rename paths propagated to all nodes" $OK
 
 # Verify all nodes agree on the full file list (same set of files)
 declare -A NODE_LISTS
-for port in 8900 8901 8902; do
+for port in 8900 8901 8902 8903 8904; do
     NODE_LISTS[$port]=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null \
         | grep -E "^[0-9a-f]{8}" | awk '{print $1, $2, $3}' | sort)
 done
 
-if [ "${NODE_LISTS[8900]}" = "${NODE_LISTS[8901]}" ] && [ "${NODE_LISTS[8901]}" = "${NODE_LISTS[8902]}" ]; then
-    check "T14b metadata identical on all 3 nodes" PASS
+if [ "${NODE_LISTS[8900]}" = "${NODE_LISTS[8901]}" ] && \
+   [ "${NODE_LISTS[8901]}" = "${NODE_LISTS[8902]}" ] && \
+   [ "${NODE_LISTS[8902]}" = "${NODE_LISTS[8903]}" ] && \
+   [ "${NODE_LISTS[8903]}" = "${NODE_LISTS[8904]}" ]; then
+    check "T14b metadata identical on all 5 nodes" PASS
 else
-    check "T14b metadata consistency" FAIL
-    echo "  Node 8900:"
-    echo "${NODE_LISTS[8900]}" | sed 's/^/    /'
-    echo "  Node 8901:"
-    echo "${NODE_LISTS[8901]}" | sed 's/^/    /'
-    echo "  Node 8902:"
-    echo "${NODE_LISTS[8902]}" | sed 's/^/    /'
+    check "T14b metadata identical on all 5 nodes" FAIL
+    for port in 8900 8901 8902 8903 8904; do
+        echo "  Node $port:"
+        echo "${NODE_LISTS[$port]}" | sed 's/^/    /'
+    done
 fi
 
 echo ""
@@ -523,7 +524,7 @@ T19_MD5_DFS=$(md5sum "$MOUNT/t19_large.bin" | cut -d' ' -f1)
 [ "$T19_MD5_LOCAL" = "$T19_MD5_DFS" ] && check "T19a 400MB write+read integrity" PASS \
     || check "T19a 400MB write+read integrity (exp $T19_MD5_LOCAL got $T19_MD5_DFS)" FAIL
 
-CHUNKS_BEFORE=$(find /tmp/dfs-test/node{1,2,3}/data/chunks -type f 2>/dev/null | wc -l)
+CHUNKS_BEFORE=$(find /tmp/dfs-test/node{1,2,3,4,5}/data/chunks -type f 2>/dev/null | wc -l)
 
 T19_START=$(date +%s%3N)
 rm "$MOUNT/t19_large.bin"
@@ -539,12 +540,67 @@ T19_MS=$(( $(date +%s%3N) - T19_START ))
 T19_WAITED=0
 while [ $T19_WAITED -lt 60 ]; do
     sleep 2; T19_WAITED=$((T19_WAITED + 2))
-    CHUNKS_AFTER=$(find /tmp/dfs-test/node{1,2,3}/data/chunks -type f 2>/dev/null | wc -l)
+    CHUNKS_AFTER=$(find /tmp/dfs-test/node{1,2,3,4,5}/data/chunks -type f 2>/dev/null | wc -l)
     [ "$CHUNKS_AFTER" -lt "$CHUNKS_BEFORE" ] && break
 done
 [ "$CHUNKS_AFTER" -lt "$CHUNKS_BEFORE" ] \
     && check "T19d chunks deleted from disk within ${T19_WAITED}s (${CHUNKS_BEFORE}→${CHUNKS_AFTER})" PASS \
     || check "T19d chunks not deleted after ${T19_WAITED}s (before=$CHUNKS_BEFORE after=$CHUNKS_AFTER)" FAIL
+
+# ── Test 21: metadata storm — 5000 touches, node health check, 100 more ──────
+echo ""
+echo "=== T21: metadata storm + node health ==="
+
+T21_DIR="$MOUNT/t21_storm"
+mkdir -p "$T21_DIR"
+
+# Touch 5000 files concurrently (100 at a time) — pure metadata load
+echo "  Touching 5000 files (100 concurrent)..."
+T21_ERRORS=0
+seq 1 5000 | xargs -P100 -I{} bash -c \
+    'touch "$1/f$(printf "%05d" "$2").txt" 2>/dev/null || echo FAIL' \
+    _ "$T21_DIR" {} | grep -c FAIL > /tmp/t21_touch_errors_$$ 2>/dev/null || true
+T21_TOUCH_ERRORS=$(cat /tmp/t21_touch_errors_$$ 2>/dev/null || echo 0)
+rm -f /tmp/t21_touch_errors_$$
+
+[ "$T21_TOUCH_ERRORS" -eq 0 ] \
+    && check "T21a 5000-file touch storm (0 errors)" PASS \
+    || check "T21a 5000-file touch storm ($T21_TOUCH_ERRORS errors)" FAIL
+
+# Wait 10 seconds for any deferred work (sled writes, broadcast flush, dissemination)
+echo "  Waiting 10s for cluster to settle..."
+sleep 10
+
+# Check every node directly — timeout 5s each; a hang means deadlock
+echo "  Checking health of all 5 nodes..."
+T21_HEALTH=PASS
+for port in 8900 8901 8902 8903 8904; do
+    STATUS=$(timeout 5 "$BIN/dfs-admin" --cluster "127.0.0.1:$port" cluster status 2>/dev/null \
+        | grep -c "Online" 2>/dev/null) || STATUS=0
+    STATUS=$(echo "$STATUS" | tr -d '[:space:]')
+    if [ "${STATUS:-0}" -ge 1 ] 2>/dev/null; then
+        echo "  Node $port: OK (${STATUS} online)"
+    else
+        echo "  Node $port: DEADLOCK or unresponsive"
+        T21_HEALTH=FAIL
+    fi
+done
+check "T21b all nodes responsive after storm" $T21_HEALTH
+
+# Touch 100 more files and check for any I/O errors
+echo "  Touching 100 more files post-storm..."
+T21_POST_ERRORS=0
+seq 5001 5100 | xargs -P20 -I{} bash -c \
+    'touch "$1/f$(printf "%05d" "$2").txt" 2>/dev/null || echo FAIL' \
+    _ "$T21_DIR" {} | grep -c FAIL > /tmp/t21_post_errors_$$ 2>/dev/null || true
+T21_POST_ERRORS=$(cat /tmp/t21_post_errors_$$ 2>/dev/null || echo 0)
+rm -f /tmp/t21_post_errors_$$
+
+[ "$T21_POST_ERRORS" -eq 0 ] \
+    && check "T21c 100-file post-storm touch (0 I/O errors)" PASS \
+    || check "T21c 100-file post-storm touch ($T21_POST_ERRORS I/O errors)" FAIL
+
+rm -rf "$T21_DIR" 2>/dev/null || true
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

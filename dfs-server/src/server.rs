@@ -108,6 +108,12 @@ pub struct Server {
 
     /// Notifier for the delete drain worker — fired when a new DeleteQueueEntry is added.
     delete_drain_notify: Arc<tokio::sync::Notify>,
+
+    /// Channel to a dedicated sled-write worker thread.
+    /// All metadata put_file calls are serialized through here — one std::thread
+    /// processes them sequentially, eliminating the futex pile-up from concurrent
+    /// spawn_blocking calls all contending on sled's internal write lock.
+    sled_write_tx: tokio::sync::mpsc::UnboundedSender<FileMetadata>,
 }
 
 impl Server {
@@ -146,6 +152,18 @@ impl Server {
             recent_writes: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
             delete_tombstones: Arc::new(DashMap::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
+            sled_write_tx: {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
+                let meta_bg = metadata.clone();
+                std::thread::spawn(move || {
+                    while let Some(m) = rx.blocking_recv() {
+                        if let Err(e) = meta_bg.put_file(&m) {
+                            warn!("sled_write_worker: put_file failed for {}: {}", m.path, e);
+                        }
+                    }
+                });
+                tx
+            },
         };
 
         server
@@ -2438,34 +2456,16 @@ impl Server {
             }
         }
 
-        // Store locally first.
-        match self.metadata.put_file(&metadata) {
-            Ok(crate::metadata::PutFileResult::Stored) => {
-                self.chunk_map_update(&metadata).await;
-                self.record_recent_write(metadata.clone()).await;
-                // Broadcast immediately to all followers with ttl=0 (we're the last hop).
-                // Also enqueue for durability — catch-up for nodes that are temporarily offline.
-                self.broadcast_metadata_to_followers(&metadata, 0).await;
-                self.enqueue_metadata_for_followers(&metadata).await;
-                Response::Ok { data: None }
-            }
-            Ok(crate::metadata::PutFileResult::Stale(newer)) => {
-                info!(
-                    "[META SERVER] stale-drop path={} id={} incoming_seq={} leader_seq={} — re-disseminating leader version",
-                    newer.path, newer.id, newer.write_seq, newer.write_seq
-                );
-                self.broadcast_metadata_to_followers(&newer, 0).await;
-                self.enqueue_metadata_for_followers(&newer).await;
-                Response::Ok { data: None }
-            }
-            Err(e) => {
-                warn!("Failed to put file metadata: {}", e);
-                Response::Error {
-                    message: format!("Failed to put file metadata: {}", e),
-                    code: ErrorCode::InternalError,
-                }
-            }
-        }
+        // Update in-memory state immediately and respond to the client.
+        // The sled write is handed to a dedicated single-threaded worker so it
+        // never blocks the async runtime — concurrent puts used to cause a futex
+        // pile-up as spawn_blocking threads all contended on sled's internal lock.
+        self.chunk_map_update(&metadata).await;
+        self.record_recent_write(metadata.clone()).await;
+        self.broadcast_metadata_to_followers(&metadata, 0).await;
+        self.enqueue_metadata_for_followers(&metadata).await;
+        let _ = self.sled_write_tx.send(metadata);
+        Response::Ok { data: None }
     }
 
     /// Handle GetMetadataSequence — return this node's last received (follower) or

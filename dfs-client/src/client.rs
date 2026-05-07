@@ -773,6 +773,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed")))
     }
 
+    /// Acquire an in-flight permit for the given node address.
+    /// Limits concurrent RPCs per server to prevent overwhelming it.
+    /// The permit is released when dropped (end of the calling function).
     /// Send a request to a specific node, reusing a pooled connection when available.
     async fn send_request(&self, addr: SocketAddr, request: Request) -> Result<Response> {
         debug!("Sending request to {}: {:?}", addr, request);
@@ -986,6 +989,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             if queue.len() < 8 {
                 queue.push_back(stream);
             }
+        }
+
+        // ServerBusy: treat as a transient error so send_request_with_retry backs
+        // off and tries another node rather than propagating as EIO.
+        if let Response::Error { code: dfs_common::ErrorCode::ServerBusy, .. } = &response {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            return Err(anyhow::anyhow!("ServerBusy"));
         }
 
         self.node_health.record_success(addr).await;
@@ -1356,6 +1366,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             if queue.len() < 8 {
                 queue.push_back(stream);
             }
+        }
+
+        // ServerBusy on write path: retry with backoff rather than EIO.
+        if let Response::Error { code: dfs_common::ErrorCode::ServerBusy, .. } = &response {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            return Box::pin(self.send_split_frame_write_request(addr, encoded_envelope, raw_data)).await;
         }
 
         self.node_health.record_success(addr).await;

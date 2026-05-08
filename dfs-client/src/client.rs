@@ -4429,10 +4429,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         for (addr, result) in results {
             match result {
                 Ok(Response::MultiPatchResult { new_chunk_id: ncid, size }) => {
-                    // If a replica returns the same chunk_id as the old one after a non-empty
-                    // patch, it applied the patch to stale (already-matching) data. Treat it
-                    // as a stale-base error so we re-push the correct chunk to this node.
-                    if ncid == old_chunk_id {
+                    // If the client pre-computed expected_new_chunk_id and it equals old_chunk_id,
+                    // the patch data was identical to the existing content — hash unchanged is correct.
+                    // Only treat ncid == old_chunk_id as a stale-base error when we did NOT
+                    // pre-compute the hash (expected_new_chunk_id is None), meaning the server
+                    // hashed the result itself and got back the same id — that means it patched
+                    // content that was already at the expected post-patch state (stale base).
+                    let is_no_op_patch = expected_new_chunk_id == Some(old_chunk_id);
+                    if ncid == old_chunk_id && !is_no_op_patch {
                         warn!("MultiPatch replica {} returned unchanged chunk_id {} after non-empty patch — stale base detected, will re-push", addr, ncid);
                         replica_results.push((addr, Err(anyhow::anyhow!("unchanged chunk_id after patch (stale base)"))));
                     } else {

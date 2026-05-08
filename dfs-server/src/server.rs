@@ -217,8 +217,22 @@ impl Server {
             let (locs, _) = entry.value_mut();
             for loc in locs.iter_mut() {
                 if loc.chunk_id == location.chunk_id {
+                    // Exact match — update in place.
                     *loc = location.clone();
-                    break;
+                    return;
+                }
+            }
+            // No chunk_id match — check by file_offset. This handles PatchChunk: the
+            // incoming location has a new chunk_id but the same file_offset. Without this,
+            // the in-memory chunk_map retains the old chunk_id and returns stale data to
+            // ChunkStale validation, causing a ping-pong of stale corrections under rapid
+            // sequential patches.
+            if let Some(file_offset) = location.file_offset {
+                for loc in locs.iter_mut() {
+                    if loc.file_offset == Some(file_offset) {
+                        *loc = location.clone();
+                        return;
+                    }
                 }
             }
         }

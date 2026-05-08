@@ -4716,11 +4716,22 @@ impl Filesystem for DfsFilesystem {
                         }
                         return;
                     }
-                    // Only flush if this session actually has slots with real data.
-                    // A write-mode open that reads but never writes (HDHomeRun scan,
-                    // Kodi seek-probe) has no slots — calling flush_all_pipelined would
-                    // pick up a flushing=true slot from a concurrent session, wait for it
-                    // to finish, then dispatch a second PatchChunk with stale data.
+                    // Wait for any concurrent flush (flushing=true slots from a prior
+                    // release task) to complete before checking has_unflushed. Without this,
+                    // a rapid write→close→write→close (T7 overwrite) can have:
+                    //   release1: flushing=true on slot, writes "original"
+                    //   write2:   updates slot data to "overwritten" while flushing=true
+                    //   release2: sees flushing=true → has_unflushed=false → skips flush
+                    //   release1: completes, keeps slot (len grew), but release2 already exited
+                    // Result: "overwritten" data is never sent to the server.
+                    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+                    loop {
+                        let any_flushing = write_buffers.get(&ino)
+                            .map(|s| s.try_lock().map(|st| st.slots.values().any(|sl| sl.flushing)).unwrap_or(true))
+                            .unwrap_or(false);
+                        if !any_flushing || tokio::time::Instant::now() >= deadline { break; }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                    }
                     let has_unflushed = write_buffers.get(&ino)
                         .map(|s| s.try_lock().map(|s| {
                             s.slots.values().any(|sl| !sl.data.is_empty() && !sl.flushing)

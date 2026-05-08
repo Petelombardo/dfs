@@ -2527,13 +2527,39 @@ impl Server {
 
         // Pre-filter tombstoned items on the async thread (DashMap lookup is cheap).
         let tombstones = self.delete_tombstones.clone();
-        let live_items: Vec<FileMetadata> = items.into_iter().filter(|m| {
+        let live_items_raw: Vec<FileMetadata> = items.into_iter().filter(|m| {
             if tombstones.contains_key(&m.id) {
                 debug!("disseminate: tombstone-reject path={} id={}", m.path, m.id);
                 false
             } else {
                 true
             }
+        }).collect();
+
+        // Reconcile chunk_locations against the in-memory chunk_map before storing.
+        // The chunk_map reflects live ReplicateChunkLocation updates (write_seq-free),
+        // which may be newer than what the leader queued. If the chunk_map has a
+        // different chunk_id for a given (file_id, file_offset), use it — this prevents
+        // DisseminateMetadata from overwriting a newer chunk_id with a stale one and
+        // causing perpetual ChunkStale loops on non-replica nodes.
+        const CHUNK_SIZE_RECONCILE: u64 = 4 * 1024 * 1024;
+        let live_items: Vec<FileMetadata> = live_items_raw.into_iter().map(|mut m| {
+            if let Some(map_entry) = self.chunk_map.get(&m.id) {
+                let (map_locs, _) = map_entry.value();
+                for loc in m.chunk_locations.iter_mut() {
+                    if let Some(file_offset) = loc.file_offset {
+                        if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
+                            if map_loc.chunk_id != loc.chunk_id {
+                                let chunk_idx = file_offset / CHUNK_SIZE_RECONCILE;
+                                debug!("disseminate: reconcile file {} chunk {} {} -> {} (chunk_map newer)",
+                                    m.id, chunk_idx, loc.chunk_id, map_loc.chunk_id);
+                                *loc = map_loc.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            m
         }).collect();
 
         // Run all sled writes in spawn_blocking so we never block the async runtime.

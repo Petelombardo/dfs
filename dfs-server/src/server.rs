@@ -1385,6 +1385,36 @@ impl Server {
             Ok(_) => {
                 // Patch the in-memory chunk map so GetFileChunkMap always reflects current replica state
                 self.chunk_map_update_location(&merged_location).await;
+
+                // Also update the file metadata record in sled so DisseminateMetadata
+                // broadcasts the correct chunk_id to followers. Without this, the file
+                // record retains the old chunk_id and periodic dissemination overwrites
+                // the in-memory fix, causing perpetual ChunkStale on followers.
+                if let Some(file_offset) = merged_location.file_offset {
+                    // Find the file that owns this chunk position and update its record.
+                    for entry in self.chunk_map.iter() {
+                        let file_id = *entry.key();
+                        let (locs, _) = entry.value();
+                        if locs.iter().any(|l| l.file_offset == Some(file_offset) && l.chunk_id == merged_location.chunk_id) {
+                            // Found the file — update its sled record.
+                            if let Ok(Some(mut file_meta)) = self.metadata.get_file(&file_id) {
+                                let mut updated = false;
+                                for loc in file_meta.chunk_locations.iter_mut() {
+                                    if loc.file_offset == Some(file_offset) {
+                                        *loc = merged_location.clone();
+                                        updated = true;
+                                        break;
+                                    }
+                                }
+                                if updated {
+                                    let _ = self.sled_write_tx.send(file_meta);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
                 info!("Successfully replicated chunk location for {} (total nodes: {})",
                       merged_location.chunk_id, merged_location.nodes.len());
 

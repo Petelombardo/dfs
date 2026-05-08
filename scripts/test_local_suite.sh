@@ -40,7 +40,9 @@ pkill -f "dfs-server" 2>/dev/null || true
 pkill -f "dfs-client" 2>/dev/null || true
 sleep 0.5
 fusermount -u $MOUNT 2>/dev/null || true
-sudo rm -rf $BASE $LOG $MOUNT $T 2>/dev/null || rm -rf $BASE $LOG $MOUNT $T 2>/dev/null || true
+# Keep $LOG (test logs) — cleared only here at run start, never at end.
+# Per-test T<N>.log snapshots persist for post-mortem debugging.
+sudo rm -rf $BASE $MOUNT $T 2>/dev/null || rm -rf $BASE $MOUNT $T 2>/dev/null || true
 mkdir -p $MOUNT $LOG $T
 
 echo "=== Building ==="
@@ -55,7 +57,7 @@ done
 sleep 3
 
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
-    --log-file "$LOG/client.log" --allow-other --log-level info &
+    --log-file "$LOG/client.log" --allow-other --log-level debug &
 CLIENT_PID=$!
 CURRENT_CLIENT_LOG="$LOG/client.log"
 sleep 2
@@ -144,7 +146,7 @@ sleep 1
 
 echo "  Remounting..."
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
-    --log-file "$LOG/client2.log" --allow-other --log-level info &
+    --log-file "$LOG/client2.log" --allow-other --log-level debug &
 CLIENT_PID2=$!
 CURRENT_CLIENT_LOG="$LOG/client2.log"
 sleep 2
@@ -650,6 +652,7 @@ rm -rf "$T21_DIR" 2>/dev/null || true
 #   - Each patch hits an existing chunk so must go through fetch-hash-patch path
 #
 # Baseline: measures total time and per-patch latency before any optimization.
+dfs_sync  # drain any residual T21 metadata before starting T22
 snapshot_log T22
 echo ""
 echo "=== T22: VM disk random-patch throughput (QEMU install pattern) ==="
@@ -671,6 +674,17 @@ echo "  Running $T22_PATCH_COUNT patches ($T22_CONCURRENCY concurrent, ${T22_PAT
 dd if=/dev/urandom of="$T/t22_patch.bin" bs=$T22_PATCH_SIZE count=1 2>/dev/null
 
 T22_START=$(date +%s%3N)
+
+# Debug: run one patch with visible stderr to capture any error
+python3 -c "
+import sys, os
+img, patch_file = sys.argv[1], sys.argv[2]
+data = open(patch_file,'rb').read()
+fd = os.open(img, os.O_WRONLY)
+os.lseek(fd, 0, 0)
+os.write(fd, data)
+os.close(fd)
+" "$T22_IMG" "$T/t22_patch.bin" 2>&1 | head -3 && echo "  DEBUG: single patch OK" || echo "  DEBUG: single patch FAILED"
 
 # Each job: pick a random 4MB-aligned chunk offset, patch T22_PATCH_SIZE bytes at a
 # random intra-chunk offset. Use dd conv=notrunc so the rest of the chunk is preserved.

@@ -899,11 +899,11 @@ impl Server {
             Request::ListDirectory { path } => self.handle_list_directory(path).await,
             Request::WriteFile { data } => self.handle_write_file(data).await,
             Request::WriteFileLocalOnly { data, file_offset } => self.handle_write_file_local_only(data, file_offset).await,
-            Request::PatchChunk { chunk_id, chunk_file_offset, intra_offset, data } => {
-                self.handle_patch_chunk(chunk_id, chunk_file_offset, intra_offset, data).await
+            Request::PatchChunk { chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data } => {
+                self.handle_patch_chunk(chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data).await
             }
-            Request::MultiPatch { chunk_id, chunk_file_offset, patches, expected_new_chunk_id } => {
-                self.handle_multi_patch(chunk_id, chunk_file_offset, patches, expected_new_chunk_id).await
+            Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id } => {
+                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id).await
             }
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
             Request::RenameFile { old_path, new_path } => {
@@ -2939,12 +2939,34 @@ impl Server {
     async fn handle_patch_chunk(
         &self,
         chunk_id: ChunkId,
+        file_id: Option<dfs_common::FileId>,
+        chunk_idx: Option<u64>,
         chunk_file_offset: u64,
         intra_offset: usize,
         patch_data: Vec<u8>,
     ) -> Response {
         use std::fs;
         use std::io::{Read, Seek, SeekFrom, Write};
+
+        // Validate chunk_id against local chunk map when file_id + chunk_idx are provided.
+        // If our record for (file_id, chunk_idx) differs, the client has a stale view —
+        // return ChunkStale so the client can retry with the correct chunk_id.
+        if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+            if let Some(entry) = self.chunk_map.get(&fid) {
+                let (locations, _) = entry.value();
+                const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                if let Some(loc) = locations.iter().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)) {
+                    if loc.chunk_id != chunk_id {
+                        info!("PatchChunk: stale chunk_id from client — file {:?} chunk {} client={} server={}",
+                            fid, cidx, chunk_id, loc.chunk_id);
+                        return Response::ChunkStale {
+                            current_chunk_id: loc.chunk_id,
+                            current_nodes: loc.nodes.clone(),
+                        };
+                    }
+                }
+            }
+        }
 
         if let Some(healing) = self.healing.read().await.as_ref() {
             healing.evict_from_pending(&chunk_id).await;
@@ -3036,12 +3058,31 @@ impl Server {
     async fn handle_multi_patch(
         &self,
         chunk_id: ChunkId,
+        file_id: Option<dfs_common::FileId>,
+        chunk_idx: Option<u64>,
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
         expected_new_chunk_id: Option<dfs_common::ChunkId>,
     ) -> Response {
         use std::fs;
         use std::io::{Read, Seek, SeekFrom, Write};
+
+        if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+            if let Some(entry) = self.chunk_map.get(&fid) {
+                const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                let (locations, _) = entry.value();
+                if let Some(loc) = locations.iter().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)) {
+                    if loc.chunk_id != chunk_id {
+                        info!("MultiPatch: stale chunk_id from client — file {:?} chunk {} client={} server={}",
+                            fid, cidx, chunk_id, loc.chunk_id);
+                        return Response::ChunkStale {
+                            current_chunk_id: loc.chunk_id,
+                            current_nodes: loc.nodes.clone(),
+                        };
+                    }
+                }
+            }
+        }
 
         if let Some(healing) = self.healing.read().await.as_ref() {
             healing.evict_from_pending(&chunk_id).await;

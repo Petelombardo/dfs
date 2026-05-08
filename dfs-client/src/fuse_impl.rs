@@ -337,6 +337,7 @@ struct FlushHandle {
     client: Arc<DfsClient>,
     write_buffers: Arc<DashMap<u64, Arc<Mutex<InodeWriteState>>>>,
     metadata_cache: Arc<DashMap<u64, FileMetadata>>,
+    chunk_write_locks: Arc<DashMap<u64, Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>>>,
     /// Tracks how many chunk-flush tasks are currently in-flight per inode.
     /// Capped at PIPELINE_CHUNKS by the background ticker.
     flush_in_flight: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>>,
@@ -538,8 +539,17 @@ impl FlushHandle {
                                 continue;
                             }
                         }
-                        let patch_result = self.client.patch_chunk_on_replicas(
+                        // Serialize this chunk's patch+metadata update with any concurrent
+                        // write to the same (ino, chunk_idx) from any other path.
+                        let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, *chunk_idx).await;
+                        // Pass file_id + chunk_idx so the server validates the chunk_id
+                        // against its chunk map and returns ChunkStale if it's stale.
+                        // patch_chunk_on_replicas_verified retries once automatically with
+                        // the corrected chunk_id — no separate leader round-trip needed.
+                        let patch_result = self.client.patch_chunk_on_replicas_verified(
                             old_location.chunk_id,
+                            file_id_legacy,
+                            *chunk_idx,
                             file_offset,
                             patch_intra,
                             patch_bytes.clone(),
@@ -549,8 +559,8 @@ impl FlushHandle {
                         let patch_result = match patch_result {
                             Ok(loc) => Ok(loc),
                             Err(e) => {
-                                // PatchChunk failed — fetch just this chunk's location from the
-                                // leader (single in-memory map lookup) instead of the full metadata.
+                                // PatchChunk failed even after ChunkStale retry — fall back to
+                                // fetching the single chunk location from the leader explicitly.
                                 warn!("flush_buffer_async: PatchChunk failed for slot {} ({}), fetching single chunk location", chunk_idx, e);
                                 match self.client.get_single_chunk_location(file_id_legacy, *chunk_idx).await {
                                     Ok(Some(fresh_loc)) if fresh_loc.chunk_id != old_location.chunk_id => {
@@ -561,16 +571,19 @@ impl FlushHandle {
                                                 *existing = fresh_loc.clone();
                                             }
                                         }
-                                        self.client.patch_chunk_on_replicas(
+                                        self.client.patch_chunk_on_replicas_verified(
                                             fresh_loc.chunk_id,
+                                            file_id_legacy,
+                                            *chunk_idx,
                                             file_offset,
                                             patch_intra,
                                             patch_bytes.clone(),
                                             &fresh_loc,
                                         ).await
                                     }
-                                    Ok(Some(loc)) => self.client.patch_chunk_on_replicas(
-                                        loc.chunk_id, file_offset, patch_intra, patch_bytes.clone(), &loc,
+                                    Ok(Some(loc)) => self.client.patch_chunk_on_replicas_verified(
+                                        loc.chunk_id, file_id_legacy, *chunk_idx,
+                                        file_offset, patch_intra, patch_bytes.clone(), &loc,
                                     ).await,
                                     Ok(None) | Err(_) => Err(e),
                                 }
@@ -642,8 +655,10 @@ impl FlushHandle {
                                         *existing = old_location.clone();
                                     }
                                 }
-                                let retry = self.client.patch_chunk_on_replicas(
+                                let retry = self.client.patch_chunk_on_replicas_verified(
                                     old_location.chunk_id,
+                                    file_id_legacy,
+                                    *chunk_idx,
                                     file_offset,
                                     patch_intra,
                                     patch_bytes.clone(),
@@ -1142,13 +1157,23 @@ impl FlushHandle {
                             info!("flush_buffer_async_one: ino={} chunk={} chunk_id changed since open ({} -> {}) — discarding stale write",
                                 ino, chunk_idx, open_id, old_location.chunk_id);
                             if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                if let Ok(mut state) = state_arc.try_lock() {
-                                    state.slots.remove(&chunk_idx);
+                                let mut state = state_arc.lock().await;
+                                let discarded_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                                state.slots.remove(&chunk_idx);
+                                if discarded_len > 0 {
+                                    self.global_buffered_bytes.fetch_sub(
+                                        discarded_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                 }
                             }
                             return Ok(());
                         }
                     }
+                    // Acquire the per-chunk lock before the network call and hold it
+                    // through the metadata_cache update at the end of this function.
+                    let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, chunk_idx).await;
+
                     // Try to compute the post-patch hash locally so the server can skip
                     // its read-back pass entirely (write patches + rename, no read).
                     //
@@ -1197,13 +1222,19 @@ impl FlushHandle {
 
                     // Send all dirty ranges in a single MultiPatch RPC — one round trip,
                     // atomic server-side write+rename, no read-back when hash is pre-computed.
-                    let patch_result = self.client.multi_patch_chunk_on_replicas(
-                        old_location.chunk_id,
-                        file_offset,
-                        patches.clone(),
-                        &old_location,
-                        expected_new_chunk_id,
-                    ).await;
+                    // Pass file_id + chunk_idx so the server validates chunk_id and returns
+                    // ChunkStale if stale; client retries automatically with corrected id.
+                    let patch_result = if let Some(fid) = file_id_at_flush_start {
+                        self.client.multi_patch_chunk_on_replicas_verified(
+                            old_location.chunk_id, fid, chunk_idx,
+                            file_offset, patches.clone(), &old_location, expected_new_chunk_id,
+                        ).await
+                    } else {
+                        self.client.multi_patch_chunk_on_replicas(
+                            old_location.chunk_id, file_offset, patches.clone(),
+                            &old_location, expected_new_chunk_id,
+                        ).await
+                    };
                     let new_location = match patch_result {
                         Ok(loc) => loc,
                         Err(e) => {
@@ -1239,13 +1270,17 @@ impl FlushHandle {
                             match fresh_loc {
                                 Some(loc) => {
                                     // Retry the patch with the authoritative location.
-                                    match self.client.multi_patch_chunk_on_replicas(
-                                        loc.chunk_id,
-                                        file_offset,
-                                        patches,
-                                        &loc,
-                                        None, // chunk_cache was evicted above; let server hash
-                                    ).await {
+                                    let retry_result = if let Some(fid) = file_id_at_flush_start {
+                                        self.client.multi_patch_chunk_on_replicas_verified(
+                                            loc.chunk_id, fid, chunk_idx, file_offset,
+                                            patches, &loc, None,
+                                        ).await
+                                    } else {
+                                        self.client.multi_patch_chunk_on_replicas(
+                                            loc.chunk_id, file_offset, patches, &loc, None,
+                                        ).await
+                                    };
+                                    match retry_result {
                                         Ok(retry_loc) => {
                                             info!("flush_buffer_async_one: retry MultiPatch succeeded for ino={} chunk={}: {} -> {}",
                                                 ino, chunk_idx, loc.chunk_id, retry_loc.chunk_id);
@@ -1254,10 +1289,9 @@ impl FlushHandle {
                                         Err(retry_err) => {
                                             warn!("flush_buffer_async_one: retry MultiPatch failed for ino={} chunk={}: {}", ino, chunk_idx, retry_err);
                                             if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                                if let Ok(mut state) = state_arc.try_lock() {
-                                                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
-                                                        slot.flushing = false;
-                                                    }
+                                                let mut state = state_arc.lock().await;
+                                                if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                                    slot.flushing = false;
                                                 }
                                             }
                                             return Err(retry_err);
@@ -1266,10 +1300,9 @@ impl FlushHandle {
                                 }
                                 None => {
                                     if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                        if let Ok(mut state) = state_arc.try_lock() {
-                                            if let Some(slot) = state.slots.get_mut(&chunk_idx) {
-                                                slot.flushing = false;
-                                            }
+                                        let mut state = state_arc.lock().await;
+                                        if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                            slot.flushing = false;
                                         }
                                     }
                                     return Err(e);
@@ -1291,8 +1324,14 @@ impl FlushHandle {
                         if file_id_at_flush_start.map(|id| id != meta_entry.id).unwrap_or(false) {
                             info!("flush_buffer_async_one: ino={} chunk={} file replaced during patch flush — discarding metadata update", ino, chunk_idx);
                             if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                if let Ok(mut state) = state_arc.try_lock() {
-                                    state.slots.remove(&chunk_idx);
+                                let mut state = state_arc.lock().await;
+                                let discarded_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                                state.slots.remove(&chunk_idx);
+                                if discarded_len > 0 {
+                                    self.global_buffered_bytes.fetch_sub(
+                                        discarded_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                 }
                             }
                             return Ok(());
@@ -1363,6 +1402,8 @@ impl FlushHandle {
                     ino, chunk_idx, slot_len, covered, dirty_ranges, existing_chunk_size);
             }
         }
+        // Acquire the per-chunk write lock for the fresh-write path too.
+        let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, chunk_idx).await;
         let result = self.client.write_data_with_cache(&slot_data, ino, file_offset).await;
         match result {
             Ok((_, _, Some(locations))) => {
@@ -1402,8 +1443,14 @@ impl FlushHandle {
                     if file_id_at_flush_start.map(|id| id != meta.id).unwrap_or(false) {
                         info!("flush_buffer_async_one: ino={} chunk={} file replaced during flush (old_id={:?} new_id={}) — discarding", ino, chunk_idx, file_id_at_flush_start, meta.id);
                         if let Some(state_arc) = self.write_buffers.get(&ino) {
-                            if let Ok(mut state) = state_arc.try_lock() {
-                                state.slots.remove(&chunk_idx);
+                            let mut state = state_arc.lock().await;
+                            let discarded_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                            state.slots.remove(&chunk_idx);
+                            if discarded_len > 0 {
+                                self.global_buffered_bytes.fetch_sub(
+                                    discarded_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                         }
                         return Ok(());
@@ -1519,14 +1566,22 @@ impl FlushHandle {
                 Ok(())
             }
             Ok((_, _, None)) => {
+                // Server accepted write but returned no locations — clear flushing so
+                // the next ticker cycle can retry. Don't decrement global_buffered_bytes:
+                // the slot is still in the buffer and will be retried.
+                if let Some(state_arc) = self.write_buffers.get(&ino) {
+                    let mut state = state_arc.lock().await;
+                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                        slot.flushing = false;
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
-                    if let Ok(mut state) = state_arc.try_lock() {
-                        if let Some(slot) = state.slots.get_mut(&chunk_idx) {
-                            slot.flushing = false;
-                        }
+                    let mut state = state_arc.lock().await;
+                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                        slot.flushing = false;
                     }
                 }
                 Err(e)
@@ -1742,6 +1797,15 @@ pub struct DfsFilesystem {
     /// path_to_inode or metadata_cache is populated by the async create task.
     direct_write_inodes: Arc<dashmap::DashSet<u64>>,
 
+    /// Per-(inode, chunk_idx) mutex that serializes all write paths on the same chunk.
+    /// Any path that does a direct network write (PatchChunk, WriteChunk) followed by
+    /// a metadata_cache update must hold this lock for the duration. Writes to different
+    /// chunks of the same inode proceed in parallel; writes to the same chunk are ordered
+    /// by arrival. Entries are created on demand and removed when the inode is fully closed
+    /// (write_buffers.remove guard in release()). The outer DashMap key is ino; the inner
+    /// DashMap key is chunk_idx, so lock granularity is per chunk, not per file.
+    chunk_write_locks: Arc<DashMap<u64, Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>>>,
+
     /// Per-inode count of release() flush tasks still in flight.
     /// Sequential writes wait for this to reach zero for the specific inode
     /// before opening, ensuring the previous release() has fully committed.
@@ -1881,6 +1945,8 @@ impl DfsFilesystem {
         // Shared write_tasks_in_flight — used by flush_one_chunk to wait for in-flight
         // write() tasks before snapshotting a full slot.
         let write_tasks_in_flight_shared: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>> = Arc::new(DashMap::new());
+        let chunk_write_locks_shared: Arc<DashMap<u64, Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>>> = Arc::new(DashMap::new());
+        let release_in_flight_shared: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>> = Arc::new(DashMap::new());
 
         // Start background task to flush expired write buffers (if buffering enabled)
         if write_buffer_enabled {
@@ -1889,6 +1955,8 @@ impl DfsFilesystem {
             let metadata_cache_for_cleanup = metadata_cache.clone();
             let write_open_counts_for_bg = write_open_counts.clone();
             let path_to_inode_for_bg = path_to_inode.clone();
+            let chunk_write_locks_for_bg = chunk_write_locks_shared.clone();
+            let release_in_flight_for_bg = release_in_flight_shared.clone();
             // in_flight: per-inode count of chunk-flush tasks currently running.
             // The ticker keeps this at most PIPELINE_CHUNKS per inode, so each
             // flush task handles exactly one chunk and decrements on completion.
@@ -1909,6 +1977,7 @@ impl DfsFilesystem {
                 global_buffered_bytes: global_buffered_bytes.clone(),
                 flush_notify: flush_notify.clone(),
                 write_tasks_in_flight: write_tasks_in_flight_shared.clone(),
+                chunk_write_locks: chunk_write_locks_for_bg.clone(),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
@@ -1948,11 +2017,25 @@ impl DfsFilesystem {
                         let has_full = !state.full_slot_indices().is_empty();
                         let no_active_writers = write_open_counts_for_bg
                             .get(&ino).map(|c| *c == 0).unwrap_or(true);
+                        // Flush idle slots with no new writes for >500ms, even with active
+                        // writers. This drains partial slots from random-write workloads
+                        // (VM disk patches) that never fill a full 4MB chunk. Without this,
+                        // the buffer fills up and new writes hit the back-pressure timeout.
+                        // Exception: skip if a release() flush task is already in flight for
+                        // this inode — it will handle the slot, and racing it here would cause
+                        // the stale-write guard to discard a legitimate second write (T7 race).
+                        const STALE_FLUSH_MS: u128 = 500;
+                        let release_inflight = release_in_flight_for_bg
+                            .get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+                        let has_stale = release_inflight == 0 && state.slots.iter().any(|(_, s)| {
+                            !s.data.is_empty() && !s.flushing && s.is_idle() &&
+                            s.last_modified.elapsed().map(|e| e.as_millis()).unwrap_or(0) >= STALE_FLUSH_MS
+                        });
                         let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
                             s.is_idle() && !s.data.is_empty() && !s.flushing
                         });
                         drop(state);
-                        if !has_full && !has_idle { continue; }
+                        if !has_full && !has_idle && !has_stale { continue; }
 
                         // Increment before spawning to prevent a second dispatch racing
                         // in the same tick before the task starts.
@@ -2034,6 +2117,7 @@ impl DfsFilesystem {
             global_buffered_bytes: global_buffered_bytes.clone(),
             flush_notify: flush_notify.clone(),
             write_tasks_in_flight: write_tasks_in_flight_shared.clone(),
+            chunk_write_locks: chunk_write_locks_shared.clone(),
         };
 
         Ok(Self {
@@ -2066,7 +2150,8 @@ impl DfsFilesystem {
             pending_creates: Arc::new(dashmap::DashSet::new()),
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
             direct_write_inodes: Arc::new(dashmap::DashSet::new()),
-            release_in_flight: Arc::new(DashMap::new()),
+            chunk_write_locks: chunk_write_locks_shared,
+            release_in_flight: release_in_flight_shared,
             write_tasks_in_flight: write_tasks_in_flight_shared,
             global_buffered_bytes,
             flush_notify,
@@ -2092,6 +2177,20 @@ impl DfsFilesystem {
         // NOTE: We can't use block_in_place because FUSE callbacks don't run on tokio worker threads
         // Just block_on directly using the runtime handle
         self.runtime.block_on(future)
+    }
+
+    /// Acquire the per-(ino, chunk_idx) write lock, creating it on demand.
+    /// Returns the guard; dropping it releases the lock.
+    async fn lock_chunk(chunk_write_locks: &Arc<DashMap<u64, Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>>>, ino: u64, chunk_idx: u64) -> tokio::sync::OwnedMutexGuard<()> {
+        let inode_map = chunk_write_locks
+            .entry(ino)
+            .or_insert_with(|| Arc::new(DashMap::new()))
+            .clone();
+        let chunk_mutex = inode_map
+            .entry(chunk_idx)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        chunk_mutex.lock_owned().await
     }
 
     /// Safely update metadata cache, checking if there's an active write in progress
@@ -2370,6 +2469,7 @@ impl Filesystem for DfsFilesystem {
             global_buffered_bytes: self.global_buffered_bytes.clone(),
             flush_notify: self.flush_notify.clone(),
             write_tasks_in_flight: self.write_tasks_in_flight.clone(),
+            chunk_write_locks: self.chunk_write_locks.clone(),
         };
 
         self.block_on(async move {
@@ -3114,6 +3214,25 @@ impl Filesystem for DfsFilesystem {
                                 reply.data(&[]);
                                 return;
                             }
+                            // If this slot is currently being flushed (mid-PatchChunk), the
+                            // old chunk ID is being deleted on the server right now. Falling
+                            // through to the network would fetch a chunk that no longer exists.
+                            // Drop the lock and wait briefly for the flush to complete, then
+                            // the slot will be gone and we can safely fetch the new chunk ID.
+                            if slot.flushing {
+                                drop(state);
+                                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                                loop {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                                    let still_flushing = write_buffers.get(&ino).map(|a| {
+                                        a.try_lock().map(|s| s.slots.get(&chunk_idx).map(|sl| sl.flushing).unwrap_or(false)).unwrap_or(true)
+                                    }).unwrap_or(false);
+                                    if !still_flushing || tokio::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                }
+                                // Fall through to network — flush is done, chunk ID is current.
+                            }
                             // Fall through to network — server has data here.
                         } else if intra >= slot.gap_filled_prefix {
                             // Real buffered data — serve it.
@@ -3628,6 +3747,7 @@ impl Filesystem for DfsFilesystem {
         let req_uid = _req.uid();
         let req_gid = _req.gid();
         let direct_write_inodes = self.direct_write_inodes.clone();
+        let chunk_write_locks = self.chunk_write_locks.clone();
 
         let write_task_counter = self.write_tasks_in_flight
             .entry(ino)
@@ -3706,6 +3826,10 @@ impl Filesystem for DfsFilesystem {
                                         10
                                     };
                                 if delay_ms == 0 { break; }
+                                // Under back-pressure, urgently wake the flush worker so it
+                                // drains stale partial slots (e.g. VM disk patches that never
+                                // fill a full 4MB chunk) instead of waiting for the 50ms tick.
+                                flush_handle.flush_notify.notify_one();
                                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                                 if fill_pct < 100 { break; }
                             }
@@ -3917,13 +4041,25 @@ impl Filesystem for DfsFilesystem {
 
                     if let Some(old_loc) = existing_loc {
                         // Target offset is within an existing chunk — patch it in-place.
+                        // Hold the per-chunk write lock so concurrent patches/writes to the
+                        // same chunk are serialized through the metadata_cache update.
+                        let _chunk_guard = DfsFilesystem::lock_chunk(&chunk_write_locks, ino, target_chunk_idx).await;
                         info!("Sparse write at offset={} lands in existing chunk {} (size={}) — using PatchChunk",
                               offset_usize, target_chunk_idx, old_loc.size);
+                        // Re-read metadata after acquiring the lock — a concurrent write may
+                        // have updated the chunk_id while we were waiting.
+                        let meta_snap = metadata_cache.get(&ino).map(|m| m.clone());
+                        let old_loc = meta_snap.as_ref()
+                            .and_then(|m| m.chunk_location_for_idx(target_chunk_idx).cloned())
+                            .unwrap_or(old_loc);
                         match client.patch_chunk_on_replicas(
                             old_loc.chunk_id, offset as u64, target_intra, data_vec.clone(), &old_loc,
                         ).await {
                             Ok(new_loc) => {
-                                let mut meta = meta_snap.unwrap();
+                                // Re-read metadata_cache after the network call to pick up
+                                // any updates from other chunks that completed while we waited.
+                                let mut meta = metadata_cache.get(&ino).map(|m| m.clone())
+                                    .unwrap_or_else(|| meta_snap.unwrap());
                                 let new_size = (offset_usize + data_vec.len()).max(current_size).max(meta.size as usize);
                                 if let Some(loc) = meta.chunk_location_for_idx_mut(target_chunk_idx) {
                                     *loc = new_loc;
@@ -3932,7 +4068,6 @@ impl Filesystem for DfsFilesystem {
                                 meta.modified_at = SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
                                 client.enqueue_metadata(&meta).await;
-                                // Update read engine immediately for SQLite read-after-write consistency
                                 client.feed_chunk_locations_to_read_engine(
                                     ino, &meta.chunk_locations, meta.size,
                                 ).await;
@@ -4022,6 +4157,7 @@ impl Filesystem for DfsFilesystem {
                             10
                         };
                         if delay_ms == 0 { break; }
+                        flush_handle.flush_notify.notify_one();
                         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                         if fill_pct < 100 { break; }
                     }
@@ -4135,6 +4271,13 @@ impl Filesystem for DfsFilesystem {
                         info!("Random write affects chunks {}-{} (out of {} total)",
                               first_idx, last_idx, metadata.chunk_locations.len());
                         affected_chunk_range = Some((first_idx, last_idx));
+
+                        // Acquire per-chunk write locks for all affected chunks in index order
+                        // (ascending) to prevent deadlock. Hold them for the entire read-modify-write.
+                        let mut _chunk_guards = Vec::new();
+                        for cidx in first_idx..=last_idx {
+                            _chunk_guards.push(DfsFilesystem::lock_chunk(&chunk_write_locks, ino, cidx as u64).await);
+                        }
 
                         let affected_locs = &metadata.chunk_locations[first_idx..=last_idx];
                         let first_chunk_file_offset: u64 = metadata.chunk_locations[..first_idx]
@@ -4436,6 +4579,7 @@ impl Filesystem for DfsFilesystem {
                 let read_engines_for_release = self.client.read_engines.map.clone();
                 let open_counts_for_release = self.open_counts.clone();
                 let write_open_counts_for_release = self.write_open_counts.clone();
+                let chunk_write_locks_for_release = self.chunk_write_locks.clone();
                 // Increment per-inode release counter
                 release_in_flight.entry(ino).or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4566,6 +4710,7 @@ impl Filesystem for DfsFilesystem {
                                ino, release_path, is_pending_delete, path_gone);
                         write_buffers.remove(&ino);
                         flush_handle.client.evict_recent_chunk_writes(ino);
+                        chunk_write_locks_for_release.remove(&ino);
                         if let Some(counter) = release_in_flight.get(&ino) {
                             counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -4585,13 +4730,14 @@ impl Filesystem for DfsFilesystem {
                         if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
-                    } else {
-                        // All chunks were already flushed to the servers by the background
-                        // tick, but the tick's 5-second metadata throttle may not have
-                        // committed the latest chunk map to the leader yet. Do a final
-                        // synchronous metadata sync so the leader knows about all chunks
-                        // before any reader can open the file.
-                        debug!("release: ino={} last writer — no unflushed data, syncing metadata", ino);
+                    }
+                    // Always do a final synchronous metadata sync after the last writer
+                    // closes, whether data was flushed now or already flushed by the
+                    // background ticker. This guarantees the leader has the complete
+                    // chunk map before release_in_flight drops to zero — preventing a
+                    // concurrent read open from fetching stale metadata from the leader
+                    // and getting chunk IDs that no longer exist (read-after-write gap).
+                    {
                         let meta_to_persist = flush_handle.metadata_cache.get(&ino).map(|m| m.clone());
                         if let Some(meta) = meta_to_persist {
                             flush_handle.client.flush_metadata_sync(&meta).await;
@@ -4625,6 +4771,10 @@ impl Filesystem for DfsFilesystem {
                         write_buffers.remove(&ino);
                         size_high_water_for_release.remove(&ino);
                         flush_handle.client.evict_recent_chunk_writes(ino);
+                        // Drop all per-chunk write locks for this inode. Any task still
+                        // holding a guard will keep it alive via Arc until it drops;
+                        // removing the map entry just prevents new waiters from queuing.
+                        chunk_write_locks_for_release.remove(&ino);
                     }
                     if let Some(owner) = lock_owner {
                         if let Err(e) = lock_manager.release_all(ino, owner).await {
@@ -5476,6 +5626,7 @@ impl Filesystem for DfsFilesystem {
             global_buffered_bytes: self.global_buffered_bytes.clone(),
             flush_notify: self.flush_notify.clone(),
             write_tasks_in_flight: self.write_tasks_in_flight.clone(),
+            chunk_write_locks: self.chunk_write_locks.clone(),
         };
 
         let result = self.block_on(async move {

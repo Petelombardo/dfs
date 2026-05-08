@@ -4236,6 +4236,35 @@ leader_addr: Arc::new(RwLock::new(None)),
         patch_data: Vec<u8>,
         old_location: &dfs_common::ChunkLocation,
     ) -> Result<dfs_common::ChunkLocation> {
+        self.patch_chunk_on_replicas_inner(old_chunk_id, None, None, chunk_file_offset, intra_offset, patch_data, old_location).await
+    }
+
+    pub async fn patch_chunk_on_replicas_verified(
+        &self,
+        old_chunk_id: ChunkId,
+        file_id: FileId,
+        chunk_idx: u64,
+        chunk_file_offset: u64,
+        intra_offset: usize,
+        patch_data: Vec<u8>,
+        old_location: &dfs_common::ChunkLocation,
+    ) -> Result<dfs_common::ChunkLocation> {
+        self.patch_chunk_on_replicas_inner(old_chunk_id, Some(file_id), Some(chunk_idx), chunk_file_offset, intra_offset, patch_data, old_location).await
+    }
+
+    async fn patch_chunk_on_replicas_inner(
+        &self,
+        mut old_chunk_id: ChunkId,
+        file_id: Option<FileId>,
+        chunk_idx: Option<u64>,
+        chunk_file_offset: u64,
+        intra_offset: usize,
+        patch_data: Vec<u8>,
+        old_location: &dfs_common::ChunkLocation,
+    ) -> Result<dfs_common::ChunkLocation> {
+        // On ChunkStale, the server tells us the current chunk_id — retry once with it.
+        let mut current_location = old_location.clone();
+        for attempt in 0u8..2 {
         // Resolve NodeId -> SocketAddr for the replica nodes
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
@@ -4243,10 +4272,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
         let all_cluster_nodes = self.cluster_nodes.read().await.clone();
 
-        let replica_addrs: Vec<SocketAddr> = if old_location.nodes.is_empty() {
+        let replica_addrs: Vec<SocketAddr> = if current_location.nodes.is_empty() {
             all_cluster_nodes.clone()
         } else {
-            old_location.nodes.iter()
+            current_location.nodes.iter()
                 .filter_map(|nid| node_id_to_addr.get(nid).copied())
                 .collect()
         };
@@ -4257,12 +4286,13 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
 
-        // Step 2: PatchChunk to all known replicas in parallel
         let patch_req = Request::PatchChunk {
             chunk_id: old_chunk_id,
+            file_id,
+            chunk_idx,
             chunk_file_offset,
             intra_offset,
-            data: patch_data,
+            data: patch_data.clone(),
         };
 
         let futures: Vec<_> = replica_addrs.iter().map(|&addr| {
@@ -4274,8 +4304,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         let results = futures::future::join_all(futures).await;
 
         let mut new_chunk_id: Option<ChunkId> = None;
-        let mut new_size: usize = old_location.size;
+        let mut new_size: usize = current_location.size;
         let mut patched_node_ids: Vec<dfs_common::NodeId> = Vec::new();
+        let mut stale_response: Option<(ChunkId, Vec<dfs_common::NodeId>)> = None;
 
         for (addr, result) in results {
             match result {
@@ -4301,6 +4332,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                         patched_node_ids.push(nid);
                     }
                 }
+                Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
+                    // Server says our chunk_id is stale — it didn't apply the patch.
+                    // Use the server's current chunk_id for the retry.
+                    if stale_response.is_none() {
+                        stale_response = Some((current_chunk_id, current_nodes));
+                    }
+                }
                 Ok(Response::Error { message, .. }) => {
                     warn!("PatchChunk replica {} error: {}", addr, message);
                 }
@@ -4308,6 +4346,26 @@ leader_addr: Arc::new(RwLock::new(None)),
                     warn!("PatchChunk replica {} failed: {}", addr, e);
                 }
                 _ => {}
+            }
+        }
+
+        // If any replica said stale and none succeeded, retry with corrected chunk_id.
+        if new_chunk_id.is_none() {
+            if let Some((corrected_id, corrected_nodes)) = stale_response {
+                if attempt == 0 {
+                    warn!("PatchChunk: client chunk_id {} is stale, retrying with server's {} (attempt {})",
+                        old_chunk_id, corrected_id, attempt + 1);
+                    old_chunk_id = corrected_id;
+                    current_location = dfs_common::ChunkLocation {
+                        chunk_id: corrected_id,
+                        nodes: corrected_nodes,
+                        size: current_location.size,
+                        checksum: corrected_id.hash,
+                        file_offset: current_location.file_offset,
+                        written_at: None,
+                    };
+                    continue;
+                }
             }
         }
 
@@ -4322,7 +4380,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             nodes: patched_node_ids.clone(),
             size: new_size,
             checksum: new_chunk_id.hash,
-            file_offset: old_location.file_offset,
+            file_offset: current_location.file_offset,
             written_at: None,
         };
         // Leader gets new ChunkLocation synchronously — guarantees the leader's chunk map
@@ -4355,24 +4413,59 @@ leader_addr: Arc::new(RwLock::new(None)),
             });
         }
 
-        // Step 4: Delete old chunk from any cluster nodes that are NOT in the replica set.
-        // These are nodes where the healer previously copied the old chunk. Deleting it
-        // prevents the healer from spreading the stale version; the healer will then see
-        // new_chunk_id is under-replicated and copy it to those nodes.
-        let replica_addr_set: std::collections::HashSet<SocketAddr> = replica_addrs.into_iter().collect();
-        for addr in all_cluster_nodes.iter().filter(|a| !replica_addr_set.contains(a)) {
-            let client = self.clone();
-            let req = Request::DeleteChunk { chunk_id: old_chunk_id };
-            let addr = *addr;
-            tokio::spawn(async move {
-                if let Err(e) = client.send_request(addr, req).await {
-                    debug!("PatchChunk: delete old chunk on {} failed (ok if not present): {}", addr, e);
-                }
-            });
-        }
+        // Step 4 (removed): We no longer eagerly delete old_chunk_id from non-replica nodes.
+        // Under concurrent patches (A→B→C), the async delete of A would race with B being
+        // spread by the healer, and the delete of B (from patch 2) could fire before patch 2's
+        // ReplicateChunkLocation broadcast reaches all nodes — causing C to be unfindable.
+        // The healer already handles cleanup of over-replicated old chunks safely.
 
         info!("PatchChunk: {} -> {} ({} replicas patched)", old_chunk_id, new_chunk_id, patched_node_ids.len());
-        Ok(new_location)
+        return Ok(new_location);
+        } // end retry loop
+        anyhow::bail!("PatchChunk: exhausted retries for chunk {}", old_chunk_id)
+    }
+
+    /// Patch a chunk at `chunk_idx` within `file_path`, with leader validation.
+    ///
+    /// Before patching, asks the leader for the current chunk location for that index.
+    /// If the leader returns a different chunk ID than `expected_chunk_id`, the caller's
+    /// view is stale — we use the leader's authoritative ID instead. This prevents the
+    /// concurrent-overwrite race where two writers both snapshot the same old chunk ID,
+    /// one patches it, and the second tries to patch the now-deleted chunk.
+    ///
+    /// Returns (new_location, fresh_metadata) so the caller can update metadata_cache
+    /// with the complete fresh picture from the leader (not just the patched chunk).
+    pub async fn patch_chunk_with_leader_verify(
+        &self,
+        file_path: &str,
+        chunk_idx: u64,
+        expected_chunk_id: ChunkId,
+        chunk_file_offset: u64,
+        intra_offset: usize,
+        patch_data: Vec<u8>,
+    ) -> Result<(dfs_common::ChunkLocation, FileMetadata)> {
+        // Fetch authoritative metadata from leader.
+        let fresh_meta = self.get_file_metadata(file_path).await?
+            .ok_or_else(|| anyhow::anyhow!("patch_chunk_with_leader_verify: file not found: {}", file_path))?;
+
+        let current_loc = fresh_meta.chunk_location_for_idx(chunk_idx)
+            .ok_or_else(|| anyhow::anyhow!("patch_chunk_with_leader_verify: chunk {} not in leader metadata for {}", chunk_idx, file_path))?
+            .clone();
+
+        if current_loc.chunk_id != expected_chunk_id {
+            info!("patch_chunk_with_leader_verify: chunk {} stale — expected {} leader has {}, using leader ID",
+                chunk_idx, expected_chunk_id, current_loc.chunk_id);
+        }
+
+        let new_loc = self.patch_chunk_on_replicas(
+            current_loc.chunk_id,
+            chunk_file_offset,
+            intra_offset,
+            patch_data,
+            &current_loc,
+        ).await?;
+
+        Ok((new_loc, fresh_meta))
     }
 
     /// Apply multiple non-contiguous byte-range patches to a chunk in a single RPC.
@@ -4386,16 +4479,44 @@ leader_addr: Arc::new(RwLock::new(None)),
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
     ) -> Result<dfs_common::ChunkLocation> {
+        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, None, None, chunk_file_offset, patches, old_location, expected_new_chunk_id).await
+    }
+
+    pub async fn multi_patch_chunk_on_replicas_verified(
+        &self,
+        old_chunk_id: ChunkId,
+        file_id: FileId,
+        chunk_idx: u64,
+        chunk_file_offset: u64,
+        patches: Vec<(usize, Vec<u8>)>,
+        old_location: &dfs_common::ChunkLocation,
+        expected_new_chunk_id: Option<ChunkId>,
+    ) -> Result<dfs_common::ChunkLocation> {
+        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, Some(file_id), Some(chunk_idx), chunk_file_offset, patches, old_location, expected_new_chunk_id).await
+    }
+
+    async fn multi_patch_chunk_on_replicas_inner(
+        &self,
+        mut old_chunk_id: ChunkId,
+        file_id: Option<FileId>,
+        chunk_idx: Option<u64>,
+        chunk_file_offset: u64,
+        patches: Vec<(usize, Vec<u8>)>,
+        old_location: &dfs_common::ChunkLocation,
+        expected_new_chunk_id: Option<ChunkId>,
+    ) -> Result<dfs_common::ChunkLocation> {
+        let mut current_location = old_location.clone();
+        'retry: for attempt in 0u8..2 {
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
         };
         let all_cluster_nodes = self.cluster_nodes.read().await.clone();
 
-        let replica_addrs: Vec<SocketAddr> = if old_location.nodes.is_empty() {
+        let replica_addrs: Vec<SocketAddr> = if current_location.nodes.is_empty() {
             all_cluster_nodes.clone()
         } else {
-            old_location.nodes.iter()
+            current_location.nodes.iter()
                 .filter_map(|nid| node_id_to_addr.get(nid).copied())
                 .collect()
         };
@@ -4408,8 +4529,10 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let patch_req = Request::MultiPatch {
             chunk_id: old_chunk_id,
+            file_id,
+            chunk_idx,
             chunk_file_offset,
-            patches,
+            patches: patches.clone(),
             expected_new_chunk_id,
         };
 
@@ -4442,6 +4565,25 @@ leader_addr: Arc::new(RwLock::new(None)),
                     } else {
                         replica_results.push((addr, Ok((ncid, size))));
                     }
+                }
+                Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
+                    if attempt == 0 {
+                        warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",
+                            addr, old_chunk_id, current_chunk_id);
+                        old_chunk_id = current_chunk_id;
+                        let old_offset = current_location.file_offset;
+                        let old_size = current_location.size;
+                        current_location = dfs_common::ChunkLocation {
+                            chunk_id: current_chunk_id,
+                            nodes: current_nodes,
+                            size: old_size,
+                            checksum: current_chunk_id.hash,
+                            file_offset: old_offset,
+                            written_at: None,
+                        };
+                        continue 'retry;
+                    }
+                    replica_results.push((addr, Err(anyhow::anyhow!("chunk stale after retry"))));
                 }
                 Ok(Response::Error { message, .. }) => {
                     warn!("MultiPatch replica {} error: {}", addr, message);
@@ -4585,21 +4727,15 @@ leader_addr: Arc::new(RwLock::new(None)),
             });
         }
 
-        let replica_addr_set: std::collections::HashSet<SocketAddr> = replica_addrs.into_iter().collect();
-        for addr in all_cluster_nodes.iter().filter(|a| !replica_addr_set.contains(a)) {
-            let client = self.clone();
-            let req = Request::DeleteChunk { chunk_id: old_chunk_id };
-            let addr = *addr;
-            tokio::spawn(async move {
-                if let Err(e) = client.send_request(addr, req).await {
-                    debug!("MultiPatch: delete old chunk on {} failed: {}", addr, e);
-                }
-            });
-        }
+        // Step 4 (removed): same reasoning as patch_chunk_on_replicas — eager deletion of
+        // old_chunk_id from non-replica nodes races with concurrent patches and causes
+        // "chunk not found" on reads. Let the healer handle old chunk cleanup.
 
-        let n_patches = if let Request::MultiPatch { ref patches, .. } = patch_req { patches.len() } else { 0 };
+        let n_patches = patches.len();
         info!("MultiPatch: {} -> {} ({} replicas, {} patches)", old_chunk_id, new_chunk_id, patched_node_ids.len(), n_patches);
-        Ok(new_location)
+        return Ok(new_location);
+        } // end retry loop
+        anyhow::bail!("MultiPatch: exhausted retries for chunk {}", old_chunk_id)
     }
 
     /// Build ChunkLocation entries from chunk_ids/sizes with file_offset tracking.

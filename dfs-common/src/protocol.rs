@@ -277,6 +277,14 @@ pub enum Request {
     PatchChunk {
         /// Existing chunk to patch
         chunk_id: ChunkId,
+        /// File this chunk belongs to — used by the server to validate chunk_id against
+        /// its local chunk map. If the server's record for (file_id, chunk_idx) differs
+        /// from chunk_id it returns ChunkStale instead of applying the patch.
+        #[serde(default)]
+        file_id: Option<FileId>,
+        /// Index of this chunk within the file (chunk_file_offset / CHUNK_SIZE).
+        #[serde(default)]
+        chunk_idx: Option<u64>,
         /// Absolute file offset of the start of this chunk (for position-aware hash)
         chunk_file_offset: u64,
         /// Byte offset within the chunk where the patch data begins
@@ -292,6 +300,12 @@ pub enum Request {
     MultiPatch {
         /// Existing chunk to patch
         chunk_id: ChunkId,
+        /// File this chunk belongs to — for server-side chunk_id validation.
+        #[serde(default)]
+        file_id: Option<FileId>,
+        /// Index of this chunk within the file.
+        #[serde(default)]
+        chunk_idx: Option<u64>,
         /// Absolute file offset of the start of this chunk (for position-aware hash)
         chunk_file_offset: u64,
         /// Patches to apply: (intra_chunk_offset, data) pairs, applied in order.
@@ -643,6 +657,18 @@ pub enum Response {
     Error {
         message: String,
         code: ErrorCode,
+    },
+
+    /// The chunk_id in a PatchChunk/MultiPatch request doesn't match the server's
+    /// record for (file_id, chunk_idx). Patch was NOT applied. Client should update
+    /// its local chunk map to use current_chunk_id and retry.
+    /// MUST stay at the end of this enum — appending preserves existing variant
+    /// indices so old servers remain wire-compatible with new clients/servers.
+    ChunkStale {
+        /// The chunk_id the server believes is current for this (file_id, chunk_idx).
+        current_chunk_id: ChunkId,
+        /// Replica nodes holding current_chunk_id.
+        current_nodes: Vec<NodeId>,
     },
 }
 

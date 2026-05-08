@@ -3839,47 +3839,43 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
         drop(node_id_map);
 
-        // Deliver ChunkLocation to the leader synchronously before returning to the caller.
-        // This guarantees the leader has the chunk map entry before the client's write ACK
-        // lands — so any subsequent read (even from another node that queries the leader)
-        // sees the chunk. Non-leader nodes get it fire-and-forget — a slow/unresponsive
-        // follower must not stall the write pipeline; the leader's dissemination covers misses.
-        let all_nodes_snapshot = all_nodes.to_vec();
+        // Deliver ChunkLocation synchronously to leader + the 2 replica nodes, in parallel.
+        // All 3 fly simultaneously so latency ≈ max(3 RPCs) ≈ 1 RPC. Non-replica followers
+        // learn about the chunk via the leader's own re-broadcast. This prevents ghost
+        // chunk_map entries on non-replica nodes that cause perpetual ChunkStale loops.
         let leader_addr = *self.leader_addr.read().await;
+        let node_id_to_addr_snap = {
+            let map = self.addr_to_node_id.read().await;
+            map.iter().map(|(&a, &id)| (id, a)).collect::<HashMap<dfs_common::NodeId, SocketAddr>>()
+        };
         for location in chunk_locations.iter().cloned() {
-            let mut leader_task = None;
-            for &addr in &all_nodes_snapshot {
+            // Build set: leader + replica nodes (deduplicated).
+            let mut sync_addrs: Vec<SocketAddr> = location.nodes.iter()
+                .filter_map(|nid| node_id_to_addr_snap.get(nid).copied())
+                .collect();
+            if let Some(leader) = leader_addr {
+                if !sync_addrs.contains(&leader) {
+                    sync_addrs.push(leader);
+                }
+            }
+            let sync_futures: Vec<_> = sync_addrs.iter().map(|&addr| {
                 let client = self.clone();
                 let loc = location.clone();
-                let is_leader = Some(addr) == leader_addr;
-                let task = tokio::spawn(async move {
-                    let req = Request::ReplicateChunkLocation { location: loc.clone() };
-                    match tokio::time::timeout(Duration::from_secs(2), client.send_request(addr, req.clone())).await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) if is_leader => {
-                            // One retry for the leader, also bounded, so a flaky leader
-                            // can't hold up the write pipeline indefinitely.
-                            warn!("ChunkLocation to leader {} failed: {}, retrying once", addr, e);
-                            if let Err(e2) = tokio::time::timeout(
-                                Duration::from_secs(2),
-                                client.send_request(addr, req),
-                            ).await.unwrap_or_else(|_| Err(anyhow::anyhow!("timeout"))) {
-                                warn!("ChunkLocation to leader {} retry also failed: {}", addr, e2);
-                            }
+                async move {
+                    let req = Request::ReplicateChunkLocation { location: loc };
+                    let mut backoff_ms = 250u64;
+                    for attempt in 1u32..=4 {
+                        match tokio::time::timeout(Duration::from_secs(3), client.send_request(addr, req.clone())).await {
+                            Ok(Ok(_)) => return,
+                            Ok(Err(e)) => warn!("WriteChunk: ChunkLocation to {} failed (attempt {}): {}", addr, attempt, e),
+                            Err(_)    => warn!("WriteChunk: ChunkLocation to {} timed out (attempt {})", addr, attempt),
                         }
-                        Ok(Err(e)) => debug!("ChunkLocation to {} failed (leader will catch up): {}", addr, e),
-                        Err(_) => warn!("ChunkLocation to {} timed out", addr),
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(4_000);
                     }
-                });
-                if is_leader {
-                    leader_task = Some(task);
                 }
-                // Non-leader tasks are detached — fire-and-forget.
-            }
-            // Only await the leader; followers run in background.
-            if let Some(t) = leader_task {
-                let _ = t.await;
-            }
+            }).collect();
+            futures::future::join_all(sync_futures).await;
         }
 
         // Populate byte-range cache for immediate read-back
@@ -4374,7 +4370,11 @@ leader_addr: Arc::new(RwLock::new(None)),
             None => anyhow::bail!("PatchChunk: all replicas failed for chunk {}", old_chunk_id),
         };
 
-        // Step 3: Broadcast new ChunkLocation to all nodes
+        // Step 3: Send new ChunkLocation synchronously to leader + replica nodes.
+        // The leader re-broadcasts to remaining followers async. Non-replica nodes must
+        // NOT receive direct ReplicateChunkLocation: they'd update their chunk_map to the
+        // new chunk_id without holding the data, causing them to return stale ChunkStale
+        // corrections on the next patch — a ghost reference that can't be resolved.
         let new_location = dfs_common::ChunkLocation {
             chunk_id: new_chunk_id,
             nodes: patched_node_ids.clone(),
@@ -4383,35 +4383,35 @@ leader_addr: Arc::new(RwLock::new(None)),
             file_offset: current_location.file_offset,
             written_at: None,
         };
-        // Leader gets new ChunkLocation synchronously — guarantees the leader's chunk map
-        // is current before we return. Followers get it async via leader's own broadcast.
         let leader_addr = *self.leader_addr.read().await;
+        // Build the set of addresses to update synchronously: leader + replica nodes.
+        let mut sync_addrs: Vec<SocketAddr> = replica_addrs.clone();
         if let Some(leader) = leader_addr {
-            let req = Request::ReplicateChunkLocation { location: new_location.clone() };
-            let mut backoff_ms = 250u64;
-            for attempt in 1u32..=4 {
-                match tokio::time::timeout(
-                    Duration::from_secs(3),
-                    self.send_request(leader, req.clone()),
-                ).await {
-                    Ok(Ok(_)) => break,
-                    Ok(Err(e)) => warn!("PatchChunk: ChunkLocation to leader {} failed (attempt {}): {}", leader, attempt, e),
-                    Err(_)    => warn!("PatchChunk: ChunkLocation to leader {} timed out (attempt {})", leader, attempt),
-                }
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(4_000);
+            if !sync_addrs.contains(&leader) {
+                sync_addrs.push(leader);
             }
         }
-        for &addr in &all_cluster_nodes {
-            if Some(addr) == leader_addr { continue; }
+        let req = Request::ReplicateChunkLocation { location: new_location.clone() };
+        let futures: Vec<_> = sync_addrs.iter().map(|&addr| {
             let client = self.clone();
-            let req = Request::ReplicateChunkLocation { location: new_location.clone() };
-            tokio::spawn(async move {
-                if let Err(e) = client.send_request(addr, req).await {
-                    debug!("PatchChunk: location to follower {} failed (leader will catch up): {}", addr, e);
+            let req = req.clone();
+            async move {
+                let mut backoff_ms = 250u64;
+                for attempt in 1u32..=4 {
+                    match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        client.send_request(addr, req.clone()),
+                    ).await {
+                        Ok(Ok(_)) => return,
+                        Ok(Err(e)) => warn!("PatchChunk: ChunkLocation to {} failed (attempt {}): {}", addr, attempt, e),
+                        Err(_)    => warn!("PatchChunk: ChunkLocation to {} timed out (attempt {})", addr, attempt),
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(4_000);
                 }
-            });
-        }
+            }
+        }).collect();
+        futures::future::join_all(futures).await;
 
         // Step 4 (removed): We no longer eagerly delete old_chunk_id from non-replica nodes.
         // Under concurrent patches (A→B→C), the async delete of A would race with B being
@@ -4699,37 +4699,36 @@ leader_addr: Arc::new(RwLock::new(None)),
             written_at: None,
         };
 
+        // Send ReplicateChunkLocation synchronously to leader + replica nodes only.
+        // Non-replica nodes must not receive this directly — see patch_chunk_on_replicas_inner.
         let leader_addr = *self.leader_addr.read().await;
+        let mut sync_addrs: Vec<SocketAddr> = replica_addrs.clone();
         if let Some(leader) = leader_addr {
-            let req = Request::ReplicateChunkLocation { location: new_location.clone() };
-            let mut backoff_ms = 250u64;
-            for attempt in 1u32..=4 {
-                match tokio::time::timeout(
-                    Duration::from_secs(3),
-                    self.send_request(leader, req.clone()),
-                ).await {
-                    Ok(Ok(_)) => break,
-                    Ok(Err(e)) => warn!("MultiPatch: ChunkLocation to leader {} failed (attempt {}): {}", leader, attempt, e),
-                    Err(_)    => warn!("MultiPatch: ChunkLocation to leader {} timed out (attempt {})", leader, attempt),
-                }
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(4_000);
+            if !sync_addrs.contains(&leader) {
+                sync_addrs.push(leader);
             }
         }
-        for &addr in &all_cluster_nodes {
-            if Some(addr) == leader_addr { continue; }
+        let loc_req = Request::ReplicateChunkLocation { location: new_location.clone() };
+        let loc_futures: Vec<_> = sync_addrs.iter().map(|&addr| {
             let client = self.clone();
-            let req = Request::ReplicateChunkLocation { location: new_location.clone() };
-            tokio::spawn(async move {
-                if let Err(e) = client.send_request(addr, req).await {
-                    debug!("MultiPatch: location to follower {} failed (leader will catch up): {}", addr, e);
+            let req = loc_req.clone();
+            async move {
+                let mut backoff_ms = 250u64;
+                for attempt in 1u32..=4 {
+                    match tokio::time::timeout(
+                        Duration::from_secs(3),
+                        client.send_request(addr, req.clone()),
+                    ).await {
+                        Ok(Ok(_)) => return,
+                        Ok(Err(e)) => warn!("MultiPatch: ChunkLocation to {} failed (attempt {}): {}", addr, attempt, e),
+                        Err(_)    => warn!("MultiPatch: ChunkLocation to {} timed out (attempt {})", addr, attempt),
+                    }
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(4_000);
                 }
-            });
-        }
-
-        // Step 4 (removed): same reasoning as patch_chunk_on_replicas — eager deletion of
-        // old_chunk_id from non-replica nodes races with concurrent patches and causes
-        // "chunk not found" on reads. Let the healer handle old chunk cleanup.
+            }
+        }).collect();
+        futures::future::join_all(loc_futures).await;
 
         let n_patches = patches.len();
         info!("MultiPatch: {} -> {} ({} replicas, {} patches)", old_chunk_id, new_chunk_id, patched_node_ids.len(), n_patches);

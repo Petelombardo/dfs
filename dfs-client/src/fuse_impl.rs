@@ -5305,6 +5305,12 @@ impl Filesystem for DfsFilesystem {
         datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        // fsync on the root inode (ino==1) means `sync /mount` — flush everything.
+        if ino == 1 {
+            self.fsyncdir(_req, 1, _fh, datasync, reply);
+            return;
+        }
+
         let path = self.metadata_cache.get(&ino).map(|m| m.path.clone()).unwrap_or_default();
         let active_writers = self.write_open_counts.get(&ino).map(|c| *c).unwrap_or(0);
         let tasks_in_flight = self.write_tasks_in_flight.get(&ino)
@@ -5430,6 +5436,108 @@ impl Filesystem for DfsFilesystem {
                     error!("Failed to flush metadata on fsync for inode {}: {}", ino, e);
                     reply.error(libc::EIO);
                 }
+            }
+        }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        // Only do a full flush when called on the root inode (i.e. `sync /mount`).
+        // For other directories there is nothing to flush — return ok immediately.
+        if ino != 1 {
+            reply.ok();
+            return;
+        }
+
+        info!("fsyncdir: root — flushing all write buffers and metadata queue");
+
+        let write_buffers = self.write_buffers.clone();
+        let flush_in_flight = self.flush_in_flight.clone();
+        let client = self.client.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let release_in_flight = self.release_in_flight.clone();
+
+        let flush_handle = FlushHandle {
+            client: client.clone(),
+            write_buffers: write_buffers.clone(),
+            metadata_cache: metadata_cache.clone(),
+            flush_in_flight: flush_in_flight.clone(),
+            last_metadata_update: self.last_metadata_update.clone(),
+            dir_cache: self.dir_cache.clone(),
+            path_to_inode: self.path_to_inode.clone(),
+            truncated_inodes: self.truncated_inodes.clone(),
+            flush_runtime: self.flush_runtime.clone(),
+            global_buffered_bytes: self.global_buffered_bytes.clone(),
+            flush_notify: self.flush_notify.clone(),
+            write_tasks_in_flight: self.write_tasks_in_flight.clone(),
+        };
+
+        let result = self.block_on(async move {
+            // Wait for any in-flight release() flush tasks to complete.
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            loop {
+                let total: usize = release_in_flight.iter()
+                    .map(|e| e.value().load(std::sync::atomic::Ordering::Relaxed))
+                    .sum();
+                if total == 0 { break; }
+                if tokio::time::Instant::now() > deadline {
+                    warn!("fsyncdir: timed out waiting for release tasks");
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+
+            // Flush all dirty write buffers.
+            let inodes: Vec<u64> = write_buffers.iter().map(|e| *e.key()).collect();
+            if !inodes.is_empty() {
+                let handles: Vec<_> = inodes.into_iter().map(|i| {
+                    let h = flush_handle.clone();
+                    let rt = h.flush_runtime.clone();
+                    rt.spawn(async move {
+                        if let Err(e) = h.flush_buffer_async(i, true).await {
+                            error!("fsyncdir: flush failed for inode {}: {}", i, e);
+                        }
+                    })
+                }).collect();
+                for h in handles { let _ = h.await; }
+            }
+
+            // Wait for any background in-flight flushes to drain.
+            if let Some(in_flight) = flush_in_flight.read().unwrap().as_ref() {
+                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                while !in_flight.is_empty() {
+                    if tokio::time::Instant::now() > deadline {
+                        warn!("fsyncdir: timed out waiting for in-flight flushes");
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+            }
+
+            // Commit metadata for all inodes with chunk locations.
+            let to_commit: Vec<_> = metadata_cache.iter()
+                .filter(|e| !e.chunk_locations.is_empty())
+                .map(|e| e.clone())
+                .collect();
+            for meta in to_commit {
+                client.flush_metadata_sync(&meta).await;
+            }
+
+            info!("fsyncdir: all buffers flushed and metadata committed");
+            Ok::<(), anyhow::Error>(())
+        });
+
+        match result {
+            Ok(_) => reply.ok(),
+            Err(e) => {
+                error!("fsyncdir: flush error: {}", e);
+                reply.error(libc::EIO);
             }
         }
     }

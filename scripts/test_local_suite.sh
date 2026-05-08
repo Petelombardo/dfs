@@ -9,11 +9,30 @@ LOG=/tmp/dfs-test-logs
 CLUSTER="127.0.0.1:8900,127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904"
 BIN="$REPO/target/release"
 PASS=0; FAIL=0; T=/tmp/dfs-suite-tmp-$$
+CURRENT_CLIENT_LOG=""   # set once each client starts
 
 check() {
     local name="$1" result="$2"
     if [ "$result" = "PASS" ]; then echo "  PASS: $name"; PASS=$((PASS+1))
     else echo "  FAIL: $name"; FAIL=$((FAIL+1)); fi
+}
+
+# snapshot_log <test-label>
+# Copies current client log to $LOG/<label>.log then truncates it to zero.
+# Call at the START of each test so <label>.log contains only that test's output.
+snapshot_log() {
+    local label="$1"
+    [ -z "$CURRENT_CLIENT_LOG" ] && return
+    [ -f "$CURRENT_CLIENT_LOG" ] || return
+    cp "$CURRENT_CLIENT_LOG" "$LOG/${label}.log"
+    : > "$CURRENT_CLIENT_LOG"
+}
+
+# dfs_sync: flush all DFS write buffers and metadata to disk.
+# Uses sync(1) on the mount point which triggers fsyncdir on the root inode,
+# causing the client to drain all write buffers and commit metadata before returning.
+dfs_sync() {
+    mountpoint -q "$MOUNT" 2>/dev/null && sync "$MOUNT" || true
 }
 
 # ── cleanup ──────────────────────────────────────────────────────────────────
@@ -38,18 +57,21 @@ sleep 3
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
     --log-file "$LOG/client.log" --allow-other --log-level info &
 CLIENT_PID=$!
+CURRENT_CLIENT_LOG="$LOG/client.log"
 sleep 2
 mountpoint -q "$MOUNT" || { echo "MOUNT FAILED"; tail -20 "$LOG/client.log"; exit 1; }
 echo "Mounted. Running tests..."
 echo ""
 
 # ── Test 1: small write + read ────────────────────────────────────────────────
+snapshot_log T1
 echo "=== T1: small write/read ==="
 echo "hello distributed world" > "$MOUNT/t1.txt"
 GOT=$(cat "$MOUNT/t1.txt")
 [ "$GOT" = "hello distributed world" ] && check "T1 small write/read" PASS || check "T1 small write/read (got: $GOT)" FAIL
 
 # ── Test 2: 2MB write + read ──────────────────────────────────────────────────
+snapshot_log T2
 echo "=== T2: 2MB write/read ==="
 dd if=/dev/urandom of="$T/big.bin" bs=1M count=2 2>/dev/null
 cp "$T/big.bin" "$MOUNT/t2.bin"
@@ -59,17 +81,20 @@ m2=$(md5sum "$T/big_read.bin"| cut -d' ' -f1)
 [ "$m1" = "$m2" ] && check "T2 2MB write/read" PASS || check "T2 2MB write/read (exp $m1 got $m2)" FAIL
 
 # ── Test 3: delete vanishes immediately ───────────────────────────────────────
+snapshot_log T3
 echo "=== T3: delete ==="
 echo "delete me" > "$MOUNT/t3_del.txt"
 rm "$MOUNT/t3_del.txt"
 [ ! -f "$MOUNT/t3_del.txt" ] && check "T3 delete vanishes" PASS || check "T3 delete vanishes" FAIL
 
 # ── Test 4: delete stays gone ─────────────────────────────────────────────────
+snapshot_log T4
 echo "=== T4: delete stays gone after 3s ==="
 sleep 3
 [ ! -f "$MOUNT/t3_del.txt" ] && check "T4 delete stays gone" PASS || check "T4 delete stays gone" FAIL
 
 # ── Test 5: delete + recreate same path ───────────────────────────────────────
+snapshot_log T5
 echo "=== T5: delete+recreate ==="
 echo "v1" > "$MOUNT/t5.txt"
 rm "$MOUNT/t5.txt"
@@ -79,6 +104,7 @@ GOT=$(cat "$MOUNT/t5.txt")
 [ "$GOT" = "v2" ] && check "T5 delete+recreate" PASS || check "T5 delete+recreate (got: $GOT)" FAIL
 
 # ── Test 6: selective delete ──────────────────────────────────────────────────
+snapshot_log T6
 echo "=== T6: selective delete ==="
 for i in 1 2 3 4 5; do echo "file$i" > "$MOUNT/t6_$i.txt"; done
 rm "$MOUNT/t6_2.txt" "$MOUNT/t6_4.txt"
@@ -92,20 +118,23 @@ OK=PASS
 check "T6 selective delete" $OK
 
 # ── Test 7: overwrite ─────────────────────────────────────────────────────────
+snapshot_log T7
 echo "=== T7: overwrite ==="
 echo "original" > "$MOUNT/t7.txt"
 echo "overwritten" > "$MOUNT/t7.txt"
+dfs_sync
 GOT=$(cat "$MOUNT/t7.txt")
 [ "$GOT" = "overwritten" ] && check "T7 overwrite" PASS || check "T7 overwrite (got: $GOT)" FAIL
 
 # ── Test 8: unmount + remount persistence ─────────────────────────────────────
+snapshot_log T8
 echo ""
 echo "=== T8: unmount + remount persistence ==="
 echo "persistent data" > "$MOUNT/t8_persist.txt"
 dd if=/dev/urandom of="$T/persist_big.bin" bs=1M count=1 2>/dev/null
 cp "$T/persist_big.bin" "$MOUNT/t8_big.bin"
 PERSIST_MD5=$(md5sum "$T/persist_big.bin" | cut -d' ' -f1)
-sync
+dfs_sync
 
 echo "  Unmounting..."
 fusermount -u "$MOUNT" 2>/dev/null || true
@@ -117,6 +146,7 @@ echo "  Remounting..."
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
     --log-file "$LOG/client2.log" --allow-other --log-level info &
 CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$LOG/client2.log"
 sleep 2
 mountpoint -q "$MOUNT" || { echo "REMOUNT FAILED"; tail -20 "$LOG/client2.log"; exit 1; }
 
@@ -131,11 +161,12 @@ m2=$(md5sum "$T/persist_big_read.bin" | cut -d' ' -f1)
 [ ! -f "$MOUNT/t3_del.txt" ] && check "T8c deleted file still gone after remount" PASS || check "T8c deleted file reappeared after remount" FAIL
 
 # ── Test 9: partial write — sub-chunk (< 4MB) write + read ───────────────────
+snapshot_log T9
 echo ""
 echo "=== T9: partial write (sub-chunk) ==="
 dd if=/dev/urandom of="$T/partial.bin" bs=1M count=1 2>/dev/null
 cp "$T/partial.bin" "$MOUNT/t9_partial.bin"
-sleep 0.2
+dfs_sync
 cp "$MOUNT/t9_partial.bin" "$T/partial_read.bin"
 m1=$(md5sum "$T/partial.bin"      | cut -d' ' -f1)
 m2=$(md5sum "$T/partial_read.bin" | cut -d' ' -f1)
@@ -144,53 +175,55 @@ m2=$(md5sum "$T/partial_read.bin" | cut -d' ' -f1)
 # Sub-chunk write that lands mid-chunk: 100KB
 dd if=/dev/urandom of="$T/tiny.bin" bs=1K count=100 2>/dev/null
 cp "$T/tiny.bin" "$MOUNT/t9_tiny.bin"
-sleep 0.2
+dfs_sync
 cp "$MOUNT/t9_tiny.bin" "$T/tiny_read.bin"
 m1=$(md5sum "$T/tiny.bin"      | cut -d' ' -f1)
 m2=$(md5sum "$T/tiny_read.bin" | cut -d' ' -f1)
 [ "$m1" = "$m2" ] && check "T9b 100KB partial write/read" PASS || check "T9b 100KB partial write/read (exp $m1 got $m2)" FAIL
 
 # ── Test 10: cross-chunk boundary write (> 4MB, < 8MB) ───────────────────────
+snapshot_log T10
 echo ""
 echo "=== T10: cross-chunk boundary write (6MB) ==="
 dd if=/dev/urandom of="$T/cross.bin" bs=1M count=6 2>/dev/null
 cp "$T/cross.bin" "$MOUNT/t10_cross.bin"
-sleep 0.3
+dfs_sync
 cp "$MOUNT/t10_cross.bin" "$T/cross_read.bin"
 m1=$(md5sum "$T/cross.bin"      | cut -d' ' -f1)
 m2=$(md5sum "$T/cross_read.bin" | cut -d' ' -f1)
 [ "$m1" = "$m2" ] && check "T10 6MB cross-chunk write/read" PASS || check "T10 6MB cross-chunk write/read (exp $m1 got $m2)" FAIL
 
 # ── Test 11: append to existing file ─────────────────────────────────────────
+snapshot_log T11
 echo ""
 echo "=== T11: append ==="
 echo "first line" > "$MOUNT/t11_append.txt"
-sleep 1  # wait for flush + metadata commit so kernel gets correct file size for O_APPEND
+dfs_sync  # ensure metadata (file size) is committed before O_APPEND open
 echo "second line" >> "$MOUNT/t11_append.txt"
-sleep 0.5
+dfs_sync
 GOT=$(cat "$MOUNT/t11_append.txt")
 EXPECTED=$'first line\nsecond line'
 [ "$GOT" = "$EXPECTED" ] && check "T11 append to file" PASS || check "T11 append to file (got: $(echo $GOT | head -c 60))" FAIL
 
 # ── Test 12: rename — new path readable, old path gone ───────────────────────
+snapshot_log T12
 echo ""
 echo "=== T12: rename ==="
 echo "rename me" > "$MOUNT/t12_before.txt"
-sleep 1
+dfs_sync
 mv "$MOUNT/t12_before.txt" "$MOUNT/t12_after.txt"
-sleep 0.5
 GOT=$(cat "$MOUNT/t12_after.txt" 2>/dev/null)
 [ "$GOT" = "rename me" ] && check "T12a renamed file readable at new path" PASS || check "T12a renamed file readable (got: $GOT)" FAIL
 [ ! -f "$MOUNT/t12_before.txt" ] && check "T12b old path gone after rename" PASS || check "T12b old path still exists after rename" FAIL
 
 # ── Test 13: rename a binary file, verify data integrity ─────────────────────
+snapshot_log T13
 echo ""
 echo "=== T13: rename binary file ==="
 dd if=/dev/urandom of="$T/rename_src.bin" bs=1M count=2 2>/dev/null
 cp "$T/rename_src.bin" "$MOUNT/t13_src.bin"
-sleep 1
+dfs_sync
 mv "$MOUNT/t13_src.bin" "$MOUNT/t13_dst.bin"
-sleep 0.5
 cp "$MOUNT/t13_dst.bin" "$T/rename_dst_read.bin"
 m1=$(md5sum "$T/rename_src.bin"      | cut -d' ' -f1)
 m2=$(md5sum "$T/rename_dst_read.bin" | cut -d' ' -f1)
@@ -198,6 +231,7 @@ m2=$(md5sum "$T/rename_dst_read.bin" | cut -d' ' -f1)
 [ ! -f "$MOUNT/t13_src.bin" ] && check "T13b src gone after rename" PASS || check "T13b src still exists after rename" FAIL
 
 # ── Test 14: rename + metadata consistency across nodes ──────────────────────
+snapshot_log T14
 echo ""
 echo "=== T14: metadata consistency after renames ==="
 sleep 3  # let dissemination propagate
@@ -241,6 +275,7 @@ echo "  Current file list (from node 8900):"
 # Create a 4MB file. Overwrite the first 2MB with new data (no truncation).
 # Result must still be 4MB, and the final content must match the same op on
 # the local filesystem (first 2MB = patch, last 2MB = original tail).
+snapshot_log T15
 echo ""
 echo "=== T15: partial in-place overwrite (4MB file, patch first 2MB) ==="
 dd if=/dev/urandom of="$T/t15_orig.bin"  bs=1M count=4 2>/dev/null
@@ -252,9 +287,9 @@ dd if="$T/t15_patch.bin" of="$T/t15_expected.bin" bs=1M count=2 conv=notrunc 2>/
 
 # Write orig to DFS, then patch first 2MB in-place (conv=notrunc)
 cp "$T/t15_orig.bin" "$MOUNT/t15_patch.bin"
-sleep 1   # wait for flush + metadata commit
+dfs_sync
 dd if="$T/t15_patch.bin" of="$MOUNT/t15_patch.bin" bs=1M count=2 conv=notrunc 2>/dev/null
-sleep 0.5
+dfs_sync
 cp "$MOUNT/t15_patch.bin" "$T/t15_read.bin"
 
 READ_SIZE=$(stat -c%s "$T/t15_read.bin")
@@ -268,14 +303,15 @@ m2=$(md5sum "$T/t15_read.bin"     | cut -d' ' -f1)
     || check "T15b partial overwrite data (exp $m1 got $m2)" FAIL
 
 # ── Test 16: full replace via O_TRUNC (cp smaller file over larger) ───────────
+snapshot_log T16
 echo ""
 echo "=== T16: O_TRUNC replace (3MB → 1MB) ==="
 dd if=/dev/urandom of="$T/t16_big.bin"   bs=1M count=3 2>/dev/null
 dd if=/dev/urandom of="$T/t16_small.bin" bs=1M count=1 2>/dev/null
 cp "$T/t16_big.bin" "$MOUNT/t16_trunc.bin"
-sleep 1
+dfs_sync
 cp "$T/t16_small.bin" "$MOUNT/t16_trunc.bin"   # cp uses O_TRUNC
-sleep 0.5
+dfs_sync
 cp "$MOUNT/t16_trunc.bin" "$T/t16_read.bin"
 
 READ_SIZE=$(stat -c%s "$T/t16_read.bin")
@@ -329,6 +365,7 @@ m2=$(md5sum "$T/t16_read.bin"  | cut -d' ' -f1)
 # This catches the gap_filled_prefix bug: when the slot fills to CHUNK_SIZE,
 # needs_patch was false and the full slot (with gap-fill zeros) was sent as a
 # fresh WriteData, overwriting real server data with zeros.
+snapshot_log T17
 echo ""
 echo "=== T17: DVR header-update (4MB file, small patch at offset 0) ==="
 dd if=/dev/urandom of="$T/t17_orig.bin" bs=1M count=4 2>/dev/null
@@ -340,9 +377,9 @@ dd if="$T/t17_hdr.bin" of="$T/t17_expected.bin" bs=1K count=12 conv=notrunc 2>/d
 
 # Write 4MB to DFS, flush, then update header
 cp "$T/t17_orig.bin" "$MOUNT/t17_dvr.bin"
-sleep 2  # ensure chunk 0 is flushed and flushed_sizes[0] is set
+dfs_sync  # ensure chunk 0 is flushed and flushed_sizes[0] is set before header patch
 dd if="$T/t17_hdr.bin" of="$MOUNT/t17_dvr.bin" bs=1K count=12 conv=notrunc 2>/dev/null
-sleep 1
+dfs_sync
 cp "$MOUNT/t17_dvr.bin" "$T/t17_read.bin"
 
 READ_SIZE=$(stat -c%s "$T/t17_read.bin")
@@ -359,6 +396,7 @@ m2=$(md5sum "$T/t17_read.bin"     | cut -d' ' -f1)
 # Simulates exact HDHomeRun DVR sequence: write 12KB header first (fresh chunk),
 # then write recording data that fills chunk 0 to exactly 4MB via background ticker.
 # Verifies the tail is not zeroed when the slot fills to CHUNK_SIZE with gap-fill.
+snapshot_log T17c
 echo ""
 echo "=== T17c: DVR exact pattern (12KB header + fill to 4MB via background ticker) ==="
 HEADER_SIZE=12032
@@ -371,13 +409,12 @@ cat "$T/t17c_header.bin" "$T/t17c_recording.bin" > "$T/t17c_expected.bin"
 
 # Step 1: write 12KB header — creates fresh 12032-byte chunk on server
 dd if="$T/t17c_header.bin" of="$MOUNT/t17c_dvr.bin" bs=1k count=$(($HEADER_SIZE/1024)) 2>/dev/null
-sleep 1  # let background ticker flush the 12KB, setting flushed_sizes[0]=12032
+dfs_sync  # flush the 12KB header, setting flushed_sizes[0]=12032 before recording write
 
 # Step 2: write recording data at offset 12032 — slot grows to 4MB, ticker flushes via PatchChunk
 dd if="$T/t17c_recording.bin" of="$MOUNT/t17c_dvr.bin" bs=1k seek=$(($HEADER_SIZE/1024)) count=$(($TAIL_SIZE/1024)) conv=notrunc 2>/dev/null
-sleep 2  # let background ticker flush the extended slot
+dfs_sync
 
-sync
 cp "$MOUNT/t17c_dvr.bin" "$T/t17c_read.bin"
 
 m1=$(md5sum "$T/t17c_expected.bin" | cut -d' ' -f1)
@@ -388,6 +425,7 @@ m2=$(md5sum "$T/t17c_read.bin"     | cut -d' ' -f1)
 # ── Test 18: DVR concurrent-read integrity ────────────────────────────────────
 # Write a 20MB file at ~4MB/s while concurrently reading from offset 0.
 # Verifies: no short reads that skip data, read copy matches written data.
+snapshot_log T18
 sleep 2
 echo "=== T18: DVR concurrent-read integrity ==="
 WRITE_SIZE_MB=16
@@ -469,6 +507,7 @@ rm -f "$T18_DST"
 # Write a 12MB file (3 chunks). Write a 2MB patch file.
 # Apply the 2MB patch to: first 2MB of chunk 0, first 2MB of chunk 1, first 2MB of chunk 2.
 # Mirror every operation on the local filesystem, then compare MD5s chunk-by-chunk.
+snapshot_log T20
 echo ""
 echo "=== T20: partial overwrite — start, middle, end chunk ==="
 CHUNK=$((4*1024*1024))
@@ -485,13 +524,13 @@ dd if="$T/t20_patch.bin" of="$T/t20_expected.bin" bs=1M count=2 seek=8          
 
 # Write original to DFS
 cp "$T/t20_orig.bin" "$MOUNT/t20_test.bin" || true
-sleep 1
+dfs_sync
 
 # Apply same patches to DFS file
 dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=0            conv=notrunc 2>/dev/null || true  # chunk 0
 dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=4            conv=notrunc 2>/dev/null || true  # chunk 1 start
 dd if="$T/t20_patch.bin" of="$MOUNT/t20_test.bin" bs=1M count=2 seek=8            conv=notrunc 2>/dev/null || true  # chunk 2 start
-sleep 1
+dfs_sync
 
 cp "$MOUNT/t20_test.bin" "$T/t20_read.bin" || true
 
@@ -510,12 +549,12 @@ else
 fi
 
 # ── Test 19: large-file delete — non-blocking rm + async chunk cleanup ────────
+snapshot_log T19
 echo ""
 echo "=== T19: large-file delete (400MB / ~100 chunks) ==="
 dd if=/dev/urandom of="$T/t19_large.bin" bs=1M count=400 2>/dev/null
 cp "$T/t19_large.bin" "$MOUNT/t19_large.bin"
-sync
-sleep 3
+dfs_sync
 # Drop the kernel page cache so the read-back goes to the DFS servers cold,
 # not the write-path chunk cache which may hold intermediate chunk states.
 echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
@@ -548,6 +587,7 @@ done
     || check "T19d chunks not deleted after ${T19_WAITED}s (before=$CHUNKS_BEFORE after=$CHUNKS_AFTER)" FAIL
 
 # ── Test 21: metadata storm — 5000 touches, node health check, 100 more ──────
+snapshot_log T21
 echo ""
 echo "=== T21: metadata storm + node health ==="
 
@@ -601,6 +641,77 @@ rm -f /tmp/t21_post_errors_$$
     || check "T21c 100-file post-storm touch ($T21_POST_ERRORS I/O errors)" FAIL
 
 rm -rf "$T21_DIR" 2>/dev/null || true
+
+# ── Test 22: VM disk image random-patch throughput (QEMU install pattern) ─────
+#
+# Emulates what happens during a Debian install on a raw disk image:
+#   - An 8GB pre-existing disk image (all chunks already on servers)
+#   - Many concurrent open → write small patch at random offset → close cycles
+#   - Each patch hits an existing chunk so must go through fetch-hash-patch path
+#
+# Baseline: measures total time and per-patch latency before any optimization.
+snapshot_log T22
+echo ""
+echo "=== T22: VM disk random-patch throughput (QEMU install pattern) ==="
+
+T22_IMG="$MOUNT/t22_disk.img"
+T22_SIZE_MB=32        # 8 chunks of 4MB — representative slice of a disk image
+T22_PATCH_COUNT=50    # 50 concurrent open/patch/close cycles
+T22_PATCH_SIZE=12032  # 12KB — matches the GRUB header write seen in logs
+T22_CONCURRENCY=8     # 8 at a time — matches QEMU's typical queue depth
+
+# Step 1: create the base image (fresh sequential write — fast path)
+echo "  Writing ${T22_SIZE_MB}MB base image..."
+dd if=/dev/urandom of="$T/t22_base.bin" bs=1M count=$T22_SIZE_MB 2>/dev/null
+cp "$T/t22_base.bin" "$T22_IMG"
+dfs_sync  # ensure all chunks are flushed and metadata is committed before patches
+
+# Step 2: run N random patches concurrently, measuring total wall time
+echo "  Running $T22_PATCH_COUNT patches ($T22_CONCURRENCY concurrent, ${T22_PATCH_SIZE}B each)..."
+dd if=/dev/urandom of="$T/t22_patch.bin" bs=$T22_PATCH_SIZE count=1 2>/dev/null
+
+T22_START=$(date +%s%3N)
+
+# Each job: pick a random 4MB-aligned chunk offset, patch T22_PATCH_SIZE bytes at a
+# random intra-chunk offset. Use dd conv=notrunc so the rest of the chunk is preserved.
+T22_ERRORS=0
+seq 1 $T22_PATCH_COUNT | xargs -P$T22_CONCURRENCY -I{} bash -c '
+    img="$1"; patch="$2"; size_mb="$3"; patch_size="$4"
+    # random chunk (0..N-1) then random intra-chunk offset aligned to 4KB
+    chunk=$(( RANDOM % (size_mb / 4) ))
+    intra=$(( (RANDOM % ((4*1024*1024 - patch_size) / 4096)) * 4096 ))
+    byte_off=$(( chunk * 4 * 1024 * 1024 + intra ))
+    python3 -c "
+import sys, os
+img, patch_file, byte_off = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(patch_file,'rb').read()
+fd = os.open(img, os.O_WRONLY)
+os.lseek(fd, byte_off, 0)
+os.write(fd, data)
+os.close(fd)
+" "$img" "$patch" "$byte_off" 2>/dev/null || echo FAIL
+' _ "$T22_IMG" "$T/t22_patch.bin" "$T22_SIZE_MB" "$T22_PATCH_SIZE" \
+  | grep -c FAIL > /tmp/t22_errors_$$ 2>/dev/null || true
+
+T22_MS=$(( $(date +%s%3N) - T22_START ))
+T22_ERRORS=$(cat /tmp/t22_errors_$$ 2>/dev/null || echo 0)
+rm -f /tmp/t22_errors_$$
+
+T22_PER_PATCH_MS=$(( T22_MS / T22_PATCH_COUNT ))
+
+[ "$T22_ERRORS" -eq 0 ] \
+    && check "T22a $T22_PATCH_COUNT random patches, 0 errors" PASS \
+    || check "T22a $T22_PATCH_COUNT random patches, $T22_ERRORS errors" FAIL
+
+echo "  Throughput: ${T22_PATCH_COUNT} patches in ${T22_MS}ms (~${T22_PER_PATCH_MS}ms/patch)"
+
+# Step 3: read back and verify the image is still consistent (no corruption)
+cp "$T22_IMG" "$T/t22_readback.bin" 2>/dev/null
+[ -s "$T/t22_readback.bin" ] \
+    && check "T22b image readable after patch storm" PASS \
+    || check "T22b image unreadable after patch storm" FAIL
+
+rm -f "$T22_IMG" 2>/dev/null || true
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

@@ -1288,6 +1288,18 @@ impl FlushHandle {
                                         }
                                         Err(retry_err) => {
                                             warn!("flush_buffer_async_one: retry MultiPatch failed for ino={} chunk={}: {}", ino, chunk_idx, retry_err);
+                                            // Even though the retry failed, update metadata cache with
+                                            // the fresh location so the next attempt uses the current
+                                            // chunk ID instead of looping forever on the stale one.
+                                            if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                                                if let Some(existing) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
+                                                    *existing = loc.clone();
+                                                }
+                                            }
+                                            self.client.recent_chunk_writes.insert(
+                                                (ino, chunk_idx),
+                                                (loc.chunk_id, file_id_at_flush_start.unwrap_or_default(), std::time::Instant::now()),
+                                            );
                                             if let Some(state_arc) = self.write_buffers.get(&ino) {
                                                 let mut state = state_arc.lock().await;
                                                 if let Some(slot) = state.slots.get_mut(&chunk_idx) {

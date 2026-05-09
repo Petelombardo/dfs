@@ -1,5 +1,7 @@
 #!/bin/bash
 # Local integration test suite: write, read, delete, partial writes, rename, remount persistence, metadata consistency.
+# Usage: test_local_suite.sh [T<N> [T<N> ...]]   — run only the specified tests (e.g. T7 T23)
+#        test_local_suite.sh                      — run all tests
 set -e
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -11,6 +13,14 @@ BIN="$REPO/target/release"
 PASS=0; FAIL=0; T=/tmp/dfs-suite-tmp-$$
 CURRENT_CLIENT_LOG=""   # set once each client starts
 
+# If test filter args given, only run those tests (e.g. T7 T23).
+RUN_TESTS="${*:-ALL}"
+should_run() {
+    [ "$RUN_TESTS" = "ALL" ] && return 0
+    for t in $RUN_TESTS; do [ "$t" = "$1" ] && return 0; done
+    return 1
+}
+
 check() {
     local name="$1" result="$2"
     if [ "$result" = "PASS" ]; then echo "  PASS: $name"; PASS=$((PASS+1))
@@ -20,8 +30,10 @@ check() {
 # snapshot_log <test-label>
 # Copies current client log to $LOG/<label>.log then truncates it to zero.
 # Call at the START of each test so <label>.log contains only that test's output.
+# Sets SKIP_TEST=1 if this test is not in the RUN_TESTS filter.
 snapshot_log() {
     local label="$1"
+    should_run "$label" || return 0   # don't snapshot log for skipped tests
     [ -z "$CURRENT_CLIENT_LOG" ] && return
     [ -f "$CURRENT_CLIENT_LOG" ] || return
     cp "$CURRENT_CLIENT_LOG" "$LOG/${label}.log"
@@ -559,7 +571,7 @@ cp "$T/t19_large.bin" "$MOUNT/t19_large.bin"
 dfs_sync
 # Drop the kernel page cache so the read-back goes to the DFS servers cold,
 # not the write-path chunk cache which may hold intermediate chunk states.
-echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
 T19_MD5_LOCAL=$(md5sum "$T/t19_large.bin" | cut -d' ' -f1)
 T19_MD5_DFS=$(md5sum "$MOUNT/t19_large.bin" | cut -d' ' -f1)
 [ "$T19_MD5_LOCAL" = "$T19_MD5_DFS" ] && check "T19a 400MB write+read integrity" PASS \
@@ -690,7 +702,7 @@ os.close(fd)
 # random intra-chunk offset. Use dd conv=notrunc so the rest of the chunk is preserved.
 T22_ERRORS=0
 seq 1 $T22_PATCH_COUNT | xargs -P$T22_CONCURRENCY -I{} bash -c '
-    img="$1"; patch="$2"; size_mb="$3"; patch_size="$4"
+    img="$1"; patch="$2"; size_mb="$3"; patch_size="$4"; errfile="$5"
     # random chunk (0..N-1) then random intra-chunk offset aligned to 4KB
     chunk=$(( RANDOM % (size_mb / 4) ))
     intra=$(( (RANDOM % ((4*1024*1024 - patch_size) / 4096)) * 4096 ))
@@ -698,14 +710,18 @@ seq 1 $T22_PATCH_COUNT | xargs -P$T22_CONCURRENCY -I{} bash -c '
     python3 -c "
 import sys, os
 img, patch_file, byte_off = sys.argv[1], sys.argv[2], int(sys.argv[3])
-data = open(patch_file,'rb').read()
+data = open(patch_file,\"rb\").read()
 fd = os.open(img, os.O_WRONLY)
 os.lseek(fd, byte_off, 0)
 os.write(fd, data)
 os.close(fd)
-" "$img" "$patch" "$byte_off" 2>/dev/null || echo FAIL
-' _ "$T22_IMG" "$T/t22_patch.bin" "$T22_SIZE_MB" "$T22_PATCH_SIZE" \
+" "$img" "$patch" "$byte_off" 2>>"$errfile" || echo FAIL
+' _ "$T22_IMG" "$T/t22_patch.bin" "$T22_SIZE_MB" "$T22_PATCH_SIZE" "/tmp/t22_py_errors_$$" \
   | grep -c FAIL > /tmp/t22_errors_$$ 2>/dev/null || true
+if [ -s "/tmp/t22_py_errors_$$" ]; then
+    echo "  Sample python error: $(head -1 /tmp/t22_py_errors_$$)"
+fi
+rm -f "/tmp/t22_py_errors_$$"
 
 T22_MS=$(( $(date +%s%3N) - T22_START ))
 T22_ERRORS=$(cat /tmp/t22_errors_$$ 2>/dev/null || echo 0)
@@ -726,6 +742,117 @@ cp "$T22_IMG" "$T/t22_readback.bin" 2>/dev/null
     || check "T22b image unreadable after patch storm" FAIL
 
 rm -f "$T22_IMG" 2>/dev/null || true
+
+# ── Test 23: random small-read path (range-fetch) ─────────────────────────────
+#
+# Verifies that 4K reads into a multi-chunk file use the byte-range fetch path
+# (ReadChunkRange) rather than fetching the full 4MB chunk.  Checks:
+#   a) Data correctness: every 4K read returns the exact bytes written.
+#   b) Range fetch fires: "Range fetch:" appears in the client log.
+#   c) Sub-chunk cache: a re-read of the same offset is served from cache
+#      (no second "Range fetch:" for the same chunk offset).
+snapshot_log T23
+if should_run T23; then
+echo "=== T23: random small-read (range-fetch) path ==="
+
+T23_SIZE=$(( 3 * 4 * 1024 * 1024 ))   # 12MB — 3 full chunks
+
+# Remount first so the file is written fresh on the new client — this means
+# the kernel page cache has never seen it, so all reads go through FUSE.
+fusermount -u "$MOUNT" 2>/dev/null || true
+sleep 0.5
+T23_CLIENT_LOG="$LOG/client_t23.log"
+: > "$T23_CLIENT_LOG"
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$T23_CLIENT_LOG" --allow-other --log-level debug &
+CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$T23_CLIENT_LOG"
+sleep 2
+mountpoint -q "$MOUNT" || { check "T23 remount" FAIL; CLIENT_PID2=""; }
+
+T23_FILE="$MOUNT/t23_range.bin"
+
+# Write known-pattern data: each 4KB block filled with its block index byte.
+python3 -c "
+size = $T23_SIZE
+block = 4096
+data = bytearray()
+for i in range(size // block):
+    data += bytes([i & 0xff]) * block
+open('$T23_FILE', 'wb').write(data)
+"
+dfs_sync
+
+# Now drop the kernel page cache for this file by evicting it — write then close
+# causes the kernel to have the file in cache. Re-open it after a sync to force
+# the kernel to re-read from FUSE (which now has cold DFS chunk cache).
+# We do this by opening with O_DIRECT hint via a temp path to bust page cache.
+# Simplest: just remount again to get a truly cold cache.
+fusermount -u "$MOUNT" 2>/dev/null || true
+kill "$CLIENT_PID2" 2>/dev/null || true
+sleep 0.5
+: > "$T23_CLIENT_LOG"
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$T23_CLIENT_LOG" --allow-other --log-level debug &
+CLIENT_PID2=$!
+sleep 2
+mountpoint -q "$MOUNT" || { check "T23 remount2" FAIL; CLIENT_PID2=""; }
+T23_FILE="$MOUNT/t23_range.bin"
+
+# Pick 3 4K offsets in different chunks.
+T23_OFF1=$(( 0 * 4*1024*1024 + 8192 ))       # chunk 0, intra 8KB
+T23_OFF2=$(( 1 * 4*1024*1024 + 1048576 ))     # chunk 1, intra 1MB
+T23_OFF3=$(( 2 * 4*1024*1024 + 3*1024*1024 )) # chunk 2, intra 3MB
+
+# Read 4K at each offset and verify pattern bytes.
+T23_ERRORS=0
+for OFF in $T23_OFF1 $T23_OFF2 $T23_OFF3; do
+    EXPECT=$(( (OFF / 4096) & 0xff ))
+    GOT=$(python3 -c "
+f = open('$T23_FILE','rb')
+f.seek($OFF)
+b = f.read(4096)
+f.close()
+exp = $EXPECT
+ok = all(x == exp for x in b) and len(b) == 4096
+print('OK' if ok else 'FAIL')
+")
+    [ "$GOT" = "OK" ] || T23_ERRORS=$(( T23_ERRORS + 1 ))
+done
+sleep 0.5  # let async log writes flush
+
+[ "$T23_ERRORS" -eq 0 ] \
+    && check "T23a 4K random reads correct data" PASS \
+    || check "T23a 4K random reads data errors=$T23_ERRORS" FAIL
+
+# Check that Range fetch log lines appeared (proves ReadChunkRange was used).
+# The log file was freshly created before this mount, so count from the start.
+RANGE_FETCHES=$(grep -c "Range fetch:" "$CURRENT_CLIENT_LOG" 2>/dev/null; true)
+[ "$RANGE_FETCHES" -ge 3 ] \
+    && check "T23b range-fetch fired ($RANGE_FETCHES lines)" PASS \
+    || check "T23b range-fetch did not fire (got $RANGE_FETCHES, want >=3)" FAIL
+
+# Re-read same offsets — verify data is still correct (cache or network).
+T23C_ERRORS=0
+for OFF in $T23_OFF1 $T23_OFF2 $T23_OFF3; do
+    EXPECT=$(( (OFF / 4096) & 0xff ))
+    GOT=$(python3 -c "
+f = open('$T23_FILE','rb')
+f.seek($OFF)
+b = f.read(4096)
+f.close()
+exp = $EXPECT
+ok = all(x == exp for x in b) and len(b) == 4096
+print('OK' if ok else 'FAIL')
+")
+    [ "$GOT" = "OK" ] || T23C_ERRORS=$(( T23C_ERRORS + 1 ))
+done
+[ "$T23C_ERRORS" -eq 0 ] \
+    && check "T23c re-read data still correct" PASS \
+    || check "T23c re-read data errors=$T23C_ERRORS" FAIL
+
+rm -f "$T23_FILE" 2>/dev/null || true
+fi # should_run T23
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

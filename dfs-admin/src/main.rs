@@ -290,6 +290,7 @@ async fn handle_cluster_command(
                     nodes,
                     total_nodes,
                     healthy_nodes,
+                    local_node_id,
                     ..
                 } => {
                     if json_output {
@@ -340,16 +341,21 @@ async fn handle_cluster_command(
                                 dfs_common::NodeStatus::Leaving => format!("← {}", status_str),
                             };
                             let role = if Some(node.id) == leader_id { "LEADER" } else { "follower" };
-                            let now = dfs_common::types::current_timestamp();
-                            let seconds_ago = now.saturating_sub(node.last_heartbeat);
+                            let heartbeat_str = if local_node_id == Some(node.id) {
+                                "-".to_string()
+                            } else {
+                                let now = dfs_common::types::current_timestamp();
+                                let seconds_ago = now.saturating_sub(node.last_heartbeat);
+                                format!("{}s ago", seconds_ago)
+                            };
                             println!(
-                                "{:<10} {:<40} {:<20} {:<12} {:<8} {}s ago",
+                                "{:<10} {:<40} {:<20} {:<12} {:<8} {}",
                                 short_id,
                                 id_str,
                                 node.addr,
                                 status_display,
                                 role,
-                                seconds_ago
+                                heartbeat_str
                             );
                         }
                     }

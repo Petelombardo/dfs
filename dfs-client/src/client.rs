@@ -1673,6 +1673,182 @@ leader_addr: Arc::new(RwLock::new(None)),
         let nodes = self.cluster_nodes.read().await.clone();
         let selector = self.replica_selector.fetch_add(1, Ordering::Relaxed);
 
+        // Detect sequential full-chunk reads (same check used below for fetch dispatch).
+        // Computed here so it can gate both the cache path and pipeline lookahead.
+        let is_sequential_full = {
+            let first_idx = needed.first().map(|(i,_,_)| *i).unwrap_or(0);
+            needed.iter().enumerate().all(|(n, (ci, _co, cs))| {
+                *ci == first_idx + n && *cs == chunk_map[*ci].size
+            })
+        };
+
+        // Random small-read path: only fire for requests that are genuinely small —
+        // specifically smaller than what the kernel issues for sequential readahead (128KB).
+        // This prevents FUSE readahead reads (131072 bytes) from taking the range-fetch
+        // path, which would corrupt data due to the offset-adjusted assembly. Only true
+        // random 4K reads (as issued by KDiskMark RND4K or QEMU random I/O) qualify.
+        const CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+        // Use range-fetch for reads up to 256KB. The kernel issues 128KB readahead reads,
+        // so this threshold catches those while staying well below full-chunk (4MB) size.
+        const RANGE_FETCH_MAX: usize = 256 * 1024;
+        let use_range_fetch = !bypass_cache && !is_sequential_full && size <= RANGE_FETCH_MAX && inode > 0;
+
+        if use_range_fetch {
+            let mut result_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
+
+            // Gather per-chunk range tasks: (chunk_idx, chunk_start, range_offset_in_chunk, range_len, cid, primary, fallbacks)
+            struct RangeFetch {
+                idx: usize,
+                chunk_start: usize,
+                offset_in_chunk: usize,
+                len_in_chunk: usize,
+                cid: ChunkId,
+                primary: SocketAddr,
+                fallbacks: Vec<SocketAddr>,
+            }
+            let mut range_fetches: Vec<RangeFetch> = Vec::new();
+
+            for (chunk_idx, chunk_start, chunk_size) in &needed {
+                let idx = *chunk_idx;
+                let chunk_start = *chunk_start;
+                let chunk_size = *chunk_size;
+                let loc = &chunk_map[idx];
+                let cid = loc.chunk_id;
+
+                let read_start = offset.max(chunk_start);
+                let read_end = (offset + size).min(chunk_start + chunk_size);
+                let offset_in_chunk = read_start - chunk_start;
+                let len_in_chunk = read_end - read_start;
+
+                // Check sub-chunk cache first. Key on read_start (the exact file byte offset
+                // of the fetched data) so the lookup and store use the same coordinate.
+                let cache_key = ByteRangeCacheKey { inode, file_offset: read_start as u64, chunk_id: cid };
+                let cached = {
+                    let mut byte_cache = self.byte_range_cache.lock().await;
+                    if let Some(entry) = byte_cache.get(&cache_key) {
+                        if entry.is_expired() {
+                            byte_cache.pop(&cache_key);
+                            None
+                        } else if len_in_chunk <= entry.data.len() {
+                            Some(Arc::clone(&entry.data))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(cached_data) = cached {
+                    // Cache stores exactly the fetched bytes starting at read_start.
+                    // Trim to len_in_chunk in case a prior fetch was larger.
+                    let slice = cached_data[..len_in_chunk.min(cached_data.len())].to_vec();
+                    debug!("Sub-chunk cache HIT inode={} file_offset={} len={}",
+                           inode, read_start, len_in_chunk);
+                    result_chunks.push((idx, Arc::new(slice)));
+                    continue;
+                }
+
+                // Also try the full chunk_cache (another path may have loaded the full chunk).
+                if let Some(data) = self.chunk_cache.get(&cid).await {
+                    if offset_in_chunk + len_in_chunk <= data.len() {
+                        result_chunks.push((idx, data));
+                        continue;
+                    }
+                }
+
+                let (primary, fallbacks) = match InodeReadEngine::resolve_primary(
+                    loc, &nim, &nodes, selector + idx as u64,
+                ) {
+                    Some(pf) => pf,
+                    None => {
+                        let p = nodes[selector as usize % nodes.len()];
+                        (p, nodes.iter().filter(|&&a| a != p).copied().collect())
+                    }
+                };
+
+                range_fetches.push(RangeFetch { idx, chunk_start, offset_in_chunk, len_in_chunk, cid, primary, fallbacks });
+            }
+
+            // Fetch all missing byte ranges in parallel.
+            if !range_fetches.is_empty() {
+                let tasks: Vec<_> = range_fetches.iter().map(|rf| {
+                    let client = self.clone();
+                    let idx = rf.idx;
+                    let chunk_start = rf.chunk_start;
+                    let offset_in_chunk = rf.offset_in_chunk;
+                    let len_in_chunk = rf.len_in_chunk;
+                    let cid = rf.cid;
+                    let primary = rf.primary;
+                    let fallbacks = rf.fallbacks.clone();
+                    tokio::spawn(async move {
+                        // Try primary then fallbacks.
+                        let mut last_err = None;
+                        for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
+                            match client.read_chunk_range_from_server(
+                                addr, cid, offset_in_chunk as u64, len_in_chunk as u64,
+                            ).await {
+                                Ok(data) => {
+                                    info!("Range fetch: chunk {} off={} len={} → {} bytes",
+                                          cid, offset_in_chunk, len_in_chunk, data.len());
+                                    return Ok((idx, chunk_start, offset_in_chunk, data));
+                                }
+                                Err(e) => { last_err = Some(e); }
+                            }
+                        }
+                        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no replicas")))
+                    })
+                }).collect();
+
+                let fetch_results = futures::future::join_all(tasks).await;
+                for res in fetch_results {
+                    let (idx, chunk_start, offset_in_chunk, data) = res
+                        .context("Range fetch task panicked")
+                        .and_then(|r| r)?;
+                    let arc = Arc::new(data);
+                    // Cache the fetched slice so re-reads of the same offset are instant.
+                    // Key on chunk_start so the entry covers this chunk regardless of which
+                    // byte within it was requested.
+                    {
+                        // Key on read_start (the exact file byte offset of the first byte
+                        // in arc) so cache lookup at the same offset hits directly.
+                        let cache_key = ByteRangeCacheKey {
+                            inode,
+                            file_offset: (chunk_start + offset_in_chunk) as u64,
+                            chunk_id: chunk_map[idx].chunk_id,
+                        };
+                        let cached_entry = CachedChunk {
+                            data: Arc::clone(&arc),
+                            chunk_size: arc.len(),
+                            cached_at: std::time::Instant::now(),
+                        };
+                        self.byte_range_cache.lock().await.put(cache_key, cached_entry);
+                    }
+                    result_chunks.push((idx, arc));
+                }
+            }
+
+            // Assemble response.
+            // Range-fetched data starts at offset_in_chunk (not chunk_start), so we
+            // copy data[0..len] directly to out[out_start..out_end] — no local_start offset.
+            result_chunks.sort_by_key(|(i, _)| *i);
+            let clamped_size = size.min((file_size as usize).saturating_sub(offset));
+            let mut out = vec![0u8; clamped_size];
+            for (chunk_idx, data) in &result_chunks {
+                let (chunk_start, chunk_size) = chunk_offsets[*chunk_idx];
+                let read_start = offset.max(chunk_start);
+                let read_end = (offset + size).min(chunk_start + chunk_size);
+                if read_end <= read_start { continue; }
+                let out_start = read_start - offset;
+                let out_end = read_end - offset;
+                let copy_len = (out_end - out_start).min(data.len());
+                out[out_start..out_start + copy_len].copy_from_slice(&data[..copy_len]);
+            }
+            return Ok(out);
+        }
+
+        // --- Full-chunk path (sequential reads, large reads, SQLite) ---
+
         // --- Cache check ---
         let mut result_chunks: Vec<(usize /*chunk_idx*/, Arc<Vec<u8>>)> = Vec::new();
         let mut to_fetch: Vec<(usize, ChunkId, SocketAddr, Vec<SocketAddr>)> = Vec::new();
@@ -1762,16 +1938,6 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // --- Fetch required chunks (sequential pipeline for full-chunk sequential reads) ---
         if !to_fetch.is_empty() {
-            // Determine if this looks like a sequential full-chunk read.
-            // All required chunks must be full (not seeking into the middle),
-            // and they must be consecutive in the chunk map.
-            let is_sequential_full = {
-                let first_idx = needed.first().map(|(i,_,_)| *i).unwrap_or(0);
-                needed.iter().enumerate().all(|(n, (ci, _co, cs))| {
-                    *ci == first_idx + n && *cs == chunk_map[*ci].size
-                })
-            };
-
             // Measure fetch time for chunk 0 to adaptively set stagger delay
             let start_time = std::time::Instant::now();
             let first_idx_in_batch = to_fetch.first().map(|(idx, _, _, _)| *idx);

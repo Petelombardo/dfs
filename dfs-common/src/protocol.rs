@@ -550,6 +550,9 @@ pub enum Response {
         /// Replication factor configured on this node
         #[serde(default)]
         replication_factor: usize,
+        /// NodeId of the node that answered this request (its own heartbeat is N/A)
+        #[serde(default)]
+        local_node_id: Option<NodeId>,
     },
 
     /// Storage statistics response

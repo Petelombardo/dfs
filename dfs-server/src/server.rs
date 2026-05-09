@@ -3639,6 +3639,7 @@ impl Server {
             chunk_size_mb,
             leader_node_id,
             replication_factor: self.replication_factor,
+            local_node_id: Some(self.cluster.local_node_id()),
         }
     }
 

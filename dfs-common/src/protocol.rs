@@ -249,6 +249,10 @@ pub enum Request {
     /// Replicate chunk location to this node (internal cluster operation)
     ReplicateChunkLocation {
         location: ChunkLocation,
+        /// File that owns this chunk — enables targeted chunk_map update instead of
+        /// scanning all files by file_offset (which matches offset=0 on every file).
+        #[serde(default)]
+        file_id: Option<FileId>,
     },
 
     /// Batch replicate chunk locations — one round-trip replaces N×ReplicateChunkLocation.

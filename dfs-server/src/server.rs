@@ -238,6 +238,32 @@ impl Server {
         }
     }
 
+    /// Targeted variant: update a single chunk location for a known file_id.
+    /// Avoids the scan-all-files fallback that `chunk_map_update_location` uses,
+    /// which incorrectly matches file_offset=0 on the first file it finds rather
+    /// than the actual file being updated.
+    async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
+        if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
+            let (locs, _) = entry.value_mut();
+            // First try exact chunk_id match.
+            for loc in locs.iter_mut() {
+                if loc.chunk_id == location.chunk_id {
+                    *loc = location.clone();
+                    return;
+                }
+            }
+            // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
+            if let Some(file_offset) = location.file_offset {
+                for loc in locs.iter_mut() {
+                    if loc.file_offset == Some(file_offset) {
+                        *loc = location.clone();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Remove a file from the chunk map (on deletion).
     async fn chunk_map_remove(&self, file_id: &FileId) {
         self.chunk_map.remove(file_id);
@@ -874,8 +900,8 @@ impl Server {
             Request::DeletePathIndex { path } => {
                 self.handle_delete_path_index(path).await
             }
-            Request::ReplicateChunkLocation { location } => {
-                self.handle_replicate_chunk_location(location).await
+            Request::ReplicateChunkLocation { location, file_id } => {
+                self.handle_replicate_chunk_location(location, file_id).await
             }
             Request::ReplicateChunkLocations { locations } => {
                 self.handle_replicate_chunk_locations(locations).await
@@ -1304,7 +1330,7 @@ impl Server {
     }
 
     /// Handle replicate chunk location (internal cluster operation)
-    async fn handle_replicate_chunk_location(&self, location: ChunkLocation) -> Response {
+    async fn handle_replicate_chunk_location(&self, location: ChunkLocation, file_id: Option<FileId>) -> Response {
         info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
 
         // Merge strategy: take the larger node set, preserving the existing record's
@@ -1383,34 +1409,45 @@ impl Server {
         // Store merged location
         match self.metadata.put_chunk_location(&merged_location) {
             Ok(_) => {
-                // Patch the in-memory chunk map so GetFileChunkMap always reflects current replica state
-                self.chunk_map_update_location(&merged_location).await;
+                // Patch the in-memory chunk map. When file_id is known, do a targeted
+                // update — no need to scan all files. Without file_id (legacy path),
+                // fall back to the scan-based update.
+                if let Some(fid) = file_id {
+                    self.chunk_map_update_location_for_file(fid, &merged_location).await;
+                } else {
+                    self.chunk_map_update_location(&merged_location).await;
+                }
 
                 // Also update the file metadata record in sled so DisseminateMetadata
                 // broadcasts the correct chunk_id to followers. Without this, the file
                 // record retains the old chunk_id and periodic dissemination overwrites
                 // the in-memory fix, causing perpetual ChunkStale on followers.
-                if let Some(file_offset) = merged_location.file_offset {
-                    // Find the file that owns this chunk position and update its record.
-                    for entry in self.chunk_map.iter() {
-                        let file_id = *entry.key();
-                        let (locs, _) = entry.value();
-                        if locs.iter().any(|l| l.file_offset == Some(file_offset) && l.chunk_id == merged_location.chunk_id) {
-                            // Found the file — update its sled record.
-                            if let Ok(Some(mut file_meta)) = self.metadata.get_file(&file_id) {
-                                let mut updated = false;
-                                for loc in file_meta.chunk_locations.iter_mut() {
-                                    if loc.file_offset == Some(file_offset) {
-                                        *loc = merged_location.clone();
-                                        updated = true;
-                                        break;
-                                    }
-                                }
-                                if updated {
-                                    let _ = self.sled_write_tx.send(file_meta);
-                                }
+                let sled_file_id = file_id.or_else(|| {
+                    // Legacy fallback: find the file by chunk_id in the chunk_map.
+                    merged_location.file_offset.and_then(|file_offset| {
+                        for entry in self.chunk_map.iter() {
+                            let fid = *entry.key();
+                            let (locs, _) = entry.value();
+                            if locs.iter().any(|l| l.file_offset == Some(file_offset) && l.chunk_id == merged_location.chunk_id) {
+                                return Some(fid);
                             }
-                            break;
+                        }
+                        None
+                    })
+                });
+                if let Some(fid) = sled_file_id {
+                    if let Ok(Some(mut file_meta)) = self.metadata.get_file(&fid) {
+                        let mut updated = false;
+                        for loc in file_meta.chunk_locations.iter_mut() {
+                            if loc.chunk_id == merged_location.chunk_id ||
+                               loc.file_offset == merged_location.file_offset {
+                                *loc = merged_location.clone();
+                                updated = true;
+                                break;
+                            }
+                        }
+                        if updated {
+                            let _ = self.sled_write_tx.send(file_meta);
                         }
                     }
                 }
@@ -1431,7 +1468,7 @@ impl Server {
                             if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                                 continue;
                             }
-                            let req = Request::ReplicateChunkLocation { location: loc.clone() };
+                            let req = Request::ReplicateChunkLocation { location: loc.clone(), file_id };
                             if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
                                 debug!("Leader chunk-location broadcast to {} failed: {}", node.id, e);
                             }
@@ -1854,6 +1891,7 @@ impl Server {
                         info!("Sending chunk location {} to node {}", chunk_id_clone, node_id);
                         let request = Request::ReplicateChunkLocation {
                             location: location_clone,
+                            file_id: None,
                         };
 
                         if let Err(e) = client_clone.send_message(node_addr, Message::Request(request)).await {
@@ -2873,7 +2911,7 @@ impl Server {
                     let client = self.client.clone();
                     let loc = location.clone();
                     tokio::spawn(async move {
-                        let req = Request::ReplicateChunkLocation { location: loc };
+                        let req = Request::ReplicateChunkLocation { location: loc, file_id: None };
                         let _ = client.send_message(node.addr, Message::Request(req)).await;
                     });
                 }

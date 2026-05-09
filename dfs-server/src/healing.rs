@@ -1297,7 +1297,7 @@ impl HealingManager {
             if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                 continue;
             }
-            let request = Request::ReplicateChunkLocation { location: location.clone() };
+            let request = Request::ReplicateChunkLocation { location: location.clone(), file_id: None };
             if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
                 warn!("Failed to broadcast chunk location {} to node {}: {}", location.chunk_id, node.id, e);
             }

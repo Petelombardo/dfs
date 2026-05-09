@@ -3553,7 +3553,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let loc = location.clone();
             let is_leader = Some(addr) == leader_addr;
             tokio::spawn(async move {
-                let req = Request::ReplicateChunkLocation { location: loc };
+                let req = Request::ReplicateChunkLocation { location: loc, file_id: None };
                 if is_leader {
                     // Retry to the leader with exponential backoff so the chunk map stays
                     // current even if the leader is momentarily slow.
@@ -3862,7 +3862,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let client = self.clone();
                 let loc = location.clone();
                 async move {
-                    let req = Request::ReplicateChunkLocation { location: loc };
+                    let req = Request::ReplicateChunkLocation { location: loc, file_id: None };
                     let mut backoff_ms = 250u64;
                     for attempt in 1u32..=4 {
                         match tokio::time::timeout(Duration::from_secs(3), client.send_request(addr, req.clone())).await {
@@ -4391,10 +4391,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 sync_addrs.push(leader);
             }
         }
-        let req = Request::ReplicateChunkLocation { location: new_location.clone() };
+        let loc_req = Request::ReplicateChunkLocation { location: new_location.clone(), file_id };
         let futures: Vec<_> = sync_addrs.iter().map(|&addr| {
             let client = self.clone();
-            let req = req.clone();
+            let req = loc_req.clone();
             async move {
                 let mut backoff_ms = 250u64;
                 for attempt in 1u32..=4 {
@@ -4708,7 +4708,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 sync_addrs.push(leader);
             }
         }
-        let loc_req = Request::ReplicateChunkLocation { location: new_location.clone() };
+        let loc_req = Request::ReplicateChunkLocation { location: new_location.clone(), file_id };
         let loc_futures: Vec<_> = sync_addrs.iter().map(|&addr| {
             let client = self.clone();
             let req = loc_req.clone();

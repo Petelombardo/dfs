@@ -1675,22 +1675,21 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Detect sequential full-chunk reads (same check used below for fetch dispatch).
         // Computed here so it can gate both the cache path and pipeline lookahead.
-        let is_sequential_full = {
+        const CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+        // Use range-fetch for reads up to 256KB. The kernel issues 128KB readahead reads,
+        // so this threshold catches those while staying well below full-chunk (4MB) size.
+        const RANGE_FETCH_MAX: usize = 256 * 1024;
+
+        // True only when the request covers full consecutive chunks — i.e. this is a
+        // sequential full-chunk read, not a small read into the middle of a chunk.
+        // chunks_for_range returns the full chunk_size (not the overlap), so we also
+        // require size >= CHUNK_SIZE_BYTES to ensure the request actually spans each chunk.
+        let is_sequential_full = size >= CHUNK_SIZE_BYTES && {
             let first_idx = needed.first().map(|(i,_,_)| *i).unwrap_or(0);
             needed.iter().enumerate().all(|(n, (ci, _co, cs))| {
                 *ci == first_idx + n && *cs == chunk_map[*ci].size
             })
         };
-
-        // Random small-read path: only fire for requests that are genuinely small —
-        // specifically smaller than what the kernel issues for sequential readahead (128KB).
-        // This prevents FUSE readahead reads (131072 bytes) from taking the range-fetch
-        // path, which would corrupt data due to the offset-adjusted assembly. Only true
-        // random 4K reads (as issued by KDiskMark RND4K or QEMU random I/O) qualify.
-        const CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
-        // Use range-fetch for reads up to 256KB. The kernel issues 128KB readahead reads,
-        // so this threshold catches those while staying well below full-chunk (4MB) size.
-        const RANGE_FETCH_MAX: usize = 256 * 1024;
         let use_range_fetch = !bypass_cache && !is_sequential_full && size <= RANGE_FETCH_MAX && inode > 0;
 
         if use_range_fetch {

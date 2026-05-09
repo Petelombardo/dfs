@@ -1749,9 +1749,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
 
                 // Also try the full chunk_cache (another path may have loaded the full chunk).
+                // Slice to [offset_in_chunk..offset_in_chunk+len_in_chunk] so the assembly
+                // (which expects data starting at offset_in_chunk) gets correctly positioned bytes.
                 if let Some(data) = self.chunk_cache.get(&cid).await {
                     if offset_in_chunk + len_in_chunk <= data.len() {
-                        result_chunks.push((idx, data));
+                        let slice = Arc::new(data[offset_in_chunk..offset_in_chunk + len_in_chunk].to_vec());
+                        result_chunks.push((idx, slice));
                         continue;
                     }
                 }

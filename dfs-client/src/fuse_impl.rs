@@ -3030,6 +3030,7 @@ impl Filesystem for DfsFilesystem {
         let size_high_water = self.size_high_water.clone();
         let write_open_counts = self.write_open_counts.clone();
         let refreshing_inodes = self.refreshing_inodes.clone();
+        let flush_in_flight = self.flush_in_flight.clone();
         let runtime = self.runtime.clone();
 
         runtime.spawn(async move {
@@ -3037,6 +3038,46 @@ impl Filesystem for DfsFilesystem {
 
             if let Some(mut metadata) = metadata {
                 if metadata.file_type == FileType::RegularFile {
+                    // Wait for in-flight flushes if the file was very recently created and
+                    // has active writers. This prevents returning size=0 when qcow2-img (or
+                    // similar tools) creates a disk and Proxmox/QEMU immediately hotplugs it
+                    // to a running VM before the initial writes are flushed. Without this,
+                    // the VM's getattr sees size=0, caches it, and the disk appears as 0 bytes
+                    // even after creation completes.
+                    let has_active_writer = write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
+                    let file_age = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(metadata.created_at);
+                    let is_very_recent = file_age < 60; // created in the last minute
+
+                    if has_active_writer && is_very_recent && metadata.size < 1024 * 1024 {
+                        // File is actively being written to, very new, and still small (< 1MB).
+                        // This is likely a create-in-progress. Wait up to 2 seconds for any
+                        // in-flight flush to complete so we return a meaningful size.
+                        let has_flush = {
+                            let guard = flush_in_flight.read().unwrap();
+                            guard.as_ref().map(|m| m.contains_key(&ino)).unwrap_or(false)
+                        }; // Drop guard before await
+                        if has_flush {
+                            let start = std::time::Instant::now();
+                            loop {
+                                let still_flushing = {
+                                    let guard = flush_in_flight.read().unwrap();
+                                    guard.as_ref().map(|m| m.contains_key(&ino)).unwrap_or(false)
+                                };
+                                if !still_flushing || start.elapsed() >= std::time::Duration::from_secs(2) {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                            // Re-fetch metadata after waiting — the flush should have updated it
+                            if let Some(fresh) = metadata_cache.get(&ino).map(|m| m.clone()) {
+                                metadata = fresh;
+                            }
+                        }
+                    }
                     // Only hit the server if the cached metadata is more than 5 seconds old.
                     // getattr is called every 1s by the kernel for open files; querying the
                     // server on every call generates a connection storm under playback.

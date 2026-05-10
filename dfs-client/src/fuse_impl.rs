@@ -5639,18 +5639,27 @@ impl Filesystem for DfsFilesystem {
                     Err(e) => { error!("fsync (no-writers) failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
                 }
             } else {
-                // Active writers present — this is a live recording or similar streaming
-                // write. Async flush: spawn and reply immediately. Do NOT insert into
-                // in_flight — that set is only for background-ticker vs force-flush races;
-                // inserting here causes a concurrent release flush to wait 30s.
-                info!("fsync: ino={} path={:?} → async flush (active_writers={})", ino, path, active_writers);
+                // Active writers present. Previously we tried to optimize by flushing
+                // asynchronously here (for "streaming writes"), but:
+                // 1. The DVR doesn't actually call fsync, so the optimization is unused
+                // 2. Async fsync breaks correctness for qcow2/disk creation tools that
+                //    expect durability when fsync returns (qcow2-img creates → fsync →
+                //    close, but VM sees size=0 because metadata is still in-flight)
+                // 3. POSIX requires fsync to flush data to durable storage before returning
+                // Solution: always flush synchronously. If DVR performance becomes an issue,
+                // we can add an explicit opt-out flag, but correctness comes first.
+                info!("fsync: ino={} path={:?} → sync flush (active_writers={})", ino, path, active_writers);
                 let handle = self.flush_handle.clone();
-                self.runtime.spawn(async move {
-                    if let Err(e) = handle.flush_all_pipelined(ino).await {
-                        error!("fsync background flush failed for inode {}: {}", ino, e);
-                    }
+                let result = self.block_on(async move {
+                    handle.flush_all_pipelined(ino).await
                 });
-                reply.ok();
+                match result {
+                    Ok(_) => reply.ok(),
+                    Err(e) => {
+                        error!("fsync failed for inode {}: {}", ino, e);
+                        reply.error(libc::EIO);
+                    }
+                }
             }
         } else {
             // No write buffer, but we still need to flush any pending metadata updates

@@ -3215,8 +3215,8 @@ impl Filesystem for DfsFilesystem {
             debug!("FUSE read: ino={}, offset={}, size={}", ino, offset, size);
 
             // --- Metadata: read only scalars we need, release DashMap ref fast. ---
-            let (file_size, file_type, file_path, file_id) = match metadata_cache.get(&ino) {
-                Some(m) => (m.size, m.file_type, m.path.clone(), m.id),
+            let (file_size, file_type, file_path, file_id, write_seq) = match metadata_cache.get(&ino) {
+                Some(m) => (m.size, m.file_type, m.path.clone(), m.id, Some(m.write_seq)),
                 None => { reply.error(libc::ENOENT); return; }
             };
 
@@ -3268,7 +3268,7 @@ impl Filesystem for DfsFilesystem {
                     if lock_result.is_err() {
                         // Flush is stuck (likely slow node) — fall through to network
                         let result = client.read_file(
-                            ino, file_size, file_id, &file_path, offset, size, false,
+                            ino, file_size, file_id, &file_path, offset, size, false, write_seq,
                         ).await;
                         let elapsed = start.elapsed();
                         match result {
@@ -3407,7 +3407,7 @@ impl Filesystem for DfsFilesystem {
             };
             info!("FUSE read: ino={}, offset={}, size={}, file_size={}", ino, offset, size, effective_size);
             let result = client.read_file(
-                ino, effective_size, file_id, &file_path, offset, size, has_active_writer,
+                ino, effective_size, file_id, &file_path, offset, size, has_active_writer, write_seq,
             ).await;
 
             let elapsed = start.elapsed();

@@ -269,6 +269,49 @@ impl Server {
         self.chunk_map.remove(file_id);
     }
 
+    /// Find which file a chunk belongs to by scanning the chunk_map.
+    /// Returns None if chunk not found in any file.
+    fn find_file_by_chunk(&self, chunk_id: &ChunkId) -> Option<FileId> {
+        for entry in self.chunk_map.iter() {
+            let file_id = *entry.key();
+            let (locations, _) = entry.value();
+            if locations.iter().any(|loc| &loc.chunk_id == chunk_id) {
+                return Some(file_id);
+            }
+        }
+        None
+    }
+
+    /// Pull fresh metadata from the leader and store it locally.
+    /// Used for self-healing when we detect we have stale metadata.
+    async fn pull_metadata_from_leader(&self, file_id: FileId) -> Result<()> {
+        let leader_addr = self.cluster.get_leader_addr().await
+            .ok_or_else(|| anyhow::anyhow!("No leader available"))?;
+
+        let req = Request::GetFileInfoById { file_id };
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            self.client.send_message(leader_addr, Message::Request(req)),
+        ).await??;
+
+        match result.message {
+            Message::Response(Response::FileMetadata { metadata }) => {
+                // Store fresh metadata locally
+                self.metadata.put_file(&metadata)?;
+                self.chunk_map_update(&metadata).await;
+                info!("Successfully pulled fresh metadata from leader: file_id={} seq={} size={}",
+                      file_id, metadata.write_seq, metadata.size);
+                Ok(())
+            }
+            Message::Response(Response::Error { message, .. }) => {
+                Err(anyhow::anyhow!("Leader returned error: {}", message))
+            }
+            _ => {
+                Err(anyhow::anyhow!("Unexpected response from leader"))
+            }
+        }
+    }
+
     /// Get reference to cluster manager
     pub fn cluster(&self) -> Arc<ClusterManager> {
         self.cluster.clone()
@@ -851,15 +894,15 @@ impl Server {
     /// Handle an incoming request message
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
-            Request::ReadChunk { chunk_id, sequential_hint } => {
+            Request::ReadChunk { chunk_id, sequential_hint, client_write_seq } => {
                 if let Some((idx, total)) = sequential_hint {
                     debug!("ReadChunk {} with sequential hint: {}/{} chunks", chunk_id, idx, total);
                     // TODO: Use hint for server-side prefetching
                 }
-                self.handle_read_chunk(chunk_id).await
+                self.handle_read_chunk(chunk_id, client_write_seq).await
             },
-            Request::ReadChunkRange { chunk_id, offset, length } => {
-                self.handle_read_chunk_range(chunk_id, offset, length).await
+            Request::ReadChunkRange { chunk_id, offset, length, client_write_seq } => {
+                self.handle_read_chunk_range(chunk_id, offset, length, client_write_seq).await
             }
             Request::WriteChunk {
                 chunk_id,
@@ -985,8 +1028,25 @@ impl Server {
     }
 
     /// Handle read chunk request (try local first, then forward to other nodes)
-    async fn handle_read_chunk(&self, chunk_id: ChunkId) -> Response {
+    async fn handle_read_chunk(&self, chunk_id: ChunkId, client_write_seq: Option<u64>) -> Response {
         debug!("Handling read chunk: {}", chunk_id);
+
+        // Client-driven staleness detection: if client has newer metadata than us,
+        // self-heal by pulling fresh metadata from leader before serving the read.
+        if let Some(client_seq) = client_write_seq {
+            if let Some(file_id) = self.find_file_by_chunk(&chunk_id) {
+                if let Ok(Some(our_meta)) = self.metadata.get_file(&file_id) {
+                    if client_seq > our_meta.write_seq {
+                        info!("Stale metadata detected: client has seq={}, we have seq={} for file_id={}, pulling from leader",
+                              client_seq, our_meta.write_seq, file_id);
+                        if let Err(e) = self.pull_metadata_from_leader(file_id).await {
+                            warn!("Failed to pull fresh metadata from leader: {}", e);
+                            // Continue anyway - serve what we have
+                        }
+                    }
+                }
+            }
+        }
 
         // Serve from local storage only — never proxy to other nodes.
         // If the client sends a ReadChunk to a node that doesn't hold the chunk,
@@ -1009,8 +1069,23 @@ impl Server {
     }
 
     /// Handle read chunk range request (for striped multi-replica reads)
-    async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64) -> Response {
+    async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64, client_write_seq: Option<u64>) -> Response {
         debug!("Handling read chunk range: {} offset={} length={}", chunk_id, offset, length);
+
+        // Client-driven staleness detection (same as handle_read_chunk)
+        if let Some(client_seq) = client_write_seq {
+            if let Some(file_id) = self.find_file_by_chunk(&chunk_id) {
+                if let Ok(Some(our_meta)) = self.metadata.get_file(&file_id) {
+                    if client_seq > our_meta.write_seq {
+                        info!("Stale metadata detected in range read: client seq={}, our seq={} for file_id={}, pulling from leader",
+                              client_seq, our_meta.write_seq, file_id);
+                        if let Err(e) = self.pull_metadata_from_leader(file_id).await {
+                            warn!("Failed to pull fresh metadata from leader: {}", e);
+                        }
+                    }
+                }
+            }
+        }
 
         match self.storage.read_chunk_range_arc(&chunk_id, offset as usize, length as usize) {
             Ok((arc, start, end)) => {
@@ -2118,6 +2193,7 @@ impl Server {
                 let request = Request::ReadChunk {
                     chunk_id: *chunk_id,
                     sequential_hint: None,
+                    client_write_seq: None,
                 };
 
                 let result = tokio::time::timeout(

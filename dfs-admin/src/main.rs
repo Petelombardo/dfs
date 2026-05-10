@@ -912,6 +912,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
         let chunk_data = match send_request(read_addr, Request::ReadChunk {
             chunk_id: *chunk_id,
             sequential_hint: Some((i as u64, old_chunk_count as u64)),
+            client_write_seq: None,
         }).await? {
             Response::ChunkData { data, .. } => data,
             Response::Error { message, .. } => {
@@ -922,6 +923,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
                     if let Ok(Response::ChunkData { data, .. }) = send_request(node, Request::ReadChunk {
                         chunk_id: *chunk_id,
                         sequential_hint: None,
+                        client_write_seq: None,
                     }).await {
                         data_opt = Some(data);
                         break;

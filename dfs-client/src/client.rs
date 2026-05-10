@@ -515,6 +515,11 @@ pub struct DfsClient {
     /// Seeded from the server's stored write_seq on first open-for-write.
     write_seq: Arc<DashMap<FileId, u64>>,
 
+    /// Cache of chunk_id -> write_seq for read operations.
+    /// Populated in read_file() from the file's metadata and looked up by read_chunk_from_server()
+    /// to enable client-driven metadata staleness detection.
+    read_write_seq_cache: Arc<DashMap<ChunkId, u64>>,
+
     /// Per-inode read engines.  Each open file gets one engine that holds the chunk map
     /// snapshot and pipeline state.  Writers never touch this; engines refresh lazily.
     pub read_engines: ReadEngineMap,
@@ -665,6 +670,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
             write_seq: Arc::new(DashMap::new()),
+            read_write_seq_cache: Arc::new(DashMap::new()),
             read_engines: ReadEngineMap::new(),
             recent_chunk_writes: Arc::new(DashMap::new()),
         })
@@ -1605,10 +1611,15 @@ leader_addr: Arc::new(RwLock::new(None)),
         offset: usize,
         size: usize,
         has_active_writer: bool,
+        client_write_seq: Option<u64>,
     ) -> Result<Vec<u8>> {
         if size == 0 || offset >= file_size as usize {
             return Ok(Vec::new());
         }
+
+        // Store write_seq in a context that read operations can access.
+        // Use the provided write_seq, or fall back to our internal counter.
+        let write_seq = client_write_seq.or_else(|| self.write_seq.get(&file_id).map(|e| *e));
 
         let engine = self.read_engines.get_or_create(inode);
 
@@ -1653,6 +1664,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Still empty — leader has no chunk map yet (file is being written, first chunk
             // not yet committed). Return empty; player will retry naturally.
             return Ok(Vec::new());
+        }
+
+        // Populate write_seq cache for all chunks in this file so read_chunk_from_server
+        // can include it in read requests for client-driven staleness detection
+        if let Some(ws) = write_seq {
+            for loc in chunk_map.iter() {
+                self.read_write_seq_cache.insert(loc.chunk_id, ws);
+            }
         }
 
         // Bypass cache for SQLite files (always) and for chunks that are currently
@@ -1781,12 +1800,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let cid = rf.cid;
                     let primary = rf.primary;
                     let fallbacks = rf.fallbacks.clone();
+                    let ws = write_seq; // Capture for async block
                     tokio::spawn(async move {
                         // Try primary then fallbacks.
                         let mut last_err = None;
                         for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
                             match client.read_chunk_range_from_server(
-                                addr, cid, offset_in_chunk as u64, len_in_chunk as u64,
+                                addr, cid, offset_in_chunk as u64, len_in_chunk as u64, ws,
                             ).await {
                                 Ok(data) => {
                                     info!("Range fetch: chunk {} off={} len={} → {} bytes",
@@ -1921,7 +1941,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let client = self.clone();
                 let eng = engine.clone();
                 tokio::spawn(async move {
-                    let result = client.fetch_chunk_with_fallback(la_cid, primary, &fallbacks).await;
+                    let result = client.fetch_chunk_with_fallback(la_cid, primary, &fallbacks, None).await;
                     match result {
                         Ok(data) => {
                             let arc = Arc::new(data);
@@ -1962,14 +1982,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     let file_offset = loc.file_offset.unwrap_or(0);
                                     client.read_chunk_striped(cid, &loc, file_offset).await
                                 } else {
-                                    client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await
+                                    client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await
                                 }
                             } else {
-                                client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await
+                                client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await
                             }
                         } else {
                             let _ = loc; // keep capture warning quiet without changing closure shape
-                            client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await
+                            client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await
                         };
                         (idx, cid, data)
                     })
@@ -1989,7 +2009,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let primary = *primary;
                     let fallbacks = fallbacks.clone();
                     tokio::spawn(async move {
-                        let data = client.fetch_chunk_with_fallback(cid, primary, &fallbacks).await;
+                        let data = client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await;
                         (idx, cid, data)
                     })
                 }).collect();
@@ -2079,7 +2099,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 if stagger_ms > 0 {
                                     tokio::time::sleep(tokio::time::Duration::from_millis(stagger_ms)).await;
                                 }
-                                match client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks).await {
+                                match client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks, None).await {
                                     Ok(data) => {
                                         client.chunk_cache.insert(swarm_cid, Arc::new(data)).await;
                                         client.chunk_landed.notify_waiters();
@@ -2107,7 +2127,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                             let chain_client = client.clone();
                                                             let chain_eng = eng.clone();
                                                             tokio::spawn(async move {
-                                                                match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks).await {
+                                                                match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None).await {
                                                                     Ok(chain_data) => {
                                                                         chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
                                                                         chain_client.chunk_landed.notify_waiters();
@@ -2173,9 +2193,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         cid: ChunkId,
         primary: SocketAddr,
         fallbacks: &[SocketAddr],
+        client_write_seq: Option<u64>,
     ) -> Result<Vec<u8>> {
         for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
-            match self.read_chunk_from_server(addr, cid).await {
+            match self.read_chunk_from_server(addr, cid, client_write_seq).await {
                 Ok(d) => {
                     self.node_health.record_success(addr).await;
                     return Ok(d);
@@ -2236,7 +2257,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let nodes = self.cluster_nodes.read().await.clone();
         let primary = nodes[0];
         let fallbacks: Vec<SocketAddr> = nodes[1..].to_vec();
-        let data = self.fetch_chunk_with_fallback(cid, primary, &fallbacks).await?;
+        let data = self.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await?;
         Ok(Arc::new(data))
     }
 
@@ -2674,7 +2695,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             let mut fallback_data = None;
                             let mut last_err = e;
                             for &fb_addr in &r.fallbacks {
-                                match client.read_chunk_from_server(fb_addr, r.chunk_id).await {
+                                match client.read_chunk_from_server(fb_addr, r.chunk_id, None).await {
                                     Ok(d) => { fallback_data = Some(d); break; }
                                     Err(e) => { last_err = e; }
                                 }
@@ -2709,9 +2730,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                             let hint = read_hint.as_ref().unwrap();
                             info!("PARTIAL READ: chunk {} offset={} length={}", r.chunk_id, hint.offset_in_chunk, hint.length);
                             client.read_chunk_range_from_server(node_addr, r.chunk_id,
-                                hint.offset_in_chunk as u64, hint.length as u64).await
+                                hint.offset_in_chunk as u64, hint.length as u64, None).await
                         } else {
-                            client.read_chunk_from_server(node_addr, r.chunk_id).await
+                            client.read_chunk_from_server(node_addr, r.chunk_id, None).await
                         };
                         match result {
                             Ok(d) => {
@@ -2835,7 +2856,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         .chain(replicas.iter().filter(|&n| n != &selected_replica))
                         .enumerate()
                     {
-                        match self.read_chunk_from_server(*node_addr, chunk_id).await {
+                        match self.read_chunk_from_server(*node_addr, chunk_id, None).await {
                             Ok(data) => {
                                 if i > 0 {
                                     debug!("Fetched chunk {} from fallback replica {} after timeout", chunk_id, node_addr);
@@ -3008,7 +3029,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 addr_map.iter().map(|(&a, &id)| (id, a)).collect();
             location.nodes.iter().find_map(|nid| id_to_addr.get(nid).copied())
         }?;
-        let base = self.read_chunk_from_server(addr, location.chunk_id).await.ok()?;
+        let base = self.read_chunk_from_server(addr, location.chunk_id, None).await.ok()?;
         let mut patched: Vec<u8> = base;
         for (intra, data) in patches {
             let end = intra + data.len();
@@ -3216,10 +3237,14 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Read a single chunk from a specific server using connection pooling
-    async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId) -> Result<Vec<u8>> {
+    async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId, client_write_seq: Option<u64>) -> Result<Vec<u8>> {
+        // Look up write_seq from cache if not explicitly provided
+        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| *e));
+
         let request = Request::ReadChunk {
             chunk_id,
             sequential_hint: None, // TODO: Pass sequential hint when available
+            client_write_seq: ws,
         };
 
         // Try using pooled connection first, with fallback to new connection
@@ -3385,8 +3410,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         &self,
         server_addr: SocketAddr,
         chunk_id: ChunkId,
+        client_write_seq: Option<u64>,
     ) -> Result<(TcpStream, usize)> {
-        let request = Request::ReadChunk { chunk_id, sequential_hint: None };
+        // Look up write_seq from cache if not explicitly provided
+        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| *e));
+
+        let request = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: ws };
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
         let envelope = MessageEnvelope::new(request_id, Message::Request(request));
         let encoded = envelope.to_bytes().context("serialize")?;
@@ -3524,7 +3553,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let (cid, addr) = chunks[0]; // ChunkId and SocketAddr are Copy
             let client = self.clone();
             Some((addr, tokio::spawn(async move {
-                client.open_chunk_request(addr, cid).await
+                client.open_chunk_request(addr, cid, None).await
             })))
         };
 
@@ -3534,7 +3563,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let (p1_addr, p1_handle) = match pending.take() {
                 Some(p) => p,
                 None => {
-                    results.push(self.read_chunk_from_server(addr, cid).await);
+                    results.push(self.read_chunk_from_server(addr, cid, None).await);
                     continue;
                 }
             };
@@ -3544,7 +3573,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let (next_cid, next_addr) = chunks[i + 1];
                 let client = self.clone();
                 Some((next_addr, tokio::spawn(async move {
-                    client.open_chunk_request(next_addr, next_cid).await
+                    client.open_chunk_request(next_addr, next_cid, None).await
                 })))
             } else {
                 None
@@ -3557,7 +3586,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
                 Ok(Err(e)) => {
                     warn!("Pipeline Phase-1 failed for chunk {:?} on {}: {}", cid, p1_addr, e);
-                    self.read_chunk_from_server(addr, cid).await
+                    self.read_chunk_from_server(addr, cid, None).await
                 }
                 Err(e) => Err(anyhow::anyhow!("Phase-1 task panicked: {}", e)),
             };
@@ -3578,8 +3607,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         chunk_id: ChunkId,
         offset: u64,
         length: u64,
+        client_write_seq: Option<u64>,
     ) -> Result<Vec<u8>> {
-        let request = Request::ReadChunkRange { chunk_id, offset, length };
+        // Look up write_seq from cache if not explicitly provided
+        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| *e));
+
+        let request = Request::ReadChunkRange { chunk_id, offset, length, client_write_seq: ws };
         let response = tokio::time::timeout(
             tokio::time::Duration::from_secs(1),
             self.send_request(server_addr, request),
@@ -3628,7 +3661,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let mut last_err: Option<anyhow::Error> = None;
                 for addr in replicas.iter().copied().chain(cluster_nodes.iter().copied()) {
                     if !tried.insert(addr) { continue; }
-                    match client.read_chunk_from_server(addr, chunk_id).await {
+                    match client.read_chunk_from_server(addr, chunk_id, None).await {
                         Ok(data) => return Ok(data),
                         Err(e) => {
                             debug!("Whole-chunk fallback: {} failed for chunk {}: {}", addr, chunk_id, e);
@@ -3669,11 +3702,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         let client2 = self.clone();
 
         let task1 = tokio::spawn(async move {
-            client1.read_chunk_range_from_server(node1, chunk_id, 0, first_half_size as u64).await
+            client1.read_chunk_range_from_server(node1, chunk_id, 0, first_half_size as u64, None).await
         });
 
         let task2 = tokio::spawn(async move {
-            client2.read_chunk_range_from_server(node2, chunk_id, mid_point as u64, second_half_size as u64).await
+            client2.read_chunk_range_from_server(node2, chunk_id, mid_point as u64, second_half_size as u64, None).await
         });
 
         let (result1, result2) = tokio::join!(task1, task2);
@@ -3725,7 +3758,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         for addr in &node_addrs {
-            match self.read_chunk_from_server(*addr, chunk_id).await {
+            match self.read_chunk_from_server(*addr, chunk_id, None).await {
                 Ok(data) => return Ok(data),
                 Err(e) => debug!("read_chunk_by_id: failed from {}: {}", addr, e),
             }
@@ -4841,7 +4874,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         .unwrap_or_else(|| all_cluster_nodes[0])
                 });
 
-            match self.read_chunk_from_server(leader_or_good, authoritative_chunk_id).await {
+            match self.read_chunk_from_server(leader_or_good, authoritative_chunk_id, None).await {
                 Ok(correct_data) => {
                     for &stale_addr in &stale_addrs {
                         let data_clone = correct_data.clone();

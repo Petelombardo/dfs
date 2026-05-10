@@ -85,6 +85,11 @@ pub enum Request {
         /// This is purely a hint - server may ignore it
         #[serde(default)]
         sequential_hint: Option<(u64, u64)>,
+        /// Client's cached metadata write_seq for this file.
+        /// Server uses this to detect stale metadata and self-heal by pulling
+        /// fresh metadata from the leader before serving the read.
+        #[serde(default)]
+        client_write_seq: Option<u64>,
     },
 
     /// Read a byte range from a chunk (for striped multi-replica reads)
@@ -92,6 +97,9 @@ pub enum Request {
         chunk_id: ChunkId,
         offset: u64,
         length: u64,
+        /// Client's cached metadata write_seq for staleness detection
+        #[serde(default)]
+        client_write_seq: Option<u64>,
     },
 
     /// Write a chunk

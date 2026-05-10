@@ -1363,22 +1363,20 @@ impl FlushHandle {
                     // concurrent patches for chunks 0/1/2 each read metadata_cache mid-flight
                     // and the highest-seq write wins in the queue dedup, potentially recording
                     // stale chunk_ids for chunks whose patch hadn't updated metadata_cache yet.
-                    let (flushed_len, meta_to_persist) = {
-                        if let Some(state_arc) = self.write_buffers.get(&ino) {
-                            let state = state_arc.lock().await;
-                            let len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
-                            (len, self.metadata_cache.get(&ino).map(|m| m.clone()))
-                        } else {
-                            (0, None)
-                        }
-                    };
+                    let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
                     if let Some(meta) = meta_to_persist {
                         self.client.feed_chunk_locations_to_read_engine(
                             ino, &meta.chunk_locations, meta.size,
                         ).await;
                     }
-                    // Now that read engine is updated, safe to remove slot.
-                    // Guard: don't update a buffer that was replaced by a new create().
+                    // Now that read engine is updated, safe to remove slot — unless new
+                    // data arrived while the patch was in-flight (concurrent write() added
+                    // bytes or dirty ranges beyond what we just patched). In that case,
+                    // keep the slot with flushing=false so the next flush cycle picks it up.
+                    // This mirrors the fresh-write path's current_len > flushed_len guard.
+                    // Without this check, writes that land during a patch are silently dropped:
+                    // the slot is removed, taking with it any dirty_ranges beyond the patch window.
+                    let patched_len = slot_data.len(); // snapshot length = what we actually sent
                     if let Some(state_arc) = self.write_buffers.get(&ino) {
                         let mut state = state_arc.lock().await;
                         let buf_id = state.expected_file_id;
@@ -1387,14 +1385,28 @@ impl FlushHandle {
                             _ => true,
                         };
                         if id_ok {
-                            if flushed_len > 0 {
-                                state.flushed_sizes.insert(chunk_idx, flushed_len);
+                            let current_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                            if current_len > patched_len {
+                                // New data arrived during the patch — keep slot, update flushed_sizes
+                                // so the next flush knows where the server's content ends.
+                                state.flushed_sizes.insert(chunk_idx, patched_len);
+                                if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                    slot.flushing = false;
+                                }
                                 self.global_buffered_bytes.fetch_sub(
-                                    flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                    patched_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
+                            } else {
+                                if patched_len > 0 {
+                                    state.flushed_sizes.insert(chunk_idx, patched_len);
+                                    self.global_buffered_bytes.fetch_sub(
+                                        patched_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                state.slots.remove(&chunk_idx);
                             }
-                            state.slots.remove(&chunk_idx);
                         }
                     }
                     return Ok(());
@@ -2863,13 +2875,34 @@ impl Filesystem for DfsFilesystem {
                 // If another session patches chunk N between our open() and flush(),
                 // the chunk_id in metadata_cache will no longer match chunk_ids_at_open[N]
                 // and we skip the PatchChunk rather than reverting the newer write.
-                if let Some(meta) = self.metadata_cache.get(&ino) {
-                    if let Ok(mut st) = state_entry.try_lock() {
-                        for loc in &meta.chunk_locations {
-                            if let Some(offset) = loc.file_offset {
-                                let idx = offset / CHUNK_SIZE as u64;
-                                let prev = st.chunk_ids_at_open.entry(idx).or_insert(loc.chunk_id);
-                                info!("open: ino={} chunk_ids_at_open[{}] = {} (prev={})", ino, idx, loc.chunk_id, prev);
+                //
+                // On the first writer: clear any stale chunk_ids_at_open entirely rather
+                // than populating from metadata_cache. metadata_cache may hold chunk IDs
+                // from a previous session that were never committed to the server (e.g.
+                // from a detach/reattach read-open that cached a partial state). Seeding
+                // from stale cache would cause the guard to fire on the first real write
+                // (open_id != current_server_id) and silently discard valid data.
+                // With an empty map, id_at_open=None and the guard is bypassed — safe
+                // because is_first_writer guarantees no concurrent session exists to conflict.
+                //
+                // On subsequent concurrent writers: or_insert so we don't clobber the
+                // first writer's snapshot mid-flight.
+                let state_arc = state_entry.clone();
+                if is_first_writer {
+                    if let Ok(mut st) = state_arc.try_lock() {
+                        st.chunk_ids_at_open.clear();
+                        info!("open: ino={} is_first_writer — cleared chunk_ids_at_open", ino);
+                    }
+                } else {
+                    let meta_snap = self.metadata_cache.get(&ino).map(|m| m.clone());
+                    if let Some(meta) = meta_snap {
+                        if let Ok(mut st) = state_arc.try_lock() {
+                            for loc in &meta.chunk_locations {
+                                if let Some(offset) = loc.file_offset {
+                                    let idx = offset / CHUNK_SIZE as u64;
+                                    let prev = *st.chunk_ids_at_open.entry(idx).or_insert(loc.chunk_id);
+                                    info!("open: ino={} chunk_ids_at_open[{}] = {} (prev={})", ino, idx, loc.chunk_id, prev);
+                                }
                             }
                         }
                     }

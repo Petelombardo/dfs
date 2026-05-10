@@ -1332,6 +1332,13 @@ impl FlushHandle {
                         );
                     }
 
+                    // Seed byte-range cache with the post-patch bytes for each dirty range.
+                    // The cache key is (inode, file_offset) — no chunk_id — so this entry
+                    // will be hit by the next read at the same offset without a network RTT.
+                    // This is what makes the 2nd-pass random read fast: the cache reflects
+                    // the current content even though the chunk_id changed after the patch.
+                    self.client.seed_byte_range_cache(ino, file_offset, &slot_data, &dirty_ranges).await;
+
                     if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
                         if file_id_at_flush_start.map(|id| id != meta_entry.id).unwrap_or(false) {
                             info!("flush_buffer_async_one: ino={} chunk={} file replaced during patch flush — discarding metadata update", ino, chunk_idx);
@@ -1429,6 +1436,10 @@ impl FlushHandle {
                 for loc in &locations {
                     self.client.chunk_cache.insert(loc.chunk_id, Arc::clone(&slot_arc)).await;
                 }
+
+                // Also seed byte-range cache for each dirty range so random reads
+                // immediately after a fresh write hit the cache.
+                self.client.seed_byte_range_cache(ino, file_offset, &slot_data, &dirty_ranges).await;
 
                 // Track flushed size but DON'T remove slot yet.
                 if let Some(state_arc) = self.write_buffers.get(&ino) {

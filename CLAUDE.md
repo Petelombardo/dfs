@@ -10,6 +10,7 @@ You can ssh into the staging nodes to test and gather logs.  All staging nodes s
 We run one service in staging, a hdhomerun dvr.  It runs from /mnt/test/podman/dvr/podman-compose.yml 
 Band-aids to the code are a last-resort.  We should always try to fix the underlying problem at its root.
 Propose protocol updates if they will make our app more efficient.
+Do not push code until we verify that we do not have regressions.  Our test script is ./scripts/test_local_suite.sh
 
 ## Local test suite
 

@@ -63,6 +63,11 @@ pub struct InodeReadEngine {
 
     /// Last chunk fetch duration in milliseconds (EMA). Used for adaptive stagger delay.
     pub last_chunk_fetch_ms: AtomicU64,
+
+    /// Byte offset one past the end of the last completed read. Used to detect sequential
+    /// access: if the current read starts here (or within a small tolerance), it's sequential
+    /// and should use the full-chunk path rather than range-fetch.
+    pub last_read_end: AtomicU64,
 }
 
 fn now_ms() -> u64 {
@@ -93,6 +98,7 @@ impl InodeReadEngine {
             last_window_start: AtomicU32::new(0),
             last_window_end: AtomicU32::new(0),
             last_chunk_fetch_ms: AtomicU64::new(50),
+            last_read_end: AtomicU64::new(0),
         })
     }
 

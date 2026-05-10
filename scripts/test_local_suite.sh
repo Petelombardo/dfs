@@ -760,7 +760,8 @@ T23_SIZE=$(( 3 * 4 * 1024 * 1024 ))   # 12MB — 3 full chunks
 # Remount first so the file is written fresh on the new client — this means
 # the kernel page cache has never seen it, so all reads go through FUSE.
 fusermount -u "$MOUNT" 2>/dev/null || true
-sleep 0.5
+kill "$CLIENT_PID2" 2>/dev/null || true
+sleep 1
 T23_CLIENT_LOG="$LOG/client_t23.log"
 : > "$T23_CLIENT_LOG"
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
@@ -783,14 +784,12 @@ open('$T23_FILE', 'wb').write(data)
 "
 dfs_sync
 
-# Now drop the kernel page cache for this file by evicting it — write then close
-# causes the kernel to have the file in cache. Re-open it after a sync to force
-# the kernel to re-read from FUSE (which now has cold DFS chunk cache).
-# We do this by opening with O_DIRECT hint via a temp path to bust page cache.
-# Simplest: just remount again to get a truly cold cache.
+# Drop kernel page cache so reads go through FUSE to DFS — not served from RAM.
+# The remount alone is not enough: the kernel page cache persists across FUSE
+# remounts (keyed by inode on the underlying fs). drop_caches flushes it fully.
 fusermount -u "$MOUNT" 2>/dev/null || true
 kill "$CLIENT_PID2" 2>/dev/null || true
-sleep 0.5
+sleep 1
 : > "$T23_CLIENT_LOG"
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
     --log-file "$T23_CLIENT_LOG" --allow-other --log-level debug &
@@ -804,19 +803,23 @@ T23_OFF1=$(( 0 * 4*1024*1024 + 8192 ))       # chunk 0, intra 8KB
 T23_OFF2=$(( 1 * 4*1024*1024 + 1048576 ))     # chunk 1, intra 1MB
 T23_OFF3=$(( 2 * 4*1024*1024 + 3*1024*1024 )) # chunk 2, intra 3MB
 
-# Read 4K at each offset and verify pattern bytes.
+# Read 4K at each offset using O_DIRECT to bypass kernel page cache.
+# FUSE passes O_DIRECT through to the filesystem handler, ensuring reads
+# go through FUSE to DFS rather than being served from the kernel page cache.
+T23_READ_PY='
+import os, sys
+path, off_s, exp_s = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+os.lseek(fd, off_s, os.SEEK_SET)
+data = os.read(fd, 4096)
+os.close(fd)
+ok = len(data) == 4096 and all(x == exp_s for x in data)
+print("OK" if ok else "FAIL")
+'
 T23_ERRORS=0
 for OFF in $T23_OFF1 $T23_OFF2 $T23_OFF3; do
     EXPECT=$(( (OFF / 4096) & 0xff ))
-    GOT=$(python3 -c "
-f = open('$T23_FILE','rb')
-f.seek($OFF)
-b = f.read(4096)
-f.close()
-exp = $EXPECT
-ok = all(x == exp for x in b) and len(b) == 4096
-print('OK' if ok else 'FAIL')
-")
+    GOT=$(python3 -c "$T23_READ_PY" "$T23_FILE" "$OFF" "$EXPECT")
     [ "$GOT" = "OK" ] || T23_ERRORS=$(( T23_ERRORS + 1 ))
 done
 sleep 0.5  # let async log writes flush
@@ -832,19 +835,11 @@ RANGE_FETCHES=$(grep -c "Range fetch:" "$CURRENT_CLIENT_LOG" 2>/dev/null; true)
     && check "T23b range-fetch fired ($RANGE_FETCHES lines)" PASS \
     || check "T23b range-fetch did not fire (got $RANGE_FETCHES, want >=3)" FAIL
 
-# Re-read same offsets — verify data is still correct (cache or network).
+# Re-read same offsets — O_DIRECT again to verify DFS byte-range cache (not page cache).
 T23C_ERRORS=0
 for OFF in $T23_OFF1 $T23_OFF2 $T23_OFF3; do
     EXPECT=$(( (OFF / 4096) & 0xff ))
-    GOT=$(python3 -c "
-f = open('$T23_FILE','rb')
-f.seek($OFF)
-b = f.read(4096)
-f.close()
-exp = $EXPECT
-ok = all(x == exp for x in b) and len(b) == 4096
-print('OK' if ok else 'FAIL')
-")
+    GOT=$(python3 -c "$T23_READ_PY" "$T23_FILE" "$OFF" "$EXPECT")
     [ "$GOT" = "OK" ] || T23C_ERRORS=$(( T23C_ERRORS + 1 ))
 done
 [ "$T23C_ERRORS" -eq 0 ] \
@@ -853,6 +848,70 @@ done
 
 rm -f "$T23_FILE" 2>/dev/null || true
 fi # should_run T23
+
+snapshot_log T24
+if should_run T24; then
+echo "=== T24: sequential read uses full-chunk path (no range-fetch) ==="
+
+# 16MB = 4 full chunks. Written and then re-read sequentially.
+# The test verifies two things:
+#   T24a: data is correct end-to-end
+#   T24b: the full-chunk path fired (no Range fetch log lines) — proving
+#         sequential reads are NOT being broken into 128KB range-fetch RTTs.
+T24_SIZE=$(( 16 * 1024 * 1024 ))
+T24_FILE="$MOUNT/t24_seq.bin"
+
+# Write known pattern: each byte = (offset / 4096) & 0xff
+python3 -c "
+size = $T24_SIZE
+block = 4096
+data = bytearray()
+for i in range(size // block):
+    data += bytes([i & 0xff]) * block
+open('$T24_FILE', 'wb').write(data)
+"
+dfs_sync
+
+# Remount for cold cache — ensures all reads go through FUSE to DFS.
+fusermount -u "$MOUNT" 2>/dev/null || true
+kill "$CLIENT_PID2" 2>/dev/null || true
+sleep 1
+T24_CLIENT_LOG="$LOG/client_t24.log"
+: > "$T24_CLIENT_LOG"
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$T24_CLIENT_LOG" --allow-other --log-level debug &
+CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$T24_CLIENT_LOG"
+sleep 2
+mountpoint -q "$MOUNT" || { check "T24 remount" FAIL; CLIENT_PID2=""; }
+T24_FILE="$MOUNT/t24_seq.bin"
+
+# Sequential read of the full file.
+T24_ERRORS=$(python3 -c "
+size = $T24_SIZE
+block = 4096
+errors = 0
+with open('$T24_FILE', 'rb') as f:
+    for i in range(size // block):
+        data = f.read(block)
+        exp = i & 0xff
+        if len(data) != block or not all(x == exp for x in data):
+            errors += 1
+print(errors)
+")
+[ "$T24_ERRORS" -eq 0 ] \
+    && check "T24a sequential read data correct" PASS \
+    || check "T24a sequential read data errors=$T24_ERRORS" FAIL
+
+# Verify full-chunk path was used: no "Range fetch:" lines in the log.
+# Sequential reads must fetch whole 4MB chunks, not 128KB slices.
+RANGE_LINES=$(grep -c "Range fetch:" "$T24_CLIENT_LOG" 2>/dev/null || true)
+[ "$RANGE_LINES" -eq 0 ] \
+    && check "T24b no range-fetch on sequential read (full-chunk path used)" PASS \
+    || check "T24b range-fetch fired on sequential read ($RANGE_LINES lines) — regression" FAIL
+
+rm -f "$T24_FILE" 2>/dev/null || true
+fi # should_run T24
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

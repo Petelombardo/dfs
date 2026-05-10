@@ -149,14 +149,16 @@ impl NodeHealthTracker {
     }
 }
 
-/// Cache key for byte-range caching: (inode, file_byte_offset, chunk_id)
-/// chunk_id is included to prevent stale hits when a file is deleted and recreated
-/// at the same inode (same offset but different content).
+/// Cache key for byte-range caching: (inode, file_byte_offset).
+/// chunk_id is intentionally excluded: after a PatchChunk the chunk_id changes,
+/// so including it caused every post-write read to be a cache miss even though
+/// the flush path writes the fresh data into the cache immediately after the patch.
+/// Staleness is prevented by the flush path overwriting the cache entry with
+/// post-patch bytes on every successful flush, and by the 30s TTL as a backstop.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 struct ByteRangeCacheKey {
     inode: u64,
     file_offset: u64,
-    chunk_id: ChunkId,
 }
 
 /// Cached chunk data with metadata and TTL
@@ -1673,24 +1675,20 @@ leader_addr: Arc::new(RwLock::new(None)),
         let nodes = self.cluster_nodes.read().await.clone();
         let selector = self.replica_selector.fetch_add(1, Ordering::Relaxed);
 
-        // Detect sequential full-chunk reads (same check used below for fetch dispatch).
-        // Computed here so it can gate both the cache path and pipeline lookahead.
         const CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
-        // Use range-fetch for reads up to 256KB. The kernel issues 128KB readahead reads,
-        // so this threshold catches those while staying well below full-chunk (4MB) size.
-        const RANGE_FETCH_MAX: usize = 256 * 1024;
+        // Sequential access detection: current read continues from where the last ended,
+        // within the same chunk. Sequential reads use the full-chunk path so pipeline
+        // prefetch fires and each 4MB chunk is fetched once, not as N × 128KB RTTs.
+        let last_end = engine.last_read_end.load(Ordering::Relaxed) as usize;
+        let is_sequential = last_end > 0
+            && offset <= last_end + size
+            && offset + size > last_end
+            && (offset / CHUNK_SIZE_BYTES) == (last_end.saturating_sub(1) / CHUNK_SIZE_BYTES);
 
-        // True only when the request covers full consecutive chunks — i.e. this is a
-        // sequential full-chunk read, not a small read into the middle of a chunk.
-        // chunks_for_range returns the full chunk_size (not the overlap), so we also
-        // require size >= CHUNK_SIZE_BYTES to ensure the request actually spans each chunk.
-        let is_sequential_full = size >= CHUNK_SIZE_BYTES && {
-            let first_idx = needed.first().map(|(i,_,_)| *i).unwrap_or(0);
-            needed.iter().enumerate().all(|(n, (ci, _co, cs))| {
-                *ci == first_idx + n && *cs == chunk_map[*ci].size
-            })
-        };
-        let use_range_fetch = !bypass_cache && !is_sequential_full && size <= RANGE_FETCH_MAX && inode > 0;
+        // Range-fetch for small random reads — fetches only the requested bytes rather
+        // than a full 4MB chunk. Keeps latency low for random 4K I/O patterns.
+        const RANGE_FETCH_MAX: usize = 32 * 1024;
+        let use_range_fetch = !bypass_cache && !is_sequential && size <= RANGE_FETCH_MAX && inode > 0;
 
         if use_range_fetch {
             let mut result_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
@@ -1721,7 +1719,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
                 // Check sub-chunk cache first. Key on read_start (the exact file byte offset
                 // of the fetched data) so the lookup and store use the same coordinate.
-                let cache_key = ByteRangeCacheKey { inode, file_offset: read_start as u64, chunk_id: cid };
+                let cache_key = ByteRangeCacheKey { inode, file_offset: read_start as u64 };
                 let cached = {
                     let mut byte_cache = self.byte_range_cache.lock().await;
                     if let Some(entry) = byte_cache.get(&cache_key) {
@@ -1817,7 +1815,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                         let cache_key = ByteRangeCacheKey {
                             inode,
                             file_offset: (chunk_start + offset_in_chunk) as u64,
-                            chunk_id: chunk_map[idx].chunk_id,
                         };
                         let cached_entry = CachedChunk {
                             data: Arc::clone(&arc),
@@ -1846,6 +1843,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let copy_len = (out_end - out_start).min(data.len());
                 out[out_start..out_start + copy_len].copy_from_slice(&data[..copy_len]);
             }
+            engine.last_read_end.store((offset + clamped_size) as u64, Ordering::Relaxed);
             return Ok(out);
         }
 
@@ -1945,7 +1943,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let first_idx_in_batch = to_fetch.first().map(|(idx, _, _, _)| *idx);
 
             let fetch_results: Vec<(usize, ChunkId, Result<Vec<u8>>)> =
-            if is_sequential_full && to_fetch.len() > 0 {
+            if is_sequential && to_fetch.len() > 0 {
                 // Use striped reads for full-chunk sequential fetches: split each chunk across
                 // both replicas and fetch the halves in parallel. This doubles effective read
                 // bandwidth — each replica only transfers 2MB instead of 4MB, but both transfer
@@ -2161,6 +2159,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                 out[out_start..out_end].copy_from_slice(&data[local_start..local_end]);
             }
         }
+
+        // Record where this read ended so the next read can detect sequential access.
+        engine.last_read_end.store((offset + clamped_size) as u64, Ordering::Relaxed);
 
         Ok(out)
     }
@@ -2457,7 +2458,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let key = ByteRangeCacheKey {
                         inode,
                         file_offset: requested_offset,
-                        chunk_id: *chunk_id,
                     };
                     if let Some(cached) = byte_cache.get(&key) {
                         if cached.is_expired() {
@@ -2763,7 +2763,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let key = ByteRangeCacheKey {
                     inode,
                     file_offset,
-                    chunk_id,
                 };
                 let cached = CachedChunk {
                     data: Arc::clone(&data_arc),
@@ -3054,6 +3053,37 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// In the future, this could query the metadata server for actual locations
     ///
     /// Parameters:
+    /// Seed the byte-range cache with freshly-written bytes for each dirty range.
+    /// Called after a successful PatchChunk or fresh WriteChunk so that subsequent
+    /// reads at those offsets hit the cache instead of going to the network.
+    /// dirty_ranges: (intra_chunk_start, intra_chunk_end) pairs from the slot.
+    pub async fn seed_byte_range_cache(
+        &self,
+        inode: u64,
+        chunk_file_offset: u64,
+        slot_data: &[u8],
+        dirty_ranges: &[(usize, usize)],
+    ) {
+        if inode == 0 || dirty_ranges.is_empty() {
+            return;
+        }
+        let mut byte_cache = self.byte_range_cache.lock().await;
+        for &(range_start, range_end) in dirty_ranges {
+            if range_end > range_start && range_end <= slot_data.len() {
+                let key = ByteRangeCacheKey {
+                    inode,
+                    file_offset: chunk_file_offset + range_start as u64,
+                };
+                let cached = CachedChunk {
+                    data: Arc::new(slot_data[range_start..range_end].to_vec()),
+                    chunk_size: range_end - range_start,
+                    cached_at: std::time::Instant::now(),
+                };
+                byte_cache.put(key, cached);
+            }
+        }
+    }
+
     /// - chunk_ids: All chunks in the file
     /// - current_chunk_idx: Current chunk index (optional, for smart warming)
     pub async fn warm_replica_cache_by_index(&self, chunk_ids: &[ChunkId], current_chunk_idx: Option<usize>) {
@@ -3802,7 +3832,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let key = ByteRangeCacheKey {
                     inode,
                     file_offset: current_offset,
-                    chunk_id: location.chunk_id,
                 };
                 let cached = CachedChunk {
                     data: Arc::new(chunk_data),
@@ -4061,7 +4090,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let key = ByteRangeCacheKey {
                     inode,
                     file_offset: current_offset,
-                    chunk_id: location.chunk_id,
                 };
                 let cached = CachedChunk {
                     data: Arc::new(chunk_data),

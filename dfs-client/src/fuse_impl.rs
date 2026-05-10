@@ -5388,21 +5388,62 @@ impl Filesystem for DfsFilesystem {
         // Store updated metadata — stamp write_seq so the server doesn't drop it as stale
         // (the last flush_metadata_sync incremented write_seq on the server, so sending the
         // cached pre-stamp value would be rejected; stamp here to always be monotonically newer).
+        //
+        // When size is not being explicitly set (no truncation), build the outgoing metadata
+        // from the live cache entry rather than our initial snapshot. A concurrent flush task
+        // on flush_rt may update metadata_cache (size, chunk_locations) via get_mut() at any
+        // time between when we read the snapshot and now. If we stamp and send the stale
+        // snapshot, the subsequent flush syncs (flush_all_pipelined final + release explicit)
+        // will read the live cache and send size=correct — but if we later clobber the cache
+        // with the stale entry, those syncs read size=0 and win with a higher write_seq.
+        // Solution: always send max(snapshot, live) and update cache via get_mut() so we
+        // never replace a concurrent in-place update with a stale full-entry insert.
+        let send_meta = if size.is_none() {
+            // Merge: take the live entry and apply only the setattr fields onto it.
+            // This means the size/chunk_locations from any concurrent flush are preserved
+            // both in what we send and in what we write back to the cache.
+            let mut m = self.metadata_cache.get(&ino)
+                .map(|e| e.clone())
+                .unwrap_or_else(|| metadata.clone());
+            if let Some(v) = mode { m.mode = v; }
+            if let Some(v) = uid  { m.uid  = v; }
+            if let Some(v) = gid  { m.gid  = v; }
+            m.modified_at = metadata.modified_at;
+            m
+        } else {
+            metadata.clone()
+        };
+
         let client = self.client.clone();
-        let metadata_clone = client.stamp_write_seq_pub(&metadata);
+        let mut send_stamped = client.stamp_write_seq_pub(&send_meta);
         let result = self.block_on(async {
-            client.put_file_metadata(&metadata_clone).await
+            client.put_file_metadata(&send_stamped).await
         });
-        // Update the cache with the stamped write_seq so future operations stay consistent.
-        metadata.write_seq = metadata_clone.write_seq;
 
         match result {
             Ok(_) => {
-                // Update cache
-                self.metadata_cache.insert(ino, metadata.clone());
+                // Update cache via get_mut() so we patch only the setattr fields onto
+                // whatever the live entry currently contains (which may have been updated
+                // by a concurrent flush between our block_on call and now).
+                // Never replace size/chunk_locations with our snapshot unless the caller
+                // explicitly requested a truncation (size.is_some()).
+                if size.is_none() {
+                    if let Some(mut live) = self.metadata_cache.get_mut(&ino) {
+                        if let Some(v) = mode { live.mode = v; }
+                        if let Some(v) = uid  { live.uid  = v; }
+                        if let Some(v) = gid  { live.gid  = v; }
+                        live.modified_at = send_stamped.modified_at;
+                        live.write_seq   = send_stamped.write_seq;
+                        send_stamped = live.clone();
+                    } else {
+                        self.metadata_cache.insert(ino, send_stamped.clone());
+                    }
+                } else {
+                    self.metadata_cache.insert(ino, send_stamped.clone());
+                }
 
                 // Convert to FUSE attr
-                let attr = self.metadata_to_attr(ino, &metadata);
+                let attr = self.metadata_to_attr(ino, &send_stamped);
                 // Short TTL (2s) for multi-client coherency
                 reply.attr(&Duration::from_secs(2), &attr);
             }

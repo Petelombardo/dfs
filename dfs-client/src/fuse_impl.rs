@@ -1186,6 +1186,11 @@ impl FlushHandle {
                     //      previously pass None and pay a read-back per replica. Now we do
                     //      one fetch here instead.
                     //   3. None — only if the replica fetch also fails; server falls back.
+                    // Pre-compute the post-patch hash only if the full chunk is already
+                    // in chunk_cache. This lets the server skip its read-back hash pass.
+                    // If the chunk is not cached, send None and let the server hash locally —
+                    // a local disk read on the server is far cheaper than a 4MB network fetch
+                    // just to compute a hash we'd immediately discard.
                     let expected_new_chunk_id = {
                         let cached = self.client.chunk_cache.get(&old_location.chunk_id).await;
                         if let Some(cached_arc) = cached {
@@ -1203,20 +1208,7 @@ impl FlushHandle {
                             self.client.chunk_cache.insert(new_cid, std::sync::Arc::new(patched)).await;
                             Some(new_cid)
                         } else {
-                            // Cache miss — fetch the chunk from one replica so we can
-                            // compute the hash client-side. One read here replaces one
-                            // read per replica that the server would otherwise do.
-                            match self.client.fetch_and_patch_chunk(&old_location, file_offset, &patches).await {
-                                Some((new_cid, patched)) => {
-                                    self.client.chunk_cache.invalidate(&old_location.chunk_id).await;
-                                    self.client.chunk_cache.insert(new_cid, std::sync::Arc::new(patched)).await;
-                                    Some(new_cid)
-                                }
-                                None => {
-                                    debug!("flush_buffer_async_one: ino={} chunk={} replica fetch for pre-hash failed, server will read-back", ino, chunk_idx);
-                                    None
-                                }
-                            }
+                            None
                         }
                     };
 

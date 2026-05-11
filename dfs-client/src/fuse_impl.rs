@@ -3081,6 +3081,7 @@ impl Filesystem for DfsFilesystem {
         let write_buffer_enabled = self.write_buffer_enabled;
         let size_high_water = self.size_high_water.clone();
         let write_open_counts = self.write_open_counts.clone();
+        let release_in_flight = self.release_in_flight.clone();
         let refreshing_inodes = self.refreshing_inodes.clone();
         let flush_in_flight = self.flush_in_flight.clone();
         let runtime = self.runtime.clone();
@@ -3091,12 +3092,19 @@ impl Filesystem for DfsFilesystem {
             if let Some(mut metadata) = metadata {
                 if metadata.file_type == FileType::RegularFile {
                     // Wait for in-flight flushes if the file was very recently created and
-                    // has active writers. This prevents returning size=0 when qcow2-img (or
-                    // similar tools) creates a disk and Proxmox/QEMU immediately hotplugs it
-                    // to a running VM before the initial writes are flushed. Without this,
-                    // the VM's getattr sees size=0, caches it, and the disk appears as 0 bytes
-                    // even after creation completes.
+                    // has active writers OR a release flush in progress. This prevents returning
+                    // size=0 when qcow2-img (or similar tools) creates a disk and Proxmox/QEMU
+                    // immediately hotplugs it to a running VM before the initial writes are
+                    // flushed. Without this, the VM's getattr sees size=0, caches it, and the
+                    // disk appears as 0 bytes even after creation completes.
+                    //
+                    // Checking release_in_flight handles the case where qemu-img has already
+                    // closed the file (has_active_writer=false) but the release task is still
+                    // flushing data in the background.
                     let has_active_writer = write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
+                    let has_release_in_flight = release_in_flight.get(&ino)
+                        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed) > 0)
+                        .unwrap_or(false);
                     let file_age = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -3104,7 +3112,7 @@ impl Filesystem for DfsFilesystem {
                         .saturating_sub(metadata.created_at);
                     let is_very_recent = file_age < 60; // created in the last minute
 
-                    if has_active_writer && is_very_recent && metadata.size < 1024 * 1024 {
+                    if (has_active_writer || has_release_in_flight) && is_very_recent && metadata.size < 1024 * 1024 {
                         // File is actively being written to, very new, and still small (< 1MB).
                         // This is likely a create-in-progress. Wait up to 2 seconds for any
                         // in-flight flush to complete so we return a meaningful size.
@@ -4819,12 +4827,152 @@ impl Filesystem for DfsFilesystem {
                     }
                 }
 
-                // Reply to FUSE immediately — release() errors are informational only
-                // and the kernel ignores them. Parking a main-runtime worker for the
-                // full flush duration (up to 10s for metadata delivery) starves all
-                // other FUSE ops (readdir, getattr, read) during DVR startup scans.
-                reply.ok();
-                flush_rt.spawn(async move {
+                // Check if this file requires synchronous close. For correctness, we must wait
+                // for the flush to complete before replying in these cases:
+                // 1. Files opened with O_SYNC/O_DSYNC (sync_on_fsync=true)
+                // 2. SQLite and database files
+                // 3. qcow2/VM disk images accessed via NBD (detected by .qcow2 extension)
+                //
+                // Without this, mkfs.ext4 journal writes and database commits are lost when
+                // the NBD/VM layer closes the file before the background flush completes.
+                //
+                // For streaming/DVR files, reply immediately to avoid blocking other FUSE ops.
+                let path_for_sync_check = self.metadata_cache.get(&ino).map(|m| m.path.clone());
+                let is_vm_disk = path_for_sync_check.as_deref()
+                    .map(|p| p.ends_with(".qcow2") || p.ends_with(".raw") || p.ends_with(".img") || p.ends_with(".vmdk"))
+                    .unwrap_or(false);
+                let sync_on_fsync = self.write_buffers.get(&ino)
+                    .and_then(|s| s.try_lock().ok().map(|state| state.sync_on_fsync))
+                    .unwrap_or(false);
+                let needs_sync_release = sync_on_fsync || is_vm_disk;
+
+                if needs_sync_release {
+                    info!("release: ino={} sync_release=true (sync_on_fsync={} is_vm_disk={}) — waiting for flush before replying",
+                          ino, sync_on_fsync, is_vm_disk);
+                    let reply_clone = reply;
+                    flush_rt.spawn(async move {
+                    // Wait for any concurrent write() tasks for this inode to finish writing
+                    // into the slot before we flush. Without this, a close() that arrives
+                    // while write() tasks are still queued flushes an incomplete slot.
+                    if let Some(counter) = write_tasks_in_flight.get(&ino) {
+                        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+                        while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                            if tokio::time::Instant::now() > deadline {
+                                warn!("release: timed out waiting for write tasks for ino={}", ino);
+                                break;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                        }
+                    }
+                    // If the file was unlinked while this release task was queued, skip the
+                    // flush — sending PutFileMetadata for a deleted file resurrects it on
+                    // the server.
+                    let release_path = path_to_inode_for_release.read().unwrap()
+                        .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                    let is_pending_delete = release_path.as_deref()
+                        .map_or(false, |p| pending_deletes_for_release.contains(p));
+                    let path_gone = release_path.is_none();
+                    if is_pending_delete || path_gone {
+                        debug!("release: ino={} path={:?} deleted (pending={} path_gone={}) — skipping flush",
+                               ino, release_path, is_pending_delete, path_gone);
+                        write_buffers.remove(&ino);
+                        flush_handle.client.evict_recent_chunk_writes(ino);
+                        chunk_write_locks_for_release.remove(&ino);
+                        if let Some(counter) = release_in_flight.get(&ino) {
+                            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return;
+                    }
+                    // Wait for any concurrent flush (flushing=true slots from a prior
+                    // release task) to complete before checking has_unflushed. Without this,
+                    // a rapid write→close→write→close (T7 overwrite) can have:
+                    //   release1: flushing=true on slot, writes "original"
+                    //   write2:   updates slot data to "overwritten" while flushing=true
+                    //   release2: sees flushing=true → has_unflushed=false → skips flush
+                    //   release1: completes, keeps slot (len grew), but release2 already exited
+                    // Result: "overwritten" data is never sent to the server.
+                    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+                    loop {
+                        let any_flushing = write_buffers.get(&ino)
+                            .map(|s| s.try_lock().map(|st| st.slots.values().any(|sl| sl.flushing)).unwrap_or(true))
+                            .unwrap_or(false);
+                        if !any_flushing || tokio::time::Instant::now() >= deadline { break; }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                    }
+                    let has_unflushed = write_buffers.get(&ino)
+                        .map(|s| s.try_lock().map(|s| {
+                            s.slots.values().any(|sl| !sl.data.is_empty() && !sl.flushing)
+                        }).unwrap_or(true))
+                        .unwrap_or(false);
+                    if has_unflushed {
+                        if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
+                            error!("release: flush failed for inode {}: {}", ino, e);
+                        }
+                    }
+                    // Always do a final synchronous metadata sync after the last writer
+                    // closes, whether data was flushed now or already flushed by the
+                    // background ticker. This guarantees the leader has the complete
+                    // chunk map before release_in_flight drops to zero — preventing a
+                    // concurrent read open from fetching stale metadata from the leader
+                    // and getting chunk IDs that no longer exist (read-after-write gap).
+                    {
+                        let meta_to_persist = flush_handle.metadata_cache.get(&ino).map(|m| m.clone());
+                        if let Some(meta) = meta_to_persist {
+                            flush_handle.client.flush_metadata_sync(&meta).await;
+                            flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                        }
+                    }
+                    // Invalidate the read engine's chunk map so the next reader
+                    // immediately picks up the newly flushed chunks — but only if no new
+                    // writer has opened since this release task was spawned. A new O_TRUNC
+                    // open pre-seeds the engine with the new session's chunk_id; expiring
+                    // it here would wipe that out, causing the next cat to fall through to
+                    // the server and read stale data (T7 race).
+                    let has_new_writer = write_open_counts_for_release
+                        .get(&ino).map(|c| *c > 0).unwrap_or(false);
+                    if !has_new_writer {
+                        if let Some(engine) = read_engines_for_release.get(&ino) {
+                            engine.expire_chunk_map();
+                        }
+                        // No readers left either — free the engine entirely.
+                        if !open_counts_for_release.get(&ino).map(|c| *c > 0).unwrap_or(false) {
+                            read_engines_for_release.remove(&ino);
+                        }
+                    }
+                    // Only remove the write buffer if no new writer has opened the file
+                    // since this release task was spawned. A new O_TRUNC open races with
+                    // this cleanup — if we remove here, we destroy the new session's buffer
+                    // and its data is silently lost (T7 race).
+                    let has_new_writer = write_open_counts_for_release
+                        .get(&ino).map(|c| *c > 0).unwrap_or(false);
+                    if !has_new_writer {
+                        write_buffers.remove(&ino);
+                        size_high_water_for_release.remove(&ino);
+                        flush_handle.client.evict_recent_chunk_writes(ino);
+                        // Drop all per-chunk write locks for this inode. Any task still
+                        // holding a guard will keep it alive via Arc until it drops;
+                        // removing the map entry just prevents new waiters from queuing.
+                        chunk_write_locks_for_release.remove(&ino);
+                    }
+                    if let Some(owner) = lock_owner {
+                        if let Err(e) = lock_manager.release_all(ino, owner).await {
+                            error!("release: lock release failed for inode {}: {}", ino, e);
+                        }
+                    }
+                    if let Some(counter) = release_in_flight.get(&ino) {
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // For sync_on_fsync files, reply to FUSE only after flush completes.
+                    // This was set earlier to reply_clone for the sync path.
+                    reply_clone.ok();
+                });
+                } else {
+                    // Async path: reply immediately for DVR/streaming files.
+                    // Parking a main-runtime worker for the full flush duration (up to 10s
+                    // for metadata delivery) starves all other FUSE ops (readdir, getattr,
+                    // read) during DVR startup scans.
+                    reply.ok();
+                    flush_rt.spawn(async move {
                     // Wait for any concurrent write() tasks for this inode to finish writing
                     // into the slot before we flush. Without this, a close() that arrives
                     // while write() tasks are still queued flushes an incomplete slot.
@@ -4937,6 +5085,7 @@ impl Filesystem for DfsFilesystem {
                         counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 });
+                }
             } else if is_write {
                 // Intermediate write close: release locks only, leave buffer intact.
                 self.runtime.spawn(async move {

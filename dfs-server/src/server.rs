@@ -2302,8 +2302,43 @@ impl Server {
                 Response::FileMetadata { metadata }
             }
             Ok(None) => {
-                // Not found locally - with metadata replication, this means file doesn't exist
-                // Don't query other nodes for performance (replication ensures consistency)
+                // Not found locally. If we are a follower, metadata might not have
+                // replicated yet — forward to leader for authoritative answer.
+                // If we are the leader, file definitively doesn't exist.
+                if !self.cluster.is_leader().await {
+                    if let Some(leader_addr) = self.cluster.get_leader_addr().await {
+                        debug!("File {} not found on follower — forwarding query to leader {}", path, leader_addr);
+                        let forward_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            self.client.send_message(leader_addr, Message::Request(Request::GetFileMetadataByPath {
+                                path: path.clone(),
+                                if_modified_since,
+                            }))
+                        ).await;
+
+                        match forward_result {
+                            Ok(Ok(envelope)) => {
+                                if let Message::Response(response) = envelope.message {
+                                    debug!("Follower forwarded {} to leader, got: {:?}", path,
+                                           if matches!(response, Response::FileMetadata { .. }) { "FileMetadata" }
+                                           else { "NotFound/Error" });
+                                    return response;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                warn!("Failed to forward {} query to leader {}: {}", path, leader_addr, e);
+                                // Fall through to NotFound
+                            }
+                            Err(_) => {
+                                warn!("Timeout forwarding {} query to leader {}", path, leader_addr);
+                                // Fall through to NotFound
+                            }
+                        }
+                    } else {
+                        debug!("File {} not found on follower but no leader available", path);
+                        // Fall through to NotFound
+                    }
+                }
                 Response::Error {
                     message: "File not found".to_string(),
                     code: ErrorCode::NotFound,

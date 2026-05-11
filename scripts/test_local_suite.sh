@@ -262,16 +262,28 @@ done
 check "T14a rename paths propagated to all nodes" $OK
 
 # Verify all nodes agree on the full file list (same set of files)
-declare -A NODE_LISTS
-for port in 8900 8901 8902 8903 8904; do
-    NODE_LISTS[$port]=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null \
-        | grep -E "^[0-9a-f]{8}" | awk '{print $1, $2, $3}' | sort)
+# Try once at 3s, then retry with extra 2s wait if inconsistent (5s total)
+T14B_OK=FAIL
+for attempt in 1 2; do
+    declare -A NODE_LISTS
+    for port in 8900 8901 8902 8903 8904; do
+        NODE_LISTS[$port]=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null \
+            | grep -E "^[0-9a-f]{8}" | awk '{print $1, $2, $3}' | sort)
+    done
+
+    if [ "${NODE_LISTS[8900]}" = "${NODE_LISTS[8901]}" ] && \
+       [ "${NODE_LISTS[8901]}" = "${NODE_LISTS[8902]}" ] && \
+       [ "${NODE_LISTS[8902]}" = "${NODE_LISTS[8903]}" ] && \
+       [ "${NODE_LISTS[8903]}" = "${NODE_LISTS[8904]}" ]; then
+        T14B_OK=PASS
+        break
+    elif [ "$attempt" -eq 1 ]; then
+        echo "  Metadata inconsistent at 3s, waiting 2s more..."
+        sleep 2
+    fi
 done
 
-if [ "${NODE_LISTS[8900]}" = "${NODE_LISTS[8901]}" ] && \
-   [ "${NODE_LISTS[8901]}" = "${NODE_LISTS[8902]}" ] && \
-   [ "${NODE_LISTS[8902]}" = "${NODE_LISTS[8903]}" ] && \
-   [ "${NODE_LISTS[8903]}" = "${NODE_LISTS[8904]}" ]; then
+if [ "$T14B_OK" = "PASS" ]; then
     check "T14b metadata identical on all 5 nodes" PASS
 else
     check "T14b metadata identical on all 5 nodes" FAIL

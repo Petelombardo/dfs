@@ -228,6 +228,7 @@ impl InodeWriteState {
                 // the full chunk state. Without this, is_append_extend PatchChunk would
                 // send only the tail, missing the first flushed_sizes bytes.
                 if flushed > 0 {
+                    debug!("write_at: chunk={} created slot with gap_fill={} from flushed_sizes", idx, flushed);
                     s.data.resize(flushed, 0u8);
                     s.gap_filled_prefix = flushed;
                 }
@@ -235,18 +236,28 @@ impl InodeWriteState {
             });
 
             // Grow slot to cover intra_offset (may need zero-fill for sparse-within-chunk)
+            let pre_fill_len = slot.data.len();
             if slot.data.len() < intra {
-                // Track how far the zero-fill extends so the read path can fall through
-                // to the server for this range rather than serving synthetic zeros.
+                // Zero-fill to reach the write position. Only update gap_filled_prefix if
+                // we're zero-filling from the START of the slot (gap_filled_prefix == pre_fill_len).
+                // Mid-slot gaps (after real data) should NOT update gap_filled_prefix, as that
+                // would incorrectly mark earlier real data as gap-filled.
                 let fill_end = intra;
-                if slot.gap_filled_prefix < fill_end {
+                if slot.gap_filled_prefix == pre_fill_len && slot.gap_filled_prefix < fill_end {
+                    debug!("write_at: chunk={} gap_fill {} -> {} (sparse write at offset {})",
+                           idx, slot.gap_filled_prefix, fill_end, file_offset);
                     slot.gap_filled_prefix = fill_end;
+                } else if pre_fill_len > 0 {
+                    debug!("write_at: chunk={} zero-fill gap {} -> {} (mid-slot gap, gap_prefix stays {})",
+                           idx, pre_fill_len, intra, slot.gap_filled_prefix);
                 }
                 slot.data.resize(intra, 0u8);
             }
 
             let space = CHUNK_SIZE - intra;
             let n = remaining.len().min(space);
+
+            let write_start_offset = cur_offset; // Save for logging before incrementing
 
             // Write or overwrite within this slot
             if intra == slot.data.len() {
@@ -262,8 +273,11 @@ impl InodeWriteState {
             // If the app writes at or before the gap-filled prefix, real data now covers
             // that region — shrink gap_filled_prefix so PatchChunk sends the real bytes
             // rather than treating the entire gap-fill as already-on-server data.
+            let old_gap_prefix = slot.gap_filled_prefix;
             if intra < slot.gap_filled_prefix {
                 slot.gap_filled_prefix = intra;
+                debug!("write_at: chunk={} gap_filled_prefix shrunk {} -> {} (overwrite at intra={})",
+                       idx, old_gap_prefix, slot.gap_filled_prefix, intra);
             }
             // Track the furthest byte of real app-written data. Bytes beyond this in the
             // slot are synthetic gap-fill zeros (representing data already on the server)
@@ -286,6 +300,10 @@ impl InodeWriteState {
             if slot.is_full() {
                 full_slots.push(idx);
             }
+
+            info!("write_at: chunk={} file_offset={} intra={} write_end={} len={} | slot_len={} gap_prefix={} real_end={} dirty_ranges={:?}",
+                   idx, write_start_offset, intra, write_end, n, slot.data.len(), slot.gap_filled_prefix, slot.real_data_end,
+                   slot.dirty_ranges);
 
             remaining = &remaining[n..];
             cur_offset += n as u64;
@@ -1068,8 +1086,8 @@ impl FlushHandle {
             }
         };
         let slot_len = slot_data.len();
-        debug!("flush_buffer_async_one: ino={} chunk={} existing_chunk_size={} slot_len={} meta_file_id={:?} buf_expected_id={:?}",
-            ino, chunk_idx, existing_chunk_size, slot_len, file_id_at_flush_start, buf_expected_id);
+        info!("flush_buffer_async_one: ino={} chunk={} file_offset={} existing_chunk_size={} slot_len={} gap_prefix={} real_end={} dirty_ranges={:?} meta_file_id={:?} buf_expected_id={:?}",
+            ino, chunk_idx, file_offset, existing_chunk_size, slot_len, gap_filled_prefix, real_data_end, dirty_ranges, file_id_at_flush_start, buf_expected_id);
         let chunk_exists = existing_chunk_size > 0;
         let is_append_extend = chunk_exists
             && slot_len > existing_chunk_size
@@ -1095,7 +1113,19 @@ impl FlushHandle {
             && gap_filled_prefix < existing_chunk_size
             && !dirty_ranges.is_empty()
             && !is_truncated_session;
-        let needs_patch = is_overwrite || is_append_extend || is_mixed_extend;
+        // Sparse-within-chunk: the slot has gaps (non-contiguous dirty_ranges) that represent
+        // unwritten regions. If we do a fresh write, the zero-filled gaps will overwrite data
+        // that may already exist on the server (e.g., qcow2 metadata written at non-sequential
+        // offsets). Force PATCH mode to send only the actually-written ranges.
+        let has_sparse_gaps = !dirty_ranges.is_empty() && {
+            let covered: usize = dirty_ranges.iter().map(|&(s, e)| e - s).sum();
+            covered < slot_len && dirty_ranges.len() > 1
+        };
+        let is_sparse_write = has_sparse_gaps && !is_truncated_session;
+        let needs_patch = is_overwrite || is_append_extend || is_mixed_extend || is_sparse_write;
+
+        info!("flush_buffer_async_one: ino={} chunk={} decision: chunk_exists={} is_overwrite={} is_append_extend={} is_mixed_extend={} is_sparse_write={} needs_patch={} is_truncated_session={}",
+              ino, chunk_idx, chunk_exists, is_overwrite, is_append_extend, is_mixed_extend, is_sparse_write, needs_patch, is_truncated_session);
 
         if needs_patch {
             // Build the patch list:
@@ -1416,17 +1446,39 @@ impl FlushHandle {
         }
 
         // Write path: send data to server, update metadata & read engine, THEN remove slot.
-        // Log when a fresh write has non-contiguous dirty ranges — the zeros between ranges
-        // will be written to the server, which may corrupt data if the chunk already exists.
-        if chunk_exists && !dirty_ranges.is_empty() {
+        // For sparse writes (non-contiguous dirty_ranges), we must NOT send the full slot with
+        // zero-filled gaps, as this will overwrite existing data (e.g. qcow2 metadata clusters).
+        // Instead, write each dirty range individually at its correct file offset.
+        info!("flush_buffer_async_one: ino={} chunk={} FRESH WRITE PATH: chunk_exists={} slot_len={} dirty_ranges={:?}",
+              ino, chunk_idx, chunk_exists, slot_len, dirty_ranges);
+
+        let has_gaps = if !dirty_ranges.is_empty() {
             let covered: usize = dirty_ranges.iter().map(|&(s, e)| e - s).sum();
-            if covered < slot_len {
-                warn!("flush_buffer_async_one: ino={} chunk={} FRESH WRITE with gaps: slot_len={} covered={} dirty={:?} existing={} — zeros will overwrite server data",
-                    ino, chunk_idx, slot_len, covered, dirty_ranges, existing_chunk_size);
-            }
+            covered < slot_len
+        } else {
+            false
+        };
+
+        if has_gaps && dirty_ranges.len() > 1 {
+            // Sparse write: multiple non-contiguous ranges with gaps. We must NOT send the full
+            // slot with zero-filled gaps, as those zeros will overwrite data written in earlier
+            // operations within the same session (e.g., qcow2 metadata clusters).
+            //
+            // Strategy: Write the FULL slot (including zeros in gaps) as a fresh chunk write.
+            // This ensures the chunk covers the entire range and reads from gap regions return
+            // zeros instead of EIO. The gaps contain zeros because the application never wrote
+            // to those offsets - it's sparse data, not missing data.
+            info!("flush_buffer_async_one: ino={} chunk={} SPARSE WRITE: {} ranges covering {} of {} bytes - writing full slot with zero gaps",
+                  ino, chunk_idx, dirty_ranges.len(),
+                  dirty_ranges.iter().map(|&(s, e)| e - s).sum::<usize>(), slot_len);
+            // Fall through to normal fresh write path which sends the full slot_data
         }
+
+        // Normal fresh write path (contiguous data, no gaps)
         // Acquire the per-chunk write lock for the fresh-write path too.
         let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, chunk_idx).await;
+        info!("flush_buffer_async_one: ino={} chunk={} calling write_data_with_cache with {} bytes at file_offset={}",
+              ino, chunk_idx, slot_data.len(), file_offset);
         let result = self.client.write_data_with_cache(&slot_data, ino, file_offset).await;
         match result {
             Ok((_, _, Some(locations))) => {
@@ -3818,7 +3870,7 @@ impl Filesystem for DfsFilesystem {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        debug!("write FUSE: ino={} offset={} len={}", ino, offset, data.len());
+        info!("write FUSE: ino={} offset={} len={}", ino, offset, data.len());
 
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
@@ -4071,7 +4123,7 @@ impl Filesystem for DfsFilesystem {
                     let gap = offset_usize - current_size;
 
                     const SMALL_GAP_THRESHOLD: usize = 64 * 1024;
-                    if gap < SMALL_GAP_THRESHOLD {
+                    if gap <= SMALL_GAP_THRESHOLD {
                         info!("Near-sequential write: offset={} current_size={} gap={} bytes — zero-filling into buffer",
                               offset_usize, current_size, gap);
                         let mut padded = vec![0u8; gap];
@@ -6003,5 +6055,77 @@ impl Filesystem for DfsFilesystem {
                 }
             }
         });
+    }
+
+    fn ioctl(
+        &mut self,
+        _req: &FuseRequest,
+        ino: u64,
+        _fh: u64,
+        _flags: u32,
+        cmd: u32,
+        _in_data: &[u8],
+        _out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        // Block device ioctl commands that qemu-nbd and mkfs use
+        const BLKFLSBUF: u32 = 0x1268;      // Flush buffer cache
+        const BLKDISCARD: u32 = 0x80041272; // Discard/TRIM blocks
+        const BLKROGET: u32 = 0x125e;       // Get read-only status
+        const BLKGETSIZE64: u32 = 0x80081272; // Get device size in bytes
+
+        match cmd {
+            BLKFLSBUF => {
+                // qemu-nbd/mkfs.ext4 calls BLKFLSBUF to flush pending writes.
+                // Forward to fsync to ensure data reaches the server.
+                info!("ioctl: BLKFLSBUF for ino={} — forwarding to fsync", ino);
+                let runtime = self.runtime.clone();
+                let flush_handle = self.flush_handle.clone();
+                let metadata_cache = self.metadata_cache.clone();
+                let client = self.client.clone();
+
+                runtime.spawn(async move {
+                    // Flush any buffered writes for this inode.
+                    // This ensures all pending writes reach the server before returning.
+                    // qemu-nbd and mkfs.ext4 rely on this for data durability.
+                    if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
+                        error!("ioctl BLKFLSBUF: flush failed for ino={}: {}", ino, e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+
+                    reply.ioctl(0, &[]);
+                });
+            }
+            BLKDISCARD => {
+                // TRIM/discard operation — qcow2 uses this for hole punching.
+                // We don't support sparse holes yet, so just acknowledge success.
+                debug!("ioctl: BLKDISCARD for ino={} — no-op (not implemented)", ino);
+                reply.ioctl(0, &[]);
+            }
+            BLKROGET => {
+                // Read-only status check — return 0 (read-write)
+                debug!("ioctl: BLKROGET for ino={} — returning read-write (0)", ino);
+                let data = 0u32.to_ne_bytes();
+                reply.ioctl(0, &data);
+            }
+            BLKGETSIZE64 => {
+                // Get device size in bytes — return file size
+                if let Some(meta) = self.metadata_cache.get(&ino) {
+                    let size = meta.size;
+                    drop(meta);
+                    debug!("ioctl: BLKGETSIZE64 for ino={} — returning size={}", ino, size);
+                    let data = size.to_ne_bytes();
+                    reply.ioctl(0, &data);
+                } else {
+                    warn!("ioctl: BLKGETSIZE64 for ino={} — metadata not found", ino);
+                    reply.error(libc::ENOENT);
+                }
+            }
+            _ => {
+                warn!("ioctl: unhandled cmd=0x{:x} for ino={}", cmd, ino);
+                reply.error(libc::ENOTTY);
+            }
+        }
     }
 }

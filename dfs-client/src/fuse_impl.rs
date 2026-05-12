@@ -338,12 +338,12 @@ impl InodeWriteState {
 
 
 /// Number of chunk-flush tasks that may run concurrently per inode.
-/// 3 means 3 × 2 replica connections = 6 simultaneous node connections.
-/// Increased from 2 to improve patch throughput (e.g., qcow2 multi-chunk updates).
-const PIPELINE_CHUNKS: usize = 3;
+/// 4 means 4 × 2 replica connections = 8 simultaneous node connections.
+/// Increased from 3 to handle both heavy 4MB writes and light patches efficiently.
+const PIPELINE_CHUNKS: usize = 4;
 
 /// Number of full chunk slots the writer may buffer ahead of the pipeline.
-/// With PIPELINE_CHUNKS=3 flushing and BUFFER_CHUNKS=4 in the buffer, the
+/// With PIPELINE_CHUNKS=4 flushing and BUFFER_CHUNKS=4 in the buffer, the
 /// writer is always filling the next slots while the current ones are in-flight.
 const BUFFER_CHUNKS: usize = 4;
 

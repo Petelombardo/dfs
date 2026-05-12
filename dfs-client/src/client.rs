@@ -1580,11 +1580,11 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Formula mirrors the write pipeline: ceil(32MB / chunk_size), minimum 1.
     /// With 4MB chunks → 8 in flight, which at ~113 MB/s wire speed gives full saturation.
     fn pipeline_depth(chunk_size: usize) -> usize {
-        // We want exactly 1 chunk of lookahead — enough to hide the connection RTT
-        // (~10ms) behind the body transfer of the current chunk (~250ms on 1Gbps).
-        // More than 2 in-flight at once wastes bandwidth and competes for NIC capacity.
+        // Testing with 4 chunks in flight (3 chunks of lookahead) to see impact on
+        // sequential read throughput. May help hide network latency on slower links.
+        // Previous value was 2 (1 chunk lookahead).
         let _ = chunk_size; // reserved for future adaptive tuning
-        2
+        4
     }
 
     // -------------------------------------------------------------------------

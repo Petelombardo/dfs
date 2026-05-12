@@ -338,12 +338,12 @@ impl InodeWriteState {
 
 
 /// Number of chunk-flush tasks that may run concurrently per inode.
-/// 2 means 2 × 2 replica connections = 4 simultaneous node connections,
-/// which fits a 5-node cluster without thrashing.
-const PIPELINE_CHUNKS: usize = 2;
+/// 3 means 3 × 2 replica connections = 6 simultaneous node connections.
+/// Increased from 2 to improve patch throughput (e.g., qcow2 multi-chunk updates).
+const PIPELINE_CHUNKS: usize = 3;
 
 /// Number of full chunk slots the writer may buffer ahead of the pipeline.
-/// With PIPELINE_CHUNKS=2 flushing and BUFFER_CHUNKS=4 in the buffer, the
+/// With PIPELINE_CHUNKS=3 flushing and BUFFER_CHUNKS=4 in the buffer, the
 /// writer is always filling the next slots while the current ones are in-flight.
 const BUFFER_CHUNKS: usize = 4;
 
@@ -3341,7 +3341,7 @@ impl Filesystem for DfsFilesystem {
                         match result {
                             Ok(data) => {
                                 let reply_data = if data.len() > size { &data[..size] } else { &data[..] };
-                                info!("FUSE read done: ino={}, {} bytes in {:?}", ino, reply_data.len(), elapsed);
+                                debug!("FUSE read done: ino={}, {} bytes in {:?}", ino, reply_data.len(), elapsed);
                                 reply.data(reply_data);
                             }
                             Err(e) => { error!("read failed: {}", e); reply.error(libc::EIO); }
@@ -3472,7 +3472,7 @@ impl Filesystem for DfsFilesystem {
                     .unwrap_or(false);
                 has_slots
             };
-            info!("FUSE read: ino={}, offset={}, size={}, file_size={}", ino, offset, size, effective_size);
+            debug!("FUSE read: ino={}, offset={}, size={}, file_size={}", ino, offset, size, effective_size);
             let result = client.read_file(
                 ino, effective_size, file_id, &file_path, offset, size, has_active_writer, write_seq,
             ).await;
@@ -3482,7 +3482,7 @@ impl Filesystem for DfsFilesystem {
                 Ok(data) => {
                     // FUSE rejects replies larger than the requested size with EINVAL.
                     let reply_data = if data.len() > size { &data[..size] } else { &data[..] };
-                    info!("FUSE read done: ino={}, {} bytes in {:?}", ino, reply_data.len(), elapsed);
+                    debug!("FUSE read done: ino={}, {} bytes in {:?}", ino, reply_data.len(), elapsed);
                     reply.data(reply_data);
                 }
                 Err(e) => {

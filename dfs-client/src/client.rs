@@ -3105,6 +3105,40 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
+    /// Invalidate all byte-range cache entries for a chunk.
+    /// Called before seeding patched data to prevent stale cache hits.
+    /// Example: qcow2 writes full header at offset 0, then patches offset 36.
+    /// Without invalidation, reads at offset 0 hit the old cached header.
+    pub async fn invalidate_byte_range_cache_for_chunk(
+        &self,
+        inode: u64,
+        chunk_file_offset: u64,
+        chunk_len: usize,
+    ) {
+        if inode == 0 || chunk_len == 0 {
+            return;
+        }
+        let mut byte_cache = self.byte_range_cache.lock().await;
+        // Invalidate all keys in the range [chunk_file_offset, chunk_file_offset + chunk_len).
+        // LruCache doesn't have range removal, so we scan all entries. This is acceptable
+        // because byte_range_cache is small (~100 entries) and invalidation is rare (patches).
+        let keys_to_remove: Vec<ByteRangeCacheKey> = byte_cache.iter()
+            .filter_map(|(k, _)| {
+                if k.inode == inode
+                    && k.file_offset >= chunk_file_offset
+                    && k.file_offset < chunk_file_offset + chunk_len as u64
+                {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in keys_to_remove {
+            byte_cache.pop(&key);
+        }
+    }
+
     /// - chunk_ids: All chunks in the file
     /// - current_chunk_idx: Current chunk index (optional, for smart warming)
     pub async fn warm_replica_cache_by_index(&self, chunk_ids: &[ChunkId], current_chunk_idx: Option<usize>) {

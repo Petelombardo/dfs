@@ -1354,6 +1354,13 @@ impl FlushHandle {
                         );
                     }
 
+                    // CRITICAL: Invalidate overlapping byte-range cache entries before seeding!
+                    // If this chunk was previously written as a fresh write (e.g., qcow2 first
+                    // pass writes full header), byte_range_cache has stale entries at offset 0.
+                    // Patching offset 36 doesn't overwrite the (ino, 0) cache key, so reads at
+                    // offset 0 hit stale data (qcow2 virtual_size=0 instead of 1GB) until the
+                    // cache expires (~30s). Invalidate the whole chunk range before seeding.
+                    self.client.invalidate_byte_range_cache_for_chunk(ino, file_offset, slot_data.len()).await;
                     // Seed byte-range cache with the post-patch bytes for each dirty range.
                     // The cache key is (inode, file_offset) — no chunk_id — so this entry
                     // will be hit by the next read at the same offset without a network RTT.
@@ -3112,8 +3119,8 @@ impl Filesystem for DfsFilesystem {
                         .saturating_sub(metadata.created_at);
                     let is_very_recent = file_age < 60; // created in the last minute
 
-                    if (has_active_writer || has_release_in_flight) && is_very_recent && metadata.size < 1024 * 1024 {
-                        // File is actively being written to, very new, and still small (< 1MB).
+                    if (has_active_writer || has_release_in_flight) && is_very_recent {
+                        // File is actively being written to and very new.
                         // This is likely a create-in-progress. Wait up to 2 seconds for any
                         // in-flight flush to complete so we return a meaningful size.
                         let has_flush = {
@@ -3801,8 +3808,20 @@ impl Filesystem for DfsFilesystem {
                     *write_open_counts.entry(ino).or_insert(0) += 1;
 
                     // Cache metadata and stamp it as fresh.
-                    metadata_cache.insert(ino, metadata.clone());
-                    last_metadata_update.insert(ino, std::time::Instant::now());
+                    // BUT: Only insert if the cache doesn't already have data from writes.
+                    // Sparse writes (qcow2 creation) may have already updated the cache
+                    // with the correct size while this async CREATE task was in flight.
+                    // Without this check, we'd overwrite the sparse write's metadata
+                    // (size=1GB) with stale creation metadata (size=0).
+                    // We can't rely on modified_at because it only has 1-second granularity
+                    // and the sparse write happens within the same second as create.
+                    let should_insert = metadata_cache.get(&ino)
+                        .map(|cached| cached.size == 0 && cached.chunk_locations.is_empty())
+                        .unwrap_or(true);
+                    if should_insert {
+                        metadata_cache.insert(ino, metadata.clone());
+                        last_metadata_update.insert(ino, std::time::Instant::now());
+                    }
 
                     // Clear any stale read engine for this inode. Inode numbers are reused
                     // within a mount session, so a previously-deleted file's chunk map may
@@ -4221,6 +4240,7 @@ impl Filesystem for DfsFilesystem {
                                     ino, &meta.chunk_locations, meta.size,
                                 ).await;
                                 metadata_cache.insert(ino, meta);
+                                last_metadata_update.insert(ino, std::time::Instant::now());
                                 info!("Sparse write complete (patch): ino={}, offset={}, len={}, new_size={}",
                                       ino, offset, data_vec.len(), new_size);
                                 reply.written(data_vec.len() as u32);
@@ -4248,6 +4268,7 @@ impl Filesystem for DfsFilesystem {
                                     ino, &metadata.chunk_locations, metadata.size,
                                 ).await;
                                 metadata_cache.insert(ino, metadata);
+                                last_metadata_update.insert(ino, std::time::Instant::now());
                                 info!("Sparse write complete: ino={}, offset={}, len={}, new_size={}",
                                       ino, offset, data_vec.len(), new_size);
                                 reply.written(data_vec.len() as u32);
@@ -6222,6 +6243,8 @@ impl Filesystem for DfsFilesystem {
         const BLKDISCARD: u32 = 0x80041272; // Discard/TRIM blocks
         const BLKROGET: u32 = 0x125e;       // Get read-only status
         const BLKGETSIZE64: u32 = 0x80081272; // Get device size in bytes
+        const BLKZEROOUT: u32 = 0x800c581e; // Zero out a range (mkswap, parted)
+        const BLKSECDISCARD: u32 = 0x801c581f; // Secure discard (mkswap, cryptsetup)
 
         match cmd {
             BLKFLSBUF => {
@@ -6252,6 +6275,21 @@ impl Filesystem for DfsFilesystem {
                 debug!("ioctl: BLKDISCARD for ino={} — no-op (not implemented)", ino);
                 reply.ioctl(0, &[]);
             }
+            BLKZEROOUT => {
+                // Zero out a block range — used by mkswap, parted, and other partitioning tools.
+                // For a distributed filesystem, we could implement this by writing zeros,
+                // but for now just acknowledge success. The actual zero-fill will happen
+                // when the tool writes zeros explicitly.
+                debug!("ioctl: BLKZEROOUT for ino={} — no-op (not implemented)", ino);
+                reply.ioctl(0, &[]);
+            }
+            BLKSECDISCARD => {
+                // Secure discard — used by mkswap, cryptsetup to securely erase data.
+                // Similar to BLKDISCARD but with security guarantees. For a distributed
+                // filesystem, we don't support secure erase yet, so just acknowledge success.
+                debug!("ioctl: BLKSECDISCARD for ino={} — no-op (not implemented)", ino);
+                reply.ioctl(0, &[]);
+            }
             BLKROGET => {
                 // Read-only status check — return 0 (read-write)
                 debug!("ioctl: BLKROGET for ino={} — returning read-write (0)", ino);
@@ -6263,7 +6301,7 @@ impl Filesystem for DfsFilesystem {
                 if let Some(meta) = self.metadata_cache.get(&ino) {
                     let size = meta.size;
                     drop(meta);
-                    debug!("ioctl: BLKGETSIZE64 for ino={} — returning size={}", ino, size);
+                    info!("ioctl: BLKGETSIZE64 for ino={} — returning size={} (_out_size={})", ino, size, _out_size);
                     let data = size.to_ne_bytes();
                     reply.ioctl(0, &data);
                 } else {

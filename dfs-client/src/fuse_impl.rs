@@ -301,7 +301,7 @@ impl InodeWriteState {
                 full_slots.push(idx);
             }
 
-            info!("write_at: chunk={} file_offset={} intra={} write_end={} len={} | slot_len={} gap_prefix={} real_end={} dirty_ranges={:?}",
+            debug!("write_at: chunk={} file_offset={} intra={} write_end={} len={} | slot_len={} gap_prefix={} real_end={} dirty_ranges={:?}",
                    idx, write_start_offset, intra, write_end, n, slot.data.len(), slot.gap_filled_prefix, slot.real_data_end,
                    slot.dirty_ranges);
 
@@ -337,13 +337,18 @@ impl InodeWriteState {
 }
 
 
-/// Number of chunk-flush tasks that may run concurrently per inode.
-/// 4 means 4 × 2 replica connections = 8 simultaneous node connections.
-/// Increased from 3 to handle both heavy 4MB writes and light patches efficiently.
-const PIPELINE_CHUNKS: usize = 4;
+/// Maximum number of chunk-flush tasks that may run concurrently per inode.
+/// Allows small patches to pipeline efficiently (16 × 1KB = 16KB in flight) while
+/// large chunks hit the byte limit instead (4 × 4MB = 16MB).
+const PIPELINE_MAX_ITEMS: usize = 16;
+
+/// Maximum total bytes that may be in-flight across all concurrent flush tasks per inode.
+/// Set to 4 × CHUNK_SIZE (16MB) to limit memory and network bandwidth usage.
+/// Whichever limit is hit first (PIPELINE_MAX_ITEMS or PIPELINE_MAX_BYTES) throttles dispatch.
+const PIPELINE_MAX_BYTES: usize = 4 * CHUNK_SIZE;
 
 /// Number of full chunk slots the writer may buffer ahead of the pipeline.
-/// With PIPELINE_CHUNKS=4 flushing and BUFFER_CHUNKS=4 in the buffer, the
+/// With up to 16 items or 16MB flushing and BUFFER_CHUNKS=4 in the buffer, the
 /// writer is always filling the next slots while the current ones are in-flight.
 const BUFFER_CHUNKS: usize = 4;
 
@@ -357,7 +362,8 @@ struct FlushHandle {
     metadata_cache: Arc<DashMap<u64, FileMetadata>>,
     chunk_write_locks: Arc<DashMap<u64, Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>>>,
     /// Tracks how many chunk-flush tasks are currently in-flight per inode.
-    /// Capped at PIPELINE_CHUNKS by the background ticker.
+    /// Capped at PIPELINE_MAX_ITEMS by the background ticker (item count only;
+    /// the byte limit is enforced separately in flush_all_pipelined).
     flush_in_flight: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>>,
     last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
     dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
@@ -1675,10 +1681,10 @@ impl FlushHandle {
         }
     }
 
-    /// Drain ALL dirty slots for `ino` (including partial tail) through the
-    /// same PIPELINE_CHUNKS-capped pipeline used by the background ticker.
-    /// Used by release() and fsync() so close/sync never exceeds 2 concurrent
-    /// writes — keeping total cluster connections at 2×2=4 on a 5-node cluster.
+    /// Drain ALL dirty slots for `ino` (including partial tail) through a pipeline
+    /// capped at both PIPELINE_MAX_ITEMS (16) and PIPELINE_MAX_BYTES (16MB).
+    /// Used by release() and fsync(). The hybrid limit allows many small patches to
+    /// fill the pipeline efficiently without exceeding memory/bandwidth budgets.
     async fn flush_all_pipelined(&self, ino: u64) -> Result<()> {
         // Wait for any background pipeline tasks to finish first so we don't
         // race with them on slot ownership.
@@ -1706,8 +1712,8 @@ impl FlushHandle {
 
         let mut first_err: Option<anyhow::Error> = None;
 
-        // Keep dispatching up to PIPELINE_CHUNKS concurrent flush_one_chunk calls
-        // until no unclaimed slots remain.
+        // Keep dispatching concurrent flush_one_chunk calls until no unclaimed slots remain.
+        // Enforce BOTH a count limit (PIPELINE_MAX_ITEMS) and a byte limit (PIPELINE_MAX_BYTES).
         loop {
             // Count how many slots are still pending (unclaimed and non-empty).
             let pending = self.write_buffers.get(&ino).map(|s| {
@@ -1719,14 +1725,56 @@ impl FlushHandle {
             if pending == 0 { break; }
 
             // Count currently in-flight slots for this inode (claimed, flushing=true).
-            let in_flight_count = self.write_buffers.get(&ino).map(|s| {
-                s.try_lock().map(|st| st.slots.values().filter(|sl| sl.flushing).count()).unwrap_or(0)
-            }).unwrap_or(0);
+            // Also sum their byte sizes to enforce the byte limit.
+            let (in_flight_count, in_flight_bytes) = self.write_buffers.get(&ino).map(|s| {
+                s.try_lock().map(|st| {
+                    let count = st.slots.values().filter(|sl| sl.flushing).count();
+                    let bytes: usize = st.slots.values()
+                        .filter(|sl| sl.flushing)
+                        .map(|sl| sl.data.len())
+                        .sum();
+                    (count, bytes)
+                }).unwrap_or((0, 0))
+            }).unwrap_or((0, 0));
 
-            // Dispatch up to PIPELINE_CHUNKS tasks total.
-            let to_dispatch = PIPELINE_CHUNKS.saturating_sub(in_flight_count).min(pending);
+            // Dispatch if BOTH limits allow it:
+            // - in_flight_count < PIPELINE_MAX_ITEMS (16 items)
+            // - in_flight_bytes < PIPELINE_MAX_BYTES (16MB)
+            // For small patches, the item limit dominates (e.g., 16 × 1KB = 16KB << 16MB).
+            // For large chunks, the byte limit dominates (e.g., 4 × 4MB = 16MB at 4 items).
+            let items_available = PIPELINE_MAX_ITEMS.saturating_sub(in_flight_count);
+            let bytes_available = PIPELINE_MAX_BYTES.saturating_sub(in_flight_bytes);
+
+            // Estimate how many more items we can dispatch based on byte budget.
+            // Peek at pending slot sizes to make a reasonable guess.
+            let pending_slot_sizes: Vec<usize> = self.write_buffers.get(&ino)
+                .and_then(|s| s.try_lock().ok().map(|st| {
+                    let mut sizes: Vec<usize> = st.slots.values()
+                        .filter(|sl| !sl.data.is_empty() && !sl.flushing)
+                        .map(|sl| sl.data.len())
+                        .collect();
+                    sizes.sort_unstable();
+                    sizes
+                }))
+                .unwrap_or_default();
+
+            let to_dispatch = if pending_slot_sizes.is_empty() {
+                0
+            } else {
+                // Greedily fit as many pending slots as possible within both limits.
+                let mut can_fit = 0;
+                let mut bytes_so_far = 0;
+                for &size in &pending_slot_sizes {
+                    if can_fit >= items_available { break; }
+                    if bytes_so_far + size > bytes_available { break; }
+                    can_fit += 1;
+                    bytes_so_far += size;
+                }
+                can_fit.min(pending)
+            };
+
             if to_dispatch == 0 {
-                // Pipeline is full — wait a bit for a slot to complete.
+                // Pipeline is full (either item or byte limit hit) — wait for a slot to complete.
                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 continue;
             }
@@ -1946,7 +1994,7 @@ impl DfsFilesystem {
 
         // Global write buffer cap: BUFFER_CHUNKS × CHUNK_SIZE.
         // The writer may buffer up to BUFFER_CHUNKS full slots per inode before blocking.
-        // With PIPELINE_CHUNKS=2 flushing concurrently, BUFFER_CHUNKS=4 slots in the buffer,
+        // With up to 32 items or 16MB flushing concurrently, BUFFER_CHUNKS=4 slots buffered,
         // the writer always has room to fill the next slot while prior ones are in-flight.
         let global_write_buffer_cap = BUFFER_CHUNKS * CHUNK_SIZE;
         info!("Global write buffer cap: {}MB ({} buffer chunks × {}MB)",
@@ -2044,7 +2092,7 @@ impl DfsFilesystem {
             let chunk_write_locks_for_bg = chunk_write_locks_shared.clone();
             let release_in_flight_for_bg = release_in_flight_shared.clone();
             // in_flight: per-inode count of chunk-flush tasks currently running.
-            // The ticker keeps this at most PIPELINE_CHUNKS per inode, so each
+            // The ticker keeps this at most PIPELINE_MAX_ITEMS per inode, so each
             // flush task handles exactly one chunk and decrements on completion.
             // flush_buffer_async (fsync/close) waits for the count to reach zero.
             let in_flight: Arc<DashMap<u64, usize>> = Arc::new(DashMap::new());
@@ -2081,7 +2129,7 @@ impl DfsFilesystem {
                         }
                     }
 
-                    // For each inode: if it has full slots and fewer than PIPELINE_CHUNKS
+                    // For each inode: if it has full slots and fewer than PIPELINE_MAX_ITEMS
                     // tasks in-flight, dispatch one more chunk-flush task.  Each task flushes
                     // exactly one chunk (max_chunks=1) and decrements the counter on completion.
                     // This gives continuous single-chunk pipelining: as soon as one chunk
@@ -2093,7 +2141,7 @@ impl DfsFilesystem {
 
                     for ino in inodes {
                         let current_in_flight = in_flight.get(&ino).map(|v| *v).unwrap_or(0);
-                        if current_in_flight >= PIPELINE_CHUNKS { continue; }
+                        if current_in_flight >= PIPELINE_MAX_ITEMS { continue; }
 
                         let state_arc = match write_buffers_clone.get(&ino) {
                             Some(a) => a.clone(),
@@ -2153,7 +2201,7 @@ impl DfsFilesystem {
                                 // If another task already filled it (ticker dispatched a sibling),
                                 // exit so we don't over-subscribe.
                                 let current = in_flight_task.get(&ino).map(|v| *v).unwrap_or(0);
-                                if current > PIPELINE_CHUNKS { break; }
+                                if current > PIPELINE_MAX_ITEMS { break; }
                             }
                             // Decrement; remove entry when it reaches zero.
                             let mut entry = in_flight_task.entry(ino).or_insert(0);
@@ -2347,7 +2395,7 @@ impl DfsFilesystem {
         self.flush_handle.flush_buffer_async(ino, force).await
     }
 
-    /// Flush all dirty chunks for `ino` using a pipelined approach capped at PIPELINE_CHUNKS.
+    /// Flush all dirty chunks for `ino` using a hybrid-limited pipeline (16 items or 16MB).
     async fn flush_all_pipelined(&self, ino: u64) -> Result<()> {
         self.flush_handle.flush_all_pipelined(ino).await
     }
@@ -3897,7 +3945,7 @@ impl Filesystem for DfsFilesystem {
         _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        info!("write FUSE: ino={} offset={} len={}", ino, offset, data.len());
+        debug!("write FUSE: ino={} offset={} len={}", ino, offset, data.len());
 
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();

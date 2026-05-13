@@ -189,6 +189,11 @@ struct InodeWriteState {
     /// that metadata_cache still refers to the same file — if it changed (delete+recreate
     /// with inode reuse), existing_chunk_size from the old file must be ignored.
     expected_file_id: Option<dfs_common::FileId>,
+    /// Per-chunk notification for in-flight flushes. When a flush for chunk N starts, it
+    /// creates a Notify and stores it here. When the flush completes (metadata committed),
+    /// it notifies all waiters and removes the entry. Before starting a new flush for chunk N,
+    /// we wait on this notifier to ensure FIFO ordering for overlapping chunk flushes.
+    chunk_flush_waiters: HashMap<u64, Arc<tokio::sync::Notify>>,
 }
 
 impl InodeWriteState {
@@ -200,6 +205,7 @@ impl InodeWriteState {
             sync_on_fsync,
             is_truncated_session: false,
             expected_file_id: None,
+            chunk_flush_waiters: HashMap::new(),
         }
     }
 
@@ -998,12 +1004,34 @@ impl FlushHandle {
                 }
             };
 
-            // Claim the slot and snapshot its data — all while holding the lock.
-            let slot = match state.slots.get_mut(&idx) {
-                Some(s) if !s.data.is_empty() => s,
-                _ => return Ok(()),
-            };
+            // FIFO ordering for overlapping chunks: wait for any in-flight flush for this chunk
+            // to complete its metadata commit before starting a new flush. This prevents the
+            // "stale chunk_id" race where two flushes both read the old chunk_id before either
+            // completes, causing the second to fail with "chunk_id is stale, server has X".
+            let waiter = state.chunk_flush_waiters.get(&idx).cloned();
+            drop(state); // Release lock while waiting
+            if let Some(notify) = waiter {
+                debug!("flush_one_chunk: ino={} chunk={} waiting for in-flight flush to complete", ino, idx);
+                notify.notified().await;
+                debug!("flush_one_chunk: ino={} chunk={} wait complete, proceeding", ino, idx);
+            }
+
+            // Re-acquire lock and claim the slot
+            let mut state = state_arc.lock().await;
+
+            // Check if slot is still valid before claiming
+            if !state.slots.get(&idx).map(|s| !s.data.is_empty()).unwrap_or(false) {
+                return Ok(());
+            }
+
+            // Create a new notifier for this flush so subsequent flushes will wait
+            let notify = Arc::new(tokio::sync::Notify::new());
+            state.chunk_flush_waiters.insert(idx, notify);
+
+            // Now claim the slot
+            let slot = state.slots.get_mut(&idx).expect("slot disappeared");
             slot.flushing = true;
+
             let data = slot.data.clone();
             let gap_filled_prefix = slot.gap_filled_prefix;
             let real_data_end = slot.real_data_end;
@@ -1051,6 +1079,19 @@ impl FlushHandle {
         } // gap_filled_prefix guard
 
         self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges).await
+    }
+
+    /// Notify any waiters for this chunk and remove the notifier.
+    /// Called after metadata commit completes (success or failure) to unblock subsequent flushes.
+    async fn notify_chunk_flush_complete(&self, ino: u64, chunk_idx: u64) {
+        if let Some(state_arc) = self.write_buffers.get(&ino) {
+            let mut state = state_arc.lock().await;
+            if let Some(notify) = state.chunk_flush_waiters.remove(&chunk_idx) {
+                drop(state); // Release lock before notifying
+                notify.notify_waiters();
+                debug!("notify_chunk_flush_complete: ino={} chunk={} notified waiters", ino, chunk_idx);
+            }
+        }
     }
 
     /// Internal: flush exactly the chunk at `chunk_idx` for `ino`.
@@ -1334,6 +1375,7 @@ impl FlushHandle {
                                                     slot.flushing = false;
                                                 }
                                             }
+                                            self.notify_chunk_flush_complete(ino, chunk_idx).await;
                                             return Err(retry_err);
                                         }
                                     }
@@ -1345,6 +1387,7 @@ impl FlushHandle {
                                             slot.flushing = false;
                                         }
                                     }
+                                    self.notify_chunk_flush_complete(ino, chunk_idx).await;
                                     return Err(e);
                                 }
                             }
@@ -1359,14 +1402,6 @@ impl FlushHandle {
                             (new_location.chunk_id, file_id, std::time::Instant::now()),
                         );
                     }
-
-                    // CRITICAL: Invalidate overlapping byte-range cache entries before seeding!
-                    // If this chunk was previously written as a fresh write (e.g., qcow2 first
-                    // pass writes full header), byte_range_cache has stale entries at offset 0.
-                    // Patching offset 36 doesn't overwrite the (ino, 0) cache key, so reads at
-                    // offset 0 hit stale data (qcow2 virtual_size=0 instead of 1GB) until the
-                    // cache expires (~30s). Invalidate the whole chunk range before seeding.
-                    self.client.invalidate_byte_range_cache_for_chunk(ino, file_offset, slot_data.len()).await;
                     // Seed byte-range cache with the post-patch bytes for each dirty range.
                     // The cache key is (inode, file_offset) — no chunk_id — so this entry
                     // will be hit by the next read at the same offset without a network RTT.
@@ -1400,6 +1435,10 @@ impl FlushHandle {
                             meta_entry.size = meta_entry.size.max(new_size);
                         }
                     }
+                    // Metadata commit complete — notify any waiters for this chunk so subsequent
+                    // flushes can proceed. This MUST happen after metadata_cache is updated so
+                    // the next flush reads the new chunk_id, not the stale one.
+                    self.notify_chunk_flush_complete(ino, chunk_idx).await;
                     // Update read engine, THEN remove slot.
                     // Do NOT call flush_metadata_sync here — flush_all_pipelined does a single
                     // final sync after ALL chunks are done. Calling it per-chunk causes a race:
@@ -1621,6 +1660,8 @@ impl FlushHandle {
                         ino, &meta.chunk_locations, current_size,
                     ).await;
                 }
+                // Metadata commit complete — notify any waiters for this chunk.
+                self.notify_chunk_flush_complete(ino, chunk_idx).await;
                 // Now that read engine is updated, safe to remove slot — unless new data
                 // arrived while the flush was in flight (concurrent writer added bytes).
                 // In that case, keep the slot so the next flush cycle sends the new data.
@@ -1667,6 +1708,7 @@ impl FlushHandle {
                         slot.flushing = false;
                     }
                 }
+                self.notify_chunk_flush_complete(ino, chunk_idx).await;
                 Ok(())
             }
             Err(e) => {
@@ -1676,6 +1718,7 @@ impl FlushHandle {
                         slot.flushing = false;
                     }
                 }
+                self.notify_chunk_flush_complete(ino, chunk_idx).await;
                 Err(e)
             }
         }

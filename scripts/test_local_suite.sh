@@ -757,84 +757,68 @@ cp "$T22_IMG" "$T/t22_readback.bin" 2>/dev/null
 
 rm -f "$T22_IMG" 2>/dev/null || true
 
-# ── Test 22b: FIFO ordering — concurrent patches to same chunk ────────────────
+# ── Test 22b: FIFO ordering — sequential overlapping patches to same chunk ─────
 snapshot_log T22b
 echo ""
 echo "=== T22b: FIFO ordering for overlapping chunk patches ==="
 
 # This test targets the concurrent same-chunk patch race fixed in be84ce7.
-# Without FIFO ordering, multiple patches to the same chunk can race:
-#   1. Small patch (4KB) starts, reads chunk_id X
-#   2. Large patch (256KB) starts, reads chunk_id X
-#   3. Small patch completes fast, updates chunk_id to Y
-#   4. Large patch tries to patch X → STALE, server has Y → corruption
-# With FIFO ordering, patch 2 waits for patch 1 to commit before starting.
+# Strategy: Apply the same sequence of overlapping dd writes to both DFS and
+# a local file, then verify md5sums match. Without FIFO ordering, background
+# ticker flushes can race with foreground writes, causing out-of-order patches
+# that result in data corruption (final DFS content differs from local file).
 
-T22B_IMG="$MOUNT/t22b_fifo.img"
-T22B_SIZE=4194304  # 4MB = 1 chunk
-dd if=/dev/zero of="$T22B_IMG" bs=1M count=4 2>/dev/null
+T22B_DFS="$MOUNT/t22b_fifo.img"
+T22B_LOCAL="$T/t22b_local.img"
+
+# Create sparse 4MB file (1 chunk) on both filesystems
+truncate -s 4M "$T22B_DFS" 2>/dev/null
+truncate -s 4M "$T22B_LOCAL" 2>/dev/null
 dfs_sync
 
-echo "  Running 12 patches to the same chunk (varying sizes, 4 concurrent)..."
-# Pattern: small(4K), large(256K), small(4K), large(256K), ...
-# The small ones complete fast; if no FIFO, they race with in-flight large patches.
+echo "  Applying 12 sequential overlapping writes (varying offsets/sizes)..."
 
 T22B_START=$(date +%s%3N)
-T22B_ERRORS=0
 
-# Generate test data files
-dd if=/dev/urandom of="$T/t22b_4k.bin" bs=4096 count=1 2>/dev/null
-dd if=/dev/urandom of="$T/t22b_256k.bin" bs=262144 count=1 2>/dev/null
-
-# 12 patches: 6 small (4K), 6 large (256K), all to offsets within chunk 0
-seq 1 12 | xargs -P4 -I{} bash -c '
-    img="$1"; small="$2"; large="$3"; idx="$4"; errfile="$5"
-    # Alternate small/large based on odd/even index
-    if [ $(( idx % 2 )) -eq 1 ]; then
-        patch="$small"
-        size=4096
+# Generate 12 distinct patterns
+for i in $(seq 0 11); do
+    pattern=$(printf "%02x" $((i * 0x11)))
+    if [ $(( i % 2 )) -eq 0 ]; then
+        # Even: small 4KB write
+        dd if=/dev/zero bs=4096 count=1 2>/dev/null | tr '\000' "\x$pattern" > "$T/t22b_pat_$i.bin"
     else
-        patch="$large"
-        size=262144
+        # Odd: large 256KB write
+        dd if=/dev/zero bs=262144 count=1 2>/dev/null | tr '\000' "\x$pattern" > "$T/t22b_pat_$i.bin"
     fi
-    # Random offset within first 2MB of chunk 0 (leave 2MB headroom for large patches)
-    max_off=$(( 2 * 1024 * 1024 - size ))
-    byte_off=$(( RANDOM % (max_off / 4096) * 4096 ))
-    python3 -c "
-import sys, os
-img, patch_file, byte_off = sys.argv[1], sys.argv[2], int(sys.argv[3])
-data = open(patch_file, \"rb\").read()
-fd = os.open(img, os.O_WRONLY)
-os.lseek(fd, byte_off, 0)
-os.write(fd, data)
-os.fsync(fd)
-os.close(fd)
-" "$img" "$patch" "$byte_off" 2>>"$errfile" || echo FAIL
-' _ "$T22B_IMG" "$T/t22b_4k.bin" "$T/t22b_256k.bin" {} "/tmp/t22b_py_errors_$$" \
-  | grep -c FAIL > /tmp/t22b_errors_$$ 2>/dev/null || true
+done
 
-if [ -s "/tmp/t22b_py_errors_$$" ]; then
-    echo "  Sample python error: $(head -1 /tmp/t22b_py_errors_$$)"
-fi
-rm -f "/tmp/t22b_py_errors_$$"
+# Apply writes to both files sequentially
+# Offsets chosen to overlap previous writes (forces patches to same chunk)
+# Offset pattern: 0, 128KB, 256KB, 384KB, 512KB, 640KB, 768KB, 896KB, 1MB, ...
+for i in $(seq 0 11); do
+    offset=$((i * 128 * 1024))  # 128KB stride
+    dd if="$T/t22b_pat_$i.bin" of="$T22B_DFS" bs=4096 seek=$((offset / 4096)) conv=notrunc 2>/dev/null
+    dd if="$T/t22b_pat_$i.bin" of="$T22B_LOCAL" bs=4096 seek=$((offset / 4096)) conv=notrunc 2>/dev/null
+done
+
+# Sync DFS to ensure all patches are flushed
+dfs_sync
 
 T22B_MS=$(( $(date +%s%3N) - T22B_START ))
-T22B_ERRORS=$(cat /tmp/t22b_errors_$$ 2>/dev/null || echo 0)
-rm -f /tmp/t22b_errors_$$
 
-[ "$T22B_ERRORS" -eq 0 ] \
-    && check "T22b-a 12 same-chunk patches (FIFO order), 0 errors" PASS \
-    || check "T22b-a 12 same-chunk patches, $T22B_ERRORS errors (FIFO broken?)" FAIL
+# Compare md5sums
+T22B_DFS_MD5=$(md5sum "$T22B_DFS" | awk '{print $1}')
+T22B_LOCAL_MD5=$(md5sum "$T22B_LOCAL" | awk '{print $1}')
+
+if [ "$T22B_DFS_MD5" = "$T22B_LOCAL_MD5" ]; then
+    check "T22b DFS matches local file (md5: ${T22B_DFS_MD5:0:8})" PASS
+else
+    check "T22b DFS differs from local (dfs=${T22B_DFS_MD5:0:8} local=${T22B_LOCAL_MD5:0:8})" FAIL
+fi
 
 echo "  Completed in ${T22B_MS}ms"
 
-# Verify image is still readable (no corruption from racing patches)
-cp "$T22B_IMG" "$T/t22b_readback.bin" 2>/dev/null
-[ -s "$T/t22b_readback.bin" ] \
-    && check "T22b-b image readable after concurrent patches" PASS \
-    || check "T22b-b image unreadable after concurrent patches" FAIL
-
-rm -f "$T22B_IMG" "$T/t22b_readback.bin" "$T/t22b_4k.bin" "$T/t22b_256k.bin" 2>/dev/null || true
+rm -f "$T22B_DFS" "$T22B_LOCAL" "$T"/t22b_pat_*.bin 2>/dev/null || true
 
 # ── Test 23: random small-read path (range-fetch) ─────────────────────────────
 #

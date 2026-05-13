@@ -1008,19 +1008,32 @@ impl FlushHandle {
             // to complete its metadata commit before starting a new flush. This prevents the
             // "stale chunk_id" race where two flushes both read the old chunk_id before either
             // completes, causing the second to fail with "chunk_id is stale, server has X".
-            let waiter = state.chunk_flush_waiters.get(&idx).cloned();
-            drop(state); // Release lock while waiting
-            if let Some(notify) = waiter {
-                debug!("flush_one_chunk: ino={} chunk={} waiting for in-flight flush to complete", ino, idx);
-                notify.notified().await;
-                debug!("flush_one_chunk: ino={} chunk={} wait complete, proceeding", ino, idx);
+            //
+            // CRITICAL: Must loop! When a flush completes, it wakes ALL waiters. They race to
+            // acquire the lock; the first one starts a new flush with a new waiter. The second
+            // must re-check and wait on the NEW waiter, not just proceed. Without the loop,
+            // multiple tasks can start flushing concurrently after a single notify_waiters().
+            loop {
+                let waiter = state.chunk_flush_waiters.get(&idx).cloned();
+                if let Some(notify) = waiter {
+                    drop(state); // Release lock while waiting
+                    debug!("flush_one_chunk: ino={} chunk={} waiting for in-flight flush", ino, idx);
+                    notify.notified().await;
+                    debug!("flush_one_chunk: ino={} chunk={} wait complete, re-checking", ino, idx);
+                    state = state_arc.lock().await; // Re-acquire and loop to check again
+                } else {
+                    // No waiter → we can proceed
+                    break;
+                }
             }
 
-            // Re-acquire lock and claim the slot
-            let mut state = state_arc.lock().await;
-
-            // Check if slot is still valid before claiming
-            if !state.slots.get(&idx).map(|s| !s.data.is_empty()).unwrap_or(false) {
+            // Now holding lock with no waiter present - claim the slot
+            // Check if slot is still valid AND not currently flushing before claiming.
+            // The !flushing check is critical: after a flush completes, it removes the waiter
+            // and notifies waiting tasks BEFORE setting flushing=false. Without this check,
+            // a woken task could re-claim the same slot while the previous flush is still
+            // updating metadata/removing the slot, causing concurrent patches with stale chunk_ids.
+            if !state.slots.get(&idx).map(|s| !s.data.is_empty() && !s.flushing).unwrap_or(false) {
                 return Ok(());
             }
 

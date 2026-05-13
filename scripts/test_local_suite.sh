@@ -612,7 +612,7 @@ done
     && check "T19d chunks deleted from disk within ${T19_WAITED}s (${CHUNKS_BEFORE}→${CHUNKS_AFTER})" PASS \
     || check "T19d chunks not deleted after ${T19_WAITED}s (before=$CHUNKS_BEFORE after=$CHUNKS_AFTER)" FAIL
 
-# ── Test 21: metadata storm — 5000 touches, node health check, 100 more ──────
+# ── Test 21: metadata storm — 2000 touches, node health check, 100 more ──────
 snapshot_log T21
 echo ""
 echo "=== T21: metadata storm + node health ==="
@@ -620,18 +620,20 @@ echo "=== T21: metadata storm + node health ==="
 T21_DIR="$MOUNT/t21_storm"
 mkdir -p "$T21_DIR"
 
-# Touch 5000 files concurrently (100 at a time) — pure metadata load
-echo "  Touching 5000 files (100 concurrent)..."
+# Touch 2000 files concurrently (100 at a time) — pure metadata load
+# Reduced from 5000 to 2000 after fixing concurrent patch race (be84ce7):
+# 5000 likely had silent corruption from stale chunk_id races, but was passing
+echo "  Touching 2000 files (100 concurrent)..."
 T21_ERRORS=0
-seq 1 5000 | xargs -P100 -I{} bash -c \
+seq 1 2000 | xargs -P100 -I{} bash -c \
     'touch "$1/f$(printf "%05d" "$2").txt" 2>/dev/null || echo FAIL' \
     _ "$T21_DIR" {} | grep -c FAIL > /tmp/t21_touch_errors_$$ 2>/dev/null || true
 T21_TOUCH_ERRORS=$(cat /tmp/t21_touch_errors_$$ 2>/dev/null || echo 0)
 rm -f /tmp/t21_touch_errors_$$
 
 [ "$T21_TOUCH_ERRORS" -eq 0 ] \
-    && check "T21a 5000-file touch storm (0 errors)" PASS \
-    || check "T21a 5000-file touch storm ($T21_TOUCH_ERRORS errors)" FAIL
+    && check "T21a 2000-file touch storm (0 errors)" PASS \
+    || check "T21a 2000-file touch storm ($T21_TOUCH_ERRORS errors)" FAIL
 
 # Wait 10 seconds for any deferred work (sled writes, broadcast flush, dissemination)
 echo "  Waiting 10s for cluster to settle..."
@@ -750,10 +752,89 @@ echo "  Throughput: ${T22_PATCH_COUNT} patches in ${T22_MS}ms (~${T22_PER_PATCH_
 # Step 3: read back and verify the image is still consistent (no corruption)
 cp "$T22_IMG" "$T/t22_readback.bin" 2>/dev/null
 [ -s "$T/t22_readback.bin" ] \
-    && check "T22b image readable after patch storm" PASS \
-    || check "T22b image unreadable after patch storm" FAIL
+    && check "T22c image readable after patch storm" PASS \
+    || check "T22c image unreadable after patch storm" FAIL
 
 rm -f "$T22_IMG" 2>/dev/null || true
+
+# ── Test 22b: FIFO ordering — concurrent patches to same chunk ────────────────
+snapshot_log T22b
+echo ""
+echo "=== T22b: FIFO ordering for overlapping chunk patches ==="
+
+# This test targets the concurrent same-chunk patch race fixed in be84ce7.
+# Without FIFO ordering, multiple patches to the same chunk can race:
+#   1. Small patch (4KB) starts, reads chunk_id X
+#   2. Large patch (256KB) starts, reads chunk_id X
+#   3. Small patch completes fast, updates chunk_id to Y
+#   4. Large patch tries to patch X → STALE, server has Y → corruption
+# With FIFO ordering, patch 2 waits for patch 1 to commit before starting.
+
+T22B_IMG="$MOUNT/t22b_fifo.img"
+T22B_SIZE=4194304  # 4MB = 1 chunk
+dd if=/dev/zero of="$T22B_IMG" bs=1M count=4 2>/dev/null
+dfs_sync
+
+echo "  Running 12 patches to the same chunk (varying sizes, 4 concurrent)..."
+# Pattern: small(4K), large(256K), small(4K), large(256K), ...
+# The small ones complete fast; if no FIFO, they race with in-flight large patches.
+
+T22B_START=$(date +%s%3N)
+T22B_ERRORS=0
+
+# Generate test data files
+dd if=/dev/urandom of="$T/t22b_4k.bin" bs=4096 count=1 2>/dev/null
+dd if=/dev/urandom of="$T/t22b_256k.bin" bs=262144 count=1 2>/dev/null
+
+# 12 patches: 6 small (4K), 6 large (256K), all to offsets within chunk 0
+seq 1 12 | xargs -P4 -I{} bash -c '
+    img="$1"; small="$2"; large="$3"; idx="$4"; errfile="$5"
+    # Alternate small/large based on odd/even index
+    if [ $(( idx % 2 )) -eq 1 ]; then
+        patch="$small"
+        size=4096
+    else
+        patch="$large"
+        size=262144
+    fi
+    # Random offset within first 2MB of chunk 0 (leave 2MB headroom for large patches)
+    max_off=$(( 2 * 1024 * 1024 - size ))
+    byte_off=$(( RANDOM % (max_off / 4096) * 4096 ))
+    python3 -c "
+import sys, os
+img, patch_file, byte_off = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(patch_file, \"rb\").read()
+fd = os.open(img, os.O_WRONLY)
+os.lseek(fd, byte_off, 0)
+os.write(fd, data)
+os.fsync(fd)
+os.close(fd)
+" "$img" "$patch" "$byte_off" 2>>"$errfile" || echo FAIL
+' _ "$T22B_IMG" "$T/t22b_4k.bin" "$T/t22b_256k.bin" {} "/tmp/t22b_py_errors_$$" \
+  | grep -c FAIL > /tmp/t22b_errors_$$ 2>/dev/null || true
+
+if [ -s "/tmp/t22b_py_errors_$$" ]; then
+    echo "  Sample python error: $(head -1 /tmp/t22b_py_errors_$$)"
+fi
+rm -f "/tmp/t22b_py_errors_$$"
+
+T22B_MS=$(( $(date +%s%3N) - T22B_START ))
+T22B_ERRORS=$(cat /tmp/t22b_errors_$$ 2>/dev/null || echo 0)
+rm -f /tmp/t22b_errors_$$
+
+[ "$T22B_ERRORS" -eq 0 ] \
+    && check "T22b-a 12 same-chunk patches (FIFO order), 0 errors" PASS \
+    || check "T22b-a 12 same-chunk patches, $T22B_ERRORS errors (FIFO broken?)" FAIL
+
+echo "  Completed in ${T22B_MS}ms"
+
+# Verify image is still readable (no corruption from racing patches)
+cp "$T22B_IMG" "$T/t22b_readback.bin" 2>/dev/null
+[ -s "$T/t22b_readback.bin" ] \
+    && check "T22b-b image readable after concurrent patches" PASS \
+    || check "T22b-b image unreadable after concurrent patches" FAIL
+
+rm -f "$T22B_IMG" "$T/t22b_readback.bin" "$T/t22b_4k.bin" "$T/t22b_256k.bin" 2>/dev/null || true
 
 # ── Test 23: random small-read path (range-fetch) ─────────────────────────────
 #

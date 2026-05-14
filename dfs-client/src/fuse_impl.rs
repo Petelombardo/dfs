@@ -2300,6 +2300,17 @@ impl DfsFilesystem {
                         const STALE_FLUSH_MS: u128 = 500;
                         let release_inflight = release_in_flight_for_bg
                             .get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+                        // Skip if flush_all_pipelined is actively running for this inode.
+                        // Without this, the ticker races with fsync/release: it patches a
+                        // chunk just before fsync reads metadata_cache, so fsync uses the
+                        // freshly-patched chunk_id as its base — but any replica that missed
+                        // the ticker's patch returns "stale" and the fsync has to retry.
+                        // These cascading retries slow down the pipeline and cause back-pressure.
+                        let pipeline_busy = flush_handle_for_bg.flush_pipeline_locks
+                            .get(&ino)
+                            .map(|lock| lock.try_lock().is_err())
+                            .unwrap_or(false);
+                        if pipeline_busy { drop(state); continue; }
                         let has_stale = release_inflight == 0 && state.slots.iter().any(|(_, s)| {
                             !s.data.is_empty() && !s.flushing && s.is_idle() &&
                             s.last_modified.elapsed().map(|e| e.as_millis()).unwrap_or(0) >= STALE_FLUSH_MS

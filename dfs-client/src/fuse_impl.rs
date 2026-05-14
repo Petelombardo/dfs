@@ -4116,7 +4116,13 @@ impl Filesystem for DfsFilesystem {
             .entry(ino)
             .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
             .clone();
-        write_task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // NOTE: write_task_counter is incremented AFTER the back-pressure wait,
+        // just before write_at(). Incrementing here (before back-pressure) would
+        // cause a deadlock: flush_one_chunk waits for write_tasks_in_flight=0 before
+        // snapshotting gap-prefix slots, but the write stalled on back-pressure can't
+        // call write_at() until the flush frees buffer space — neither can proceed.
+        // After a 5-second timeout flush_one_chunk would snapshot incomplete data and
+        // flush zeros to the server (silent data corruption).
 
         // Fast path: if metadata is cached, buffer is not full, and this is a
         // sequential (non-sparse) buffered write, handle it synchronously on the
@@ -4182,7 +4188,7 @@ impl Filesystem for DfsFilesystem {
                                     else {
                                         if t_bp.elapsed() >= BP_TIMEOUT {
                                             error!("write fast-path: ino={} bp timeout — EIO (global_buffered={}  cap={})", ino, current, global_write_buffer_cap);
-                                            write_task_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                            // counter was never incremented (moved to after back-pressure)
                                             reply.error(libc::EIO);
                                             return;
                                         }
@@ -4197,6 +4203,9 @@ impl Filesystem for DfsFilesystem {
                                 if fill_pct < 100 { break; }
                             }
                         }
+                        // Increment AFTER back-pressure wait: counter now only reflects
+                        // write_at() calls in progress, not writes stalled on buffer-full.
+                        write_task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let mut state = state_arc.blocking_lock();
                         {
                             let bytes_before = state.buffered_bytes();
@@ -4236,6 +4245,9 @@ impl Filesystem for DfsFilesystem {
             }
         }
 
+        // Slow path: increment here (before spawn) since there is no back-pressure
+        // wait in the outer thread for this path. WriteTaskGuard decrements on drop.
+        write_task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.runtime.spawn(async move {
             let _write_guard = WriteTaskGuard(write_task_counter);
             let start = std::time::Instant::now();

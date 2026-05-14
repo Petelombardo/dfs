@@ -183,9 +183,13 @@ async fn handle_connection<H: MessageHandler>(
 ) -> Result<()> {
     let mut read_buf = BytesMut::with_capacity(8192); // 8KB buffer (SBC-friendly)
 
-    // Close idle connections after 30s of inactivity so pooled connections from
-    // peers don't accumulate indefinitely on the leader (which receives all healing ops).
-    const IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+    // Close idle connections after 5 minutes of inactivity. Must be longer than
+    // READ_TIMEOUT (30s) so the outer idle wrapper always fires first (producing a
+    // clean DEBUG log) rather than the inner read timeout producing a spurious WARN.
+    // 30s was too short: during quiet I/O periods (VM paused, no disk activity)
+    // all inter-node connections would tear down and rebuild every 30s, causing the
+    // client to briefly see the leader as unreachable on every cluster health refresh.
+    const IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(300);
 
     loop {
         // Read message from stream, with idle timeout
@@ -308,9 +312,20 @@ async fn read_message(
             }
         }
 
-        let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
-            .map_err(|_| anyhow::anyhow!("Timeout reading message frame"))?
-            .context("IO error reading message frame")?;
+        // If the buffer is empty we're waiting for the START of the next message.
+        // Don't apply READ_TIMEOUT here — an idle connection will wait here for a
+        // long time between requests (normal) and the outer IDLE_TIMEOUT wrapper
+        // will close it cleanly after 300s without producing a WARN.
+        // Only apply READ_TIMEOUT when buf already has partial frame bytes (mid-frame
+        // stall from a client that sent some bytes then hung).
+        let n = if buf.is_empty() {
+            stream.read_buf(buf).await
+                .context("IO error reading message frame")?
+        } else {
+            tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                .map_err(|_| anyhow::anyhow!("Timeout reading message frame"))?
+                .context("IO error reading message frame")?
+        };
         if n == 0 {
             if buf.is_empty() {
                 return Ok(None);

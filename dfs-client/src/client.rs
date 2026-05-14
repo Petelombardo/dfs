@@ -176,6 +176,42 @@ impl CachedChunk {
     }
 }
 
+/// Key for zero-filled gap table (inode + chunk file offset)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ZeroGapKey {
+    inode: u64,
+    chunk_offset: u64,
+}
+
+/// Represents a zero-filled gap in a sparse file chunk.
+/// Instead of caching actual zeros, we just track the range metadata.
+#[derive(Debug, Clone)]
+struct ZeroGap {
+    /// File offset where this gap starts
+    start: u64,
+    /// File offset where this gap ends (exclusive)
+    end: u64,
+    /// When this gap was created (for TTL expiration)
+    created_at: Instant,
+}
+
+impl ZeroGap {
+    /// Check if this gap has expired (same TTL as byte cache: 30 seconds)
+    fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > std::time::Duration::from_secs(30)
+    }
+
+    /// Check if a given file offset falls within this zero gap
+    fn contains(&self, offset: u64) -> bool {
+        offset >= self.start && offset < self.end
+    }
+
+    /// Check if this gap overlaps with the given range
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.start < end && start < self.end
+    }
+}
+
 /// Hint for how to read a chunk - full or partial
 /// Used to optimize seeks by only fetching needed portions of chunks
 #[derive(Debug, Clone)]
@@ -432,6 +468,12 @@ pub struct DfsClient {
     /// Even if chunk hashes change, we can still cache by file position
     byte_range_cache: Arc<Mutex<LruCache<ByteRangeCacheKey, CachedChunk>>>,
 
+    /// Zero-filled gap table: tracks ranges that contain zeros in sparse files.
+    /// Key: (inode, chunk_offset), Value: Vec of gap ranges within that chunk.
+    /// This avoids caching megabytes of zeros for qcow2 sparse writes.
+    /// Gaps expire with same TTL as byte_range_cache (30s).
+    zero_gap_table: Arc<Mutex<HashMap<ZeroGapKey, Vec<ZeroGap>>>>,
+
     /// TCP connection pool - maintains up to N idle connections per server
     /// VecDeque allows concurrent callers to each get their own connection.
     /// Arc<Mutex<...>> so the Arc can be cloned out of the DashMap before any .await,
@@ -653,6 +695,7 @@ impl DfsClient {
             current_node: Arc::new(RwLock::new(0)),
             chunk_cache: cache,
             byte_range_cache: Arc::new(Mutex::new(byte_range_cache)),
+            zero_gap_table: Arc::new(Mutex::new(HashMap::new())),
             connection_pool: Arc::new(DashMap::new()),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(tokio::sync::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
@@ -1763,6 +1806,36 @@ leader_addr: Arc::new(RwLock::new(None)),
                            inode, read_start, len_in_chunk);
                     result_chunks.push((idx, Arc::new(slice)));
                     continue;
+                }
+
+                // Check zero gap table for sparse file gaps.
+                // This handles qcow2 sparse writes without caching megabytes of zeros.
+                {
+                    let gap_key = ZeroGapKey {
+                        inode,
+                        chunk_offset: chunk_start as u64,
+                    };
+                    let mut gap_table = self.zero_gap_table.lock().await;
+                    if let Some(gaps) = gap_table.get_mut(&gap_key) {
+                        // Check if requested range overlaps any gap
+                        let mut found_gap = false;
+                        gaps.retain(|gap| !gap.is_expired());
+
+                        for gap in gaps.iter() {
+                            if gap.contains(read_start as u64) {
+                                // Entire requested range is within this gap - return zeros
+                                let zeros = vec![0u8; len_in_chunk];
+                                debug!("Zero gap HIT inode={} file_offset={} len={} gap={}..{}",
+                                       inode, read_start, len_in_chunk, gap.start, gap.end);
+                                result_chunks.push((idx, Arc::new(zeros)));
+                                found_gap = true;
+                                break;
+                            }
+                        }
+                        if found_gap {
+                            continue;
+                        }
+                    }
                 }
 
                 // Also try the full chunk_cache (another path may have loaded the full chunk).
@@ -3105,6 +3178,69 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
+    /// Seed the zero gap table with metadata about zero-filled regions between dirty ranges.
+    /// This allows us to serve zeros for sparse file gaps without caching megabytes of zeros.
+    /// Called after a successful flush with sparse writes (e.g., qcow2 header + L1 table).
+    pub async fn seed_zero_gap_table(
+        &self,
+        inode: u64,
+        chunk_file_offset: u64,
+        slot_len: usize,
+        dirty_ranges: &[(usize, usize)],
+    ) {
+        if inode == 0 || dirty_ranges.is_empty() || slot_len == 0 {
+            return;
+        }
+
+        // Identify gaps between dirty ranges
+        let mut gaps = Vec::new();
+        let mut sorted_ranges = dirty_ranges.to_vec();
+        sorted_ranges.sort_by_key(|r| r.0);
+
+        // Check for gap before first dirty range
+        if sorted_ranges[0].0 > 0 {
+            gaps.push((0, sorted_ranges[0].0));
+        }
+
+        // Check for gaps between consecutive dirty ranges
+        for i in 0..sorted_ranges.len() - 1 {
+            let end_of_current = sorted_ranges[i].1;
+            let start_of_next = sorted_ranges[i + 1].0;
+            if start_of_next > end_of_current {
+                gaps.push((end_of_current, start_of_next));
+            }
+        }
+
+        // Check for gap after last dirty range
+        let last_end = sorted_ranges.last().unwrap().1;
+        if last_end < slot_len {
+            gaps.push((last_end, slot_len));
+        }
+
+        // Add gaps to the gap table
+        if !gaps.is_empty() {
+            let key = ZeroGapKey {
+                inode,
+                chunk_offset: chunk_file_offset,
+            };
+            let mut gap_table = self.zero_gap_table.lock().await;
+            let gap_entries: Vec<ZeroGap> = gaps
+                .into_iter()
+                .map(|(start, end)| ZeroGap {
+                    start: chunk_file_offset + start as u64,
+                    end: chunk_file_offset + end as u64,
+                    created_at: std::time::Instant::now(),
+                })
+                .collect();
+
+            debug!(
+                "seed_zero_gap_table: ino={} chunk_offset={} added {} gaps",
+                inode, chunk_file_offset, gap_entries.len()
+            );
+            gap_table.insert(key, gap_entries);
+        }
+    }
+
     /// Invalidate all byte-range cache entries for a chunk.
     /// Called before seeding patched data to prevent stale cache hits.
     /// Example: qcow2 writes full header at offset 0, then patches offset 36.
@@ -3137,6 +3273,16 @@ leader_addr: Arc::new(RwLock::new(None)),
         for key in keys_to_remove {
             byte_cache.pop(&key);
         }
+
+        // Also invalidate zero gaps for this chunk.
+        // When we invalidate the byte cache, we should also invalidate gap metadata
+        // since the chunk content may have changed.
+        let gap_key = ZeroGapKey {
+            inode,
+            chunk_offset: chunk_file_offset,
+        };
+        let mut gap_table = self.zero_gap_table.lock().await;
+        gap_table.remove(&gap_key);
     }
 
     /// - chunk_ids: All chunks in the file

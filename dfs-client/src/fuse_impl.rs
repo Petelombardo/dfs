@@ -1829,24 +1829,29 @@ impl FlushHandle {
             }
         }
 
-        // Make partial slots eligible for flush_one_chunk by temporarily marking
-        // them as idle (last_modified = old enough). They're already no longer
-        // being written to (release/fsync caller guarantees this).
-        if let Some(state_arc) = self.write_buffers.get(&ino) {
-            let mut state = state_arc.lock().await;
-            let epoch = SystemTime::UNIX_EPOCH; // far in the past → is_idle() = true
-            for (_, slot) in state.slots.iter_mut() {
-                if !slot.data.is_empty() {
-                    slot.last_modified = epoch;
-                }
-            }
-        }
-
         let mut first_err: Option<anyhow::Error> = None;
 
         // Keep dispatching concurrent flush_one_chunk calls until no unclaimed slots remain.
         // Enforce BOTH a count limit (PIPELINE_MAX_ITEMS) and a byte limit (PIPELINE_MAX_BYTES).
         loop {
+            // Mark all pending slots as idle on every iteration so flush_one_chunk can claim
+            // them. This must be inside the loop: write() calls arriving while a previous
+            // iteration's flush_one_chunk tasks were in flight reset last_modified to now().
+            // If the marking only happens once (before the loop), those new-write slots are
+            // never idle and flush_one_chunk returns immediately without claiming them, causing
+            // a busy-spin with pending > 0 but nothing to flush. Marking each iteration is
+            // safe: flush_one_chunk waits for write_tasks_in_flight before snapshotting, so
+            // in-flight write() data is never dropped.
+            if let Some(state_arc) = self.write_buffers.get(&ino) {
+                let mut state = state_arc.lock().await;
+                let epoch = SystemTime::UNIX_EPOCH;
+                for (_, slot) in state.slots.iter_mut() {
+                    if !slot.data.is_empty() && !slot.flushing {
+                        slot.last_modified = epoch;
+                    }
+                }
+            }
+
             // Count how many slots are still pending (unclaimed and non-empty).
             let pending = self.write_buffers.get(&ino).map(|s| {
                 s.try_lock().map(|st| {

@@ -1407,6 +1407,107 @@ T25D_ERR_COUNT=$(echo "$T25D_RESULT" | tail -1)
     || check "T25d write→heal→write: data corruption under interleaved healing" FAIL
 
 rm -f "$T25C_FILE" "$T25D_FILE" 2>/dev/null || true
+
+# T25e: slow-path write + immediate fsync race.
+# Regression for: when metadata_cache has no entry for an inode (first write
+# after open, or after cache eviction), write() falls through to the slow path
+# which spawns an async task and increments write_tasks_in_flight BEFORE the
+# spawn. flush_all_pipelined only checks pending *slots* — the slow-path task
+# hasn't called write_at() yet so pending=0, the loop exits, flush_metadata_sync
+# fires, reply.ok() fires. The spawned task then puts data on the server AFTER
+# fsync returned. Remount + read returns pre-write data.
+#
+# To reproduce: open a NEW file (no metadata cache entry), write MBR-like data
+# (small write, grub installer pattern), fsync immediately, close.
+# Remount cold, read back. Without the fix the data is missing/zero.
+echo "  T25e: slow-path write + immediate fsync (first-write race)..."
+T25E_FILE="$MOUNT/t25e_firstwrite.bin"
+T25E_MANIFEST="$T/t25e_manifest.bin"
+T25E_WRITE_SIZE=512   # MBR size — small write like grub stage1
+
+python3 -c "
+import os, sys
+data = bytes([0xEB, 0x63, 0x90] + [0xAA] * ($T25E_WRITE_SIZE - 3))   # MBR-like pattern
+open('$T25E_MANIFEST', 'wb').write(data)
+# Open file fresh — no metadata in cache yet — triggers slow path
+fd = os.open('$T25E_FILE', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fd, data)
+# Fsync immediately while spawned write task may still be in-flight
+os.fsync(fd)
+os.close(fd)
+"
+
+# Remount cold — forces a fresh metadata fetch, bypasses any client-side cache
+fusermount -u "$MOUNT" 2>/dev/null || true
+sleep 0.5
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client_t25e.log" --allow-other --log-level debug &
+T25E_PID=$!
+sleep 2
+mountpoint -q "$MOUNT" || { check "T25e remount" FAIL; T25E_PID=""; }
+
+T25E_RESULT=$(python3 -c "
+import sys
+expected = open('$T25E_MANIFEST','rb').read()
+try:
+    actual = open('$T25E_FILE','rb').read($T25E_WRITE_SIZE)
+except Exception as e:
+    print(f'read error: {e}')
+    print(1); sys.exit()
+if actual == expected:
+    print(0)
+else:
+    bad = sum(1 for a,b in zip(actual,expected) if a!=b)
+    print(f'first-write race: {bad}/{len(expected)} bytes wrong after remount')
+    print(1)
+" 2>&1)
+
+T25E_ERR=$(echo "$T25E_RESULT" | tail -1)
+[ "${T25E_ERR:-1}" -eq 0 ] \
+    && check "T25e first-write+fsync race: data durable after immediate fsync" PASS \
+    || check "T25e first-write+fsync race: data lost — slow-path/fsync race" FAIL
+
+# Also test: write multiple times to trigger path after metadata is cached,
+# then immediate fsync — verifying the fix doesn't break the normal path.
+T25E2_FILE="$MOUNT/t25e2_seqwrite.bin"
+python3 -c "
+import os
+fd = os.open('$T25E2_FILE', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+# First write — slow path (no metadata cache)
+os.write(fd, bytes([0x11] * 512))
+# Second write — fast path (metadata now cached)
+os.write(fd, bytes([0x22] * 512))
+# Third write — still fast path
+os.write(fd, bytes([0x33] * 512))
+os.fsync(fd)
+os.close(fd)
+"
+T25E2_RESULT=$(python3 -c "
+with open('$T25E2_FILE','rb') as f:
+    data = f.read(1536)
+errors = 0
+if data[0:512] != bytes([0x11]*512): errors += 1; print('block1 wrong')
+if data[512:1024] != bytes([0x22]*512): errors += 1; print('block2 wrong')
+if data[1024:1536] != bytes([0x33]*512): errors += 1; print('block3 wrong')
+print(errors)
+")
+T25E2_ERR=$(echo "$T25E2_RESULT" | tail -1)
+[ "${T25E2_ERR:-1}" -eq 0 ] \
+    && check "T25e2 mixed slow+fast path writes all durable after fsync" PASS \
+    || check "T25e2 mixed slow+fast path writes: data loss" FAIL
+
+# Cleanup T25e client
+fusermount -u "$MOUNT" 2>/dev/null || true
+sleep 0.3
+kill $T25E_PID 2>/dev/null || true
+# Remount for remaining tests/cleanup
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$LOG/client.log" --allow-other --log-level debug &
+CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$LOG/client.log"
+sleep 2
+
+rm -f "$T25E_FILE" "$T25E_MANIFEST" "$T25E2_FILE" 2>/dev/null || true
 fi # should_run T25
 
 # ── cleanup ───────────────────────────────────────────────────────────────────

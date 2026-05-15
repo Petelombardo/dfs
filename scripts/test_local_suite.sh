@@ -1020,12 +1020,19 @@ CHUNK = 4 * 1024 * 1024
 n_chunks = size_mb * 1024 * 1024 // CHUNK
 
 fd = os.open(img, os.O_RDWR)
-state = {}   # file_offset -> hex of last written data
+state = {}   # file_offset (str) -> hex of last written data
 
 def write_at(offset, data):
+    end = offset + len(data)
+    # Evict any earlier manifest entry whose start falls inside this write's range.
+    # Without this, a large write (e.g. 32KB grub core) leaves stale entries for
+    # sub-ranges written in earlier phases, causing false verification mismatches.
+    for k in list(state.keys()):
+        if offset <= int(k) < end:
+            del state[k]
     os.lseek(fd, offset, os.SEEK_SET)
     os.write(fd, data)
-    state[offset] = data.hex()
+    state[str(offset)] = data.hex()
 
 # MBR / partition table (chunk 0, very beginning)
 write_at(0,   b'DFSTEST_MBR_' + bytes(range(256)) * 2)   # 512 B
@@ -1070,6 +1077,10 @@ state = json.load(open(manifest_path))
 fd = os.open(img, os.O_RDWR)
 
 def write_at(offset, data):
+    end = offset + len(data)
+    for k in list(state.keys()):
+        if offset <= int(k) < end:
+            del state[k]
     os.lseek(fd, offset, os.SEEK_SET)
     os.write(fd, data)
     state[str(offset)] = data.hex()
@@ -1100,6 +1111,10 @@ state = json.load(open(manifest_path))
 fd = os.open(img, os.O_RDWR)
 
 def write_at(offset, data):
+    end = offset + len(data)
+    for k in list(state.keys()):
+        if offset <= int(k) < end:
+            del state[k]
     os.lseek(fd, offset, os.SEEK_SET)
     os.write(fd, data)
     state[str(offset)] = data.hex()

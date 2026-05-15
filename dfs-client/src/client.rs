@@ -234,6 +234,11 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum number of recent SQLite file writes to track for read-after-write consistency
 const SQLITE_WRITE_TRACKER_SIZE: usize = 256;
+/// Per-server connection pool capacity. Must exceed PIPELINE_MAX_ITEMS (16) so that
+/// all concurrent patch tasks can each return their connection without evicting others.
+/// Evicted connections are dropped rather than shutdown, leaving the server in CLOSE_WAIT
+/// and accumulating until file descriptor limits are hit under heavy write load.
+const POOL_SIZE: usize = 20;
 
 /// Toggle for striped reads (split a 4MB chunk across 2 replicas, fetch halves in parallel).
 /// Striped reads halve transfer time on saturated links but cost an extra 4MB allocation +
@@ -1029,6 +1034,11 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Return connection to pool after all bytes are drained.
         // Clone Arc out before .await to avoid holding DashMap shard lock across await.
+        // Pool size matches PIPELINE_MAX_ITEMS so concurrent patches each have a slot.
+        // When the pool is full, explicitly shutdown() instead of dropping: dropping sends
+        // a FIN but the kernel may not complete the TCP close sequence before the server
+        // handles it, leaving the server stuck in CLOSE_WAIT. Explicit shutdown() lets the
+        // server progress through CLOSE_WAIT → LAST_ACK → CLOSED immediately.
         {
             let mutex = {
                 let entry = self.connection_pool
@@ -1037,8 +1047,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                 Arc::clone(&*entry)
             };
             let mut queue = mutex.lock().await;
-            if queue.len() < 8 {
+            if queue.len() < POOL_SIZE {
                 queue.push_back(stream);
+            } else {
+                // Pool full — close gracefully so server doesn't accumulate CLOSE_WAIT.
+                tokio::spawn(async move { let _ = stream.shutdown().await; });
             }
         }
 
@@ -1248,8 +1261,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 Arc::clone(&*entry)
             };
             let mut queue = mutex.lock().await;
-            if queue.len() < 8 {
+            if queue.len() < POOL_SIZE {
                 queue.push_back(stream);
+            } else {
+                tokio::spawn(async move { let _ = stream.shutdown().await; });
             }
         }
 
@@ -1414,8 +1429,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 Arc::clone(&*entry)
             };
             let mut queue = mutex.lock().await;
-            if queue.len() < 8 {
+            if queue.len() < POOL_SIZE {
                 queue.push_back(stream);
+            } else {
+                tokio::spawn(async move { let _ = stream.shutdown().await; });
             }
         }
 
@@ -3553,8 +3570,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                             Arc::clone(&*entry)
                         };
                         let mut queue = mutex.lock().await;
-                        if queue.len() < 8 {
+                        if queue.len() < POOL_SIZE {
                             queue.push_back(stream);
+                        } else {
+                            tokio::spawn(async move { let _ = stream.shutdown().await; });
                         }
                     }
 
@@ -3707,8 +3726,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 Arc::clone(&*entry)
             };
             let mut queue = mutex.lock().await;
-            if queue.len() < 8 {
+            if queue.len() < POOL_SIZE {
                 queue.push_back(stream);
+            } else {
+                tokio::spawn(async move { let _ = stream.shutdown().await; });
             }
         }
 
@@ -4892,6 +4913,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
+    pub async fn tombstone_chunk_on_node(&self, addr: SocketAddr, chunk_id: ChunkId) {
+        let req = Request::TombstoneChunk { chunk_id };
+        if let Err(e) = self.send_request(addr, req).await {
+            warn!("tombstone_chunk_on_node: {} chunk {} failed — healer may revert patch: {}", addr, chunk_id, e);
+        }
+    }
+
     /// Apply multiple non-contiguous byte-range patches to a chunk in a single RPC.
     /// Equivalent to patch_chunk_on_replicas but sends all dirty ranges in one request,
     /// so the server applies them atomically without serial round-trips or gap zero-fills.
@@ -5201,20 +5229,17 @@ leader_addr: Arc::new(RwLock::new(None)),
         }).collect();
         futures::future::join_all(loc_futures).await;
 
-        // Synchronously tombstone old_chunk_id on skipped replicas BEFORE returning.
-        // This prevents the healer from selecting those nodes as a source and reverting
-        // the patch on the 2 patched replicas during the metadata commit window.
-        // The tombstone is cleared automatically when DeleteChunk fires later.
+        // Collect skip pairs for deferred tombstone+delete after metadata commits.
+        // Tombstone is NOT sent here — sending it before metadata sync creates a read
+        // blackout window: PatchChunk renames old→new on patched nodes (old gone), and
+        // a premature tombstone makes the skip node return HasChunks=false too, so any
+        // read during the metadata-sync window hits all nodes and fails. By deferring
+        // tombstone to after flush_metadata_sync, the skip node still serves old_chunk
+        // during the commit window; after metadata is updated the deferred task
+        // tombstones then deletes old_chunk from the skip node cleanly.
         let skip_pairs: Vec<(SocketAddr, ChunkId)> = skip_addrs.iter()
             .map(|&addr| (addr, original_old_chunk_id))
             .collect();
-        for &addr in &skip_addrs {
-            let req = Request::TombstoneChunk { chunk_id: original_old_chunk_id };
-            if let Err(e) = self.send_request(addr, req).await {
-                warn!("MultiPatch: TombstoneChunk {} on {} failed — healer may revert patch: {}",
-                    original_old_chunk_id, addr, e);
-            }
-        }
 
         let n_patches = patches.len();
         info!("MultiPatch: {} -> {} ({} replicas, {} patches, {} skipped)",

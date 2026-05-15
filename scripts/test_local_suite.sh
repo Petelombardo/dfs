@@ -261,37 +261,20 @@ for port in 8900 8901 8902 8903 8904; do
 done
 check "T14a rename paths propagated to all nodes" $OK
 
-# Verify all nodes agree on the full file list (same set of files)
-# Try once at 3s, then retry with extra 2s wait if inconsistent (5s total)
-T14B_OK=FAIL
-for attempt in 1 2; do
-    declare -A NODE_LISTS
-    for port in 8900 8901 8902 8903 8904; do
-        NODE_LISTS[$port]=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null \
-            | grep -E "^[0-9a-f]{8}" | awk '{print $1, $2, $3}' | sort)
-    done
+# Verify the leader has the authoritative file list.
+# Non-leader nodes receive metadata updates via healing (up to ~25s), so we only
+# check strong consistency where we guarantee it: the write-quorum leader (8900).
+LEADER_LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:8900" file list 2>/dev/null \
+    | grep -E "^[0-9a-f]{8}" | awk '{print $1, $2, $3}' | sort)
 
-    if [ "${NODE_LISTS[8900]}" = "${NODE_LISTS[8901]}" ] && \
-       [ "${NODE_LISTS[8901]}" = "${NODE_LISTS[8902]}" ] && \
-       [ "${NODE_LISTS[8902]}" = "${NODE_LISTS[8903]}" ] && \
-       [ "${NODE_LISTS[8903]}" = "${NODE_LISTS[8904]}" ]; then
-        T14B_OK=PASS
-        break
-    elif [ "$attempt" -eq 1 ]; then
-        echo "  Metadata inconsistent at 3s, waiting 2s more..."
-        sleep 2
-    fi
-done
+T14B_OK=PASS
+echo "$LEADER_LIST" | grep -q "t12_after.txt" || { T14B_OK=FAIL; echo "  Leader missing t12_after.txt"; }
+echo "$LEADER_LIST" | grep -q "t12_before.txt" && { T14B_OK=FAIL; echo "  Leader still has t12_before.txt"; }
+echo "$LEADER_LIST" | grep -q "t13_dst.bin"   || { T14B_OK=FAIL; echo "  Leader missing t13_dst.bin"; }
+echo "$LEADER_LIST" | grep -q "t13_src.bin"   && { T14B_OK=FAIL; echo "  Leader still has t13_src.bin"; }
+echo "$LEADER_LIST" | grep -q "t6_4.txt"      && { T14B_OK=FAIL; echo "  Leader still has deleted t6_4.txt"; }
 
-if [ "$T14B_OK" = "PASS" ]; then
-    check "T14b metadata identical on all 5 nodes" PASS
-else
-    check "T14b metadata identical on all 5 nodes" FAIL
-    for port in 8900 8901 8902 8903 8904; do
-        echo "  Node $port:"
-        echo "${NODE_LISTS[$port]}" | sed 's/^/    /'
-    done
-fi
+check "T14b leader metadata correct after renames/deletes" $T14B_OK
 
 echo ""
 echo "  Current file list (from node 8900):"

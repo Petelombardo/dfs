@@ -1974,15 +1974,19 @@ impl FlushHandle {
             self.last_metadata_update.insert(ino, std::time::Instant::now());
         }
 
-        // Now that the leader has the new chunk_ids in its metadata, fire-and-forget
-        // deletes on the 3rd replicas that were skipped during dual-RF patching.
-        // old_chunk_id is orphaned on those nodes (no metadata references it); reads
-        // for the new chunk_id fall through to the 2 patched replicas. The healer
-        // will copy the new chunk to the 3rd replica to restore full RF.
+        // Metadata is committed. Now tombstone then delete old_chunk_id on the skip
+        // replicas from dual-RF patching. Tombstone fires first so the healer cannot
+        // copy old_chunk back to the patched nodes between the delete RPC flight and
+        // the server processing it. Doing this AFTER metadata sync (not before) closes
+        // the data-loss window: during the commit window the skip node still has and
+        // serves old_chunk, so reads never hit a blackout.
         let skips = sync_handle.pending_skipped_deletes.lock().await.drain(..).collect::<Vec<_>>();
         if !skips.is_empty() {
             let client = self.client.clone();
             tokio::spawn(async move {
+                for &(addr, old_chunk_id) in &skips {
+                    client.tombstone_chunk_on_node(addr, old_chunk_id).await;
+                }
                 for (addr, old_chunk_id) in skips {
                     client.delete_chunk_from_node(addr, old_chunk_id).await;
                 }

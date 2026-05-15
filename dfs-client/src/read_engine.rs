@@ -276,23 +276,24 @@ impl InodeReadEngine {
     pub fn resolve_primary(
         loc: &ChunkLocation,
         nim: &HashMap<dfs_common::NodeId, SocketAddr>,
-        fallback_nodes: &[SocketAddr],
-        selector: u64,
+        _fallback_nodes: &[SocketAddr],
+        _selector: u64,
     ) -> Option<(SocketAddr, Vec<SocketAddr>)> {
-        let addrs: Vec<SocketAddr> = loc.nodes.iter()
+        // Only try nodes that actually hold this chunk. Cluster-wide fallback
+        // (leader + all other nodes) caused spurious "not found on this node"
+        // failures and false health penalties on nodes that simply don't hold
+        // the chunk. Leader priority is for metadata reads only, not data reads.
+        // Sort deterministically by address so the same chunk always routes to
+        // the same primary, enabling warm server-side caches.
+        let mut addrs: Vec<SocketAddr> = loc.nodes.iter()
             .filter_map(|nid| nim.get(nid).copied())
             .collect();
         if addrs.is_empty() {
             return None;
         }
-        let primary_idx = selector as usize % addrs.len();
-        let primary = addrs[primary_idx];
-        let fallbacks = addrs.iter().copied()
-            .chain(fallback_nodes.iter().copied())
-            .filter(|&a| a != primary)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
+        addrs.sort_unstable();
+        let primary = addrs[0];
+        let fallbacks = addrs[1..].to_vec();
         Some((primary, fallbacks))
     }
 

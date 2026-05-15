@@ -990,6 +990,410 @@ RANGE_LINES=$(grep -c "Range fetch:" "$T24_CLIENT_LOG" 2>/dev/null || true)
 rm -f "$T24_FILE" 2>/dev/null || true
 fi # should_run T24
 
+# ── Test 25: OS-install simulation — full disk image, multi-phase patches, fsync, integrity ──
+snapshot_log T25
+if should_run T25; then
+echo ""
+echo "=== T25: OS-install simulation (disk image, scatter patches, fsync, integrity) ==="
+
+# 256MB raw disk = 64 chunks.  Chunks 0-253 are inside the metadata-refresh window;
+# chunks 254-63 are beyond it and rely on metadata_cache / recent_chunk_writes.
+# This specifically tests the dual-RF stale-base retry and healer tombstone paths.
+T25_IMG="$MOUNT/t25_disk.raw"
+T25_MB=256
+T25_MANIFEST="$T/t25_manifest.py"
+
+# Phase 1: blank disk (like a fresh VM disk allocation via ftruncate)
+echo "  Phase 1: allocating ${T25_MB}MB blank disk..."
+truncate -s ${T25_MB}M "$T25_IMG"
+dfs_sync
+
+# Phase 2: partition table + filesystem structures (scattered writes across many chunks)
+# Simulates what mkfs.ext4 or the debian-installer does: small writes spread across
+# the whole disk including chunks well beyond the metadata-refresh window.
+echo "  Phase 2: writing partition table + filesystem structures..."
+python3 - "$T25_IMG" "$T25_MANIFEST" "$T25_MB" << 'PYEOF'
+import os, sys, json, random
+
+img, manifest_path, size_mb = sys.argv[1], sys.argv[2], int(sys.argv[3])
+CHUNK = 4 * 1024 * 1024
+n_chunks = size_mb * 1024 * 1024 // CHUNK
+
+fd = os.open(img, os.O_RDWR)
+state = {}   # file_offset -> hex of last written data
+
+def write_at(offset, data):
+    os.lseek(fd, offset, os.SEEK_SET)
+    os.write(fd, data)
+    state[offset] = data.hex()
+
+# MBR / partition table (chunk 0, very beginning)
+write_at(0,   b'DFSTEST_MBR_' + bytes(range(256)) * 2)   # 512 B
+write_at(512, b'GPT_HEADER___' + b'\xaa' * 500)           # 512 B
+
+# Superblock at 1KB offset inside chunk 0
+write_at(1024, b'EXT4_SUPER___' + b'\x5a' * 1011)         # 1024 B
+
+# Group descriptors etc — scattered 4KB writes inside first few chunks
+for chunk_idx in range(min(4, n_chunks)):
+    for inner in [0, 4096, 8192, 32768, 65536]:
+        off = chunk_idx * CHUNK + inner
+        tag = f'GDT_c{chunk_idx:03d}_{inner:06d}'.encode().ljust(64, b'\x11')
+        write_at(off, tag)
+
+# Inode table + data blocks scattered across HIGH-NUMBERED chunks
+# (beyond the 253-chunk metadata-window — these are the problematic ones)
+random.seed(42)
+for chunk_idx in random.sample(range(30, n_chunks), min(30, n_chunks - 30)):
+    for inner in [0, 4096, 12288, 65536]:
+        off = chunk_idx * CHUNK + inner
+        tag = f'INODE_c{chunk_idx:04d}_{inner:08d}_PHASE2'.encode().ljust(128, b'\x22')
+        write_at(off, tag)
+
+os.close(fd)
+json.dump(state, open(manifest_path, 'w'))
+print(f"  wrote {len(state)} regions across {n_chunks} chunks")
+PYEOF
+dfs_sync
+echo "  Phase 2 fsync done."
+
+# Phase 3: file data installation — full-chunk writes to a run of high chunks,
+# simulating large package extractions overwriting blocks across the disk.
+echo "  Phase 3: simulating package file extraction (full-chunk writes)..."
+python3 - "$T25_IMG" "$T25_MANIFEST" "$T25_MB" << 'PYEOF'
+import os, sys, json
+
+img, manifest_path, size_mb = sys.argv[1], sys.argv[2], int(sys.argv[3])
+CHUNK = 4 * 1024 * 1024
+state = json.load(open(manifest_path))
+
+fd = os.open(img, os.O_RDWR)
+
+def write_at(offset, data):
+    os.lseek(fd, offset, os.SEEK_SET)
+    os.write(fd, data)
+    state[str(offset)] = data.hex()
+
+# Write full-chunk data to several mid-range chunks (like extracting a 20MB package)
+for chunk_idx in range(10, 15):
+    off = chunk_idx * CHUNK
+    data = bytes([(chunk_idx * 7 + i) & 0xff for i in range(CHUNK)])
+    write_at(off, data)
+
+os.close(fd)
+json.dump(state, open(manifest_path, 'w'))
+print(f"  {len(state)} total regions tracked")
+PYEOF
+dfs_sync
+echo "  Phase 3 fsync done."
+
+# Phase 4: grub install — small patches over chunks that were already written,
+# then an fsync exactly like grub does.  This is the critical path that was failing.
+echo "  Phase 4: grub-style small patches + fsync..."
+python3 - "$T25_IMG" "$T25_MANIFEST" << 'PYEOF'
+import os, sys, json
+
+img, manifest_path = sys.argv[1], sys.argv[2]
+CHUNK = 4 * 1024 * 1024
+state = json.load(open(manifest_path))
+
+fd = os.open(img, os.O_RDWR)
+
+def write_at(offset, data):
+    os.lseek(fd, offset, os.SEEK_SET)
+    os.write(fd, data)
+    state[str(offset)] = data.hex()
+
+# Overwrite MBR with grub stage1 (exactly like grub-install does)
+write_at(0, b'GRUB_STAGE1__' + b'\xeb\x63\x90' + b'\xff' * 499)
+
+# Grub core image: 32KB patch at start of chunk 0 after the first sector
+write_at(512 * 2, b'GRUB_CORE____' + bytes(range(256)) * 128)
+
+# Also re-patch two high-numbered chunks to simulate grub writing
+# filesystem-specific data (e.g., blocklist for /boot/grub files).
+# These patches land on top of previously written phase-2 data.
+for chunk_idx in [40, 55]:
+    off = chunk_idx * CHUNK + 4096
+    write_at(off, f'GRUB_BLKLIST_c{chunk_idx:04d}'.encode().ljust(512, b'\xdd'))
+
+os.close(fd)
+json.dump(state, open(manifest_path, 'w'))
+PYEOF
+
+# The fsync that triggers "please insert CD" — this is the exact failing operation
+dfs_sync
+echo "  Phase 4 fsync done (grub complete)."
+
+# Verification: re-open cold and check every written region
+echo "  Verifying integrity..."
+T25_MISMATCHES=$(python3 - "$T25_IMG" "$T25_MANIFEST" << 'PYEOF'
+import os, sys, json
+
+img, manifest_path = sys.argv[1], sys.argv[2]
+state = json.load(open(manifest_path))
+errors = []
+
+with open(img, 'rb') as f:
+    for offset_str, expected_hex in sorted(state.items(), key=lambda x: int(x[0])):
+        offset = int(offset_str)
+        expected = bytes.fromhex(expected_hex)
+        f.seek(offset)
+        actual = f.read(len(expected))
+        if actual != expected:
+            errors.append(f"offset {offset}: exp {expected_hex[:16]}... got {actual.hex()[:16]}...")
+
+for e in errors[:5]:
+    print(e)
+print(len(errors))
+PYEOF
+)
+
+T25_ERR_COUNT=$(echo "$T25_MISMATCHES" | tail -1)
+T25_ERR_COUNT=${T25_ERR_COUNT:-1}
+[ "$T25_ERR_COUNT" -eq 0 ] \
+    && check "T25a OS-install integrity: all ${#} regions match after 4-phase install+fsync" PASS \
+    || check "T25a OS-install integrity: $T25_ERR_COUNT mismatches after install" FAIL
+
+# Phase 5: patch-over-full-chunk integrity —
+# write a full chunk, then patch a small region within it, verify both regions.
+echo "  Phase 5: patch-over-full-chunk integrity..."
+T25B_CHUNK_OFF=$(( 20 * 4 * 1024 * 1024 ))   # chunk 20, well within range
+T25B_RESULT=$(python3 - "$T25_IMG" "$T25B_CHUNK_OFF" << 'PYEOF'
+import os, sys
+
+img = sys.argv[1]
+base_off = int(sys.argv[2])
+CHUNK = 4 * 1024 * 1024
+PATCH_OFF = 131072   # 128KB into chunk
+PATCH_LEN = 4096
+
+# Write known full-chunk pattern
+full = bytes([0xab] * CHUNK)
+with open(img, 'r+b') as f:
+    f.seek(base_off); f.write(full)
+PYEOF
+)
+dfs_sync   # flush full write
+
+python3 - "$T25_IMG" "$T25B_CHUNK_OFF" << 'PYEOF'
+import os, sys
+
+img = sys.argv[1]
+base_off = int(sys.argv[2])
+PATCH_OFF = 131072
+PATCH_LEN = 4096
+
+# Now patch a small region within it (simulating grub patching a written chunk)
+patch_data = bytes([0xcd] * PATCH_LEN)
+with open(img, 'r+b') as f:
+    f.seek(base_off + PATCH_OFF); f.write(patch_data)
+PYEOF
+dfs_sync   # fsync the patch
+
+# Verify: before-patch region and after-patch region both correct
+T25B_ERRORS=$(python3 - "$T25_IMG" "$T25B_CHUNK_OFF" << 'PYEOF'
+import sys
+img = sys.argv[1]
+base_off = int(sys.argv[2])
+CHUNK = 4 * 1024 * 1024
+PATCH_OFF = 131072
+PATCH_LEN = 4096
+
+errors = 0
+with open(img, 'rb') as f:
+    # Region before patch — should still be 0xab
+    f.seek(base_off)
+    pre = f.read(PATCH_OFF)
+    if any(b != 0xab for b in pre):
+        print(f"pre-patch region corrupted ({sum(1 for b in pre if b != 0xab)} wrong bytes)")
+        errors += 1
+    # Patch region — should be 0xcd
+    f.seek(base_off + PATCH_OFF)
+    patch = f.read(PATCH_LEN)
+    if any(b != 0xcd for b in patch):
+        print(f"patch region wrong ({sum(1 for b in patch if b != 0xcd)} wrong bytes)")
+        errors += 1
+    # Region after patch — should still be 0xab
+    f.seek(base_off + PATCH_OFF + PATCH_LEN)
+    post = f.read(CHUNK - PATCH_OFF - PATCH_LEN)
+    if any(b != 0xab for b in post):
+        print(f"post-patch region corrupted ({sum(1 for b in post if b != 0xab)} wrong bytes)")
+        errors += 1
+print(errors)
+PYEOF
+)
+T25B_ERR_COUNT=$(echo "$T25B_ERRORS" | tail -1)
+T25B_ERR_COUNT=${T25B_ERR_COUNT:-1}
+[ "$T25B_ERR_COUNT" -eq 0 ] \
+    && check "T25b patch-over-full-chunk: pre/patch/post regions all correct" PASS \
+    || check "T25b patch-over-full-chunk: $T25B_ERR_COUNT region errors" FAIL
+
+rm -f "$T25_IMG" "$T25_MANIFEST" 2>/dev/null || true
+
+# T25c: healer-race regression — write, patch (dual-RF), trigger healer, verify no revert.
+# This is the exact corruption scenario from staging:
+#   Without tombstones: healer copies old_hash from 3rd replica back to the 2 patched
+#   replicas, reverting the patch. Read-back returns pre-patch data.
+#   With tombstones: HasChunks returns false for old_hash on 3rd replica — healer
+#   cannot use it as source, cannot revert. Read-back returns patched data.
+echo "  T25c: healer-race regression (patch + trigger healer + verify no revert)..."
+T25C_FILE="$MOUNT/t25c_healer.bin"
+T25C_CHUNK_BYTES=$(( 4 * 1024 * 1024 ))
+T25C_PATCH_OFF=$(( 64 * 1024 ))   # 64KB into the chunk
+T25C_PATCH_LEN=$(( 32 * 1024 ))   # 32KB patch
+
+# Step 1: fresh full-chunk write — goes RF=3 (no dual-RF skip, no old data on any node)
+python3 -c "
+import sys
+with open(sys.argv[1], 'wb') as f:
+    f.write(bytes([0xaa] * $T25C_CHUNK_BYTES))
+" "$T25C_FILE"
+dfs_sync
+
+# Step 2: small patch within the chunk — dual-RF: 2 nodes get 0xbb region, 3rd keeps 0xaa
+python3 -c "
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+os.lseek(fd, $T25C_PATCH_OFF, 0)
+os.write(fd, bytes([0xbb] * $T25C_PATCH_LEN))
+os.close(fd)
+" "$T25C_FILE"
+dfs_sync   # flush — now: patched_node_A and patched_node_B have 0xbb; 3rd has 0xaa
+
+# Step 3: explicitly trigger the healer while the patched state is live.
+# Without tombstones the healer would copy 0xaa from 3rd node back to A and B.
+# With tombstones the 3rd node's old chunk returns false from HasChunks — safe.
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
+sleep 5   # give healer time to run a full cycle
+
+# Also trigger a second time and wait — catches healers that need multiple cycles
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
+sleep 5
+
+# Step 4: read back and verify both regions
+T25C_RESULT=$(python3 -c "
+import sys
+errors = []
+with open(sys.argv[1], 'rb') as f:
+    # Pre-patch region: should still be 0xaa
+    pre = f.read($T25C_PATCH_OFF)
+    bad = sum(1 for b in pre if b != 0xaa)
+    if bad: errors.append(f'pre-patch: {bad} bytes wrong (healer may have reverted)')
+    # Patch region: should be 0xbb
+    patch = f.read($T25C_PATCH_LEN)
+    bad = sum(1 for b in patch if b != 0xbb)
+    if bad: errors.append(f'patch region: {bad} bytes wrong (healer reverted patch!)')
+    # Post-patch region: should still be 0xaa
+    post = f.read()
+    bad = sum(1 for b in post if b != 0xaa)
+    if bad: errors.append(f'post-patch: {bad} bytes wrong')
+for e in errors: print(e)
+print(len(errors))
+" "$T25C_FILE")
+
+T25C_ERRS=$(echo "$T25C_RESULT" | tail -1)
+[ "${T25C_ERRS:-1}" -eq 0 ] \
+    && check "T25c healer-race: patch survived healer cycle (tombstone working)" PASS \
+    || check "T25c healer-race: patch reverted by healer — tombstone not working" FAIL
+
+# T25d: write → heal → write again — the exact installer-corruption scenario.
+# Reproduces: install phase1 fsyncs, healer fires (reverts dual-RF patches without
+# tombstones), install phase2 builds on reverted state, wrong data after final fsync.
+#
+# Without tombstones: phase1 patches get reverted between phase2; phase2 builds on
+# wrong base; final data differs from what was written in phase2.
+# With tombstones: phase1 patches are protected; phase2 builds correctly; data matches.
+echo "  T25d: write → trigger-heal → write more → verify (install corruption scenario)..."
+T25D_FILE="$MOUNT/t25d_install.bin"
+T25D_SIZE=$(( 8 * 1024 * 1024 ))   # 2 chunks
+
+# Base: fresh full write (establishes RF=3 baseline — no corruption possible here)
+python3 -c "
+with open('$T25D_FILE', 'wb') as f:
+    f.write(bytes([0x00] * $T25D_SIZE))
+"
+dfs_sync
+
+# Phase 1: installer writes filesystem structures (patches to specific offsets)
+# These are the writes that get reverted by the healer in the bug scenario
+python3 -c "
+import os
+fd = os.open('$T25D_FILE', os.O_RDWR)
+# MBR / partition table region
+os.lseek(fd, 0, 0);       os.write(fd, bytes([0xAA] * 4096))
+# Superblock
+os.lseek(fd, 65536, 0);   os.write(fd, bytes([0xBB] * 4096))
+# Journal / inode table (second chunk, high offset)
+os.lseek(fd, 4*1024*1024 + 65536, 0); os.write(fd, bytes([0xCC] * 4096))
+os.close(fd)
+"
+dfs_sync   # phase1 fsync: dual-RF patches land on 2 of 3 replicas
+
+# Trigger healer between phase1 and phase2 — this is what causes the corruption.
+# Without tombstones: healer copies pre-phase1 data (0x00) from 3rd replica back to
+# the 2 patched replicas, reverting the 0xAA/0xBB/0xCC writes.
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
+sleep 8   # enough time for healer cycle to complete
+
+# Phase 2: grub writes over the already-written phase1 data (like grub-install does)
+# If phase1 was reverted, these build on 0x00 base; if not reverted, on 0xAA/0xBB base.
+# Either way, these specific bytes MUST be present in the final read-back.
+python3 -c "
+import os
+fd = os.open('$T25D_FILE', os.O_RDWR)
+# Grub stage1 overwrites MBR region
+os.lseek(fd, 0, 0);     os.write(fd, bytes([0xDD] * 512))
+# Grub core: 32KB at offset 1KB
+os.lseek(fd, 1024, 0);  os.write(fd, bytes([0xEE] * 32768))
+# Superblock is NOT touched by grub — must still be 0xBB from phase1
+os.close(fd)
+"
+dfs_sync   # phase2 fsync
+
+# Trigger healer again (simulates healer still running during/after install)
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
+sleep 8
+
+# Final integrity check: verify the LAST write to each region wins
+T25D_RESULT=$(python3 -c "
+errors = []
+with open('$T25D_FILE', 'rb') as f:
+    data = f.read()
+
+# MBR first 512 bytes: phase2 wrote 0xDD — must be 0xDD
+r = data[0:512]
+bad = sum(1 for b in r if b != 0xdd)
+if bad: errors.append(f'MBR (0..512): {bad} wrong bytes, expected 0xDD — phase2 write lost')
+
+# 1024..33792: phase2 grub core 0xEE
+r = data[1024:1024+32768]
+bad = sum(1 for b in r if b != 0xee)
+if bad: errors.append(f'grub core (1024..34KB): {bad} wrong bytes, expected 0xEE — phase2 write lost')
+
+# 65536..69632: phase1 wrote 0xBB, NOT overwritten in phase2 — must still be 0xBB
+r = data[65536:65536+4096]
+bad = sum(1 for b in r if b != 0xbb)
+if bad: errors.append(f'superblock (64KB): {bad} wrong bytes, expected 0xBB — phase1 write reverted by healer')
+
+# second chunk inode region: phase1 wrote 0xCC, not touched in phase2 — must be 0xCC
+off2 = 4*1024*1024 + 65536
+r = data[off2:off2+4096]
+bad = sum(1 for b in r if b != 0xcc)
+if bad: errors.append(f'inode table (chunk2+64KB): {bad} wrong bytes, expected 0xCC — phase1 write reverted by healer')
+
+for e in errors: print(e)
+print(len(errors))
+" 2>&1)
+
+T25D_ERR_COUNT=$(echo "$T25D_RESULT" | tail -1)
+[ "${T25D_ERR_COUNT:-1}" -eq 0 ] \
+    && check "T25d write→heal→write: all regions correct after interleaved healing" PASS \
+    || check "T25d write→heal→write: data corruption under interleaved healing" FAIL
+
+rm -f "$T25C_FILE" "$T25D_FILE" 2>/dev/null || true
+fi # should_run T25
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

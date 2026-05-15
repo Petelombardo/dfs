@@ -106,6 +106,12 @@ pub struct Server {
     /// Entries are expired lazily on each put check.
     delete_tombstones: Arc<DashMap<FileId, std::time::Instant>>,
 
+    /// Chunk-level tombstones: chunk_ids that must not be used as a heal source.
+    /// Set synchronously by TombstoneChunk during dual-RF MultiPatch so the healer
+    /// can't replicate old_chunk_id back to the patched replicas before metadata commits.
+    /// Cleared when the chunk is physically deleted (DeleteChunk / DeleteChunksBatch).
+    chunk_tombstones: Arc<dashmap::DashSet<dfs_common::ChunkId>>,
+
     /// Notifier for the delete drain worker — fired when a new DeleteQueueEntry is added.
     delete_drain_notify: Arc<tokio::sync::Notify>,
 
@@ -151,6 +157,7 @@ impl Server {
             leader_forward_notify: Arc::new(tokio::sync::Notify::new()),
             recent_writes: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
             delete_tombstones: Arc::new(DashMap::new()),
+            chunk_tombstones: Arc::new(dashmap::DashSet::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             sled_write_tx: {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
@@ -909,6 +916,10 @@ impl Server {
                 data,
                 checksum,
             } => self.handle_write_chunk(chunk_id, data, checksum).await,
+            Request::TombstoneChunk { chunk_id } => {
+                self.chunk_tombstones.insert(chunk_id);
+                Response::Ok { data: None }
+            }
             Request::DeleteChunk { chunk_id } => self.handle_delete_chunk(chunk_id).await,
             Request::DeleteChunksBatch { file_id, path, chunk_ids } => {
                 self.handle_delete_chunks_batch(file_id, path, chunk_ids).await
@@ -1754,6 +1765,10 @@ impl Server {
     async fn handle_delete_chunk(&self, chunk_id: ChunkId) -> Response {
         debug!("Handling delete chunk: {}", chunk_id);
 
+        // Clear tombstone: the chunk is being physically removed, so the healer
+        // guard is no longer needed.
+        self.chunk_tombstones.remove(&chunk_id);
+
         // Always delete the chunk location record, even if the chunk data isn't here.
         // A node may have a location record without the actual bytes — that stale record
         // must be purged too, otherwise it causes ghost entries after delete+rewrite.
@@ -1777,7 +1792,12 @@ impl Server {
     }
 
     async fn handle_has_chunks(&self, chunk_ids: Vec<ChunkId>) -> Response {
-        let values = chunk_ids.iter().map(|id| self.storage.has_chunk(id)).collect();
+        // A tombstoned chunk must not be reported as present — the healer would
+        // otherwise select this node as a source and replicate the old chunk_id
+        // back to the two dual-RF patched replicas before metadata is committed.
+        let values = chunk_ids.iter()
+            .map(|id| !self.chunk_tombstones.contains(id) && self.storage.has_chunk(id))
+            .collect();
         Response::BoolVec { values }
     }
 
@@ -3507,6 +3527,7 @@ impl Server {
         self.chunk_map_remove(&file_id).await;
 
         for chunk_id in &chunk_ids {
+            self.chunk_tombstones.remove(chunk_id);
             let _ = self.metadata.delete_chunk_location(chunk_id);
             if let Err(e) = self.storage.delete_chunk(chunk_id) {
                 // Not present locally — fine, log at debug.
@@ -4956,5 +4977,32 @@ impl MessageHandler for Server {
                 },
             }
         })
+    }
+
+}
+
+impl Server {
+    /// Periodically remove tombstones for chunks that are no longer on disk.
+    /// Handles the case where the fire-and-forget DeleteChunk from the client failed —
+    /// the tombstone guard is no longer needed once the data is gone.
+    pub fn start_chunk_tombstone_cleanup_loop(self: Arc<Self>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+                let tombstoned: Vec<dfs_common::ChunkId> = server.chunk_tombstones
+                    .iter().map(|e| *e).collect();
+                let mut cleaned = 0usize;
+                for chunk_id in tombstoned {
+                    if !server.storage.has_chunk(&chunk_id) {
+                        server.chunk_tombstones.remove(&chunk_id);
+                        cleaned += 1;
+                    }
+                }
+                if cleaned > 0 {
+                    debug!("chunk_tombstone_cleanup: removed {} stale tombstones", cleaned);
+                }
+            }
+        });
     }
 }

@@ -4883,6 +4883,15 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok((new_loc, fresh_meta))
     }
 
+    /// Fire-and-forget delete of a specific chunk from one node.
+    /// Used by flush_all_pipelined to clean up the skipped 3rd replica after metadata commit.
+    pub async fn delete_chunk_from_node(&self, addr: SocketAddr, chunk_id: ChunkId) {
+        let req = Request::DeleteChunk { chunk_id };
+        if let Err(e) = self.send_request(addr, req).await {
+            debug!("delete_chunk_from_node: {} chunk {} failed (healer will clean up): {}", addr, chunk_id, e);
+        }
+    }
+
     /// Apply multiple non-contiguous byte-range patches to a chunk in a single RPC.
     /// Equivalent to patch_chunk_on_replicas but sends all dirty ranges in one request,
     /// so the server applies them atomically without serial round-trips or gap zero-fills.
@@ -4893,8 +4902,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         patches: Vec<(usize, Vec<u8>)>,
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
-    ) -> Result<dfs_common::ChunkLocation> {
-        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, None, None, chunk_file_offset, patches, old_location, expected_new_chunk_id).await
+        dual_rf: bool,
+    ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
+        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, None, None, chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf).await
     }
 
     pub async fn multi_patch_chunk_on_replicas_verified(
@@ -4906,8 +4916,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         patches: Vec<(usize, Vec<u8>)>,
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
-    ) -> Result<dfs_common::ChunkLocation> {
-        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, Some(file_id), Some(chunk_idx), chunk_file_offset, patches, old_location, expected_new_chunk_id).await
+        dual_rf: bool,
+    ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
+        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, Some(file_id), Some(chunk_idx), chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf).await
     }
 
     async fn multi_patch_chunk_on_replicas_inner(
@@ -4919,8 +4930,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         patches: Vec<(usize, Vec<u8>)>,
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
-    ) -> Result<dfs_common::ChunkLocation> {
+        dual_rf: bool,
+    ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
+        let original_old_chunk_id = old_chunk_id;
         let mut current_location = old_location.clone();
+        let mut skip_addrs: Vec<SocketAddr> = vec![];
         'retry: for attempt in 0u8..2 {
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
@@ -4928,7 +4942,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
         let all_cluster_nodes = self.cluster_nodes.read().await.clone();
 
-        let replica_addrs: Vec<SocketAddr> = if current_location.nodes.is_empty() {
+        let mut replica_addrs: Vec<SocketAddr> = if current_location.nodes.is_empty() {
             all_cluster_nodes.clone()
         } else {
             current_location.nodes.iter()
@@ -4939,6 +4953,31 @@ leader_addr: Arc::new(RwLock::new(None)),
         if replica_addrs.is_empty() {
             anyhow::bail!("MultiPatch: no replica addresses resolved for chunk {}", old_chunk_id);
         }
+
+        let leader_addr = *self.leader_addr.read().await;
+
+        // Sort deterministically: leader first, remaining by address.
+        // Consistent ordering means the same nodes are always primary targets, which
+        // makes stale-base retries predictable (the stale response points back to the
+        // nodes we always write to).
+        if let Some(la) = leader_addr {
+            if let Some(pos) = replica_addrs.iter().position(|&a| a == la) {
+                replica_addrs.swap(0, pos);
+            }
+        }
+        if replica_addrs.len() > 1 {
+            replica_addrs[1..].sort();
+        }
+
+        // Dual-RF: patch the first 2 replicas; the 3rd is tombstoned (synchronously, below)
+        // so the healer cannot use it as a source before metadata commits.
+        let patch_addrs: Vec<SocketAddr> = if dual_rf && replica_addrs.len() > 2 {
+            skip_addrs = replica_addrs[2..].to_vec();
+            replica_addrs[..2].to_vec()
+        } else {
+            skip_addrs = vec![];
+            replica_addrs.clone()
+        };
 
         let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
 
@@ -4951,15 +4990,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             expected_new_chunk_id,
         };
 
-        let futures: Vec<_> = replica_addrs.iter().map(|&addr| {
+        let futures: Vec<_> = patch_addrs.iter().map(|&addr| {
             let client = self.clone();
             let req = patch_req.clone();
             async move { (addr, client.send_request(addr, req).await) }
         }).collect();
 
         let results = futures::future::join_all(futures).await;
-
-        let leader_addr = *self.leader_addr.read().await;
 
         // Collect per-replica results before any disagreement logic.
         // (addr, Ok(ncid, size)) for success, (addr, Err) for failure.
@@ -5016,13 +5053,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         // our assumed base was wrong for ALL replicas, so we need to patch the real base.
         let has_any_success = replica_results.iter().any(|(_, r)| r.is_ok());
         if !has_any_success {
-            if let Some((fresh_id, mut fresh_loc)) = stale_retry {
-                // Force empty node list so the retry broadcasts to ALL cluster nodes.
-                // The stale response's current_nodes may be incomplete (e.g. only 2 of
-                // RF=3 replicas), which would leave the missing replica permanently
-                // diverged. Empty nodes causes the retry to use all_cluster_nodes;
-                // nodes that don't hold the chunk return errors and are skipped.
-                fresh_loc.nodes = vec![];
+            if let Some((fresh_id, fresh_loc)) = stale_retry {
+                // Use current_nodes from the stale response — the server told us exactly
+                // which nodes hold the correct base hash. Broadcasting to all cluster
+                // nodes wastes bandwidth and throws away that knowledge. The deterministic
+                // sort+dual-RF selection runs again on this updated node list, so we
+                // still hit the same predictable 2 nodes.
                 old_chunk_id = fresh_id;
                 current_location = fresh_loc;
                 continue 'retry;
@@ -5136,10 +5172,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             written_at: None,
         };
 
-        // Send ReplicateChunkLocation synchronously to leader + replica nodes only.
-        // Non-replica nodes must not receive this directly — see patch_chunk_on_replicas_inner.
-        let leader_addr = *self.leader_addr.read().await;
-        let mut sync_addrs: Vec<SocketAddr> = replica_addrs.clone();
+        // Send ReplicateChunkLocation to patched replicas + leader (the 3 metadata nodes).
+        let mut sync_addrs: Vec<SocketAddr> = patch_addrs.clone();
         if let Some(leader) = leader_addr {
             if !sync_addrs.contains(&leader) {
                 sync_addrs.push(leader);
@@ -5167,9 +5201,25 @@ leader_addr: Arc::new(RwLock::new(None)),
         }).collect();
         futures::future::join_all(loc_futures).await;
 
+        // Synchronously tombstone old_chunk_id on skipped replicas BEFORE returning.
+        // This prevents the healer from selecting those nodes as a source and reverting
+        // the patch on the 2 patched replicas during the metadata commit window.
+        // The tombstone is cleared automatically when DeleteChunk fires later.
+        let skip_pairs: Vec<(SocketAddr, ChunkId)> = skip_addrs.iter()
+            .map(|&addr| (addr, original_old_chunk_id))
+            .collect();
+        for &addr in &skip_addrs {
+            let req = Request::TombstoneChunk { chunk_id: original_old_chunk_id };
+            if let Err(e) = self.send_request(addr, req).await {
+                warn!("MultiPatch: TombstoneChunk {} on {} failed — healer may revert patch: {}",
+                    original_old_chunk_id, addr, e);
+            }
+        }
+
         let n_patches = patches.len();
-        info!("MultiPatch: {} -> {} ({} replicas, {} patches)", old_chunk_id, new_chunk_id, patched_node_ids.len(), n_patches);
-        return Ok(new_location);
+        info!("MultiPatch: {} -> {} ({} replicas, {} patches, {} skipped)",
+            old_chunk_id, new_chunk_id, patched_node_ids.len(), n_patches, skip_pairs.len());
+        return Ok((new_location, skip_pairs));
         } // end retry loop
         anyhow::bail!("MultiPatch: exhausted retries for chunk {}", old_chunk_id)
     }

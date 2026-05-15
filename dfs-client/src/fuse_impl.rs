@@ -395,6 +395,15 @@ struct FlushHandle {
     /// enter flush_all_pipelined concurrently, race on slot ownership, and produce
     /// out-of-order patches on the server (T22b / qcow2 header corruption).
     flush_pipeline_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// When true, MultiPatch writes to only 2 replicas (leader-preferred, deterministic)
+    /// and returns the skipped 3rd-replica addresses. flush_all_pipelined enables this
+    /// for fsync/release flushes so it can fire deferred deletes after metadata commits.
+    /// Background ticker flushes leave this false (no safe metadata-commit barrier).
+    use_dual_rf: bool,
+    /// Accumulates (replica_addr, old_chunk_id) pairs for 3rd replicas skipped during
+    /// dual-RF MultiPatch. Drained by flush_all_pipelined AFTER flush_metadata_sync so
+    /// the delete fires only once the leader has the new chunk_id in its metadata.
+    pending_skipped_deletes: Arc<tokio::sync::Mutex<Vec<(std::net::SocketAddr, dfs_common::ChunkId)>>>,
 }
 
 impl FlushHandle {
@@ -1342,15 +1351,17 @@ impl FlushHandle {
                         self.client.multi_patch_chunk_on_replicas_verified(
                             old_location.chunk_id, fid, chunk_idx,
                             file_offset, patches.clone(), &old_location, expected_new_chunk_id,
+                            self.use_dual_rf,
                         ).await
                     } else {
                         self.client.multi_patch_chunk_on_replicas(
                             old_location.chunk_id, file_offset, patches.clone(),
                             &old_location, expected_new_chunk_id,
+                            self.use_dual_rf,
                         ).await
                     };
-                    let new_location = match patch_result {
-                        Ok(loc) => loc,
+                    let (new_location, skip_pairs) = match patch_result {
+                        Ok((loc, sp)) => (loc, sp),
                         Err(e) => {
                             // MultiPatch failed — the chunk_id in our cache (or recent_chunk_writes)
                             // is stale. Rather than fetching the full file metadata, ask the leader
@@ -1387,18 +1398,19 @@ impl FlushHandle {
                                     let retry_result = if let Some(fid) = file_id_at_flush_start {
                                         self.client.multi_patch_chunk_on_replicas_verified(
                                             loc.chunk_id, fid, chunk_idx, file_offset,
-                                            patches, &loc, None,
+                                            patches, &loc, None, self.use_dual_rf,
                                         ).await
                                     } else {
                                         self.client.multi_patch_chunk_on_replicas(
                                             loc.chunk_id, file_offset, patches, &loc, None,
+                                            self.use_dual_rf,
                                         ).await
                                     };
                                     match retry_result {
-                                        Ok(retry_loc) => {
+                                        Ok((retry_loc, retry_skips)) => {
                                             info!("flush_buffer_async_one: retry MultiPatch succeeded for ino={} chunk={}: {} -> {}",
                                                 ino, chunk_idx, loc.chunk_id, retry_loc.chunk_id);
-                                            retry_loc
+                                            (retry_loc, retry_skips)
                                         }
                                         Err(retry_err) => {
                                             warn!("flush_buffer_async_one: retry MultiPatch failed for ino={} chunk={}: {}", ino, chunk_idx, retry_err);
@@ -1438,6 +1450,12 @@ impl FlushHandle {
                             }
                         }
                     };
+
+                    // Accumulate skipped 3rd-replica addresses for deferred delete.
+                    // flush_all_pipelined fires these after flush_metadata_sync.
+                    if self.use_dual_rf && !skip_pairs.is_empty() {
+                        self.pending_skipped_deletes.lock().await.extend(skip_pairs);
+                    }
 
                     // Record the new chunk_id so the next flush of this slot (or rapid
                     // successive writes) can use it directly without a metadata round-trip.
@@ -1829,6 +1847,15 @@ impl FlushHandle {
             }
         }
 
+        // Sync-flush handle: dual-RF enabled so MultiPatch writes to 2 replicas and
+        // returns skipped 3rd-replica addresses. Fresh skip-list accumulator so deferred
+        // deletes from this flush session don't bleed into the background ticker's handle.
+        let sync_handle = FlushHandle {
+            use_dual_rf: true,
+            pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
+            ..self.clone()
+        };
+
         let mut first_err: Option<anyhow::Error> = None;
 
         // Keep dispatching concurrent flush_one_chunk calls until no unclaimed slots remain.
@@ -1918,9 +1945,9 @@ impl FlushHandle {
 
             let mut handles = Vec::new();
             for _ in 0..to_dispatch {
-                let handle = self.clone();
+                let h = sync_handle.clone();
                 handles.push(tokio::spawn(async move {
-                    handle.flush_one_chunk(ino).await
+                    h.flush_one_chunk(ino).await
                 }));
             }
 
@@ -1947,7 +1974,21 @@ impl FlushHandle {
             self.last_metadata_update.insert(ino, std::time::Instant::now());
         }
 
-        // Slots are removed immediately on flush success, so nothing to clean up here.
+        // Now that the leader has the new chunk_ids in its metadata, fire-and-forget
+        // deletes on the 3rd replicas that were skipped during dual-RF patching.
+        // old_chunk_id is orphaned on those nodes (no metadata references it); reads
+        // for the new chunk_id fall through to the 2 patched replicas. The healer
+        // will copy the new chunk to the 3rd replica to restore full RF.
+        let skips = sync_handle.pending_skipped_deletes.lock().await.drain(..).collect::<Vec<_>>();
+        if !skips.is_empty() {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                for (addr, old_chunk_id) in skips {
+                    client.delete_chunk_from_node(addr, old_chunk_id).await;
+                }
+            });
+        }
+
         Ok(())
     }
 }
@@ -2251,6 +2292,8 @@ impl DfsFilesystem {
                 write_tasks_in_flight: write_tasks_in_flight_shared.clone(),
                 chunk_write_locks: chunk_write_locks_for_bg.clone(),
                 flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
+                use_dual_rf: false,
+                pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
@@ -2403,6 +2446,8 @@ impl DfsFilesystem {
             write_tasks_in_flight: write_tasks_in_flight_shared.clone(),
             chunk_write_locks: chunk_write_locks_shared.clone(),
             flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
+            use_dual_rf: false,
+            pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
         };
 
         Ok(Self {
@@ -2756,6 +2801,8 @@ impl Filesystem for DfsFilesystem {
             write_tasks_in_flight: self.write_tasks_in_flight.clone(),
             chunk_write_locks: self.chunk_write_locks.clone(),
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
+            use_dual_rf: false,
+            pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
         };
 
         self.block_on(async move {
@@ -6191,6 +6238,8 @@ impl Filesystem for DfsFilesystem {
             write_tasks_in_flight: self.write_tasks_in_flight.clone(),
             chunk_write_locks: self.chunk_write_locks.clone(),
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
+            use_dual_rf: false,
+            pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
         };
 
         // Spawn so the FUSE dispatch thread is freed immediately — same pattern as fsync().

@@ -114,6 +114,15 @@ pub enum Request {
         chunk_id: ChunkId,
     },
 
+    /// Mark a chunk as tombstoned on this node. The HasChunks handler returns false for
+    /// tombstoned chunks so the healer never selects this node as a source, preventing it
+    /// from replicating the old chunk back to the two patched replicas during the window
+    /// between a dual-RF MultiPatch and the metadata commit. Cleared automatically when
+    /// the chunk is physically deleted (DeleteChunk / DeleteChunksBatch).
+    TombstoneChunk {
+        chunk_id: ChunkId,
+    },
+
     /// Delete an excess chunk replica — leader-coordinated cleanup only.
     /// leader_id: the NodeId of the node issuing this instruction — recipient
     /// validates that the sender is actually the current leader before executing.

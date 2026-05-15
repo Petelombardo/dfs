@@ -4958,6 +4958,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Collect per-replica results before any disagreement logic.
         // (addr, Ok(ncid, size)) for success, (addr, Err) for failure.
         let mut replica_results: Vec<(SocketAddr, Result<(ChunkId, usize)>)> = Vec::new();
+        // If any replica reports a stale base, record its corrected location for a
+        // potential full retry. We do NOT continue 'retry immediately upon the first
+        // stale response — doing so discards all successful results from other replicas
+        // and re-sends to everyone with the stale replica's hash, causing them to reject
+        // it too ("all replicas failed"). Instead, finish collecting all results first,
+        // then only retry if no replica succeeded (i.e. our base is wrong for everyone).
+        // Replicas that did succeed are handled via the re-push mechanism below.
+        let mut stale_retry: Option<(ChunkId, dfs_common::ChunkLocation)> = None;
         for (addr, result) in results {
             match result {
                 Ok(Response::MultiPatchResult { new_chunk_id: ncid, size }) => {
@@ -4968,23 +4976,20 @@ leader_addr: Arc::new(RwLock::new(None)),
                     replica_results.push((addr, Ok((ncid, size))));
                 }
                 Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
+                    warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",
+                        addr, old_chunk_id, current_chunk_id);
                     if attempt == 0 {
-                        warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",
-                            addr, old_chunk_id, current_chunk_id);
-                        old_chunk_id = current_chunk_id;
-                        let old_offset = current_location.file_offset;
-                        let old_size = current_location.size;
-                        current_location = dfs_common::ChunkLocation {
+                        // Save corrected location; retry only if no replica succeeded.
+                        stale_retry = Some((current_chunk_id, dfs_common::ChunkLocation {
                             chunk_id: current_chunk_id,
                             nodes: current_nodes,
-                            size: old_size,
+                            size: current_location.size,
                             checksum: current_chunk_id.hash,
-                            file_offset: old_offset,
+                            file_offset: current_location.file_offset,
                             written_at: None,
-                        };
-                        continue 'retry;
+                        }));
                     }
-                    replica_results.push((addr, Err(anyhow::anyhow!("chunk stale after retry"))));
+                    replica_results.push((addr, Err(anyhow::anyhow!("chunk stale"))));
                 }
                 Ok(Response::Error { message, .. }) => {
                     warn!("MultiPatch replica {} error: {}", addr, message);
@@ -4997,6 +5002,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                 _ => {
                     replica_results.push((addr, Err(anyhow::anyhow!("unexpected response"))));
                 }
+            }
+        }
+
+        // If no replica succeeded and we have a corrected location from a stale response,
+        // retry with that location. This is the only case where a full retry makes sense:
+        // our assumed base was wrong for ALL replicas, so we need to patch the real base.
+        let has_any_success = replica_results.iter().any(|(_, r)| r.is_ok());
+        if !has_any_success {
+            if let Some((fresh_id, fresh_loc)) = stale_retry {
+                old_chunk_id = fresh_id;
+                current_location = fresh_loc;
+                continue 'retry;
             }
         }
 

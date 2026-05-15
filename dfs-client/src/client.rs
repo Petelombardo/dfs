@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use blake3;
 use dashmap::DashMap;
-use dfs_common::{ChunkId, ErrorCode, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
+use dfs_common::{ChunkId, ChunkLocation, ErrorCode, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
 use lru::LruCache;
 use moka::future::Cache as MokaCache;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1962,7 +1962,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // --- Cache check ---
         let mut result_chunks: Vec<(usize /*chunk_idx*/, Arc<Vec<u8>>)> = Vec::new();
         let mut to_fetch: Vec<(usize, ChunkId, SocketAddr, Vec<SocketAddr>)> = Vec::new();
-        let mut to_wait: Vec<(usize, ChunkId)> = Vec::new();
+        let mut to_wait: Vec<(usize, ChunkId, ChunkLocation)> = Vec::new();
 
         for (chunk_idx, _chunk_start, _chunk_size) in &needed {
             let idx = *chunk_idx;
@@ -1979,7 +1979,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             // 2. Another request already fetching it?
             if engine.in_flight.contains(&cid) {
-                to_wait.push((idx, cid));
+                to_wait.push((idx, cid, loc.clone()));
                 continue;
             }
 
@@ -2140,8 +2140,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         // --- Wait for in-flight chunks fetched by concurrent requests ---
-        for (idx, cid) in to_wait {
-            let data = self.wait_for_chunk_in_cache(cid, &engine).await?;
+        for (idx, cid, loc) in to_wait {
+            let data = self.wait_for_chunk_in_cache(cid, &engine, &loc).await?;
             result_chunks.push((idx, data));
         }
 
@@ -2317,6 +2317,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         &self,
         cid: ChunkId,
         engine: &InodeReadEngine,
+        loc: &ChunkLocation,
     ) -> Result<Arc<Vec<u8>>> {
         // Arm the notified() future BEFORE checking the cache so we never miss
         // a notify_waiters() that fires between the check and the wait.
@@ -2348,11 +2349,19 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        // Fall back — fetch ourselves.
+        // Fall back — fetch ourselves using only the chunk's actual holders.
         warn!("Timeout waiting for concurrent fetch of chunk {}, fetching directly", cid);
+        let nim = {
+            let m = self.addr_to_node_id.read().await;
+            m.iter().map(|(&a, &id)| (id, a)).collect::<std::collections::HashMap<_, _>>()
+        };
         let nodes = self.cluster_nodes.read().await.clone();
-        let primary = nodes[0];
-        let fallbacks: Vec<SocketAddr> = nodes[1..].to_vec();
+        let (primary, fallbacks) =
+            InodeReadEngine::resolve_primary(loc, &nim, &nodes, 0)
+                .unwrap_or_else(|| {
+                    let p = nodes[0];
+                    (p, nodes[1..].to_vec())
+                });
         let data = self.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await?;
         Ok(Arc::new(data))
     }

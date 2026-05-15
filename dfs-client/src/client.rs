@@ -5016,7 +5016,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         // our assumed base was wrong for ALL replicas, so we need to patch the real base.
         let has_any_success = replica_results.iter().any(|(_, r)| r.is_ok());
         if !has_any_success {
-            if let Some((fresh_id, fresh_loc)) = stale_retry {
+            if let Some((fresh_id, mut fresh_loc)) = stale_retry {
+                // Force empty node list so the retry broadcasts to ALL cluster nodes.
+                // The stale response's current_nodes may be incomplete (e.g. only 2 of
+                // RF=3 replicas), which would leave the missing replica permanently
+                // diverged. Empty nodes causes the retry to use all_cluster_nodes;
+                // nodes that don't hold the chunk return errors and are skipped.
+                fresh_loc.nodes = vec![];
                 old_chunk_id = fresh_id;
                 current_location = fresh_loc;
                 continue 'retry;
@@ -5057,11 +5063,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                 }
                 Ok((ncid, _)) => {
-                    warn!("MultiPatch REPLICA DISAGREEMENT: {} returned {} but leader/majority returned {} — stale base chunk; will re-push correct data",
+                    warn!("MultiPatch REPLICA DISAGREEMENT: {} returned {} but leader/majority returned {} — will re-push correct data",
                         addr, ncid, authoritative_chunk_id);
                     stale_addrs.push(*addr);
                 }
-                Err(_) => {} // already logged above
+                Err(e) if e.to_string().contains("chunk stale") => {
+                    // Stale-base replica: the patch wasn't applied there. Re-push the
+                    // authoritative result so it converges with the successful replicas.
+                    warn!("MultiPatch replica {}: stale base, will re-push {} to bring it current",
+                        addr, authoritative_chunk_id);
+                    stale_addrs.push(*addr);
+                }
+                Err(_) => {} // connection/other failure — already logged
             }
         }
 

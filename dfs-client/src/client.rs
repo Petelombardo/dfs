@@ -2277,7 +2277,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                 Err(e) => {
                     let msg = e.to_string();
                     warn!("{} failed for chunk {}: {}", addr, cid, msg);
-                    self.node_health.record_failure(addr).await;
+                    // "Chunk not found on this node" means the node is up but doesn't hold
+                    // this specific chunk — a metadata/routing issue, not a health issue.
+                    // Only count actual connectivity failures against node health so we don't
+                    // penalise a healthy node and skew future routing decisions.
+                    if !msg.contains("not found on this node") {
+                        self.node_health.record_failure(addr).await;
+                    }
                     if msg.contains("permanently missing") || msg.contains("location not found") {
                         anyhow::bail!("Chunk {} is permanently missing", cid);
                     }

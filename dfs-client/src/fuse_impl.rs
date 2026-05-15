@@ -6074,24 +6074,23 @@ impl Filesystem for DfsFilesystem {
         if self.direct_write_inodes.contains(&ino) {
             if let Some(counter) = self.write_tasks_in_flight.get(&ino) {
                 let counter = counter.clone();
-                let result = self.block_on(async move {
+                self.runtime.spawn(async move {
                     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
                     while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                         if tokio::time::Instant::now() > deadline {
-                            return Err(anyhow::anyhow!("fsync: timed out waiting for direct write tasks for ino={}", ino));
+                            error!("fsync: timed out waiting for direct write tasks for ino={}", ino);
+                            reply.error(libc::EIO);
+                            return;
                         }
                         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                     }
-                    Ok(())
+                    info!("fsync: ino={} → direct-write path, done", ino);
+                    reply.ok();
                 });
-                if let Err(e) = result {
-                    error!("{}", e);
-                    reply.error(libc::EIO);
-                    return;
-                }
+            } else {
+                info!("fsync: ino={} path={:?} → direct-write path, done", ino, path);
+                reply.ok();
             }
-            info!("fsync: ino={} path={:?} → direct-write path, done", ino, path);
-            reply.ok();
             return;
         }
 
@@ -6110,54 +6109,25 @@ impl Filesystem for DfsFilesystem {
                 })
                 .unwrap_or(false);
 
+            // All three branches (O_SYNC/SQLite, no active writers, active writers) do the
+            // same thing: flush and reply. Spawn so the FUSE dispatch thread is freed
+            // immediately — the calling process's fsync() syscall blocks in the kernel
+            // until the reply arrives, satisfying POSIX durability semantics without
+            // monopolising the dispatch thread and starving other FUSE requests.
+            let handle = self.flush_handle.clone();
             if sync_on_fsync {
-                // O_SYNC / O_DSYNC: flush synchronously and wait for network ack.
                 info!("fsync: ino={} path={:?} → sync flush (O_SYNC/SQLite)", ino, path);
-                let handle = self.flush_handle.clone();
-                let result = self.block_on(async move {
-                    handle.flush_all_pipelined(ino).await
-                });
-                match result {
-                    Ok(_) => reply.ok(),
-                    Err(e) => { error!("fsync (O_SYNC) failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
-                }
             } else if active_writers == 0 {
-                // No active writers — file is closed (e.g. mkfs, QEMU, VM tools fsyncing
-                // after close). Flush synchronously so the caller's durability guarantee
-                // holds. DVR always has active_writers > 0 during recording so it never
-                // hits this branch.
                 info!("fsync: ino={} path={:?} → sync flush (no active writers)", ino, path);
-                let handle = self.flush_handle.clone();
-                let result = self.block_on(async move {
-                    handle.flush_all_pipelined(ino).await
-                });
-                match result {
-                    Ok(_) => reply.ok(),
-                    Err(e) => { error!("fsync (no-writers) failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
-                }
             } else {
-                // Active writers present. Previously we tried to optimize by flushing
-                // asynchronously here (for "streaming writes"), but:
-                // 1. The DVR doesn't actually call fsync, so the optimization is unused
-                // 2. Async fsync breaks correctness for qcow2/disk creation tools that
-                //    expect durability when fsync returns (qcow2-img creates → fsync →
-                //    close, but VM sees size=0 because metadata is still in-flight)
-                // 3. POSIX requires fsync to flush data to durable storage before returning
-                // Solution: always flush synchronously. If DVR performance becomes an issue,
-                // we can add an explicit opt-out flag, but correctness comes first.
                 info!("fsync: ino={} path={:?} → sync flush (active_writers={})", ino, path, active_writers);
-                let handle = self.flush_handle.clone();
-                let result = self.block_on(async move {
-                    handle.flush_all_pipelined(ino).await
-                });
-                match result {
-                    Ok(_) => reply.ok(),
-                    Err(e) => {
-                        error!("fsync failed for inode {}: {}", ino, e);
-                        reply.error(libc::EIO);
-                    }
-                }
             }
+            self.runtime.spawn(async move {
+                match handle.flush_all_pipelined(ino).await {
+                    Ok(_) => reply.ok(),
+                    Err(e) => { error!("fsync failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
+                }
+            });
         } else {
             // No write buffer, but we still need to flush any pending metadata updates
             // that were batched by the write() path to ensure data durability
@@ -6165,34 +6135,21 @@ impl Filesystem for DfsFilesystem {
             let metadata_cache = self.metadata_cache.clone();
             let write_counters = self.write_counters.clone();
 
-            let result = self.block_on(async {
-                // Get metadata from cache
+            self.runtime.spawn(async move {
                 let metadata_opt = metadata_cache.get(&ino).map(|m| m.clone());
-
                 if let Some(metadata) = metadata_opt {
-                    // Check if there are pending writes
                     let has_pending = {
                         let counters = write_counters.read().unwrap();
                         counters.get(&ino).map(|c| *c > 0).unwrap_or(false)
                     };
-
                     if has_pending {
                         debug!("fsync: enqueueing pending metadata for ino={}", ino);
                         client.enqueue_metadata(&metadata).await;
                         write_counters.write().unwrap().insert(ino, 0);
                     }
                 }
-
-                Ok::<(), anyhow::Error>(())
+                reply.ok();
             });
-
-            match result {
-                Ok(_) => reply.ok(),
-                Err(e) => {
-                    error!("Failed to flush metadata on fsync for inode {}: {}", ino, e);
-                    reply.error(libc::EIO);
-                }
-            }
         }
     }
 
@@ -6236,7 +6193,8 @@ impl Filesystem for DfsFilesystem {
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
         };
 
-        let result = self.block_on(async move {
+        // Spawn so the FUSE dispatch thread is freed immediately — same pattern as fsync().
+        self.runtime.spawn(async move {
             // Wait for any in-flight release() flush tasks to complete.
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
             loop {
@@ -6267,7 +6225,10 @@ impl Filesystem for DfsFilesystem {
             }
 
             // Wait for any background in-flight flushes to drain.
-            if let Some(in_flight) = flush_in_flight.read().unwrap().as_ref() {
+            // Clone the Arc before the await loop so the RwLockReadGuard is dropped
+            // immediately — RwLockReadGuard is not Send and can't be held across await.
+            let in_flight_opt = flush_in_flight.read().unwrap().as_ref().cloned();
+            if let Some(in_flight) = in_flight_opt {
                 let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
                 while !in_flight.is_empty() {
                     if tokio::time::Instant::now() > deadline {
@@ -6288,16 +6249,8 @@ impl Filesystem for DfsFilesystem {
             }
 
             info!("fsyncdir: all buffers flushed and metadata committed");
-            Ok::<(), anyhow::Error>(())
+            reply.ok();
         });
-
-        match result {
-            Ok(_) => reply.ok(),
-            Err(e) => {
-                error!("fsyncdir: flush error: {}", e);
-                reply.error(libc::EIO);
-            }
-        }
     }
 
     fn getxattr(

@@ -395,15 +395,15 @@ struct FlushHandle {
     /// enter flush_all_pipelined concurrently, race on slot ownership, and produce
     /// out-of-order patches on the server (T22b / qcow2 header corruption).
     flush_pipeline_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
-    /// When true, MultiPatch writes to only 2 replicas (leader-preferred, deterministic)
-    /// and returns the skipped 3rd-replica addresses. flush_all_pipelined enables this
-    /// for fsync/release flushes so it can fire deferred deletes after metadata commits.
-    /// Background ticker flushes leave this false (no safe metadata-commit barrier).
+    /// When true, MultiPatch writes to only 2 replicas (leader-preferred, deterministic).
+    /// flush_all_pipelined enables this for fsync/release flushes so deferred chunk
+    /// cleanup fires after metadata commits. Background ticker leaves this false.
     use_dual_rf: bool,
-    /// Accumulates (replica_addr, old_chunk_id) pairs for 3rd replicas skipped during
-    /// dual-RF MultiPatch. Drained by flush_all_pipelined AFTER flush_metadata_sync so
-    /// the delete fires only once the leader has the new chunk_id in its metadata.
-    pending_skipped_deletes: Arc<tokio::sync::Mutex<Vec<(std::net::SocketAddr, dfs_common::ChunkId)>>>,
+    /// Old chunk_ids replaced by patches this flush cycle. Drained by flush_all_pipelined
+    /// AFTER flush_metadata_sync: broadcasts TombstoneChunk+DeleteChunk to every cluster
+    /// node so orphaned old chunks are removed from all replicas and routing tables —
+    /// not just the dual-RF skip node — preventing healer copies from accumulating.
+    pending_old_chunks: Arc<tokio::sync::Mutex<Vec<dfs_common::ChunkId>>>,
 }
 
 impl FlushHandle {
@@ -1451,11 +1451,12 @@ impl FlushHandle {
                         }
                     };
 
-                    // Accumulate skipped 3rd-replica addresses for deferred delete.
-                    // flush_all_pipelined fires these after flush_metadata_sync.
-                    if self.use_dual_rf && !skip_pairs.is_empty() {
-                        self.pending_skipped_deletes.lock().await.extend(skip_pairs);
-                    }
+                    // Record old_chunk_id for broadcast cleanup after metadata sync.
+                    // flush_all_pipelined tombstones + deletes it from ALL cluster nodes,
+                    // not just the dual-RF skip node — clearing healer copies everywhere.
+                    // skip_pairs is no longer used; old_chunk_id covers the same need.
+                    let _ = skip_pairs; // skip_pairs dropped: cleanup is now broadcast
+                    self.pending_old_chunks.lock().await.push(old_location.chunk_id);
 
                     // Record the new chunk_id so the next flush of this slot (or rapid
                     // successive writes) can use it directly without a metadata round-trip.
@@ -1852,7 +1853,7 @@ impl FlushHandle {
         // deletes from this flush session don't bleed into the background ticker's handle.
         let sync_handle = FlushHandle {
             use_dual_rf: true,
-            pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
+            pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
             ..self.clone()
         };
 
@@ -1983,21 +1984,27 @@ impl FlushHandle {
             ).await;
         }
 
-        // Metadata is committed. Now tombstone then delete old_chunk_id on the skip
-        // replicas from dual-RF patching. Tombstone fires first so the healer cannot
-        // copy old_chunk back to the patched nodes between the delete RPC flight and
-        // the server processing it. Doing this AFTER metadata sync (not before) closes
-        // the data-loss window: during the commit window the skip node still has and
-        // serves old_chunk, so reads never hit a blackout.
-        let skips = sync_handle.pending_skipped_deletes.lock().await.drain(..).collect::<Vec<_>>();
-        if !skips.is_empty() {
+        // Metadata is committed. Broadcast tombstone+delete for every old chunk_id
+        // replaced this flush cycle to ALL cluster nodes. This ensures:
+        //   - Skip node: old chunk removed (was the sole target before)
+        //   - Patched nodes: routing entry removed (physical file already renamed away)
+        //   - Healer-replicated nodes: any stale copy removed from disk + routing table
+        // Tombstone fires first so HasChunks returns false everywhere before delete,
+        // preventing the healer from copying an old chunk to a new node in the gap.
+        let old_chunks = sync_handle.pending_old_chunks.lock().await.drain(..).collect::<Vec<_>>();
+        if !old_chunks.is_empty() {
             let client = self.client.clone();
+            let all_nodes = client.cluster_nodes.read().await.clone();
             tokio::spawn(async move {
-                for &(addr, old_chunk_id) in &skips {
-                    client.tombstone_chunk_on_node(addr, old_chunk_id).await;
+                for &old_chunk_id in &old_chunks {
+                    for &addr in &all_nodes {
+                        client.tombstone_chunk_on_node(addr, old_chunk_id).await;
+                    }
                 }
-                for (addr, old_chunk_id) in skips {
-                    client.delete_chunk_from_node(addr, old_chunk_id).await;
+                for old_chunk_id in old_chunks {
+                    for &addr in &all_nodes {
+                        client.delete_chunk_from_node(addr, old_chunk_id).await;
+                    }
                 }
             });
         }
@@ -2306,7 +2313,7 @@ impl DfsFilesystem {
                 chunk_write_locks: chunk_write_locks_for_bg.clone(),
                 flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
                 use_dual_rf: false,
-                pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
+                pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
@@ -2460,7 +2467,7 @@ impl DfsFilesystem {
             chunk_write_locks: chunk_write_locks_shared.clone(),
             flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
             use_dual_rf: false,
-            pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
+            pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
         };
 
         Ok(Self {
@@ -2815,7 +2822,7 @@ impl Filesystem for DfsFilesystem {
             chunk_write_locks: self.chunk_write_locks.clone(),
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
             use_dual_rf: false,
-            pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
+            pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
         };
 
         self.block_on(async move {
@@ -6160,7 +6167,7 @@ impl Filesystem for DfsFilesystem {
             chunk_write_locks: self.chunk_write_locks.clone(),
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
             use_dual_rf: false,
-            pending_skipped_deletes: Arc::new(tokio::sync::Mutex::new(vec![])),
+            pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
         };
 
         // Spawn so the FUSE dispatch thread is freed immediately — same pattern as fsync().

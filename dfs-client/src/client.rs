@@ -454,7 +454,7 @@ impl MetadataQueue {
 #[derive(Clone)]
 pub struct DfsClient {
     /// List of cluster nodes (updated by refresh_cluster_nodes)
-    cluster_nodes: Arc<RwLock<Vec<SocketAddr>>>,
+    pub cluster_nodes: Arc<RwLock<Vec<SocketAddr>>>,
 
     /// Original seed addresses provided at startup.
     /// Never mutated — used as a fallback when all cluster_nodes are unreachable
@@ -5121,12 +5121,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             None => anyhow::bail!("MultiPatch: all replicas failed for chunk {}", old_chunk_id),
         };
 
-        // For any replica that disagreed (stale base chunk), recover it by fetching the
-        // correct chunk from the leader and re-writing it to the stale node directly.
-        // This avoids a multi-round-trip retry and immediately brings stale nodes current.
+        // Record only replicas that successfully applied the patch with the authoritative
+        // chunk_id. Stale replicas (healer-copied old versions) are simply excluded from
+        // the new location — the healer will replicate the new chunk to them on the next
+        // cycle. Re-pushing is not our job: we already have our dual-RF write guarantee
+        // from the nodes that succeeded, and re-pushing risks pushing incorrect data to
+        // nodes whose state we don't fully know.
         let new_size: usize = authoritative_size;
         let mut patched_node_ids: Vec<dfs_common::NodeId> = Vec::new();
-        let mut stale_addrs: Vec<SocketAddr> = Vec::new();
 
         for (addr, result) in &replica_results {
             match result {
@@ -5136,65 +5138,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                 }
                 Ok((ncid, _)) => {
-                    warn!("MultiPatch REPLICA DISAGREEMENT: {} returned {} but leader/majority returned {} — will re-push correct data",
+                    warn!("MultiPatch REPLICA DISAGREEMENT: {} returned {} but leader/majority returned {} — excluding, healer will correct",
                         addr, ncid, authoritative_chunk_id);
-                    stale_addrs.push(*addr);
                 }
                 Err(e) if e.to_string().contains("chunk stale") => {
-                    // Stale-base replica: the patch wasn't applied there. Re-push the
-                    // authoritative result so it converges with the successful replicas.
-                    warn!("MultiPatch replica {}: stale base, will re-push {} to bring it current",
-                        addr, authoritative_chunk_id);
-                    stale_addrs.push(*addr);
+                    warn!("MultiPatch replica {}: stale base — excluding from location, healer will bring current",
+                        addr);
                 }
                 Err(_) => {} // connection/other failure — already logged
-            }
-        }
-
-        // Re-push the correct chunk to any stale replicas.
-        if !stale_addrs.is_empty() {
-            // Fetch the correct chunk bytes from the leader (or any good replica).
-            let leader_or_good: SocketAddr = leader_addr
-                .filter(|&la| replica_results.iter().any(|(a, r)| *a == la && r.as_ref().ok().map(|(id,_)| *id) == Some(authoritative_chunk_id)))
-                .unwrap_or_else(|| {
-                    replica_results.iter()
-                        .find(|(_, r)| r.as_ref().ok().map(|(id,_)| *id) == Some(authoritative_chunk_id))
-                        .map(|(a, _)| *a)
-                        .unwrap_or_else(|| all_cluster_nodes[0])
-                });
-
-            match self.read_chunk_from_server(leader_or_good, authoritative_chunk_id, None).await {
-                Ok(correct_data) => {
-                    for &stale_addr in &stale_addrs {
-                        let data_clone = correct_data.clone();
-                        let file_offset = old_location.file_offset.unwrap_or(0);
-                        match Self::write_chunk_to_server_local_only(stale_addr, data_clone, file_offset).await {
-                            Ok((written_ids, _)) => {
-                                if written_ids.first().copied() == Some(authoritative_chunk_id) {
-                                    info!("MultiPatch: re-pushed correct chunk {} to stale replica {}", authoritative_chunk_id, stale_addr);
-                                    // Delete the wrong chunk the stale node wrote from its bad base.
-                                    let client = self.clone();
-                                    let old_id = old_chunk_id;
-                                    let stale = stale_addr;
-                                    tokio::spawn(async move {
-                                        let _ = client.send_request(stale, Request::DeleteChunk { chunk_id: old_id }).await;
-                                    });
-                                    if let Some(&nid) = addr_to_node_id_snap.get(&stale_addr) {
-                                        patched_node_ids.push(nid);
-                                    }
-                                } else {
-                                    warn!("MultiPatch: re-push to stale {} produced unexpected chunk_id {:?}, skipping", stale_addr, written_ids.first());
-                                }
-                            }
-                            Err(e) => {
-                                warn!("MultiPatch: failed to re-push correct chunk to stale {}: {}", stale_addr, e);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("MultiPatch: could not fetch correct chunk from {}: {}; stale replicas {} will self-heal", leader_or_good, e, stale_addrs.len());
-                }
             }
         }
 

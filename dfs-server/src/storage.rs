@@ -90,18 +90,19 @@ impl ChunkStorage {
             .map(|bytes| bytes / (1024 * 1024))
             .unwrap_or(4096);
 
-        // Scale conservatively off total RAM:
+        // Scale off total RAM (~12% target):
         //   ≤ 2 GB  →  32 chunks (128 MB)  — SBC / low-memory nodes
-        //   ≤ 8 GB  →  64 chunks (256 MB)  — typical server nodes
-        //   > 8 GB  → 128 chunks (512 MB)  — high-memory nodes
+        //   ≤ 8 GB  → 128 chunks (512 MB)  — typical 4-8 GB server nodes
+        //   > 8 GB  → 256 chunks (  1 GB)  — high-memory nodes
         //
-        // These are intentionally small; the client cache handles read amplification.
+        // Previous tiers (64/128 chunks) were too small for concurrent DVR+ISO+VM
+        // workloads: nodes hit 100% cache pressure and began throttling reads.
         let cache_mb: u64 = if total_mb <= 2048 {
             128
         } else if total_mb <= 8192 {
-            256
-        } else {
             512
+        } else {
+            1024
         };
 
         let final_cache = (cache_mb / CHUNK_SIZE_MB) as usize;

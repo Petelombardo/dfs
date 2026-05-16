@@ -1493,6 +1493,75 @@ sleep 2
 rm -f "$T25E_FILE" "$T25E_MANIFEST" "$T25E2_FILE" 2>/dev/null || true
 fi # should_run T25
 
+# ── Test 26: repeated patches to same chunk — stale-base regression ───────────
+# Rapidly patches the same intra-chunk offset 10 times in sequence.
+# Each patch should be applied to the SAME 2 replica nodes as the previous one.
+# If the node-tracking bug is present, the second and subsequent patches target
+# wrong nodes (nodes that never received the previous patch) and the client log
+# will contain "stale base" warnings from the stale-base retry path.
+# Data correctness is verified by md5sum; stale warnings are a separate check.
+if should_run T26; then
+snapshot_log T26
+echo ""
+echo "=== T26: repeated same-chunk patches (stale-base node-tracking regression) ==="
+
+T26_FILE="$MOUNT/t26_repatch.bin"
+T26_PATCH_OFFSET=$(( 1024 * 1024 )) # 1MB into the chunk
+
+# Create initial 4MB file (fresh write — establishes chunk on 2 replica nodes)
+dd if=/dev/urandom of="$T/t26_orig.bin" bs=1M count=4 2>/dev/null
+cp "$T/t26_orig.bin" "$T26_FILE"
+dfs_sync
+
+# Mark log position before the patch sequence so we can isolate T26's warnings.
+T26_LOG_MARK=$( wc -l < "$CURRENT_CLIENT_LOG" 2>/dev/null || echo 0 )
+
+# Wait for the healer to replicate the chunk to a 3rd node.
+# Healer: 10s initial delay + 15s interval → 30s guarantees at least one cycle.
+# This is the key condition for the bug: healer adds a node to the chunk's
+# location list; the next patch may target that node (which has the pre-patch
+# version) instead of the nodes that actually received the previous patch.
+echo "  Waiting 30s for healer to replicate chunk to 3rd node..."
+sleep 30
+
+# Apply 20 sequential patches to the same intra-chunk offset.
+cp "$T/t26_orig.bin" "$T/t26_expected.bin"
+for i in $(seq 1 20); do
+    dd if=/dev/urandom of="$T/t26_patch_${i}.bin" bs=4096 count=1 2>/dev/null
+    dd if="$T/t26_patch_${i}.bin" of="$T26_FILE" bs=4096 count=1 \
+        seek=$(( T26_PATCH_OFFSET / 4096 )) conv=notrunc 2>/dev/null
+    dd if="$T/t26_patch_${i}.bin" of="$T/t26_expected.bin" bs=4096 count=1 \
+        seek=$(( T26_PATCH_OFFSET / 4096 )) conv=notrunc 2>/dev/null
+done
+dfs_sync
+
+# Verify data correctness
+cp "$T26_FILE" "$T/t26_read.bin"
+m1=$(md5sum "$T/t26_expected.bin" | cut -d' ' -f1)
+m2=$(md5sum "$T/t26_read.bin"     | cut -d' ' -f1)
+[ "$m1" = "$m2" ] \
+    && check "T26a repeated-patch data integrity" PASS \
+    || check "T26a repeated-patch data integrity (exp $m1 got $m2)" FAIL
+
+# Check for stale-base warnings in the lines added since T26_LOG_MARK.
+# "stale base" appears when a patch targets a node that has an older version —
+# signature of the node-tracking bug where metadata_cache carries wrong nodes.
+STALE_COUNT=$( tail -n +"$T26_LOG_MARK" "$CURRENT_CLIENT_LOG" 2>/dev/null \
+               | grep "stale base" | wc -l )
+[ "$STALE_COUNT" -eq 0 ] \
+    && check "T26b no stale-base retries (node tracking correct)" PASS \
+    || check "T26b stale-base retries detected ($STALE_COUNT) — node tracking bug" FAIL
+
+if [ "$STALE_COUNT" -gt 0 ]; then
+    echo "  Stale-base detail:"
+    tail -n +"$T26_LOG_MARK" "$CURRENT_CLIENT_LOG" 2>/dev/null \
+        | grep "stale base\|MultiPatch.*replicas" | head -20 | sed 's/^/    /'
+fi
+
+rm -f "$T26_FILE" "$T/t26_orig.bin" "$T/t26_expected.bin" "$T/t26_read.bin" \
+      "$T"/t26_patch_*.bin 2>/dev/null || true
+fi # should_run T26
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

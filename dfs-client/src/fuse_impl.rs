@@ -559,14 +559,20 @@ impl FlushHandle {
                         let cached_loc = meta.chunk_location_for_idx(*chunk_idx).cloned();
                         let recent = self.client.recent_chunk_writes.get(&(ino, *chunk_idx))
                             .filter(|r| {
-                                let (_, fid, ts) = r.value();
+                                let (_, fid, ts, _) = r.value();
                                 *fid == file_id_legacy && ts.elapsed().as_secs() < 10
                             })
-                            .map(|r| r.value().0);
+                            .map(|r| {
+                                let (cid, _, _, nodes) = r.value();
+                                (*cid, nodes.clone())
+                            });
                         match (cached_loc, recent) {
-                            (Some(mut loc), Some(recent_id)) if recent_id != loc.chunk_id => {
+                            (Some(mut loc), Some((recent_id, recent_nodes))) if recent_id != loc.chunk_id => {
                                 loc.chunk_id = recent_id;
                                 loc.checksum = recent_id.hash;
+                                if !recent_nodes.is_empty() {
+                                    loc.nodes = recent_nodes;
+                                }
                                 Some(loc)
                             }
                             (loc, _) => loc,
@@ -641,7 +647,7 @@ impl FlushHandle {
                                 // Record the new chunk_id for fast lookup on the next write.
                                 self.client.recent_chunk_writes.insert(
                                     (ino, *chunk_idx),
-                                    (new_location.chunk_id, file_id_legacy, std::time::Instant::now()),
+                                    (new_location.chunk_id, file_id_legacy, std::time::Instant::now(), new_location.nodes.clone()),
                                 );
                                 // Evict the old chunk_id — the file at that hash path has been
                                 // renamed away on the server. Any cached entry for it would cause
@@ -714,7 +720,7 @@ impl FlushHandle {
                                               chunk_idx, old_location.chunk_id, new_location.chunk_id);
                                         self.client.recent_chunk_writes.insert(
                                             (ino, *chunk_idx),
-                                            (new_location.chunk_id, file_id_legacy, std::time::Instant::now()),
+                                            (new_location.chunk_id, file_id_legacy, std::time::Instant::now(), new_location.nodes.clone()),
                                         );
                                         if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
                                             if let Some(loc) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
@@ -1253,16 +1259,29 @@ impl FlushHandle {
                     let cached_loc = meta.chunk_location_for_idx(chunk_idx).cloned();
                     let recent = self.client.recent_chunk_writes.get(&(ino, chunk_idx))
                         .filter(|r| {
-                            let (_, fid, ts) = r.value();
+                            let (_, fid, ts, _) = r.value();
                             *fid == meta.id && ts.elapsed().as_secs() < 10
                         })
-                        .map(|r| r.value().0);
+                        .map(|r| {
+                            let (cid, _, _, nodes) = r.value();
+                            (*cid, nodes.clone())
+                        });
                     match (cached_loc, recent) {
-                        (Some(mut loc), Some(recent_id)) if recent_id != loc.chunk_id => {
-                            info!("flush_buffer_async_one: ino={} chunk={} using recent_chunk_writes id {} (cache had {})",
-                                ino, chunk_idx, recent_id, loc.chunk_id);
+                        (Some(mut loc), Some((recent_id, recent_nodes))) if recent_id != loc.chunk_id => {
+                            // Use the chunk_id AND the nodes from the most recent patch.
+                            // Using stale nodes from metadata_cache here causes the next patch
+                            // to target nodes that never received the previous patch (e.g. nodes
+                            // added by the healer between patches), producing stale-base retries.
+                            // Only override nodes if non-empty: empty means addr_to_node_id_snap
+                            // was not yet populated when the previous patch ran, so metadata_cache
+                            // nodes are a better fallback than an empty list.
+                            info!("flush_buffer_async_one: ino={} chunk={} using recent_chunk_writes id {} nodes={} (cache had id={} nodes={})",
+                                ino, chunk_idx, recent_id, recent_nodes.len(), loc.chunk_id, loc.nodes.len());
                             loc.chunk_id = recent_id;
                             loc.checksum = recent_id.hash;
+                            if !recent_nodes.is_empty() {
+                                loc.nodes = recent_nodes;
+                            }
                             Some(loc)
                         }
                         (loc, _) => loc,
@@ -1424,7 +1443,7 @@ impl FlushHandle {
                                             }
                                             self.client.recent_chunk_writes.insert(
                                                 (ino, chunk_idx),
-                                                (loc.chunk_id, file_id_at_flush_start.unwrap_or_default(), std::time::Instant::now()),
+                                                (loc.chunk_id, file_id_at_flush_start.unwrap_or_default(), std::time::Instant::now(), loc.nodes.clone()),
                                             );
                                             if let Some(state_arc) = self.write_buffers.get(&ino) {
                                                 let mut state = state_arc.lock().await;
@@ -1458,12 +1477,13 @@ impl FlushHandle {
                     let _ = skip_pairs; // skip_pairs dropped: cleanup is now broadcast
                     self.pending_old_chunks.lock().await.push(old_location.chunk_id);
 
-                    // Record the new chunk_id so the next flush of this slot (or rapid
-                    // successive writes) can use it directly without a metadata round-trip.
+                    // Record new chunk_id AND patched node list so the next flush uses
+                    // the correct nodes — not the stale node list from metadata_cache,
+                    // which may include healer-added nodes that never received this patch.
                     if let Some(file_id) = file_id_at_flush_start {
                         self.client.recent_chunk_writes.insert(
                             (ino, chunk_idx),
-                            (new_location.chunk_id, file_id, std::time::Instant::now()),
+                            (new_location.chunk_id, file_id, std::time::Instant::now(), new_location.nodes.clone()),
                         );
                     }
                     // Apply the patch to the cached base chunk so chunk_cache reflects the

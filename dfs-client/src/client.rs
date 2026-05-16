@@ -576,7 +576,7 @@ pub struct DfsClient {
     /// slot can bypass a full GetFileMetadata round-trip and go straight to a single-chunk
     /// GetFileChunkMap on failure — or use the cached id directly on the happy path.
     /// TTL is enforced by comparing the stored Instant against a 10s window at read time.
-    pub recent_chunk_writes: Arc<DashMap<(u64, u64), (ChunkId, FileId, Instant)>>,
+    pub recent_chunk_writes: Arc<DashMap<(u64, u64), (ChunkId, FileId, Instant, Vec<dfs_common::NodeId>)>>,
 }
 
 impl DfsClient {

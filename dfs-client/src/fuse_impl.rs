@@ -1972,6 +1972,15 @@ impl FlushHandle {
         if let Some(meta) = meta_to_persist {
             self.client.flush_metadata_sync(&meta).await;
             self.last_metadata_update.insert(ino, std::time::Instant::now());
+            // Re-feed the read engine AFTER metadata is committed to the server.
+            // flush_buffer_async_one feeds it per-chunk (before flush_metadata_sync),
+            // but a concurrent background refresh_engine call can race that window:
+            // it reads stale server metadata (old chunk_ids) and overwrites the engine,
+            // causing reads after fsync to try renamed-away chunks → EIO. By feeding
+            // again here, any stale refresh is corrected before fsync/release returns.
+            self.client.feed_chunk_locations_to_read_engine(
+                ino, &meta.chunk_locations, meta.size,
+            ).await;
         }
 
         // Metadata is committed. Now tombstone then delete old_chunk_id on the skip
@@ -5012,106 +5021,14 @@ impl Filesystem for DfsFilesystem {
                 release_in_flight.entry(ino).or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                // Seed the read engine and chunk cache from the write buffer before
-                // replying ok. This makes any read that arrives before the async flush
-                // completes (e.g. T7: echo > file; cat file) a local cache hit with no
-                // network round-trip — the same trick we use in the MultiPatch path.
-                //
-                // For each unflushed slot: compute the post-write chunk_id from the
-                // slot data (applying dirty ranges on top of any cached base), insert
-                // into chunk_cache, and push a synthetic ChunkLocation into the read
-                // engine. The async flush task will later confirm the server has the
-                // same hash; if it disagrees (stale base), the read engine gets updated
-                // again and any stale cache entry evicted.
-                //
-                // Cost: one blake3 hash per unflushed slot — pure CPU, no I/O. For
-                // a 4KB write this is ~2µs. For a full 4MB slot ~1ms. Either way it
-                // completes before the kernel processes the next syscall from userspace.
-                if let Some(state_arc) = self.write_buffers.get(&ino) {
-                    if let Ok(state) = state_arc.try_lock() {
-                        const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
-                        let mut seeded_locations: Vec<dfs_common::ChunkLocation> = Vec::new();
-                        for (&chunk_idx, slot) in &state.slots {
-                            if slot.data.is_empty() || slot.flushing { continue; }
-                            let file_offset = chunk_idx * CHUNK_SIZE_U64;
-                            // Build the full post-write bytes.
-                            // If a chunk already exists on the server, we need the full
-                            // pre-patch content to compute the correct post-patch hash.
-                            // If it's in chunk_cache, apply dirty ranges on top — result
-                            // is exact. If it's NOT cached, skip this slot: seeding a hash
-                            // computed from partial slot data would produce a wrong chunk_id
-                            // that points to a non-existent file on the server (I/O error).
-                            // Fresh writes (no existing chunk) use slot data directly — it
-                            // IS the full content.
-                            let existing_cid = self.metadata_cache.get(&ino)
-                                .and_then(|m| m.chunk_location_for_idx(chunk_idx).map(|l| l.chunk_id));
-                            let full_bytes: std::sync::Arc<Vec<u8>> = if let Some(cid) = existing_cid {
-                                if let Some(cached) = self.runtime.block_on(
-                                    self.client.chunk_cache.get(&cid)
-                                ) {
-                                    // Apply dirty ranges on top of cached base.
-                                    let mut base = (*cached).clone();
-                                    for &(s, e) in &slot.dirty_ranges {
-                                        let e = e.min(slot.data.len());
-                                        if e > base.len() { base.resize(e, 0); }
-                                        base[s..e].copy_from_slice(&slot.data[s..e]);
-                                    }
-                                    std::sync::Arc::new(base)
-                                } else {
-                                    // Existing chunk not in cache — can't compute correct
-                                    // post-patch hash. Skip seeding this slot.
-                                    continue;
-                                }
-                            } else {
-                                // Fresh write — slot data is the full chunk content.
-                                std::sync::Arc::new(slot.data.clone())
-                            };
-                            let new_hash = dfs_common::compute_chunk_hash_at(&full_bytes, file_offset);
-                            let new_cid = ChunkId::from_hash(new_hash);
-                            // Evict old cache entry, insert new.
-                            if let Some(old_cid) = self.metadata_cache.get(&ino)
-                                .and_then(|m| m.chunk_location_for_idx(chunk_idx).map(|l| l.chunk_id))
-                            {
-                                if old_cid != new_cid {
-                                    let client = self.client.clone();
-                                    self.runtime.spawn(async move {
-                                        client.chunk_cache.invalidate(&old_cid).await;
-                                    });
-                                }
-                            }
-                            let size = full_bytes.len();
-                            self.runtime.block_on(
-                                self.client.chunk_cache.insert(new_cid, full_bytes)
-                            );
-                            // Invalidate byte_range_cache and zero_gap_table for this chunk.
-                            // chunk_cache now has the authoritative post-write content; clearing
-                            // stale sub-range entries ensures reads fall through to chunk_cache
-                            // rather than returning old data from the sub-range cache.
-                            self.runtime.block_on(
-                                self.client.invalidate_byte_range_cache_for_chunk(ino, file_offset, CHUNK_SIZE)
-                            );
-                            seeded_locations.push(dfs_common::ChunkLocation {
-                                chunk_id: new_cid,
-                                nodes: vec![],
-                                size,
-                                checksum: new_cid.hash,
-                                file_offset: Some(file_offset),
-                                written_at: None,
-                            });
-                        }
-                        if !seeded_locations.is_empty() {
-                            let file_size = self.metadata_cache.get(&ino)
-                                .map(|m| m.size)
-                                .unwrap_or(0)
-                                .max(seeded_locations.iter()
-                                    .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
-                                    .max().unwrap_or(0));
-                            self.runtime.block_on(
-                                self.client.feed_chunk_locations_to_read_engine(ino, &seeded_locations, file_size)
-                            );
-                        }
-                    }
-                }
+                // NOTE: No pre-seeding of chunk_cache or read engine here.
+                // Reads during the flush window are served directly from the write buffer
+                // slot (see read() handler, write-buffer-read path). After the flush
+                // completes, flush_buffer_async_one updates chunk_cache and calls
+                // feed_chunk_locations_to_read_engine *before* removing the slot, so
+                // there is no window where reads can fall through to a missing chunk.
+                // Pre-seeding with block_on was blocking the FUSE dispatch thread under
+                // heavy write load (many files), causing FUSE timeouts and spurious EIO.
 
                 // Check if this file requires synchronous close. For correctness, we must wait
                 // for the flush to complete before replying in these cases:

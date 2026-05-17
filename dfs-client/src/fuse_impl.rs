@@ -578,6 +578,18 @@ impl FlushHandle {
                             (loc, _) => loc,
                         }
                     };
+                    // Enforce sorted-first-2: always patch the canonical pair of nodes (sorted
+                    // by NodeId, lowest two). The 3rd replica is healer-owned — we never target
+                    // it directly, so we can never get a stale-base from a healer-added node.
+                    // After the patch, the broadcast-delete tombstones the old chunk on every
+                    // node (including the 3rd) and the metadata update drops it from the map.
+                    let old_location_opt = old_location_opt.map(|mut loc| {
+                        if loc.nodes.len() > 2 {
+                            loc.nodes.sort_unstable();
+                            loc.nodes.truncate(2);
+                        }
+                        loc
+                    });
                     if let Some(old_location) = old_location_opt {
                         // Stale-write guard: discard if another session patched this chunk after our open().
                         let id_at_open = self.write_buffers.get(&ino)
@@ -613,9 +625,10 @@ impl FlushHandle {
                                 // fetching the single chunk location from the leader explicitly.
                                 warn!("flush_buffer_async: PatchChunk failed for slot {} ({}), fetching single chunk location", chunk_idx, e);
                                 match self.client.get_single_chunk_location(file_id_legacy, *chunk_idx).await {
-                                    Ok(Some(fresh_loc)) if fresh_loc.chunk_id != old_location.chunk_id => {
+                                    Ok(Some(mut fresh_loc)) if fresh_loc.chunk_id != old_location.chunk_id => {
                                         info!("flush_buffer_async: retrying PatchChunk slot {} with fresh location {} (was {})",
                                               chunk_idx, fresh_loc.chunk_id, old_location.chunk_id);
+                                        if fresh_loc.nodes.len() > 2 { fresh_loc.nodes.sort_unstable(); fresh_loc.nodes.truncate(2); }
                                         if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
                                             if let Some(existing) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
                                                 *existing = fresh_loc.clone();
@@ -631,10 +644,13 @@ impl FlushHandle {
                                             &fresh_loc,
                                         ).await
                                     }
-                                    Ok(Some(loc)) => self.client.patch_chunk_on_replicas_verified(
-                                        loc.chunk_id, file_id_legacy, *chunk_idx,
-                                        file_offset, patch_intra, patch_bytes.clone(), &loc,
-                                    ).await,
+                                    Ok(Some(mut loc)) => {
+                                        if loc.nodes.len() > 2 { loc.nodes.sort_unstable(); loc.nodes.truncate(2); }
+                                        self.client.patch_chunk_on_replicas_verified(
+                                            loc.chunk_id, file_id_legacy, *chunk_idx,
+                                            file_offset, patch_intra, patch_bytes.clone(), &loc,
+                                        ).await
+                                    }
                                     Ok(None) | Err(_) => Err(e),
                                 }
                             }
@@ -1289,6 +1305,18 @@ impl FlushHandle {
                         (loc, _) => loc,
                     }
                 };
+                // Enforce sorted-first-2: always patch the canonical pair of nodes (sorted
+                // by NodeId, lowest two). The 3rd replica is healer-owned — we never target
+                // it directly, so we can never get a stale-base from a healer-added node.
+                // After the patch, the broadcast-delete tombstones the old chunk on every
+                // node (including the 3rd) and the metadata update drops it from the map.
+                let old_location = old_location.map(|mut loc| {
+                    if loc.nodes.len() > 2 {
+                        loc.nodes.sort_unstable();
+                        loc.nodes.truncate(2);
+                    }
+                    loc
+                });
                 if let Some(old_location) = old_location {
                     // Stale-write guard: if another session already patched this chunk
                     // between our open() and now, the current chunk_id will differ from
@@ -1412,6 +1440,11 @@ impl FlushHandle {
                             } else {
                                 None
                             };
+                            // Apply sorted-first-2 to the fresh location too.
+                            let fresh_loc = fresh_loc.map(|mut loc| {
+                                if loc.nodes.len() > 2 { loc.nodes.sort_unstable(); loc.nodes.truncate(2); }
+                                loc
+                            });
 
                             match fresh_loc {
                                 Some(loc) => {

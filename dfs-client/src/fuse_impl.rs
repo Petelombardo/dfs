@@ -6554,73 +6554,35 @@ impl Filesystem for DfsFilesystem {
             }
             BLKZEROOUT => {
                 // Zero out a block range — used by parted/sgdisk before writing a new
-                // partition table. We honour this by writing zeros into the write buffer
-                // so that read-back verification after BLKZEROOUT sees zeros, not stale
-                // server data (e.g. an old GPT header from a previous install).
+                // partition table.
                 //
                 // This ioctl (0x800C581E) is direction=_IOC_READ, size=12: the caller
-                // expects 12 bytes of output. We return zeros (safe "not supported"
-                // default). The zero range is taken from _in_data if present (16-byte
-                // {from:u64, len:u64} or 12-byte {from:u64, len:u32}) or defaults to
-                // the first CHUNK_SIZE bytes of the file (covers the GPT header area).
-                const MAX_ZERO_BYTES: u64 = CHUNK_SIZE as u64;
+                // expects 12 bytes of output. We acknowledge success and return zeros.
+                //
+                // We deliberately do NOT write zeros into the write buffer or flush.
+                // Previous implementations did this, but caused partition table loss:
+                // Proxmox/QEMU calls BLKZEROOUT multiple times during disk management,
+                // including AFTER fdisk has written the partition table. Writing zeros
+                // to the buffer at that point erases committed user data. The callers
+                // (parted, sgdisk, fdisk) write the actual partition table immediately
+                // after BLKZEROOUT anyway, so zeroing the buffer is unnecessary — the
+                // real write always follows and overwrites whatever was there.
                 let (from, zero_len) = if _in_data.len() >= 16 {
                     let from = u64::from_ne_bytes(_in_data[0..8].try_into().unwrap());
                     let len  = u64::from_ne_bytes(_in_data[8..16].try_into().unwrap());
-                    (from, len.min(MAX_ZERO_BYTES))
+                    (from, len)
                 } else if _in_data.len() >= 12 {
                     let from = u64::from_ne_bytes(_in_data[0..8].try_into().unwrap());
                     let len  = u32::from_ne_bytes(_in_data[8..12].try_into().unwrap()) as u64 * 512;
-                    (from, len.min(MAX_ZERO_BYTES))
+                    (from, len)
                 } else {
-                    // No range data — zero the first chunk to clear any stale GPT header.
-                    (0u64, MAX_ZERO_BYTES)
+                    (0u64, 0u64)
                 };
                 let has_write_handle = self.write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
-                info!("ioctl: BLKZEROOUT for ino={} from={} len={} (in_data={}B, write_handle={})",
+                info!("ioctl: BLKZEROOUT for ino={} from={} len={} (in_data={}B, write_handle={}) — acknowledged, no buffer write",
                       ino, from, zero_len, _in_data.len(), has_write_handle);
-                if zero_len > 0 && has_write_handle {
-                    if !self.write_buffers.contains_key(&ino) {
-                        self.write_buffers.insert(ino, Arc::new(Mutex::new(InodeWriteState::new(false))));
-                    }
-                    if let Some(state_arc) = self.write_buffers.get(&ino).map(|e| e.clone()) {
-                        let zeros = vec![0u8; zero_len as usize];
-                        let mut state = state_arc.blocking_lock();
-                        let bytes_before = state.buffered_bytes();
-                        state.write_at(from, &zeros);
-                        let bytes_after = state.buffered_bytes();
-                        drop(state);
-                        let added = bytes_after.saturating_sub(bytes_before);
-                        if added > 0 {
-                            self.global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        let new_end = from + zero_len;
-                        let mut hwm = self.size_high_water.entry(ino).or_insert(0);
-                        if new_end > *hwm { *hwm = new_end; }
-                    }
-
-                    // Flush synchronously before returning — same as BLKFLSBUF. Without this,
-                    // the zeros sit in the write buffer and are committed asynchronously via the
-                    // metadata queue. If refresh_engine runs before the queue delivers (e.g.,
-                    // triggered by the next read), it fetches stale metadata from the leader
-                    // (the old chunk_id, which was just renamed away) and overwrites the read
-                    // engine, causing every subsequent read to return EIO.
-                    let runtime = self.runtime.clone();
-                    let flush_handle = self.flush_handle.clone();
-                    let out = vec![0u8; _out_size as usize];
-                    runtime.spawn(async move {
-                        if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
-                            error!("ioctl BLKZEROOUT: flush failed for ino={}: {}", ino, e);
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                        reply.ioctl(0, &out);
-                    });
-                } else {
-                    // No write handle or nothing to zero — return immediately.
-                    let out = vec![0u8; _out_size as usize];
-                    reply.ioctl(0, &out);
-                }
+                let out = vec![0u8; _out_size as usize];
+                reply.ioctl(0, &out);
             }
             BLKSECDISCARD => {
                 // Secure discard — used by mkswap, cryptsetup to securely erase data.

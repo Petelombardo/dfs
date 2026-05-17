@@ -308,6 +308,46 @@ async fn read_message(
                     }
                 }
 
+                // Split-frame MultiPatch: all patch Vec<u8> are empty as a signal.
+                // Raw payload: [4B len0][data0][4B len1][data1]... for each patch.
+                if let dfs_common::Message::Request(dfs_common::Request::MultiPatch { ref mut patches, .. }) = envelope.message {
+                    if !patches.is_empty() && patches.iter().all(|(_, d)| d.is_empty()) {
+                        while buf.len() < 4 {
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                                .map_err(|_| anyhow::anyhow!("Timeout reading MultiPatch payload length"))?
+                                .context("IO error reading MultiPatch payload length")?;
+                            if n == 0 { anyhow::bail!("Connection closed reading MultiPatch payload length"); }
+                        }
+                        let mut plen_bytes = [0u8; 4];
+                        plen_bytes.copy_from_slice(&buf[..4]);
+                        buf.advance(4);
+                        let plen = u32::from_be_bytes(plen_bytes) as usize;
+
+                        while buf.len() < plen {
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
+                                .map_err(|_| anyhow::anyhow!("Timeout reading MultiPatch payload"))?
+                                .context("IO error reading MultiPatch payload")?;
+                            if n == 0 { anyhow::bail!("Connection closed reading MultiPatch payload"); }
+                        }
+                        let raw = buf.split_to(plen);
+                        // Parse [4B len_i][data_i] for each patch in order.
+                        let mut pos = 0usize;
+                        for (_, data) in patches.iter_mut() {
+                            if pos + 4 > raw.len() {
+                                anyhow::bail!("MultiPatch split-frame: truncated length header");
+                            }
+                            let dlen = u32::from_be_bytes(raw[pos..pos+4].try_into().unwrap()) as usize;
+                            pos += 4;
+                            if pos + dlen > raw.len() {
+                                anyhow::bail!("MultiPatch split-frame: truncated patch data");
+                            }
+                            *data = raw[pos..pos+dlen].to_vec();
+                            pos += dlen;
+                        }
+                        debug!("Received split-frame MultiPatch: {} patches, {} bytes total", patches.len(), plen);
+                    }
+                }
+
                 return Ok(Some(envelope));
             }
         }

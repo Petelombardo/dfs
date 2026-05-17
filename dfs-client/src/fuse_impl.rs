@@ -6620,10 +6620,29 @@ impl Filesystem for DfsFilesystem {
                         let mut hwm = self.size_high_water.entry(ino).or_insert(0);
                         if new_end > *hwm { *hwm = new_end; }
                     }
+
+                    // Flush synchronously before returning — same as BLKFLSBUF. Without this,
+                    // the zeros sit in the write buffer and are committed asynchronously via the
+                    // metadata queue. If refresh_engine runs before the queue delivers (e.g.,
+                    // triggered by the next read), it fetches stale metadata from the leader
+                    // (the old chunk_id, which was just renamed away) and overwrites the read
+                    // engine, causing every subsequent read to return EIO.
+                    let runtime = self.runtime.clone();
+                    let flush_handle = self.flush_handle.clone();
+                    let out = vec![0u8; _out_size as usize];
+                    runtime.spawn(async move {
+                        if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
+                            error!("ioctl BLKZEROOUT: flush failed for ino={}: {}", ino, e);
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                        reply.ioctl(0, &out);
+                    });
+                } else {
+                    // No write handle or nothing to zero — return immediately.
+                    let out = vec![0u8; _out_size as usize];
+                    reply.ioctl(0, &out);
                 }
-                // Return _out_size zero bytes so the caller's output buffer is defined.
-                let out = vec![0u8; _out_size as usize];
-                reply.ioctl(0, &out);
             }
             BLKSECDISCARD => {
                 // Secure discard — used by mkswap, cryptsetup to securely erase data.

@@ -4988,7 +4988,19 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         if replica_addrs.is_empty() {
-            anyhow::bail!("MultiPatch: no replica addresses resolved for chunk {}", old_chunk_id);
+            // NodeIds in the chunk location don't resolve to any known address — the nodes
+            // that held this chunk are temporarily unreachable or their addr mapping is stale
+            // (e.g., after a node outage). Fall back to all cluster nodes: any node that has
+            // the correct base chunk will apply the patch; others will return ChunkStale and
+            // we retry with their authoritative id. This lets writes proceed rather than
+            // blocking indefinitely with "no replica addresses resolved".
+            warn!("MultiPatch: no replica addresses resolved for chunk {} (location has {} node(s)), falling back to all {} cluster nodes",
+                  old_chunk_id, current_location.nodes.len(), all_cluster_nodes.len());
+            replica_addrs = all_cluster_nodes.clone();
+        }
+
+        if replica_addrs.is_empty() {
+            anyhow::bail!("MultiPatch: no cluster nodes available for chunk {}", old_chunk_id);
         }
 
         let leader_addr = *self.leader_addr.read().await;

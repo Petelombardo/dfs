@@ -1476,8 +1476,16 @@ impl FlushHandle {
                     // flush_all_pipelined tombstones + deletes it from ALL cluster nodes,
                     // not just the dual-RF skip node — clearing healer copies everywhere.
                     // skip_pairs is no longer used; old_chunk_id covers the same need.
+                    //
+                    // Guard: only queue cleanup when the chunk actually changed. If the
+                    // patch was idempotent (same bytes already on disk → same hash →
+                    // old_chunk_id == new_chunk_id), pushing old_chunk_id would broadcast-
+                    // delete the live current chunk, making it unreadable (EIO) even though
+                    // metadata still references it.
                     let _ = skip_pairs; // skip_pairs dropped: cleanup is now broadcast
-                    self.pending_old_chunks.lock().await.push(old_location.chunk_id);
+                    if old_location.chunk_id != new_location.chunk_id {
+                        self.pending_old_chunks.lock().await.push(old_location.chunk_id);
+                    }
 
                     // Record new chunk_id AND patched node list so the next flush uses
                     // the correct nodes — not the stale node list from metadata_cache,

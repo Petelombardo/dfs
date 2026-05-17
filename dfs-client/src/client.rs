@@ -4988,15 +4988,47 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         if replica_addrs.is_empty() {
-            // NodeIds in the chunk location don't resolve to any known address — the nodes
-            // that held this chunk are temporarily unreachable or their addr mapping is stale
-            // (e.g., after a node outage). Fall back to all cluster nodes: any node that has
-            // the correct base chunk will apply the patch; others will return ChunkStale and
-            // we retry with their authoritative id. This lets writes proceed rather than
-            // blocking indefinitely with "no replica addresses resolved".
-            warn!("MultiPatch: no replica addresses resolved for chunk {} (location has {} node(s)), falling back to all {} cluster nodes",
-                  old_chunk_id, current_location.nodes.len(), all_cluster_nodes.len());
-            replica_addrs = all_cluster_nodes.clone();
+            // NodeIds in the chunk location don't resolve — addr↔NodeId map is stale.
+            // Step 1: refresh cluster membership to rebuild the map, then retry resolution.
+            // Step 2: if still unresolvable, query the leader for the current authoritative
+            //         chunk location (may list different NodeIds after healer moved the chunk).
+            // Step 3: last resort — broadcast to all cluster nodes and let stale-base
+            //         retry find the correct holder.
+            warn!("MultiPatch: no replica addresses resolved for chunk {} ({} location node(s)) — refreshing cluster nodes",
+                  old_chunk_id, current_location.nodes.len());
+            let _ = self.refresh_cluster_nodes().await;
+
+            let refreshed_node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
+                let addr_map = self.addr_to_node_id.read().await;
+                addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
+            };
+            replica_addrs = current_location.nodes.iter()
+                .filter_map(|nid| refreshed_node_id_to_addr.get(nid).copied())
+                .collect();
+
+            if replica_addrs.is_empty() {
+                warn!("MultiPatch: chunk {} NodeIds still unresolved after cluster refresh — querying leader for current location",
+                      old_chunk_id);
+                if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+                    if let Ok(Some(fresh_loc)) = self.get_single_chunk_location(fid, cidx).await {
+                        let fresh_addrs: Vec<SocketAddr> = fresh_loc.nodes.iter()
+                            .filter_map(|nid| refreshed_node_id_to_addr.get(nid).copied())
+                            .collect();
+                        if !fresh_addrs.is_empty() {
+                            info!("MultiPatch: resolved {} replica(s) for chunk {} via leader query",
+                                  fresh_addrs.len(), old_chunk_id);
+                            replica_addrs = fresh_addrs;
+                            current_location = fresh_loc;
+                        }
+                    }
+                }
+            }
+
+            if replica_addrs.is_empty() {
+                warn!("MultiPatch: falling back to all {} cluster nodes for chunk {}",
+                      all_cluster_nodes.len(), old_chunk_id);
+                replica_addrs = all_cluster_nodes.clone();
+            }
         }
 
         if replica_addrs.is_empty() {

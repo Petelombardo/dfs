@@ -998,7 +998,7 @@ impl FlushHandle {
         // Pick the lowest-index unclaimed full slot, falling back to the lowest idle slot.
         // Atomically set flushing=true while holding the mutex so no second concurrent
         // task can claim the same slot.
-        let (chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges) = {
+        let (chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap) = {
             let Some(state_arc) = self.write_buffers.get(&ino) else { return Ok(()); };
             let mut state = state_arc.lock().await;
 
@@ -1085,11 +1085,12 @@ impl FlushHandle {
             slot.flushing = true;
 
             let data = slot.data.clone();
+            let last_modified_snap = slot.last_modified;
             let gap_filled_prefix = slot.gap_filled_prefix;
             let real_data_end = slot.real_data_end;
             let dirty_ranges = slot.dirty_ranges.clone();
             let offset = idx * CHUNK_SIZE as u64;
-            (idx, data, offset, gap_filled_prefix, real_data_end, dirty_ranges)
+            (idx, data, offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap)
             // mutex released here
         };
 
@@ -1118,19 +1119,20 @@ impl FlushHandle {
                 let mut state = state_arc.lock().await;
                 if let Some(slot) = state.slots.get_mut(&chunk_idx) {
                     let data = slot.data.clone();
+                    let last_modified_snap = slot.last_modified;
                     let gap_filled_prefix = slot.gap_filled_prefix;
                     let real_data_end = slot.real_data_end;
                     let dirty_ranges = slot.dirty_ranges.clone();
                     let file_offset = chunk_idx * CHUNK_SIZE as u64;
                     drop(state);
-                    return self.flush_buffer_async_one(ino, chunk_idx, data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges).await;
+                    return self.flush_buffer_async_one(ino, chunk_idx, data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap).await;
                 }
                 info!("flush_one_chunk: ino={} chunk={} slot gone after wait — already flushed elsewhere", ino, chunk_idx);
             }
         } // write_tasks_in_flight guard
         } // gap_filled_prefix guard
 
-        self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges).await
+        self.flush_buffer_async_one(ino, chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap).await
     }
 
     /// Notify any waiters for this chunk and remove the notifier.
@@ -1154,7 +1156,7 @@ impl FlushHandle {
     /// Slot data, file offset, gap_filled_prefix, real_data_end, and dirty_ranges are all
     /// pre-snapshotted by flush_one_chunk while holding the mutex. Reading these from the
     /// live slot after release is wrong — the slot may have been removed and recreated.
-    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, slot_data: Vec<u8>, file_offset: u64, gap_filled_prefix: usize, real_data_end: usize, dirty_ranges: Vec<(usize, usize)>) -> Result<()> {
+    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, slot_data: Vec<u8>, file_offset: u64, gap_filled_prefix: usize, real_data_end: usize, dirty_ranges: Vec<(usize, usize)>, last_modified_snap: SystemTime) -> Result<()> {
 
         // Snapshot the file ID now. After the network write we'll verify it hasn't changed —
         // a delete+create can replace the file while the flush is in flight, and the new
@@ -1551,9 +1553,13 @@ impl FlushHandle {
                     // data arrived while the patch was in-flight (concurrent write() added
                     // bytes or dirty ranges beyond what we just patched). In that case,
                     // keep the slot with flushing=false so the next flush cycle picks it up.
-                    // This mirrors the fresh-write path's current_len > flushed_len guard.
                     // Without this check, writes that land during a patch are silently dropped:
-                    // the slot is removed, taking with it any dirty_ranges beyond the patch window.
+                    // the slot is removed, taking with it any dirty_ranges within the patch window.
+                    // We detect concurrent writes via BOTH:
+                    //   - current_len > patched_len: an append extended the slot
+                    //   - last_modified > last_modified_snap: an overwrite updated existing bytes
+                    // The length check alone misses same-region overwrites (T26: 20 sequential
+                    // patches at the same 1MB intra-chunk offset each leave slot len unchanged).
                     let patched_len = slot_data.len(); // snapshot length = what we actually sent
                     if let Some(state_arc) = self.write_buffers.get(&ino) {
                         let mut state = state_arc.lock().await;
@@ -1563,8 +1569,10 @@ impl FlushHandle {
                             _ => true,
                         };
                         if id_ok {
-                            let current_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
-                            if current_len > patched_len {
+                            let new_data_arrived = state.slots.get(&chunk_idx).map(|s| {
+                                s.data.len() > patched_len || s.last_modified > last_modified_snap
+                            }).unwrap_or(false);
+                            if new_data_arrived {
                                 // New data arrived during the patch — keep slot, update flushed_sizes
                                 // so the next flush knows where the server's content ends.
                                 state.flushed_sizes.insert(chunk_idx, patched_len);

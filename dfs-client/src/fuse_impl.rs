@@ -1412,6 +1412,28 @@ impl FlushHandle {
                         }
                     };
 
+                    // Pre-tombstone: when we know the patch is non-idempotent (expected hash
+                    // differs from current), mark the old chunk as dead on all cluster nodes
+                    // concurrently with the patch. This closes the healer race window —
+                    // the old chunk is dead before the patch lands, so the healer can never
+                    // copy it to new nodes and create a stale-base situation.
+                    // Only fires when expected_new_chunk_id is known (cache was warm) and
+                    // the patch will actually change the chunk (guards against idempotent writes
+                    // that would otherwise delete a live chunk).
+                    if let Some(expected_new) = expected_new_chunk_id {
+                        if expected_new != old_location.chunk_id {
+                            let client_t = self.client.clone();
+                            let old_id = old_location.chunk_id;
+                            tokio::spawn(async move {
+                                let nodes = client_t.cluster_nodes.read().await.clone();
+                                futures::future::join_all(nodes.iter().map(|&addr| {
+                                    let c = client_t.clone();
+                                    async move { c.tombstone_chunk_on_node(addr, old_id).await }
+                                })).await;
+                            });
+                        }
+                    }
+
                     // Send all dirty ranges in a single MultiPatch RPC — one round trip,
                     // atomic server-side write+rename, no read-back when hash is pre-computed.
                     // Pass file_id + chunk_idx so the server validates chunk_id and returns

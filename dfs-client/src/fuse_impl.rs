@@ -1243,10 +1243,30 @@ impl FlushHandle {
             covered < slot_len && dirty_ranges.len() > 1
         };
         let is_sparse_write = has_sparse_gaps && !is_truncated_session;
-        let needs_patch = is_overwrite || is_append_extend || is_mixed_extend || is_sparse_write;
+        // Full-chunk replacement: all bytes newly written from offset 0, covering the entire
+        // existing chunk, no gap-fill prefix. We have the complete new content in slot_data,
+        // so we skip MultiPatch (which forces the server to read the old chunk) and use the
+        // fresh write path instead — parallel dual-replica write, no server disk read.
+        // The old chunk_id is queued for broadcast-delete cleanup afterward.
+        let is_full_replacement = is_overwrite
+            && gap_filled_prefix == 0
+            && dirty_ranges.len() == 1
+            && dirty_ranges[0].0 == 0
+            && dirty_ranges[0].1 >= existing_chunk_size;
 
-        info!("flush_buffer_async_one: ino={} chunk={} decision: chunk_exists={} is_overwrite={} is_append_extend={} is_mixed_extend={} is_sparse_write={} needs_patch={} is_truncated_session={}",
-              ino, chunk_idx, chunk_exists, is_overwrite, is_append_extend, is_mixed_extend, is_sparse_write, needs_patch, is_truncated_session);
+        // Capture old chunk_id before bypassing the patch path (needed for cleanup).
+        let full_replacement_old_chunk_id: Option<dfs_common::ChunkId> = if is_full_replacement {
+            self.metadata_cache.get(&ino)
+                .and_then(|m| m.chunk_location_for_idx(chunk_idx).map(|l| l.chunk_id))
+        } else {
+            None
+        };
+
+        let needs_patch = (is_overwrite && !is_full_replacement)
+            || is_append_extend || is_mixed_extend || is_sparse_write;
+
+        info!("flush_buffer_async_one: ino={} chunk={} decision: chunk_exists={} is_overwrite={} is_append_extend={} is_mixed_extend={} is_sparse_write={} is_full_replacement={} needs_patch={} is_truncated_session={}",
+              ino, chunk_idx, chunk_exists, is_overwrite, is_append_extend, is_mixed_extend, is_sparse_write, is_full_replacement, needs_patch, is_truncated_session);
 
         if needs_patch {
             // Build the patch list:
@@ -1713,6 +1733,29 @@ impl FlushHandle {
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     let mut state = state_arc.lock().await;
                     state.flushed_sizes.insert(chunk_idx, flushed_len);
+                }
+
+                // Full-chunk replacement: update recent_chunk_writes with the new nodes so
+                // the next patch targets the correct sorted-first-2, and queue the old chunk
+                // for broadcast-delete cleanup. Guard against idempotent writes (same content
+                // → same chunk_id) to avoid deleting the live chunk.
+                if is_full_replacement {
+                    if let Some(loc) = locations.first() {
+                        if let Some(file_id) = file_id_at_flush_start {
+                            let mut sorted_nodes = loc.nodes.clone();
+                            sorted_nodes.sort_unstable();
+                            sorted_nodes.truncate(2);
+                            self.client.recent_chunk_writes.insert(
+                                (ino, chunk_idx),
+                                (loc.chunk_id, file_id, std::time::Instant::now(), sorted_nodes),
+                            );
+                        }
+                        if let Some(old_cid) = full_replacement_old_chunk_id {
+                            if loc.chunk_id != old_cid {
+                                self.pending_old_chunks.lock().await.push(old_cid);
+                            }
+                        }
+                    }
                 }
 
                 // Fetch metadata if not cached

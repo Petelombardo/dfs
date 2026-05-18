@@ -3312,7 +3312,12 @@ impl Filesystem for DfsFilesystem {
                     };
                     if safe_to_remove {
                         self.write_buffers.remove(&ino);
-                        self.client.evict_recent_chunk_writes(ino);
+                        // Do NOT evict recent_chunk_writes here. For VM disks, QEMU opens and
+                        // closes the file every few seconds (BLKFLSBUF cycles). Evicting on every
+                        // close wipes the chunk-ID cache, forcing every subsequent patch to use the
+                        // stale metadata_cache (leader hasn't received async updates yet) and
+                        // incur a stale-base retry. The 10-second TTL in recent_chunk_writes
+                        // handles natural expiry; file_id filtering prevents cross-file pollution.
                     }
                     // Clear any pending truncate flag — new write session starts clean.
                     self.truncated_inodes.remove(&ino);
@@ -5300,10 +5305,9 @@ impl Filesystem for DfsFilesystem {
                     if !has_new_writer {
                         write_buffers.remove(&ino);
                         size_high_water_for_release.remove(&ino);
-                        flush_handle.client.evict_recent_chunk_writes(ino);
-                        // Drop all per-chunk write locks for this inode. Any task still
-                        // holding a guard will keep it alive via Arc until it drops;
-                        // removing the map entry just prevents new waiters from queuing.
+                        // Do NOT evict recent_chunk_writes here — see open() is_first_writer
+                        // comment. QEMU closes and reopens the disk every few seconds; evicting
+                        // on close triggers the stale-base cascade on the very next open.
                         chunk_write_locks_for_release.remove(&ino);
                     }
                     if let Some(owner) = lock_owner {
@@ -5432,10 +5436,7 @@ impl Filesystem for DfsFilesystem {
                     if !has_new_writer {
                         write_buffers.remove(&ino);
                         size_high_water_for_release.remove(&ino);
-                        flush_handle.client.evict_recent_chunk_writes(ino);
-                        // Drop all per-chunk write locks for this inode. Any task still
-                        // holding a guard will keep it alive via Arc until it drops;
-                        // removing the map entry just prevents new waiters from queuing.
+                        // Do NOT evict recent_chunk_writes — see sync release path comment.
                         chunk_write_locks_for_release.remove(&ino);
                     }
                     if let Some(owner) = lock_owner {

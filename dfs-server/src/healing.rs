@@ -465,10 +465,16 @@ impl HealingManager {
                         continue;
                     }
                     if prev_candidates.contains(&chunk_id) {
-                        debug!("Purging orphaned chunk location record: {}", chunk_id);
+                        debug!("Purging orphaned chunk location record and physical file: {}", chunk_id);
                         if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
                             warn!("Failed to purge orphaned chunk location {}: {}", chunk_id, e);
                         } else {
+                            // Also delete the physical file on this node — the routing table
+                            // purge alone leaves chunk files on disk indefinitely (e.g. after
+                            // a node misses DeleteChunk RPCs while offline).
+                            if let Err(e) = self.storage.delete_chunk(&chunk_id) {
+                                debug!("Orphan {} not on local disk (ok): {}", chunk_id, e);
+                            }
                             purged_orphans.push(chunk_id);
                         }
                         self.pending_healing.write().await.remove(&chunk_id);

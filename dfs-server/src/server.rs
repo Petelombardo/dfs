@@ -1601,6 +1601,13 @@ impl Server {
             if let Err(e) = self.metadata.delete_chunk_location(chunk_id) {
                 warn!("Failed to purge chunk location {}: {}", chunk_id, e);
                 failed += 1;
+            } else {
+                // Also delete the physical file — followers that missed DeleteChunk RPCs
+                // while offline accumulate orphaned chunk files that routing-table-only
+                // purges would leave on disk forever.
+                if let Err(e) = self.storage.delete_chunk(chunk_id) {
+                    debug!("Orphan {} not on local disk (ok): {}", chunk_id, e);
+                }
             }
         }
         if failed == 0 {

@@ -1562,6 +1562,143 @@ rm -f "$T26_FILE" "$T/t26_orig.bin" "$T/t26_expected.bin" "$T/t26_read.bin" \
       "$T"/t26_patch_*.bin 2>/dev/null || true
 fi # should_run T26
 
+# ── Test 27: sparse-patch gap-fill corruption regression ──────────────────────
+# Verifies two flush_buffer_async code paths that were sending zero-filled buffer
+# bytes to the server, overwriting real data in the gaps between writes.
+#
+#   T27a — is_overwrite + sparse dirty_ranges:
+#     Two non-adjacent writes to the same chunk in one session (no intermediate
+#     sync). The gap between them has real server data that must be preserved.
+#     Before the fix: batch flush sent slot_data[gap_filled_prefix..effective_end]
+#     as one block, zeroing the gap. Fix: sparse dirty_ranges delegates to
+#     MultiPatch, which sends only the actually-written byte ranges.
+#
+#   T27b — is_append_extend + gap_filled_prefix > existing_chunk_size:
+#     A partial flush (fsync within the same session) sets flushed_sizes[0]=N.
+#     A subsequent write at offset M > N triggers is_append_extend with
+#     gap_filled_prefix=M > existing_chunk_size=N. The gap N..M has real server
+#     data that must be preserved. Before the fix: patch started at existing_chunk_size
+#     (N), sending zeros for N..M. Fix: patch starts at gap_filled_prefix (M).
+#
+# Both bugs corrupt GPT/inode-bitmap data during OS install: GRUB writes MBR at
+# byte 0 and the core image at byte 1MB, leaving the GPT partition table in the
+# gap — that gap was getting zeroed and corrupting the disk.
+if should_run T27; then
+snapshot_log T27
+echo ""
+echo "=== T27: sparse-patch gap-fill corruption regression ==="
+
+T27_IMG="$MOUNT/t27_disk.raw"
+
+# 4MB base image with a never-zero repeating pattern so every byte is checkable.
+# Pattern: byte at offset i = (i % 251) + 1   (range 1-251, never 0)
+echo "  Writing 4MB base image with known pattern..."
+python3 -c "
+import sys
+CHUNK = 4 * 1024 * 1024
+sys.stdout.buffer.write(bytes([(i % 251) + 1 for i in range(CHUNK)]))
+" > "$T/t27_base.bin"
+cp "$T/t27_base.bin" "$T27_IMG"
+dfs_sync
+
+# ── T27a: is_overwrite with sparse dirty_ranges ────────────────────────────────
+echo "  T27a: two non-adjacent writes to same chunk, no intermediate sync..."
+python3 - "$T27_IMG" << 'PYEOF'
+import os, sys
+img = sys.argv[1]
+fd = os.open(img, os.O_RDWR)
+
+# Write 1: bytes 0-511
+os.lseek(fd, 0, os.SEEK_SET)
+os.write(fd, b'PATCHA__' + b'\xab' * 504)   # 512 bytes
+
+# Write 2: bytes 65536-66047  (64KB gap at 512..65535 has original pattern)
+os.lseek(fd, 65536, os.SEEK_SET)
+os.write(fd, b'PATCHB__' + b'\xcd' * 504)   # 512 bytes
+
+# No intermediate sync — both writes are buffered together at close time.
+# flush_buffer_async sees is_overwrite with dirty_ranges=[(0,512),(65536,66048)].
+os.close(fd)
+PYEOF
+
+T27A_RESULT=$(python3 - "$T27_IMG" "$T/t27_base.bin" << 'PYEOF'
+import sys
+img_path, base_path = sys.argv[1], sys.argv[2]
+with open(img_path, 'rb') as f:
+    data = f.read(66048)
+with open(base_path, 'rb') as f:
+    base = f.read(66048)
+errors = []
+if data[:8] != b'PATCHA__':
+    errors.append(f"patch A missing at 0: {data[:8]!r}")
+if data[65536:65536+8] != b'PATCHB__':
+    errors.append(f"patch B missing at 65536: {data[65536:65536+8]!r}")
+# Gap at 512..65535 must NOT be zeroed — must still hold original pattern.
+bad = [(i, data[i], base[i]) for i in range(512, 65536) if data[i] != base[i]]
+if bad:
+    sample = ', '.join(f'off={o} got={g:#04x} want={w:#04x}' for o,g,w in bad[:3])
+    errors.append(f"gap corrupted ({len(bad)} bytes): {sample}")
+print("PASS" if not errors else "FAIL: " + "; ".join(errors))
+PYEOF
+)
+[[ "$T27A_RESULT" == PASS* ]] \
+    && check "T27a sparse is_overwrite: gap bytes preserved" PASS \
+    || check "T27a sparse is_overwrite: gap bytes corrupted ($T27A_RESULT)" FAIL
+
+# ── T27b: is_append_extend with gap_filled_prefix > existing_chunk_size ────────
+echo "  T27b: is_append_extend gap — fsync mid-session then write past flush point..."
+cp "$T/t27_base.bin" "$T27_IMG"
+dfs_sync
+
+python3 - "$T27_IMG" << 'PYEOF'
+import os, sys
+img = sys.argv[1]
+fd = os.open(img, os.O_RDWR)
+
+# Write 12KB header at offset 0, then fsync within the same session.
+# This sets flushed_sizes[chunk 0] = 12288 WITHOUT closing the file.
+os.lseek(fd, 0, os.SEEK_SET)
+os.write(fd, b'HEADER__' + b'\x42' * (12288 - 8))
+os.fsync(fd)   # flush_all_pipelined: chunk 0 patched, flushed_sizes[0]=12288
+
+# Write 4KB at offset 16384 — there is a 4KB gap at 12288..16383.
+# The server chunk still has original pattern data at 12288..16383.
+# gap_filled_prefix becomes 16384 (> existing_chunk_size=12288).
+# is_append_extend fires. Bug: sends slot_data[12288..] zeroing the gap.
+# Fix: sends slot_data[16384..] starting at gap_filled_prefix.
+os.lseek(fd, 16384, os.SEEK_SET)
+os.write(fd, b'RECORD__' + b'\xcc' * (4096 - 8))
+
+os.close(fd)
+PYEOF
+
+T27B_RESULT=$(python3 - "$T27_IMG" "$T/t27_base.bin" << 'PYEOF'
+import sys
+img_path, base_path = sys.argv[1], sys.argv[2]
+with open(img_path, 'rb') as f:
+    data = f.read(16384 + 4096)
+with open(base_path, 'rb') as f:
+    base = f.read(16384 + 4096)
+errors = []
+if data[:8] != b'HEADER__':
+    errors.append(f"header missing at 0: {data[:8]!r}")
+if data[16384:16384+8] != b'RECORD__':
+    errors.append(f"record missing at 16384: {data[16384:16384+8]!r}")
+# Gap at 12288..16383 must NOT be zeroed — original pattern must be intact.
+bad = [(i, data[i], base[i]) for i in range(12288, 16384) if data[i] != base[i]]
+if bad:
+    sample = ', '.join(f'off={o} got={g:#04x} want={w:#04x}' for o,g,w in bad[:3])
+    errors.append(f"gap corrupted ({len(bad)} bytes): {sample}")
+print("PASS" if not errors else "FAIL: " + "; ".join(errors))
+PYEOF
+)
+[[ "$T27B_RESULT" == PASS* ]] \
+    && check "T27b append-extend gap preserved (gap_filled_prefix > existing)" PASS \
+    || check "T27b append-extend gap corrupted ($T27B_RESULT)" FAIL
+
+rm -f "$T27_IMG" "$T/t27_base.bin"
+fi # should_run T27
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

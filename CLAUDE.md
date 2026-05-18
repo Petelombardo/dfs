@@ -11,6 +11,7 @@ We run one service in staging, a hdhomerun dvr.  It runs from /mnt/test/podman/d
 Band-aids to the code are a last-resort.  We should always try to fix the underlying problem at its root.
 Propose protocol updates if they will make our app more efficient.
 Do not push code until we verify that we do not have regressions.  Our test script is ./scripts/test_local_suite.sh
+Do not run the test suite, let the user run it and report issues.
 
 ## Local test suite
 

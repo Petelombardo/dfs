@@ -208,6 +208,15 @@ impl HealingManager {
                 was_leader = is_leader;
             }
 
+            // Disk orphan sweep: runs on EVERY node every 5 cycles (5 minutes).
+            // Must run on followers too — they accumulate orphaned files when they miss
+            // DeleteChunk RPCs while offline. Intentionally before the is_leader gate.
+            disk_sweep_counter += 1;
+            if disk_sweep_counter >= 5 {
+                disk_sweep_counter = 0;
+                self.run_disk_orphan_sweep().await;
+            }
+
             if !is_leader {
                 continue;
             }
@@ -228,15 +237,6 @@ impl HealingManager {
                 if let Err(e) = self.cleanup_stale_pending().await {
                     warn!("Pending healing cleanup error: {}", e);
                 }
-            }
-
-            // Disk orphan sweep: runs on every node every 5 cycles (5 minutes).
-            // Deletes chunk files whose routing table entries are gone — catches nodes
-            // that missed DeleteChunk RPCs while offline.
-            disk_sweep_counter += 1;
-            if disk_sweep_counter >= 5 {
-                disk_sweep_counter = 0;
-                self.run_disk_orphan_sweep().await;
             }
         }
     }

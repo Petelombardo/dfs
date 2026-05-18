@@ -506,11 +506,11 @@ impl FlushHandle {
             // real data was appended beyond. Use gap_filled_prefix (set explicitly when we
             // zero-fill) rather than checking for all-zeros — the all-zeros heuristic was
             // wrong when the server's real chunk 0 data happened to start with zeros.
-            let (gap_filled_prefix, real_data_end) = {
+            let (gap_filled_prefix, real_data_end, dirty_ranges_snap) = {
                 let state_lock = self.write_buffers.get(&ino);
                 state_lock.and_then(|s| s.try_lock().ok()
-                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| (sl.gap_filled_prefix, sl.real_data_end))))
-                    .unwrap_or((0, 0))
+                    .and_then(|st| st.slots.get(&chunk_idx).map(|sl| (sl.gap_filled_prefix, sl.real_data_end, sl.dirty_ranges.clone()))))
+                    .unwrap_or((0, 0, Vec::new()))
             };
             // is_append_extend also covers the full-chunk case: if the slot grew to exactly
             // 4MB but started with a gap-filled prefix (bytes already on server), we must
@@ -538,9 +538,29 @@ impl FlushHandle {
             let needs_patch = is_overwrite || is_append_extend;
 
             if needs_patch {
+                // For in-place overwrites, if dirty_ranges has multiple non-adjacent entries,
+                // the gap bytes between them are zeros in the slot buffer but hold real data
+                // on the server. A single-range patch (gap_filled_prefix..effective_write_end)
+                // would include those zeros and corrupt the server (e.g. two writes to the
+                // same chunk at offsets 0 and 1MB — the gap at 4KB..1MB gets zeroed).
+                // mark_dirty() merges adjacent ranges, so len > 1 always implies real gaps.
+                // Delegate to flush_buffer_async_one which uses MultiPatch for these cases.
+                if is_overwrite && dirty_ranges_snap.len() > 1 {
+                    info!("flush_buffer_async: slot {} is_overwrite with {} sparse dirty ranges — deferring to MultiPatch path",
+                          chunk_idx, dirty_ranges_snap.len());
+                    slots_to_write.push((*chunk_idx, slot_data, file_offset));
+                    continue;
+                }
+
                 let (patch_intra, patch_bytes) = if is_append_extend {
-                    // Send only the new appended bytes, starting at the old chunk boundary.
-                    (existing_chunk_size, slot_data[existing_chunk_size..].to_vec())
+                    // Send only the new appended bytes, starting at gap_filled_prefix (not
+                    // existing_chunk_size). When gap_filled_prefix > existing_chunk_size (e.g.
+                    // a prior flush wrote 446 bytes, but the next write starts at byte 1MB),
+                    // using existing_chunk_size would include the zero-filled gap 446..1MB
+                    // and overwrite real server data (GPT entries, partition headers, etc.).
+                    // When gap_filled_prefix == existing_chunk_size (normal DVR append),
+                    // behavior is unchanged.
+                    (gap_filled_prefix, slot_data[gap_filled_prefix..].to_vec())
                 } else {
                     // In-place overwrite: send only the real app-written bytes.
                     // Use real_data_end to bound the patch so gap-fill zeros beyond the
@@ -6502,6 +6522,24 @@ impl Filesystem for DfsFilesystem {
                 }
             }
         });
+    }
+
+    fn poll(
+        &mut self,
+        _req: &FuseRequest,
+        _ino: u64,
+        _fh: u64,
+        _ph: fuser::PollHandle,
+        _events: u32,
+        _flags: u32,
+        reply: fuser::ReplyPoll,
+    ) {
+        // Regular files are always ready for both reads and writes.
+        // Returning POLLIN|POLLOUT avoids ENOSYS, which breaks QEMU's async
+        // I/O completion notification (FUSE_POLL_SCHEDULE_NOTIFY) and causes
+        // it to fall back to periodic polling — introducing timing gaps that
+        // manifest as transient errors after partition table writes.
+        reply.poll(libc::POLLIN as u32 | libc::POLLOUT as u32);
     }
 
     fn ioctl(

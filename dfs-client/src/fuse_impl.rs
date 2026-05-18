@@ -580,7 +580,7 @@ impl FlushHandle {
                         let recent = self.client.recent_chunk_writes.get(&(ino, *chunk_idx))
                             .filter(|r| {
                                 let (_, fid, ts, _) = r.value();
-                                *fid == file_id_legacy && ts.elapsed().as_secs() < 10
+                                *fid == meta.id && ts.elapsed().as_secs() < 120
                             })
                             .map(|r| {
                                 let (cid, _, _, nodes) = r.value();
@@ -1318,7 +1318,7 @@ impl FlushHandle {
                     let recent = self.client.recent_chunk_writes.get(&(ino, chunk_idx))
                         .filter(|r| {
                             let (_, fid, ts, _) = r.value();
-                            *fid == meta.id && ts.elapsed().as_secs() < 10
+                            *fid == meta.id && ts.elapsed().as_secs() < 120
                         })
                         .map(|r| {
                             let (cid, _, _, nodes) = r.value();

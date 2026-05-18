@@ -1656,8 +1656,36 @@ impl Server {
 
     async fn handle_replicate_chunk_locations(&self, locations: Vec<ChunkLocation>) -> Response {
         debug!("Handling batch replicate of {} chunk locations", locations.len());
+
+        // Build the live chunk set once. Only accept locations for chunks that are
+        // referenced by at least one active file. This prevents rejoining nodes from
+        // resurrecting deleted files' chunks: when a node was offline, the leader deleted
+        // those routing entries, but the node still has them in its local sled and pushes
+        // them all back via chunk_location_sync on rejoin — causing the healer to
+        // replicate them cluster-wide and inflating disk usage on every node.
+        let live_chunks: std::collections::HashSet<dfs_common::ChunkId> = {
+            let metadata = self.metadata.clone();
+            match tokio::task::spawn_blocking(move || metadata.live_chunk_ids()).await {
+                Ok(Ok(ids)) => ids,
+                _ => {
+                    // Can't load live set — accept everything to avoid silently dropping
+                    // valid locations (safe fallback: healer will orphan-purge stale ones).
+                    warn!("handle_replicate_chunk_locations: failed to load live chunk IDs, accepting all {} locations",
+                          locations.len());
+                    locations.iter().map(|l| l.chunk_id).collect()
+                }
+            }
+        };
+
         let mut failed = 0usize;
+        let mut rejected = 0usize;
         for location in &locations {
+            // Reject locations for chunks not referenced by any live file.
+            if !live_chunks.contains(&location.chunk_id) {
+                rejected += 1;
+                continue;
+            }
+
             // Re-use existing merge logic from the single-item handler inline.
             let existing = self.metadata.get_chunk_location(&location.chunk_id)
                 .ok().flatten();
@@ -1683,6 +1711,10 @@ impl Server {
                 warn!("Failed to replicate chunk location {}: {}", location.chunk_id, e);
                 failed += 1;
             }
+        }
+        if rejected > 0 {
+            info!("handle_replicate_chunk_locations: rejected {} stale orphan locations (deleted files), accepted {}",
+                  rejected, locations.len().saturating_sub(rejected + failed));
         }
         if failed == 0 {
             Response::Ok { data: None }

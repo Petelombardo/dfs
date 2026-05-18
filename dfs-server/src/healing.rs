@@ -186,6 +186,7 @@ impl HealingManager {
     async fn run_discovery_loop(&self) {
         let mut cycle_counter = 0u32;
         let mut cleanup_counter = 0u32;
+        let mut disk_sweep_counter = 0u32;
         let mut was_leader = false;
 
         loop {
@@ -227,6 +228,15 @@ impl HealingManager {
                 if let Err(e) = self.cleanup_stale_pending().await {
                     warn!("Pending healing cleanup error: {}", e);
                 }
+            }
+
+            // Disk orphan sweep: runs on every node every 5 cycles (5 minutes).
+            // Deletes chunk files whose routing table entries are gone — catches nodes
+            // that missed DeleteChunk RPCs while offline.
+            disk_sweep_counter += 1;
+            if disk_sweep_counter >= 5 {
+                disk_sweep_counter = 0;
+                self.run_disk_orphan_sweep().await;
             }
         }
     }
@@ -309,6 +319,76 @@ impl HealingManager {
     }
 
     /// Run periodic scrubber
+    /// Disk-level orphan sweep — runs on every node every 5 minutes.
+    ///
+    /// Walks the local chunk directory and deletes any chunk file whose chunk_id is
+    /// absent from the local routing table. This catches the case where a node missed
+    /// DeleteChunk RPCs while offline: the routing table entries are gone (cleaned up
+    /// by the leader while the node was absent), but the physical files remain.
+    ///
+    /// Uses a 5-minute grace period to avoid deleting chunks that were just written
+    /// but whose routing table entries haven't been committed yet.
+    async fn run_disk_orphan_sweep(&self) {
+        const GRACE_PERIOD_SECS: u64 = 300;
+
+        let storage = self.storage.clone();
+        let metadata = self.metadata.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let chunks = storage.list_chunks()?;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let mut deleted = 0usize;
+            let mut kept = 0usize;
+            let mut too_recent = 0usize;
+
+            for chunk_id in &chunks {
+                match metadata.get_chunk_location(chunk_id) {
+                    Ok(Some(_)) => { kept += 1; } // In routing table — keep
+                    Ok(None) => {
+                        // Not in routing table — orphaned file. Apply grace period
+                        // so we don't delete chunks that were just written.
+                        let age_secs = storage.get_chunk_mtime(chunk_id)
+                            .map(|mtime| now_secs.saturating_sub(mtime))
+                            .unwrap_or(u64::MAX);
+
+                        if age_secs > GRACE_PERIOD_SECS {
+                            if let Err(e) = storage.delete_chunk(chunk_id) {
+                                debug!("Disk orphan sweep: failed to delete {}: {}", chunk_id, e);
+                            } else {
+                                debug!("Disk orphan sweep: deleted local orphan {}", chunk_id);
+                                deleted += 1;
+                            }
+                        } else {
+                            too_recent += 1;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Disk orphan sweep: routing table error for {}: {}", chunk_id, e);
+                    }
+                }
+            }
+
+            Ok::<_, anyhow::Error>((deleted, kept, too_recent, chunks.len()))
+        }).await;
+
+        match result {
+            Ok(Ok((deleted, kept, too_recent, total))) => {
+                if deleted > 0 || too_recent > 0 {
+                    info!("Disk orphan sweep: {} local chunks checked — {} orphans deleted, {} kept (in routing table), {} too recent",
+                          total, deleted, kept, too_recent);
+                } else {
+                    debug!("Disk orphan sweep: {} chunks checked, all accounted for", total);
+                }
+            }
+            Ok(Err(e)) => warn!("Disk orphan sweep error: {}", e),
+            Err(e) => warn!("Disk orphan sweep panicked: {}", e),
+        }
+    }
+
     async fn run_scrubber(&self) {
         let scrub_interval = Duration::from_secs(self.scrub_interval_hours * 3600);
         let mut timer = interval(scrub_interval);

@@ -763,15 +763,14 @@ echo "  Applying 12 sequential overlapping writes (varying offsets/sizes)..."
 
 T22B_START=$(date +%s%3N)
 
-# Generate 12 distinct patterns
+# Generate 12 distinct patterns using python3 for reliable byte generation
+# (tr '\000' "\xNN" is not portable across platforms for \x00)
 for i in $(seq 0 11); do
-    pattern=$(printf "%02x" $((i * 0x11)))
+    val=$((i * 0x11))
     if [ $(( i % 2 )) -eq 0 ]; then
-        # Even: small 4KB write
-        dd if=/dev/zero bs=4096 count=1 2>/dev/null | tr '\000' "\x$pattern" > "$T/t22b_pat_$i.bin"
+        python3 -c "import sys; sys.stdout.buffer.write(bytes([$val]*4096))" > "$T/t22b_pat_$i.bin"
     else
-        # Odd: large 256KB write
-        dd if=/dev/zero bs=262144 count=1 2>/dev/null | tr '\000' "\x$pattern" > "$T/t22b_pat_$i.bin"
+        python3 -c "import sys; sys.stdout.buffer.write(bytes([$val]*262144))" > "$T/t22b_pat_$i.bin"
     fi
 done
 

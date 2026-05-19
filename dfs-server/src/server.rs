@@ -234,10 +234,20 @@ impl Server {
             // the in-memory chunk_map retains the old chunk_id and returns stale data to
             // ChunkStale validation, causing a ping-pong of stale corrections under rapid
             // sequential patches.
+            //
+            // Guard: only replace if incoming is strictly newer (by written_at). Storage
+            // nodes now update chunk_map atomically after each patch, so their local entry
+            // may be AHEAD of what the healer or leader sends. Overwriting a newer chunk
+            // with an older one (healer working from stale metadata) would regress the
+            // chunk_map and produce false stale-base errors or data corruption.
             if let Some(file_offset) = location.file_offset {
                 for loc in locs.iter_mut() {
                     if loc.file_offset == Some(file_offset) {
-                        *loc = location.clone();
+                        let incoming_ts = location.written_at.unwrap_or(0);
+                        let existing_ts = loc.written_at.unwrap_or(0);
+                        if incoming_ts >= existing_ts {
+                            *loc = location.clone();
+                        }
                         return;
                     }
                 }
@@ -260,10 +270,16 @@ impl Server {
                 }
             }
             // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
+            // Same written_at guard as chunk_map_update_location: never regress a newer
+            // locally-patched chunk with stale data from the healer or leader.
             if let Some(file_offset) = location.file_offset {
                 for loc in locs.iter_mut() {
                     if loc.file_offset == Some(file_offset) {
-                        *loc = location.clone();
+                        let incoming_ts = location.written_at.unwrap_or(0);
+                        let existing_ts = loc.written_at.unwrap_or(0);
+                        if incoming_ts >= existing_ts {
+                            *loc = location.clone();
+                        }
                         return;
                     }
                 }
@@ -303,11 +319,25 @@ impl Server {
 
         match result.message {
             Message::Response(Response::FileMetadata { metadata }) => {
-                // Store fresh metadata locally
-                self.metadata.put_file(&metadata)?;
-                self.chunk_map_update(&metadata).await;
-                info!("Successfully pulled fresh metadata from leader: file_id={} seq={} size={}",
-                      file_id, metadata.write_seq, metadata.size);
+                // Storage nodes now update their chunk_map atomically after each patch,
+                // so they may be AHEAD of the leader (async metadata queue lag). Only
+                // accept leader data if it is strictly newer than our local copy.
+                // Applying stale leader metadata would regress our chunk_map from the
+                // current chunk_id (Y, just patched) back to the old one (X, pre-patch).
+                let local_seq = self.metadata.get_file(&file_id)
+                    .ok().flatten()
+                    .map(|m| m.write_seq)
+                    .unwrap_or(0);
+                if metadata.write_seq > local_seq {
+                    self.metadata.put_file(&metadata)?;
+                    self.chunk_map_update(&metadata).await;
+                    info!("Successfully pulled fresh metadata from leader: file_id={} seq={} size={}",
+                          file_id, metadata.write_seq, metadata.size);
+                } else {
+                    info!("Skipping leader metadata pull — local seq={} >= leader seq={} for file_id={}; \
+                           storage node is ahead (patch in flight to leader)",
+                          local_seq, metadata.write_seq, file_id);
+                }
                 Ok(())
             }
             Message::Response(Response::Error { message, .. }) => {
@@ -3320,6 +3350,47 @@ impl Server {
         match result {
             Ok(Ok((new_chunk_id, final_size, patch_len))) => {
                 info!("PatchChunk: {} -> {} ({} bytes at intra_offset={})", chunk_id, new_chunk_id, patch_len, intra_offset);
+
+                // Same atomic chunk_map update as handle_multi_patch — see that function
+                // for the full explanation of why this is required.
+                if new_chunk_id != chunk_id {
+                    const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                    if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+                        if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
+                            let (locations, _) = entry.value_mut();
+                            if let Some(loc) = locations.iter_mut().find(|l| {
+                                l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)
+                                    && l.chunk_id == chunk_id
+                            }) {
+                                loc.chunk_id = new_chunk_id;
+                                loc.checksum = new_chunk_id.hash;
+                                loc.size = final_size;
+                            }
+                        }
+                    }
+                    let metadata = self.metadata.clone();
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if let Ok(Some(old_loc)) = metadata.get_chunk_location(&chunk_id) {
+                        let new_loc = dfs_common::ChunkLocation {
+                            chunk_id: new_chunk_id,
+                            nodes: old_loc.nodes,
+                            size: final_size,
+                            checksum: new_chunk_id.hash,
+                            file_offset: old_loc.file_offset,
+                            written_at: Some(now_secs),
+                        };
+                        if let Err(e) = metadata.put_chunk_location(&new_loc) {
+                            warn!("PatchChunk: failed to update local sled {} -> {}: {}", chunk_id, new_chunk_id, e);
+                        }
+                        if let Err(e) = metadata.delete_chunk_location(&chunk_id) {
+                            warn!("PatchChunk: failed to remove old sled entry {}: {}", chunk_id, e);
+                        }
+                    }
+                }
+
                 Response::PatchChunkResult { new_chunk_id, size: final_size }
             }
             Ok(Err((msg, code))) => {
@@ -3454,6 +3525,59 @@ impl Server {
                     .collect();
                 info!("MultiPatch: {} -> {} ({} patches, final size={}): {:?}",
                     chunk_id, new_chunk_id, patches.len(), final_size, patch_summary);
+
+                // Update this node's local chunk_map and sled metadata to reflect the
+                // new chunk_id atomically with the patch — before returning the response.
+                //
+                // Without this, the stale-base check at the top of this function uses the
+                // chunk_map, which is only updated via async ReplicateChunkLocations from
+                // the leader. That async gap means the next MultiPatch from the client
+                // (using new_chunk_id as the base) would immediately see a false stale-base
+                // here (chunk_map still says old chunk_id). The client then retries with the
+                // old chunk_id, which no longer exists on disk (it was renamed), and the
+                // server creates an empty file and patches it — producing corrupt garbage data.
+                if new_chunk_id != chunk_id {
+                    const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
+                    // 1. Update in-memory chunk_map (used by the stale-base check above).
+                    if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+                        if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
+                            let (locations, _) = entry.value_mut();
+                            if let Some(loc) = locations.iter_mut().find(|l| {
+                                l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)
+                                    && l.chunk_id == chunk_id
+                            }) {
+                                loc.chunk_id = new_chunk_id;
+                                loc.checksum = new_chunk_id.hash;
+                                loc.size = final_size;
+                            }
+                        }
+                    }
+
+                    // 2. Update local sled metadata so chunk_map survives restarts.
+                    let metadata = self.metadata.clone();
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if let Ok(Some(old_loc)) = metadata.get_chunk_location(&chunk_id) {
+                        let new_loc = dfs_common::ChunkLocation {
+                            chunk_id: new_chunk_id,
+                            nodes: old_loc.nodes,
+                            size: final_size,
+                            checksum: new_chunk_id.hash,
+                            file_offset: old_loc.file_offset,
+                            written_at: Some(now_secs),
+                        };
+                        if let Err(e) = metadata.put_chunk_location(&new_loc) {
+                            warn!("MultiPatch: failed to update local sled for {} -> {}: {}", chunk_id, new_chunk_id, e);
+                        }
+                        if let Err(e) = metadata.delete_chunk_location(&chunk_id) {
+                            warn!("MultiPatch: failed to remove old sled entry {}: {}", chunk_id, e);
+                        }
+                    }
+                }
+
                 Response::MultiPatchResult { new_chunk_id, size: final_size }
             }
             Ok(Err((msg, code))) => {

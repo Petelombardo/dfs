@@ -3282,6 +3282,7 @@ impl Server {
 
         let old_path = self.storage.get_chunk_path(&chunk_id);
         let storage = self.storage.clone();
+        let metadata = self.metadata.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
@@ -3334,8 +3335,29 @@ impl Server {
                         return Err((format!("Failed to create chunk directory: {}", e), ErrorCode::InternalError));
                     }
                 }
+                // Same pre-registration as handle_multi_patch — see comment there.
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if let Ok(Some(old_loc)) = metadata.get_chunk_location(&chunk_id) {
+                    let new_loc = ChunkLocation {
+                        chunk_id: new_chunk_id,
+                        nodes: old_loc.nodes,
+                        size: final_size,
+                        checksum: new_chunk_id.hash,
+                        file_offset: old_loc.file_offset,
+                        written_at: Some(now_secs),
+                    };
+                    if let Err(e) = metadata.put_chunk_location(&new_loc) {
+                        warn!("PatchChunk: failed to pre-register {} in sled: {}", new_chunk_id, e);
+                    }
+                }
                 if let Err(e) = fs::rename(&old_path, &new_path) {
                     return Err((format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError));
+                }
+                if let Err(e) = metadata.delete_chunk_location(&chunk_id) {
+                    warn!("PatchChunk: failed to remove old sled entry {}: {}", chunk_id, e);
                 }
             }
 
@@ -3351,8 +3373,8 @@ impl Server {
             Ok(Ok((new_chunk_id, final_size, patch_len))) => {
                 info!("PatchChunk: {} -> {} ({} bytes at intra_offset={})", chunk_id, new_chunk_id, patch_len, intra_offset);
 
-                // Same atomic chunk_map update as handle_multi_patch — see that function
-                // for the full explanation of why this is required.
+                // Update in-memory chunk_map. Sled was already updated inside
+                // spawn_blocking before the rename — see comment there.
                 if new_chunk_id != chunk_id {
                     const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
                     if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
@@ -3366,27 +3388,6 @@ impl Server {
                                 loc.checksum = new_chunk_id.hash;
                                 loc.size = final_size;
                             }
-                        }
-                    }
-                    let metadata = self.metadata.clone();
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if let Ok(Some(old_loc)) = metadata.get_chunk_location(&chunk_id) {
-                        let new_loc = dfs_common::ChunkLocation {
-                            chunk_id: new_chunk_id,
-                            nodes: old_loc.nodes,
-                            size: final_size,
-                            checksum: new_chunk_id.hash,
-                            file_offset: old_loc.file_offset,
-                            written_at: Some(now_secs),
-                        };
-                        if let Err(e) = metadata.put_chunk_location(&new_loc) {
-                            warn!("PatchChunk: failed to update local sled {} -> {}: {}", chunk_id, new_chunk_id, e);
-                        }
-                        if let Err(e) = metadata.delete_chunk_location(&chunk_id) {
-                            warn!("PatchChunk: failed to remove old sled entry {}: {}", chunk_id, e);
                         }
                     }
                 }
@@ -3439,6 +3440,7 @@ impl Server {
 
         let old_path = self.storage.get_chunk_path(&chunk_id);
         let storage = self.storage.clone();
+        let metadata = self.metadata.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
@@ -3506,8 +3508,35 @@ impl Server {
                     fs::create_dir_all(parent)
                         .map_err(|e| (format!("Failed to create chunk directory: {}", e), ErrorCode::InternalError))?;
                 }
+                // Register new_chunk_id in sled BEFORE the rename. Linux rename(2)
+                // preserves the source file's mtime on the destination, so the renamed
+                // file may appear older than the orphan-sweep grace period (300 s).
+                // If sled isn't updated until after the rename, the sweep can see the
+                // new file as an orphan and delete it — causing permanent data loss.
+                // Order: put_new → rename → delete_old ensures no window where a live
+                // chunk file is absent from the routing table.
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if let Ok(Some(old_loc)) = metadata.get_chunk_location(&chunk_id) {
+                    let new_loc = ChunkLocation {
+                        chunk_id: new_chunk_id,
+                        nodes: old_loc.nodes,
+                        size: final_size,
+                        checksum: new_chunk_id.hash,
+                        file_offset: old_loc.file_offset,
+                        written_at: Some(now_secs),
+                    };
+                    if let Err(e) = metadata.put_chunk_location(&new_loc) {
+                        warn!("MultiPatch: failed to pre-register {} in sled: {}", new_chunk_id, e);
+                    }
+                }
                 fs::rename(&old_path, &new_path)
                     .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
+                if let Err(e) = metadata.delete_chunk_location(&chunk_id) {
+                    warn!("MultiPatch: failed to remove old sled entry {}: {}", chunk_id, e);
+                }
             }
 
             storage.invalidate_cache(&chunk_id);
@@ -3538,8 +3567,8 @@ impl Server {
                 // server creates an empty file and patches it — producing corrupt garbage data.
                 if new_chunk_id != chunk_id {
                     const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-
-                    // 1. Update in-memory chunk_map (used by the stale-base check above).
+                    // Update in-memory chunk_map. Sled was already updated inside
+                    // spawn_blocking before the rename — see comment there.
                     if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
                         if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
                             let (locations, _) = entry.value_mut();
@@ -3551,29 +3580,6 @@ impl Server {
                                 loc.checksum = new_chunk_id.hash;
                                 loc.size = final_size;
                             }
-                        }
-                    }
-
-                    // 2. Update local sled metadata so chunk_map survives restarts.
-                    let metadata = self.metadata.clone();
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if let Ok(Some(old_loc)) = metadata.get_chunk_location(&chunk_id) {
-                        let new_loc = dfs_common::ChunkLocation {
-                            chunk_id: new_chunk_id,
-                            nodes: old_loc.nodes,
-                            size: final_size,
-                            checksum: new_chunk_id.hash,
-                            file_offset: old_loc.file_offset,
-                            written_at: Some(now_secs),
-                        };
-                        if let Err(e) = metadata.put_chunk_location(&new_loc) {
-                            warn!("MultiPatch: failed to update local sled for {} -> {}: {}", chunk_id, new_chunk_id, e);
-                        }
-                        if let Err(e) = metadata.delete_chunk_location(&chunk_id) {
-                            warn!("MultiPatch: failed to remove old sled entry {}: {}", chunk_id, e);
                         }
                     }
                 }

@@ -2861,6 +2861,7 @@ impl Filesystem for DfsFilesystem {
             let next_inode = self.next_inode.clone();
             let last_metadata_update = self.last_metadata_update.clone();
             let dir_cache = self.dir_cache.clone();
+            let write_open_counts_warmup = self.write_open_counts.clone();
             self.runtime.spawn(async move {
                 info!("Startup: warming metadata cache from leader");
                 let files = match client.list_all_files().await {
@@ -2900,7 +2901,14 @@ impl Filesystem for DfsFilesystem {
                             file.size = cached.size;
                         }
                     }
-                    metadata_cache.insert(ino, file.clone());
+                    // Don't overwrite metadata for an inode currently open for writing.
+                    // The write path keeps in-memory chunk_ids authoritative between
+                    // flush_buffer_async_one and flush_metadata_sync; a stale server
+                    // snapshot here would clobber those ids and corrupt the committed state.
+                    let is_open_for_write = write_open_counts_warmup.get(&ino).map(|c| *c > 0).unwrap_or(false);
+                    if !is_open_for_write {
+                        metadata_cache.insert(ino, file.clone());
+                    }
                     last_metadata_update.insert(ino, now);
 
                     if let Some(slash) = file.path.rfind('/') {
@@ -3237,10 +3245,22 @@ impl Filesystem for DfsFilesystem {
                 if let Some(path) = path_opt {
                     let client = self.client.clone();
                     let metadata_cache = self.metadata_cache.clone();
+                    let write_open_counts = self.write_open_counts.clone();
+                    let write_buffers_for_refresh = self.write_buffers.clone();
                     self.runtime.spawn(async move {
                         if let Ok(Some(fresh)) = client.get_file_metadata(&path).await {
                             client.seed_write_seq(fresh.id, fresh.write_seq);
-                            metadata_cache.insert(ino, fresh);
+                            // Don't replace metadata_cache while any write activity is in-flight.
+                            // Checking write_open_counts alone is insufficient: the FUSE release()
+                            // handler decrements write_open_count synchronously, but the async
+                            // release task (which runs flush_all_pipelined + flush_metadata_sync)
+                            // may still be mid-flight. write_buffers[ino] is only removed AFTER
+                            // the flush completes, so it correctly guards the entire flush window.
+                            let flush_in_flight = write_buffers_for_refresh.contains_key(&ino);
+                            let still_open = write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
+                            if !flush_in_flight && !still_open {
+                                metadata_cache.insert(ino, fresh);
+                            }
                         }
                     });
                 }
@@ -3835,18 +3855,36 @@ impl Filesystem for DfsFilesystem {
                         if let Some(cached) = metadata_cache.get(&ino) {
                             if cached.size > fresh.size { fresh.size = cached.size; }
                         }
+                        // Do NOT replace metadata_cache with server data while the file is
+                        // open for writing. Between flush_buffer_async_one updating chunk_ids
+                        // in-memory and flush_metadata_sync committing them to the leader, the
+                        // server's view is stale. Overwriting here clobbers the correct in-memory
+                        // chunk_ids, which flush_metadata_sync then commits to the leader — leaving
+                        // live chunks unreferenced and old (deleted) chunk_ids in the leader's DB.
+                        let is_write_open = write_buffers.contains_key(&ino);
                         if offset >= fresh.size as usize {
                             client.seed_write_seq(fresh.id, fresh.write_seq);
-                            // Invalidate the read engine so next read picks up new chunk map.
-                            client.invalidate_read_engine(ino);
-                            metadata_cache.insert(ino, fresh);
+                            if !is_write_open {
+                                // Invalidate the read engine so next read picks up new chunk map.
+                                client.invalidate_read_engine(ino);
+                                metadata_cache.insert(ino, fresh);
+                            }
                             reply.data(&[]);
                             return;
                         }
                         let new_size = fresh.size;
                         client.seed_write_seq(fresh.id, fresh.write_seq);
-                        client.invalidate_read_engine(ino);
-                        metadata_cache.insert(ino, fresh);
+                        if is_write_open {
+                            // File open for writing: in-memory chunk_ids are authoritative.
+                            // Only advance the size; never overwrite chunk locations.
+                            if let Some(mut m) = metadata_cache.get_mut(&ino) {
+                                m.size = m.size.max(new_size);
+                            }
+                        } else {
+                            // Invalidate the read engine so next read picks up new chunk map.
+                            client.invalidate_read_engine(ino);
+                            metadata_cache.insert(ino, fresh);
+                        }
                         info!("File grew to {} bytes (ino={})", new_size, ino);
                         new_size
                     }

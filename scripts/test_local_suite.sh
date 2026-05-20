@@ -792,11 +792,24 @@ T22B_MS=$(( $(date +%s%3N) - T22B_START ))
 T22B_DFS_MD5=$(md5sum "$T22B_DFS" | awk '{print $1}')
 T22B_LOCAL_MD5=$(md5sum "$T22B_LOCAL" | awk '{print $1}')
 
+T22B_READ="$T/t22b_read.bin"
+cp "$T22B_DFS" "$T22B_READ" 2>/dev/null
 if [ "$T22B_DFS_MD5" = "$T22B_LOCAL_MD5" ]; then
     check "T22b DFS matches local file (md5: ${T22B_DFS_MD5:0:8})" PASS
 else
     check "T22b DFS differs from local (dfs=${T22B_DFS_MD5:0:8} local=${T22B_LOCAL_MD5:0:8})" FAIL
+    echo "  Per-write region check:"
+    for i in $(seq 0 11); do
+        offset=$((i * 128 * 1024))
+        if [ $(( i % 2 )) -eq 0 ]; then sz=4096; else sz=262144; fi
+        pat=$(printf "%02x" $((i * 0x11)))
+        dfs_hex=$(dd if="$T22B_READ"  bs=1 skip=$offset count=4 2>/dev/null | xxd -p | tr -d '\n')
+        loc_hex=$(dd if="$T22B_LOCAL" bs=1 skip=$offset count=4 2>/dev/null | xxd -p | tr -d '\n')
+        [ "$dfs_hex" = "$loc_hex" ] && status="ok" || status="MISMATCH dfs=$dfs_hex local=$loc_hex"
+        echo "    i=$i off=$offset sz=$sz pat=0x$pat: $status"
+    done
 fi
+rm -f "$T22B_READ"
 
 echo "  Completed in ${T22B_MS}ms"
 

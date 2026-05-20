@@ -3246,19 +3246,15 @@ impl Filesystem for DfsFilesystem {
                     let client = self.client.clone();
                     let metadata_cache = self.metadata_cache.clone();
                     let write_open_counts = self.write_open_counts.clone();
-                    let write_buffers_for_refresh = self.write_buffers.clone();
                     self.runtime.spawn(async move {
                         if let Ok(Some(fresh)) = client.get_file_metadata(&path).await {
                             client.seed_write_seq(fresh.id, fresh.write_seq);
-                            // Don't replace metadata_cache while any write activity is in-flight.
-                            // Checking write_open_counts alone is insufficient: the FUSE release()
-                            // handler decrements write_open_count synchronously, but the async
-                            // release task (which runs flush_all_pipelined + flush_metadata_sync)
-                            // may still be mid-flight. write_buffers[ino] is only removed AFTER
-                            // the flush completes, so it correctly guards the entire flush window.
-                            let flush_in_flight = write_buffers_for_refresh.contains_key(&ino);
+                            // Don't replace metadata_cache while any writer has the file open.
+                            // In-memory chunk_ids are authoritative between flush_buffer_async_one
+                            // and flush_metadata_sync; overwriting here clobbers them with stale
+                            // server data, causing flush_metadata_sync to commit wrong ids.
                             let still_open = write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
-                            if !flush_in_flight && !still_open {
+                            if !still_open {
                                 metadata_cache.insert(ino, fresh);
                             }
                         }
@@ -3310,15 +3306,16 @@ impl Filesystem for DfsFilesystem {
                             });
                         }
                     }
-                    // Only remove the write buffer if it has no unflushed data.
-                    // If a slot with real data exists (flushing=false, non-empty), a
-                    // concurrent flush task wrote data that hasn't been sent to the server yet.
-                    // Removing the buffer here would silently discard that data.
-                    // If flushing=true, a flush is in progress — leave it; that task will
-                    // clean up the slot after the network call completes.
+                    // Only remove the write buffer if it has no active slot data.
+                    // A slot is active if it has ANY data — whether flushing=false (pending
+                    // send) OR flushing=true (network I/O in-flight). The flush task releases
+                    // the write-buffer mutex BEFORE the network call, so try_lock() succeeds
+                    // while the flush is running. Checking !flushing was a bug: it treated
+                    // in-flight data as "safe to remove", silently discarding writes that
+                    // arrived between the flush task's mutex release and its metadata commit.
                     let safe_to_remove = if let Some(state_arc) = self.write_buffers.get(&ino) {
                         if let Ok(st) = state_arc.try_lock() {
-                            let has_unflushed = st.slots.values().any(|s| !s.data.is_empty() && !s.flushing);
+                            let has_unflushed = st.slots.values().any(|s| !s.data.is_empty());
                             if has_unflushed {
                                 info!("open: ino={} is_first_writer — NOT removing write_buffers, has unflushed data", ino);
                             }
@@ -5235,6 +5232,7 @@ impl Filesystem for DfsFilesystem {
                     info!("release: ino={} sync_release=true (sync_on_fsync={} is_vm_disk={}) — waiting for flush before replying",
                           ino, sync_on_fsync, is_vm_disk);
                     let reply_clone = reply;
+                    let this_write_buffer_arc_sync = write_buffers.get(&ino).map(|e| std::sync::Arc::clone(e.value()));
                     flush_rt.spawn(async move {
                     // Wait for any concurrent write() tasks for this inode to finish writing
                     // into the slot before we flush. Without this, a close() that arrives
@@ -5335,12 +5333,20 @@ impl Filesystem for DfsFilesystem {
                         }
                     }
                     // Only remove the write buffer if no new writer has opened the file
-                    // since this release task was spawned. A new O_TRUNC open races with
-                    // this cleanup — if we remove here, we destroy the new session's buffer
-                    // and its data is silently lost (T7 race).
+                    // since this release task was spawned, AND the DashMap still holds the
+                    // same Arc we were working with (Arc identity check). See async path for
+                    // full explanation of the rapid write→close→write→close race.
                     let has_new_writer = write_open_counts_for_release
                         .get(&ino).map(|c| *c > 0).unwrap_or(false);
-                    if !has_new_writer {
+                    let is_our_buffer_sync = this_write_buffer_arc_sync.as_ref()
+                        .map(|orig| write_buffers.get(&ino)
+                            .map(|e| std::sync::Arc::ptr_eq(orig, e.value()))
+                            .unwrap_or(false))
+                        .unwrap_or(false);
+                    let has_unflushed_data_sync = write_buffers.get(&ino)
+                        .map(|s| s.try_lock().map(|st| st.slots.values().any(|sl| !sl.data.is_empty())).unwrap_or(true))
+                        .unwrap_or(false);
+                    if !has_new_writer && is_our_buffer_sync && !has_unflushed_data_sync {
                         write_buffers.remove(&ino);
                         size_high_water_for_release.remove(&ino);
                         // Do NOT evict recent_chunk_writes here — see open() is_first_writer
@@ -5366,6 +5372,14 @@ impl Filesystem for DfsFilesystem {
                     // for metadata delivery) starves all other FUSE ops (readdir, getattr,
                     // read) during DVR startup scans.
                     reply.ok();
+                    // Capture the Arc identity of the write buffer we're about to flush.
+                    // Used at cleanup to avoid removing a newer session's buffer: a rapid
+                    // write→close→write→close (T22b pattern) can have:
+                    //   write_i9 closes: spawns this task with write_buffers[ino] = Arc_i9
+                    //   write_i10 opens+writes+closes: write_buffers[ino] = Arc_i10
+                    //   this task reaches write_buffers.remove: count=0 (i10 already closed),
+                    //     removes Arc_i10 instead of Arc_i9 → i10's data silently lost.
+                    let this_write_buffer_arc = write_buffers.get(&ino).map(|e| std::sync::Arc::clone(e.value()));
                     flush_rt.spawn(async move {
                     // Wait for any concurrent write() tasks for this inode to finish writing
                     // into the slot before we flush. Without this, a close() that arrives
@@ -5469,9 +5483,27 @@ impl Filesystem for DfsFilesystem {
                     // since this release task was spawned. A new O_TRUNC open races with
                     // this cleanup — if we remove here, we destroy the new session's buffer
                     // and its data is silently lost (T7 race).
+                    //
+                    // Also guard by Arc identity: a rapid write→close→write→close sequence
+                    // can have write_i10 create a new buffer (Arc_i10) while this task is
+                    // still running. If write_i10 closes before we reach here (count=0),
+                    // has_new_writer=false, but the DashMap entry is Arc_i10 not our Arc_i9.
+                    // Removing without the identity check silently destroys Arc_i10's data.
                     let has_new_writer = write_open_counts_for_release
                         .get(&ino).map(|c| *c > 0).unwrap_or(false);
-                    if !has_new_writer {
+                    let is_our_buffer = this_write_buffer_arc.as_ref()
+                        .map(|orig| write_buffers.get(&ino)
+                            .map(|e| std::sync::Arc::ptr_eq(orig, e.value()))
+                            .unwrap_or(false))
+                        .unwrap_or(false);
+                    // Also guard against removing a buffer that received new data AFTER our
+                    // flush completed. A write() arriving between slot-removal and cleanup can
+                    // create a fresh slot in Arc_i1; if we remove Arc_i1 here, R2 (the next
+                    // release task) finds no buffer and silently drops that data (T22b race).
+                    let has_unflushed_data = write_buffers.get(&ino)
+                        .map(|s| s.try_lock().map(|st| st.slots.values().any(|sl| !sl.data.is_empty())).unwrap_or(true))
+                        .unwrap_or(false);
+                    if !has_new_writer && is_our_buffer && !has_unflushed_data {
                         write_buffers.remove(&ino);
                         size_high_water_for_release.remove(&ino);
                         // Do NOT evict recent_chunk_writes — see sync release path comment.

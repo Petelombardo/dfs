@@ -1574,26 +1574,13 @@ impl Server {
                 info!("Successfully replicated chunk location for {} (total nodes: {})",
                       merged_location.chunk_id, merged_location.nodes.len());
 
-                // If we are the leader, broadcast the merged location to all followers so they
-                // stay consistent without the client having to contact each one individually.
-                if self.cluster.is_leader().await {
-                    let cluster = self.cluster.clone();
-                    let client = self.client.clone();
-                    let local_id = self.cluster.local_node_id();
-                    let loc = merged_location.clone();
-                    tokio::spawn(async move {
-                        let nodes = cluster.get_all_nodes().await;
-                        for node in &nodes {
-                            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                                continue;
-                            }
-                            let req = Request::ReplicateChunkLocation { location: loc.clone(), file_id };
-                            if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
-                                debug!("Leader chunk-location broadcast to {} failed: {}", node.id, e);
-                            }
-                        }
-                    });
-                }
+                // Do NOT re-broadcast to followers. The client sends ReplicateChunkLocation
+                // only to the leader; followers receive authoritative full-file state via
+                // PutFileMetadata (flush_metadata_sync) with write_seq ordering at the end
+                // of each flush cycle. Broadcasting per-chunk location updates to followers
+                // creates stale races: a late-arriving broadcast for an older chunk_id can
+                // overwrite a newer patch result, making the chunk_map point to a renamed
+                // (deleted) file and causing all subsequent patches to fail with NotFound.
 
                 Response::Ok { data: None }
             }

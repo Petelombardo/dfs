@@ -1325,18 +1325,20 @@ impl FlushHandle {
                             (*cid, nodes.clone())
                         });
                     match (cached_loc, recent) {
-                        (Some(mut loc), Some((recent_id, recent_nodes))) if recent_id != loc.chunk_id => {
-                            // Use the chunk_id AND the nodes from the most recent patch.
-                            // Using stale nodes from metadata_cache here causes the next patch
-                            // to target nodes that never received the previous patch (e.g. nodes
-                            // added by the healer between patches), producing stale-base retries.
+                        (Some(mut loc), Some((recent_id, recent_nodes))) => {
+                            // Always use the nodes from recent_chunk_writes when available —
+                            // these are the 2 nodes we actually patched most recently.
+                            // metadata_cache node lists include healer-added 3rd replicas that
+                            // never received the latest patch; targeting them produces ChunkStale.
                             // Only override nodes if non-empty: empty means addr_to_node_id_snap
                             // was not yet populated when the previous patch ran, so metadata_cache
                             // nodes are a better fallback than an empty list.
-                            info!("flush_buffer_async_one: ino={} chunk={} using recent_chunk_writes id {} nodes={} (cache had id={} nodes={})",
-                                ino, chunk_idx, recent_id, recent_nodes.len(), loc.chunk_id, loc.nodes.len());
-                            loc.chunk_id = recent_id;
-                            loc.checksum = recent_id.hash;
+                            if recent_id != loc.chunk_id {
+                                info!("flush_buffer_async_one: ino={} chunk={} using recent_chunk_writes id {} nodes={} (cache had id={} nodes={})",
+                                    ino, chunk_idx, recent_id, recent_nodes.len(), loc.chunk_id, loc.nodes.len());
+                                loc.chunk_id = recent_id;
+                                loc.checksum = recent_id.hash;
+                            }
                             if !recent_nodes.is_empty() {
                                 loc.nodes = recent_nodes;
                             }

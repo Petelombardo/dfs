@@ -4271,13 +4271,17 @@ leader_addr: Arc::new(RwLock::new(None)),
             let node2_id = Self::resolve_node_id(&node_id_map, addr2);
 
             let chunk_size = chunk_sizes_1[idx] as usize;
+            let write_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let location = dfs_common::ChunkLocation {
                 chunk_id: *chunk_id,
                 nodes: vec![node1_id, node2_id],
                 size: chunk_size,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
-                written_at: None,
+                written_at: Some(write_ts),
             };
 
             chunk_locations.push(location);
@@ -4820,13 +4824,17 @@ leader_addr: Arc::new(RwLock::new(None)),
         // NOT receive direct ReplicateChunkLocation: they'd update their chunk_map to the
         // new chunk_id without holding the data, causing them to return stale ChunkStale
         // corrections on the next patch — a ghost reference that can't be resolved.
+        let patch_written_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let new_location = dfs_common::ChunkLocation {
             chunk_id: new_chunk_id,
             nodes: patched_node_ids.clone(),
             size: new_size,
             checksum: new_chunk_id.hash,
             file_offset: current_location.file_offset,
-            written_at: None,
+            written_at: Some(patch_written_at),
         };
         let leader_addr = *self.leader_addr.read().await;
         // Build the set of addresses to update synchronously: leader + replica nodes.
@@ -5239,13 +5247,17 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let new_chunk_id = authoritative_chunk_id;
 
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let new_location = dfs_common::ChunkLocation {
             chunk_id: new_chunk_id,
             nodes: patched_node_ids.clone(),
             size: new_size,
             checksum: new_chunk_id.hash,
             file_offset: old_location.file_offset,
-            written_at: None,
+            written_at: Some(now_secs),
         };
 
         // Send ReplicateChunkLocation to patched replicas + leader (the 3 metadata nodes).
@@ -5306,6 +5318,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         file_offset: u64,
         replica_nodes_per_chunk: Vec<Vec<NodeId>>,
     ) -> Vec<dfs_common::ChunkLocation> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut locations = Vec::with_capacity(chunk_ids.len());
         let mut current_offset = file_offset;
         for (idx, (chunk_id, &size)) in chunk_ids.iter().zip(chunk_sizes.iter()).enumerate() {
@@ -5316,7 +5332,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 size: size as usize,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
-                written_at: None,
+                written_at: Some(now_secs),
             });
             current_offset += size;
         }

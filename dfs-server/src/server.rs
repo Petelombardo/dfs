@@ -235,18 +235,22 @@ impl Server {
             // ChunkStale validation, causing a ping-pong of stale corrections under rapid
             // sequential patches.
             //
-            // Guard: only replace if incoming is strictly newer (by written_at). Storage
-            // nodes now update chunk_map atomically after each patch, so their local entry
-            // may be AHEAD of what the healer or leader sends. Overwriting a newer chunk
-            // with an older one (healer working from stale metadata) would regress the
-            // chunk_map and produce false stale-base errors or data corruption.
+            // written_at guard only applies when chunk_id is the same (stale node-list
+            // broadcast for an already-patched chunk). When chunk_id differs, the incoming
+            // location is a post-patch broadcast for a new chunk — always accept it.
             if let Some(file_offset) = location.file_offset {
                 for loc in locs.iter_mut() {
                     if loc.file_offset == Some(file_offset) {
-                        let incoming_ts = location.written_at.unwrap_or(0);
-                        let existing_ts = loc.written_at.unwrap_or(0);
-                        if incoming_ts >= existing_ts {
+                        if loc.chunk_id != location.chunk_id {
+                            // New chunk_id from a patch — always update.
                             *loc = location.clone();
+                        } else {
+                            // Same chunk_id — guard against regressing healer-expanded node lists.
+                            let incoming_ts = location.written_at.unwrap_or(0);
+                            let existing_ts = loc.written_at.unwrap_or(0);
+                            if incoming_ts >= existing_ts {
+                                *loc = location.clone();
+                            }
                         }
                         return;
                     }
@@ -270,15 +274,24 @@ impl Server {
                 }
             }
             // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
-            // Same written_at guard as chunk_map_update_location: never regress a newer
-            // locally-patched chunk with stale data from the healer or leader.
+            // written_at guard only applies when chunk_id matches (same chunk, different
+            // node lists from healer). When chunk_id differs, the incoming location is
+            // a post-patch broadcast with a new chunk — always accept it, or the node's
+            // chunk_map retains the old chunk_id and incorrectly returns ChunkStale to
+            // the client on the next write cycle.
             if let Some(file_offset) = location.file_offset {
                 for loc in locs.iter_mut() {
                     if loc.file_offset == Some(file_offset) {
-                        let incoming_ts = location.written_at.unwrap_or(0);
-                        let existing_ts = loc.written_at.unwrap_or(0);
-                        if incoming_ts >= existing_ts {
+                        if loc.chunk_id != location.chunk_id {
+                            // New chunk_id from a patch — always update.
                             *loc = location.clone();
+                        } else {
+                            // Same chunk_id — apply written_at guard to block stale node-list broadcasts.
+                            let incoming_ts = location.written_at.unwrap_or(0);
+                            let existing_ts = loc.written_at.unwrap_or(0);
+                            if incoming_ts >= existing_ts {
+                                *loc = location.clone();
+                            }
                         }
                         return;
                     }

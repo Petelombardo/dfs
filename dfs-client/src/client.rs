@@ -4274,7 +4274,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let write_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs();
+                .as_millis() as u64;
             let location = dfs_common::ChunkLocation {
                 chunk_id: *chunk_id,
                 nodes: vec![node1_id, node2_id],
@@ -4827,7 +4827,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let patch_written_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
         let new_location = dfs_common::ChunkLocation {
             chunk_id: new_chunk_id,
             nodes: patched_node_ids.clone(),
@@ -5250,7 +5250,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
         let new_location = dfs_common::ChunkLocation {
             chunk_id: new_chunk_id,
             nodes: patched_node_ids.clone(),
@@ -5321,7 +5321,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
         let mut locations = Vec::with_capacity(chunk_ids.len());
         let mut current_offset = file_offset;
         for (idx, (chunk_id, &size)) in chunk_ids.iter().zip(chunk_sizes.iter()).enumerate() {

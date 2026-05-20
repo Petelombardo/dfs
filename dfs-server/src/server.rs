@@ -3352,7 +3352,7 @@ impl Server {
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs();
+                    .as_millis() as u64;
                 if let Ok(Some(old_loc)) = metadata.get_chunk_location(&chunk_id) {
                     let new_loc = ChunkLocation {
                         chunk_id: new_chunk_id,
@@ -3459,19 +3459,18 @@ impl Server {
             use std::fs;
             use std::io::{Read, Seek, SeekFrom, Write};
 
-            let chunk_exists = old_path.exists();
+            // If the chunk file doesn't exist on disk, refuse the patch.
+            // A ghost chunk_map entry (chunk_id in metadata but no file on disk)
+            // can arise when ReplicateChunkLocation updated this node's map but the
+            // actual data was written elsewhere. Creating an empty file and patching
+            // it would produce corrupt data — return NotFound so the client excludes
+            // this node and the healer can copy the real chunk here.
+            if !old_path.exists() {
+                return Err((format!("Failed to read chunk range: Failed to open chunk file: {:?}", old_path), ErrorCode::NotFound));
+            }
 
-            let mut f = if chunk_exists {
-                fs::OpenOptions::new().read(false).write(true).open(&old_path)
-                    .map_err(|e| (format!("Failed to open chunk: {}", e), ErrorCode::InternalError))?
-            } else {
-                if let Some(parent) = old_path.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|e| (format!("Failed to create chunk directory: {}", e), ErrorCode::InternalError))?;
-                }
-                fs::OpenOptions::new().write(true).create(true).open(&old_path)
-                    .map_err(|e| (format!("Failed to create chunk: {}", e), ErrorCode::InternalError))?
-            };
+            let mut f = fs::OpenOptions::new().read(false).write(true).open(&old_path)
+                .map_err(|e| (format!("Failed to open chunk: {}", e), ErrorCode::InternalError))?;
 
             let current_len = f.metadata()
                 .map_err(|e| (format!("Failed to stat chunk: {}", e), ErrorCode::InternalError))?.len();
@@ -3531,7 +3530,7 @@ impl Server {
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs();
+                    .as_millis() as u64;
                 if let Ok(Some(old_loc)) = metadata.get_chunk_location(&chunk_id) {
                     let new_loc = ChunkLocation {
                         chunk_id: new_chunk_id,

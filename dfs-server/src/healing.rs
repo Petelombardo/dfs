@@ -1343,6 +1343,40 @@ impl HealingManager {
         if !replicated.is_empty() {
             info!("Healed chunk {}: added {} replicas", chunk_id, replicated.len());
 
+            // CAS-style freshness check: verify the source node still holds the chunk
+            // before broadcasting the healed replica into the chunk map. Between our scan
+            // and now, a client write may have patched the source: it renames chunk_id
+            // to a new hash, so HasChunks(chunk_id) returns false on the source. If the
+            // source lost the chunk, our healed copy on the target is a stale version —
+            // don't add it to metadata. The orphan sweep will clean up the target's copy,
+            // and the healer will heal the correct (newer) chunk_id on the next cycle.
+            // This keeps the chunk map free of stale replicas and prevents the client's
+            // sorted-first-2 algorithm from targeting a node with an old base chunk.
+            let source_still_valid = {
+                let req = dfs_common::Request::HasChunks { chunk_ids: vec![*chunk_id] };
+                match client.send_message(source_addr, dfs_common::Message::Request(req)).await {
+                    Ok(env) => match env.message {
+                        dfs_common::Message::Response(dfs_common::Response::BoolVec { ref values }) => {
+                            values.first().copied().unwrap_or(false)
+                        }
+                        _ => {
+                            warn!("Healer: unexpected response verifying chunk {} on source {}", chunk_id, source_addr);
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Healer: could not verify chunk {} on source {}: {}", chunk_id, source_addr, e);
+                        false
+                    }
+                }
+            };
+
+            if !source_still_valid {
+                info!("Healer: chunk {} no longer on source {} (superseded by a newer write) — discarding healed replica", chunk_id, source_addr);
+                pending_healing.write().await.remove(chunk_id);
+                return Ok(());
+            }
+
             let mut updated_nodes: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
             updated_nodes.extend(replicated);
 

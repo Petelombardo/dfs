@@ -1295,6 +1295,7 @@ impl FlushHandle {
         info!("flush_buffer_async_one: ino={} chunk={} decision: chunk_exists={} is_overwrite={} is_append_extend={} is_mixed_extend={} is_sparse_write={} is_full_replacement={} needs_patch={} is_truncated_session={}",
               ino, chunk_idx, chunk_exists, is_overwrite, is_append_extend, is_mixed_extend, is_sparse_write, is_full_replacement, needs_patch, is_truncated_session);
 
+        'try_patch: {
         if needs_patch {
             // Build the patch list:
             // Always use dirty_ranges when available — send only what the app actually
@@ -1528,6 +1529,20 @@ impl FlushHandle {
                                         }
                                         Err(retry_err) => {
                                             warn!("flush_buffer_async_one: retry MultiPatch failed for ino={} chunk={}: {}", ino, chunk_idx, retry_err);
+                                            // If the fresh location had a DIFFERENT chunk_id than our
+                                            // original (stale-corrected to X) and X also fails with
+                                            // "all replicas failed", the chunk exists in metadata but
+                                            // not on disk on any replica — an unrecoverable patch state.
+                                            // Fall back to the fresh write path: write slot_data as a
+                                            // new chunk (gap regions will be zeros, but that data is
+                                            // already lost since the source chunk is gone).
+                                            if loc.chunk_id != old_location.chunk_id
+                                                && retry_err.to_string().contains("all replicas failed")
+                                            {
+                                                warn!("flush_buffer_async_one: chunk {} missing on all replicas after stale correction for ino={} chunk={} — falling back to fresh write",
+                                                    loc.chunk_id, ino, chunk_idx);
+                                                break 'try_patch;
+                                            }
                                             // Even though the retry failed, update metadata cache with
                                             // the fresh location so the next attempt uses the current
                                             // chunk ID instead of looping forever on the stale one.
@@ -1724,6 +1739,7 @@ impl FlushHandle {
             }
             // No metadata or location — fall through to normal write
         }
+        } // end 'try_patch
 
         // Write path: send data to server, update metadata & read engine, THEN remove slot.
         // For sparse writes (non-contiguous dirty_ranges), we must NOT send the full slot with

@@ -235,22 +235,19 @@ impl Server {
             // ChunkStale validation, causing a ping-pong of stale corrections under rapid
             // sequential patches.
             //
-            // written_at guard only applies when chunk_id is the same (stale node-list
-            // broadcast for an already-patched chunk). When chunk_id differs, the incoming
-            // location is a post-patch broadcast for a new chunk — always accept it.
+            // Always apply the written_at guard regardless of whether chunk_id matches.
+            // A late-arriving broadcast for an older chunk (lower written_at ms) must not
+            // overwrite a newer patch result. With millisecond timestamps, rapid write+patch
+            // sequences get distinct timestamps so the guard correctly distinguishes ordering.
+            // Never regress a newer chunk_id with an older one — that makes the chunk_map
+            // point to a file that no longer exists on disk (it was renamed by a later patch).
             if let Some(file_offset) = location.file_offset {
                 for loc in locs.iter_mut() {
                     if loc.file_offset == Some(file_offset) {
-                        if loc.chunk_id != location.chunk_id {
-                            // New chunk_id from a patch — always update.
+                        let incoming_ts = location.written_at.unwrap_or(0);
+                        let existing_ts = loc.written_at.unwrap_or(0);
+                        if incoming_ts >= existing_ts {
                             *loc = location.clone();
-                        } else {
-                            // Same chunk_id — guard against regressing healer-expanded node lists.
-                            let incoming_ts = location.written_at.unwrap_or(0);
-                            let existing_ts = loc.written_at.unwrap_or(0);
-                            if incoming_ts >= existing_ts {
-                                *loc = location.clone();
-                            }
                         }
                         return;
                     }
@@ -274,24 +271,17 @@ impl Server {
                 }
             }
             // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
-            // written_at guard only applies when chunk_id matches (same chunk, different
-            // node lists from healer). When chunk_id differs, the incoming location is
-            // a post-patch broadcast with a new chunk — always accept it, or the node's
-            // chunk_map retains the old chunk_id and incorrectly returns ChunkStale to
-            // the client on the next write cycle.
+            // Always apply the written_at guard — a late broadcast for an older chunk
+            // must never overwrite a newer patch result, even when chunk_ids differ.
+            // Regressing chunk_map to a renamed (deleted) chunk_id causes all replicas
+            // to return "chunk file not found" on the next patch attempt.
             if let Some(file_offset) = location.file_offset {
                 for loc in locs.iter_mut() {
                     if loc.file_offset == Some(file_offset) {
-                        if loc.chunk_id != location.chunk_id {
-                            // New chunk_id from a patch — always update.
+                        let incoming_ts = location.written_at.unwrap_or(0);
+                        let existing_ts = loc.written_at.unwrap_or(0);
+                        if incoming_ts >= existing_ts {
                             *loc = location.clone();
-                        } else {
-                            // Same chunk_id — apply written_at guard to block stale node-list broadcasts.
-                            let incoming_ts = location.written_at.unwrap_or(0);
-                            let existing_ts = loc.written_at.unwrap_or(0);
-                            if incoming_ts >= existing_ts {
-                                *loc = location.clone();
-                            }
                         }
                         return;
                     }

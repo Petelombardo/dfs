@@ -3579,9 +3579,11 @@ impl Server {
                 // server creates an empty file and patches it — producing corrupt garbage data.
                 if new_chunk_id != chunk_id {
                     const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-                    // Update in-memory chunk_map. Sled was already updated inside
-                    // spawn_blocking before the rename — see comment there.
+                    // Update in-memory chunk_map synchronously before returning the response.
+                    // This prevents the next MultiPatch from seeing a false stale-base here
+                    // (chunk_map still shows old chunk_id) before ReplicateChunkLocation arrives.
                     if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+                        // Targeted: O(1) lookup by file_id.
                         if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
                             let (locations, _) = entry.value_mut();
                             if let Some(loc) = locations.iter_mut().find(|l| {
@@ -3591,6 +3593,19 @@ impl Server {
                                 loc.chunk_id = new_chunk_id;
                                 loc.checksum = new_chunk_id.hash;
                                 loc.size = final_size;
+                            }
+                        }
+                    } else {
+                        // No file_id: fall back to scanning all files for the old chunk_id.
+                        // Slower but correct — ensures chunk_map is updated even when the
+                        // client didn't send file_id (e.g. legacy or fallback patch path).
+                        for mut entry in self.chunk_map.iter_mut() {
+                            let (locations, _) = entry.value_mut();
+                            if let Some(loc) = locations.iter_mut().find(|l| l.chunk_id == chunk_id) {
+                                loc.chunk_id = new_chunk_id;
+                                loc.checksum = new_chunk_id.hash;
+                                loc.size = final_size;
+                                break;
                             }
                         }
                     }

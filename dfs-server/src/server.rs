@@ -707,8 +707,52 @@ impl Server {
                 if let Err(e) = Self::push_locations_to(&server, leader_addr).await {
                     warn!("chunk_location_sync: push failed: {}", e);
                 }
+                // Also push file metadata for files this node physically holds.
+                // This fills leader gaps that arise from rolling restarts where the
+                // leader rebuilt its chunk_map before all followers were available.
+                // Only files where this node is a data holder are pushed — spectator
+                // metadata (known via gossip but no local chunk file) is not authoritative
+                // and is excluded. The leader's written_at guard prevents regressions.
+                if let Err(e) = Self::push_held_file_metadata_to(&server, leader_addr).await {
+                    warn!("chunk_location_sync: file metadata push failed: {}", e);
+                }
             }
         });
+    }
+
+    /// Push file metadata for files where this node is a data holder to `target`.
+    /// Uses ReplicateMetadataBatch — fills leader gaps without bumping write_seq
+    /// or triggering an immediate re-broadcast. The leader's sled write_seq ordering
+    /// and chunk_map written_at guard both prevent regressions from stale pushes.
+    async fn push_held_file_metadata_to(server: &Arc<Self>, target: std::net::SocketAddr) -> anyhow::Result<()> {
+        let my_node_id = server.cluster.local_node_id();
+        let metadata = server.metadata.clone();
+
+        let files: Vec<dfs_common::FileMetadata> = tokio::task::spawn_blocking(move || {
+            let mut held = Vec::new();
+            let _ = metadata.scan_files(|file| {
+                // Only push files where we actually hold at least one chunk on disk.
+                if file.chunk_locations.iter().any(|loc| loc.nodes.contains(&my_node_id)) {
+                    held.push(file);
+                }
+                Ok(())
+            });
+            held
+        }).await?;
+
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let total = files.len();
+        let mut sent = 0usize;
+        for batch in files.chunks(100) {
+            let req = dfs_common::Request::ReplicateMetadataBatch { items: batch.to_vec() };
+            server.client.send_message(target, dfs_common::Message::Request(req)).await?;
+            sent += batch.len();
+        }
+        info!("chunk_location_sync: pushed file metadata for {}/{} held files to {}", sent, total, target);
+        Ok(())
     }
 
     /// Push all local chunk locations to `target` in 500-record batches.
@@ -1340,6 +1384,32 @@ impl Server {
         // dedicated worker so we never block an async thread on sled I/O.
         // Under a 5000-file touch storm the leader broadcasts ~20k RPCs; without
         // this, every follower's Tokio runtime stalls on concurrent sled writes.
+        //
+        // Protect freshly-patched locations from being overwritten by stale broadcasts.
+        // A concurrent release/fsync may commit pre-patch metadata to the leader before
+        // our MultiPatch completes. The leader then broadcasts the stale state here. If
+        // our chunk_map already holds a newer written_at for a chunk (stamped by
+        // handle_multi_patch), keep it rather than reverting to the old chunk_id.
+        let metadata = {
+            let mut m = metadata;
+            if let Some(map_entry) = self.chunk_map.get(&m.id) {
+                let (map_locs, _) = map_entry.value();
+                for loc in m.chunk_locations.iter_mut() {
+                    if let Some(file_offset) = loc.file_offset {
+                        if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
+                            if map_loc.chunk_id != loc.chunk_id {
+                                let incoming_ts = loc.written_at.unwrap_or(0);
+                                let existing_ts = map_loc.written_at.unwrap_or(0);
+                                if existing_ts > incoming_ts {
+                                    *loc = map_loc.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            m
+        };
         self.chunk_map_update(&metadata).await;
         let _ = self.sled_write_tx.send(metadata.clone());
 
@@ -1748,8 +1818,29 @@ impl Server {
 
     async fn handle_replicate_metadata_batch(&self, items: Vec<FileMetadata>) -> Response {
         debug!("Handling batch replicate of {} metadata items", items.len());
-        for metadata in &items {
-            self.chunk_map_update(metadata).await;
+        for metadata in items {
+            // Same stale-broadcast guard as handle_replicate_metadata.
+            let metadata = {
+                let mut m = metadata;
+                if let Some(map_entry) = self.chunk_map.get(&m.id) {
+                    let (map_locs, _) = map_entry.value();
+                    for loc in m.chunk_locations.iter_mut() {
+                        if let Some(file_offset) = loc.file_offset {
+                            if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
+                                if map_loc.chunk_id != loc.chunk_id {
+                                    let incoming_ts = loc.written_at.unwrap_or(0);
+                                    let existing_ts = map_loc.written_at.unwrap_or(0);
+                                    if existing_ts > incoming_ts {
+                                        *loc = map_loc.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                m
+            };
+            self.chunk_map_update(&metadata).await;
             let _ = self.sled_write_tx.send(metadata.clone());
         }
         Response::Ok { data: None }
@@ -2727,6 +2818,32 @@ impl Server {
         // The sled write is handed to a dedicated single-threaded worker so it
         // never blocks the async runtime — concurrent puts used to cause a futex
         // pile-up as spawn_blocking threads all contended on sled's internal lock.
+        //
+        // Same stale-broadcast guard as handle_replicate_metadata: a concurrent release
+        // may commit pre-patch state here before the patch's ReplicateChunkLocation
+        // arrives to correct it. If our chunk_map already holds a freshly-patched
+        // location (higher written_at), keep it — don't let the stale put regress it.
+        // Also ensures the broadcast we fire carries the corrected state.
+        let metadata = {
+            let mut m = metadata;
+            if let Some(map_entry) = self.chunk_map.get(&m.id) {
+                let (map_locs, _) = map_entry.value();
+                for loc in m.chunk_locations.iter_mut() {
+                    if let Some(file_offset) = loc.file_offset {
+                        if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
+                            if map_loc.chunk_id != loc.chunk_id {
+                                let incoming_ts = loc.written_at.unwrap_or(0);
+                                let existing_ts = map_loc.written_at.unwrap_or(0);
+                                if existing_ts > incoming_ts {
+                                    *loc = map_loc.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            m
+        };
         self.chunk_map_update(&metadata).await;
         self.record_recent_write(metadata.clone()).await;
         self.broadcast_metadata_to_followers(&metadata, 0).await;
@@ -3559,6 +3676,14 @@ impl Server {
                     // Update in-memory chunk_map synchronously before returning the response.
                     // This prevents the next MultiPatch from seeing a false stale-base here
                     // (chunk_map still shows old chunk_id) before ReplicateChunkLocation arrives.
+                    //
+                    // Stamp written_at = now so that a concurrent stale broadcast (from a
+                    // release that committed pre-patch metadata to the leader) cannot overwrite
+                    // this freshly-patched location via handle_replicate_metadata.
+                    let patch_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
                     if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
                         // Targeted: O(1) lookup by file_id.
                         if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
@@ -3570,6 +3695,7 @@ impl Server {
                                 loc.chunk_id = new_chunk_id;
                                 loc.checksum = new_chunk_id.hash;
                                 loc.size = final_size;
+                                loc.written_at = Some(patch_ts);
                             }
                         }
                     } else {
@@ -3582,6 +3708,7 @@ impl Server {
                                 loc.chunk_id = new_chunk_id;
                                 loc.checksum = new_chunk_id.hash;
                                 loc.size = final_size;
+                                loc.written_at = Some(patch_ts);
                                 break;
                             }
                         }

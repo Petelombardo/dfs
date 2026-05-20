@@ -5,12 +5,12 @@ fi
 
 
 if [ "$1" == "all" ] || [ "$1" == "server" ]; then
-	for i in $(seq 1 5); 
+	for i in gluster2 gluster3 gluster4 gluster5 gluster1; 
 	do 
-		echo "Deploying to gluster$i"; 
-		ssh root@gluster$i systemctl stop dfs-server; 
-		scp target/release/dfs-server target/release/dfs-admin target/release/dfs-client root@gluster$i:/usr/bin/; 
-		ssh root@gluster$i systemctl start dfs-server; 
+		echo "Deploying to $i"; 
+		ssh root@$i systemctl stop dfs-server; 
+		scp target/release/dfs-server target/release/dfs-admin target/release/dfs-client root@$i:/usr/bin/; 
+		ssh root@$i systemctl start dfs-server; 
 		sleep 3; 
 		echo ""; 
 	done

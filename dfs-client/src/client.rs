@@ -5749,20 +5749,47 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// This is safer than separate put + purge operations as it prevents
     /// race conditions where the file disappears during rename
     pub async fn rename_file(&self, old_path: &str, new_path: &str) -> Result<()> {
-        let request = Request::RenameFile {
-            old_path: old_path.to_string(),
-            new_path: new_path.to_string(),
-        };
+        // Route to the leader — followers may not have received the file metadata
+        // yet if the broadcast flush window (100ms) hasn't fired since the last
+        // PutFileMetadata. The leader always has authoritative sled state.
+        let nodes = self.cluster_nodes.read().await.clone();
+        let mut leader_addr = *self.leader_addr.read().await;
 
-        let response = self.send_request_with_retry(request).await?;
-
-        match response {
-            Response::Ok { .. } => Ok(()),
-            Response::Error { message, .. } => {
-                anyhow::bail!("Failed to rename file: {}", message);
+        for attempt in 0..4u32 {
+            let target = leader_addr.unwrap_or_else(|| nodes[0]);
+            let req = Request::RenameFile {
+                old_path: old_path.to_string(),
+                new_path: new_path.to_string(),
+            };
+            match self.send_request(target, req).await {
+                Ok(Response::Ok { .. }) => {
+                    *self.leader_addr.write().await = Some(target);
+                    return Ok(());
+                }
+                Ok(Response::NotLeader { leader_addr: redirect }) => {
+                    if let Some(addr) = redirect {
+                        *self.leader_addr.write().await = Some(addr);
+                        leader_addr = Some(addr);
+                    } else {
+                        let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
+                        leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
+                    }
+                    if attempt < 3 { continue; }
+                }
+                Ok(Response::Error { message, .. }) => {
+                    anyhow::bail!("Failed to rename file: {}", message);
+                }
+                Ok(_) => anyhow::bail!("rename_file: unexpected response"),
+                Err(e) => {
+                    warn!("rename_file: {} failed: {}", target, e);
+                    let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
+                    leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
+                    if attempt < 3 { continue; }
+                    anyhow::bail!("rename_file: all nodes failed: {}", e);
+                }
             }
-            _ => anyhow::bail!("Unexpected response type"),
         }
+        anyhow::bail!("rename_file: could not reach leader after 4 attempts")
     }
 
     /// Refresh cluster node list by querying GetClusterStatus.

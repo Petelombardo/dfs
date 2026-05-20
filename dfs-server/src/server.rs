@@ -1469,6 +1469,10 @@ impl Server {
         // Record tombstone before deleting so that any concurrent ReplicateMetadata
         // arriving on this node is also blocked from resurrecting the file.
         self.delete_tombstones.insert(file_id, std::time::Instant::now());
+        // Purge from the coalescing broadcast buffer. Without this, a create that
+        // landed in pending_broadcasts moments before this delete would be flushed
+        // to followers 100ms later, resurrecting the file there.
+        self.pending_broadcasts.remove(&file_id);
 
         if let Err(e) = self.metadata.delete_file(&file_id) {
             warn!("Failed to delete file record {} on peer: {}", file_id, e);
@@ -1825,7 +1829,17 @@ impl Server {
 
     async fn handle_replicate_metadata_batch(&self, items: Vec<FileMetadata>) -> Response {
         debug!("Handling batch replicate of {} metadata items", items.len());
+        const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
         for metadata in items {
+            // Tombstone check: reject items for recently-deleted files.
+            // Matches the check in handle_replicate_metadata — without this, a
+            // create flushed from pending_broadcasts after the delete tombstone was
+            // set could resurrect the file on this follower.
+            if let Some(entry) = self.delete_tombstones.get(&metadata.id) {
+                if entry.value().elapsed() < TOMBSTONE_TTL {
+                    continue;
+                }
+            }
             // Same stale-broadcast guard as handle_replicate_metadata.
             let metadata = {
                 let mut m = metadata;
@@ -3849,6 +3863,7 @@ impl Server {
 
         // Step 3: tombstone + in-memory chunk_map removal.
         self.delete_tombstones.insert(metadata.id, std::time::Instant::now());
+        self.pending_broadcasts.remove(&metadata.id);
         self.chunk_map_remove(&metadata.id).await;
 
         // Notify the drain worker that there's a new entry (leader only acts on it,
@@ -3871,6 +3886,7 @@ impl Server {
 
         // Tombstone so in-flight replicates can't resurrect the file.
         self.delete_tombstones.insert(file_id, std::time::Instant::now());
+        self.pending_broadcasts.remove(&file_id);
 
         // Wipe metadata (idempotent — already gone on quorum nodes).
         let _ = self.metadata.delete_file(&file_id);

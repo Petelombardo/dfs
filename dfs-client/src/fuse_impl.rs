@@ -194,6 +194,12 @@ struct InodeWriteState {
     /// it notifies all waiters and removes the entry. Before starting a new flush for chunk N,
     /// we wait on this notifier to ensure FIFO ordering for overlapping chunk flushes.
     chunk_flush_waiters: HashMap<u64, Arc<tokio::sync::Notify>>,
+    /// Canonical write-pair for each chunk in this session. Set on the first successful
+    /// patch of a chunk and held for the lifetime of the write session. All subsequent
+    /// patches to the same chunk use these exact nodes — ignoring healer-added replicas
+    /// in metadata_cache and recent_chunk_writes. This prevents the ChunkStale cascade
+    /// where alternating between different node pairs creates divergent chunk versions.
+    canonical_write_nodes: HashMap<u64, Vec<dfs_common::NodeId>>,
 }
 
 impl InodeWriteState {
@@ -202,6 +208,7 @@ impl InodeWriteState {
             slots: HashMap::new(),
             flushed_sizes: HashMap::new(),
             chunk_ids_at_open: HashMap::new(),
+            canonical_write_nodes: HashMap::new(),
             sync_on_fsync,
             is_truncated_session: false,
             expected_file_id: None,
@@ -1348,12 +1355,22 @@ impl FlushHandle {
                     }
                 };
 
-                // Enforce sorted-first-2: always patch the canonical pair of nodes (sorted
-                // by NodeId, lowest two). The 3rd replica is healer-owned — we never target
-                // it directly, so we can never get a stale-base from a healer-added node.
-                // After the patch, the broadcast-delete tombstones the old chunk on every
-                // node (including the 3rd) and the metadata update drops it from the map.
+                // Canonical write-pair: once we've successfully patched a chunk in this
+                // session, always use the same 2 nodes for all subsequent patches.
+                // canonical_write_nodes takes priority over everything — metadata_cache,
+                // recent_chunk_writes, sorted-first-2 — because those can all be
+                // contaminated by healer-added replicas that hold divergent chunk versions.
+                // If no canonical pair exists yet, fall back to sorted-first-2.
+                let canonical = self.write_buffers.get(&ino)
+                    .and_then(|s| s.try_lock().ok()
+                        .and_then(|st| st.canonical_write_nodes.get(&chunk_idx).cloned()));
                 let old_location = old_location.map(|mut loc| {
+                    if let Some(nodes) = canonical {
+                        if !nodes.is_empty() {
+                            loc.nodes = nodes;
+                            return loc;
+                        }
+                    }
                     if loc.nodes.len() > 2 {
                         loc.nodes.sort_unstable();
                         loc.nodes.truncate(2);
@@ -1579,6 +1596,16 @@ impl FlushHandle {
                             (ino, chunk_idx),
                             (new_location.chunk_id, file_id, std::time::Instant::now(), new_location.nodes.clone()),
                         );
+                    }
+                    // Persist the canonical write-pair for this chunk in the session write buffer.
+                    // This overrides sorted-first-2 on the next flush: same 2 nodes every time,
+                    // regardless of what the healer adds to metadata_cache between patches.
+                    if !new_location.nodes.is_empty() {
+                        if let Some(state_arc) = self.write_buffers.get(&ino) {
+                            if let Ok(mut state) = state_arc.try_lock() {
+                                state.canonical_write_nodes.insert(chunk_idx, new_location.nodes.clone());
+                            }
+                        }
                     }
                     // Apply the patch to the cached base chunk so chunk_cache reflects the
                     // post-patch state immediately. This is the same recipe the server uses:

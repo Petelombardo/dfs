@@ -2595,6 +2595,21 @@ impl Server {
             return;
         }
 
+        let local_id = self.cluster.local_node_id();
+        let nodes = self.cluster.get_all_nodes().await;
+
+        // Only enqueue for offline followers — online nodes receive the update
+        // immediately via the pending_broadcasts flush loop. This check MUST happen
+        // before next_meta_sequence(): that call does a synchronous sled write, and
+        // under a write storm (rsync of 1000s of files) calling it 3500 times/sec
+        // blocks Tokio worker threads even when there is nothing to enqueue.
+        let offline_followers: Vec<_> = nodes.iter()
+            .filter(|n| n.id != local_id && n.status != dfs_common::NodeStatus::Online)
+            .collect();
+        if offline_followers.is_empty() {
+            return;
+        }
+
         let seq = match self.metadata.next_meta_sequence() {
             Ok(s) => s,
             Err(e) => {
@@ -2603,18 +2618,7 @@ impl Server {
             }
         };
 
-        let local_id = self.cluster.local_node_id();
-        let nodes = self.cluster.get_all_nodes().await;
-        for node in &nodes {
-            if node.id == local_id {
-                continue;
-            }
-            // Only enqueue for offline nodes — online nodes receive it immediately
-            // via broadcast_metadata_to_followers. Enqueueing for online nodes causes
-            // the dissemination loop to re-deliver every 5s, creating a metadata storm.
-            if node.status == dfs_common::NodeStatus::Online {
-                continue;
-            }
+        for node in &offline_followers {
             if let Err(e) = self.metadata.enqueue_meta_for_node(node.id, seq, metadata) {
                 warn!("Failed to enqueue metadata for node {}: {}", node.id, e);
             }

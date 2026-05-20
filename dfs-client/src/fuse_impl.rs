@@ -1347,16 +1347,6 @@ impl FlushHandle {
                         (loc, _) => loc,
                     }
                 };
-                // Save ALL candidate nodes before sorted-first-2 truncation. If the primary
-                // patch returns < 2 replicas (stale-base on one node, chunk not found, etc.),
-                // we fall back to these extra nodes so we always try to reach 2 replicas when
-                // ≥ 2 nodes hold the correct base. Without this, a single stale-base starts a
-                // cascade: 1-replica patch → 1 node in recent_chunk_writes → every subsequent
-                // patch also 1-replica, perpetuating inconsistent state between nodes.
-                let all_candidate_nodes: Vec<dfs_common::NodeId> = old_location
-                    .as_ref()
-                    .map(|loc| loc.nodes.clone())
-                    .unwrap_or_default();
 
                 // Enforce sorted-first-2: always patch the canonical pair of nodes (sorted
                 // by NodeId, lowest two). The 3rd replica is healer-owned — we never target
@@ -1558,54 +1548,13 @@ impl FlushHandle {
                         }
                     };
 
-                    // Fallback to extra replicas when primary patch returned < 2 nodes.
-                    // A stale-base on one of the sorted-first-2 nodes results in only 1
-                    // successful replica, leaving the second node behind. Before accepting
-                    // that, try any remaining nodes from the full pre-truncation candidate
-                    // list — e.g. the healer-added 3rd replica that still has the correct
-                    // base. Content-addressed storage guarantees same base + same patches
-                    // produces the same new chunk_id, so the result is consistent.
-                    if new_location.nodes.len() < 2 && all_candidate_nodes.len() > old_location.nodes.len() {
-                        let already_patched: std::collections::HashSet<dfs_common::NodeId> =
-                            new_location.nodes.iter().copied().collect();
-                        let primary_tried: std::collections::HashSet<dfs_common::NodeId> =
-                            old_location.nodes.iter().copied().collect();
-                        let needed = 2 - new_location.nodes.len();
-                        let mut extra_loc = old_location.clone();
-                        extra_loc.nodes = all_candidate_nodes.iter()
-                            .filter(|n| !primary_tried.contains(n) && !already_patched.contains(n))
-                            .copied()
-                            .take(needed)
-                            .collect();
-                        if !extra_loc.nodes.is_empty() {
-                            warn!("flush_buffer_async_one: ino={} chunk={} only {} replica — trying {} extra node(s) to reach 2",
-                                ino, chunk_idx, new_location.nodes.len(), extra_loc.nodes.len());
-                            let extra_result = if let Some(fid) = file_id_at_flush_start {
-                                self.client.multi_patch_chunk_on_replicas_verified(
-                                    extra_loc.chunk_id, fid, chunk_idx, file_offset,
-                                    patches.clone(), &extra_loc, expected_new_chunk_id,
-                                    self.use_dual_rf,
-                                ).await
-                            } else {
-                                self.client.multi_patch_chunk_on_replicas(
-                                    extra_loc.chunk_id, file_offset, patches.clone(),
-                                    &extra_loc, expected_new_chunk_id, self.use_dual_rf,
-                                ).await
-                            };
-                            match extra_result {
-                                Ok((fb_loc, _)) => {
-                                    info!("flush_buffer_async_one: ino={} chunk={} extra patch added {} node(s) — now {} replicas",
-                                        ino, chunk_idx, fb_loc.nodes.len(),
-                                        new_location.nodes.len() + fb_loc.nodes.len());
-                                    new_location.nodes.extend(fb_loc.nodes);
-                                }
-                                Err(e) => {
-                                    warn!("flush_buffer_async_one: ino={} chunk={} extra patch also failed: {}",
-                                        ino, chunk_idx, e);
-                                }
-                            }
-                        }
-                    }
+                    // Do NOT attempt to patch extra nodes when the primary returned < 2 replicas.
+                    // A node not in the sorted-first-2 may hold a divergent version of the chunk
+                    // (from a prior patch cycle that wrote to it but didn't track it in
+                    // recent_chunk_writes), causing a REPLICA DISAGREEMENT that produces a
+                    // second divergent chunk_id — making state worse, not better.
+                    // The healer's freshness check correctly converges replica state without
+                    // introducing further divergence.
 
                     // Record old_chunk_id for broadcast cleanup after metadata sync.
                     // flush_all_pipelined tombstones + deletes it from ALL cluster nodes,

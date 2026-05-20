@@ -95,10 +95,16 @@ pub struct Server {
     leader_forward_notify: Arc<tokio::sync::Notify>,
 
     /// Short-term gossip ring: metadata written by this node in the last ~30s.
-    /// Each entry is (FileMetadata, written_at). The gossip loop broadcasts these
-    /// to all peers (including the leader) every 15s with TTL=0, fire-and-forget.
-    /// Capped at 512 entries; oldest entries are evicted when full.
-    recent_writes: Arc<tokio::sync::Mutex<std::collections::VecDeque<(FileMetadata, std::time::Instant)>>>,
+    /// Keyed by FileId for O(1) insert+dedup — replaces the old Mutex<VecDeque>
+    /// which caused contention at >100 writes/sec (rsync storms, bulk copies).
+    recent_writes: Arc<DashMap<FileId, (FileMetadata, std::time::Instant)>>,
+
+    /// Coalescing buffer for immediate metadata broadcasts to followers.
+    /// handle_put_file_metadata inserts here instead of spawning a per-file task.
+    /// start_broadcast_flush_loop drains and sends ReplicateMetadataBatch every 100ms.
+    /// DashMap provides O(1) insert and natural dedup by FileId — a write storm of
+    /// 3500 files/sec produces at most one batch per 100ms window, not 3500 tasks.
+    pending_broadcasts: Arc<DashMap<FileId, FileMetadata>>,
 
     /// Delete tombstone set: FileId -> deleted_at instant.
     /// Any PutFileMetadata that arrives for an ID in this set within TOMBSTONE_TTL
@@ -155,7 +161,8 @@ impl Server {
             healing: Arc::new(RwLock::new(None)),
             leader_forward_queue: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
             leader_forward_notify: Arc::new(tokio::sync::Notify::new()),
-            recent_writes: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            recent_writes: Arc::new(DashMap::new()),
+            pending_broadcasts: Arc::new(DashMap::new()),
             delete_tombstones: Arc::new(DashMap::new()),
             chunk_tombstones: Arc::new(dashmap::DashSet::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
@@ -2602,15 +2609,11 @@ impl Server {
 
     /// Record a metadata write in the short-term gossip ring.
     /// Evicts the oldest entry when the ring exceeds 512 items.
-    async fn record_recent_write(&self, metadata: FileMetadata) {
-        const MAX_RECENT: usize = 512;
-        let mut ring = self.recent_writes.lock().await;
-        // Dedup: replace any existing entry for this file_id so we only gossip the latest.
-        ring.retain(|(m, _)| m.id != metadata.id);
-        ring.push_back((metadata, std::time::Instant::now()));
-        while ring.len() > MAX_RECENT {
-            ring.pop_front();
-        }
+    fn record_recent_write(&self, metadata: FileMetadata) {
+        // DashMap insert is O(1) and deduplicates by file_id automatically —
+        // a newer write for the same file replaces the older one, which is exactly
+        // what we want. No mutex, no O(n) retain, no contention under write storms.
+        self.recent_writes.insert(metadata.id, (metadata, std::time::Instant::now()));
     }
 
     /// Short-term gossip loop: every 15s broadcast all writes from the last 30s
@@ -2624,13 +2627,13 @@ impl Server {
             loop {
                 tokio::time::sleep(GOSSIP_INTERVAL).await;
 
-                // Collect writes from the last 30s, then evict older ones from the ring.
+                // Collect writes from the last 30s, evict stale entries in the same pass.
+                // DashMap.retain is lock-striped and doesn't block other inserts.
                 let batch: Vec<FileMetadata> = {
-                    let mut ring = server.recent_writes.lock().await;
-                    ring.retain(|(_, t)| t.elapsed() < GOSSIP_WINDOW * 2); // keep up to 60s for safety
-                    ring.iter()
-                        .filter(|(_, t)| t.elapsed() < GOSSIP_WINDOW)
-                        .map(|(m, _)| m.clone())
+                    server.recent_writes.retain(|_, (_, t)| t.elapsed() < GOSSIP_WINDOW * 2);
+                    server.recent_writes.iter()
+                        .filter(|e| e.value().1.elapsed() < GOSSIP_WINDOW)
+                        .map(|e| e.value().0.clone())
                         .collect()
                 };
 
@@ -2678,6 +2681,48 @@ impl Server {
                         let _ = tokio::time::timeout(
                             tokio::time::Duration::from_secs(5),
                             client.send_message(addr, req),
+                        ).await;
+                    });
+                }
+            }
+        });
+    }
+
+    /// Drains pending_broadcasts every 100ms and sends ReplicateMetadataBatch to
+    /// all online followers. Coalesces all inserts within the 100ms window into a
+    /// single RPC per follower instead of one task per file — critical for write
+    /// storms (rsync, bulk copies) where handle_put_file_metadata runs 1000s/sec.
+    pub fn start_broadcast_flush_loop(self: Arc<Self>) {
+        let server = self;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if server.pending_broadcasts.is_empty() {
+                    continue;
+                }
+                let batch: Vec<FileMetadata> = server.pending_broadcasts
+                    .iter()
+                    .map(|e| e.value().clone())
+                    .collect();
+                server.pending_broadcasts.clear();
+                if batch.is_empty() {
+                    continue;
+                }
+                let local_id = server.cluster.local_node_id();
+                let nodes = server.cluster.get_all_nodes().await;
+                for node in &nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let req = dfs_common::Request::ReplicateMetadataBatch { items: batch.clone() };
+                    let client = server.client.clone();
+                    let addr = node.addr;
+                    let sem = server.broadcast_semaphore.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await.ok();
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            client.send_message(addr, dfs_common::Message::Request(req)),
                         ).await;
                     });
                 }
@@ -2845,8 +2890,14 @@ impl Server {
             m
         };
         self.chunk_map_update(&metadata).await;
-        self.record_recent_write(metadata.clone()).await;
-        self.broadcast_metadata_to_followers(&metadata, 0).await;
+        self.record_recent_write(metadata.clone());
+        // Coalesce into the broadcast buffer instead of spawning a per-file task.
+        // start_broadcast_flush_loop drains this DashMap every 100ms as a batch.
+        // Prevents Tokio task storms during bulk writes (rsync, large copies).
+        // The dissemination queue provides the durable ordered catch-up path.
+        if metadata.write_seq > 0 || !metadata.chunk_locations.is_empty() {
+            self.pending_broadcasts.insert(metadata.id, metadata.clone());
+        }
         self.enqueue_metadata_for_followers(&metadata).await;
         let _ = self.sled_write_tx.send(metadata);
         Response::Ok { data: None }

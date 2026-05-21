@@ -1949,7 +1949,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let read_end = (offset + size).min(chunk_start + chunk_size);
                 if read_end <= read_start { continue; }
                 let out_start = read_start - offset;
-                let out_end = read_end - offset;
+                // Clamp out_end to the output buffer size. loc.size may be larger than
+                // the actual file content (e.g. chunk rounded to a block boundary) but
+                // the output buffer is bounded by clamped_size = file_size - offset.
+                let out_end = (read_end - offset).min(clamped_size);
+                if out_end <= out_start { continue; }
                 let copy_len = (out_end - out_start).min(data.len());
                 out[out_start..out_start + copy_len].copy_from_slice(&data[..copy_len]);
             }
@@ -2259,14 +2263,17 @@ leader_addr: Arc::new(RwLock::new(None)),
             let local_start = read_start - chunk_start;
             let local_end = read_end - chunk_start;
             let out_start = read_start - offset;
-            let out_end = read_end - offset;
+            // Clamp out_end to the output buffer — loc.size may exceed actual file content.
+            let out_end = (read_end - offset).min(clamped_size);
+            if out_end <= out_start { continue; }
             if local_end > data.len() {
                 if local_start < data.len() {
-                    let copy_len = data.len() - local_start;
-                    out[out_start..out_start + copy_len].copy_from_slice(&data[local_start..]);
+                    let copy_len = (data.len() - local_start).min(out_end - out_start);
+                    out[out_start..out_start + copy_len].copy_from_slice(&data[local_start..local_start + copy_len]);
                 }
             } else {
-                out[out_start..out_end].copy_from_slice(&data[local_start..local_end]);
+                let clamped_local_end = local_end.min(local_start + (out_end - out_start));
+                out[out_start..out_end].copy_from_slice(&data[local_start..clamped_local_end]);
             }
         }
 

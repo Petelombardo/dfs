@@ -236,26 +236,14 @@ impl Server {
                     return;
                 }
             }
-            // No chunk_id match — check by file_offset. This handles PatchChunk: the
-            // incoming location has a new chunk_id but the same file_offset. Without this,
-            // the in-memory chunk_map retains the old chunk_id and returns stale data to
-            // ChunkStale validation, causing a ping-pong of stale corrections under rapid
-            // sequential patches.
-            //
-            // Guard: reject if incoming is older than what we already have. Fresh writes
-            // use written_at=None (=0) so any server-timestamped patch always wins.
-            if let Some(file_offset) = location.file_offset {
-                for loc in locs.iter_mut() {
-                    if loc.file_offset == Some(file_offset) {
-                        let incoming_ts = location.written_at.unwrap_or(0);
-                        let existing_ts = loc.written_at.unwrap_or(0);
-                        if incoming_ts >= existing_ts {
-                            *loc = location.clone();
-                        }
-                        return;
-                    }
-                }
-            }
+            // Do NOT fall back to file_offset matching when file_id is unknown.
+            // chunk_map_update_location is only called from handle_replicate_chunk_location
+            // when file_id=None (fresh writes from write_chunk_to_replicas). Every file
+            // has a chunk at file_offset=0, so a scan-all-files match by offset alone is
+            // non-deterministic and corrupts the wrong file's chunk_map entry (T8 race:
+            // t8_big.bin's ReplicateChunkLocation can hit t8_persist.txt first).
+            // Exact chunk_id match above covers the update case; PutFileMetadata from
+            // flush_metadata_sync is the authoritative update for fresh writes.
         }
     }
 

@@ -127,6 +127,11 @@ struct ChunkSlot {
     /// clock skew or pre-existing corruption keeps the stale-broadcast guard from
     /// converging in a timely manner.
     consecutive_patch_failures: u32,
+    /// The chunk_id last confirmed by the server for this slot — set from every
+    /// successful MultiPatch or fresh-write response, never from metadata_cache or
+    /// recent_chunk_writes. This is the authoritative base for the next patch: if set,
+    /// it takes priority over all other sources so we never use a stale chunk_id.
+    server_chunk_id: Option<ChunkId>,
 }
 
 impl ChunkSlot {
@@ -139,6 +144,7 @@ impl ChunkSlot {
             dirty_ranges: Vec::new(),
             consecutive_patch_failures: 0,
             flushing: false,
+            server_chunk_id: None,
         }
     }
 
@@ -1322,11 +1328,19 @@ impl FlushHandle {
             };
             let meta = self.metadata_cache.get(&ino).map(|m| m.clone());
             if let Some(meta) = meta {
-                // Before using the cached location, check if recent_chunk_writes has a
-                // fresher chunk_id for this (ino, chunk_idx) — this happens when consecutive
-                // writes to the same chunk arrive faster than metadata_cache is updated.
-                // The leader already has the new id (we sent it synchronously); using it
-                // avoids both a stale-base rejection and a round-trip on the first attempt.
+                // Priority order for the base chunk_id:
+                //   1. slot.server_chunk_id — confirmed by server in this session (highest)
+                //   2. recent_chunk_writes  — last server-confirmed id (120s window)
+                //   3. metadata_cache       — server metadata, may lag by a flush cycle
+                //
+                // server_chunk_id is set from every successful MultiPatch/write response
+                // and is never overwritten by a cache refresh. It is the authoritative base
+                // and eliminates the stale-base problem for any chunk that has been written
+                // at least once in this session.
+                let slot_server_id = self.write_buffers.get(&ino)
+                    .and_then(|s| s.try_lock().ok()
+                        .and_then(|st| st.slots.get(&chunk_idx)
+                            .and_then(|sl| sl.server_chunk_id)));
                 let old_location = {
                     let cached_loc = meta.chunk_location_for_idx(chunk_idx).cloned();
                     let recent = self.client.recent_chunk_writes.get(&(ino, chunk_idx))
@@ -1361,6 +1375,20 @@ impl FlushHandle {
                         (loc, _) => loc,
                     }
                 };
+                // Override chunk_id with the server-confirmed value if we have one.
+                // This is the highest-priority source and cannot be stale — it was set
+                // directly from the last server response for this slot.
+                let old_location = old_location.map(|mut loc| {
+                    if let Some(confirmed_id) = slot_server_id {
+                        if confirmed_id != loc.chunk_id {
+                            info!("flush_buffer_async_one: ino={} chunk={} using server_chunk_id {} (cache/recent had {})",
+                                ino, chunk_idx, confirmed_id, loc.chunk_id);
+                            loc.chunk_id = confirmed_id;
+                            loc.checksum = confirmed_id.hash;
+                        }
+                    }
+                    loc
+                });
 
                 // Canonical write-pair: once we've successfully patched a chunk in this
                 // session, always use the same 2 nodes for all subsequent patches.
@@ -1478,11 +1506,26 @@ impl FlushHandle {
                     };
                     let (mut new_location, skip_pairs) = match patch_result {
                         Ok((loc, sp)) => {
-                            // Patch succeeded — reset the failure counter.
+                            // Compare client's expected hash vs server's actual hash.
+                            // They should agree when the client's cached content was correct.
+                            // A mismatch means the server's copy differed from what we thought —
+                            // evict the wrong client-side cache entry and warn. Either way the
+                            // server's hash is authoritative.
+                            if let Some(exp) = expected_new_chunk_id {
+                                if exp != loc.chunk_id {
+                                    warn!("flush_buffer_async_one: ino={} chunk={} hash MISMATCH — client expected {} server returned {} — evicting stale cache entry",
+                                        ino, chunk_idx, exp, loc.chunk_id);
+                                    self.client.chunk_cache.invalidate(&exp).await;
+                                }
+                            }
+                            // Patch succeeded — reset failure counter and record the
+                            // server-confirmed chunk_id. This becomes the authoritative base
+                            // for the next patch, bypassing metadata_cache / recent_chunk_writes.
                             if let Some(state_arc) = self.write_buffers.get(&ino) {
                                 if let Ok(mut state) = state_arc.try_lock() {
                                     if let Some(slot) = state.slots.get_mut(&chunk_idx) {
                                         slot.consecutive_patch_failures = 0;
+                                        slot.server_chunk_id = Some(loc.chunk_id);
                                     }
                                 }
                             }
@@ -1867,9 +1910,14 @@ impl FlushHandle {
                 self.client.seed_zero_gap_table(ino, file_offset, slot_data.len(), &dirty_ranges).await;
 
                 // Track flushed size but DON'T remove slot yet.
+                // Also store the server-confirmed chunk_id so the next patch
+                // uses it as the authoritative base rather than metadata_cache.
                 if let Some(state_arc) = self.write_buffers.get(&ino) {
                     let mut state = state_arc.lock().await;
                     state.flushed_sizes.insert(chunk_idx, flushed_len);
+                    if let (Some(loc), Some(slot)) = (locations.first(), state.slots.get_mut(&chunk_idx)) {
+                        slot.server_chunk_id = Some(loc.chunk_id);
+                    }
                 }
 
                 // Full-chunk replacement: update recent_chunk_writes with the new nodes so

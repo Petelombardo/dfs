@@ -1047,7 +1047,7 @@ impl FlushHandle {
         // Pick the lowest-index unclaimed full slot, falling back to the lowest idle slot.
         // Atomically set flushing=true while holding the mutex so no second concurrent
         // task can claim the same slot.
-        let (chunk_idx, slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap) = {
+        let (chunk_idx, mut slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap) = {
             let Some(state_arc) = self.write_buffers.get(&ino) else { return Ok(()); };
             let mut state = state_arc.lock().await;
 
@@ -1205,7 +1205,7 @@ impl FlushHandle {
     /// Slot data, file offset, gap_filled_prefix, real_data_end, and dirty_ranges are all
     /// pre-snapshotted by flush_one_chunk while holding the mutex. Reading these from the
     /// live slot after release is wrong — the slot may have been removed and recreated.
-    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, slot_data: Vec<u8>, file_offset: u64, gap_filled_prefix: usize, real_data_end: usize, dirty_ranges: Vec<(usize, usize)>, last_modified_snap: SystemTime) -> Result<()> {
+    async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, mut slot_data: Vec<u8>, file_offset: u64, gap_filled_prefix: usize, real_data_end: usize, dirty_ranges: Vec<(usize, usize)>, last_modified_snap: SystemTime) -> Result<()> {
 
         // Snapshot the file ID now. After the network write we'll verify it hasn't changed —
         // a delete+create can replace the file while the flush is in flight, and the new
@@ -1574,8 +1574,36 @@ impl FlushHandle {
                                                 } else { MAX_PATCH_FAILURES }
                                             } else { MAX_PATCH_FAILURES };
                                             if failures >= MAX_PATCH_FAILURES {
-                                                warn!("flush_buffer_async_one: ino={} chunk={} exceeded {} consecutive patch failures — falling back to fresh write to prevent data loss",
+                                                warn!("flush_buffer_async_one: ino={} chunk={} exceeded {} consecutive patch failures — attempting cache reconstruction before fresh write",
                                                     ino, chunk_idx, MAX_PATCH_FAILURES);
+                                                // If there are gap regions (gap_filled_prefix > 0),
+                                                // slot_data has zeros there — not actual server data.
+                                                // Overwriting with zeros would corrupt the existing
+                                                // chunk content at those offsets. Try to reconstruct
+                                                // from chunk_cache so the fresh write preserves the
+                                                // gap regions rather than zeroing them.
+                                                if gap_filled_prefix > 0 {
+                                                    let base = self.client.chunk_cache.get(&old_location.chunk_id).await
+                                                        .or(self.client.chunk_cache.get(&loc.chunk_id).await);
+                                                    if let Some(base_arc) = base {
+                                                        let mut reconstructed = (*base_arc).clone();
+                                                        if reconstructed.len() < slot_data.len() {
+                                                            reconstructed.resize(slot_data.len(), 0);
+                                                        }
+                                                        for &(start, end) in &dirty_ranges {
+                                                            let e = end.min(slot_data.len()).min(reconstructed.len());
+                                                            if start < e {
+                                                                reconstructed[start..e].copy_from_slice(&slot_data[start..e]);
+                                                            }
+                                                        }
+                                                        info!("flush_buffer_async_one: ino={} chunk={} reconstructed from cache — gap regions preserved, writing fresh",
+                                                            ino, chunk_idx);
+                                                        slot_data = reconstructed;
+                                                    } else {
+                                                        warn!("flush_buffer_async_one: ino={} chunk={} cache miss — fresh write will zero gap regions (potential data loss in bytes 0..{})",
+                                                            ino, chunk_idx, gap_filled_prefix);
+                                                    }
+                                                }
                                                 break 'try_patch;
                                             }
                                             // Even though the retry failed, update metadata cache with

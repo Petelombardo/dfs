@@ -2718,8 +2718,19 @@ impl Server {
                 if server.pending_broadcasts.is_empty() {
                     continue;
                 }
+                // Filter tombstoned entries before sending. The DashMap iter() and
+                // clear() are not atomic: a delete_tombstones.insert() + pending_broadcasts
+                // .remove() can race between iter() and clear(), leaving the deleted file
+                // in the batch. The follower tombstone check catches most of these, but
+                // filtering here is the right place to stop it at the source.
+                const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
                 let batch: Vec<FileMetadata> = server.pending_broadcasts
                     .iter()
+                    .filter(|e| {
+                        server.delete_tombstones.get(e.key())
+                            .map(|t| t.value().elapsed() >= TOMBSTONE_TTL)
+                            .unwrap_or(true)
+                    })
                     .map(|e| e.value().clone())
                     .collect();
                 server.pending_broadcasts.clear();

@@ -5304,10 +5304,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         file_offset: u64,
         replica_nodes_per_chunk: Vec<Vec<NodeId>>,
     ) -> Vec<dfs_common::ChunkLocation> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // written_at intentionally None for fresh writes. Using the client clock here
+        // creates a timestamp that can exceed any server-side patch_ts (client ahead of
+        // server). The broadcast guard (existing_ts > incoming_ts) then incorrectly
+        // treats a subsequent patch as "stale" and reverts the chunk_map. None (=0)
+        // ensures every server-timestamped patch result beats a fresh-write broadcast.
         let mut locations = Vec::with_capacity(chunk_ids.len());
         let mut current_offset = file_offset;
         for (idx, (chunk_id, &size)) in chunk_ids.iter().zip(chunk_sizes.iter()).enumerate() {
@@ -5318,7 +5319,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 size: size as usize,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
-                written_at: Some(now_secs),
+                written_at: None,
             });
             current_offset += size;
         }

@@ -242,15 +242,16 @@ impl Server {
             // ChunkStale validation, causing a ping-pong of stale corrections under rapid
             // sequential patches.
             //
-            // No written_at guard here: chunk_map_update_location is called from
-            // handle_replicate_chunk_location (live client patch results) and from
-            // handle_multi_patch (local node's own patch). Both are authoritative.
-            // The broadcast guard belongs in handle_replicate_metadata_batch /
-            // handle_put_file_metadata, not here.
+            // Guard: reject if incoming is older than what we already have. Fresh writes
+            // use written_at=None (=0) so any server-timestamped patch always wins.
             if let Some(file_offset) = location.file_offset {
                 for loc in locs.iter_mut() {
                     if loc.file_offset == Some(file_offset) {
-                        *loc = location.clone();
+                        let incoming_ts = location.written_at.unwrap_or(0);
+                        let existing_ts = loc.written_at.unwrap_or(0);
+                        if incoming_ts >= existing_ts {
+                            *loc = location.clone();
+                        }
                         return;
                     }
                 }
@@ -264,10 +265,12 @@ impl Server {
     /// than the actual file being updated.
     ///
     /// Called exclusively from handle_replicate_chunk_location — a client-sent message
-    /// reporting the live result of a just-completed MultiPatch. No written_at guard is
-    /// applied on the file_offset path: the client is always authoritative here, and the
-    /// guard was defeating legitimate updates when the initial write stored client-clock
-    /// written_at while the patch carried server-clock written_at (client ahead of server).
+    /// reporting the live result of a just-completed MultiPatch.
+    ///
+    /// The written_at guard on the file_offset path is required: a late-arriving retry of
+    /// an earlier ReplicateChunkLocation (e.g. first attempt failed, retry fires after a
+    /// newer patch already committed) must not overwrite the newer result. Fresh writes
+    /// use written_at=None (=0) so any server-timestamped patch always wins (T>0 >= 0).
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
         if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
             let (locs, _) = entry.value_mut();
@@ -279,11 +282,15 @@ impl Server {
                 }
             }
             // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
-            // Always accept: this is a live patch result from the client — never stale.
+            // Guard: reject if incoming is older than what we already have.
             if let Some(file_offset) = location.file_offset {
                 for loc in locs.iter_mut() {
                     if loc.file_offset == Some(file_offset) {
-                        *loc = location.clone();
+                        let incoming_ts = location.written_at.unwrap_or(0);
+                        let existing_ts = loc.written_at.unwrap_or(0);
+                        if incoming_ts >= existing_ts {
+                            *loc = location.clone();
+                        }
                         return;
                     }
                 }

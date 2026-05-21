@@ -648,6 +648,11 @@ pub enum Response {
     MultiPatchResult {
         new_chunk_id: ChunkId,
         size: usize,
+        /// Server-side timestamp (ms since epoch) when the patch was applied.
+        /// The client MUST use this as written_at for the new ChunkLocation so that
+        /// future guard comparisons are all in server time, preventing clock-skew
+        /// between client and server from defeating the stale-broadcast guard.
+        patch_ts: Option<u64>,
     },
 
     /// Returned when a client sends PutFileMetadata to a non-leader.

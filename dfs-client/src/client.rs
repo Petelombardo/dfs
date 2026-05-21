@@ -5116,7 +5116,8 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Collect per-replica results before any disagreement logic.
         // (addr, Ok(ncid, size)) for success, (addr, Err) for failure.
-        let mut replica_results: Vec<(SocketAddr, Result<(ChunkId, usize)>)> = Vec::new();
+        // (addr, Ok((chunk_id, size, patch_ts_from_server)))
+        let mut replica_results: Vec<(SocketAddr, Result<(ChunkId, usize, Option<u64>)>)> = Vec::new();
         // If any replica reports a stale base, record its corrected location for a
         // potential full retry. We do NOT continue 'retry immediately upon the first
         // stale response — doing so discards all successful results from other replicas
@@ -5127,12 +5128,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         let mut stale_retry: Option<(ChunkId, dfs_common::ChunkLocation)> = None;
         for (addr, result) in results {
             match result {
-                Ok(Response::MultiPatchResult { new_chunk_id: ncid, size }) => {
+                Ok(Response::MultiPatchResult { new_chunk_id: ncid, size, patch_ts }) => {
                     // ncid == old_chunk_id means the patch produced no content change (hash
                     // unchanged). This is always a legitimate no-op — the server applied the
                     // patch bytes and got the same hash back. A stale base is signalled by the
                     // server via ChunkStale, not by an unchanged hash. Accept it as success.
-                    replica_results.push((addr, Ok((ncid, size))));
+                    replica_results.push((addr, Ok((ncid, size, patch_ts))));
                 }
                 Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
                     warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",
@@ -5188,14 +5189,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                 .and_then(|(_, r)| r.as_ref().ok().copied())
         });
 
-        let authoritative: Option<(ChunkId, usize)> = if let Some(lr) = leader_result {
+        let authoritative: Option<(ChunkId, usize, Option<u64>)> = if let Some(lr) = leader_result {
             Some(lr)
         } else {
             // No leader result — use the first successful result (they should all agree).
             replica_results.iter().find_map(|(_, r)| r.as_ref().ok().copied())
         };
 
-        let (authoritative_chunk_id, authoritative_size) = match authoritative {
+        let (authoritative_chunk_id, authoritative_size, authoritative_patch_ts) = match authoritative {
             Some(x) => x,
             None => anyhow::bail!("MultiPatch: all replicas failed for chunk {}", old_chunk_id),
         };
@@ -5211,12 +5212,12 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         for (addr, result) in &replica_results {
             match result {
-                Ok((ncid, _)) if *ncid == authoritative_chunk_id => {
+                Ok((ncid, _, _)) if *ncid == authoritative_chunk_id => {
                     if let Some(&nid) = addr_to_node_id_snap.get(addr) {
                         patched_node_ids.push(nid);
                     }
                 }
-                Ok((ncid, _)) => {
+                Ok((ncid, _, _)) => {
                     warn!("MultiPatch REPLICA DISAGREEMENT: {} returned {} but leader/majority returned {} — excluding, healer will correct",
                         addr, ncid, authoritative_chunk_id);
                 }
@@ -5230,10 +5231,15 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let new_chunk_id = authoritative_chunk_id;
 
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Use server's patch_ts if available — this ensures written_at is in server
+        // time, making guard comparisons clock-agnostic. Falls back to client time
+        // only when the server doesn't return a timestamp (no-op patch or old server).
+        let now_secs = authoritative_patch_ts.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        });
         let new_location = dfs_common::ChunkLocation {
             chunk_id: new_chunk_id,
             nodes: patched_node_ids.clone(),

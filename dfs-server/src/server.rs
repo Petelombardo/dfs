@@ -3740,19 +3740,17 @@ impl Server {
                 // here (chunk_map still says old chunk_id). The client then retries with the
                 // old chunk_id, which no longer exists on disk (it was renamed), and the
                 // server creates an empty file and patches it — producing corrupt garbage data.
+                // Compute patch_ts once — used for both the chunk_map stamp and the
+                // response. The client MUST use the returned patch_ts as written_at for
+                // the new ChunkLocation so guard comparisons are in server time, not
+                // client time. Clock skew (client ahead of server) otherwise defeats
+                // the stale-broadcast guard: T0(client) > T1(server) → guard fails.
+                let patch_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
                 if new_chunk_id != chunk_id {
                     const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-                    // Update in-memory chunk_map synchronously before returning the response.
-                    // This prevents the next MultiPatch from seeing a false stale-base here
-                    // (chunk_map still shows old chunk_id) before ReplicateChunkLocation arrives.
-                    //
-                    // Stamp written_at = now so that a concurrent stale broadcast (from a
-                    // release that committed pre-patch metadata to the leader) cannot overwrite
-                    // this freshly-patched location via handle_replicate_metadata.
-                    let patch_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
                     if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
                         // Targeted: O(1) lookup by file_id.
                         if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
@@ -3784,7 +3782,11 @@ impl Server {
                     }
                 }
 
-                Response::MultiPatchResult { new_chunk_id, size: final_size }
+                Response::MultiPatchResult {
+                    new_chunk_id,
+                    size: final_size,
+                    patch_ts: if new_chunk_id != chunk_id { Some(patch_ts) } else { None },
+                }
             }
             Ok(Err((msg, code))) => {
                 warn!("MultiPatch {}: {}", chunk_id, msg);

@@ -1588,18 +1588,19 @@ impl FlushHandle {
                                         }
                                         Err(retry_err) => {
                                             warn!("flush_buffer_async_one: retry MultiPatch failed for ino={} chunk={}: {}", ino, chunk_idx, retry_err);
-                                            // If the fresh location had a DIFFERENT chunk_id than our
-                                            // original (stale-corrected to X) and X also fails with
-                                            // "all replicas failed", the chunk exists in metadata but
-                                            // not on disk on any replica — an unrecoverable patch state.
-                                            // Fall back to the fresh write path: write slot_data as a
-                                            // new chunk (gap regions will be zeros, but that data is
-                                            // already lost since the source chunk is gone).
-                                            if loc.chunk_id != old_location.chunk_id
-                                                && retry_err.to_string().contains("all replicas failed")
-                                            {
-                                                warn!("flush_buffer_async_one: chunk {} missing on all replicas after stale correction for ino={} chunk={} — falling back to fresh write",
-                                                    loc.chunk_id, ino, chunk_idx);
+                                            // If ALL replicas failed after the leader-refresh retry, the
+                                            // chunk file is gone from every replica — unrecoverable.
+                                            // This covers two cases:
+                                            //   a) leader returned a different chunk_id (stale-corrected
+                                            //      to X) and X is missing (healer deleted it as orphan)
+                                            //   b) leader returned the SAME chunk_id as our base (leader
+                                            //      is stale, never received the patch update) but replicas
+                                            //      are ahead and their corrected chunk is also gone
+                                            // In both cases gap regions are already lost; write slot_data
+                                            // as a new chunk so the application write succeeds.
+                                            if retry_err.to_string().contains("all replicas failed") {
+                                                warn!("flush_buffer_async_one: all replicas failed after leader-refresh retry for ino={} chunk={} (leader_id={} base_id={}) — falling back to fresh write",
+                                                    ino, chunk_idx, loc.chunk_id, old_location.chunk_id);
                                                 break 'try_patch;
                                             }
                                             // Increment the consecutive failure counter. After

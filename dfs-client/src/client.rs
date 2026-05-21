@@ -4278,17 +4278,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             let node2_id = Self::resolve_node_id(&node_id_map, addr2);
 
             let chunk_size = chunk_sizes_1[idx] as usize;
-            let write_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
             let location = dfs_common::ChunkLocation {
                 chunk_id: *chunk_id,
                 nodes: vec![node1_id, node2_id],
                 size: chunk_size,
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
-                written_at: Some(write_ts),
+                written_at: None, // fresh writes use None — see build_chunk_locations_from_ids
             };
 
             chunk_locations.push(location);

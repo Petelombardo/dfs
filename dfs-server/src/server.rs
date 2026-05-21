@@ -106,21 +106,19 @@ pub struct Server {
     /// 3500 files/sec produces at most one batch per 100ms window, not 3500 tasks.
     pending_broadcasts: Arc<DashMap<FileId, FileMetadata>>,
 
+    /// Tracks the highest write_seq seen per file across PutFileMetadata calls.
+    /// Used to bypass the per-chunk written_at guard when a newer write_seq arrives:
+    /// write_seq is a monotonically-increasing client-managed counter (clock-agnostic)
+    /// that reliably identifies whether incoming metadata is from a newer session than
+    /// what's stored. Any PutFileMetadata with write_seq > stored bypasses the guard
+    /// entirely — the entire incoming metadata is accepted as authoritative.
+    file_write_seqs: Arc<DashMap<FileId, u64>>,
+
     /// Delete tombstone set: FileId -> deleted_at instant.
     /// Any PutFileMetadata that arrives for an ID in this set within TOMBSTONE_TTL
     /// is rejected so that in-flight seq=0 creates can't resurrect a deleted file.
     /// Entries are expired lazily on each put check.
     delete_tombstones: Arc<DashMap<FileId, std::time::Instant>>,
-
-    /// Tracks chunks that were recently patched by a LOCAL MultiPatch on this node.
-    /// Key: (FileId, file_offset). Value: (new_chunk_id, patched_at instant).
-    /// Used in handle_replicate_metadata_batch to protect recently locally-patched
-    /// chunks from broadcast reversions caused by cross-node clock skew: if the
-    /// leader's clock is ahead of a follower's, a broadcast timestamped by the
-    /// leader can appear "newer" than the follower's local patch and revert it.
-    /// Clock-agnostic: we simply keep the local patch result for a grace window
-    /// (5 seconds) regardless of what the broadcast says.
-    recent_local_patches: Arc<DashMap<(FileId, u64), (dfs_common::ChunkId, std::time::Instant)>>,
 
     /// Chunk-level tombstones: chunk_ids that must not be used as a heal source.
     /// Set synchronously by TombstoneChunk during dual-RF MultiPatch so the healer
@@ -175,7 +173,7 @@ impl Server {
             pending_broadcasts: Arc::new(DashMap::new()),
             delete_tombstones: Arc::new(DashMap::new()),
             chunk_tombstones: Arc::new(dashmap::DashSet::new()),
-            recent_local_patches: Arc::new(DashMap::new()),
+            file_write_seqs: Arc::new(DashMap::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             sled_write_tx: {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
@@ -205,6 +203,7 @@ impl Server {
     /// materialising a 2 GB Vec<FileMetadata> and triggering OOM-like behaviour.
     pub fn rebuild_chunk_map_from_metadata(&self) {
         let chunk_map = self.chunk_map.clone();
+        let file_write_seqs = self.file_write_seqs.clone();
         let metadata = self.metadata.clone();
 
         std::thread::spawn(move || {
@@ -216,6 +215,12 @@ impl Server {
                 if !file.chunk_locations.is_empty() {
                     chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
                     built += 1;
+                }
+                // Seed file_write_seqs so the bypass guard has a correct baseline
+                // on startup — prevents stale messages from a previous session
+                // (with lower write_seq) from bypassing the guard after restart.
+                if file.write_seq > 0 {
+                    file_write_seqs.insert(file.id, file.write_seq);
                 }
                 Ok(())
             });
@@ -1397,8 +1402,18 @@ impl Server {
         // our MultiPatch completes. The leader then broadcasts the stale state here. If
         // our chunk_map already holds a newer written_at for a chunk (stamped by
         // handle_multi_patch), keep it rather than reverting to the old chunk_id.
-        const LOCAL_PATCH_GRACE_RM: std::time::Duration = std::time::Duration::from_secs(5);
-        let metadata = {
+        // write_seq bypass: if incoming is from a newer session, accept as-is.
+        // Otherwise, prefer the chunk_map's chunk_id for any offset already present —
+        // chunk_map is updated only by RCL (authoritative, sent immediately after each
+        // successful patch) and should never be regressed by a metadata broadcast.
+        let stored_write_seq_rm = self.file_write_seqs.get(&metadata.id).map(|v| *v).unwrap_or(0);
+        let bypass_rm = metadata.write_seq > stored_write_seq_rm;
+        if bypass_rm {
+            self.file_write_seqs.insert(metadata.id, metadata.write_seq);
+        }
+        let metadata = if bypass_rm {
+            metadata
+        } else {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
@@ -1406,23 +1421,7 @@ impl Server {
                     if let Some(file_offset) = loc.file_offset {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                             if map_loc.chunk_id != loc.chunk_id {
-                                let locally_patched = self.recent_local_patches
-                                    .get(&(m.id, file_offset))
-                                    .map(|e| {
-                                        let (local_cid, patched_at) = e.value();
-                                        *local_cid == map_loc.chunk_id
-                                            && patched_at.elapsed() < LOCAL_PATCH_GRACE_RM
-                                    })
-                                    .unwrap_or(false);
-                                if locally_patched {
-                                    *loc = map_loc.clone();
-                                } else {
-                                    let incoming_ts = loc.written_at.unwrap_or(0);
-                                    let existing_ts = map_loc.written_at.unwrap_or(0);
-                                    if existing_ts > incoming_ts {
-                                        *loc = map_loc.clone();
-                                    }
-                                }
+                                *loc = map_loc.clone(); // chunk_map is ground truth
                             }
                         }
                     }
@@ -1866,9 +1865,18 @@ impl Server {
                     continue;
                 }
             }
-            // Same stale-broadcast guard as handle_replicate_metadata.
-            const LOCAL_PATCH_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-            let metadata = {
+            // write_seq bypass: newer session → accept as-is.
+            // Same/old session → prefer chunk_map (chunk_map is updated only by RCL,
+            // so it holds the authoritative current chunk_id; the broadcast may carry
+            // a snapshot from before a concurrent patch and must not regress the map).
+            let stored_write_seq_b = self.file_write_seqs.get(&metadata.id).map(|v| *v).unwrap_or(0);
+            let bypass_b = metadata.write_seq > stored_write_seq_b;
+            if bypass_b {
+                self.file_write_seqs.insert(metadata.id, metadata.write_seq);
+            }
+            let metadata = if bypass_b {
+                metadata
+            } else {
                 let mut m = metadata;
                 if let Some(map_entry) = self.chunk_map.get(&m.id) {
                     let (map_locs, _) = map_entry.value();
@@ -1876,28 +1884,7 @@ impl Server {
                         if let Some(file_offset) = loc.file_offset {
                             if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                                 if map_loc.chunk_id != loc.chunk_id {
-                                    // Check if this chunk was recently patched locally on
-                                    // this node. If so, keep the local result regardless of
-                                    // timestamps — cross-node clock skew can make a broadcast
-                                    // from the leader appear newer than a local patch that
-                                    // actually happened after the broadcast was sent.
-                                    let locally_patched = self.recent_local_patches
-                                        .get(&(m.id, file_offset))
-                                        .map(|e| {
-                                            let (local_cid, patched_at) = e.value();
-                                            *local_cid == map_loc.chunk_id
-                                                && patched_at.elapsed() < LOCAL_PATCH_GRACE
-                                        })
-                                        .unwrap_or(false);
-                                    if locally_patched {
-                                        *loc = map_loc.clone();
-                                    } else {
-                                        let incoming_ts = loc.written_at.unwrap_or(0);
-                                        let existing_ts = map_loc.written_at.unwrap_or(0);
-                                        if existing_ts > incoming_ts {
-                                            *loc = map_loc.clone();
-                                        }
-                                    }
+                                    *loc = map_loc.clone(); // chunk_map is ground truth
                                 }
                             }
                         }
@@ -2940,30 +2927,27 @@ impl Server {
         // Same stale-broadcast guard as handle_replicate_metadata: a concurrent release
         // may commit pre-patch state here before the patch's ReplicateChunkLocation
         // arrives to correct it. If our chunk_map already holds a freshly-patched
-        // location (higher written_at), keep it — don't let the stale put regress it.
-        // Also ensures the broadcast we fire carries the corrected state.
+        // location, keep it — don't let the stale put regress it.
         //
-        // Step 1: assign server-side written_at to any fresh-write chunk_location that
-        // has written_at=None. The client uses None to avoid clock-skew problems, but
-        // None (=0) always loses to any server-timestamped patch in the guard below.
-        // Using T_now (leader's current time) guarantees fresh writes override old
-        // patches: T_now > T_any_previous_patch on the same monotonic clock.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let metadata = {
-            let mut m = metadata;
-            for loc in m.chunk_locations.iter_mut() {
-                if loc.written_at.is_none() {
-                    loc.written_at = Some(now_ms);
-                }
-            }
-            m
-        };
-        // Step 2: per-chunk reconcile — keep existing if it has a higher timestamp
-        // (a concurrent patch completed after this metadata snapshot was taken).
-        let metadata = {
+        // Ordering uses write_seq (clock-agnostic) first, then written_at as a
+        // secondary guard within the same session.
+        //
+        // write_seq is monotonically increasing per-file, managed by the client
+        // (seeded from the server on open). If incoming.write_seq > stored_write_seq,
+        // this is from a newer session — bypass the per-chunk guard entirely and
+        // accept the incoming metadata as authoritative. This correctly handles
+        // cross-session fresh overwrites where timestamps are unreliable (different
+        // clocks, or T_now from a previous session stored in sled beats None/0).
+        let stored_write_seq = self.file_write_seqs.get(&metadata.id).map(|v| *v).unwrap_or(0);
+        let incoming_write_seq = metadata.write_seq;
+        let bypass_reconcile = incoming_write_seq > stored_write_seq;
+        let metadata = if bypass_reconcile {
+            // Newer session — accept as-is without per-chunk guard.
+            metadata
+        } else {
+            // Same or older session — apply per-chunk written_at guard to prevent a
+            // concurrent PutFileMetadata (captured before a patch) from reverting a
+            // freshly-patched chunk that ReplicateChunkLocation already committed.
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
@@ -2983,6 +2967,10 @@ impl Server {
             }
             m
         };
+        // Track the highest write_seq seen — used for the bypass decision above.
+        if incoming_write_seq > stored_write_seq {
+            self.file_write_seqs.insert(metadata.id, incoming_write_seq);
+        }
         self.chunk_map_update(&metadata).await;
         self.record_recent_write(metadata.clone());
         // Coalesce into the broadcast buffer instead of spawning a per-file task.
@@ -3855,21 +3843,6 @@ impl Server {
                                 break;
                             }
                         }
-                    }
-                }
-
-                // Record this local patch so broadcast-path guards know not to
-                // revert this chunk for a grace window (cross-node clock skew can
-                // make a broadcast from the leader appear "newer" than a local patch
-                // that actually happened after it, causing a false reversion).
-                if new_chunk_id != chunk_id {
-                    if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
-                        const CHUNK_SIZE_KEY: u64 = 4 * 1024 * 1024;
-                        let file_offset = cidx * CHUNK_SIZE_KEY;
-                        self.recent_local_patches.insert(
-                            (fid, file_offset),
-                            (new_chunk_id, std::time::Instant::now()),
-                        );
                     }
                 }
 

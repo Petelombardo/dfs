@@ -112,6 +112,16 @@ pub struct Server {
     /// Entries are expired lazily on each put check.
     delete_tombstones: Arc<DashMap<FileId, std::time::Instant>>,
 
+    /// Tracks chunks that were recently patched by a LOCAL MultiPatch on this node.
+    /// Key: (FileId, file_offset). Value: (new_chunk_id, patched_at instant).
+    /// Used in handle_replicate_metadata_batch to protect recently locally-patched
+    /// chunks from broadcast reversions caused by cross-node clock skew: if the
+    /// leader's clock is ahead of a follower's, a broadcast timestamped by the
+    /// leader can appear "newer" than the follower's local patch and revert it.
+    /// Clock-agnostic: we simply keep the local patch result for a grace window
+    /// (5 seconds) regardless of what the broadcast says.
+    recent_local_patches: Arc<DashMap<(FileId, u64), (dfs_common::ChunkId, std::time::Instant)>>,
+
     /// Chunk-level tombstones: chunk_ids that must not be used as a heal source.
     /// Set synchronously by TombstoneChunk during dual-RF MultiPatch so the healer
     /// can't replicate old_chunk_id back to the patched replicas before metadata commits.
@@ -165,6 +175,7 @@ impl Server {
             pending_broadcasts: Arc::new(DashMap::new()),
             delete_tombstones: Arc::new(DashMap::new()),
             chunk_tombstones: Arc::new(dashmap::DashSet::new()),
+            recent_local_patches: Arc::new(DashMap::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             sled_write_tx: {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
@@ -1386,6 +1397,7 @@ impl Server {
         // our MultiPatch completes. The leader then broadcasts the stale state here. If
         // our chunk_map already holds a newer written_at for a chunk (stamped by
         // handle_multi_patch), keep it rather than reverting to the old chunk_id.
+        const LOCAL_PATCH_GRACE_RM: std::time::Duration = std::time::Duration::from_secs(5);
         let metadata = {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
@@ -1394,10 +1406,22 @@ impl Server {
                     if let Some(file_offset) = loc.file_offset {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                             if map_loc.chunk_id != loc.chunk_id {
-                                let incoming_ts = loc.written_at.unwrap_or(0);
-                                let existing_ts = map_loc.written_at.unwrap_or(0);
-                                if existing_ts > incoming_ts {
+                                let locally_patched = self.recent_local_patches
+                                    .get(&(m.id, file_offset))
+                                    .map(|e| {
+                                        let (local_cid, patched_at) = e.value();
+                                        *local_cid == map_loc.chunk_id
+                                            && patched_at.elapsed() < LOCAL_PATCH_GRACE_RM
+                                    })
+                                    .unwrap_or(false);
+                                if locally_patched {
                                     *loc = map_loc.clone();
+                                } else {
+                                    let incoming_ts = loc.written_at.unwrap_or(0);
+                                    let existing_ts = map_loc.written_at.unwrap_or(0);
+                                    if existing_ts > incoming_ts {
+                                        *loc = map_loc.clone();
+                                    }
                                 }
                             }
                         }
@@ -1843,6 +1867,7 @@ impl Server {
                 }
             }
             // Same stale-broadcast guard as handle_replicate_metadata.
+            const LOCAL_PATCH_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
             let metadata = {
                 let mut m = metadata;
                 if let Some(map_entry) = self.chunk_map.get(&m.id) {
@@ -1851,10 +1876,27 @@ impl Server {
                         if let Some(file_offset) = loc.file_offset {
                             if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                                 if map_loc.chunk_id != loc.chunk_id {
-                                    let incoming_ts = loc.written_at.unwrap_or(0);
-                                    let existing_ts = map_loc.written_at.unwrap_or(0);
-                                    if existing_ts > incoming_ts {
+                                    // Check if this chunk was recently patched locally on
+                                    // this node. If so, keep the local result regardless of
+                                    // timestamps — cross-node clock skew can make a broadcast
+                                    // from the leader appear newer than a local patch that
+                                    // actually happened after the broadcast was sent.
+                                    let locally_patched = self.recent_local_patches
+                                        .get(&(m.id, file_offset))
+                                        .map(|e| {
+                                            let (local_cid, patched_at) = e.value();
+                                            *local_cid == map_loc.chunk_id
+                                                && patched_at.elapsed() < LOCAL_PATCH_GRACE
+                                        })
+                                        .unwrap_or(false);
+                                    if locally_patched {
                                         *loc = map_loc.clone();
+                                    } else {
+                                        let incoming_ts = loc.written_at.unwrap_or(0);
+                                        let existing_ts = map_loc.written_at.unwrap_or(0);
+                                        if existing_ts > incoming_ts {
+                                            *loc = map_loc.clone();
+                                        }
                                     }
                                 }
                             }
@@ -3813,6 +3855,21 @@ impl Server {
                                 break;
                             }
                         }
+                    }
+                }
+
+                // Record this local patch so broadcast-path guards know not to
+                // revert this chunk for a grace window (cross-node clock skew can
+                // make a broadcast from the leader appear "newer" than a local patch
+                // that actually happened after it, causing a false reversion).
+                if new_chunk_id != chunk_id {
+                    if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+                        const CHUNK_SIZE_KEY: u64 = 4 * 1024 * 1024;
+                        let file_offset = cidx * CHUNK_SIZE_KEY;
+                        self.recent_local_patches.insert(
+                            (fid, file_offset),
+                            (new_chunk_id, std::time::Instant::now()),
+                        );
                     }
                 }
 

@@ -1522,6 +1522,19 @@ impl Server {
     async fn handle_replicate_chunk_location(&self, location: ChunkLocation, file_id: Option<FileId>) -> Response {
         info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
 
+        // Assign server-side timestamp to fresh-write locations (written_at=None).
+        // Same reason as in handle_put_file_metadata: T_now on the leader is always
+        // greater than any previous patch timestamp, so fresh writes win the guard.
+        let location = if location.written_at.is_none() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            ChunkLocation { written_at: Some(now_ms), ..location }
+        } else {
+            location
+        };
+
         // Merge strategy: take the larger node set, preserving the existing record's
         // file_offset and written_at if the incoming doesn't carry them.
         //
@@ -2887,6 +2900,27 @@ impl Server {
         // arrives to correct it. If our chunk_map already holds a freshly-patched
         // location (higher written_at), keep it — don't let the stale put regress it.
         // Also ensures the broadcast we fire carries the corrected state.
+        //
+        // Step 1: assign server-side written_at to any fresh-write chunk_location that
+        // has written_at=None. The client uses None to avoid clock-skew problems, but
+        // None (=0) always loses to any server-timestamped patch in the guard below.
+        // Using T_now (leader's current time) guarantees fresh writes override old
+        // patches: T_now > T_any_previous_patch on the same monotonic clock.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let metadata = {
+            let mut m = metadata;
+            for loc in m.chunk_locations.iter_mut() {
+                if loc.written_at.is_none() {
+                    loc.written_at = Some(now_ms);
+                }
+            }
+            m
+        };
+        // Step 2: per-chunk reconcile — keep existing if it has a higher timestamp
+        // (a concurrent patch completed after this metadata snapshot was taken).
         let metadata = {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {

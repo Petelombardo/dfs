@@ -1921,21 +1921,24 @@ impl FlushHandle {
                     }
                 }
 
-                // Full-chunk replacement: update recent_chunk_writes with the new nodes so
-                // the next patch targets the correct sorted-first-2, and queue the old chunk
-                // for broadcast-delete cleanup. Guard against idempotent writes (same content
-                // → same chunk_id) to avoid deleting the live chunk.
+                // Update recent_chunk_writes for ALL fresh writes so the next open/write
+                // can find the correct server-confirmed chunk_id without relying on the
+                // leader's metadata (which may be behind by up to one flush cycle when the
+                // previous ReplicateChunkLocation arrived while the old guard was active).
+                // is_full_replacement also queues the old chunk for broadcast-delete cleanup.
+                if let Some(loc) = locations.first() {
+                    if let Some(file_id) = file_id_at_flush_start {
+                        let mut sorted_nodes = loc.nodes.clone();
+                        sorted_nodes.sort_unstable();
+                        sorted_nodes.truncate(2);
+                        self.client.recent_chunk_writes.insert(
+                            (ino, chunk_idx),
+                            (loc.chunk_id, file_id, std::time::Instant::now(), sorted_nodes),
+                        );
+                    }
+                }
                 if is_full_replacement {
                     if let Some(loc) = locations.first() {
-                        if let Some(file_id) = file_id_at_flush_start {
-                            let mut sorted_nodes = loc.nodes.clone();
-                            sorted_nodes.sort_unstable();
-                            sorted_nodes.truncate(2);
-                            self.client.recent_chunk_writes.insert(
-                                (ino, chunk_idx),
-                                (loc.chunk_id, file_id, std::time::Instant::now(), sorted_nodes),
-                            );
-                        }
                         if let Some(old_cid) = full_replacement_old_chunk_id {
                             if loc.chunk_id != old_cid {
                                 self.pending_old_chunks.lock().await.push(old_cid);

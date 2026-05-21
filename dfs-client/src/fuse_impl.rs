@@ -122,6 +122,11 @@ struct ChunkSlot {
     /// Prevents a second concurrent flush task from picking the same slot.
     /// Cleared on failure (so it can be retried); on success the slot is removed.
     flushing: bool,
+    /// Consecutive patch failures for this slot. When this exceeds MAX_PATCH_FAILURES
+    /// the flush falls back to a fresh write, preventing an infinite retry loop when
+    /// clock skew or pre-existing corruption keeps the stale-broadcast guard from
+    /// converging in a timely manner.
+    consecutive_patch_failures: u32,
 }
 
 impl ChunkSlot {
@@ -132,6 +137,7 @@ impl ChunkSlot {
             gap_filled_prefix: 0,
             real_data_end: 0,
             dirty_ranges: Vec::new(),
+            consecutive_patch_failures: 0,
             flushing: false,
         }
     }
@@ -1471,7 +1477,17 @@ impl FlushHandle {
                         ).await
                     };
                     let (mut new_location, skip_pairs) = match patch_result {
-                        Ok((loc, sp)) => (loc, sp),
+                        Ok((loc, sp)) => {
+                            // Patch succeeded — reset the failure counter.
+                            if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                if let Ok(mut state) = state_arc.try_lock() {
+                                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                        slot.consecutive_patch_failures = 0;
+                                    }
+                                }
+                            }
+                            (loc, sp)
+                        }
                         Err(e) => {
                             // MultiPatch failed — the chunk_id in our cache (or recent_chunk_writes)
                             // is stale. Rather than fetching the full file metadata, ask the leader
@@ -1541,6 +1557,25 @@ impl FlushHandle {
                                             {
                                                 warn!("flush_buffer_async_one: chunk {} missing on all replicas after stale correction for ino={} chunk={} — falling back to fresh write",
                                                     loc.chunk_id, ino, chunk_idx);
+                                                break 'try_patch;
+                                            }
+                                            // Increment the consecutive failure counter. After
+                                            // MAX_PATCH_FAILURES, fall back to a fresh write
+                                            // regardless of the error type — this is the safety
+                                            // valve against infinite loops when clock skew or
+                                            // lingering corruption prevents the guard from
+                                            // converging.
+                                            const MAX_PATCH_FAILURES: u32 = 5;
+                                            let failures = if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                                let mut state = state_arc.lock().await;
+                                                if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                                    slot.consecutive_patch_failures += 1;
+                                                    slot.consecutive_patch_failures
+                                                } else { MAX_PATCH_FAILURES }
+                                            } else { MAX_PATCH_FAILURES };
+                                            if failures >= MAX_PATCH_FAILURES {
+                                                warn!("flush_buffer_async_one: ino={} chunk={} exceeded {} consecutive patch failures — falling back to fresh write to prevent data loss",
+                                                    ino, chunk_idx, MAX_PATCH_FAILURES);
                                                 break 'try_patch;
                                             }
                                             // Even though the retry failed, update metadata cache with

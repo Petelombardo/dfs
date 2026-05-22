@@ -1456,12 +1456,8 @@ impl Server {
         if bypass_rm {
             self.file_write_seqs.insert(metadata.id, metadata.write_seq);
         }
-        // Guard: same reasoning as handle_put_file_metadata — bypass accepts as-is,
-        // non-bypass applies written_at guard. Fresh writes (written_at=None) must not
-        // be rejected in the bypass case by being compared against patch timestamps.
-        let metadata = if bypass_rm {
-            metadata
-        } else {
+        // Same guard as handle_replicate_metadata_batch — see comment there.
+        let metadata = {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
@@ -1469,10 +1465,11 @@ impl Server {
                     if let Some(file_offset) = loc.file_offset {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                             if map_loc.chunk_id != loc.chunk_id {
-                                let incoming_ts = loc.written_at.unwrap_or(0);
-                                let existing_ts = map_loc.written_at.unwrap_or(0);
-                                if existing_ts > incoming_ts {
-                                    *loc = map_loc.clone();
+                                if let Some(incoming_ts) = loc.written_at {
+                                    let existing_ts = map_loc.written_at.unwrap_or(0);
+                                    if existing_ts > incoming_ts {
+                                        *loc = map_loc.clone();
+                                    }
                                 }
                             }
                         }
@@ -1926,13 +1923,18 @@ impl Server {
             if bypass_b {
                 self.file_write_seqs.insert(metadata.id, metadata.write_seq);
             }
-            // Guard: bypass accepts as-is (write_seq ensures ordering AND fresh writes
-            // have written_at=None which must not be rejected by timestamp comparison).
-            // Non-bypass applies written_at guard to prevent stale patches from reverting
-            // locally-applied patch results that the chunk_map already holds.
-            let metadata = if bypass_b {
-                metadata
-            } else {
+            // Apply written_at guard unconditionally — bypass or not — but ONLY when the
+            // incoming chunk has an explicit timestamp (written_at=Some(ts)). Fresh writes
+            // use written_at=None (client deliberately omits timestamps to avoid clock-skew
+            // issues) and must always be accepted. Patches always carry Some(patch_ts).
+            //
+            // The guard fires on bypass too because a concurrent FAP can send PutFileMetadata
+            // for chunk_74 (seq=N, pre-patch snapshot of chunk_0) while the chunk_0 patch
+            // is still in progress. seq=N bypasses, but its chunk_0 snapshot has an OLDER
+            // ts than the patch result already on disk. Without the guard, this broadcast
+            // reverts the chunk_map to the pre-patch hash — which no longer exists as a file —
+            // creating the ghost that causes infinite ChunkStale retry loops.
+            let metadata = {
                 let mut m = metadata;
                 if let Some(map_entry) = self.chunk_map.get(&m.id) {
                     let (map_locs, _) = map_entry.value();
@@ -1940,11 +1942,14 @@ impl Server {
                         if let Some(file_offset) = loc.file_offset {
                             if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                                 if map_loc.chunk_id != loc.chunk_id {
-                                    let incoming_ts = loc.written_at.unwrap_or(0);
-                                    let existing_ts = map_loc.written_at.unwrap_or(0);
-                                    if existing_ts > incoming_ts {
-                                        *loc = map_loc.clone();
+                                    if let Some(incoming_ts) = loc.written_at {
+                                        // Both have explicit timestamps — only accept if incoming is newer.
+                                        let existing_ts = map_loc.written_at.unwrap_or(0);
+                                        if existing_ts > incoming_ts {
+                                            *loc = map_loc.clone();
+                                        }
                                     }
+                                    // else: incoming written_at=None (fresh write) → always accept
                                 }
                             }
                         }
@@ -3001,21 +3006,8 @@ impl Server {
         let stored_write_seq = self.file_write_seqs.get(&metadata.id).map(|v| *v).unwrap_or(0);
         let incoming_write_seq = metadata.write_seq;
         let bypass_reconcile = incoming_write_seq > stored_write_seq;
-        // For the NON-bypass path: apply per-chunk written_at guard.
-        // For the BYPASS path: accept as-is — write_seq already ensures ordering.
-        // DO NOT apply the guard in the bypass case: fresh writes have written_at=None
-        // (client deliberately omits timestamps to avoid clock-skew issues). None → ts=0
-        // which is LESS than any patch's written_at, so the guard would incorrectly
-        // reject a fresh write that overwrites a chunk previously modified by a patch.
-        // Example: 300MB write (ts=0) → 4MB overwrite (ts=0) → patches (ts>0).
-        // The 4MB overwrite PutFileMetadata has ts=0 but IS the correct current state;
-        // without the bypass exemption the guard keeps the patch result, causing stale.
-        let metadata = if bypass_reconcile {
-            metadata
-        } else {
-            // Same or older session: apply per-chunk written_at guard to prevent a
-            // concurrent PutFileMetadata (captured before a patch) from reverting a
-            // freshly-patched chunk that ReplicateChunkLocation already committed.
+        // Same guard as handle_replicate_metadata_batch — see comment there.
+        let metadata = {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
@@ -3023,10 +3015,11 @@ impl Server {
                     if let Some(file_offset) = loc.file_offset {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                             if map_loc.chunk_id != loc.chunk_id {
-                                let incoming_ts = loc.written_at.unwrap_or(0);
-                                let existing_ts = map_loc.written_at.unwrap_or(0);
-                                if existing_ts > incoming_ts {
-                                    *loc = map_loc.clone();
+                                if let Some(incoming_ts) = loc.written_at {
+                                    let existing_ts = map_loc.written_at.unwrap_or(0);
+                                    if existing_ts > incoming_ts {
+                                        *loc = map_loc.clone();
+                                    }
                                 }
                             }
                         }

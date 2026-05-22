@@ -1065,11 +1065,19 @@ impl FlushHandle {
         Ok(())
     }
 
-    /// Flush exactly one full (or idle) chunk slot for `ino`.
-    /// Called by the background ticker; each call handles one chunk so the pipeline
-    /// drains one slot at a time rather than batch-flushing all full slots at once.
-    async fn flush_one_chunk(&self, ino: u64) -> Result<()> {
-        // Pick the lowest-index unclaimed full slot, falling back to the lowest idle slot.
+    /// Flush exactly one chunk slot for `ino`.
+    ///
+    /// `urgent=false` (background ticker): only full or idle slots — avoids dispatching
+    /// tiny dirty ranges before they've had a chance to accumulate into larger batches.
+    ///
+    /// `urgent=true` (flush_all_pipelined / fsync / release): flush ANY non-empty slot.
+    /// FAP holds flush_pipeline_locks, which prevents the ticker from running for this
+    /// inode. Without the urgent fallback, FAP would spin forever dispatching tasks that
+    /// return Ok(()) on no-full/no-idle slots while the pipeline lock blocks the ticker
+    /// from ever draining them via the stale path.
+    async fn flush_one_chunk(&self, ino: u64, urgent: bool) -> Result<()> {
+        // Pick the lowest-index unclaimed full slot, falling back to the lowest idle slot,
+        // and finally (urgent=true only) to any non-empty slot.
         // Atomically set flushing=true while holding the mutex so no second concurrent
         // task can claim the same slot.
         let (chunk_idx, mut slot_data, file_offset, gap_filled_prefix, real_data_end, dirty_ranges, last_modified_snap) = {
@@ -1094,7 +1102,25 @@ impl FlushHandle {
                 idle.sort_by_key(|&(_, t)| t);
                 match idle.into_iter().next() {
                     Some((i, _)) => i,
-                    None => return Ok(()),
+                    None => {
+                        if urgent {
+                            // Urgent path: flush any non-empty slot regardless of age or
+                            // dirty coverage. Required during FAP (fsync/release) because
+                            // the pipeline lock prevents the background ticker from running
+                            // its own stale-flush path for this inode.
+                            let mut any: Vec<u64> = state.slots.iter()
+                                .filter(|(_, s)| !s.data.is_empty() && !s.flushing)
+                                .map(|(idx, _)| *idx)
+                                .collect();
+                            any.sort_unstable();
+                            match any.into_iter().next() {
+                                Some(i) => i,
+                                None => return Ok(()),
+                            }
+                        } else {
+                            return Ok(());
+                        }
+                    }
                 }
             };
 
@@ -2291,7 +2317,7 @@ impl FlushHandle {
             for _ in 0..to_dispatch {
                 let h = sync_handle.clone();
                 handles.push(tokio::spawn(async move {
-                    h.flush_one_chunk(ino).await
+                    h.flush_one_chunk(ino, true).await  // urgent: flush any slot, not just full/idle
                 }));
             }
 
@@ -2739,7 +2765,7 @@ impl DfsFilesystem {
                             // each task fills its own pipeline slot back-to-back without
                             // waiting up to 100ms for the ticker to notice the vacancy.
                             loop {
-                                if let Err(e) = handle.flush_one_chunk(ino).await {
+                                if let Err(e) = handle.flush_one_chunk(ino, false).await {
                                     tracing::error!("Background flush failed for inode {}: {}", ino, e);
                                     break;
                                 }

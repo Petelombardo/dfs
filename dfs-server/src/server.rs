@@ -243,22 +243,32 @@ impl Server {
     /// Update the chunk map for a single file — called after every metadata write or heal.
     async fn chunk_map_update(&self, metadata: &FileMetadata) {
         if !metadata.chunk_locations.is_empty() {
-            // Ghost-chunk diagnostic: log if any incoming chunk_id doesn't exist on disk.
-            // This helps trace how a stale/renamed hash ends up in chunk_map, causing
-            // infinite ChunkStale retry loops when clients try to patch a ghost.
-            for loc in &metadata.chunk_locations {
-                let path = self.storage.get_chunk_path(&loc.chunk_id);
-                if !path.exists() {
-                    // Check if the existing chunk_map entry for this file_offset differs —
-                    // that indicates a REVERSION (chunk_map being set back to a stale value).
-                    let existing = self.chunk_map.get(&metadata.id).and_then(|e| {
-                        let (locs, _) = e.value();
-                        locs.iter().find(|l| l.file_offset == loc.file_offset)
-                            .map(|l| (l.chunk_id, l.written_at))
-                    });
-                    warn!("[GHOST] chunk_map_update: path={} offset={:?} incoming={} (written_at={:?}) file_does_not_exist write_seq={} existing={:?}",
-                        metadata.path, loc.file_offset, loc.chunk_id,
-                        loc.written_at, metadata.write_seq, existing);
+            // Ghost-chunk diagnostic: only log when we're OVERWRITING an existing
+            // entry where the old chunk_id EXISTS on disk but the new one DOESN'T.
+            // This is the reversion event: a broadcast is replacing a valid local chunk
+            // with a stale hash — the exact condition that causes infinite ChunkStale loops.
+            // Normal cases (fresh recordings writing to other nodes) are filtered out because
+            // their existing entry also has no local file (written_at=None, not local).
+            if let Some(existing_entry) = self.chunk_map.get(&metadata.id) {
+                let (existing_locs, _) = existing_entry.value();
+                for loc in &metadata.chunk_locations {
+                    if loc.file_offset.is_none() { continue; }
+                    let incoming_path = self.storage.get_chunk_path(&loc.chunk_id);
+                    if !incoming_path.exists() {
+                        // Incoming doesn't exist — only a ghost if the existing DID exist
+                        if let Some(old_loc) = existing_locs.iter().find(|l| l.file_offset == loc.file_offset) {
+                            if old_loc.chunk_id != loc.chunk_id {
+                                let old_path = self.storage.get_chunk_path(&old_loc.chunk_id);
+                                if old_path.exists() {
+                                    // REVERSION: existing file will be "orphaned" from chunk_map
+                                    warn!("[GHOST-reversion] chunk_map_update: path={} offset={:?} seq={} OLD={} (exists=true ts={:?}) → NEW={} (exists=false ts={:?}) — stale broadcast overwriting a local chunk",
+                                        metadata.path, loc.file_offset, metadata.write_seq,
+                                        old_loc.chunk_id, old_loc.written_at,
+                                        loc.chunk_id, loc.written_at);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             self.chunk_map.insert(metadata.id, (metadata.chunk_locations.clone(), metadata.modified_at));
@@ -319,17 +329,16 @@ impl Server {
                         let incoming_ts = location.written_at.unwrap_or(0);
                         let existing_ts = loc.written_at.unwrap_or(0);
                         if incoming_ts >= existing_ts {
-                            // Ghost-chunk diagnostic: log if existing file is being overwritten
-                            // with a chunk_id whose file doesn't exist on disk.
+                            // Ghost diagnostic: warn if we're replacing an existing file
+                            // with a chunk_id that doesn't exist here (RCL for other-node chunk).
                             let new_path = self.storage.get_chunk_path(&location.chunk_id);
-                            if !new_path.exists() {
-                                warn!("[GHOST] RCL chunk_map_update_location_for_file: file={:?} offset={:?} new={} (written_at={:?}) file_does_not_exist old={}",
-                                    file_id, location.file_offset, location.chunk_id, location.written_at, loc.chunk_id);
+                            let old_path = self.storage.get_chunk_path(&loc.chunk_id);
+                            if !new_path.exists() && old_path.exists() {
+                                warn!("[GHOST-reversion] RCL: file={:?} offset={:?} OLD={} (exists=true ts={:?}) → NEW={} (exists=false ts={:?})",
+                                    file_id, location.file_offset, loc.chunk_id, loc.written_at,
+                                    location.chunk_id, location.written_at);
                             }
                             *loc = location.clone();
-                        } else {
-                            debug!("[GHOST-skip] RCL rejected stale update: file={:?} offset={:?} incoming={} ts={} existing={} ts={}",
-                                file_id, location.file_offset, location.chunk_id, incoming_ts, loc.chunk_id, existing_ts);
                         }
                         return;
                     }

@@ -4043,7 +4043,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Write data with synchronous dual-replica replication
     /// NEW: Writes each chunk to 2 nodes synchronously (not striped)
     /// Returns chunk_locations with replica tracking
-    pub async fn write_data_dual_replica(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<Vec<dfs_common::ChunkLocation>> {
+    pub async fn write_data_dual_replica(&self, data: &[u8], inode: u64, file_offset: u64, file_id: Option<dfs_common::FileId>) -> Result<Vec<dfs_common::ChunkLocation>> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
             anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
@@ -4058,7 +4058,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         info!("Writing {} bytes with synchronous dual-replica (preferred: {}, {})",
               data.len(), preferred1, preferred2);
 
-        let chunk_locations = self.write_chunk_to_replicas(data, preferred1, preferred2, inode, file_offset, &nodes).await?;
+        let chunk_locations = self.write_chunk_to_replicas(data, preferred1, preferred2, inode, file_offset, &nodes, file_id).await?;
 
         // Log which nodes were actually used
         if let Some(loc) = chunk_locations.first() {
@@ -4114,6 +4114,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         inode: u64,
         file_offset: u64,
         all_nodes: &[SocketAddr],
+        file_id: Option<dfs_common::FileId>,
     ) -> Result<Vec<dfs_common::ChunkLocation>> {
         const WRITE_TIMEOUT_SECS: u64 = 30;
 
@@ -4301,7 +4302,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         if let Some(leader) = leader_addr {
             for location in chunk_locations.iter().cloned() {
                 let client = self.clone();
-                let req = Request::ReplicateChunkLocation { location, file_id: None };
+                // Include file_id so the leader can update chunk_map by file_offset
+                // (chunk_map_update_location_for_file), not just by chunk_id match.
+                // Without file_id, a new chunk (not yet in chunk_map) produces no match
+                // and the chunk_map stays stale — causing handle_put_file_metadata to
+                // override the correct new hash with the old chunk_map entry.
+                let req = Request::ReplicateChunkLocation { location, file_id };
                 let mut backoff_ms = 250u64;
                 for attempt in 1u32..=4 {
                     match tokio::time::timeout(Duration::from_secs(3), client.send_request(leader, req.clone())).await {
@@ -4475,7 +4481,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Write data and populate byte-range cache for immediate read-back
     /// This enables zero-latency reads of just-written data (DVR use case)
     /// Returns (chunk_ids, chunk_sizes, chunk_locations) - locations include full replica node tracking
-    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
+    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64, file_id: Option<dfs_common::FileId>) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
             // Single-node cluster: fall back to server-side replication
@@ -4484,7 +4490,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
-        let chunk_locations = self.write_data_dual_replica(data, inode, file_offset).await?;
+        let chunk_locations = self.write_data_dual_replica(data, inode, file_offset, file_id).await?;
 
         // Extract chunk IDs and sizes for backward compatibility
         let chunk_ids: Vec<ChunkId> = chunk_locations.iter().map(|loc| loc.chunk_id).collect();

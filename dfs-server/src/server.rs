@@ -3682,6 +3682,36 @@ impl Server {
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
 
+        // Pre-update chunk_map with expected_new_chunk_id BEFORE entering spawn_blocking.
+        // spawn_blocking suspends this async task during I/O, creating a window where a
+        // concurrent patch2 (using new_chunk_id as base) arrives, sees old_chunk_id in
+        // chunk_map, and returns false ChunkStale. This is the source of spurious stale
+        // warnings on staging: two rapid sequential writes to the same chunk from QEMU.
+        // Pre-updating is safe: stale check above confirmed old_chunk_id matches. If the
+        // patch fails we revert chunk_map below.
+        let patch_ts_pre = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if let Some(expected) = expected_new_chunk_id {
+            if expected != chunk_id {
+                const CHUNK_SIZE_PRE: u64 = 4 * 1024 * 1024;
+                if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+                    if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
+                        let (locations, _) = entry.value_mut();
+                        if let Some(loc) = locations.iter_mut().find(|l| {
+                            l.file_offset.map(|o| o / CHUNK_SIZE_PRE) == Some(cidx)
+                                && l.chunk_id == chunk_id
+                        }) {
+                            loc.chunk_id = expected;
+                            loc.checksum = expected.hash;
+                            loc.written_at = Some(patch_ts_pre);
+                        }
+                    }
+                }
+            }
+        }
+
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
             use std::io::{Read, Seek, SeekFrom, Write};
@@ -3854,6 +3884,26 @@ impl Server {
             }
             Ok(Err((msg, code))) => {
                 warn!("MultiPatch {}: {}", chunk_id, msg);
+                // Revert the pre-update: the patch failed so chunk_map still has expected
+                // hash, but the file is still named old_chunk_id on disk. Roll it back.
+                if let Some(expected) = expected_new_chunk_id {
+                    if expected != chunk_id {
+                        const CHUNK_SIZE_REV: u64 = 4 * 1024 * 1024;
+                        if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+                            if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
+                                let (locations, _) = entry.value_mut();
+                                if let Some(loc) = locations.iter_mut().find(|l| {
+                                    l.file_offset.map(|o| o / CHUNK_SIZE_REV) == Some(cidx)
+                                        && l.chunk_id == expected
+                                }) {
+                                    loc.chunk_id = chunk_id;
+                                    loc.checksum = chunk_id.hash;
+                                    loc.written_at = None;
+                                }
+                            }
+                        }
+                    }
+                }
                 Response::Error { message: msg, code }
             }
             Err(e) => {

@@ -1419,8 +1419,12 @@ impl Server {
         if bypass_rm {
             self.file_write_seqs.insert(metadata.id, metadata.write_seq);
         }
-        // Always apply per-chunk written_at guard — same reasoning as handle_replicate_metadata_batch.
-        let metadata = {
+        // Guard: same reasoning as handle_put_file_metadata — bypass accepts as-is,
+        // non-bypass applies written_at guard. Fresh writes (written_at=None) must not
+        // be rejected in the bypass case by being compared against patch timestamps.
+        let metadata = if bypass_rm {
+            metadata
+        } else {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
@@ -1885,12 +1889,13 @@ impl Server {
             if bypass_b {
                 self.file_write_seqs.insert(metadata.id, metadata.write_seq);
             }
-            // Always apply per-chunk written_at guard regardless of bypass.
-            // bypass_b means "newer write session" at the file level, but individual
-            // chunks may have been patched MORE recently on this node via handle_multi_patch.
-            // Without this guard, a 100ms-old broadcast reverts a locally-applied patch,
-            // causing the next patch request to get a false ChunkStale response.
-            let metadata = {
+            // Guard: bypass accepts as-is (write_seq ensures ordering AND fresh writes
+            // have written_at=None which must not be rejected by timestamp comparison).
+            // Non-bypass applies written_at guard to prevent stale patches from reverting
+            // locally-applied patch results that the chunk_map already holds.
+            let metadata = if bypass_b {
+                metadata
+            } else {
                 let mut m = metadata;
                 if let Some(map_entry) = self.chunk_map.get(&m.id) {
                     let (map_locs, _) = map_entry.value();
@@ -2959,12 +2964,21 @@ impl Server {
         let stored_write_seq = self.file_write_seqs.get(&metadata.id).map(|v| *v).unwrap_or(0);
         let incoming_write_seq = metadata.write_seq;
         let bypass_reconcile = incoming_write_seq > stored_write_seq;
-        // Always apply per-chunk written_at guard regardless of bypass.
-        // bypass_reconcile means "newer session", but the chunk_map may already hold
-        // a freshly-patched chunk_id (written_at from the patch) that is newer than
-        // what this PutFileMetadata snapshot carries. Without the guard, a broadcast
-        // or concurrent release capturing pre-patch metadata reverts a just-applied patch.
-        let metadata = {
+        // For the NON-bypass path: apply per-chunk written_at guard.
+        // For the BYPASS path: accept as-is — write_seq already ensures ordering.
+        // DO NOT apply the guard in the bypass case: fresh writes have written_at=None
+        // (client deliberately omits timestamps to avoid clock-skew issues). None → ts=0
+        // which is LESS than any patch's written_at, so the guard would incorrectly
+        // reject a fresh write that overwrites a chunk previously modified by a patch.
+        // Example: 300MB write (ts=0) → 4MB overwrite (ts=0) → patches (ts>0).
+        // The 4MB overwrite PutFileMetadata has ts=0 but IS the correct current state;
+        // without the bypass exemption the guard keeps the patch result, causing stale.
+        let metadata = if bypass_reconcile {
+            metadata
+        } else {
+            // Same or older session: apply per-chunk written_at guard to prevent a
+            // concurrent PutFileMetadata (captured before a patch) from reverting a
+            // freshly-patched chunk that ReplicateChunkLocation already committed.
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();

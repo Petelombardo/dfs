@@ -2059,11 +2059,17 @@ impl FlushHandle {
                         }
                     }
                     self.last_metadata_update.insert(ino, std::time::Instant::now());
-                    // Commit metadata to leader first, then update the read engine.
-                    // This ensures leader refreshes never overwrite our engine update
-                    // with stale data — the leader has the chunk map before we expose it.
-                    self.client.flush_metadata_sync(&meta).await;
-                    // Update read engine after leader has the metadata.
+                    // Do NOT call flush_metadata_sync here. This path runs for individual
+                    // fresh-write chunks inside flush_all_pipelined (or background ticker),
+                    // where OTHER chunks for the same inode may still be flushing concurrently
+                    // (e.g., chunk_74 completes while chunk_0's patch is still in progress).
+                    // Reading metadata_cache now captures a STALE snapshot of chunk_0 (pre-patch),
+                    // and broadcasting it causes a ghost-reversion: chunk_map on all nodes reverts
+                    // to the pre-patch hash whose file was already renamed, causing infinite
+                    // ChunkStale retry loops. flush_all_pipelined (line 2275) and flush_buffer_async
+                    // (line ~820) both call flush_metadata_sync after ALL chunks complete — that is
+                    // the correct place where metadata_cache reflects the full current state.
+                    // Update read engine for immediate read-after-write visibility.
                     let current_size = meta.size;
                     self.client.feed_chunk_locations_to_read_engine(
                         ino, &meta.chunk_locations, current_size,

@@ -134,6 +134,13 @@ pub struct Server {
     /// processes them sequentially, eliminating the futex pile-up from concurrent
     /// spawn_blocking calls all contending on sled's internal write lock.
     sled_write_tx: tokio::sync::mpsc::UnboundedSender<FileMetadata>,
+
+    /// Per-chunk serialization locks for MultiPatch.
+    /// Serializes all patches to the same (FileId, chunk_idx) pair so that two
+    /// concurrent patches (A→B and B→C) cannot race in spawn_blocking: without
+    /// this, the second patch passes the stale check and enters spawn_blocking
+    /// while the first is still renaming A→B, and fails with "file not found".
+    chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Server {
@@ -175,6 +182,7 @@ impl Server {
             chunk_tombstones: Arc::new(dashmap::DashSet::new()),
             file_write_seqs: Arc::new(DashMap::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
+            chunk_patch_locks: Arc::new(DashMap::new()),
             sled_write_tx: {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
                 let meta_bg = metadata.clone();
@@ -3656,6 +3664,21 @@ impl Server {
     ) -> Response {
         use std::fs;
         use std::io::{Read, Seek, SeekFrom, Write};
+
+        // Serialize all patches to the same (file_id, chunk_idx). This prevents the race
+        // where patch2 (B→C) passes the stale check and enters spawn_blocking while patch1
+        // (A→B) is still renaming file A to B — causing patch2 to fail with "file not found".
+        // Without this lock, even the chunk_map pre-update below can't prevent patch2 from
+        // racing ahead into the I/O before patch1 finishes the rename.
+        let _chunk_patch_guard = if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+            let lock = self.chunk_patch_locks
+                .entry((fid, cidx))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            Some(lock.lock_owned().await)
+        } else {
+            None
+        };
 
         if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
             if let Some(entry) = self.chunk_map.get(&fid) {

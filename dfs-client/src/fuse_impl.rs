@@ -2291,12 +2291,27 @@ impl FlushHandle {
 
         if let Some(e) = first_err { return Err(e); }
 
-        // Final metadata sync — flush_one_chunk enqueues to the metadata queue,
-        // but release/fsync need a synchronous commit so the file survives restart.
+        // Final metadata sync — only if no more unflushed data is pending.
+        // If another write has already deposited data in a slot while this FAP was
+        // running (e.g., chunk_74 fresh write FAP completes while chunk_0's 4MB
+        // overwrite is still buffered), reading metadata_cache now would capture a
+        // snapshot with the pre-overwrite chunk_0 hash. Broadcasting that snapshot
+        // creates the ghost-reversion: the stale hash propagates to followers, they
+        // revert their chunk_map, and the next MultiPatch for chunk_0 gets ChunkStale
+        // with a hash that no longer exists on disk — infinite retry cascade.
+        //
+        // When there IS pending data, the subsequent FAP (or release else-branch)
+        // will send flush_metadata_sync after flushing that data, at which point
+        // metadata_cache will correctly reflect all writes. Skip here.
+        let has_more_pending = self.write_buffers.get(&ino).map(|s| {
+            s.try_lock().map(|st| st.slots.values().any(|sl| !sl.data.is_empty())).unwrap_or(false)
+        }).unwrap_or(false);
         let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
         if let Some(meta) = meta_to_persist {
-            self.client.flush_metadata_sync(&meta).await;
-            self.last_metadata_update.insert(ino, std::time::Instant::now());
+            if !has_more_pending {
+                self.client.flush_metadata_sync(&meta).await;
+                self.last_metadata_update.insert(ino, std::time::Instant::now());
+            }
             // Re-feed the read engine AFTER metadata is committed to the server.
             // flush_buffer_async_one feeds it per-chunk (before flush_metadata_sync),
             // but a concurrent background refresh_engine call can race that window:

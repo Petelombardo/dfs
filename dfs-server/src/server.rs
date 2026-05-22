@@ -243,6 +243,24 @@ impl Server {
     /// Update the chunk map for a single file — called after every metadata write or heal.
     async fn chunk_map_update(&self, metadata: &FileMetadata) {
         if !metadata.chunk_locations.is_empty() {
+            // Ghost-chunk diagnostic: log if any incoming chunk_id doesn't exist on disk.
+            // This helps trace how a stale/renamed hash ends up in chunk_map, causing
+            // infinite ChunkStale retry loops when clients try to patch a ghost.
+            for loc in &metadata.chunk_locations {
+                let path = self.storage.get_chunk_path(&loc.chunk_id);
+                if !path.exists() {
+                    // Check if the existing chunk_map entry for this file_offset differs —
+                    // that indicates a REVERSION (chunk_map being set back to a stale value).
+                    let existing = self.chunk_map.get(&metadata.id).and_then(|e| {
+                        let (locs, _) = e.value();
+                        locs.iter().find(|l| l.file_offset == loc.file_offset)
+                            .map(|l| (l.chunk_id, l.written_at))
+                    });
+                    warn!("[GHOST] chunk_map_update: path={} offset={:?} incoming={} (written_at={:?}) file_does_not_exist write_seq={} existing={:?}",
+                        metadata.path, loc.file_offset, loc.chunk_id,
+                        loc.written_at, metadata.write_seq, existing);
+                }
+            }
             self.chunk_map.insert(metadata.id, (metadata.chunk_locations.clone(), metadata.modified_at));
         }
         // If the file has no chunks yet (new empty file), no map entry is needed.
@@ -301,7 +319,17 @@ impl Server {
                         let incoming_ts = location.written_at.unwrap_or(0);
                         let existing_ts = loc.written_at.unwrap_or(0);
                         if incoming_ts >= existing_ts {
+                            // Ghost-chunk diagnostic: log if existing file is being overwritten
+                            // with a chunk_id whose file doesn't exist on disk.
+                            let new_path = self.storage.get_chunk_path(&location.chunk_id);
+                            if !new_path.exists() {
+                                warn!("[GHOST] RCL chunk_map_update_location_for_file: file={:?} offset={:?} new={} (written_at={:?}) file_does_not_exist old={}",
+                                    file_id, location.file_offset, location.chunk_id, location.written_at, loc.chunk_id);
+                            }
                             *loc = location.clone();
+                        } else {
+                            debug!("[GHOST-skip] RCL rejected stale update: file={:?} offset={:?} incoming={} ts={} existing={} ts={}",
+                                file_id, location.file_offset, location.chunk_id, incoming_ts, loc.chunk_id, existing_ts);
                         }
                         return;
                     }
@@ -3718,8 +3746,9 @@ impl Server {
                         // chunk_id; if it exists we patch correctly, if not it returns NotFound.
                         let current_path = self.storage.get_chunk_path(&loc.chunk_id);
                         if !current_path.exists() {
-                            info!("MultiPatch: chunk_map has {} for chunk {} but file not on disk (stale broadcast?) — proceeding with client's {}",
-                                loc.chunk_id, cidx, chunk_id);
+                            warn!("[GHOST-stale-check] chunk_map has {} for file {:?} chunk {} (written_at={:?}) but file NOT on disk — chunk_map is stale/reverted; proceeding with client's {} (file exists={})",
+                                loc.chunk_id, fid, cidx, loc.written_at, chunk_id,
+                                self.storage.get_chunk_path(&chunk_id).exists());
                         } else {
                             info!("MultiPatch: stale chunk_id from client — file {:?} chunk {} client={} server={}",
                                 fid, cidx, chunk_id, loc.chunk_id);
@@ -3955,9 +3984,19 @@ impl Server {
                                     l.file_offset.map(|o| o / CHUNK_SIZE_REV) == Some(cidx)
                                         && l.chunk_id == expected
                                 }) {
+                                    info!("[GHOST-revert] pre-update revert: chunk {} expected={} → old={} (patch failed: {})",
+                                        cidx, expected, chunk_id, msg);
                                     loc.chunk_id = chunk_id;
                                     loc.checksum = chunk_id.hash;
                                     loc.written_at = None;
+                                } else {
+                                    // Revert FAILED: chunk_map no longer has expected — it was
+                                    // overwritten by a broadcast between pre-update and failure.
+                                    let current = locations.iter()
+                                        .find(|l| l.file_offset.map(|o| o / CHUNK_SIZE_REV) == Some(cidx))
+                                        .map(|l| (l.chunk_id, l.written_at));
+                                    warn!("[GHOST-revert-MISS] pre-update revert FAILED for chunk {} expected={} old={} current={:?} — chunk_map was overwritten between pre-update and failure (broadcast race?)",
+                                        cidx, expected, chunk_id, current);
                                 }
                             }
                         }

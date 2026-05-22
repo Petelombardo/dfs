@@ -423,6 +423,11 @@ struct FlushHandle {
     /// node so orphaned old chunks are removed from all replicas and routing tables —
     /// not just the dual-RF skip node — preventing healer copies from accumulating.
     pending_old_chunks: Arc<tokio::sync::Mutex<Vec<dfs_common::ChunkId>>>,
+    /// Per-inode count of active write-mode open file descriptors. Used by
+    /// flush_all_pipelined to skip flush_metadata_sync when a writer still has
+    /// the file open — metadata_cache may only partially reflect the current
+    /// session (e.g., mid-way through a 300MB write, only some chunks updated).
+    write_open_counts: Arc<DashMap<u64, usize>>,
 }
 
 impl FlushHandle {
@@ -2291,24 +2296,31 @@ impl FlushHandle {
 
         if let Some(e) = first_err { return Err(e); }
 
-        // Final metadata sync — only if no more unflushed data is pending.
-        // If another write has already deposited data in a slot while this FAP was
-        // running (e.g., chunk_74 fresh write FAP completes while chunk_0's 4MB
-        // overwrite is still buffered), reading metadata_cache now would capture a
-        // snapshot with the pre-overwrite chunk_0 hash. Broadcasting that snapshot
-        // creates the ghost-reversion: the stale hash propagates to followers, they
-        // revert their chunk_map, and the next MultiPatch for chunk_0 gets ChunkStale
-        // with a hash that no longer exists on disk — infinite retry cascade.
+        // Final metadata sync — only when ALL writers have closed (write_open_counts==0)
+        // AND no more unflushed data is pending.
         //
-        // When there IS pending data, the subsequent FAP (or release else-branch)
-        // will send flush_metadata_sync after flushing that data, at which point
-        // metadata_cache will correctly reflect all writes. Skip here.
+        // The write_open_counts check is the critical gate: if a writer still has the file
+        // open (write_open_counts > 0), metadata_cache may only partially reflect the
+        // current session. For a 300MB write (single dd, no truncation), FAP fires for each
+        // batch of chunks flushed. At those intermediate points, metadata_cache has new
+        // hashes for flushed chunks and OLD hashes from the previous session for chunks not
+        // yet written. Broadcasting that mixed snapshot creates ghost-reversions: nodes that
+        // already wrote the new chunks get their chunk_map reverted to non-existent old hashes.
+        //
+        // Only when write_open_counts == 0 (last writer closed) are ALL chunks guaranteed to
+        // have been written and metadata_cache fully up-to-date. The release else-branch
+        // (has_unflushed=false) fires after this FAP returns and sends the sync too — but
+        // having it here also handles the case where the background ticker triggered FAP.
+        //
+        // The has_more_pending check handles the concurrent-write case where another writer
+        // deposited data in a slot while this FAP was running.
         let has_more_pending = self.write_buffers.get(&ino).map(|s| {
             s.try_lock().map(|st| st.slots.values().any(|sl| !sl.data.is_empty())).unwrap_or(false)
         }).unwrap_or(false);
+        let has_active_writers = self.write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
         let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
         if let Some(meta) = meta_to_persist {
-            if !has_more_pending {
+            if !has_more_pending && !has_active_writers {
                 self.client.flush_metadata_sync(&meta).await;
                 self.last_metadata_update.insert(ino, std::time::Instant::now());
             }
@@ -2653,6 +2665,7 @@ impl DfsFilesystem {
                 flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
                 use_dual_rf: false,
                 pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
+                write_open_counts: write_open_counts_for_bg.clone(),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
@@ -2807,6 +2820,7 @@ impl DfsFilesystem {
             flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
             use_dual_rf: false,
             pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
+            write_open_counts: write_open_counts.clone(),
         };
 
         Ok(Self {
@@ -3170,6 +3184,7 @@ impl Filesystem for DfsFilesystem {
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
             use_dual_rf: false,
             pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
+            write_open_counts: self.write_open_counts.clone(),
         };
 
         self.block_on(async move {
@@ -6596,6 +6611,7 @@ impl Filesystem for DfsFilesystem {
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
             use_dual_rf: false,
             pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
+            write_open_counts: self.write_open_counts.clone(),
         };
 
         // Spawn so the FUSE dispatch thread is freed immediately — same pattern as fsync().

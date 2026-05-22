@@ -1466,11 +1466,18 @@ impl Server {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                             if map_loc.chunk_id != loc.chunk_id {
                                 if let Some(incoming_ts) = loc.written_at {
+                                    // (Some, *): incoming is a patch result — compare timestamps.
                                     let existing_ts = map_loc.written_at.unwrap_or(0);
                                     if existing_ts > incoming_ts {
                                         *loc = map_loc.clone();
                                     }
+                                } else if map_loc.written_at.is_some() && !bypass_rm {
+                                    // (None, Some): incoming is a fresh-write snapshot, existing
+                                    // is a patch result. Same/older session: keep the patch.
+                                    // bypass=true means newer write_seq (new session) → accept.
+                                    *loc = map_loc.clone();
                                 }
+                                // (None, None) or (None, Some)+bypass: accept incoming.
                             }
                         }
                     }
@@ -1943,13 +1950,20 @@ impl Server {
                             if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                                 if map_loc.chunk_id != loc.chunk_id {
                                     if let Some(incoming_ts) = loc.written_at {
-                                        // Both have explicit timestamps — only accept if incoming is newer.
+                                        // (Some, *): incoming is a patch result — compare timestamps.
                                         let existing_ts = map_loc.written_at.unwrap_or(0);
                                         if existing_ts > incoming_ts {
                                             *loc = map_loc.clone();
                                         }
+                                    } else if map_loc.written_at.is_some() && !bypass_b {
+                                        // (None, Some): incoming is a fresh-write snapshot, existing
+                                        // is a patch result. Same/older session: the patch supersedes
+                                        // this fresh write — keep existing. Accepting the None would
+                                        // revert chunk_map to a hash that no longer exists → ghost.
+                                        // bypass=true means newer write_seq (new session) → accept.
+                                        *loc = map_loc.clone();
                                     }
-                                    // else: incoming written_at=None (fresh write) → always accept
+                                    // (None, None) or (None, Some)+bypass: accept incoming.
                                 }
                             }
                         }

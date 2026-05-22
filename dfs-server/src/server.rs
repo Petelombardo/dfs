@@ -3709,12 +3709,25 @@ impl Server {
                 let (locations, _) = entry.value();
                 if let Some(loc) = locations.iter().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)) {
                     if loc.chunk_id != chunk_id {
-                        info!("MultiPatch: stale chunk_id from client — file {:?} chunk {} client={} server={}",
-                            fid, cidx, chunk_id, loc.chunk_id);
-                        return Response::ChunkStale {
-                            current_chunk_id: loc.chunk_id,
-                            current_nodes: loc.nodes.clone(),
-                        };
+                        // Before returning ChunkStale, verify the "current" chunk exists on disk.
+                        // A stale broadcast can revert chunk_map to an old hash whose file was
+                        // already renamed away by a subsequent patch. Returning ChunkStale with
+                        // that ghost hash sends the client into an infinite retry loop: the
+                        // "corrected" hash is unreachable, so every retry fails. Instead, let
+                        // the request proceed — spawn_blocking will open the file by the client's
+                        // chunk_id; if it exists we patch correctly, if not it returns NotFound.
+                        let current_path = self.storage.get_chunk_path(&loc.chunk_id);
+                        if !current_path.exists() {
+                            info!("MultiPatch: chunk_map has {} for chunk {} but file not on disk (stale broadcast?) — proceeding with client's {}",
+                                loc.chunk_id, cidx, chunk_id);
+                        } else {
+                            info!("MultiPatch: stale chunk_id from client — file {:?} chunk {} client={} server={}",
+                                fid, cidx, chunk_id, loc.chunk_id);
+                            return Response::ChunkStale {
+                                current_chunk_id: loc.chunk_id,
+                                current_nodes: loc.nodes.clone(),
+                            };
+                        }
                     }
                 }
             }

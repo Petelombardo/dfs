@@ -99,11 +99,11 @@ pub struct Server {
     /// which caused contention at >100 writes/sec (rsync storms, bulk copies).
     recent_writes: Arc<DashMap<FileId, (FileMetadata, std::time::Instant)>>,
 
-    /// Coalescing buffer for immediate metadata broadcasts to followers.
-    /// handle_put_file_metadata inserts here instead of spawning a per-file task.
-    /// start_broadcast_flush_loop drains and sends ReplicateMetadataBatch every 100ms.
-    /// DashMap provides O(1) insert and natural dedup by FileId — a write storm of
-    /// 3500 files/sec produces at most one batch per 100ms window, not 3500 tasks.
+    /// Dirty-file buffer for the metadata healer.
+    /// handle_put_file_metadata inserts here after every write; the healer drains
+    /// it every 5s and pushes authoritative metadata (rebuilt from chunk_map) to
+    /// all online followers. DashMap deduplicates by FileId so write storms produce
+    /// at most one push per file per 5s window.
     pending_broadcasts: Arc<DashMap<FileId, FileMetadata>>,
 
     /// Tracks the highest write_seq seen per file across PutFileMetadata calls.
@@ -2816,57 +2816,179 @@ impl Server {
         });
     }
 
-    /// Drains pending_broadcasts every 100ms and sends ReplicateMetadataBatch to
-    /// all online followers. Coalesces all inserts within the 100ms window into a
-    /// single RPC per follower instead of one task per file — critical for write
-    /// storms (rsync, bulk copies) where handle_put_file_metadata runs 1000s/sec.
-    pub fn start_broadcast_flush_loop(self: Arc<Self>) {
+    /// Metadata healer: drains pending_broadcasts every 5s and pushes authoritative
+    /// metadata to all online followers. Unlike the old broadcast_flush_loop, this
+    /// rebuilds chunk_locations from the leader's authoritative chunk_map before
+    /// sending — client-originated chunk_locations in pending_broadcasts are ignored.
+    /// A full-sweep every 5 minutes catches followers that missed dirty-file pushes.
+    pub fn start_metadata_healer_loop(self: Arc<Self>) {
         let server = self;
         tokio::spawn(async move {
+            const DIRTY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+            const FULL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+            const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut last_full = std::time::Instant::now();
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if server.pending_broadcasts.is_empty() {
+                tokio::time::sleep(DIRTY_INTERVAL).await;
+
+                if !server.cluster.is_leader().await {
+                    server.pending_broadcasts.clear();
                     continue;
                 }
-                // Filter tombstoned entries before sending. The DashMap iter() and
-                // clear() are not atomic: a delete_tombstones.insert() + pending_broadcasts
-                // .remove() can race between iter() and clear(), leaving the deleted file
-                // in the batch. The follower tombstone check catches most of these, but
-                // filtering here is the right place to stop it at the source.
-                const TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-                let batch: Vec<FileMetadata> = server.pending_broadcasts
-                    .iter()
-                    .filter(|e| {
-                        server.delete_tombstones.get(e.key())
-                            .map(|t| t.value().elapsed() >= TOMBSTONE_TTL)
-                            .unwrap_or(true)
-                    })
-                    .map(|e| e.value().clone())
-                    .collect();
-                server.pending_broadcasts.clear();
-                if batch.is_empty() {
-                    continue;
-                }
-                let local_id = server.cluster.local_node_id();
-                let nodes = server.cluster.get_all_nodes().await;
-                for node in &nodes {
-                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                        continue;
+
+                // Dirty-file push: rebuild authoritative metadata for changed files.
+                if !server.pending_broadcasts.is_empty() {
+                    let dirty_entries: Vec<(dfs_common::FileId, dfs_common::FileMetadata)> = server
+                        .pending_broadcasts
+                        .iter()
+                        .filter(|e| {
+                            // Skip recently tombstoned files.
+                            server.delete_tombstones.get(e.key())
+                                .map(|t| t.value().elapsed() >= TOMBSTONE_TTL)
+                                .unwrap_or(true)
+                        })
+                        .map(|e| (*e.key(), e.value().clone()))
+                        .collect();
+                    server.pending_broadcasts.clear();
+
+                    if !dirty_entries.is_empty() {
+                        // Rebuild chunk_locations from leader's authoritative chunk_map.
+                        let batch: Vec<dfs_common::FileMetadata> = dirty_entries
+                            .into_iter()
+                            .map(|(file_id, mut meta)| {
+                                if let Some(map_entry) = server.chunk_map.get(&file_id) {
+                                    meta.chunk_locations = map_entry.value().0.clone();
+                                }
+                                meta
+                            })
+                            .collect();
+
+                        let local_id = server.cluster.local_node_id();
+                        let nodes = server.cluster.get_all_nodes().await;
+                        for node in &nodes {
+                            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                                continue;
+                            }
+                            let req = dfs_common::Request::ReplicateMetadataBatch { items: batch.clone() };
+                            let client = server.client.clone();
+                            let addr = node.addr;
+                            let sem = server.broadcast_semaphore.clone();
+                            tokio::spawn(async move {
+                                let _permit = sem.acquire().await.ok();
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    client.send_message(addr, dfs_common::Message::Request(req)),
+                                ).await;
+                            });
+                        }
                     }
-                    let req = dfs_common::Request::ReplicateMetadataBatch { items: batch.clone() };
-                    let client = server.client.clone();
-                    let addr = node.addr;
-                    let sem = server.broadcast_semaphore.clone();
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire().await.ok();
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            client.send_message(addr, dfs_common::Message::Request(req)),
-                        ).await;
-                    });
+                }
+
+                // Full-sweep: push any file that an online follower is missing or behind on.
+                if last_full.elapsed() >= FULL_INTERVAL {
+                    last_full = std::time::Instant::now();
+                    server.run_metadata_push_to_followers().await;
                 }
             }
         });
+    }
+
+    /// Full-sweep push: for each online follower, find files where the follower's
+    /// write_seq lags the leader's, and push the authoritative metadata for those files.
+    /// Runs every 5 minutes from start_metadata_healer_loop. Guarantees ≥N copies of
+    /// metadata across the cluster even after network partitions or node restarts.
+    async fn run_metadata_push_to_followers(&self) {
+        if !self.cluster.is_leader().await {
+            return;
+        }
+        let local_id = self.cluster.local_node_id();
+        let nodes = self.cluster.get_all_nodes().await;
+
+        // Build the leader's authoritative inventory: FileId → write_seq.
+        let my_inventory: std::collections::HashMap<dfs_common::FileId, u64> = {
+            let meta = self.metadata.clone();
+            match tokio::task::spawn_blocking(move || meta.get_file_inventory()).await {
+                Ok(Ok(v)) => v.into_iter().collect(),
+                Ok(Err(e)) => { warn!("metadata_healer full-sweep: local inventory failed: {}", e); return; }
+                Err(e) => { warn!("metadata_healer full-sweep: spawn_blocking panic: {}", e); return; }
+            }
+        };
+        if my_inventory.is_empty() { return; }
+
+        for node in &nodes {
+            if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+
+            // Get the follower's inventory.
+            let inv = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.client.send_message(node.addr, dfs_common::Message::Request(dfs_common::Request::GetFileInventory)),
+            ).await;
+            let follower_inv: Vec<(dfs_common::FileId, u64)> = match inv {
+                Ok(Ok(env)) => match env.message {
+                    dfs_common::Message::Response(dfs_common::Response::FileInventory { entries }) => entries,
+                    _ => { warn!("metadata_healer: unexpected inventory response from {}", node.id); continue; }
+                },
+                Ok(Err(e)) => { warn!("metadata_healer: inventory fetch from {} failed: {}", node.id, e); continue; }
+                Err(_) => { warn!("metadata_healer: inventory fetch from {} timed out", node.id); continue; }
+            };
+            let follower_map: std::collections::HashMap<dfs_common::FileId, u64> =
+                follower_inv.into_iter().collect();
+
+            // Find files where follower is behind or missing.
+            let behind: Vec<dfs_common::FileId> = my_inventory.iter()
+                .filter_map(|(id, &leader_seq)| {
+                    match follower_map.get(id) {
+                        None => Some(*id),
+                        Some(&follower_seq) if follower_seq < leader_seq => Some(*id),
+                        _ => None,
+                    }
+                })
+                .collect();
+
+            if behind.is_empty() { continue; }
+            info!("metadata_healer: {} files to push to {}", behind.len(), node.id);
+
+            for chunk in behind.chunks(100) {
+                // Fetch full metadata from local sled.
+                let batch_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    {
+                        let meta = self.metadata.clone();
+                        let ids = chunk.to_vec();
+                        tokio::task::spawn_blocking(move || {
+                            ids.iter()
+                                .filter_map(|id| meta.get_file(id).ok().flatten())
+                                .collect::<Vec<_>>()
+                        })
+                    },
+                ).await;
+                let mut batch: Vec<dfs_common::FileMetadata> = match batch_result {
+                    Ok(Ok(v)) => v,
+                    _ => { warn!("metadata_healer: sled fetch failed for chunk"); continue; }
+                };
+
+                // Override chunk_locations with authoritative chunk_map entries.
+                for meta in batch.iter_mut() {
+                    if let Some(map_entry) = self.chunk_map.get(&meta.id) {
+                        meta.chunk_locations = map_entry.value().0.clone();
+                    }
+                }
+
+                let req = dfs_common::Request::ReplicateMetadataBatch { items: batch };
+                let client = self.client.clone();
+                let addr = node.addr;
+                let sem = self.broadcast_semaphore.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        client.send_message(addr, dfs_common::Message::Request(req)),
+                    ).await;
+                });
+            }
+        }
     }
 
     /// Periodic long-term reconciliation loop: every 5 minutes the leader collects
@@ -3017,10 +3139,22 @@ impl Server {
         // accept the incoming metadata as authoritative. This correctly handles
         // cross-session fresh overwrites where timestamps are unreliable (different
         // clocks, or T_now from a previous session stored in sled beats None/0).
+        // Track the highest write_seq seen for session management.
         let stored_write_seq = self.file_write_seqs.get(&metadata.id).map(|v| *v).unwrap_or(0);
         let incoming_write_seq = metadata.write_seq;
-        let bypass_reconcile = incoming_write_seq > stored_write_seq;
-        // Same guard as handle_replicate_metadata_batch — see comment there.
+        if incoming_write_seq > stored_write_seq {
+            self.file_write_seqs.insert(metadata.id, incoming_write_seq);
+        }
+        // The leader's chunk_map is the sole authoritative source of chunk locations,
+        // updated exclusively by ReplicateChunkLocation (actual confirmed write results).
+        // The incoming chunk_locations from the client's metadata_cache are a mixed
+        // snapshot: correct hashes for already-written chunks, stale hashes for chunks
+        // not yet written in this session. Using them as-is would overwrite authoritative
+        // chunk_map entries and create ghost chunks — a hash in the map that doesn't exist
+        // on any node, causing infinite ChunkStale retry loops.
+        //
+        // Rule: prefer chunk_map for every offset it knows about; fall back to incoming
+        // only for offsets the leader hasn't seen yet (RCL not yet received).
         let metadata = {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
@@ -3028,30 +3162,17 @@ impl Server {
                 for loc in m.chunk_locations.iter_mut() {
                     if let Some(file_offset) = loc.file_offset {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
-                            if map_loc.chunk_id != loc.chunk_id {
-                                if let Some(incoming_ts) = loc.written_at {
-                                    let existing_ts = map_loc.written_at.unwrap_or(0);
-                                    if existing_ts > incoming_ts {
-                                        *loc = map_loc.clone();
-                                    }
-                                }
-                            }
+                            *loc = map_loc.clone();
                         }
                     }
                 }
             }
             m
         };
-        // Track the highest write_seq seen — used for the bypass decision above.
-        if incoming_write_seq > stored_write_seq {
-            self.file_write_seqs.insert(metadata.id, incoming_write_seq);
-        }
         self.chunk_map_update(&metadata).await;
         self.record_recent_write(metadata.clone());
-        // Coalesce into the broadcast buffer instead of spawning a per-file task.
-        // start_broadcast_flush_loop drains this DashMap every 100ms as a batch.
-        // Prevents Tokio task storms during bulk writes (rsync, large copies).
-        // The dissemination queue provides the durable ordered catch-up path.
+        // Mark file dirty for the metadata healer (drains every 5s).
+        // DashMap deduplicates by FileId — write storms produce one healer push per file.
         if metadata.write_seq > 0 || !metadata.chunk_locations.is_empty() {
             self.pending_broadcasts.insert(metadata.id, metadata.clone());
         }

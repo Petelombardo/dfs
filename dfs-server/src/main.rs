@@ -238,7 +238,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_leader_forward_loop();
     server.clone().start_chunk_location_sync_loop();
     server.clone().start_metadata_gossip_loop();
-    server.clone().start_broadcast_flush_loop();
+    server.clone().start_metadata_healer_loop();
     server.clone().start_periodic_reconciliation_loop();
     server.clone().start_delete_drain_loop();
     server.clone().start_chunk_tombstone_cleanup_loop();

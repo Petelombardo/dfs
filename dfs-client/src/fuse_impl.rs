@@ -2296,40 +2296,12 @@ impl FlushHandle {
 
         if let Some(e) = first_err { return Err(e); }
 
-        // Final metadata sync — only when ALL writers have closed (write_open_counts==0)
-        // AND no more unflushed data is pending.
-        //
-        // The write_open_counts check is the critical gate: if a writer still has the file
-        // open (write_open_counts > 0), metadata_cache may only partially reflect the
-        // current session. For a 300MB write (single dd, no truncation), FAP fires for each
-        // batch of chunks flushed. At those intermediate points, metadata_cache has new
-        // hashes for flushed chunks and OLD hashes from the previous session for chunks not
-        // yet written. Broadcasting that mixed snapshot creates ghost-reversions: nodes that
-        // already wrote the new chunks get their chunk_map reverted to non-existent old hashes.
-        //
-        // Only when write_open_counts == 0 (last writer closed) are ALL chunks guaranteed to
-        // have been written and metadata_cache fully up-to-date. The release else-branch
-        // (has_unflushed=false) fires after this FAP returns and sends the sync too — but
-        // having it here also handles the case where the background ticker triggered FAP.
-        //
-        // The has_more_pending check handles the concurrent-write case where another writer
-        // deposited data in a slot while this FAP was running.
-        let has_more_pending = self.write_buffers.get(&ino).map(|s| {
-            s.try_lock().map(|st| st.slots.values().any(|sl| !sl.data.is_empty())).unwrap_or(false)
-        }).unwrap_or(false);
-        let has_active_writers = self.write_open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false);
-        let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
-        if let Some(meta) = meta_to_persist {
-            if !has_more_pending && !has_active_writers {
-                self.client.flush_metadata_sync(&meta).await;
-                self.last_metadata_update.insert(ino, std::time::Instant::now());
-            }
-            // Re-feed the read engine AFTER metadata is committed to the server.
-            // flush_buffer_async_one feeds it per-chunk (before flush_metadata_sync),
-            // but a concurrent background refresh_engine call can race that window:
-            // it reads stale server metadata (old chunk_ids) and overwrites the engine,
-            // causing reads after fsync to try renamed-away chunks → EIO. By feeding
-            // again here, any stale refresh is corrected before fsync/release returns.
+        // Re-feed the read engine so reads after fsync see the latest chunk_ids.
+        // flush_buffer_async_one feeds it per-chunk, but a concurrent refresh_engine
+        // can race and overwrite with stale server data. Feeding here corrects that.
+        // flush_metadata_sync is NOT called from FAP — the release handler owns that
+        // responsibility so metadata is only sent after ALL chunks are confirmed written.
+        if let Some(meta) = self.metadata_cache.get(&ino).map(|m| m.clone()) {
             self.client.feed_chunk_locations_to_read_engine(
                 ino, &meta.chunk_locations, meta.size,
             ).await;
@@ -5513,19 +5485,21 @@ impl Filesystem for DfsFilesystem {
                         if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
-                        // flush_all_pipelined already called flush_metadata_sync internally
-                        // and waited for delivery — do NOT call it again. A concurrent release
-                        // task that read metadata_cache before flush_all_pipelined updated it
-                        // would send a stale chunk_id with a higher write_seq, bypassing all
-                        // guards and reverting the server's chunk_map to the old chunk_id.
-                        // Re-check pending_delete: a delete can arrive while flush_all_pipelined
-                        // is in progress (window widened by flush_pipeline_locks serialization).
+                        // FAP no longer calls flush_metadata_sync — it only flushes chunk data.
+                        // Send metadata here, after ALL chunks are confirmed written, so the
+                        // leader receives a complete and accurate snapshot. The server's
+                        // handle_put_file_metadata uses its authoritative chunk_map to override
+                        // any stale entries, so this is safe even if a new session has started.
+                        // Re-check pending_delete: a delete can arrive while FAP was running.
                         {
                             let path_now = path_to_inode_for_release.read().unwrap()
                                 .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
                             let still_live = path_now.as_deref()
                                 .map_or(false, |p| !pending_deletes_for_release.contains(p));
                             if still_live {
+                                if let Some(meta) = flush_handle.metadata_cache.get(&ino).map(|m| m.clone()) {
+                                    flush_handle.client.flush_metadata_sync(&meta).await;
+                                }
                                 flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
                             }
                         }
@@ -5669,19 +5643,21 @@ impl Filesystem for DfsFilesystem {
                         if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
-                        // flush_all_pipelined already called flush_metadata_sync internally
-                        // and waited for delivery — do NOT call it again. A concurrent release
-                        // task that read metadata_cache before flush_all_pipelined updated it
-                        // would send a stale chunk_id with a higher write_seq, bypassing all
-                        // guards and reverting the server's chunk_map to the old chunk_id.
-                        // Re-check pending_delete: a delete can arrive while flush_all_pipelined
-                        // is in progress (window widened by flush_pipeline_locks serialization).
+                        // FAP no longer calls flush_metadata_sync — it only flushes chunk data.
+                        // Send metadata here, after ALL chunks are confirmed written, so the
+                        // leader receives a complete and accurate snapshot. The server's
+                        // handle_put_file_metadata uses its authoritative chunk_map to override
+                        // any stale entries, so this is safe even if a new session has started.
+                        // Re-check pending_delete: a delete can arrive while FAP was running.
                         {
                             let path_now = path_to_inode_for_release.read().unwrap()
                                 .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
                             let still_live = path_now.as_deref()
                                 .map_or(false, |p| !pending_deletes_for_release.contains(p));
                             if still_live {
+                                if let Some(meta) = flush_handle.metadata_cache.get(&ino).map(|m| m.clone()) {
+                                    flush_handle.client.flush_metadata_sync(&meta).await;
+                                }
                                 flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
                             }
                         }

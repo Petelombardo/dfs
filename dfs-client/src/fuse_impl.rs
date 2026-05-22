@@ -6518,7 +6518,19 @@ impl Filesystem for DfsFilesystem {
             }
             self.runtime.spawn(async move {
                 match handle.flush_all_pipelined(ino).await {
-                    Ok(_) => reply.ok(),
+                    Ok(_) => {
+                        // Commit metadata to the leader after flushing chunk data.
+                        // For long-lived file handles (VM disks, databases) that are never
+                        // released between write sessions, fsync is the only durability
+                        // boundary — metadata must be committed here so followers receive
+                        // routing updates before the next read. The server's authoritative
+                        // chunk_map guard makes mid-session metadata syncs ghost-free.
+                        if let Some(meta) = handle.metadata_cache.get(&ino).map(|m| m.clone()) {
+                            handle.client.flush_metadata_sync(&meta).await;
+                            handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                        }
+                        reply.ok();
+                    }
                     Err(e) => { error!("fsync failed for inode {}: {}", ino, e); reply.error(libc::EIO); }
                 }
             });

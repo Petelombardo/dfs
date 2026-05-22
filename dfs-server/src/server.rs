@@ -1419,9 +1419,8 @@ impl Server {
         if bypass_rm {
             self.file_write_seqs.insert(metadata.id, metadata.write_seq);
         }
-        let metadata = if bypass_rm {
-            metadata
-        } else {
+        // Always apply per-chunk written_at guard — same reasoning as handle_replicate_metadata_batch.
+        let metadata = {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
@@ -1429,7 +1428,11 @@ impl Server {
                     if let Some(file_offset) = loc.file_offset {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                             if map_loc.chunk_id != loc.chunk_id {
-                                *loc = map_loc.clone(); // chunk_map is ground truth
+                                let incoming_ts = loc.written_at.unwrap_or(0);
+                                let existing_ts = map_loc.written_at.unwrap_or(0);
+                                if existing_ts > incoming_ts {
+                                    *loc = map_loc.clone();
+                                }
                             }
                         }
                     }
@@ -1882,9 +1885,12 @@ impl Server {
             if bypass_b {
                 self.file_write_seqs.insert(metadata.id, metadata.write_seq);
             }
-            let metadata = if bypass_b {
-                metadata
-            } else {
+            // Always apply per-chunk written_at guard regardless of bypass.
+            // bypass_b means "newer write session" at the file level, but individual
+            // chunks may have been patched MORE recently on this node via handle_multi_patch.
+            // Without this guard, a 100ms-old broadcast reverts a locally-applied patch,
+            // causing the next patch request to get a false ChunkStale response.
+            let metadata = {
                 let mut m = metadata;
                 if let Some(map_entry) = self.chunk_map.get(&m.id) {
                     let (map_locs, _) = map_entry.value();
@@ -1892,7 +1898,11 @@ impl Server {
                         if let Some(file_offset) = loc.file_offset {
                             if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                                 if map_loc.chunk_id != loc.chunk_id {
-                                    *loc = map_loc.clone(); // chunk_map is ground truth
+                                    let incoming_ts = loc.written_at.unwrap_or(0);
+                                    let existing_ts = map_loc.written_at.unwrap_or(0);
+                                    if existing_ts > incoming_ts {
+                                        *loc = map_loc.clone();
+                                    }
                                 }
                             }
                         }
@@ -2949,13 +2959,12 @@ impl Server {
         let stored_write_seq = self.file_write_seqs.get(&metadata.id).map(|v| *v).unwrap_or(0);
         let incoming_write_seq = metadata.write_seq;
         let bypass_reconcile = incoming_write_seq > stored_write_seq;
-        let metadata = if bypass_reconcile {
-            // Newer session — accept as-is without per-chunk guard.
-            metadata
-        } else {
-            // Same or older session — apply per-chunk written_at guard to prevent a
-            // concurrent PutFileMetadata (captured before a patch) from reverting a
-            // freshly-patched chunk that ReplicateChunkLocation already committed.
+        // Always apply per-chunk written_at guard regardless of bypass.
+        // bypass_reconcile means "newer session", but the chunk_map may already hold
+        // a freshly-patched chunk_id (written_at from the patch) that is newer than
+        // what this PutFileMetadata snapshot carries. Without the guard, a broadcast
+        // or concurrent release capturing pre-patch metadata reverts a just-applied patch.
+        let metadata = {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();

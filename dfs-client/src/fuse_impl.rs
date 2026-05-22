@@ -168,7 +168,17 @@ impl ChunkSlot {
     }
 
     fn is_full(&self) -> bool {
-        self.data.len() >= CHUNK_SIZE
+        if self.data.len() < CHUNK_SIZE {
+            return false;
+        }
+        // For overwrite slots, data is preloaded with the existing 4MB chunk even
+        // when only a small range was written. Only mark "full" for immediate ticker
+        // dispatch when dirty ranges cover the entire slot (full replacement path).
+        // Partial overwrites wait for the stale-flush timer or an explicit fsync so
+        // sequential writes can accumulate into one fresh write instead of many tiny
+        // MultiPatch operations (one per background tick = one per ~20ms per 262KB).
+        let total_dirty: usize = self.dirty_ranges.iter().map(|&(s, e)| e - s).sum();
+        total_dirty >= self.data.len()
     }
 
     fn is_idle(&self) -> bool {
@@ -6517,48 +6527,14 @@ impl Filesystem for DfsFilesystem {
                 info!("fsync: ino={} path={:?} → sync flush (active_writers={})", ino, path, active_writers);
             }
             self.runtime.spawn(async move {
-                // For O_SYNC / SQLite files, flush everything immediately — these callers
-                // require strict per-fsync durability and throughput is not the priority.
-                //
-                // For VM disks and other non-sync files (sync_on_fsync=false): flushing
-                // every tiny dirty range on each fsync is catastrophically slow. A sequential
-                // write benchmark writes 4KB, issues fsync, writes 4KB, issues fsync — each
-                // fsync would trigger a MultiPatch of 4KB (~20ms) instead of letting writes
-                // accumulate into a full 4MB chunk that becomes a single fresh write (~40ms
-                // total instead of 1000 × 20ms). So for non-sync files: flush only full
-                // chunks (is_full_replacement slots); partial chunks stay in the buffer and
-                // are drained by the background stale-flush ticker within 500ms. Metadata
-                // is synced at most once per second to avoid per-fsync leader roundtrips.
-                if !sync_on_fsync {
-                    // Flush only full (ready-for-fresh-write) chunks; skip partials.
-                    let has_full = handle.write_buffers.get(&ino).map(|s| {
-                        s.try_lock().map(|st| !st.full_slot_indices().is_empty()).unwrap_or(false)
-                    }).unwrap_or(false);
-                    if has_full {
-                        if let Err(e) = handle.flush_all_pipelined(ino).await {
-                            error!("fsync (non-sync) flush failed for inode {}: {}", ino, e);
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                    }
-                    // Rate-limit metadata sync: at most once per second.
-                    const META_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-                    let last = handle.last_metadata_update.get(&ino)
-                        .map(|t| t.elapsed())
-                        .unwrap_or(std::time::Duration::from_secs(u64::MAX));
-                    if last >= META_SYNC_INTERVAL {
-                        if let Some(meta) = handle.metadata_cache.get(&ino).map(|m| m.clone()) {
-                            handle.client.flush_metadata_sync(&meta).await;
-                            handle.last_metadata_update.insert(ino, std::time::Instant::now());
-                        }
-                    }
-                    reply.ok();
-                    return;
-                }
-
-                // sync_on_fsync=true (O_SYNC / SQLite): full flush + metadata commit.
                 match handle.flush_all_pipelined(ino).await {
                     Ok(_) => {
+                        // Commit metadata to the leader after flushing chunk data.
+                        // For long-lived file handles (VM disks, databases) that are never
+                        // released between write sessions, fsync is the only durability
+                        // boundary — metadata must be committed here so followers receive
+                        // routing updates before the next read. The server's authoritative
+                        // chunk_map guard makes mid-session metadata syncs ghost-free.
                         if let Some(meta) = handle.metadata_cache.get(&ino).map(|m| m.clone()) {
                             handle.client.flush_metadata_sync(&meta).await;
                             handle.last_metadata_update.insert(ino, std::time::Instant::now());

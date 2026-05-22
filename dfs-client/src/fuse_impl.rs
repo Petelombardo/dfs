@@ -1354,18 +1354,21 @@ impl FlushHandle {
                         });
                     match (cached_loc, recent) {
                         (Some(mut loc), Some((recent_id, recent_nodes))) => {
-                            // Always use the nodes from recent_chunk_writes when available —
-                            // these are the 2 nodes we actually patched most recently.
-                            // metadata_cache node lists include healer-added 3rd replicas that
-                            // never received the latest patch; targeting them produces ChunkStale.
-                            // Only override nodes if non-empty: empty means addr_to_node_id_snap
-                            // was not yet populated when the previous patch ran, so metadata_cache
-                            // nodes are a better fallback than an empty list.
+                            // Use recent_chunk_writes NODES — these are the 2 nodes we actually
+                            // wrote to most recently, bypassing healer-added 3rd replicas in
+                            // metadata_cache that don't have the latest patch and would cause
+                            // ChunkStale. Do NOT override the chunk_id from metadata_cache:
+                            // recent_chunk_writes is updated for both fresh writes and patches, so
+                            // both should agree. If they differ, metadata_cache reflects the latest
+                            // server-committed state (via flush_metadata_sync) and is authoritative.
+                            // The old chunk_id override was causing T26 failures: the initial
+                            // fresh-write's H0 in recent_chunk_writes poisoned every other patch
+                            // by overriding H1, H2 etc. from metadata_cache with the stale H0.
                             if recent_id != loc.chunk_id {
-                                info!("flush_buffer_async_one: ino={} chunk={} using recent_chunk_writes id {} nodes={} (cache had id={} nodes={})",
-                                    ino, chunk_idx, recent_id, recent_nodes.len(), loc.chunk_id, loc.nodes.len());
-                                loc.chunk_id = recent_id;
-                                loc.checksum = recent_id.hash;
+                                // They can momentarily differ if the initial write and a subsequent
+                                // patch race, but slot.server_chunk_id (checked next) resolves it.
+                                debug!("flush_buffer_async_one: ino={} chunk={} recent_chunk_writes id {} differs from cache id={} — using cache id, recent nodes",
+                                    ino, chunk_idx, recent_id, loc.chunk_id);
                             }
                             if !recent_nodes.is_empty() {
                                 loc.nodes = recent_nodes;
@@ -1728,6 +1731,20 @@ impl FlushHandle {
                                 state.canonical_write_nodes.insert(chunk_idx, new_location.nodes.clone());
                             }
                         }
+                    }
+                    // Update recent_chunk_writes after every patch so that if write_buffers is
+                    // cleared (safe_to_remove=true removes the slot + server_chunk_id), the
+                    // next flush still has the correct base chunk_id rather than reverting to
+                    // the initial fresh-write's chunk_id (H0), which would make it patch from
+                    // a stale base and trigger ChunkStale on every other write cycle (T26).
+                    if let Some(file_id) = file_id_at_flush_start {
+                        let mut sorted_nodes = new_location.nodes.clone();
+                        sorted_nodes.sort_unstable();
+                        sorted_nodes.truncate(2);
+                        self.client.recent_chunk_writes.insert(
+                            (ino, chunk_idx),
+                            (new_location.chunk_id, file_id, std::time::Instant::now(), sorted_nodes),
+                        );
                     }
                     // Apply the patch to the cached base chunk so chunk_cache reflects the
                     // post-patch state immediately. This is the same recipe the server uses:
@@ -5460,18 +5477,27 @@ impl Filesystem for DfsFilesystem {
                         if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
-                    }
-                    // Always do a final synchronous metadata sync after the last writer
-                    // closes, whether data was flushed now or already flushed by the
-                    // background ticker. This guarantees the leader has the complete
-                    // chunk map before release_in_flight drops to zero — preventing a
-                    // concurrent read open from fetching stale metadata from the leader
-                    // and getting chunk IDs that no longer exist (read-after-write gap).
-                    //
-                    // Re-check pending_delete here: a delete can arrive while flush_all_pipelined
-                    // is in progress (window widened by flush_pipeline_locks serialization).
-                    // Sending PutFileMetadata after a DeleteFile would resurrect the file.
-                    {
+                        // flush_all_pipelined already called flush_metadata_sync internally
+                        // and waited for delivery — do NOT call it again. A concurrent release
+                        // task that read metadata_cache before flush_all_pipelined updated it
+                        // would send a stale chunk_id with a higher write_seq, bypassing all
+                        // guards and reverting the server's chunk_map to the old chunk_id.
+                        // Re-check pending_delete: a delete can arrive while flush_all_pipelined
+                        // is in progress (window widened by flush_pipeline_locks serialization).
+                        {
+                            let path_now = path_to_inode_for_release.read().unwrap()
+                                .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                            let still_live = path_now.as_deref()
+                                .map_or(false, |p| !pending_deletes_for_release.contains(p));
+                            if still_live {
+                                flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                            }
+                        }
+                    } else {
+                        // Background ticker already flushed the data. Still need to guarantee
+                        // the leader has current metadata before release_in_flight drops to
+                        // zero — preventing a concurrent read open from getting stale chunk IDs.
+                        // Re-check pending_delete: a delete can arrive while we waited above.
                         let path_now = path_to_inode_for_release.read().unwrap()
                             .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
                         let still_live = path_now.as_deref()
@@ -5607,18 +5633,27 @@ impl Filesystem for DfsFilesystem {
                         if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
-                    }
-                    // Always do a final synchronous metadata sync after the last writer
-                    // closes, whether data was flushed now or already flushed by the
-                    // background ticker. This guarantees the leader has the complete
-                    // chunk map before release_in_flight drops to zero — preventing a
-                    // concurrent read open from fetching stale metadata from the leader
-                    // and getting chunk IDs that no longer exist (read-after-write gap).
-                    //
-                    // Re-check pending_delete here: a delete can arrive while flush_all_pipelined
-                    // is in progress (window widened by flush_pipeline_locks serialization).
-                    // Sending PutFileMetadata after a DeleteFile would resurrect the file.
-                    {
+                        // flush_all_pipelined already called flush_metadata_sync internally
+                        // and waited for delivery — do NOT call it again. A concurrent release
+                        // task that read metadata_cache before flush_all_pipelined updated it
+                        // would send a stale chunk_id with a higher write_seq, bypassing all
+                        // guards and reverting the server's chunk_map to the old chunk_id.
+                        // Re-check pending_delete: a delete can arrive while flush_all_pipelined
+                        // is in progress (window widened by flush_pipeline_locks serialization).
+                        {
+                            let path_now = path_to_inode_for_release.read().unwrap()
+                                .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                            let still_live = path_now.as_deref()
+                                .map_or(false, |p| !pending_deletes_for_release.contains(p));
+                            if still_live {
+                                flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                            }
+                        }
+                    } else {
+                        // Background ticker already flushed the data. Still need to guarantee
+                        // the leader has current metadata before release_in_flight drops to
+                        // zero — preventing a concurrent read open from getting stale chunk IDs.
+                        // Re-check pending_delete: a delete can arrive while we waited above.
                         let path_now = path_to_inode_for_release.read().unwrap()
                             .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
                         let still_live = path_now.as_deref()

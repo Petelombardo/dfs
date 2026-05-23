@@ -2770,6 +2770,17 @@ impl DfsFilesystem {
                                     tracing::error!("Background flush failed for inode {}: {}", ino, e);
                                     break;
                                 }
+                                // Notify leader of current chunk locations after each successful
+                                // flush so chunk_map stays populated throughout long writes
+                                // (e.g., recordings where reads happen during the write session).
+                                // MetadataQueue deduplicates by file_id so concurrent flushes
+                                // only deliver one update; the final flush_metadata_sync at
+                                // release always wins via write_seq ordering.
+                                if let Some(meta) = handle.metadata_cache.get(&ino).map(|m| m.clone()) {
+                                    if !meta.chunk_locations.is_empty() {
+                                        handle.client.enqueue_metadata(&meta).await;
+                                    }
+                                }
                                 // Check whether more full slots remain.
                                 let has_more = handle.write_buffers.get(&ino).map(|s| {
                                     s.try_lock().map(|st| !st.full_slot_indices().is_empty()).unwrap_or(false)

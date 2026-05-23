@@ -312,39 +312,50 @@ impl Server {
     /// newer patch already committed) must not overwrite the newer result. Fresh writes
     /// use written_at=None (=0) so any server-timestamped patch always wins (T>0 >= 0).
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
-        if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
-            let (locs, _) = entry.value_mut();
-            // First try exact chunk_id match.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Use entry() to atomically create-or-get: for brand-new files that have no
+        // chunk_map entry yet, this inserts an empty Vec so subsequent logic can push
+        // the first chunk in. Without this, every ReplicateChunkLocation for a new file
+        // was a silent no-op and chunk_map stayed empty for the entire recording session.
+        let mut entry = self.chunk_map.entry(file_id).or_insert_with(|| (vec![], now));
+        let (locs, _) = entry.value_mut();
+        // First try exact chunk_id match.
+        for loc in locs.iter_mut() {
+            if loc.chunk_id == location.chunk_id {
+                *loc = location.clone();
+                return;
+            }
+        }
+        // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
+        // Guard: reject if incoming is older than what we already have.
+        if let Some(file_offset) = location.file_offset {
             for loc in locs.iter_mut() {
-                if loc.chunk_id == location.chunk_id {
-                    *loc = location.clone();
+                if loc.file_offset == Some(file_offset) {
+                    let incoming_ts = location.written_at.unwrap_or(0);
+                    let existing_ts = loc.written_at.unwrap_or(0);
+                    if incoming_ts >= existing_ts {
+                        // Ghost diagnostic: warn if we're replacing an existing file
+                        // with a chunk_id that doesn't exist here (RCL for other-node chunk).
+                        let new_path = self.storage.get_chunk_path(&location.chunk_id);
+                        let old_path = self.storage.get_chunk_path(&loc.chunk_id);
+                        if !new_path.exists() && old_path.exists() {
+                            warn!("[GHOST-reversion] RCL: file={:?} offset={:?} OLD={} (exists=true ts={:?}) → NEW={} (exists=false ts={:?})",
+                                file_id, location.file_offset, loc.chunk_id, loc.written_at,
+                                location.chunk_id, location.written_at);
+                        }
+                        *loc = location.clone();
+                    }
                     return;
                 }
             }
-            // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
-            // Guard: reject if incoming is older than what we already have.
-            if let Some(file_offset) = location.file_offset {
-                for loc in locs.iter_mut() {
-                    if loc.file_offset == Some(file_offset) {
-                        let incoming_ts = location.written_at.unwrap_or(0);
-                        let existing_ts = loc.written_at.unwrap_or(0);
-                        if incoming_ts >= existing_ts {
-                            // Ghost diagnostic: warn if we're replacing an existing file
-                            // with a chunk_id that doesn't exist here (RCL for other-node chunk).
-                            let new_path = self.storage.get_chunk_path(&location.chunk_id);
-                            let old_path = self.storage.get_chunk_path(&loc.chunk_id);
-                            if !new_path.exists() && old_path.exists() {
-                                warn!("[GHOST-reversion] RCL: file={:?} offset={:?} OLD={} (exists=true ts={:?}) → NEW={} (exists=false ts={:?})",
-                                    file_id, location.file_offset, loc.chunk_id, loc.written_at,
-                                    location.chunk_id, location.written_at);
-                            }
-                            *loc = location.clone();
-                        }
-                        return;
-                    }
-                }
-            }
         }
+        // No existing entry matched by chunk_id or file_offset — new chunk for this file.
+        // Push so chunk_map grows incrementally as chunks are written rather than waiting
+        // until file close (PutFileMetadata) to learn about the file's chunks.
+        locs.push(location.clone());
     }
 
     /// Remove a file from the chunk map (on deletion).
@@ -3848,7 +3859,7 @@ impl Server {
         chunk_idx: Option<u64>,
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
-        expected_new_chunk_id: Option<dfs_common::ChunkId>,
+        _expected_new_chunk_id: Option<dfs_common::ChunkId>,
     ) -> Response {
         use std::fs;
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -3907,36 +3918,6 @@ impl Server {
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
 
-        // Pre-update chunk_map with expected_new_chunk_id BEFORE entering spawn_blocking.
-        // spawn_blocking suspends this async task during I/O, creating a window where a
-        // concurrent patch2 (using new_chunk_id as base) arrives, sees old_chunk_id in
-        // chunk_map, and returns false ChunkStale. This is the source of spurious stale
-        // warnings on staging: two rapid sequential writes to the same chunk from QEMU.
-        // Pre-updating is safe: stale check above confirmed old_chunk_id matches. If the
-        // patch fails we revert chunk_map below.
-        let patch_ts_pre = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        if let Some(expected) = expected_new_chunk_id {
-            if expected != chunk_id {
-                const CHUNK_SIZE_PRE: u64 = 4 * 1024 * 1024;
-                if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
-                    if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
-                        let (locations, _) = entry.value_mut();
-                        if let Some(loc) = locations.iter_mut().find(|l| {
-                            l.file_offset.map(|o| o / CHUNK_SIZE_PRE) == Some(cidx)
-                                && l.chunk_id == chunk_id
-                        }) {
-                            loc.chunk_id = expected;
-                            loc.checksum = expected.hash;
-                            loc.written_at = Some(patch_ts_pre);
-                        }
-                    }
-                }
-            }
-        }
-
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
             use std::io::{Read, Seek, SeekFrom, Write};
@@ -3979,9 +3960,11 @@ impl Server {
 
             let final_size = needed_len as usize;
 
-            let new_chunk_id = if let Some(expected) = expected_new_chunk_id {
-                expected
-            } else {
+            // Always compute the actual hash from disk so the leader and client get
+            // ground truth. Trusting the client's pre-computed expected hash is wrong:
+            // if the server's on-disk base differed (stale client cache, healer update)
+            // the file would be named with the wrong hash, silently corrupting the chunk.
+            let new_chunk_id = {
                 let mut f2 = fs::File::open(&old_path)
                     .map_err(|e| (format!("Failed to open chunk for hashing: {}", e), ErrorCode::InternalError))?;
                 let mut hasher = blake3::Hasher::new();
@@ -4101,6 +4084,33 @@ impl Server {
                     }
                 }
 
+                // Notify the leader of the actual computed hash before returning to the
+                // client. Each replica sends its own node_id; the leader's merge logic
+                // unions under-RF sets, so two replicas sending {A} and {B} accumulate
+                // correctly to {A, B}. Fire-and-forget: if the leader is down the
+                // chunk_location_sync loop and healer will reconcile.
+                if new_chunk_id != chunk_id {
+                    if let Some(leader_addr) = self.cluster.get_leader_addr().await {
+                        if leader_addr != self.cluster.local_addr() {
+                            let location = ChunkLocation {
+                                chunk_id: new_chunk_id,
+                                nodes: vec![self.cluster.local_node_id()],
+                                size: final_size,
+                                checksum: new_chunk_id.hash,
+                                file_offset: Some(chunk_file_offset),
+                                written_at: Some(patch_ts),
+                            };
+                            let req = Request::ReplicateChunkLocation { location, file_id };
+                            let client = self.client.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = client.send_message(leader_addr, Message::Request(req)).await {
+                                    warn!("MultiPatch: failed to notify leader {} of new chunk {}: {}", leader_addr, new_chunk_id, e);
+                                }
+                            });
+                        }
+                    }
+                }
+
                 Response::MultiPatchResult {
                     new_chunk_id,
                     size: final_size,
@@ -4109,36 +4119,6 @@ impl Server {
             }
             Ok(Err((msg, code))) => {
                 warn!("MultiPatch {}: {}", chunk_id, msg);
-                // Revert the pre-update: the patch failed so chunk_map still has expected
-                // hash, but the file is still named old_chunk_id on disk. Roll it back.
-                if let Some(expected) = expected_new_chunk_id {
-                    if expected != chunk_id {
-                        const CHUNK_SIZE_REV: u64 = 4 * 1024 * 1024;
-                        if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
-                            if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
-                                let (locations, _) = entry.value_mut();
-                                if let Some(loc) = locations.iter_mut().find(|l| {
-                                    l.file_offset.map(|o| o / CHUNK_SIZE_REV) == Some(cidx)
-                                        && l.chunk_id == expected
-                                }) {
-                                    info!("[GHOST-revert] pre-update revert: chunk {} expected={} → old={} (patch failed: {})",
-                                        cidx, expected, chunk_id, msg);
-                                    loc.chunk_id = chunk_id;
-                                    loc.checksum = chunk_id.hash;
-                                    loc.written_at = None;
-                                } else {
-                                    // Revert FAILED: chunk_map no longer has expected — it was
-                                    // overwritten by a broadcast between pre-update and failure.
-                                    let current = locations.iter()
-                                        .find(|l| l.file_offset.map(|o| o / CHUNK_SIZE_REV) == Some(cidx))
-                                        .map(|l| (l.chunk_id, l.written_at));
-                                    warn!("[GHOST-revert-MISS] pre-update revert FAILED for chunk {} expected={} old={} current={:?} — chunk_map was overwritten between pre-update and failure (broadcast race?)",
-                                        cidx, expected, chunk_id, current);
-                                }
-                            }
-                        }
-                    }
-                }
                 Response::Error { message: msg, code }
             }
             Err(e) => {

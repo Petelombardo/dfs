@@ -186,7 +186,7 @@ impl ChunkSlot {
     }
 
     fn is_idle(&self) -> bool {
-        self.last_modified.elapsed().unwrap_or_default() > std::time::Duration::from_millis(500)
+        self.last_modified.elapsed().unwrap_or_default() > std::time::Duration::from_millis(50)
     }
 }
 
@@ -2724,7 +2724,7 @@ impl DfsFilesystem {
                         // Exception: skip if a release() flush task is already in flight for
                         // this inode — it will handle the slot, and racing it here would cause
                         // the stale-write guard to discard a legitimate second write (T7 race).
-                        const STALE_FLUSH_MS: u128 = 500;
+                        const STALE_FLUSH_MS: u128 = 50;
                         let release_inflight = release_in_flight_for_bg
                             .get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
                         // Skip if flush_all_pipelined is actively running for this inode.

@@ -4703,6 +4703,23 @@ impl Filesystem for DfsFilesystem {
                                 let mut hwm = size_high_water.entry(ino).or_insert(0);
                                 if new_end > *hwm { *hwm = new_end; }
                             }
+                            // Invalidate zero_gap_table for chunks touched by this write.
+                            // Same rationale as the slow path: gap entries must not shadow
+                            // in-flight writes before the 50ms flush fires.
+                            {
+                                const GAP_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                                let write_start = offset as u64;
+                                let write_end_gap = write_start + data_vec.len() as u64;
+                                let first_chunk_off = (write_start / GAP_CHUNK_SIZE) * GAP_CHUNK_SIZE;
+                                let client_gap = client.clone();
+                                flush_handle.flush_runtime.spawn(async move {
+                                    let mut chunk_off = first_chunk_off;
+                                    while chunk_off < write_end_gap {
+                                        client_gap.invalidate_zero_gap_for_chunk(ino, chunk_off).await;
+                                        chunk_off += GAP_CHUNK_SIZE;
+                                    }
+                                });
+                            }
                             // Only count bytes actually added to the buffer, not the write
                             // size. Overlapping writes don't grow the slot, so adding
                             // data_vec.len() unconditionally causes the counter to drift up.
@@ -5036,6 +5053,24 @@ impl Filesystem for DfsFilesystem {
                     // worker immediately (event-driven) instead of waiting for the 50ms ticker.
                     let has_full_chunks = !state.full_slot_indices().is_empty();
                     drop(state);
+
+                    // Immediately evict zero_gap_table entries for every chunk touched by
+                    // this write.  Without this, a gap seeded by a prior flush stays live
+                    // and reads of the newly-written bytes return stale zeros until the
+                    // next flush fires (up to 50 ms).  This is the root cause of ftruncate
+                    // disk.img corruption: QEMU reads zeros in RMW cycles and writes the
+                    // corruption back to disk.
+                    {
+                        const GAP_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                        let write_start = offset as u64;
+                        let write_end = write_start + data_vec.len() as u64;
+                        let first_chunk_off = (write_start / GAP_CHUNK_SIZE) * GAP_CHUNK_SIZE;
+                        let mut chunk_off = first_chunk_off;
+                        while chunk_off < write_end {
+                            client.invalidate_zero_gap_for_chunk(ino, chunk_off).await;
+                            chunk_off += GAP_CHUNK_SIZE;
+                        }
+                    }
 
                     if has_full_chunks {
                         flush_handle.flush_notify.notify_one();

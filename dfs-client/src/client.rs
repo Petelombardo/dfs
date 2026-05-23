@@ -1839,7 +1839,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                         gaps.retain(|gap| !gap.is_expired());
 
                         for gap in gaps.iter() {
-                            if gap.contains(read_start as u64) {
+                            if gap.start <= read_start as u64
+                                && (read_start as u64 + len_in_chunk as u64) <= gap.end
+                            {
                                 // Entire requested range is within this gap - return zeros
                                 let zeros = vec![0u8; len_in_chunk];
                                 debug!("Zero gap HIT inode={} file_offset={} len={} gap={}..{}",
@@ -3320,6 +3322,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             inode,
             chunk_offset: chunk_file_offset,
         };
+        let mut gap_table = self.zero_gap_table.lock().await;
+        gap_table.remove(&gap_key);
+    }
+
+    /// Invalidate only the zero_gap_table entry for a specific chunk.
+    /// Called on every write so that gap entries never shadow real in-flight data.
+    pub async fn invalidate_zero_gap_for_chunk(&self, inode: u64, chunk_file_offset: u64) {
+        let gap_key = ZeroGapKey { inode, chunk_offset: chunk_file_offset };
         let mut gap_table = self.zero_gap_table.lock().await;
         gap_table.remove(&gap_key);
     }

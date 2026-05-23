@@ -173,16 +173,17 @@ impl ChunkSlot {
         }
         // Overwrite slots are preloaded with the full existing 4MB chunk, so
         // data.len() >= CHUNK_SIZE immediately — we can't use data size alone.
-        // Instead dispatch when dirty ranges hit a meaningful batch size:
-        //   >= 1MB (CHUNK_SIZE/4): batch 4× better than the old 262KB-per-tick
-        //     dispatch, while still providing backpressure so a continuous random
-        //     write workload can't accumulate 1GB of uncommitted data in memory.
-        //   == data.len(): full coverage → fresh-write path (most efficient).
-        // Sequential writes covering a full chunk naturally accumulate to 4MB
-        // and take the fresh-write path if they arrive faster than the 1MB
-        // dispatch rate; otherwise they're sent as four ~1MB patches.
+        // Only dispatch immediately when the full chunk is dirty (total_dirty ==
+        // data.len()). flush_buffer_async_one detects this as is_full_replacement=true
+        // and takes the fresh-write path: one 4MB write to a new content-addressed
+        // chunk, no patch/rename/re-hash. Equivalent to a brand new write.
+        //
+        // Partial overwrites (random writes, small VM ops) don't dispatch here —
+        // they're handled by the 50ms stale-flush timer, which provides backpressure
+        // (max uncommitted ≈ write_rate × 50ms) and batches scattered writes into
+        // fewer, larger patches. fsync/release always drain all slots via urgent=true.
         let total_dirty: usize = self.dirty_ranges.iter().map(|&(s, e)| e - s).sum();
-        total_dirty >= self.data.len() || total_dirty >= CHUNK_SIZE / 4
+        total_dirty >= self.data.len()
     }
 
     fn is_idle(&self) -> bool {

@@ -4089,17 +4089,23 @@ impl Server {
                 // unions under-RF sets, so two replicas sending {A} and {B} accumulate
                 // correctly to {A, B}. Fire-and-forget: if the leader is down the
                 // chunk_location_sync loop and healer will reconcile.
+                //
+                // When this node IS the leader, update the chunk_map directly instead of
+                // sending an RCL over the network. Without this, the chunk_map retains the
+                // old chunk_id forever (no self-RCL), and handle_put_file_metadata's
+                // "prefer chunk_map" merge logic later writes the stale id to sled —
+                // causing EIO on cold reads after a client restart.
                 if new_chunk_id != chunk_id {
+                    let location = ChunkLocation {
+                        chunk_id: new_chunk_id,
+                        nodes: vec![self.cluster.local_node_id()],
+                        size: final_size,
+                        checksum: new_chunk_id.hash,
+                        file_offset: Some(chunk_file_offset),
+                        written_at: Some(patch_ts),
+                    };
                     if let Some(leader_addr) = self.cluster.get_leader_addr().await {
                         if leader_addr != self.cluster.local_addr() {
-                            let location = ChunkLocation {
-                                chunk_id: new_chunk_id,
-                                nodes: vec![self.cluster.local_node_id()],
-                                size: final_size,
-                                checksum: new_chunk_id.hash,
-                                file_offset: Some(chunk_file_offset),
-                                written_at: Some(patch_ts),
-                            };
                             let req = Request::ReplicateChunkLocation { location, file_id };
                             let client = self.client.clone();
                             tokio::spawn(async move {
@@ -4107,6 +4113,10 @@ impl Server {
                                     warn!("MultiPatch: failed to notify leader {} of new chunk {}: {}", leader_addr, new_chunk_id, e);
                                 }
                             });
+                        } else {
+                            // We ARE the leader — update chunk_map directly, then sled.
+                            // Reuse handle_replicate_chunk_location's merge + sled logic.
+                            self.handle_replicate_chunk_location(location, file_id).await;
                         }
                     }
                 }

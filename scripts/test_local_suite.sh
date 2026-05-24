@@ -1711,6 +1711,114 @@ PYEOF
 rm -f "$T27_IMG" "$T/t27_base.bin"
 fi # should_run T27
 
+# ── Test 28: thick-file heavy-patch + restart → stale-metadata EIO regression ──
+#
+# Reproduces the "e2fsck passes warm, fails after restart" bug:
+#   1. Write a thick 200MB file (dd /dev/urandom — not ftruncate, so no gaps)
+#   2. Do 200 random 4KB overwrites spread across all chunks (heavy patch storm)
+#   3. dfs_sync to flush everything and commit metadata
+#   4. Kill and restart the dfs-client (cold cache — metadata fetched from leader)
+#   5. md5sum the file — must match the reference captured before restart
+#      If the leader has stale chunk_ids (pointing to deleted patch intermediates),
+#      reads will EIO and the sum will fail.
+if should_run T28; then
+snapshot_log T28
+echo ""
+echo "=== T28: thick-file heavy-patch + restart stale-metadata regression ==="
+
+T28_FILE="$MOUNT/t28_thick.bin"
+T28_SIZE_MB=200
+T28_PATCH_COUNT=200
+T28_PATCH_SIZE=4096
+CHUNK_SIZE=$(( 4 * 1024 * 1024 ))
+T28_CHUNKS=$(( T28_SIZE_MB / 4 ))  # 50 chunks
+
+# Phase 1: write thick file (dd so every byte is real, no sparse/gap)
+echo "  Writing ${T28_SIZE_MB}MB thick file..."
+dd if=/dev/urandom of="$T/t28_orig.bin" bs=1M count=$T28_SIZE_MB 2>/dev/null
+cp "$T/t28_orig.bin" "$T28_FILE"
+dfs_sync
+
+# Phase 2: 200 random 4KB patches spread across all chunks
+echo "  Applying $T28_PATCH_COUNT random 4KB patches..."
+dd if=/dev/urandom of="$T/t28_patch.bin" bs=$T28_PATCH_SIZE count=1 2>/dev/null
+
+# Build reference: apply same patches to local copy so we know expected content.
+python3 - "$T/t28_orig.bin" "$T28_FILE" "$T/t28_patch.bin" \
+         "$T28_PATCH_COUNT" "$T28_CHUNKS" "$CHUNK_SIZE" "$T28_PATCH_SIZE" \
+         "$T/t28_expected.bin" <<'T28PY'
+import sys, os, random
+orig_path, dfs_path, patch_path, n_patches, n_chunks, chunk_size, patch_size, out_path = sys.argv[1:]
+n_patches = int(n_patches); n_chunks = int(n_chunks)
+chunk_size = int(chunk_size); patch_size = int(patch_size)
+
+patch_data = open(patch_path, 'rb').read()
+reference = bytearray(open(orig_path, 'rb').read())
+
+random.seed(42)
+offsets = []
+for _ in range(n_patches):
+    chunk = random.randrange(n_chunks)
+    max_intra = chunk_size - patch_size
+    intra = (random.randrange(max_intra // 4096)) * 4096
+    off = chunk * chunk_size + intra
+    offsets.append(off)
+
+# Apply to DFS
+fd = os.open(dfs_path, os.O_WRONLY)
+for off in offsets:
+    os.lseek(fd, off, os.SEEK_SET)
+    os.write(fd, patch_data)
+os.close(fd)
+
+# Apply same offsets to local reference
+for off in offsets:
+    reference[off:off+patch_size] = patch_data
+
+open(out_path, 'wb').write(reference)
+print("patches applied")
+T28PY
+
+dfs_sync
+echo "  Flush complete. Computing reference md5..."
+T28_REF_MD5=$(md5sum "$T/t28_expected.bin" | awk '{print $1}')
+echo "  Reference md5: $T28_REF_MD5"
+
+# Phase 3: restart the client (cold cache — all metadata fetched from leader)
+echo "  Restarting dfs-client (cold cache)..."
+fusermount -u "$MOUNT" 2>/dev/null || true
+sleep 0.3
+kill $CLIENT_PID2 2>/dev/null || true
+sleep 1
+T28_CLIENT_LOG="$LOG/client_t28.log"
+: > "$T28_CLIENT_LOG"
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$T28_CLIENT_LOG" --allow-other --log-level debug &
+CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$T28_CLIENT_LOG"
+sleep 2
+mountpoint -q "$MOUNT" || { check "T28 remount" FAIL; }
+
+# Phase 4: verify data integrity with cold cache (reads go to DFS, no local state)
+echo "  Verifying data integrity after cold restart..."
+T28_GOT_MD5=$(md5sum "$MOUNT/t28_thick.bin" 2>/dev/null | awk '{print $1}')
+
+[ "$T28_GOT_MD5" = "$T28_REF_MD5" ] \
+    && check "T28a thick-file data intact after patch storm + restart (md5 match)" PASS \
+    || check "T28a thick-file data corrupt after restart (want $T28_REF_MD5 got $T28_GOT_MD5)" FAIL
+
+# Check for EIO errors in the cold-read log — they indicate stale metadata routing failures.
+# grep -c returns exit 1 (no match) even when count is 0, so use grep -c ... || true.
+T28_EIO=$(grep -c "EIO\|Input/output error\|chunk not found\|No such file\|file_not_found" \
+    "$T28_CLIENT_LOG" 2>/dev/null || true)
+T28_EIO=${T28_EIO:-0}
+[ "${T28_EIO:-0}" -eq 0 ] \
+    && check "T28b no EIO/chunk-not-found errors during cold read" PASS \
+    || check "T28b EIO or chunk-not-found errors during cold read ($T28_EIO lines)" FAIL
+
+rm -f "$T28_FILE" "$T/t28_orig.bin" "$T/t28_expected.bin" "$T/t28_patch.bin"
+fi # should_run T28
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

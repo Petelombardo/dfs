@@ -1896,6 +1896,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     tokio::spawn(async move {
                         // Try primary then fallbacks.
                         let mut last_err = None;
+                        let mut all_not_found = true;
                         for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
                             match client.read_chunk_range_from_server(
                                 addr, cid, offset_in_chunk as u64, len_in_chunk as u64, ws,
@@ -1905,37 +1906,101 @@ leader_addr: Arc::new(RwLock::new(None)),
                                           cid, offset_in_chunk, len_in_chunk, data.len());
                                     return Ok((idx, chunk_start, offset_in_chunk, data));
                                 }
-                                Err(e) => { last_err = Some(e); }
+                                Err(e) => {
+                                    let msg = e.to_string();
+                                    if !msg.contains("Failed to open chunk file")
+                                        && !msg.contains("Failed to read chunk range")
+                                    {
+                                        all_not_found = false;
+                                    }
+                                    last_err = Some(e);
+                                }
                             }
                         }
-                        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no replicas")))
+                        if all_not_found && last_err.is_some() {
+                            Err(anyhow::anyhow!(
+                                "Range chunk {} missing on all replicas — metadata may be stale", cid
+                            ))
+                        } else {
+                            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no replicas")))
+                        }
                     })
                 }).collect();
 
                 let fetch_results = futures::future::join_all(tasks).await;
-                for res in fetch_results {
-                    let (idx, chunk_start, offset_in_chunk, data) = res
-                        .context("Range fetch task panicked")
-                        .and_then(|r| r)?;
-                    let arc = Arc::new(data);
-                    // Cache the fetched slice so re-reads of the same offset are instant.
-                    // Key on chunk_start so the entry covers this chunk regardless of which
-                    // byte within it was requested.
-                    {
-                        // Key on read_start (the exact file byte offset of the first byte
-                        // in arc) so cache lookup at the same offset hits directly.
-                        let cache_key = ByteRangeCacheKey {
-                            inode,
-                            file_offset: (chunk_start + offset_in_chunk) as u64,
-                        };
-                        let cached_entry = CachedChunk {
-                            data: Arc::clone(&arc),
-                            chunk_size: arc.len(),
-                            cached_at: std::time::Instant::now(),
-                        };
-                        self.byte_range_cache.lock().await.put(cache_key, cached_entry);
+
+                // Collect results; queue stale-metadata failures for one metadata-refresh retry.
+                let mut stale_range_retries: Vec<(usize, usize, usize, usize)> = Vec::new(); // (idx, chunk_start, offset_in_chunk, len_in_chunk)
+                for (rf, res) in range_fetches.iter().zip(fetch_results) {
+                    match res.context("Range fetch task panicked").and_then(|r| r) {
+                        Ok((idx, chunk_start, offset_in_chunk, data)) => {
+                            let arc = Arc::new(data);
+                            {
+                                let cache_key = ByteRangeCacheKey {
+                                    inode,
+                                    file_offset: (chunk_start + offset_in_chunk) as u64,
+                                };
+                                let cached_entry = CachedChunk {
+                                    data: Arc::clone(&arc),
+                                    chunk_size: arc.len(),
+                                    cached_at: std::time::Instant::now(),
+                                };
+                                self.byte_range_cache.lock().await.put(cache_key, cached_entry);
+                            }
+                            result_chunks.push((idx, arc));
+                        }
+                        Err(e) if e.to_string().contains("metadata may be stale") => {
+                            warn!("Range chunk {} missing on all replicas — will refresh metadata and retry", rf.cid);
+                            stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk));
+                        }
+                        Err(e) => return Err(e),
                     }
-                    result_chunks.push((idx, arc));
+                }
+
+                // Retry stale-metadata range chunks with a fresh chunk_map from the leader.
+                if !stale_range_retries.is_empty() {
+                    use std::sync::atomic::Ordering;
+                    engine.refresh_in_progress.store(false, Ordering::Release);
+                    self.refresh_engine(&engine, file_id, file_size, 0).await;
+                    let snap = engine.snapshot();
+                    let fresh_map = snap.0;
+                    let fresh_nim = snap.2;
+                    let fresh_nodes = self.cluster_nodes.read().await.clone();
+                    for (idx, chunk_start, offset_in_chunk, len_in_chunk) in stale_range_retries {
+                        if let Some(fresh_loc) = fresh_map.get(idx) {
+                            let fresh_cid = fresh_loc.chunk_id;
+                            let (fp, ffb) = match InodeReadEngine::resolve_primary(
+                                fresh_loc, &fresh_nim, &fresh_nodes, selector + idx as u64,
+                            ) {
+                                Some(pf) => pf,
+                                None => {
+                                    let p = fresh_nodes[selector as usize % fresh_nodes.len()];
+                                    (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
+                                }
+                            };
+                            let data = self.read_chunk_range_from_server(
+                                fp, fresh_cid, offset_in_chunk as u64, len_in_chunk as u64, None,
+                            ).await.with_context(|| format!(
+                                "Failed to fetch range for chunk {} after metadata refresh", fresh_cid
+                            ))?;
+                            let arc = Arc::new(data);
+                            {
+                                let cache_key = ByteRangeCacheKey {
+                                    inode,
+                                    file_offset: (chunk_start + offset_in_chunk) as u64,
+                                };
+                                let cached_entry = CachedChunk {
+                                    data: Arc::clone(&arc),
+                                    chunk_size: arc.len(),
+                                    cached_at: std::time::Instant::now(),
+                                };
+                                self.byte_range_cache.lock().await.put(cache_key, cached_entry);
+                            }
+                            result_chunks.push((idx, arc));
+                        } else {
+                            anyhow::bail!("Chunk at index {} missing from fresh metadata", idx);
+                        }
+                    }
                 }
             }
 
@@ -2130,18 +2195,69 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Collect results; cache full chunks; remove from in-flight.
             // Always remove from in_flight before propagating errors — a leaked entry
             // causes every subsequent read for that chunk to wait 1s for a timeout.
+            let mut stale_retries: Vec<(usize, ChunkId)> = Vec::new();
             for (idx, cid, res) in fetch_results {
                 engine.in_flight.remove(&cid);
                 // Wake any waiter regardless of success — a failure also unblocks
                 // the waiter (which falls back to fetching directly).
                 self.chunk_landed.notify_waiters();
-                let data = res.with_context(|| format!("Failed to fetch chunk {}", cid))?;
-                let arc = Arc::new(data);
-                if !bypass_cache {
-                    self.chunk_cache.insert(cid, Arc::clone(&arc)).await;
-                    self.chunk_landed.notify_waiters();
+                match res {
+                    Ok(data) => {
+                        let arc = Arc::new(data);
+                        if !bypass_cache {
+                            self.chunk_cache.insert(cid, Arc::clone(&arc)).await;
+                            self.chunk_landed.notify_waiters();
+                        }
+                        result_chunks.push((idx, arc));
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("metadata may be stale") {
+                            // All listed replicas said "not found" — the metadata is stale
+                            // (chunk was patched and replaced since we last fetched the map).
+                            // Queue for one fresh-metadata retry rather than surfacing EIO.
+                            warn!("Chunk {} missing on all replicas — will refresh metadata and retry", cid);
+                            stale_retries.push((idx, cid));
+                        } else {
+                            return Err(e).with_context(|| format!("Failed to fetch chunk {}", cid));
+                        }
+                    }
                 }
-                result_chunks.push((idx, arc));
+            }
+
+            // Retry any stale-metadata chunks with a fresh chunk_map from the leader.
+            if !stale_retries.is_empty() {
+                use std::sync::atomic::Ordering;
+                engine.refresh_in_progress.store(false, Ordering::Release);
+                self.refresh_engine(&engine, file_id, file_size, 0).await;
+                let snap = engine.snapshot();
+                let fresh_map = snap.0;
+                let fresh_nim = snap.2;
+                let fresh_nodes = self.cluster_nodes.read().await.clone();
+                for (idx, _stale_cid) in stale_retries {
+                    if let Some(fresh_loc) = fresh_map.get(idx) {
+                        let fresh_cid = fresh_loc.chunk_id;
+                        let (fp, ffb) = match InodeReadEngine::resolve_primary(
+                            fresh_loc, &fresh_nim, &fresh_nodes, selector + idx as u64,
+                        ) {
+                            Some(pf) => pf,
+                            None => {
+                                let p = fresh_nodes[selector as usize % fresh_nodes.len()];
+                                (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
+                            }
+                        };
+                        let data = self.fetch_chunk_with_fallback(fresh_cid, fp, &ffb, None).await
+                            .with_context(|| format!("Failed to fetch chunk {} after metadata refresh", fresh_cid))?;
+                        let arc = Arc::new(data);
+                        if !bypass_cache {
+                            self.chunk_cache.insert(fresh_cid, Arc::clone(&arc)).await;
+                            self.chunk_landed.notify_waiters();
+                        }
+                        result_chunks.push((idx, arc));
+                    } else {
+                        anyhow::bail!("Chunk at index {} missing from fresh metadata", idx);
+                    }
+                }
             }
         }
 
@@ -2294,6 +2410,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         fallbacks: &[SocketAddr],
         client_write_seq: Option<u64>,
     ) -> Result<Vec<u8>> {
+        let mut all_not_found = true;
         for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
             match self.read_chunk_from_server(addr, cid, client_write_seq).await {
                 Ok(d) => {
@@ -2308,6 +2425,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // Only count actual connectivity failures against node health so we don't
                     // penalise a healthy node and skew future routing decisions.
                     if !msg.contains("not found on this node") {
+                        all_not_found = false;
                         self.node_health.record_failure(addr).await;
                     }
                     if msg.contains("permanently missing") || msg.contains("location not found") {
@@ -2317,7 +2435,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
             }
         }
-        anyhow::bail!("All replicas failed for chunk {}", cid)
+        // Distinguish "chunk missing everywhere" (stale metadata) from connectivity failures
+        // so callers can refresh metadata and retry instead of surfacing EIO immediately.
+        if all_not_found {
+            anyhow::bail!("Chunk {} missing on all replicas — metadata may be stale", cid)
+        } else {
+            anyhow::bail!("All replicas failed for chunk {}", cid)
+        }
     }
 
     /// Poll chunk_cache for up to 1s waiting for a concurrent fetch to complete.

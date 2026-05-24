@@ -734,6 +734,7 @@ impl HealingManager {
                     checksum: location.checksum,
                     file_offset: location.file_offset,
                     written_at: location.written_at,
+                    client_write_seq: None,
                 };
                 if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
                     warn!("Failed to prune removed nodes from chunk {} metadata: {}", chunk_id, e);
@@ -769,6 +770,7 @@ impl HealingManager {
                         checksum: location.checksum,
                         file_offset: location.file_offset,
                         written_at: location.written_at,
+                        client_write_seq: None,
                     };
                     if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
                         warn!("Failed to prune ghost nodes from chunk {} metadata: {}", chunk_id, e);
@@ -863,6 +865,7 @@ impl HealingManager {
                     checksum: location.checksum,
                     file_offset: location.file_offset,
                     written_at: location.written_at,
+                    client_write_seq: None,
                 };
                 if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
                     warn!("Failed to reconcile chunk {} routing table: {}", chunk_id, e);
@@ -1387,6 +1390,7 @@ impl HealingManager {
                 checksum: location.checksum,
                 file_offset: location.file_offset,
                 written_at: location.written_at,
+                client_write_seq: None,
             };
 
             if let Err(e) = metadata.put_chunk_location(&updated_location) {
@@ -1493,6 +1497,7 @@ impl HealingManager {
             checksum: location.checksum,
             file_offset: location.file_offset,
             written_at: location.written_at,
+            client_write_seq: None,
         };
 
         if let Err(e) = metadata.put_chunk_location(&updated_location) {

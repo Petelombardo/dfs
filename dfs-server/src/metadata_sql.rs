@@ -208,6 +208,7 @@ impl SqlMetadataStore {
                 checksum,
                 file_offset: file_offset.map(|o| o as u64),
                 written_at: None,
+                client_write_seq: None,
             });
         }
 
@@ -285,6 +286,7 @@ impl SqlMetadataStore {
                 checksum,
                 file_offset: file_offset.map(|o| o as u64),
                 written_at: None,
+                client_write_seq: None,
             }))
         } else {
             Ok(None)
@@ -383,6 +385,7 @@ mod tests {
             checksum: [2u8; 32],
             file_offset: Some(0),
             written_at: None,
+            client_write_seq: None,
         });
 
         // Store and retrieve
@@ -412,6 +415,7 @@ mod tests {
             checksum: [0u8; 32],
             file_offset: Some(0),
             written_at: None,
+            client_write_seq: None,
         });
 
         // Gap: bytes 4096-8191 (no chunk = hole)
@@ -423,6 +427,7 @@ mod tests {
             checksum: [0u8; 32],
             file_offset: Some(8192),
             written_at: None,
+            client_write_seq: None,
         });
 
         store.put_file_metadata(&metadata).unwrap();

@@ -307,10 +307,10 @@ impl Server {
     /// Called exclusively from handle_replicate_chunk_location — a client-sent message
     /// reporting the live result of a just-completed MultiPatch.
     ///
-    /// The written_at guard on the file_offset path is required: a late-arriving retry of
-    /// an earlier ReplicateChunkLocation (e.g. first attempt failed, retry fires after a
-    /// newer patch already committed) must not overwrite the newer result. Fresh writes
-    /// use written_at=None (=0) so any server-timestamped patch always wins (T>0 >= 0).
+    /// Ordering for the file_offset path: prefer client_write_seq (monotone counter from
+    /// the client, clock-agnostic) when available; fall back to written_at (server-side
+    /// timestamp) for legacy records that predate the client_write_seq field.
+    /// Fresh writes carry client_write_seq=None so any patch (seq > 0) always wins.
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -331,20 +331,28 @@ impl Server {
         }
         // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
         // Guard: reject if incoming is older than what we already have.
+        // Prefer client_write_seq (clock-agnostic monotone counter) over written_at.
         if let Some(file_offset) = location.file_offset {
             for loc in locs.iter_mut() {
                 if loc.file_offset == Some(file_offset) {
-                    let incoming_ts = location.written_at.unwrap_or(0);
-                    let existing_ts = loc.written_at.unwrap_or(0);
-                    if incoming_ts >= existing_ts {
+                    let should_update = match (location.client_write_seq, loc.client_write_seq) {
+                        (Some(inc), Some(ext)) => inc >= ext,
+                        (Some(_), None)        => true,  // incoming has seq, existing is legacy → accept
+                        (None, Some(_))        => false, // existing has seq, incoming is legacy → keep
+                        (None, None)           => {
+                            // Legacy path: both records predate client_write_seq → use written_at
+                            location.written_at.unwrap_or(0) >= loc.written_at.unwrap_or(0)
+                        }
+                    };
+                    if should_update {
                         // Ghost diagnostic: warn if we're replacing an existing file
                         // with a chunk_id that doesn't exist here (RCL for other-node chunk).
                         let new_path = self.storage.get_chunk_path(&location.chunk_id);
                         let old_path = self.storage.get_chunk_path(&loc.chunk_id);
                         if !new_path.exists() && old_path.exists() {
-                            warn!("[GHOST-reversion] RCL: file={:?} offset={:?} OLD={} (exists=true ts={:?}) → NEW={} (exists=false ts={:?})",
-                                file_id, location.file_offset, loc.chunk_id, loc.written_at,
-                                location.chunk_id, location.written_at);
+                            warn!("[GHOST-reversion] RCL: file={:?} offset={:?} OLD={} (exists=true seq={:?}) → NEW={} (exists=false seq={:?})",
+                                file_id, location.file_offset, loc.chunk_id, loc.client_write_seq,
+                                location.chunk_id, location.client_write_seq);
                         }
                         *loc = location.clone();
                     }
@@ -1141,8 +1149,8 @@ impl Server {
             Request::PatchChunk { chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data } => {
                 self.handle_patch_chunk(chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data).await
             }
-            Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id } => {
-                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id).await
+            Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq } => {
+                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq).await
             }
             Request::DeleteFile { path } => self.handle_delete_file(path).await,
             Request::RenameFile { old_path, new_path } => {
@@ -1686,6 +1694,7 @@ impl Server {
                     checksum: location.checksum,
                     file_offset: location.file_offset.or(existing.file_offset),
                     written_at: existing.written_at.or(location.written_at),
+                    client_write_seq: None,
                 }
             }
             Ok(None) => {
@@ -1731,10 +1740,27 @@ impl Server {
                     if let Ok(Some(mut file_meta)) = self.metadata.get_file(&fid) {
                         let mut updated = false;
                         for loc in file_meta.chunk_locations.iter_mut() {
-                            if loc.chunk_id == merged_location.chunk_id ||
-                               loc.file_offset == merged_location.file_offset {
+                            if loc.chunk_id == merged_location.chunk_id {
+                                // Same chunk_id: pure node-list merge — ordering doesn't apply.
                                 *loc = merged_location.clone();
                                 updated = true;
+                                break;
+                            } else if loc.file_offset == merged_location.file_offset {
+                                // Different chunk_id at same offset: guard against stale RCL
+                                // arriving after a newer patch already updated the sled.
+                                let should_update = match (merged_location.client_write_seq, loc.client_write_seq) {
+                                    (Some(inc), Some(ext)) => inc >= ext,
+                                    (Some(_), None)        => true,
+                                    (None, Some(_))        => false,
+                                    (None, None)           => true, // no ordering info — accept (existing behavior)
+                                };
+                                if should_update {
+                                    *loc = merged_location.clone();
+                                    updated = true;
+                                } else {
+                                    debug!("RCL sled update skipped: stale client_write_seq {:?} < existing {:?} for file {:?} offset {:?}",
+                                        merged_location.client_write_seq, loc.client_write_seq, fid, loc.file_offset);
+                                }
                                 break;
                             }
                         }
@@ -1899,6 +1925,7 @@ impl Server {
                 checksum: location.checksum,
                 file_offset: location.file_offset.or_else(|| existing.as_ref().and_then(|e| e.file_offset)),
                 written_at: location.written_at.or_else(|| existing.as_ref().and_then(|e| e.written_at)),
+                client_write_seq: None,
             };
             if let Err(e) = self.metadata.put_chunk_location(&merged) {
                 warn!("Failed to replicate chunk location {}: {}", location.chunk_id, e);
@@ -2246,6 +2273,7 @@ impl Server {
                     checksum: chunk_id.hash,
                     file_offset: None,  // Server-side replication doesn't track file offsets
                     written_at: None,
+                    client_write_seq: None,
                 };
 
                 let metadata_start = std::time::Instant::now();
@@ -2353,6 +2381,7 @@ impl Server {
                     checksum: chunk_id.hash,
                     file_offset: None,  // Server-side local-only writes don't track file offsets
                     written_at: None,
+                    client_write_seq: None,
                 };
 
                 metadata.put_chunk_location(&location)
@@ -2414,6 +2443,7 @@ impl Server {
                     checksum: chunk_id.hash,
                     file_offset: None,
                     written_at: None,
+                    client_write_seq: None,
                 };
 
                 metadata.put_chunk_location(&location)
@@ -2565,6 +2595,7 @@ impl Server {
                 checksum: chunk_id.hash,
                 file_offset: None,  // Legacy fallback when metadata not found
                 written_at: None,
+                client_write_seq: None,
             })
         }
     }
@@ -3542,6 +3573,7 @@ impl Server {
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
                 written_at: None,
+                client_write_seq: None,
             };
 
             // Persist chunk location locally
@@ -3795,6 +3827,7 @@ impl Server {
                         checksum: new_chunk_id.hash,
                         file_offset: old_loc.file_offset,
                         written_at: Some(now_secs),
+                        client_write_seq: None,
                     };
                     if let Err(e) = metadata.put_chunk_location(&new_loc) {
                         warn!("PatchChunk: failed to pre-register {} in sled: {}", new_chunk_id, e);
@@ -3860,6 +3893,7 @@ impl Server {
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
         _expected_new_chunk_id: Option<dfs_common::ChunkId>,
+        client_write_seq: Option<u64>,
     ) -> Response {
         use std::fs;
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -4004,6 +4038,7 @@ impl Server {
                         checksum: new_chunk_id.hash,
                         file_offset: old_loc.file_offset,
                         written_at: Some(now_secs),
+                        client_write_seq: None,
                     };
                     if let Err(e) = metadata.put_chunk_location(&new_loc) {
                         warn!("MultiPatch: failed to pre-register {} in sled: {}", new_chunk_id, e);
@@ -4103,6 +4138,7 @@ impl Server {
                         checksum: new_chunk_id.hash,
                         file_offset: Some(chunk_file_offset),
                         written_at: Some(patch_ts),
+                        client_write_seq,
                     };
                     if let Some(leader_addr) = self.cluster.get_leader_addr().await {
                         if leader_addr != self.cluster.local_addr() {

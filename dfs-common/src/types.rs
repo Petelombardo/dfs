@@ -308,6 +308,13 @@ pub struct ChunkLocation {
     /// the corresponding put_file_metadata has committed.
     /// None for records written before this field was added (treated as old).
     pub written_at: Option<u64>,
+
+    /// Client's monotone write_seq at the time this chunk was patched.
+    /// Carried through MultiPatch → RCL so the leader can order concurrent patch
+    /// notifications from the same file without relying on wall-clock time.
+    /// Higher value = newer patch. None for fresh writes and legacy records.
+    #[serde(default)]
+    pub client_write_seq: Option<u64>,
 }
 
 impl ChunkLocation {

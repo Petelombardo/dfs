@@ -337,6 +337,11 @@ pub enum Request {
         /// patch bytes; only the hash verification read is skipped.
         #[serde(default)]
         expected_new_chunk_id: Option<ChunkId>,
+        /// Client's current write_seq for this file. Carried through to RCL so the
+        /// leader can order concurrent patch notifications using a monotone client-side
+        /// counter instead of wall-clock timestamps (which are unreliable across nodes).
+        #[serde(default)]
+        client_write_seq: Option<u64>,
     },
 
     // Admin requests

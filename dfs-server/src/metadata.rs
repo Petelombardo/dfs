@@ -196,19 +196,52 @@ impl MetadataStore {
                         return Ok(PutFileResult::Stale(existing));
                     }
 
-                    // Merge chunk nodes: preserve any replica nodes from the existing record
-                    // that the incoming record doesn't know about yet.
-                    let existing_nodes: std::collections::HashMap<ChunkId, Vec<NodeId>> =
+                    // Merge chunk locations: two rules applied per chunk in the incoming record.
+                    //
+                    // Rule 1 (same chunk_id): merge node lists — preserve any replica nodes
+                    // the existing record has that the incoming doesn't know about yet.
+                    //
+                    // Rule 2 (different chunk_id, same file_offset): a patched chunk. Use
+                    // client_write_seq (monotone, clock-agnostic) to decide which version is
+                    // newer; fall back to written_at for legacy records that predate it.
+                    // If the existing sled entry is newer, keep it — the incoming is an
+                    // out-of-order stale write from an earlier patch. This prevents the sled
+                    // worker from reverting a chunk to an intermediate hash when two RCL sled
+                    // writes race.
+                    let existing_by_id: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
                         existing.chunk_locations.iter()
-                            .map(|loc| (loc.chunk_id, loc.nodes.clone()))
+                            .map(|loc| (loc.chunk_id, loc))
+                            .collect();
+                    let existing_by_offset: std::collections::HashMap<u64, &dfs_common::ChunkLocation> =
+                        existing.chunk_locations.iter()
+                            .filter_map(|loc| loc.file_offset.map(|o| (o, loc)))
                             .collect();
 
                     let mut cloned = metadata.clone();
                     for loc in &mut cloned.chunk_locations {
-                        if let Some(known_nodes) = existing_nodes.get(&loc.chunk_id) {
-                            for node in known_nodes {
+                        if let Some(existing_loc) = existing_by_id.get(&loc.chunk_id) {
+                            // Rule 1: same chunk_id — merge node lists.
+                            for node in &existing_loc.nodes {
                                 if !loc.nodes.contains(node) {
                                     loc.nodes.push(*node);
+                                }
+                            }
+                        } else if let Some(file_offset) = loc.file_offset {
+                            // Rule 2: different chunk_id at same offset — keep the newer one.
+                            if let Some(existing_loc) = existing_by_offset.get(&file_offset) {
+                                let keep_existing = match (loc.client_write_seq, existing_loc.client_write_seq) {
+                                    (Some(inc), Some(ext)) => ext > inc,
+                                    (Some(_), None)        => false, // incoming has seq, existing is legacy → incoming wins
+                                    (None, Some(_))        => true,  // existing has seq, incoming is legacy → keep existing
+                                    (None, None)           => {
+                                        // Legacy fallback: use written_at
+                                        existing_loc.written_at.unwrap_or(0) > loc.written_at.unwrap_or(0)
+                                    }
+                                };
+                                if keep_existing {
+                                    // Existing sled state is newer — incoming is a stale
+                                    // intermediate patch arriving out of order. Keep existing.
+                                    *loc = (*existing_loc).clone();
                                 }
                             }
                         }

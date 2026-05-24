@@ -4420,6 +4420,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
                 written_at: None, // fresh writes use None — see build_chunk_locations_from_ids
+                client_write_seq: None,
             };
 
             chunk_locations.push(location);
@@ -4935,6 +4936,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         checksum: corrected_id.hash,
                         file_offset: current_location.file_offset,
                         written_at: None,
+                        client_write_seq: None,
                     };
                     continue;
                 }
@@ -4962,6 +4964,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             checksum: new_chunk_id.hash,
             file_offset: current_location.file_offset,
             written_at: Some(patch_written_at),
+            client_write_seq: None,
         };
         let leader_addr = *self.leader_addr.read().await;
         // Send ReplicateChunkLocation only to the leader — same rationale as MultiPatch path.
@@ -5189,6 +5192,10 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
 
+        // Capture the current write_seq for this file so the leader can use it to order
+        // concurrent RCL notifications from the same file without relying on wall clocks.
+        let patch_client_write_seq = file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e));
+
         // Split-frame MultiPatch: when total patch data is large enough that bincode
         // serialization overhead matters (>= 32KB), serialize the envelope once with
         // empty patch data as a signal, then send raw patch bytes separately.
@@ -5209,6 +5216,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 chunk_file_offset,
                 patches: empty_patches,
                 expected_new_chunk_id,
+                client_write_seq: patch_client_write_seq,
             };
             let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
             let envelope = MessageEnvelope::new(request_id, Message::Request(patch_req_split));
@@ -5241,6 +5249,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 chunk_file_offset,
                 patches: patches.clone(),
                 expected_new_chunk_id,
+                client_write_seq: patch_client_write_seq,
             };
             let futures: Vec<_> = patch_addrs.iter().map(|&addr| {
                 let client = self.clone();
@@ -5283,6 +5292,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             checksum: current_chunk_id.hash,
                             file_offset: current_location.file_offset,
                             written_at: None,
+                            client_write_seq: None,
                         }));
                     }
                     replica_results.push((addr, Err(anyhow::anyhow!("chunk stale"))));
@@ -5383,6 +5393,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             checksum: new_chunk_id.hash,
             file_offset: old_location.file_offset,
             written_at: Some(now_secs),
+            client_write_seq: None,
         };
 
         // Send ReplicateChunkLocation ONLY to the leader.
@@ -5456,6 +5467,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
                 written_at: None,
+                client_write_seq: None,
             });
             current_offset += size;
         }

@@ -200,6 +200,7 @@ impl InodeReadEngine {
                 checksum: [0u8; 32],
                 file_offset: None,
                 written_at: None,
+                client_write_seq: None,
             });
         }
 

@@ -213,7 +213,20 @@ impl InodeReadEngine {
                 from
             };
             if idx < new_map.len() {
-                new_map[idx] = loc;
+                // Guard: only overwrite if the incoming data is at least as new as what
+                // the engine already has. After a local patch, the engine's client_write_seq
+                // for that chunk is >= what the server's sled knows (RCL is async). Without
+                // this guard, every merge after an unrelated flush overwrites the engine's
+                // correct local hash with the server's slightly-stale one.
+                let should_update = match (loc.client_write_seq, new_map[idx].client_write_seq) {
+                    (Some(inc), Some(ext)) => inc >= ext,
+                    (Some(_), None)        => true,
+                    (None, Some(_))        => false,
+                    (None, None)           => true,
+                };
+                if should_update {
+                    new_map[idx] = loc;
+                }
             }
         }
         while new_map.last().map(|l| l.chunk_id.hash == [0u8; 32]).unwrap_or(false) {

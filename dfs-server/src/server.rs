@@ -345,16 +345,12 @@ impl Server {
                         }
                     };
                     if should_update {
-                        // Ghost diagnostic: warn if we're replacing an existing file
-                        // with a chunk_id that doesn't exist here (RCL for other-node chunk).
-                        let new_path = self.storage.get_chunk_path(&location.chunk_id);
-                        let old_path = self.storage.get_chunk_path(&loc.chunk_id);
-                        if !new_path.exists() && old_path.exists() {
-                            warn!("[GHOST-reversion] RCL: file={:?} offset={:?} OLD={} (exists=true seq={:?}) → NEW={} (exists=false seq={:?})",
-                                file_id, location.file_offset, loc.chunk_id, loc.client_write_seq,
-                                location.chunk_id, location.client_write_seq);
-                        }
                         *loc = location.clone();
+                    } else {
+                        // Stale RCL rejected: log so we can confirm the guard is working.
+                        debug!("[RCL-stale-rejected] file={:?} offset={:?} kept={} (seq={:?}) dropped={} (seq={:?})",
+                            file_id, location.file_offset, loc.chunk_id, loc.client_write_seq,
+                            location.chunk_id, location.client_write_seq);
                     }
                     return;
                 }

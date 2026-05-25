@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use blake3;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use dfs_common::{ChunkId, ChunkLocation, ErrorCode, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
 use lru::LruCache;
 use moka::future::Cache as MokaCache;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::read_engine::{InodeReadEngine, ReadEngineMap};
 
@@ -279,6 +279,12 @@ pub struct MetadataQueue {
     notify: Notify,
     /// How long the oldest async item may sit before new pushes block.
     max_age: Duration,
+    /// File IDs for which all future metadata writes are permanently blocked.
+    /// Populated by cancel() when a file is deleted. Prevents a race where the
+    /// release task's chunk write completes after the delete and tries to enqueue
+    /// a stale metadata update — resurrecting the file on the server.
+    /// Each FileId is a UUID: never reused, so no false-positive blocking.
+    deleted_ids: DashSet<FileId>,
 }
 
 struct MetadataEntry {
@@ -295,6 +301,7 @@ impl MetadataQueue {
             index: Mutex::new(HashMap::new()),
             notify: Notify::new(),
             max_age: Duration::from_secs(24),
+            deleted_ids: DashSet::new(),
         })
     }
 
@@ -343,6 +350,16 @@ impl MetadataQueue {
         metadata: FileMetadata,
         done_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) {
+        // Block metadata writes for deleted files. cancel() adds the file_id here to
+        // prevent a race where the release task's chunk write completes after the unlink
+        // delete and enqueues stale metadata — resurrecting the file on the server.
+        if self.deleted_ids.contains(&metadata.id) {
+            debug!("[META QUEUE] blocked: file {} ({}) is deleted, skipping enqueue",
+                   metadata.id, metadata.path);
+            // Signal any done_tx waiter so the release path doesn't hang.
+            if let Some(tx) = done_tx { let _ = tx.send(()); }
+            return;
+        }
         let op = if done_tx.is_some() { "release" } else { "update" };
         let mut q = self.inner.lock().await;
         let mut idx = self.index.lock().await;
@@ -414,10 +431,14 @@ impl MetadataQueue {
         }
     }
 
-    /// Cancel any pending queue entry for the given file_id.
-    /// Called after a successful delete_file so the queue worker doesn't
-    /// resurrect the file by delivering a stale metadata update.
+    /// Cancel any pending queue entry for the given file_id AND block all future
+    /// enqueues for it. Called when a file is deleted — prevents a race where the
+    /// release task's chunk write completes after the delete and enqueues stale
+    /// metadata, resurrecting the file on the server.
     pub async fn cancel(&self, file_id: FileId) {
+        // Mark as deleted first so any concurrent push_inner sees it immediately.
+        self.deleted_ids.insert(file_id);
+
         let mut q = self.inner.lock().await;
         let mut idx = self.index.lock().await;
         if let Some(pos) = idx.remove(&file_id) {
@@ -426,6 +447,8 @@ impl MetadataQueue {
                     "[META QUEUE] cancel id={} path={} seq={} (delete pre-empt)",
                     file_id, removed.metadata.path, removed.metadata.write_seq
                 );
+                // Signal any done_tx waiter so push_and_wait doesn't hang.
+                if let Some(tx) = removed.done_tx { let _ = tx.send(()); }
             }
             // Rebuild index positions after removal.
             for (i, e) in q.iter().enumerate() {
@@ -1789,7 +1812,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let chunk_start = *chunk_start;
                 let chunk_size = *chunk_size;
                 let loc = &chunk_map[idx];
-                let cid = loc.chunk_id;
+                // Prefer the chunk_id confirmed by our own write path over the engine's
+                // FILE_TABLE entry, which may lag behind the meta_queue drain. The client
+                // is authoritative for chunks it has written.
+                let cid = self.recent_chunk_writes
+                    .get(&(inode, idx as u64))
+                    .map(|e| e.0)
+                    .unwrap_or(loc.chunk_id);
 
                 let read_start = offset.max(chunk_start);
                 let read_end = (offset + size).min(chunk_start + chunk_size);
@@ -1950,14 +1979,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                             result_chunks.push((idx, arc));
                         }
                         Err(e) if e.to_string().contains("metadata may be stale") => {
-                            warn!("Range chunk {} missing on all replicas — will refresh metadata and retry", rf.cid);
+                            error!("Range chunk {} missing on all replicas — will refresh metadata and retry", rf.cid);
                             stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk));
                         }
                         Err(e) => return Err(e),
                     }
                 }
 
-                // Retry stale-metadata range chunks with a fresh chunk_map from the leader.
+                // Retry stale-metadata range chunks. Prefer chunk_id from our own write
+                // path (recent_chunk_writes) over the leader's FILE_TABLE, which may lag
+                // behind the meta_queue drain. The client is authoritative for what it wrote.
                 if !stale_range_retries.is_empty() {
                     use std::sync::atomic::Ordering;
                     engine.refresh_in_progress.store(false, Ordering::Release);
@@ -1967,39 +1998,49 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let fresh_nim = snap.2;
                     let fresh_nodes = self.cluster_nodes.read().await.clone();
                     for (idx, chunk_start, offset_in_chunk, len_in_chunk) in stale_range_retries {
-                        if let Some(fresh_loc) = fresh_map.get(idx) {
-                            let fresh_cid = fresh_loc.chunk_id;
-                            let (fp, ffb) = match InodeReadEngine::resolve_primary(
-                                fresh_loc, &fresh_nim, &fresh_nodes, selector + idx as u64,
-                            ) {
-                                Some(pf) => pf,
-                                None => {
-                                    let p = fresh_nodes[selector as usize % fresh_nodes.len()];
-                                    (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
-                                }
-                            };
-                            let data = self.read_chunk_range_from_server(
-                                fp, fresh_cid, offset_in_chunk as u64, len_in_chunk as u64, None,
-                            ).await.with_context(|| format!(
-                                "Failed to fetch range for chunk {} after metadata refresh", fresh_cid
-                            ))?;
-                            let arc = Arc::new(data);
-                            {
-                                let cache_key = ByteRangeCacheKey {
-                                    inode,
-                                    file_offset: (chunk_start + offset_in_chunk) as u64,
-                                };
-                                let cached_entry = CachedChunk {
-                                    data: Arc::clone(&arc),
-                                    chunk_size: arc.len(),
-                                    cached_at: std::time::Instant::now(),
-                                };
-                                self.byte_range_cache.lock().await.put(cache_key, cached_entry);
+                        // recent_chunk_writes holds the last chunk_id confirmed by our write
+                        // path. Prefer it over the leader's FILE_TABLE for this chunk.
+                        let fresh_cid = self.recent_chunk_writes
+                            .get(&(inode, idx as u64))
+                            .map(|e| e.0)
+                            .or_else(|| fresh_map.get(idx).map(|l| l.chunk_id))
+                            .ok_or_else(|| anyhow::anyhow!("Chunk at index {} missing from fresh metadata", idx))?;
+
+                        let (fp, ffb) = match fresh_map.get(idx).and_then(|loc| InodeReadEngine::resolve_primary(
+                            loc, &fresh_nim, &fresh_nodes, selector + idx as u64,
+                        )) {
+                            Some(pf) => pf,
+                            None => {
+                                let p = fresh_nodes[selector as usize % fresh_nodes.len()];
+                                (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
                             }
-                            result_chunks.push((idx, arc));
-                        } else {
-                            anyhow::bail!("Chunk at index {} missing from fresh metadata", idx);
+                        };
+                        // Try primary then all fallbacks with the preferred chunk_id.
+                        let mut retry_data: Option<Vec<u8>> = None;
+                        for &addr in std::iter::once(&fp).chain(ffb.iter()) {
+                            if let Ok(data) = self.read_chunk_range_from_server(
+                                addr, fresh_cid, offset_in_chunk as u64, len_in_chunk as u64, None,
+                            ).await {
+                                retry_data = Some(data);
+                                break;
+                            }
                         }
+                        let data = retry_data.ok_or_else(|| anyhow::anyhow!(
+                            "Failed to fetch range for chunk {} after metadata refresh", fresh_cid
+                        ))?;
+                        let arc = Arc::new(data);
+                        {
+                            let cache_key = ByteRangeCacheKey {
+                                inode,
+                                file_offset: (chunk_start + offset_in_chunk) as u64,
+                            };
+                            self.byte_range_cache.lock().await.put(cache_key, CachedChunk {
+                                data: Arc::clone(&arc),
+                                chunk_size: arc.len(),
+                                cached_at: std::time::Instant::now(),
+                            });
+                        }
+                        result_chunks.push((idx, arc));
                     }
                 }
             }
@@ -2226,38 +2267,131 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
 
             // Retry any stale-metadata chunks with a fresh chunk_map from the leader.
+            //
+            // Strategy (in order of preference):
+            //   1. recent_chunk_writes: session-local record of the last chunk_id and nodes
+            //      we wrote to. Available immediately, no leader needed — covers the common
+            //      case where the chunk was rewritten in this session and the read engine
+            //      hasn't caught up yet, or the leader is briefly down after an election.
+            //   2. Leader chunk_map refresh: for chunks written by other sessions or when
+            //      recent_chunk_writes doesn't have a fresher id. Retried with exponential
+            //      backoff (up to ~7s) so a leader election has time to complete.
             if !stale_retries.is_empty() {
                 use std::sync::atomic::Ordering;
-                engine.refresh_in_progress.store(false, Ordering::Release);
-                self.refresh_engine(&engine, file_id, file_size, 0).await;
-                let snap = engine.snapshot();
-                let fresh_map = snap.0;
-                let fresh_nim = snap.2;
-                let fresh_nodes = self.cluster_nodes.read().await.clone();
-                for (idx, _stale_cid) in stale_retries {
-                    if let Some(fresh_loc) = fresh_map.get(idx) {
-                        let fresh_cid = fresh_loc.chunk_id;
-                        let (fp, ffb) = match InodeReadEngine::resolve_primary(
-                            fresh_loc, &fresh_nim, &fresh_nodes, selector + idx as u64,
-                        ) {
-                            Some(pf) => pf,
-                            None => {
-                                let p = fresh_nodes[selector as usize % fresh_nodes.len()];
-                                (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
+                const STALE_RETRY_DELAYS_MS: &[u64] = &[0, 200, 500, 1000, 2000, 3000];
+                let inode = engine.inode;
+                let mut resolved: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
+                let mut remaining = stale_retries;
+                let mut last_err: Option<anyhow::Error> = None;
+                'stale: for (attempt, &delay_ms) in STALE_RETRY_DELAYS_MS.iter().enumerate() {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    // Always try to refresh from the leader on each attempt.
+                    // This is async and cheap — it gives us updated locations for chunks
+                    // NOT in recent_chunk_writes (other-session writes) and keeps the
+                    // engine up to date after a newly elected leader comes online.
+                    engine.refresh_in_progress.store(false, Ordering::Release);
+                    self.refresh_engine(&engine, file_id, file_size, 0).await;
+                    let snap = engine.snapshot();
+                    let fresh_map = snap.0;
+                    let fresh_nim = snap.2;
+                    let fresh_nodes = self.cluster_nodes.read().await.clone();
+                    let mut still_stale: Vec<(usize, ChunkId)> = Vec::new();
+                    for (idx, stale_cid) in remaining {
+                        // --- Source 1: session-local recent_chunk_writes ---
+                        // If we wrote this chunk in this session we know exactly where it
+                        // is and what its current hash is — no leader round-trip needed.
+                        let local_loc = self.recent_chunk_writes
+                            .get(&(inode, idx as u64))
+                            .filter(|r| {
+                                let (cid, fid, _, _) = r.value();
+                                *fid == file_id && *cid != stale_cid
+                            })
+                            .map(|r| {
+                                let (cid, _, _, nodes) = r.value();
+                                (*cid, nodes.clone())
+                            });
+
+                        if let Some((local_cid, local_nodes)) = local_loc {
+                            let fallbacks: Vec<SocketAddr> = local_nodes.iter()
+                                .filter_map(|nid| fresh_nim.get(nid).copied())
+                                .collect();
+                            let primary = fallbacks.first().copied()
+                                .unwrap_or_else(|| fresh_nodes[selector as usize % fresh_nodes.len()]);
+                            let fallback_rest: Vec<SocketAddr> = fallbacks.iter()
+                                .skip(1).copied().collect();
+                            match self.fetch_chunk_with_fallback(local_cid, primary, &fallback_rest, None).await {
+                                Ok(data) => {
+                                    let arc = Arc::new(data);
+                                    if !bypass_cache {
+                                        self.chunk_cache.insert(local_cid, Arc::clone(&arc)).await;
+                                        self.chunk_landed.notify_waiters();
+                                    }
+                                    resolved.push((idx, arc));
+                                    continue; // chunk resolved — move to next
+                                }
+                                Err(_) => {
+                                    // Local nodes don't have it either; fall through to
+                                    // leader-refresh path below.
+                                }
                             }
-                        };
-                        let data = self.fetch_chunk_with_fallback(fresh_cid, fp, &ffb, None).await
-                            .with_context(|| format!("Failed to fetch chunk {} after metadata refresh", fresh_cid))?;
-                        let arc = Arc::new(data);
-                        if !bypass_cache {
-                            self.chunk_cache.insert(fresh_cid, Arc::clone(&arc)).await;
-                            self.chunk_landed.notify_waiters();
                         }
-                        result_chunks.push((idx, arc));
-                    } else {
-                        anyhow::bail!("Chunk at index {} missing from fresh metadata", idx);
+
+                        // --- Source 2: leader chunk_map refresh ---
+                        if let Some(fresh_loc) = fresh_map.get(idx) {
+                            let fresh_cid = fresh_loc.chunk_id;
+                            // Same chunk_id as the one that failed — leader hasn't
+                            // updated yet; queue for the next backoff round.
+                            if fresh_cid == stale_cid && attempt + 1 < STALE_RETRY_DELAYS_MS.len() {
+                                still_stale.push((idx, stale_cid));
+                                continue;
+                            }
+                            let (fp, ffb) = match InodeReadEngine::resolve_primary(
+                                fresh_loc, &fresh_nim, &fresh_nodes, selector + idx as u64,
+                            ) {
+                                Some(pf) => pf,
+                                None => {
+                                    let p = fresh_nodes[selector as usize % fresh_nodes.len()];
+                                    (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
+                                }
+                            };
+                            match self.fetch_chunk_with_fallback(fresh_cid, fp, &ffb, None).await {
+                                Ok(data) => {
+                                    let arc = Arc::new(data);
+                                    if !bypass_cache {
+                                        self.chunk_cache.insert(fresh_cid, Arc::clone(&arc)).await;
+                                        self.chunk_landed.notify_waiters();
+                                    }
+                                    resolved.push((idx, arc));
+                                }
+                                Err(e) => {
+                                    let msg = e.to_string();
+                                    if msg.contains("metadata may be stale") && attempt + 1 < STALE_RETRY_DELAYS_MS.len() {
+                                        still_stale.push((idx, fresh_cid));
+                                    } else {
+                                        last_err = Some(e);
+                                        break 'stale;
+                                    }
+                                }
+                            }
+                        } else if attempt + 1 < STALE_RETRY_DELAYS_MS.len() {
+                            // Chunk not in leader map yet (election in progress); retry.
+                            still_stale.push((idx, stale_cid));
+                        } else {
+                            last_err = Some(anyhow::anyhow!("Chunk at index {} missing from leader map after {} retries", idx, attempt + 1));
+                            break 'stale;
+                        }
+                    }
+                    remaining = still_stale;
+                    if remaining.is_empty() {
+                        break 'stale;
                     }
                 }
+                if let Some(e) = last_err {
+                    return Err(e);
+                }
+                result_chunks.extend(resolved);
             }
         }
 
@@ -2545,7 +2679,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader in {:?}",
                       engine.inode, locs.len(), window_from, total_chunks, rpc_start.elapsed());
                 engine.clear_failed_refresh();
-                engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size);
+                engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size, false);
             }
             Ok(_) | Err(_) => {
                 info!("refresh_engine: inode={} no chunk map from leader (took {:?})",
@@ -2613,6 +2747,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             total_chunks,
             Arc::new(nim),
             file_size,
+            true,
         );
         engine.clear_failed_refresh();
 
@@ -3224,21 +3359,28 @@ leader_addr: Arc::new(RwLock::new(None)),
         let request = Request::GetFileChunkMap { file_id, from_chunk, count };
         let response = self.send_request(target, request).await;
 
+        // Followers only have the chunks written to them — they cannot answer
+        // GetFileChunkMap authoritatively. Never fall back to a non-leader node:
+        // a partial follower response would give the client stale chunk_ids for
+        // chunks it doesn't hold, causing "chunk not found" on all replicas.
         let response = match response {
             Ok(r) => r,
             Err(e) => {
-                warn!("GetFileChunkMap to leader failed ({}), retrying any node", e);
-                let nodes = self.cluster_nodes.read().await.clone();
-                let mut last_err = e;
-                let mut found = None;
-                for addr in &nodes {
-                    if *addr == target { continue; }
-                    match self.send_request(*addr, Request::GetFileChunkMap { file_id, from_chunk, count }).await {
-                        Ok(r) => { found = Some(r); break; }
-                        Err(e) => { last_err = e; }
+                // Leader unreachable: refresh our leader address and retry once on
+                // the newly discovered leader before giving up entirely.
+                warn!("GetFileChunkMap to leader {} failed ({}), refreshing leader and retrying", target, e);
+                let _ = self.refresh_cluster_nodes().await;
+                let new_target = {
+                    let leader = self.leader_addr.read().await;
+                    *leader
+                };
+                match new_target {
+                    Some(addr) if addr != target => {
+                        self.send_request(addr, Request::GetFileChunkMap { file_id, from_chunk, count }).await
+                            .map_err(|e2| anyhow::anyhow!("GetFileChunkMap: leader {} also failed: {}", addr, e2))?
                     }
+                    _ => return Err(anyhow::anyhow!("GetFileChunkMap: leader unreachable: {}", e)),
                 }
-                found.ok_or(last_err)?
             }
         };
 
@@ -3748,7 +3890,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                         debug!("Retrying with new connection to {}", server_addr);
                         continue;
                     } else {
-                        return Err(e).context("Failed to read chunk after retry");
+                        // Preserve the original error message so callers can inspect it
+                        // (e.g. "not found on this node" drives stale-metadata retry in
+                        // fetch_chunk_with_fallback — wrapping loses that signal).
+                        return Err(anyhow::Error::from(e));
                     }
                 }
             }
@@ -4252,52 +4397,24 @@ leader_addr: Arc::new(RwLock::new(None)),
     ) -> Result<Vec<dfs_common::ChunkLocation>> {
         const WRITE_TIMEOUT_SECS: u64 = 30;
 
-        // Build the ordered list of candidates: preferred pair first, then others as fallbacks.
-        // Sort so penalized nodes are tried last — healthy nodes get first crack at quorum.
+        // Build the ordered list of candidates: preferred pair ALWAYS first, then rest
+        // nodes sorted by health as fallback.
         //
-        // IMPORTANT: We must not write to a penalized node AND its healthy replacement in the same
-        // parallel round, or we end up with 3+ replicas on disk (the penalized write completes late).
-        // Fix: promote healthy rest nodes ahead of penalized preferred nodes in the candidate list,
-        // so the parallel pair is always 2 healthy nodes when healthy alternatives exist.
-        let preferred: Vec<SocketAddr> = vec![replica1, replica2];
-        let mut rest: Vec<SocketAddr> = all_nodes.iter().copied()
-            .filter(|&n| n != replica1 && n != replica2)
-            .collect();
+        // We do NOT demote penalized preferred nodes behind healthy rest nodes.
+        // Rationale: the preferred pair is where the chunk lives (or should live for
+        // consistent routing). Writing to a different pair because the preferred nodes
+        // are slow causes canonical drift — the next patch must go to the canonical pair,
+        // and if we moved the data elsewhere, that patch will fail with "chunk not found."
+        // A slow preferred node is always better than a fast node that doesn't have the chunk.
+        // If a preferred node is truly unreachable it will time out and we fall back to rest.
+        let rest: Vec<SocketAddr> = self.node_health.sort_by_health(
+            &all_nodes.iter().copied()
+                .filter(|&n| n != replica1 && n != replica2)
+                .collect::<Vec<_>>()
+        ).await;
 
-        let sorted_preferred = self.node_health.sort_by_health(&preferred).await;
-        let sorted_rest = self.node_health.sort_by_health(&rest).await;
-        rest = sorted_rest;
-
-        // Count how many of the preferred pair are healthy (not penalized)
-        let mut healthy_preferred: Vec<SocketAddr> = Vec::new();
-        let mut penalized_preferred: Vec<SocketAddr> = Vec::new();
-        for &n in &sorted_preferred {
-            if self.node_health.is_penalized(n).await {
-                penalized_preferred.push(n);
-            } else {
-                healthy_preferred.push(n);
-            }
-        }
-
-        // Build candidates: healthy preferred first, then healthy rest (to fill any gaps from
-        // penalized preferred), then penalized preferred last (only used if no other choice).
-        let mut candidates: Vec<SocketAddr> = Vec::new();
-        candidates.extend_from_slice(&healthy_preferred);
-        // Fill up to 2 with healthy rest nodes before falling back to penalized preferred
-        for &n in &rest {
-            if candidates.len() >= 2 { break; }
-            if !penalized_preferred.contains(&n) {
-                candidates.push(n);
-            }
-        }
-        // Append penalized preferred (fallback only)
-        candidates.extend_from_slice(&penalized_preferred);
-        // Append remaining rest nodes not yet in candidates
-        for &n in &rest {
-            if !candidates.contains(&n) {
-                candidates.push(n);
-            }
-        }
+        let mut candidates: Vec<SocketAddr> = vec![replica1, replica2];
+        candidates.extend_from_slice(&rest);
 
         // Try the preferred pair in parallel first — halves write latency on the hot path.
         // If either fails, fall back to serial retries from the remaining candidates.
@@ -5298,7 +5415,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                     replica_results.push((addr, Err(anyhow::anyhow!("chunk stale"))));
                 }
                 Ok(Response::Error { message, .. }) => {
-                    warn!("MultiPatch replica {} error: {}", addr, message);
+                    if message.contains("Failed to open chunk file")
+                        || message.contains("Failed to read chunk range")
+                    {
+                        error!("MultiPatch replica {} error: {} (chunk data missing on this node)", addr, message);
+                    } else {
+                        warn!("MultiPatch replica {} error: {}", addr, message);
+                    }
                     replica_results.push((addr, Err(anyhow::anyhow!("{}", message))));
                 }
                 Err(e) => {
@@ -5393,7 +5516,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             checksum: new_chunk_id.hash,
             file_offset: old_location.file_offset,
             written_at: Some(now_secs),
-            client_write_seq: None,
+            // Carry the file's current write_seq so the server's put_file Rule 2 merge
+            // correctly identifies this patched chunk as newer than the old chunk it replaced.
+            // Without this, Rule 2 sees (None, Some(old_seq)) and keeps the pre-patch chunk_id.
+            client_write_seq: patch_client_write_seq,
         };
 
         // Send ReplicateChunkLocation ONLY to the leader.

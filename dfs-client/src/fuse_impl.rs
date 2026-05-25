@@ -1498,6 +1498,33 @@ impl FlushHandle {
                     // through the metadata_cache update at the end of this function.
                     let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, chunk_idx).await;
 
+                    // Re-read server_chunk_id and canonical_write_nodes after acquiring
+                    // the lock. A concurrent flush that completed while we were waiting
+                    // may have patched this chunk and updated both — our pre-lock snapshot
+                    // of old_location is stale in that case and would cause a guaranteed
+                    // MultiPatch failure (the base chunk was already renamed away).
+                    let old_location = {
+                        let mut loc = old_location;
+                        if let Some(s) = self.write_buffers.get(&ino) {
+                            if let Ok(st) = s.try_lock() {
+                                if let Some(new_id) = st.slots.get(&chunk_idx).and_then(|sl| sl.server_chunk_id) {
+                                    if new_id != loc.chunk_id {
+                                        info!("flush_buffer_async_one: ino={} chunk={} post-lock server_chunk_id refresh {} -> {}",
+                                            ino, chunk_idx, loc.chunk_id, new_id);
+                                        loc.chunk_id = new_id;
+                                        loc.checksum = new_id.hash;
+                                    }
+                                }
+                                if let Some(nodes) = st.canonical_write_nodes.get(&chunk_idx).cloned() {
+                                    if !nodes.is_empty() {
+                                        loc.nodes = nodes;
+                                    }
+                                }
+                            }
+                        }
+                        loc
+                    };
+
                     // Try to compute the post-patch hash locally so the server can skip
                     // its read-back pass entirely (write patches + rename, no read).
                     //
@@ -1981,6 +2008,15 @@ impl FlushHandle {
                     state.flushed_sizes.insert(chunk_idx, flushed_len);
                     if let (Some(loc), Some(slot)) = (locations.first(), state.slots.get_mut(&chunk_idx)) {
                         slot.server_chunk_id = Some(loc.chunk_id);
+                    }
+                    // Update canonical_write_nodes so the next patch targets the correct
+                    // nodes. Without this, canonical_write_nodes retains the pre-fallback
+                    // pair while server_chunk_id has the new hash (written to different
+                    // nodes), causing "chunk data missing" on every subsequent patch.
+                    if let Some(loc) = locations.first() {
+                        if !loc.nodes.is_empty() {
+                            state.canonical_write_nodes.insert(chunk_idx, loc.nodes.clone());
+                        }
                     }
                 }
 

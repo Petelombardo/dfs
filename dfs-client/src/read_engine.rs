@@ -178,6 +178,11 @@ impl InodeReadEngine {
     }
 
     /// Merge a windowed chunk map response into the engine's full map.
+    ///
+    /// `from_write_path`: when true, write-path updates always win regardless of seq
+    ///   (the client just received a confirmed result from the server — it's authoritative).
+    ///   When false (server refresh), use strict `>` so an equal-seq server entry cannot
+    ///   revert the engine to an older chunk_id that was already renamed on disk.
     pub fn update_chunk_map_window(
         &self,
         window: Vec<ChunkLocation>,
@@ -185,6 +190,7 @@ impl InodeReadEngine {
         total_chunks: u32,
         node_map: Arc<HashMap<dfs_common::NodeId, SocketAddr>>,
         file_size: u64,
+        from_write_path: bool,
     ) {
         let from = from_chunk as usize;
         let total = total_chunks as usize;
@@ -213,16 +219,20 @@ impl InodeReadEngine {
                 from
             };
             if idx < new_map.len() {
-                // Guard: only overwrite if the incoming data is at least as new as what
-                // the engine already has. After a local patch, the engine's client_write_seq
-                // for that chunk is >= what the server's sled knows (RCL is async). Without
-                // this guard, every merge after an unrelated flush overwrites the engine's
-                // correct local hash with the server's slightly-stale one.
-                let should_update = match (loc.client_write_seq, new_map[idx].client_write_seq) {
-                    (Some(inc), Some(ext)) => inc >= ext,
-                    (Some(_), None)        => true,
-                    (None, Some(_))        => false,
-                    (None, None)           => true,
+                // Guard: for server-refresh calls, only update if the incoming seq is
+                // strictly newer (prevents equal-seq server entries from reverting the
+                // engine to an older chunk_id that has already been renamed on disk).
+                // For write-path calls, always update — the client just received a
+                // confirmed result; it is authoritative regardless of seq equality.
+                let should_update = if from_write_path {
+                    true
+                } else {
+                    match (loc.client_write_seq, new_map[idx].client_write_seq) {
+                        (Some(inc), Some(ext)) => inc > ext,
+                        (Some(_), None)        => true,
+                        (None, Some(_))        => false,
+                        (None, None)           => true,
+                    }
                 };
                 if should_update {
                     new_map[idx] = loc;

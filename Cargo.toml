@@ -24,7 +24,7 @@ bincode = "1.3"
 toml = "0.8"
 
 # Embedded database
-sled = "0.34"
+redb = "2"
 
 # Hashing and crypto
 blake3 = "1.5"

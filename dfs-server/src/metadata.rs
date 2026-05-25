@@ -1,8 +1,52 @@
 use anyhow::{Context, Result};
 use dfs_common::{ChunkId, ChunkLocation, FileId, FileMetadata, NodeId};
-use sled::Db;
+use redb::{Database, Durability, ReadableTable, TableDefinition};
+// On Linux, Durability::Eventual calls fdatasync (same as Immediate). Only the macOS
+// backend (F_BARRIERFSYNC) distinguishes them. Durability::None writes to the OS page
+// cache without fdatasync — fast, immediately visible to reads, survives process crashes,
+// only lost on kernel panic/power failure. Acceptable with 5-way replication.
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Table definitions — each replaces one sled prefix or named tree.
+// Keys carry no prefix since the table name is already the namespace.
+// ---------------------------------------------------------------------------
+
+/// file_id (hyphenated UUID string) → bincode(FileMetadata)
+const FILE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("file");
+
+/// full path string → bincode(FileMetadata)  (path index, same data as file table)
+const PATH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("path");
+
+/// chunk_id hex string → bincode(ChunkLocation)
+const CHUNK_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("chunk");
+
+/// "{node_hex}:{seq:016x}" → bincode(FileMetadata)  (leader dissemination queue)
+const META_QUEUE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta_queue");
+
+/// "{node_hex}:{file_id_hex}" → seq as 8-byte big-endian u64  (dedup index)
+const META_QUEUE_IDX: TableDefinition<&str, &[u8]> = TableDefinition::new("meta_queue_idx");
+
+/// "meta_seq" → u64,  "follower_seq" → u64
+const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
+
+/// "del:{file_id}" → bincode(DeleteQueueEntry)
+const DELETE_QUEUE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("delete_queue");
+
+// ---------------------------------------------------------------------------
+
+/// Increment the last byte of a prefix to produce its exclusive upper bound.
+/// All prefix strings used here end with ASCII characters far below 0xFF.
+fn prefix_next(prefix: &str) -> String {
+    let mut bytes = prefix.as_bytes().to_vec();
+    if let Some(last) = bytes.last_mut() {
+        *last += 1;
+    }
+    String::from_utf8(bytes).expect("prefix bytes are ASCII")
+}
+
+// ---------------------------------------------------------------------------
 
 /// Result of a put_file call — distinguishes accepted writes from stale drops.
 pub enum PutFileResult {
@@ -14,405 +58,389 @@ pub enum PutFileResult {
     Stale(FileMetadata),
 }
 
-/// Metadata storage using Sled embedded database
-/// Optimized for SBC environments (memory-efficient, crash-safe)
+/// Metadata storage using redb embedded database.
+/// Replaces sled to eliminate the u8 fragment-count panic under heavy write loads.
 pub struct MetadataStore {
-    /// Sled database instance
-    db: Db,
-
-    /// Durable per-follower dissemination queue tree (leader-only).
-    /// Key: `{node_id_hex}:{seq:016x}` — Value: bincode-serialized FileMetadata.
-    /// The leader writes here before acking the client; a background loop drains
-    /// entries to each follower and removes them on confirmed ack.
-    pub meta_queue: sled::Tree,
-
-    /// Secondary index for write-path deduplication (leader-only).
-    /// Key: `{node_id_hex}:{file_id_hex}` — Value: `{seq:016x}` (8 raw bytes, big-endian).
-    /// Allows O(1) lookup of the existing queue entry for a file before replacement.
-    pub meta_queue_idx: sled::Tree,
-
-    /// Monotonic sequence counter for this node's metadata writes (leader-only).
-    /// Stored in sled so it survives restarts. Key: b"meta_seq".
-    pub meta_seq_tree: sled::Tree,
-
-    /// Last sequence number received from the leader (follower-only).
-    /// Key: b"follower_seq". Used by new leaders for catch-up calculation.
-    pub follower_seq_tree: sled::Tree,
-
-    /// Durable delete queue — survives restarts so chunk cleanup is never lost.
-    /// Key: `del:{file_id_hex}` — Value: bincode-serialized DeleteQueueEntry.
-    /// Written BEFORE metadata is deleted; cleared by leader after all nodes ack.
-    pub delete_queue: sled::Tree,
+    db: Database,
+    db_path: PathBuf,
 }
 
 impl MetadataStore {
-    /// Create a new metadata store
+    /// Create a new metadata store (creates the redb file if it does not exist).
     pub fn new(metadata_dir: PathBuf) -> Result<Self> {
-        // Configure Sled with memory limits to prevent unbounded cache growth
-        // Default cache can grow to multiple GB even for small databases
-        let cache_capacity_mb = std::env::var("DFS_METADATA_CACHE_MB")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(16); // 16MB — keeps the hot working set (file: and path: keys) warm
-                            // without mapping the full chunk: index into RAM.  The chunk:
-                            // keyspace is large (100k+ records) but only scanned by the
-                            // leader healer once per minute; 16MB is enough for file lookups
-                            // and write-path hot keys.
+        std::fs::create_dir_all(&metadata_dir)
+            .with_context(|| format!("Failed to create metadata dir {:?}", metadata_dir))?;
 
-        let cache_capacity_bytes = cache_capacity_mb * 1024 * 1024;
+        let db_path = metadata_dir.join("metadata.redb");
 
-        let db = sled::Config::new()
-            .path(&metadata_dir)
-            .cache_capacity(cache_capacity_bytes)
-            .flush_every_ms(Some(250))  // Flush every 250ms — reduces metadata write stalls for sequential workloads
-            .open()
-            .with_context(|| format!("Failed to open metadata database at {:?}", metadata_dir))?;
+        let db = Database::create(&db_path)
+            .with_context(|| format!("Failed to open redb at {:?}", db_path))?;
 
-        let meta_queue = db.open_tree(b"meta_queue")
-            .context("Failed to open meta_queue tree")?;
-        let meta_queue_idx = db.open_tree(b"meta_queue_idx")
-            .context("Failed to open meta_queue_idx tree")?;
-        let meta_seq_tree = db.open_tree(b"meta_seq")
-            .context("Failed to open meta_seq tree")?;
-        let follower_seq_tree = db.open_tree(b"follower_seq")
-            .context("Failed to open follower_seq tree")?;
-        let delete_queue = db.open_tree(b"delete_queue")
-            .context("Failed to open delete_queue tree")?;
+        // Ensure all tables exist on first open.
+        {
+            let txn = db.begin_write()?;
+            txn.open_table(FILE_TABLE)?;
+            txn.open_table(PATH_TABLE)?;
+            txn.open_table(CHUNK_TABLE)?;
+            txn.open_table(META_QUEUE_TABLE)?;
+            txn.open_table(META_QUEUE_IDX)?;
+            txn.open_table(COUNTERS_TABLE)?;
+            txn.open_table(DELETE_QUEUE_TABLE)?;
+            txn.commit()?;
+        }
 
-        info!("Initialized metadata store at {:?} (cache: {}MB)", metadata_dir, cache_capacity_mb);
+        info!("Initialized redb metadata store at {:?}", db_path);
 
-        Ok(Self { db, meta_queue, meta_queue_idx, meta_seq_tree, follower_seq_tree, delete_queue })
+        Ok(Self { db, db_path })
     }
 
-    /// Scan all `file:` records and re-create any missing `path:` index entries.
-    ///
-    /// A crash between the two sled inserts in `put_file` (file: written, path: not yet)
-    /// leaves the DB with a file record that is invisible to `list_directory`.  This runs
-    /// at startup and is cheap: it only inserts when the path: key is absent.
+    // -------------------------------------------------------------------------
+    // Startup repair (retained as a sanity check; crash window no longer exists
+    // because put_file now writes file: and path: atomically in one transaction).
+    // -------------------------------------------------------------------------
+
+    /// Scan all file records and re-create any missing path index entries.
     pub fn repair_path_index(&self) -> Result<()> {
-        let mut repaired = 0usize;
-        // Pass 1: ensure every file: record has a corresponding path: entry.
-        for item in self.db.scan_prefix(b"file:") {
-            let (_, value) = item?;
-            let metadata = match bincode::deserialize::<FileMetadata>(&value) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let path_key = self.path_key(&metadata.path);
-            if self.db.get(&path_key)?.is_none() {
-                self.db.insert(path_key, value)?;
-                warn!("Repaired missing path index for: {}", metadata.path);
-                repaired += 1;
+        // Pass 1: find file records whose path index entry is missing.
+        let to_repair: Vec<(String, Vec<u8>)> = {
+            let txn = self.db.begin_read()?;
+            let file_table = txn.open_table(FILE_TABLE)?;
+            let path_table = txn.open_table(PATH_TABLE)?;
+            let mut repairs = Vec::new();
+            for item in file_table.range::<&str>(..)? {
+                let (_, v) = item?;
+                let m = match bincode::deserialize::<FileMetadata>(v.value()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if path_table.get(m.path.as_str())?.is_none() {
+                    repairs.push((m.path.clone(), v.value().to_vec()));
+                }
             }
+            repairs
+        };
+
+        let repaired = to_repair.len();
+        if !to_repair.is_empty() {
+            let mut txn = self.db.begin_write()?;
+            txn.set_durability(Durability::None);
+            {
+                let mut path_table = txn.open_table(PATH_TABLE)?;
+                for (path, bytes) in &to_repair {
+                    warn!("Repaired missing path index for: {}", path);
+                    path_table.insert(path.as_str(), bytes.as_slice())?;
+                }
+            }
+            txn.commit()?;
         }
 
-        // Pass 2: remove path: entries whose file: record no longer exists.
-        // These accumulate when a delete removes the file: record but the path:
-        // entry isn't cleaned up (crash, replication gap, etc.) — causing deleted
-        // files to reappear in readdir on every remount.
-        let mut stale_keys: Vec<sled::IVec> = Vec::new();
-        for item in self.db.scan_prefix(b"path:") {
-            let (key, value) = item?;
-            let file_id = match bincode::deserialize::<FileMetadata>(&value) {
-                Ok(m) => m.id,
-                Err(_) => continue,
-            };
-
-            let file_key = self.file_key(&file_id);
-            if self.db.get(&file_key)?.is_none() {
-                stale_keys.push(key);
+        // Pass 2: find path index entries whose file record no longer exists.
+        let stale_paths: Vec<String> = {
+            let txn = self.db.begin_read()?;
+            let file_table = txn.open_table(FILE_TABLE)?;
+            let path_table = txn.open_table(PATH_TABLE)?;
+            let mut stale = Vec::new();
+            for item in path_table.range::<&str>(..)? {
+                let (k, v) = item?;
+                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                    let fid_str = format!("{}", m.id);
+                    if file_table.get(fid_str.as_str())?.is_none() {
+                        stale.push(k.value().to_string());
+                    }
+                }
             }
-        }
+            stale
+        };
 
-        let stale_count = stale_keys.len();
-        for key in stale_keys {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                warn!("Removing stale path index entry: {}", key_str);
+        let stale_count = stale_paths.len();
+        if !stale_paths.is_empty() {
+            let mut txn = self.db.begin_write()?;
+            txn.set_durability(Durability::None);
+            {
+                let mut path_table = txn.open_table(PATH_TABLE)?;
+                for path in &stale_paths {
+                    warn!("Removing stale path index entry: {}", path);
+                    path_table.remove(path.as_str())?;
+                }
             }
-            self.db.remove(key)?;
+            txn.commit()?;
         }
 
         if repaired > 0 || stale_count > 0 {
-            info!("Path index repair: {} entries rebuilt, {} stale entries removed", repaired, stale_count);
+            info!(
+                "Path index repair: {} entries rebuilt, {} stale entries removed",
+                repaired, stale_count
+            );
         }
         Ok(())
     }
 
-    /// Store file metadata
-    pub fn put_file(&self, metadata: &FileMetadata) -> Result<PutFileResult> {
-        // If a different file ID already exists at this path, remove the old file: record
-        // before writing the new one. Without this, every create() on an existing path
-        // allocates a new FileId UUID and leaves the old file: entry orphaned in the DB —
-        // causing unbounded metadata growth and a permanent healer backlog.
-        let path_key = self.path_key(&metadata.path);
-        if let Ok(Some(existing_bytes)) = self.db.get(&path_key) {
-            let existing_id = bincode::deserialize::<FileMetadata>(&existing_bytes)
-                .ok()
-                .map(|m| m.id);
+    // -------------------------------------------------------------------------
+    // File metadata — core CRUD
+    // -------------------------------------------------------------------------
 
-            if let Some(old_id) = existing_id {
-                if old_id != metadata.id {
-                    // Different ID at same path — purge the old file: record
-                    let old_key = self.file_key(&old_id);
-                    if let Err(e) = self.db.remove(old_key) {
-                        warn!("Failed to remove stale file record {} for path {}: {}", old_id, metadata.path, e);
-                    } else {
-                        debug!("Removed stale file record {} superseded by {} at path {}", old_id, metadata.id, metadata.path);
-                    }
+    /// Store file metadata.
+    pub fn put_file(&self, metadata: &FileMetadata) -> Result<PutFileResult> {
+        let file_id_str = format!("{}", metadata.id);
+        let path_str = metadata.path.as_str();
+
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+
+        // Read-before-write: open both tables once and keep them alive for the
+        // duration of the transaction so all reads and writes are atomic.
+        let mut file_table = txn.open_table(FILE_TABLE)?;
+        let mut path_table = txn.open_table(PATH_TABLE)?;
+
+        // If a different file ID already exists at this path, remove the stale file record.
+        {
+            let old_id_str: Option<String> = match path_table.get(path_str)? {
+                Some(v) => bincode::deserialize::<FileMetadata>(v.value())
+                    .ok()
+                    .filter(|m| m.id != metadata.id)
+                    .map(|m| format!("{}", m.id)),
+                None => None,
+            };
+            if let Some(old_id) = old_id_str {
+                if let Err(e) = file_table.remove(old_id.as_str()) {
+                    warn!("Failed to remove stale file record {} for path {}: {}", old_id, metadata.path, e);
+                } else {
+                    debug!("Removed stale file record {} superseded by {} at path {}", old_id, metadata.id, metadata.path);
                 }
             }
         }
 
-        // Merge chunk_locations: if the same file already exists with more replica nodes
-        // for any chunk, preserve those nodes. This prevents stale PutFileMetadata/
-        // ReplicateMetadata broadcasts (which carry only the 2 nodes written by the client)
-        // from overwriting healed 3-node state that was added via ReplicateChunkLocation.
-        //
-        // Also guards against stale-metadata resurrection: if the existing record is
-        // strictly newer (higher modified_at) AND has chunks while the incoming one
-        // does not, silently drop the incoming write. This prevents the metadata retry
-        // queue from clobbering a fully-written file with its zero-size create entry.
-        let merged_metadata;
-        let metadata_to_store = {
-            let file_key = self.file_key(&metadata.id);
-            if let Ok(Some(existing_bytes)) = self.db.get(&file_key) {
-                let existing_opt = bincode::deserialize::<FileMetadata>(&existing_bytes).ok();
-
-                if let Some(existing) = existing_opt {
-                    // Drop the incoming write if it is stale: both records have a
-                    // write_seq > 0 and the existing is strictly newer.
-                    // write_seq is assigned by the client in strictly increasing order
-                    // before enqueueing, so higher == newer. Sequence 0 means legacy
-                    // record (no sequencing) — never drop those on sequence alone.
-                    if existing.write_seq > 0
-                        && metadata.write_seq > 0
-                        && existing.write_seq > metadata.write_seq
-                    {
-                        debug!(
-                            "Dropping stale metadata for {} (existing write_seq={} > incoming={})",
-                            metadata.path, existing.write_seq, metadata.write_seq
-                        );
-                        return Ok(PutFileResult::Stale(existing));
-                    }
-
-                    // Merge chunk locations: two rules applied per chunk in the incoming record.
-                    //
-                    // Rule 1 (same chunk_id): merge node lists — preserve any replica nodes
-                    // the existing record has that the incoming doesn't know about yet.
-                    //
-                    // Rule 2 (different chunk_id, same file_offset): a patched chunk. Use
-                    // client_write_seq (monotone, clock-agnostic) to decide which version is
-                    // newer; fall back to written_at for legacy records that predate it.
-                    // If the existing sled entry is newer, keep it — the incoming is an
-                    // out-of-order stale write from an earlier patch. This prevents the sled
-                    // worker from reverting a chunk to an intermediate hash when two RCL sled
-                    // writes race.
-                    let existing_by_id: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
-                        existing.chunk_locations.iter()
-                            .map(|loc| (loc.chunk_id, loc))
-                            .collect();
-                    let existing_by_offset: std::collections::HashMap<u64, &dfs_common::ChunkLocation> =
-                        existing.chunk_locations.iter()
-                            .filter_map(|loc| loc.file_offset.map(|o| (o, loc)))
-                            .collect();
-
-                    let mut cloned = metadata.clone();
-                    for loc in &mut cloned.chunk_locations {
-                        if let Some(existing_loc) = existing_by_id.get(&loc.chunk_id) {
-                            // Rule 1: same chunk_id — merge node lists.
-                            for node in &existing_loc.nodes {
-                                if !loc.nodes.contains(node) {
-                                    loc.nodes.push(*node);
-                                }
-                            }
-                        } else if let Some(file_offset) = loc.file_offset {
-                            // Rule 2: different chunk_id at same offset — keep the newer one.
-                            if let Some(existing_loc) = existing_by_offset.get(&file_offset) {
-                                let keep_existing = match (loc.client_write_seq, existing_loc.client_write_seq) {
-                                    (Some(inc), Some(ext)) => ext > inc,
-                                    (Some(_), None)        => false, // incoming has seq, existing is legacy → incoming wins
-                                    (None, Some(_))        => true,  // existing has seq, incoming is legacy → keep existing
-                                    (None, None)           => {
-                                        // Legacy fallback: use written_at
-                                        existing_loc.written_at.unwrap_or(0) > loc.written_at.unwrap_or(0)
-                                    }
-                                };
-                                if keep_existing {
-                                    // Existing sled state is newer — incoming is a stale
-                                    // intermediate patch arriving out of order. Keep existing.
-                                    *loc = (*existing_loc).clone();
-                                }
-                            }
-                        }
-                    }
-                    merged_metadata = cloned;
-                    &merged_metadata
-                } else {
-                    metadata
-                }
-            } else {
-                metadata
-            }
+        // Merge chunk_locations with any existing same-ID record.
+        let existing_opt: Option<FileMetadata> = match file_table.get(file_id_str.as_str())? {
+            Some(v) => bincode::deserialize::<FileMetadata>(v.value()).ok(),
+            None => None,
         };
 
-        let key = self.file_key(&metadata_to_store.id);
+        let merged_metadata: Option<FileMetadata>;
+        let metadata_to_store: &FileMetadata = if let Some(existing) = existing_opt {
+            // Drop stale incoming write if existing is strictly newer.
+            if existing.write_seq > 0
+                && metadata.write_seq > 0
+                && existing.write_seq > metadata.write_seq
+            {
+                debug!(
+                    "Dropping stale metadata for {} (existing write_seq={} > incoming={})",
+                    metadata.path, existing.write_seq, metadata.write_seq
+                );
+                return Ok(PutFileResult::Stale(existing));
+            }
+
+            // Merge chunk locations — Rule 1 (same chunk_id: merge node lists),
+            // Rule 2 (same offset, different chunk_id: keep newer by client_write_seq).
+            let existing_by_id: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
+                existing.chunk_locations.iter().map(|loc| (loc.chunk_id, loc)).collect();
+            let existing_by_offset: std::collections::HashMap<u64, &dfs_common::ChunkLocation> =
+                existing.chunk_locations.iter()
+                    .filter_map(|loc| loc.file_offset.map(|o| (o, loc)))
+                    .collect();
+
+            let mut cloned = metadata.clone();
+            for loc in &mut cloned.chunk_locations {
+                if let Some(existing_loc) = existing_by_id.get(&loc.chunk_id) {
+                    // Rule 1: same chunk_id — merge node lists.
+                    for node in &existing_loc.nodes {
+                        if !loc.nodes.contains(node) {
+                            loc.nodes.push(*node);
+                        }
+                    }
+                } else if let Some(file_offset) = loc.file_offset {
+                    // Rule 2: different chunk_id at same offset — keep the newer one.
+                    if let Some(existing_loc) = existing_by_offset.get(&file_offset) {
+                        let keep_existing = match (loc.client_write_seq, existing_loc.client_write_seq) {
+                            (Some(inc), Some(ext)) => ext > inc,
+                            (Some(_), None)        => false,
+                            (None, Some(_))        => true,
+                            (None, None)           => {
+                                existing_loc.written_at.unwrap_or(0) > loc.written_at.unwrap_or(0)
+                            }
+                        };
+                        if keep_existing {
+                            *loc = (*existing_loc).clone();
+                        }
+                    }
+                }
+            }
+            merged_metadata = Some(cloned);
+            merged_metadata.as_ref().unwrap()
+        } else {
+            metadata
+        };
+
         let value = bincode::serialize(metadata_to_store)
             .context("Failed to serialize file metadata")?;
 
-        self.db
-            .insert(key, value.clone())
+        file_table.insert(file_id_str.as_str(), value.as_slice())
             .context("Failed to insert file metadata")?;
-
-        // Also index by path for lookups — store full metadata so list_directory
-        // is a single prefix scan with no per-entry secondary lookups.
-        self.db
-            .insert(path_key, value)
+        path_table.insert(path_str, value.as_slice())
             .context("Failed to insert path index")?;
 
-        debug!("Stored metadata for file: {} ({})", metadata_to_store.path, metadata_to_store.id);
+        drop(file_table);
+        drop(path_table);
+        txn.commit()?;
 
+        debug!("Stored metadata for file: {} ({})", metadata_to_store.path, metadata_to_store.id);
         Ok(PutFileResult::Stored)
     }
 
-    /// Get file metadata by ID
+    /// Get file metadata by ID.
     pub fn get_file(&self, file_id: &FileId) -> Result<Option<FileMetadata>> {
-        let key = self.file_key(file_id);
-        match self.db.get(key)? {
-            Some(value) => Ok(Some(bincode::deserialize::<FileMetadata>(&value)
+        let key = format!("{}", file_id);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILE_TABLE)?;
+        match table.get(key.as_str())? {
+            Some(v) => Ok(Some(bincode::deserialize::<FileMetadata>(v.value())
                 .with_context(|| format!("Failed to deserialize metadata for {}", file_id))?)),
             None => Ok(None),
         }
     }
 
-    /// Get file metadata by path
+    /// Get file metadata by path.
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
-        let path_key = self.path_key(path);
-        match self.db.get(&path_key)? {
-            Some(bytes) => Ok(Some(bincode::deserialize::<FileMetadata>(&bytes)
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PATH_TABLE)?;
+        match table.get(path)? {
+            Some(v) => Ok(Some(bincode::deserialize::<FileMetadata>(v.value())
                 .with_context(|| format!("Failed to deserialize metadata for path {}", path))?)),
             None => Ok(None),
         }
     }
 
-    /// Delete file metadata
+    /// Delete file metadata (removes both file and path index entries).
     pub fn delete_file(&self, file_id: &FileId) -> Result<()> {
-        // Get metadata first to remove path index
-        if let Some(metadata) = self.get_file(file_id)? {
-            let path_key = self.path_key(&metadata.path);
-            self.db.remove(path_key)?;
+        let file_id_str = format!("{}", file_id);
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+        {
+            let mut file_table = txn.open_table(FILE_TABLE)?;
+            let mut path_table = txn.open_table(PATH_TABLE)?;
+
+            // Get path from file record so we can remove the path index entry.
+            if let Some(v) = file_table.get(file_id_str.as_str())? {
+                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                    path_table.remove(m.path.as_str())?;
+                }
+            }
+            file_table.remove(file_id_str.as_str())?;
         }
-
-        let key = self.file_key(file_id);
-        self.db
-            .remove(key)
-            .context("Failed to delete file metadata")?;
-
+        txn.commit()?;
         debug!("Deleted metadata for file: {}", file_id);
-
         Ok(())
     }
 
-    /// Delete only the path index entry for a specific path
-    /// Used during rename to remove the old path without touching the file metadata
+    /// Delete only the path index entry for a specific path (used during rename).
     pub fn delete_path_index(&self, path: &str) -> Result<()> {
-        let path_key = self.path_key(path);
-        self.db.remove(path_key)
-            .context("Failed to delete path index")?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(PATH_TABLE)?;
+            table.remove(path)?;
+        }
+        txn.commit()?;
         debug!("Deleted path index for: {}", path);
         Ok(())
     }
 
-    /// List all files — returns a Vec, loading all records into memory.
-    /// Only use for admin/diagnostic paths where the full list is needed at once.
-    /// For startup scans use `scan_files` to avoid loading all metadata into RAM.
+    /// List all files — loads all records into memory. Use scan_files for streaming.
     pub fn list_files(&self) -> Result<Vec<FileMetadata>> {
         let mut files = Vec::new();
         self.scan_files(|m| { files.push(m); Ok(()) })?;
         Ok(files)
     }
 
-    /// Stream all file metadata records, calling `f` for each one without
-    /// materialising the full collection in memory.  Used at startup for the
-    /// chunk-map build so that 535 MB of on-disk sled data doesn't become 2 GB
-    /// of in-RAM Vec<FileMetadata>.
+    /// Stream all file metadata records, calling `f` for each without materialising all in RAM.
     pub fn scan_files<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(FileMetadata) -> Result<()>,
     {
-        for item in self.db.scan_prefix(b"file:") {
-            let (key, value) = item?;
-            match bincode::deserialize::<FileMetadata>(&value) {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILE_TABLE)?;
+        for item in table.range::<&str>(..)? {
+            let (k, v) = item?;
+            match bincode::deserialize::<FileMetadata>(v.value()) {
                 Ok(m) => f(m)?,
-                Err(_) => warn!("Skipping corrupt metadata entry (key={:?})", key),
+                Err(_) => warn!("Skipping corrupt metadata entry (key={:?})", k.value()),
             }
         }
         Ok(())
     }
 
-    /// Remove file: and path: records whose file ID is not in `live_ids`.
-    ///
-    /// Called on followers after the leader sends a ReconcileMetadata message.
-    /// The leader's file: keyspace is authoritative — any ID the leader doesn't
-    /// have is a stale entry from a missed delete. Chunk data is never touched.
-    ///
-    /// Returns the number of (file:, path:) record pairs removed.
+    /// Remove file and path records whose file ID is not in `live_ids`.
+    /// Called on followers after ReconcileMetadata.  Returns records removed.
     pub fn remove_unlisted_files(
         &self,
         live_ids: &std::collections::HashSet<FileId>,
     ) -> Result<usize> {
+        // Collect stale file entries.
+        let (stale_file_ids, stale_file_paths): (Vec<String>, Vec<String>) = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(FILE_TABLE)?;
+            let mut ids = Vec::new();
+            let mut paths = Vec::new();
+            for item in table.range::<&str>(..)? {
+                let (k, v) = item?;
+                let m = match bincode::deserialize::<FileMetadata>(v.value()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if !live_ids.contains(&m.id) {
+                    ids.push(k.value().to_string());
+                    paths.push(m.path.clone());
+                }
+            }
+            (ids, paths)
+        };
+
         let mut removed = 0usize;
-
-        // Collect stale file: records.
-        let mut stale_file_keys: Vec<sled::IVec> = Vec::new();
-        let mut stale_paths: Vec<String> = Vec::new();
-
-        for item in self.db.scan_prefix(b"file:") {
-            let (key, value) = item?;
-            let m = match bincode::deserialize::<FileMetadata>(&value) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let file_id = m.id;
-            stale_paths.push(m.path.clone());
-
-            if !live_ids.contains(&file_id) {
-                stale_file_keys.push(key);
-            } else {
-                stale_paths.pop(); // not stale, remove the path we just pushed
+        if !stale_file_ids.is_empty() {
+            let mut txn = self.db.begin_write()?;
+            txn.set_durability(Durability::None);
+            {
+                let mut file_table = txn.open_table(FILE_TABLE)?;
+                let mut path_table = txn.open_table(PATH_TABLE)?;
+                for (id_str, path) in stale_file_ids.iter().zip(stale_file_paths.iter()) {
+                    warn!("ReconcileMetadata: removing stale file record: {} (path: {})", id_str, path);
+                    file_table.remove(id_str.as_str())?;
+                    path_table.remove(path.as_str())?;
+                    removed += 1;
+                }
             }
+            txn.commit()?;
         }
 
-        // Remove stale file: records and their path: index entries.
-        for (key, path) in stale_file_keys.iter().zip(stale_paths.iter()) {
-            if let Ok(key_str) = std::str::from_utf8(key) {
-                warn!("ReconcileMetadata: removing stale file record: {} (path: {})", key_str, path);
+        // Also sweep path entries independently — a path entry can exist without
+        // a file entry if the file entry was removed out-of-order.
+        let stale_path_keys: Vec<String> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(PATH_TABLE)?;
+            let mut stale = Vec::new();
+            for item in table.range::<&str>(..)? {
+                let (k, v) = item?;
+                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                    if !live_ids.contains(&m.id) {
+                        stale.push(k.value().to_string());
+                    }
+                }
             }
-            self.db.remove(key)?;
-            let path_key = self.path_key(path);
-            self.db.remove(path_key)?;
-            removed += 1;
-        }
+            stale
+        };
 
-        // Also sweep path: entries independently — a path: record can exist without
-        // a file: record if the file: record was removed out-of-order.
-        let mut stale_path_keys: Vec<sled::IVec> = Vec::new();
-        for item in self.db.scan_prefix(b"path:") {
-            let (key, value) = item?;
-            let file_id = match bincode::deserialize::<FileMetadata>(&value) {
-                Ok(m) => m.id,
-                Err(_) => continue,
-            };
-            if !live_ids.contains(&file_id) {
-                stale_path_keys.push(key);
+        if !stale_path_keys.is_empty() {
+            let mut txn = self.db.begin_write()?;
+            txn.set_durability(Durability::None);
+            {
+                let mut table = txn.open_table(PATH_TABLE)?;
+                for path in &stale_path_keys {
+                    warn!("ReconcileMetadata: removing stale path index entry: {}", path);
+                    table.remove(path.as_str())?;
+                    removed += 1;
+                }
             }
-        }
-        for key in stale_path_keys {
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                warn!("ReconcileMetadata: removing stale path index entry: {}", key_str);
-            }
-            self.db.remove(key)?;
-            removed += 1;
+            txn.commit()?;
         }
 
         if removed > 0 {
@@ -421,54 +449,198 @@ impl MetadataStore {
         Ok(removed)
     }
 
-    /// List files in a directory (optimized with path prefix scan)
+    /// List direct children of `dir_path`.
     pub fn list_directory(&self, dir_path: &str) -> Result<Vec<FileMetadata>> {
-        let mut files = Vec::new();
-
-        // Normalize directory path
         let dir_path = if dir_path.ends_with('/') {
             dir_path.to_string()
         } else {
             format!("{}/", dir_path)
         };
 
-        // Use path index prefix scan instead of full table scan
-        // This scans only paths starting with "path:/dir/" instead of all files
-        let prefix = format!("path:{}", dir_path);
+        // Range scan: all paths that start with dir_path.
+        // Upper bound = increment last char of dir_path ("/" → "0").
+        let end = prefix_next(&dir_path);
 
-        for item in self.db.scan_prefix(prefix.as_bytes()) {
-            let (key, value) = item?;
-
-            // Extract the path from the key
-            let key_str = String::from_utf8_lossy(&key);
-            if let Some(path) = key_str.strip_prefix("path:") {
-                // Check if this is a direct child (not nested subdirectory)
-                let relative = &path[dir_path.len()..];
-                if !relative.is_empty() && (!relative.contains('/') || relative.ends_with('/')) {
-                    match bincode::deserialize::<FileMetadata>(&value) {
-                        Ok(metadata) => files.push(metadata),
-                        Err(_) => warn!("list_directory: could not deserialize path index entry for {}", path),
-                    }
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PATH_TABLE)?;
+        let mut files = Vec::new();
+        for item in table.range(dir_path.as_str()..end.as_str())? {
+            let (k, v) = item?;
+            let path = k.value();
+            let relative = &path[dir_path.len()..];
+            // Direct child: no slash, or a lone trailing slash (directory entry).
+            if !relative.is_empty() && (!relative.contains('/') || relative.ends_with('/')) {
+                match bincode::deserialize::<FileMetadata>(v.value()) {
+                    Ok(m) => files.push(m),
+                    Err(_) => warn!("list_directory: could not deserialize path index for {}", path),
                 }
             }
         }
-
         Ok(files)
     }
 
-    /// Store chunk location information
+    // -------------------------------------------------------------------------
+    // Chunk location
+    // -------------------------------------------------------------------------
+
+    /// Store chunk location information.
     pub fn put_chunk_location(&self, location: &ChunkLocation) -> Result<()> {
-        let key = self.chunk_key(&location.chunk_id);
+        let key = format!("{}", location.chunk_id);
         let value = bincode::serialize(location)
             .context("Failed to serialize chunk location")?;
-
-        self.db
-            .insert(key, value)
-            .context("Failed to insert chunk location")?;
-
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(CHUNK_TABLE)?;
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+        txn.commit()?;
         debug!("Stored location for chunk: {}", location.chunk_id);
-
         Ok(())
+    }
+
+    /// Get chunk location information.
+    pub fn get_chunk_location(&self, chunk_id: &ChunkId) -> Result<Option<ChunkLocation>> {
+        let key = format!("{}", chunk_id);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(CHUNK_TABLE)?;
+        match table.get(key.as_str())? {
+            Some(v) => Ok(Some(bincode::deserialize::<ChunkLocation>(v.value())
+                .with_context(|| format!("Failed to deserialize chunk location {}", chunk_id))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete chunk location.
+    pub fn delete_chunk_location(&self, chunk_id: &ChunkId) -> Result<()> {
+        let key = format!("{}", chunk_id);
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(CHUNK_TABLE)?;
+            table.remove(key.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// List all chunk IDs known in metadata.
+    pub fn list_all_chunk_ids(&self) -> Result<Vec<ChunkId>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(CHUNK_TABLE)?;
+        let mut ids = Vec::new();
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            if let Ok(loc) = bincode::deserialize::<ChunkLocation>(v.value()) {
+                ids.push(loc.chunk_id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Return all chunk location records in one scan.
+    pub fn list_all_chunk_locations(&self) -> Result<Vec<ChunkLocation>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(CHUNK_TABLE)?;
+        let mut locations = Vec::new();
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            if let Ok(loc) = bincode::deserialize::<ChunkLocation>(v.value()) {
+                locations.push(loc);
+            }
+        }
+        Ok(locations)
+    }
+
+    /// Stream chunk location records, calling `f` for each. Return `false` to stop early.
+    pub fn scan_chunk_locations<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(ChunkLocation) -> bool,
+    {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(CHUNK_TABLE)?;
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            if let Ok(loc) = bincode::deserialize::<ChunkLocation>(v.value()) {
+                if !f(loc) {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the set of chunk IDs referenced by any live file in metadata.
+    pub fn live_chunk_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILE_TABLE)?;
+        let mut live = std::collections::HashSet::new();
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                for loc in &m.chunk_locations {
+                    live.insert(loc.chunk_id);
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    /// Rebuild missing chunk: routing table entries from file metadata.
+    pub fn rebuild_chunk_locations_from_files(&self) -> Result<(usize, usize)> {
+        // Collect missing chunk records (read phase).
+        let to_write: Vec<(String, Vec<u8>)> = {
+            let txn = self.db.begin_read()?;
+            let file_table = txn.open_table(FILE_TABLE)?;
+            let chunk_table = txn.open_table(CHUNK_TABLE)?;
+            let mut missing = Vec::new();
+            for item in file_table.range::<&str>(..)? {
+                let (_, v) = item?;
+                let m = match bincode::deserialize::<FileMetadata>(v.value()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                for loc in &m.chunk_locations {
+                    let key = format!("{}", loc.chunk_id);
+                    if chunk_table.get(key.as_str())?.is_none() {
+                        let bytes = bincode::serialize(loc)
+                            .context("Failed to serialize ChunkLocation during rebuild")?;
+                        missing.push((key, bytes));
+                    }
+                }
+            }
+            missing
+        };
+
+        let written = to_write.len();
+        if !to_write.is_empty() {
+            let mut txn = self.db.begin_write()?;
+            txn.set_durability(Durability::None);
+            {
+                let mut table = txn.open_table(CHUNK_TABLE)?;
+                for (key, bytes) in &to_write {
+                    warn!("Rebuilt missing chunk record for {}", key);
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        // Count already-present entries (skipped).
+        let skipped = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(CHUNK_TABLE)?;
+            let total: usize = table.range::<&str>(..)?.count();
+            total.saturating_sub(written)
+        };
+
+        if written > 0 {
+            info!(
+                "Chunk location rebuild: {} missing records restored, {} already present",
+                written, skipped
+            );
+        }
+        Ok((written, skipped))
     }
 
     // -------------------------------------------------------------------------
@@ -476,76 +648,86 @@ impl MetadataStore {
     // -------------------------------------------------------------------------
 
     /// Increment and return the next metadata sequence number (leader-only).
-    /// Persisted in sled so it survives leader restarts.
     pub fn next_meta_sequence(&self) -> Result<u64> {
-        // Atomic fetch-and-increment via sled's compare-and-swap loop.
-        loop {
-            let current_bytes = self.meta_seq_tree.get(b"meta_seq")?;
-            let current: u64 = current_bytes.as_ref()
-                .and_then(|b| b.as_ref().try_into().ok())
-                .map(u64::from_be_bytes)
-                .unwrap_or(0);
+        let txn = self.db.begin_write()?;
+        let next = {
+            let mut table = txn.open_table(COUNTERS_TABLE)?;
+            let current = table.get("meta_seq")?.map(|v| v.value()).unwrap_or(0);
             let next = current + 1;
-            let next_bytes = next.to_be_bytes();
-            match self.meta_seq_tree.compare_and_swap(
-                b"meta_seq",
-                current_bytes.as_deref(),
-                Some(&next_bytes),
-            )? {
-                Ok(_) => return Ok(next),
-                Err(_) => continue, // lost the race, retry
-            }
-        }
+            table.insert("meta_seq", next)?;
+            next
+        };
+        txn.commit()?;
+        Ok(next)
     }
 
-    /// Read current metadata sequence (leader: last issued; follower: last received).
+    /// Read current metadata sequence number.
     pub fn current_meta_sequence(&self) -> Result<u64> {
-        Ok(self.meta_seq_tree.get(b"meta_seq")?
-            .as_ref()
-            .and_then(|b| b.as_ref().try_into().ok())
-            .map(u64::from_be_bytes)
-            .unwrap_or(0))
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(COUNTERS_TABLE)?;
+        Ok(table.get("meta_seq")?.map(|v| v.value()).unwrap_or(0))
     }
 
-    /// Format node_id as a fixed-length hex string for use as a sled key prefix.
+    /// Format node_id as a fixed-length hex string for use as a key prefix.
     fn node_id_hex(node_id: NodeId) -> String {
         node_id.as_bytes().iter().map(|b| format!("{:02x}", b)).collect()
     }
 
     /// Enqueue a metadata update destined for `node_id` at `sequence`.
-    /// Key format: `{node_id_hex}:{seq:016x}` — lexicographic order == sequence order.
-    pub fn enqueue_meta_for_node(&self, node_id: NodeId, sequence: u64, metadata: &FileMetadata) -> Result<()> {
+    pub fn enqueue_meta_for_node(
+        &self,
+        node_id: NodeId,
+        sequence: u64,
+        metadata: &FileMetadata,
+    ) -> Result<()> {
         let node_hex = Self::node_id_hex(node_id);
         let file_id_hex = metadata.id.0.as_simple().to_string();
         let idx_key = format!("{}:{}", node_hex, file_id_hex);
 
-        // Remove any existing queue entry for this (node, file) pair before inserting.
-        if let Some(old_seq_bytes) = self.meta_queue_idx.get(idx_key.as_bytes())? {
-            if old_seq_bytes.len() == 8 {
-                let old_seq = u64::from_be_bytes(old_seq_bytes.as_ref().try_into().unwrap());
-                let old_key = format!("{}:{:016x}", node_hex, old_seq);
-                self.meta_queue.remove(old_key.as_bytes())?;
-            }
-        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut queue_table = txn.open_table(META_QUEUE_TABLE)?;
+            let mut idx_table = txn.open_table(META_QUEUE_IDX)?;
 
-        let key = format!("{}:{:016x}", node_hex, sequence);
-        let value = bincode::serialize(metadata).context("Failed to serialize metadata for queue")?;
-        self.meta_queue.insert(key.as_bytes(), value)?;
-        self.meta_queue_idx.insert(idx_key.as_bytes(), &sequence.to_be_bytes())?;
+            // Remove any existing queue entry for this (node, file) pair.
+            if let Some(old_seq_bytes) = idx_table.get(idx_key.as_str())? {
+                if old_seq_bytes.value().len() == 8 {
+                    let old_seq = u64::from_be_bytes(
+                        old_seq_bytes.value().try_into().unwrap()
+                    );
+                    let old_key = format!("{}:{:016x}", node_hex, old_seq);
+                    queue_table.remove(old_key.as_str())?;
+                }
+            }
+
+            let queue_key = format!("{}:{:016x}", node_hex, sequence);
+            let value = bincode::serialize(metadata)
+                .context("Failed to serialize metadata for queue")?;
+            queue_table.insert(queue_key.as_str(), value.as_slice())?;
+            idx_table.insert(idx_key.as_str(), sequence.to_be_bytes().as_slice())?;
+        }
+        txn.commit()?;
         Ok(())
     }
 
     /// Return all queued metadata entries for `node_id`, in sequence order.
-    /// Returns Vec<(sequence, FileMetadata)>.
-    pub fn drain_meta_queue_for_node(&self, node_id: NodeId) -> Result<Vec<(u64, FileMetadata)>> {
-        let prefix = format!("{}:", Self::node_id_hex(node_id));
+    pub fn drain_meta_queue_for_node(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<(u64, FileMetadata)>> {
+        let node_hex = Self::node_id_hex(node_id);
+        let prefix = format!("{}:", node_hex);
+        let prefix_end = prefix_next(&prefix);
+
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(META_QUEUE_TABLE)?;
         let mut items = Vec::new();
-        for item in self.meta_queue.scan_prefix(prefix.as_bytes()) {
-            let (key, value) = item?;
-            let key_str = std::str::from_utf8(&key).unwrap_or("");
+        for item in table.range(prefix.as_str()..prefix_end.as_str())? {
+            let (k, v) = item?;
+            let key_str = k.value();
             let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
             let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
-            match bincode::deserialize::<FileMetadata>(&value) {
+            match bincode::deserialize::<FileMetadata>(v.value()) {
                 Ok(m) => items.push((seq, m)),
                 Err(e) => warn!("meta_queue: failed to deserialize entry {}: {}", key_str, e),
             }
@@ -557,84 +739,141 @@ impl MetadataStore {
     pub fn ack_meta_queue_for_node(&self, node_id: NodeId, up_to_sequence: u64) -> Result<()> {
         let node_hex = Self::node_id_hex(node_id);
         let prefix = format!("{}:", node_hex);
+        let prefix_end = prefix_next(&prefix);
         let up_to_key = format!("{}:{:016x}", node_hex, up_to_sequence);
-        let mut to_remove = Vec::new();
-        for item in self.meta_queue.scan_prefix(prefix.as_bytes()) {
-            let (key, value) = item?;
-            if key.as_ref() <= up_to_key.as_bytes() {
-                // Also remove the idx entry if it still points to this sequence.
-                if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                    let file_id_hex = m.id.0.as_simple().to_string();
-                    let idx_key = format!("{}:{}", node_hex, file_id_hex);
-                    if let Some(idx_seq_bytes) = self.meta_queue_idx.get(idx_key.as_bytes())? {
-                        if idx_seq_bytes.len() == 8 {
-                            let key_str = std::str::from_utf8(&key).unwrap_or("");
-                            let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
-                            let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
-                            let idx_seq = u64::from_be_bytes(idx_seq_bytes.as_ref().try_into().unwrap());
-                            if idx_seq == seq {
-                                self.meta_queue_idx.remove(idx_key.as_bytes())?;
-                            }
+
+        // Collect keys to remove (read phase — no mutation during iteration).
+        let to_remove: Vec<(String, Option<String>)> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(META_QUEUE_TABLE)?;
+            let mut items = Vec::new();
+            for item in table.range(prefix.as_str()..prefix_end.as_str())? {
+                let (k, v) = item?;
+                let key_str = k.value();
+                if key_str > up_to_key.as_str() {
+                    break;
+                }
+                let idx_key = bincode::deserialize::<FileMetadata>(v.value())
+                    .ok()
+                    .map(|m| format!("{}:{}", node_hex, m.id.0.as_simple()));
+                items.push((key_str.to_string(), idx_key));
+            }
+            items
+        };
+
+        if to_remove.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+        {
+            let mut queue_table = txn.open_table(META_QUEUE_TABLE)?;
+            let mut idx_table = txn.open_table(META_QUEUE_IDX)?;
+
+            for (queue_key, idx_key_opt) in &to_remove {
+                if let Some(idx_key) = idx_key_opt {
+                    // Extract idx_seq before any mutable borrow of idx_table.
+                    let idx_seq_opt: Option<u64> = match idx_table.get(idx_key.as_str())? {
+                        Some(v) if v.value().len() == 8 => {
+                            Some(u64::from_be_bytes(v.value().try_into().unwrap()))
+                        }
+                        _ => None,
+                    };
+                    if let Some(idx_seq) = idx_seq_opt {
+                        let seq_hex = queue_key.split(':').nth(1).unwrap_or("0");
+                        let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
+                        if idx_seq == seq {
+                            idx_table.remove(idx_key.as_str())?;
                         }
                     }
                 }
-                to_remove.push(key);
+                queue_table.remove(queue_key.as_str())?;
             }
         }
-        for key in to_remove {
-            self.meta_queue.remove(key)?;
-        }
+        txn.commit()?;
         Ok(())
     }
 
-    /// Deduplication pass: for each node prefix, retain only the last entry per FileId.
-    /// Called before draining to avoid sending redundant updates for files written many times.
+    /// Deduplication pass: retain only the last entry per FileId for `node_id`.
     pub fn compact_meta_queue_for_node(&self, node_id: NodeId) -> Result<()> {
-        let prefix = format!("{}:", Self::node_id_hex(node_id));
-        // Build map: file_id -> (key, seq) — keep highest seq per file_id.
-        let mut seen: std::collections::HashMap<FileId, (sled::IVec, u64)> = std::collections::HashMap::new();
-        for item in self.meta_queue.scan_prefix(prefix.as_bytes()) {
-            let (key, value) = item?;
-            let key_str = std::str::from_utf8(&key).unwrap_or("");
-            let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
-            let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
-            if let Ok(m) = bincode::deserialize::<FileMetadata>(&value) {
-                let entry = seen.entry(m.id).or_insert((key.clone(), seq));
-                if seq > entry.1 {
-                    self.meta_queue.remove(&entry.0)?;
-                    *entry = (key, seq);
-                } else if seq < entry.1 {
-                    self.meta_queue.remove(&key)?;
+        let node_hex = Self::node_id_hex(node_id);
+        let prefix = format!("{}:", node_hex);
+        let prefix_end = prefix_next(&prefix);
+
+        // Read all entries first.
+        let entries: Vec<(String, u64, FileId)> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(META_QUEUE_TABLE)?;
+            let mut result = Vec::new();
+            for item in table.range(prefix.as_str()..prefix_end.as_str())? {
+                let (k, v) = item?;
+                let key_str = k.value();
+                let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
+                let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
+                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                    result.push((key_str.to_string(), seq, m.id));
                 }
             }
+            result
+        };
+
+        // Determine which keys to remove (keep highest seq per FileId).
+        let mut seen: std::collections::HashMap<FileId, (String, u64)> =
+            std::collections::HashMap::new();
+        let mut to_remove: Vec<String> = Vec::new();
+        for (key, seq, file_id) in entries {
+            let entry = seen.entry(file_id).or_insert((key.clone(), seq));
+            if seq > entry.1 {
+                to_remove.push(entry.0.clone());
+                *entry = (key, seq);
+            } else if seq < entry.1 {
+                to_remove.push(key);
+            }
+        }
+
+        if !to_remove.is_empty() {
+            let mut txn = self.db.begin_write()?;
+            txn.set_durability(Durability::None);
+            {
+                let mut table = txn.open_table(META_QUEUE_TABLE)?;
+                for key in &to_remove {
+                    table.remove(key.as_str())?;
+                }
+            }
+            txn.commit()?;
         }
         Ok(())
     }
 
     /// Record the last sequence number received from the leader (follower-only).
     pub fn set_follower_sequence(&self, seq: u64) -> Result<()> {
-        self.follower_seq_tree.insert(b"follower_seq", &seq.to_be_bytes())?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(COUNTERS_TABLE)?;
+            table.insert("follower_seq", seq)?;
+        }
+        txn.commit()?;
         Ok(())
     }
 
     /// Get the last sequence number received from the leader (follower-only).
     pub fn get_follower_sequence(&self) -> Result<u64> {
-        Ok(self.follower_seq_tree.get(b"follower_seq")?
-            .as_ref()
-            .and_then(|b| b.as_ref().try_into().ok())
-            .map(u64::from_be_bytes)
-            .unwrap_or(0))
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(COUNTERS_TABLE)?;
+        Ok(table.get("follower_seq")?.map(|v| v.value()).unwrap_or(0))
     }
 
     /// Return a compact inventory of all known files: Vec<(FileId, modified_at)>.
-    /// Used by a newly-elected leader to diff against follower inventories.
     pub fn get_file_inventory(&self) -> Result<Vec<(FileId, u64)>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILE_TABLE)?;
         let mut out = Vec::new();
-        for item in self.db.scan_prefix(b"file:") {
-            let (_, value) = item?;
-            match bincode::deserialize::<FileMetadata>(&value) {
-                Ok(m) => out.push((m.id, m.modified_at)),
-                Err(_) => continue,
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                out.push((m.id, m.modified_at));
             }
         }
         Ok(out)
@@ -642,227 +881,101 @@ impl MetadataStore {
 
     /// Fetch a batch of file records by ID. Missing IDs are silently skipped.
     pub fn get_files_batch(&self, ids: &[FileId]) -> Result<Vec<FileMetadata>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILE_TABLE)?;
         let mut out = Vec::new();
         for id in ids {
-            if let Ok(Some(m)) = self.get_file(id) {
-                out.push(m);
+            let key = format!("{}", id);
+            if let Some(v) = table.get(key.as_str())? {
+                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                    out.push(m);
+                }
             }
         }
         Ok(out)
     }
 
-    /// Scan all file records and call `f` for each deserialized FileMetadata.
-    /// Used by the catch-up pass on leader election — avoids exposing `db` directly.
+    /// Scan all file records, calling `f` for each deserialized FileMetadata.
     pub fn scan_all_files<F>(&self, mut f: F) -> Result<usize>
     where
         F: FnMut(FileMetadata) -> Result<()>,
     {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FILE_TABLE)?;
         let mut count = 0usize;
-        for item in self.db.scan_prefix(b"file:") {
-            let (_, value) = item?;
-            match bincode::deserialize::<FileMetadata>(&value) {
-                Ok(m) => { f(m)?; count += 1; }
-                Err(_) => continue,
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                f(m)?;
+                count += 1;
             }
         }
         Ok(count)
     }
 
     // -------------------------------------------------------------------------
-
-    /// List all chunk IDs known in metadata (for leader-coordinated healing).
-    /// Returns every chunk ID that has a location record, regardless of which
-    /// node holds it locally.
-    pub fn list_all_chunk_ids(&self) -> Result<Vec<dfs_common::ChunkId>> {
-        let prefix = b"chunk:";
-        let mut ids = Vec::new();
-        for item in self.db.scan_prefix(prefix) {
-            let (_, value) = item?;
-            if let Ok(location) = bincode::deserialize::<ChunkLocation>(&value) {
-                ids.push(location.chunk_id);
-            }
-        }
-        Ok(ids)
-    }
-
-    /// Return all chunk location records in one sled scan.
-    /// Used by the discovery pass to build per-node chunk assignment maps without
-    /// a second pass over the DB.
-    pub fn list_all_chunk_locations(&self) -> Result<Vec<ChunkLocation>> {
-        let prefix = b"chunk:";
-        let mut locations = Vec::new();
-        for item in self.db.scan_prefix(prefix) {
-            let (_, value) = item?;
-            if let Ok(loc) = bincode::deserialize::<ChunkLocation>(&value) {
-                locations.push(loc);
-            }
-        }
-        Ok(locations)
-    }
-
-    /// Stream chunk location records, calling `f` for each one.
-    /// Return `false` from `f` to stop iteration early.
-    /// More memory-efficient than list_all_chunk_locations when only a subset is needed.
-    pub fn scan_chunk_locations<F>(&self, mut f: F) -> Result<()>
-    where
-        F: FnMut(ChunkLocation) -> bool,
-    {
-        let prefix = b"chunk:";
-        for item in self.db.scan_prefix(prefix) {
-            let (_, value) = item?;
-            if let Ok(loc) = bincode::deserialize::<ChunkLocation>(&value) {
-                if !f(loc) {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Build the set of chunk IDs referenced by any live file in metadata.
-    /// Used by the healer to identify orphaned chunk: records (chunks whose
-    /// file metadata was deleted but whose chunk: record was not cleaned up).
-    /// Scanning file records is cheaper than a reverse index for our file counts.
-    pub fn live_chunk_ids(&self) -> Result<std::collections::HashSet<dfs_common::ChunkId>> {
-        let mut live = std::collections::HashSet::new();
-        let prefix = b"file:";
-        for item in self.db.scan_prefix(prefix) {
-            let (_, value) = item?;
-            if let Ok(metadata) = bincode::deserialize::<FileMetadata>(&value) {
-                for loc in &metadata.chunk_locations {
-                    live.insert(loc.chunk_id);
-                }
-            }
-        }
-        Ok(live)
-    }
-
-    /// Rebuild chunk: routing table entries from file metadata.
-    ///
-    /// If an earlier healer bug (aggressive orphan purge, crash mid-write, etc.) deleted
-    /// chunk: records while the file: record still references those chunks, the healer
-    /// can't discover them via its normal sled scan and healing stalls permanently.
-    ///
-    /// This repair pass reads every file: record, extracts each ChunkLocation embedded in
-    /// chunk_locations, and writes a chunk: entry if one doesn't already exist.  Existing
-    /// entries are left untouched — this only fills gaps.
-    ///
-    /// Returns (written, skipped) counts.
-    pub fn rebuild_chunk_locations_from_files(&self) -> Result<(usize, usize)> {
-        let mut written = 0usize;
-        let mut skipped = 0usize;
-
-        for item in self.db.scan_prefix(b"file:") {
-            let (_, value) = item?;
-            let metadata: FileMetadata = match bincode::deserialize::<FileMetadata>(&value) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            for loc in &metadata.chunk_locations {
-                let key = self.chunk_key(&loc.chunk_id);
-                if self.db.get(&key)?.is_none() {
-                    let bytes = bincode::serialize(loc)
-                        .context("Failed to serialize ChunkLocation during rebuild")?;
-                    self.db.insert(key, bytes)?;
-                    warn!(
-                        "Rebuilt missing chunk: record for {} (file: {})",
-                        loc.chunk_id, metadata.path
-                    );
-                    written += 1;
-                } else {
-                    skipped += 1;
-                }
-            }
-        }
-
-        if written > 0 {
-            info!(
-                "Chunk location rebuild: {} missing records restored, {} already present",
-                written, skipped
-            );
-        }
-        Ok((written, skipped))
-    }
-
-    /// Get chunk location information
-    pub fn get_chunk_location(&self, chunk_id: &dfs_common::ChunkId) -> Result<Option<ChunkLocation>> {
-        let key = self.chunk_key(chunk_id);
-
-        match self.db.get(&key)? {
-            Some(value) => Ok(Some(bincode::deserialize::<ChunkLocation>(&value)
-                .with_context(|| format!("Failed to deserialize chunk location {}", chunk_id))?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Delete chunk location
-    pub fn delete_chunk_location(&self, chunk_id: &dfs_common::ChunkId) -> Result<()> {
-        let key = self.chunk_key(chunk_id);
-        self.db.remove(key)?;
-        Ok(())
-    }
-
-    /// Flush all pending writes to disk (for durability)
-    pub fn flush(&self) -> Result<()> {
-        self.db.flush()?;
-        Ok(())
-    }
-
-    /// Get database statistics
-    pub fn get_stats(&self) -> Result<MetadataStats> {
-        let file_count = self.list_files()?.len();
-        let size_on_disk = self.db.size_on_disk()?;
-
-        Ok(MetadataStats {
-            file_count,
-            size_on_disk,
-        })
-    }
+    // Delete queue
+    // -------------------------------------------------------------------------
 
     /// Enqueue a pending deletion. Written BEFORE metadata is removed so the
     /// chunk list is never lost even on a crash mid-delete.
     pub fn enqueue_delete(&self, entry: &dfs_common::DeleteQueueEntry) -> Result<()> {
-        let key = format!("del:{}", entry.file_id).into_bytes();
+        let key = format!("del:{}", entry.file_id);
         let value = bincode::serialize(entry)
             .context("Failed to serialize DeleteQueueEntry")?;
-        self.delete_queue.insert(key, value)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+        txn.commit()?;
         Ok(())
     }
 
     /// Remove a completed deletion from the queue (called after all nodes ack).
     pub fn dequeue_delete(&self, file_id: &FileId) -> Result<()> {
-        let key = format!("del:{}", file_id).into_bytes();
-        self.delete_queue.remove(key)?;
+        let key = format!("del:{}", file_id);
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
+            table.remove(key.as_str())?;
+        }
+        txn.commit()?;
         Ok(())
     }
 
-    /// Return all pending delete queue entries (for GetDeleteQueue / leader merge).
+    /// Return all pending delete queue entries.
     pub fn get_all_pending_deletes(&self) -> Result<Vec<dfs_common::DeleteQueueEntry>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DELETE_QUEUE_TABLE)?;
         let mut entries = Vec::new();
-        for item in self.delete_queue.scan_prefix(b"del:") {
-            let (_, value) = item?;
-            match bincode::deserialize::<dfs_common::DeleteQueueEntry>(&value) {
-                Ok(entry) => entries.push(entry),
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            match bincode::deserialize::<dfs_common::DeleteQueueEntry>(v.value()) {
+                Ok(e) => entries.push(e),
                 Err(e) => warn!("Skipping corrupt delete queue entry: {}", e),
             }
         }
         Ok(entries)
     }
 
-    /// Key for file metadata
-    fn file_key(&self, file_id: &FileId) -> Vec<u8> {
-        format!("file:{}", file_id).into_bytes()
+    // -------------------------------------------------------------------------
+    // Misc
+    // -------------------------------------------------------------------------
+
+    /// No-op: redb commits are immediately durable by default.
+    pub fn flush(&self) -> Result<()> {
+        Ok(())
     }
 
-    /// Key for path index
-    fn path_key(&self, path: &str) -> Vec<u8> {
-        format!("path:{}", path).into_bytes()
-    }
-
-    /// Key for chunk location
-    fn chunk_key(&self, chunk_id: &dfs_common::ChunkId) -> Vec<u8> {
-        format!("chunk:{}", chunk_id).into_bytes()
+    /// Get database statistics.
+    pub fn get_stats(&self) -> Result<MetadataStats> {
+        let file_count = self.list_files()?.len();
+        let size_on_disk = std::fs::metadata(&self.db_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Ok(MetadataStats { file_count, size_on_disk })
     }
 }
 
@@ -952,6 +1065,7 @@ mod tests {
             checksum: [2u8; 32],
             file_offset: None,
             written_at: None,
+            client_write_seq: None,
         };
 
         store.put_chunk_location(&location).unwrap();

@@ -4664,15 +4664,20 @@ impl Filesystem for DfsFilesystem {
                         {
                             let t_bp = std::time::Instant::now();
                             const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+                            // Scale cap with concurrent write sessions: each active inode needs
+                            // BUFFER_CHUNKS slots, but cap total at PIPELINE_MAX_ITEMS × CHUNK_SIZE
+                            // to bound memory under many concurrent writers.
+                            let effective_cap = (write_buffers.len().max(1) * global_write_buffer_cap)
+                                .min(PIPELINE_MAX_ITEMS * CHUNK_SIZE);
                             loop {
                                 let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                                let fill_pct = current * 100 / global_write_buffer_cap.max(1);
+                                let fill_pct = current * 100 / effective_cap.max(1);
                                 let delay_ms: u64 = if fill_pct < 75 { 0 }
                                     else if fill_pct < 90 { 1 }
                                     else if fill_pct < 100 { 5 }
                                     else {
                                         if t_bp.elapsed() >= BP_TIMEOUT {
-                                            error!("write fast-path: ino={} bp timeout — EIO (global_buffered={}  cap={})", ino, current, global_write_buffer_cap);
+                                            error!("write fast-path: ino={} bp timeout — EIO (global_buffered={}  cap={} active_inodes={})", ino, current, effective_cap, write_buffers.len());
                                             // counter was never incremented (moved to after back-pressure)
                                             reply.error(libc::EIO);
                                             return;
@@ -5017,9 +5022,11 @@ impl Filesystem for DfsFilesystem {
                     // flush tasks needed to drain the buffer.
                     let t_bp_start = std::time::Instant::now();
                     const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+                    let effective_cap = (write_buffers.len().max(1) * global_write_buffer_cap)
+                        .min(PIPELINE_MAX_ITEMS * CHUNK_SIZE);
                     loop {
                         let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                        let fill_pct = current * 100 / global_write_buffer_cap.max(1);
+                        let fill_pct = current * 100 / effective_cap.max(1);
                         let delay_ms: u64 = if fill_pct < 75 {
                             0
                         } else if fill_pct < 90 {
@@ -5028,8 +5035,8 @@ impl Filesystem for DfsFilesystem {
                             5
                         } else {
                             if t_bp_start.elapsed() >= BP_TIMEOUT {
-                                error!("write: ino={} back-pressure timeout after {:?} — flush pipeline stuck, returning EIO",
-                                       ino, t_bp_start.elapsed());
+                                error!("write: ino={} back-pressure timeout after {:?} — EIO (global_buffered={}  cap={} active_inodes={})",
+                                       ino, t_bp_start.elapsed(), current, effective_cap, write_buffers.len());
                                 reply.error(libc::EIO);
                                 return;
                             }

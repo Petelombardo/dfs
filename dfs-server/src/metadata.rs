@@ -251,12 +251,24 @@ impl MetadataStore {
                 } else if let Some(file_offset) = loc.file_offset {
                     // Rule 2: different chunk_id at same offset — keep the newer one.
                     if let Some(existing_loc) = existing_by_offset.get(&file_offset) {
-                        let keep_existing = match (loc.client_write_seq, existing_loc.client_write_seq) {
-                            (Some(inc), Some(ext)) => ext > inc,
-                            (Some(_), None)        => false,
-                            (None, Some(_))        => true,
-                            (None, None)           => {
-                                existing_loc.written_at.unwrap_or(0) > loc.written_at.unwrap_or(0)
+                        // If the incoming file-level write_seq is strictly higher, the incoming
+                        // chunk is definitively from a later write session and always wins,
+                        // regardless of per-chunk client_write_seq. This covers the case where
+                        // the incoming chunk has client_write_seq=None (e.g. fresh overwrite after
+                        // a patch that did carry a client_write_seq).
+                        let incoming_file_seq_wins = metadata.write_seq > 0
+                            && existing.write_seq > 0
+                            && metadata.write_seq > existing.write_seq;
+                        let keep_existing = if incoming_file_seq_wins {
+                            false
+                        } else {
+                            match (loc.client_write_seq, existing_loc.client_write_seq) {
+                                (Some(inc), Some(ext)) => ext > inc,
+                                (Some(_), None)        => false,
+                                (None, Some(_))        => true,
+                                (None, None)           => {
+                                    existing_loc.written_at.unwrap_or(0) > loc.written_at.unwrap_or(0)
+                                }
                             }
                         };
                         if keep_existing {
@@ -519,6 +531,36 @@ impl MetadataStore {
         {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             table.remove(key.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Batch apply chunk location updates — all puts and deletes in one write transaction.
+    /// Use this from async code via `spawn_blocking` to avoid blocking Tokio worker threads
+    /// on redb's exclusive write lock.
+    pub fn batch_update_chunk_locations(
+        &self,
+        puts: &[ChunkLocation],
+        deletes: &[ChunkId],
+    ) -> Result<()> {
+        if puts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(CHUNK_TABLE)?;
+            for location in puts {
+                let key = format!("{}", location.chunk_id);
+                let value = bincode::serialize(location)
+                    .context("Failed to serialize chunk location")?;
+                table.insert(key.as_str(), value.as_slice())?;
+            }
+            for chunk_id in deletes {
+                let key = format!("{}", chunk_id);
+                table.remove(key.as_str())?;
+            }
         }
         txn.commit()?;
         Ok(())

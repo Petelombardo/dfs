@@ -2631,13 +2631,17 @@ impl Server {
         if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
             Ok(location)
         } else {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
             Ok(ChunkLocation {
                 chunk_id: *chunk_id,
                 nodes: Vec::new(),
                 size,
                 checksum: chunk_id.hash,
-                file_offset: None,  // Legacy fallback when metadata not found
-                written_at: None,
+                file_offset: None,
+                written_at: Some(now_ms),
                 client_write_seq: None,
             })
         }

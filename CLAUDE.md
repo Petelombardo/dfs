@@ -12,6 +12,8 @@ Band-aids to the code are a last-resort.  We should always try to fix the underl
 Propose protocol updates if they will make our app more efficient.
 Do not push code until we verify that we do not have regressions.  Our test script is ./scripts/test_local_suite.sh
 Do not run the test suite, let the user run it and report issues.
+While it is important to make our code robust, it's imperative that we prioritize resolving the root cause of any problems.  When we identify a new problem that is difficult to resolve, we should attempt to create a local test to reproduce it so that we can easily validate when our solution works.
+
 
 ## Local test suite
 

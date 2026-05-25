@@ -467,7 +467,8 @@ impl HealingManager {
             /// live_chunk_ids from file records (deep scan only, else None).
             live_chunks: Option<HashSet<ChunkId>>,
             /// All chunk IDs from routing table (deep scan only, for orphan diff).
-            all_chunk_ids: Option<Vec<ChunkId>>,
+            /// Paired with written_at (ms since epoch) for the grace-period check.
+            all_chunk_ids: Option<Vec<(ChunkId, Option<u64>)>>,
         }
 
         // Fast path: no sled scan at all. We fetch locations only for chunks already
@@ -488,10 +489,10 @@ impl HealingManager {
                 let live = Some(metadata_scan.live_chunk_ids()?);
 
                 let mut chunks_to_check = Vec::new();
-                let mut all_chunk_ids_for_orphan_check: Vec<ChunkId> = Vec::new();
+                let mut all_chunk_ids_for_orphan_check: Vec<(ChunkId, Option<u64>)> = Vec::new();
 
                 metadata_scan.scan_chunk_locations(|loc| {
-                    all_chunk_ids_for_orphan_check.push(loc.chunk_id);
+                    all_chunk_ids_for_orphan_check.push((loc.chunk_id, loc.written_at));
                     // Deep: include all live chunks for HasChunks verification.
                     if let Some(ref live_set) = live {
                         if live_set.contains(&loc.chunk_id) {
@@ -532,13 +533,44 @@ impl HealingManager {
         let mut purged_orphans: Vec<ChunkId> = Vec::new();
         let mut new_candidates: HashSet<ChunkId> = HashSet::new();
 
+        // Pending DB writes — applied in a single spawn_blocking after all classification.
+        // Direct calls to metadata.put_chunk_location() / delete_chunk_location() call
+        // redb's begin_write() which blocks the OS thread. Under a heal storm with many
+        // concurrent async tasks all hitting begin_write(), every Tokio worker thread can
+        // end up blocked on the mutex, freezing the entire async runtime.
+        let mut db_puts: Vec<ChunkLocation> = Vec::new();
+        let mut db_deletes: Vec<ChunkId> = Vec::new();
+        // Physical file deletions for orphaned chunks — applied in the same spawn_blocking.
+        let mut disk_deletes: Vec<ChunkId> = Vec::new();
+
         // --- Orphan detection (deep scan only) ---
         if let (Some(ref live_chunks), Some(all_chunk_ids)) = (live_chunks_opt.as_ref(), all_chunk_ids_opt) {
+            // Grace period: chunks written within this window are never touched by the
+            // orphan purge, even if they're absent from live file metadata.  The META
+            // QUEUE can lag many minutes behind chunk writes on large files, so a short
+            // two-pass guard (2 × 5 min) is not sufficient.  30 minutes comfortably
+            // covers any realistic META QUEUE backlog.
+            const ORPHAN_GRACE_SECS: u64 = 1800;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
             // Snapshot prev_candidates and immediately drop the read lock so we can
             // take the write lock at the end of this block without deadlocking.
             let prev_candidates: HashSet<ChunkId> = self.orphan_candidates.read().await.clone();
-            for chunk_id in all_chunk_ids {
+            for (chunk_id, written_at_ms) in all_chunk_ids {
                 if !live_chunks.contains(&chunk_id) {
+                    // Skip chunks that were recently registered in the routing table —
+                    // their file metadata may still be in transit through the META QUEUE.
+                    let age_secs = written_at_ms
+                        .map(|ts| now_ms.saturating_sub(ts) / 1000)
+                        .unwrap_or(u64::MAX);
+                    if age_secs < ORPHAN_GRACE_SECS {
+                        debug!("Orphan grace: skipping {} (written {}s ago, grace={}s)", chunk_id, age_secs, ORPHAN_GRACE_SECS);
+                        continue;
+                    }
+
                     if !quorum {
                         debug!("Skipping orphan purge for {} — no quorum", chunk_id);
                         self.pending_healing.write().await.remove(&chunk_id);
@@ -546,17 +578,13 @@ impl HealingManager {
                     }
                     if prev_candidates.contains(&chunk_id) {
                         debug!("Purging orphaned chunk location record and physical file: {}", chunk_id);
-                        if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
-                            warn!("Failed to purge orphaned chunk location {}: {}", chunk_id, e);
-                        } else {
-                            // Also delete the physical file on this node — the routing table
-                            // purge alone leaves chunk files on disk indefinitely (e.g. after
-                            // a node misses DeleteChunk RPCs while offline).
-                            if let Err(e) = self.storage.delete_chunk(&chunk_id) {
-                                debug!("Orphan {} not on local disk (ok): {}", chunk_id, e);
-                            }
-                            purged_orphans.push(chunk_id);
-                        }
+                        // Deferred: collected into db_deletes/disk_deletes and applied in
+                        // spawn_blocking below. Optimistically add to purged_orphans for
+                        // broadcasting — if the db delete fails it logs a warning and
+                        // the purge is retried next cycle.
+                        db_deletes.push(chunk_id);
+                        disk_deletes.push(chunk_id);
+                        purged_orphans.push(chunk_id);
                         self.pending_healing.write().await.remove(&chunk_id);
                         orphan_count += 1;
                     } else {
@@ -736,11 +764,8 @@ impl HealingManager {
                     written_at: location.written_at,
                     client_write_seq: None,
                 };
-                if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
-                    warn!("Failed to prune removed nodes from chunk {} metadata: {}", chunk_id, e);
-                } else {
-                    location_updates.push(updated_location.clone());
-                }
+                db_puts.push(updated_location.clone());
+                location_updates.push(updated_location);
             }
 
             // Ghost node pruning: only remove a node from metadata after the healing
@@ -772,11 +797,8 @@ impl HealingManager {
                         written_at: location.written_at,
                         client_write_seq: None,
                     };
-                    if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
-                        warn!("Failed to prune ghost nodes from chunk {} metadata: {}", chunk_id, e);
-                    } else {
-                        location_updates.push(updated_location.clone());
-                    }
+                    db_puts.push(updated_location.clone());
+                    location_updates.push(updated_location);
                 } else {
                     debug!(
                         "Chunk {} — {} online node(s) didn't confirm holding it, waiting for delay before pruning: {:?}",
@@ -827,9 +849,7 @@ impl HealingManager {
                         "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
                         chunk_id, location.nodes.len()
                     );
-                    if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
-                        warn!("Failed to purge unrecoverable chunk {} metadata: {}", chunk_id, e);
-                    }
+                    db_deletes.push(chunk_id);
                     self.pending_healing.write().await.remove(&chunk_id);
                     continue;
                 } else {
@@ -867,11 +887,8 @@ impl HealingManager {
                     written_at: location.written_at,
                     client_write_seq: None,
                 };
-                if let Err(e) = self.metadata.put_chunk_location(&updated_location) {
-                    warn!("Failed to reconcile chunk {} routing table: {}", chunk_id, e);
-                } else {
-                    location_updates.push(updated_location.clone());
-                }
+                db_puts.push(updated_location.clone());
+                location_updates.push(updated_location.clone());
                 let new_count = updated_location.nodes.len();
                 (updated_location, new_count)
             } else {
@@ -950,6 +967,36 @@ impl HealingManager {
             }
         }
 
+        // Apply all accumulated metadata writes in a single spawn_blocking call.
+        // This is the key fix for the runtime deadlock: redb's begin_write() is a
+        // synchronous exclusive lock. Calling it from async code during a healing
+        // storm (many concurrent tasks) blocks all Tokio worker threads, freezing
+        // the runtime. One batched spawn_blocking keeps the OS thread off the
+        // async executor and reduces total lock contention to a single acquisition.
+        if !db_puts.is_empty() || !db_deletes.is_empty() || !disk_deletes.is_empty() {
+            let metadata = Arc::clone(&self.metadata);
+            let storage = Arc::clone(&self.storage);
+            let has_orphans = !disk_deletes.is_empty();
+            let result = tokio::task::spawn_blocking(move || {
+                metadata.batch_update_chunk_locations(&db_puts, &db_deletes)?;
+                for chunk_id in &disk_deletes {
+                    if let Err(e) = storage.delete_chunk(chunk_id) {
+                        debug!("Orphan {} not on local disk (ok): {}", chunk_id, e);
+                    }
+                }
+                if has_orphans {
+                    // Compact redb after bulk orphan purge so the OS can reclaim page-cache.
+                    metadata.flush()?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Batch metadata update failed: {}", e),
+                Err(e) => warn!("Batch metadata update spawn_blocking panicked: {}", e),
+            }
+        }
+
         // Update alive_nodes_cache so drain_heal_queue can read fresh presence data
         // without waiting for another scan. Under-replicated and over-replicated chunks
         // both need this; drain_heal_queue() reads the cache for all work it executes.
@@ -970,11 +1017,6 @@ impl HealingManager {
 
         if orphan_count > 0 {
             info!("Purged {} orphaned chunk location records", orphan_count);
-            // Flush sled after bulk orphan purge so the B-tree compacts and the OS
-            // can reclaim page-cache memory from the now-smaller DB file.
-            if let Err(e) = self.metadata.flush() {
-                warn!("Failed to flush metadata after orphan purge: {}", e);
-            }
         }
 
         // Batch-broadcast all chunk location updates accumulated during this pass.
@@ -1393,10 +1435,15 @@ impl HealingManager {
                 client_write_seq: None,
             };
 
-            if let Err(e) = metadata.put_chunk_location(&updated_location) {
-                warn!("Failed to update chunk location after healing {}: {}", chunk_id, e);
-            } else {
-                Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
+            let meta = Arc::clone(metadata);
+            let loc = updated_location.clone();
+            let store_result = tokio::task::spawn_blocking(move || meta.put_chunk_location(&loc)).await;
+            match store_result {
+                Ok(Ok(())) => {
+                    Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
+                }
+                Ok(Err(e)) => warn!("Failed to update chunk location after healing {}: {}", chunk_id, e),
+                Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
             }
 
             pending_healing.write().await.remove(chunk_id);
@@ -1500,11 +1547,16 @@ impl HealingManager {
             client_write_seq: None,
         };
 
-        if let Err(e) = metadata.put_chunk_location(&updated_location) {
-            warn!("Failed to update chunk location after cleanup of {}: {}", chunk_id, e);
-        } else {
-            Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
-            info!("Excess replica cleanup complete for chunk {}", chunk_id);
+        let meta = Arc::clone(metadata);
+        let loc = updated_location.clone();
+        let store_result = tokio::task::spawn_blocking(move || meta.put_chunk_location(&loc)).await;
+        match store_result {
+            Ok(Ok(())) => {
+                Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
+                info!("Excess replica cleanup complete for chunk {}", chunk_id);
+            }
+            Ok(Err(e)) => warn!("Failed to update chunk location after cleanup of {}: {}", chunk_id, e),
+            Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
         }
 
         Ok(())

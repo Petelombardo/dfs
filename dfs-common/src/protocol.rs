@@ -691,7 +691,26 @@ pub enum Response {
         items: Vec<FileMetadata>,
     },
 
+    /// Error response
+    Error {
+        message: String,
+        code: ErrorCode,
+    },
+
+    /// The chunk_id in a PatchChunk/MultiPatch request doesn't match the server's
+    /// record for (file_id, chunk_idx). Patch was NOT applied. Client should update
+    /// its local chunk map to use current_chunk_id and retry.
+    /// MUST stay at the end of this enum — appending preserves existing variant
+    /// indices so old servers remain wire-compatible with new clients/servers.
+    ChunkStale {
+        /// The chunk_id the server believes is current for this (file_id, chunk_idx).
+        current_chunk_id: ChunkId,
+        /// Replica nodes holding current_chunk_id.
+        current_nodes: Vec<NodeId>,
+    },
+
     /// Per-node ops/sec statistics (response to GetNodeStats).
+    /// APPENDED at end to preserve wire compatibility with older nodes.
     NodeStats {
         /// Reads in the most recently completed 1-second window.
         reads_live: u64,
@@ -715,24 +734,6 @@ pub enum Response {
         meta_avg_1h: u64,
         /// Node uptime in seconds.
         uptime_secs: u64,
-    },
-
-    /// Error response
-    Error {
-        message: String,
-        code: ErrorCode,
-    },
-
-    /// The chunk_id in a PatchChunk/MultiPatch request doesn't match the server's
-    /// record for (file_id, chunk_idx). Patch was NOT applied. Client should update
-    /// its local chunk map to use current_chunk_id and retry.
-    /// MUST stay at the end of this enum — appending preserves existing variant
-    /// indices so old servers remain wire-compatible with new clients/servers.
-    ChunkStale {
-        /// The chunk_id the server believes is current for this (file_id, chunk_idx).
-        current_chunk_id: ChunkId,
-        /// Replica nodes holding current_chunk_id.
-        current_nodes: Vec<NodeId>,
     },
 }
 

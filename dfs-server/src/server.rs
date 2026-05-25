@@ -3,6 +3,7 @@ use crate::cluster::ClusterManager;
 use crate::healing::HealingManager;
 use crate::metadata::MetadataStore;
 use crate::network::{MessageHandler, NetworkClient};
+use crate::stats::OpsTracker;
 use crate::storage::ChunkStorage;
 use anyhow::{Context, Result};
 use dfs_common::{
@@ -141,6 +142,11 @@ pub struct Server {
     /// this, the second patch passes the stale check and enters spawn_blocking
     /// while the first is still renaming A→B, and fails with "file not found".
     chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
+
+    /// Per-node ops/sec tracker — read, write, and metadata op counts in a
+    /// 3600-bucket ring (one bucket per second). Near-zero overhead: atomic
+    /// fetch_add per op, single mutex acquire per second for the ring write.
+    ops_tracker: Arc<OpsTracker>,
 }
 
 impl Server {
@@ -183,6 +189,7 @@ impl Server {
             file_write_seqs: Arc::new(DashMap::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             chunk_patch_locks: Arc::new(DashMap::new()),
+            ops_tracker: Arc::new(OpsTracker::new()),
             sled_write_tx: {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
                 let meta_bg = metadata.clone();
@@ -1051,6 +1058,7 @@ impl Server {
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
             Request::ReadChunk { chunk_id, sequential_hint, client_write_seq } => {
+                self.ops_tracker.inc_read();
                 if let Some((idx, total)) = sequential_hint {
                     debug!("ReadChunk {} with sequential hint: {}/{} chunks", chunk_id, idx, total);
                     // TODO: Use hint for server-side prefetching
@@ -1058,13 +1066,17 @@ impl Server {
                 self.handle_read_chunk(chunk_id, client_write_seq).await
             },
             Request::ReadChunkRange { chunk_id, offset, length, client_write_seq } => {
+                self.ops_tracker.inc_read();
                 self.handle_read_chunk_range(chunk_id, offset, length, client_write_seq).await
             }
             Request::WriteChunk {
                 chunk_id,
                 data,
                 checksum,
-            } => self.handle_write_chunk(chunk_id, data, checksum).await,
+            } => {
+                self.ops_tracker.inc_write();
+                self.handle_write_chunk(chunk_id, data, checksum).await
+            }
             Request::TombstoneChunk { chunk_id } => {
                 self.chunk_tombstones.insert(chunk_id);
                 Response::Ok { data: None }
@@ -1134,22 +1146,39 @@ impl Server {
                 self.handle_prefetch_hint(chunk_ids).await
             }
             Request::GetFileMetadataByPath { path, if_modified_since } => {
+                self.ops_tracker.inc_meta();
                 self.handle_get_file_metadata_by_path(path, if_modified_since).await
             }
             Request::PutFileMetadata { metadata } => {
+                self.ops_tracker.inc_meta();
                 self.handle_put_file_metadata(metadata).await
             }
-            Request::ListDirectory { path } => self.handle_list_directory(path).await,
-            Request::WriteFile { data } => self.handle_write_file(data).await,
-            Request::WriteFileLocalOnly { data, file_offset } => self.handle_write_file_local_only(data, file_offset).await,
+            Request::ListDirectory { path } => {
+                self.ops_tracker.inc_meta();
+                self.handle_list_directory(path).await
+            }
+            Request::WriteFile { data } => {
+                self.ops_tracker.inc_write();
+                self.handle_write_file(data).await
+            }
+            Request::WriteFileLocalOnly { data, file_offset } => {
+                self.ops_tracker.inc_write();
+                self.handle_write_file_local_only(data, file_offset).await
+            }
             Request::PatchChunk { chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data } => {
+                self.ops_tracker.inc_write();
                 self.handle_patch_chunk(chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data).await
             }
             Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq } => {
+                self.ops_tracker.inc_write();
                 self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq).await
             }
-            Request::DeleteFile { path } => self.handle_delete_file(path).await,
+            Request::DeleteFile { path } => {
+                self.ops_tracker.inc_meta();
+                self.handle_delete_file(path).await
+            }
             Request::RenameFile { old_path, new_path } => {
+                self.ops_tracker.inc_meta();
                 self.handle_rename_file(old_path, new_path).await
             }
 
@@ -1177,7 +1206,25 @@ impl Server {
             }
 
             Request::AppendFile { file_id, data, expected_offset } => {
+                self.ops_tracker.inc_write();
                 self.handle_append_file(file_id, data, expected_offset).await
+            }
+
+            Request::GetNodeStats => {
+                let snap = self.ops_tracker.get_stats();
+                Response::NodeStats {
+                    reads_live: snap.reads_live,
+                    writes_live: snap.writes_live,
+                    meta_live: snap.meta_live,
+                    reads_peak_1h: snap.reads_peak_1h,
+                    writes_peak_1h: snap.writes_peak_1h,
+                    meta_peak_1h: snap.meta_peak_1h,
+                    total_peak_1h: snap.total_peak_1h,
+                    reads_avg_1h: snap.reads_avg_1h,
+                    writes_avg_1h: snap.writes_avg_1h,
+                    meta_avg_1h: snap.meta_avg_1h,
+                    uptime_secs: snap.uptime_secs,
+                }
             }
 
             _ => Response::Error {
@@ -2859,6 +2906,18 @@ impl Server {
     /// rebuilds chunk_locations from the leader's authoritative chunk_map before
     /// sending — client-originated chunk_locations in pending_broadcasts are ignored.
     /// A full-sweep every 5 minutes catches followers that missed dirty-file pushes.
+    pub fn start_ops_tracker_loop(self: Arc<Self>) {
+        let tracker = self.ops_tracker.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                tracker.tick();
+            }
+        });
+    }
+
     pub fn start_metadata_healer_loop(self: Arc<Self>) {
         let server = self;
         tokio::spawn(async move {
@@ -5530,7 +5589,7 @@ mod tests {
         }
 
         // Test read
-        let response = server.handle_read_chunk(chunk_id).await;
+        let response = server.handle_read_chunk(chunk_id, None).await;
 
         match response {
             Response::ChunkData { data: read_data, .. } => {

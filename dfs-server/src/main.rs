@@ -11,6 +11,7 @@ mod metadata;
 mod metadata_sql;
 mod network;
 mod server;
+mod stats;
 mod storage;
 
 use anyhow::Result;
@@ -234,6 +235,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     ));
     healing.clone().start().await;
     server.set_healing_manager(healing.clone()).await;
+    server.clone().start_ops_tracker_loop();
     server.clone().start_metadata_dissemination_loop();
     server.clone().start_leader_forward_loop();
     server.clone().start_chunk_location_sync_loop();

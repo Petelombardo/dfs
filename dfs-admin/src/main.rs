@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{error, info, warn, Level};
+use tracing::{error, warn, Level};
 
 #[derive(Parser)]
 #[command(name = "dfs-admin")]
@@ -55,6 +55,13 @@ enum Commands {
     Delete {
         #[command(subcommand)]
         cmd: DeleteCommands,
+    },
+
+    /// Show per-node ops/sec statistics (reads, writes, metadata)
+    Stats {
+        /// Refresh display every second (like watch)
+        #[arg(long)]
+        watch: bool,
     },
 }
 
@@ -176,6 +183,7 @@ async fn main() -> Result<()> {
         }
         Commands::File { cmd } => handle_file_command(cmd, &cluster_addrs, json_output).await?,
         Commands::Delete { cmd } => handle_delete_command(cmd, &cluster_addrs, json_output).await?,
+        Commands::Stats { watch } => handle_stats_command(&cluster_addrs, watch).await?,
     }
 
     Ok(())
@@ -1188,6 +1196,152 @@ async fn handle_delete_command(
         }
     }
     Ok(())
+}
+
+async fn handle_stats_command(cluster_addrs: &[SocketAddr], watch: bool) -> Result<()> {
+    // Discover all node addresses from cluster status so the user only needs to
+    // pass one seed address; we fan out to every node automatically.
+    let all_addrs: Vec<SocketAddr> = match send_request(cluster_addrs[0], Request::GetClusterStatus).await {
+        Ok(Response::ClusterStatus { nodes, .. }) => {
+            let mut addrs: Vec<SocketAddr> = nodes.iter().map(|n| n.addr).collect();
+            if addrs.is_empty() {
+                addrs = cluster_addrs.to_vec();
+            }
+            addrs.sort();
+            addrs
+        }
+        _ => cluster_addrs.to_vec(),
+    };
+
+    // Identify the leader by querying cluster status once.
+    let leader_addr: Option<SocketAddr> = match send_request(cluster_addrs[0], Request::GetClusterStatus).await {
+        Ok(Response::ClusterStatus { nodes, leader_node_id, .. }) => {
+            let lid = leader_node_id.or_else(|| {
+                nodes.iter()
+                    .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                    .map(|n| n.id)
+                    .min()
+            });
+            lid.and_then(|lid| nodes.iter().find(|n| n.id == lid).map(|n| n.addr))
+        }
+        _ => None,
+    };
+
+    loop {
+        // Query each node sequentially (5 nodes × ~10ms = ~50ms per refresh).
+        let mut rows: Vec<(SocketAddr, Option<Response>)> = Vec::new();
+        for &addr in &all_addrs {
+            let resp = send_request(addr, Request::GetNodeStats).await.ok();
+            rows.push((addr, resp));
+        }
+
+        if watch {
+            print!("\x1b[2J\x1b[H"); // clear screen, move to top-left
+        }
+
+        print_stats_table(&rows, leader_addr);
+
+        if !watch {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+
+    Ok(())
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+fn print_stats_table(rows: &[(SocketAddr, Option<Response>)], leader_addr: Option<SocketAddr>) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let hh = (ts % 86400) / 3600;
+    let mm = (ts % 3600) / 60;
+    let ss = ts % 60;
+
+    println!(
+        "DFS Cluster Ops/sec                                         {:02}:{:02}:{:02} UTC",
+        hh, mm, ss
+    );
+    println!();
+
+    let hdr = format!(
+        "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}  {}",
+        "Node", "Reads/s", "Writ/s", "Meta/s", "Total/s", "Peak 1h", "Avg 1h", "Uptime"
+    );
+    println!("{}", hdr);
+    println!("{}", "─".repeat(hdr.chars().count()));
+
+    let mut cluster_reads_live: u64 = 0;
+    let mut cluster_writes_live: u64 = 0;
+    let mut cluster_meta_live: u64 = 0;
+    let mut cluster_total_peak: u64 = 0;
+    let mut cluster_reads_avg: u64 = 0;
+    let mut cluster_writes_avg: u64 = 0;
+    let mut cluster_meta_avg: u64 = 0;
+    let mut nodes_with_data: usize = 0;
+
+    for (addr, resp) in rows {
+        let is_leader = leader_addr == Some(*addr);
+        let label = if is_leader {
+            format!("{} [L]", addr)
+        } else {
+            format!("{}", addr)
+        };
+
+        match resp {
+            Some(Response::NodeStats {
+                reads_live, writes_live, meta_live,
+                total_peak_1h, reads_avg_1h, writes_avg_1h, meta_avg_1h,
+                uptime_secs, ..
+            }) => {
+                let total_live = reads_live + writes_live + meta_live;
+                let total_avg = reads_avg_1h + writes_avg_1h + meta_avg_1h;
+                cluster_reads_live += reads_live;
+                cluster_writes_live += writes_live;
+                cluster_meta_live += meta_live;
+                cluster_total_peak = cluster_total_peak.max(*total_peak_1h);
+                cluster_reads_avg += reads_avg_1h;
+                cluster_writes_avg += writes_avg_1h;
+                cluster_meta_avg += meta_avg_1h;
+                nodes_with_data += 1;
+                println!(
+                    "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}  {}",
+                    label,
+                    reads_live, writes_live, meta_live, total_live,
+                    total_peak_1h, total_avg,
+                    format_uptime(*uptime_secs)
+                );
+            }
+            _ => {
+                println!("{:<23} {}", label, "(unavailable)");
+            }
+        }
+    }
+
+    println!("{}", "─".repeat(hdr.chars().count()));
+
+    let cluster_total_live = cluster_reads_live + cluster_writes_live + cluster_meta_live;
+    let cluster_total_avg = cluster_reads_avg + cluster_writes_avg + cluster_meta_avg;
+    let avg_divisor = nodes_with_data.max(1) as u64;
+    println!(
+        "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}",
+        "Cluster",
+        cluster_reads_live, cluster_writes_live, cluster_meta_live, cluster_total_live,
+        cluster_total_peak,
+        cluster_total_avg / avg_divisor,
+    );
+    println!();
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {

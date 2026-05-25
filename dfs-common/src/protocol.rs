@@ -488,6 +488,10 @@ pub enum Request {
         items: Vec<FileMetadata>,
         up_to_sequence: u64,
     },
+
+    /// Request per-node ops/sec statistics (reads, writes, metadata).
+    /// Returns NodeStats. Safe to call on any node at any time.
+    GetNodeStats,
 }
 
 /// Response types
@@ -685,6 +689,32 @@ pub enum Response {
     /// Response to GetFileMetadataBatch — full metadata for the requested files.
     FileMetadataBatch {
         items: Vec<FileMetadata>,
+    },
+
+    /// Per-node ops/sec statistics (response to GetNodeStats).
+    NodeStats {
+        /// Reads in the most recently completed 1-second window.
+        reads_live: u64,
+        /// Writes in the most recently completed 1-second window.
+        writes_live: u64,
+        /// Metadata ops in the most recently completed 1-second window.
+        meta_live: u64,
+        /// Peak reads/s over the last hour (0 if uptime < 1s).
+        reads_peak_1h: u64,
+        /// Peak writes/s over the last hour.
+        writes_peak_1h: u64,
+        /// Peak meta ops/s over the last hour.
+        meta_peak_1h: u64,
+        /// Peak total ops/s over the last hour (may exceed sum of individual peaks).
+        total_peak_1h: u64,
+        /// Average reads/s over the last hour.
+        reads_avg_1h: u64,
+        /// Average writes/s over the last hour.
+        writes_avg_1h: u64,
+        /// Average meta ops/s over the last hour.
+        meta_avg_1h: u64,
+        /// Node uptime in seconds.
+        uptime_secs: u64,
     },
 
     /// Error response

@@ -250,35 +250,46 @@ impl Server {
     /// Update the chunk map for a single file — called after every metadata write or heal.
     async fn chunk_map_update(&self, metadata: &FileMetadata) {
         if !metadata.chunk_locations.is_empty() {
-            // Ghost-chunk diagnostic: only log when we're OVERWRITING an existing
-            // entry where the old chunk_id EXISTS on disk but the new one DOESN'T.
-            // This is the reversion event: a broadcast is replacing a valid local chunk
-            // with a stale hash — the exact condition that causes infinite ChunkStale loops.
-            // Normal cases (fresh recordings writing to other nodes) are filtered out because
-            // their existing entry also has no local file (written_at=None, not local).
-            if let Some(existing_entry) = self.chunk_map.get(&metadata.id) {
+            // Atomic staleness guard: build the chunk_locations to store, preserving any
+            // existing chunk whose written_at is newer than the incoming one. This prevents
+            // the GHOST-reversion race where a concurrent RCL updates the chunk_map to a
+            // newer chunk Y AFTER a broadcast pre-guard read it (and decided to keep Y) but
+            // BEFORE this insert runs — causing the stale broadcast to overwrite Y with X.
+            //
+            // Moving the guard here makes the check+insert atomic for all callers, not just
+            // the ones with pre-guards (handle_replicate_metadata[_batch]). The disk-existence
+            // check is kept for the diagnostic warning but the BLOCK is timestamp-only so it
+            // applies even when neither file exists locally (e.g., on non-replica nodes).
+            let new_locs: Vec<ChunkLocation> = if let Some(existing_entry) = self.chunk_map.get(&metadata.id) {
                 let (existing_locs, _) = existing_entry.value();
-                for loc in &metadata.chunk_locations {
+                let mut locs = metadata.chunk_locations.clone();
+                for loc in locs.iter_mut() {
                     if loc.file_offset.is_none() { continue; }
-                    let incoming_path = self.storage.get_chunk_path(&loc.chunk_id);
-                    if !incoming_path.exists() {
-                        // Incoming doesn't exist — only a ghost if the existing DID exist
-                        if let Some(old_loc) = existing_locs.iter().find(|l| l.file_offset == loc.file_offset) {
-                            if old_loc.chunk_id != loc.chunk_id {
-                                let old_path = self.storage.get_chunk_path(&old_loc.chunk_id);
-                                if old_path.exists() {
-                                    // REVERSION: existing file will be "orphaned" from chunk_map
-                                    warn!("[GHOST-reversion] chunk_map_update: path={} offset={:?} seq={} OLD={} (exists=true ts={:?}) → NEW={} (exists=false ts={:?}) — stale broadcast overwriting a local chunk",
+                    if let Some(old_loc) = existing_locs.iter().find(|l| l.file_offset == loc.file_offset) {
+                        if old_loc.chunk_id == loc.chunk_id { continue; }
+                        // Only block when the incoming chunk carries an explicit timestamp.
+                        // Fresh writes use written_at=None and must always be accepted.
+                        if let Some(incoming_ts) = loc.written_at {
+                            let existing_ts = old_loc.written_at.unwrap_or(0);
+                            if existing_ts > incoming_ts {
+                                // Incoming is older — preserve the existing chunk.
+                                let incoming_missing = !self.storage.get_chunk_path(&loc.chunk_id).exists();
+                                if incoming_missing {
+                                    warn!("[GHOST-reversion] chunk_map_update: path={} offset={:?} seq={} OLD={} (ts={:?}) → NEW={} (exists=false ts={:?}) — stale broadcast BLOCKED",
                                         metadata.path, loc.file_offset, metadata.write_seq,
                                         old_loc.chunk_id, old_loc.written_at,
                                         loc.chunk_id, loc.written_at);
                                 }
+                                *loc = old_loc.clone();
                             }
                         }
                     }
                 }
-            }
-            self.chunk_map.insert(metadata.id, (metadata.chunk_locations.clone(), metadata.modified_at));
+                locs
+            } else {
+                metadata.chunk_locations.clone()
+            };
+            self.chunk_map.insert(metadata.id, (new_locs, metadata.modified_at));
         }
         // If the file has no chunks yet (new empty file), no map entry is needed.
     }

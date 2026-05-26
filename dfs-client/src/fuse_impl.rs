@@ -1594,17 +1594,6 @@ impl FlushHandle {
                                     self.client.chunk_cache.invalidate(&exp).await;
                                 }
                             }
-                            // Patch succeeded — reset failure counter and record the
-                            // server-confirmed chunk_id. This becomes the authoritative base
-                            // for the next patch, bypassing metadata_cache / recent_chunk_writes.
-                            if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                if let Ok(mut state) = state_arc.try_lock() {
-                                    if let Some(slot) = state.slots.get_mut(&chunk_idx) {
-                                        slot.consecutive_patch_failures = 0;
-                                        slot.server_chunk_id = Some(loc.chunk_id);
-                                    }
-                                }
-                            }
                             (loc, sp)
                         }
                         Err(e) => {
@@ -1795,16 +1784,7 @@ impl FlushHandle {
                             (new_location.chunk_id, file_id, std::time::Instant::now(), new_location.nodes.clone()),
                         );
                     }
-                    // Persist the canonical write-pair for this chunk in the session write buffer.
-                    // This overrides sorted-first-2 on the next flush: same 2 nodes every time,
-                    // regardless of what the healer adds to metadata_cache between patches.
-                    if !new_location.nodes.is_empty() {
-                        if let Some(state_arc) = self.write_buffers.get(&ino) {
-                            if let Ok(mut state) = state_arc.try_lock() {
-                                state.canonical_write_nodes.insert(chunk_idx, new_location.nodes.clone());
-                            }
-                        }
-                    }
+                    // canonical_write_nodes is updated in the guaranteed lock().await below.
                     // Update recent_chunk_writes after every patch so that if write_buffers is
                     // cleared (safe_to_remove=true removes the slot + server_chunk_id), the
                     // next flush still has the correct base chunk_id rather than reverting to
@@ -1900,6 +1880,18 @@ impl FlushHandle {
                             _ => true,
                         };
                         if id_ok {
+                            // Guaranteed update for server_chunk_id and canonical_write_nodes.
+                            // Must live here (not try_lock above) — QEMU write() holds this lock
+                            // frequently, and a skipped try_lock leaves server_chunk_id stale,
+                            // causing every subsequent flush to use the wrong base chunk_id.
+                            // Covers both first-success and retry-success paths.
+                            if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                slot.server_chunk_id = Some(new_location.chunk_id);
+                                slot.consecutive_patch_failures = 0;
+                            }
+                            if !new_location.nodes.is_empty() {
+                                state.canonical_write_nodes.insert(chunk_idx, new_location.nodes.clone());
+                            }
                             let new_data_arrived = state.slots.get(&chunk_idx).map(|s| {
                                 s.data.len() > patched_len || s.last_modified > last_modified_snap
                             }).unwrap_or(false);

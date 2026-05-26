@@ -4537,7 +4537,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
                 written_at: None, // fresh writes use None — see build_chunk_locations_from_ids
-                client_write_seq: None,
+                client_write_seq: file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e)),
             };
 
             chunk_locations.push(location);
@@ -4738,7 +4738,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         if nodes.len() < 2 {
             // Single-node cluster: fall back to server-side replication
             let (chunk_ids, chunk_sizes, replica_nodes_per_chunk) = self.write_data_single_chunk_tracked(data).await?;
-            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk);
+            let cws = file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e));
+            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk, cws);
             return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
@@ -5053,7 +5054,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         checksum: corrected_id.hash,
                         file_offset: current_location.file_offset,
                         written_at: None,
-                        client_write_seq: None,
+                        client_write_seq: file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e)),
                     };
                     continue;
                 }
@@ -5081,7 +5082,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             checksum: new_chunk_id.hash,
             file_offset: current_location.file_offset,
             written_at: Some(patch_written_at),
-            client_write_seq: None,
+            client_write_seq: file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e)),
         };
         let leader_addr = *self.leader_addr.read().await;
         // Send ReplicateChunkLocation only to the leader — same rationale as MultiPatch path.
@@ -5409,7 +5410,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             checksum: current_chunk_id.hash,
                             file_offset: current_location.file_offset,
                             written_at: None,
-                            client_write_seq: None,
+                            client_write_seq: file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e)),
                         }));
                     }
                     replica_results.push((addr, Err(anyhow::anyhow!("chunk stale"))));
@@ -5576,6 +5577,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         chunk_sizes: &[u64],
         file_offset: u64,
         replica_nodes_per_chunk: Vec<Vec<NodeId>>,
+        client_write_seq: Option<u64>,
     ) -> Vec<dfs_common::ChunkLocation> {
         // written_at intentionally None for fresh writes. Using the client clock here
         // creates a timestamp that can exceed any server-side patch_ts (client ahead of
@@ -5593,7 +5595,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
                 written_at: None,
-                client_write_seq: None,
+                client_write_seq,
             });
             current_offset += size;
         }
@@ -5877,6 +5879,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                         Some(e) => e,
                         None => break,
                     };
+
+                    // Second deleted_ids check: the file may have been deleted while
+                    // this entry was already popped and in the worker's hands — cancel()
+                    // can only remove from the queue, not from an already-popped entry.
+                    if client.metadata_queue.deleted_ids.contains(&entry.metadata.id) {
+                        debug!("[META QUEUE] skip-deleted (post-pop) id={} path={}",
+                            entry.metadata.id, entry.metadata.path);
+                        if let Some(tx) = entry.done_tx { let _ = tx.send(()); }
+                        continue;
+                    }
 
                     // Retry until the leader confirms. Each failure re-identifies the leader.
                     // Each attempt is capped at 5s so a saturated/slow leader can't block

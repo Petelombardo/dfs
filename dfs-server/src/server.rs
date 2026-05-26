@@ -228,7 +228,9 @@ impl Server {
             let result = metadata.scan_files(|file| {
                 total += 1;
                 if !file.chunk_locations.is_empty() {
-                    chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
+                    // or_insert_with: don't overwrite entries already added by incoming RCLs
+                    // while the scan is running — the RCL is always newer than redb state.
+                    chunk_map.entry(file.id).or_insert_with(|| (file.chunk_locations.clone(), file.modified_at));
                     built += 1;
                 }
                 // Seed file_write_seqs so the bypass guard has a correct baseline
@@ -267,21 +269,34 @@ impl Server {
                     if loc.file_offset.is_none() { continue; }
                     if let Some(old_loc) = existing_locs.iter().find(|l| l.file_offset == loc.file_offset) {
                         if old_loc.chunk_id == loc.chunk_id { continue; }
-                        // Only block when the incoming chunk carries an explicit timestamp.
-                        // Fresh writes use written_at=None and must always be accepted.
-                        if let Some(incoming_ts) = loc.written_at {
-                            let existing_ts = old_loc.written_at.unwrap_or(0);
-                            if existing_ts > incoming_ts {
-                                // Incoming is older — preserve the existing chunk.
-                                let incoming_missing = !self.storage.get_chunk_path(&loc.chunk_id).exists();
-                                if incoming_missing {
-                                    warn!("[GHOST-reversion] chunk_map_update: path={} offset={:?} seq={} OLD={} (ts={:?}) → NEW={} (exists=false ts={:?}) — stale broadcast BLOCKED",
-                                        metadata.path, loc.file_offset, metadata.write_seq,
-                                        old_loc.chunk_id, old_loc.written_at,
-                                        loc.chunk_id, loc.written_at);
+                        // Staleness guard: prefer client_write_seq (monotone, clock-agnostic)
+                        // then fall back to written_at. Rejects stale follower metadata that
+                        // arrives via push_held_file_metadata_to with a lower write_seq.
+                        let stale = match (loc.client_write_seq, old_loc.client_write_seq) {
+                            (Some(inc), Some(ext)) => inc < ext,
+                            (Some(_), None)        => false, // incoming has seq → newer
+                            (None, Some(_))        => true,  // existing has seq, incoming doesn't → stale
+                            (None, None)           => {
+                                if let Some(incoming_ts) = loc.written_at {
+                                    let existing_ts = old_loc.written_at.unwrap_or(0);
+                                    existing_ts > incoming_ts
+                                } else {
+                                    // No seq or timestamp on either side (pre-Fix-C legacy data).
+                                    // Treat as stale if the incoming chunk_id doesn't exist on
+                                    // disk — it was already superseded by a later patch.
+                                    !self.storage.get_chunk_path(&loc.chunk_id).exists()
                                 }
-                                *loc = old_loc.clone();
                             }
+                        };
+                        if stale {
+                            let incoming_missing = !self.storage.get_chunk_path(&loc.chunk_id).exists();
+                            if incoming_missing {
+                                warn!("[GHOST-reversion] chunk_map_update: path={} offset={:?} seq={} OLD={} (cws={:?}) → NEW={} (exists=false cws={:?}) — stale broadcast BLOCKED",
+                                    metadata.path, loc.file_offset, metadata.write_seq,
+                                    old_loc.chunk_id, old_loc.client_write_seq,
+                                    loc.chunk_id, loc.client_write_seq);
+                            }
+                            *loc = old_loc.clone();
                         }
                     }
                 }
@@ -1748,7 +1763,7 @@ impl Server {
                     checksum: location.checksum,
                     file_offset: location.file_offset.or(existing.file_offset),
                     written_at: existing.written_at.or(location.written_at),
-                    client_write_seq: None,
+                    client_write_seq: location.client_write_seq.or(existing.client_write_seq),
                 }
             }
             Ok(None) => {
@@ -3257,16 +3272,18 @@ impl Server {
         if incoming_write_seq > stored_write_seq {
             self.file_write_seqs.insert(metadata.id, incoming_write_seq);
         }
-        // The leader's chunk_map is the sole authoritative source of chunk locations,
-        // updated exclusively by ReplicateChunkLocation (actual confirmed write results).
-        // The incoming chunk_locations from the client's metadata_cache are a mixed
-        // snapshot: correct hashes for already-written chunks, stale hashes for chunks
-        // not yet written in this session. Using them as-is would overwrite authoritative
-        // chunk_map entries and create ghost chunks — a hash in the map that doesn't exist
-        // on any node, causing infinite ChunkStale retry loops.
+        // The leader's chunk_map is updated by ReplicateChunkLocation (RCL) after each
+        // confirmed write. When RCL succeeds, chunk_map is authoritative and newer than
+        // the client's metadata_cache snapshot. But if all 4 RCL attempts fail silently,
+        // chunk_map retains the OLD chunk_id while the client's metadata holds the NEW one.
+        // Blindly preferring chunk_map in that case would commit the stale chunk_id and
+        // cause subsequent reads to return old data (observed as ext4 inode refcount errors
+        // on VM disk images).
         //
-        // Rule: prefer chunk_map for every offset it knows about; fall back to incoming
-        // only for offsets the leader hasn't seen yet (RCL not yet received).
+        // Rule: prefer chunk_map only when it's provably newer — same written_at comparison
+        // used by chunk_map_update's GHOST-reversion guard. Fresh writes (written_at=None)
+        // from the client always win; a timestamped server entry only wins if its timestamp
+        // is strictly greater than the client's.
         let metadata = {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
@@ -3274,7 +3291,16 @@ impl Server {
                 for loc in m.chunk_locations.iter_mut() {
                     if let Some(file_offset) = loc.file_offset {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
-                            *loc = map_loc.clone();
+                            let should_use_server = if let Some(client_ts) = loc.written_at {
+                                let server_ts = map_loc.written_at.unwrap_or(0);
+                                server_ts > client_ts
+                            } else {
+                                // Client has no timestamp: fresh write, always newer than any existing entry
+                                false
+                            };
+                            if should_use_server {
+                                *loc = map_loc.clone();
+                            }
                         }
                     }
                 }

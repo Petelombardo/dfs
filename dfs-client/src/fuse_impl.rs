@@ -122,6 +122,12 @@ struct ChunkSlot {
     /// Prevents a second concurrent flush task from picking the same slot.
     /// Cleared on failure (so it can be retried); on success the slot is removed.
     flushing: bool,
+    /// Intra-chunk end offset of the most recent app write to this slot.
+    /// Used to detect when an incoming write breaks the sequential pattern — a transition
+    /// from sequential appends to a random offset signals that the existing buffered data
+    /// should be flushed immediately rather than waiting for the timer.
+    /// None until the first app write lands in this slot.
+    last_sequential_end: Option<usize>,
     /// Consecutive patch failures for this slot. When this exceeds MAX_PATCH_FAILURES
     /// the flush falls back to a fresh write, preventing an infinite retry loop when
     /// clock skew or pre-existing corruption keeps the stale-broadcast guard from
@@ -144,6 +150,7 @@ impl ChunkSlot {
             dirty_ranges: Vec::new(),
             consecutive_patch_failures: 0,
             flushing: false,
+            last_sequential_end: None,
             server_chunk_id: None,
         }
     }
@@ -179,9 +186,8 @@ impl ChunkSlot {
         // chunk, no patch/rename/re-hash. Equivalent to a brand new write.
         //
         // Partial overwrites (random writes, small VM ops) don't dispatch here —
-        // they're handled by the 50ms stale-flush timer, which provides backpressure
-        // (max uncommitted ≈ write_rate × 50ms) and batches scattered writes into
-        // fewer, larger patches. fsync/release always drain all slots via urgent=true.
+        // they're flushed by the write-pattern-change detector (sequential→random
+        // transition triggers an immediate notify) or by fsync/release (urgent=true).
         let total_dirty: usize = self.dirty_ranges.iter().map(|&(s, e)| e - s).sum();
         total_dirty >= self.data.len()
     }
@@ -227,6 +233,10 @@ struct InodeWriteState {
     /// in metadata_cache and recent_chunk_writes. This prevents the ChunkStale cascade
     /// where alternating between different node pairs creates divergent chunk versions.
     canonical_write_nodes: HashMap<u64, Vec<dfs_common::NodeId>>,
+    /// Chunk index of the most recent write_at call. Used to detect when the caller
+    /// jumps to a different chunk, so the previous chunk's partial slot can be flushed
+    /// immediately rather than waiting for the timer.
+    last_written_chunk: Option<u64>,
 }
 
 impl InodeWriteState {
@@ -240,6 +250,7 @@ impl InodeWriteState {
             is_truncated_session: false,
             expected_file_id: None,
             chunk_flush_waiters: HashMap::new(),
+            last_written_chunk: None,
         }
     }
 
@@ -252,15 +263,34 @@ impl InodeWriteState {
         (file_offset % CHUNK_SIZE as u64) as usize
     }
 
-    /// Write bytes into the appropriate slot(s).  Returns chunk indices that became full.
-    fn write_at(&mut self, file_offset: u64, data: &[u8]) -> Vec<u64> {
-        let mut full_slots = Vec::new();
+    /// Write bytes into the appropriate slot(s). Returns true if any write broke the
+    /// sequential pattern of an existing slot (indicating the flush worker should be
+    /// woken immediately to drain buffered data before it gets fragmented further).
+    fn write_at(&mut self, file_offset: u64, data: &[u8]) -> bool {
+        let mut pattern_changed = false;
         let mut remaining = data;
         let mut cur_offset = file_offset;
 
         while !remaining.is_empty() {
             let idx = Self::chunk_index(cur_offset);
             let intra = Self::intra_offset(cur_offset);
+
+            // Cross-chunk pattern change: if this write lands in a different chunk than
+            // the last one, the previous chunk's slot has been abandoned mid-fill.
+            // Signal an immediate flush so its buffered data doesn't wait for the timer.
+            if let Some(prev_idx) = self.last_written_chunk {
+                if prev_idx != idx {
+                    if let Some(prev_slot) = self.slots.get(&prev_idx) {
+                        if (prev_slot.real_data_end > 0 || prev_slot.gap_filled_prefix > 0)
+                            && !prev_slot.flushing
+                        {
+                            pattern_changed = true;
+                        }
+                    }
+                }
+            }
+            self.last_written_chunk = Some(idx);
+
             let flushed = self.flushed_sizes.get(&idx).copied().unwrap_or(0);
             let slot = self.slots.entry(idx).or_insert_with(|| {
                 let mut s = ChunkSlot::new();
@@ -271,9 +301,25 @@ impl InodeWriteState {
                     debug!("write_at: chunk={} created slot with gap_fill={} from flushed_sizes", idx, flushed);
                     s.data.resize(flushed, 0u8);
                     s.gap_filled_prefix = flushed;
+                    // last_sequential_end left as None: the first write to this slot is
+                    // always treated as sequential so that overwrite workloads (VM disk
+                    // sequential writes to an existing image) can accumulate normally.
+                    // Random writes are caught on the second write via gap_filled_prefix > 0.
                 }
                 s
             });
+
+            // Detect write-pattern change: if this write doesn't start exactly where
+            // the last one ended, the caller has switched from sequential to random
+            // I/O. Signal an immediate flush of whatever is already buffered so
+            // partial-chunk data doesn't sit in the buffer indefinitely.
+            // Also treat any write to a gap-filled slot as a pattern change — the slot
+            // represents already-committed server data, so every write is a random
+            // patch regardless of position, and should be flushed promptly.
+            let expected = slot.last_sequential_end.unwrap_or(intra);
+            if intra != expected && (slot.real_data_end > 0 || slot.gap_filled_prefix > 0) {
+                pattern_changed = true;
+            }
 
             // Grow slot to cover intra_offset (may need zero-fill for sparse-within-chunk)
             let pre_fill_len = slot.data.len();
@@ -330,16 +376,15 @@ impl InodeWriteState {
             // one patch per contiguous written region, skipping gaps of synthetic zeros.
             slot.mark_dirty(intra, write_end);
             slot.last_modified = SystemTime::now();
+            // Advance sequential tracking regardless of whether this write was sequential.
+            // The next write will compare its start against this end position.
+            slot.last_sequential_end = Some(write_end);
             // A real write() supersedes the open-time snapshot for this chunk.
             // The stale-write guard uses chunk_ids_at_open to detect sessions that
             // buffered content at open time and would revert a competing write — but
             // once an actual write() has landed here, the slot has newer data than
             // anything on the server and must not be discarded.
             self.chunk_ids_at_open.remove(&idx);
-
-            if slot.is_full() {
-                full_slots.push(idx);
-            }
 
             debug!("write_at: chunk={} file_offset={} intra={} write_end={} len={} | slot_len={} gap_prefix={} real_end={} dirty_ranges={:?}",
                    idx, write_start_offset, intra, write_end, n, slot.data.len(), slot.gap_filled_prefix, slot.real_data_end,
@@ -349,12 +394,19 @@ impl InodeWriteState {
             cur_offset += n as u64;
         }
 
-        full_slots
+        pattern_changed
     }
 
-    /// How many dirty bytes are buffered across all slots
+    /// How many dirty bytes are buffered across all slots.
+    /// Counts only application-written ranges, not gap-fill prefix bytes.
+    /// Gap-fill is a layout artifact (zeroes representing committed server data)
+    /// and must not contribute to back-pressure — otherwise a single 4KB write
+    /// to an existing 4MB chunk registers as 4MB of pressure, causing writes to
+    /// stall after just 16 slots even though only ~64KB of real data is dirty.
     fn buffered_bytes(&self) -> usize {
-        self.slots.values().map(|s| s.data.len()).sum()
+        self.slots.values()
+            .map(|s| s.dirty_ranges.iter().map(|&(start, end)| end - start).sum::<usize>())
+            .sum()
     }
 
     /// Slots that are full and not yet claimed by a flush task.
@@ -2787,7 +2839,7 @@ impl DfsFilesystem {
                         // Exception: skip if a release() flush task is already in flight for
                         // this inode — it will handle the slot, and racing it here would cause
                         // the stale-write guard to discard a legitimate second write (T7 race).
-                        const STALE_FLUSH_MS: u128 = 50;
+                        const STALE_FLUSH_MS: u128 = 2_000;
                         let release_inflight = release_in_flight_for_bg
                             .get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
                         // Skip if flush_all_pipelined is actively running for this inode.
@@ -4809,7 +4861,7 @@ impl Filesystem for DfsFilesystem {
                         let mut state = state_arc.blocking_lock();
                         {
                             let bytes_before = state.buffered_bytes();
-                            state.write_at(offset as u64, &data_vec);
+                            let pattern_changed = state.write_at(offset as u64, &data_vec);
                             let bytes_after = state.buffered_bytes();
                             let has_full = !state.full_slot_indices().is_empty();
                             drop(state);
@@ -4846,7 +4898,7 @@ impl Filesystem for DfsFilesystem {
                                 let mut counters = write_counters.write().unwrap();
                                 *counters.entry(ino).or_insert(0) += 1;
                             }
-                            if has_full {
+                            if has_full || pattern_changed {
                                 flush_handle.flush_notify.notify_one();
                             }
                             write_task_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -4988,7 +5040,7 @@ impl Filesystem for DfsFilesystem {
                             .clone();
                         let mut state = state_arc.lock().await;
                         let bytes_before = state.buffered_bytes();
-                        state.write_at(gap_write_offset, &padded);
+                        let pattern_changed = state.write_at(gap_write_offset, &padded);
                         // Mark the gap bytes as synthetic so flush doesn't mistake them
                         // for real app data when deciding whether to PatchChunk.
                         let gap_chunk_idx = InodeWriteState::chunk_index(gap_write_offset);
@@ -4998,14 +5050,14 @@ impl Filesystem for DfsFilesystem {
                         }
                         let added = state.buffered_bytes().saturating_sub(bytes_before);
 
-                        // Notify flush worker if chunks are now full (event-driven flush)
+                        // Notify flush worker if chunks are now full or write pattern changed.
                         let has_full_chunks = !state.full_slot_indices().is_empty();
                         drop(state);
                         if added > 0 {
                             global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
                         }
 
-                        if has_full_chunks {
+                        if has_full_chunks || pattern_changed {
                             flush_handle.flush_notify.notify_one();
                         }
 
@@ -5163,11 +5215,11 @@ impl Filesystem for DfsFilesystem {
                     let t_buf_start = std::time::Instant::now();
                     let mut state = state_arc.lock().await;
                     let bytes_before = state.buffered_bytes();
-                    state.write_at(write_offset, &data_vec);
+                    let pattern_changed = state.write_at(write_offset, &data_vec);
                     let added = state.buffered_bytes().saturating_sub(bytes_before);
 
-                    // Check if this write completed any 4MB chunks. If so, notify the flush
-                    // worker immediately (event-driven) instead of waiting for the 50ms ticker.
+                    // Notify the flush worker if a 4MB chunk is full or the write pattern
+                    // changed from sequential to random (event-driven, no timer needed).
                     let has_full_chunks = !state.full_slot_indices().is_empty();
                     drop(state);
 
@@ -5189,7 +5241,7 @@ impl Filesystem for DfsFilesystem {
                         }
                     }
 
-                    if has_full_chunks {
+                    if has_full_chunks || pattern_changed {
                         flush_handle.flush_notify.notify_one();
                     }
 

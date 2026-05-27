@@ -260,7 +260,14 @@ impl MetadataStore {
                             && existing.write_seq > 0
                             && metadata.write_seq > existing.write_seq;
                         let keep_existing = if incoming_file_seq_wins {
-                            false
+                            // File-level seq wins for fresh overwrites, but a chunk with a
+                            // higher existing client_write_seq is still authoritative —
+                            // prevents a stale broadcast (lower cws) from winning just
+                            // because the accompanying file write_seq happened to be higher.
+                            matches!(
+                                (loc.client_write_seq, existing_loc.client_write_seq),
+                                (Some(inc), Some(ext)) if ext > inc
+                            )
                         } else {
                             match (loc.client_write_seq, existing_loc.client_write_seq) {
                                 (Some(inc), Some(ext)) => ext > inc,

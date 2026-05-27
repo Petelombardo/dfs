@@ -909,6 +909,23 @@ impl Server {
             Err(e) => { warn!("catchup: spawn_blocking panic building inventory: {}", e); return; }
         };
 
+        // Build the set of files that are queued for deletion on this node.
+        // The leader is always in the initial DeleteFile fanout, so any pending
+        // delete will have an entry here. Catchup must not pull these files from
+        // followers — doing so would resurrect files the drain worker is about to
+        // remove. This is the primary cause of "all deleted files come back after
+        // redeploy": catchup fires immediately on leader election while the drain
+        // loop waits 30 s before its first pass.
+        let pending_delete_ids: std::collections::HashSet<FileId> = self.metadata
+            .get_all_pending_deletes()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.file_id)
+            .collect();
+        if !pending_delete_ids.is_empty() {
+            info!("catchup: skipping {} file(s) queued for deletion", pending_delete_ids.len());
+        }
+
         info!("catchup: starting with {} local file records", my_inventory.len());
 
         // --- Phase 1: pull anything we're missing from each follower ---
@@ -939,8 +956,13 @@ impl Server {
             };
 
             // Find files the follower has that we don't, or that are newer on the follower.
+            // Skip files in the pending delete queue — they were removed from our DB by
+            // handle_delete_file and would otherwise be resurrected here.
             let missing: Vec<FileId> = follower_inventory.iter()
                 .filter_map(|(id, follower_modified_at)| {
+                    if pending_delete_ids.contains(id) {
+                        return None;
+                    }
                     match my_inventory.get(id) {
                         None => Some(*id),  // we don't have it at all
                         Some(our_modified_at) if follower_modified_at > our_modified_at => Some(*id),
@@ -1045,10 +1067,10 @@ impl Server {
                 _ => std::collections::HashSet::new(),
             };
 
-            // Enqueue everything the follower is missing.
+            // Enqueue everything the follower is missing, excluding files queued for deletion.
             let node_id = node.id;
             let to_enqueue: Vec<FileId> = updated_inventory.keys()
-                .filter(|id| !follower_has.contains(id))
+                .filter(|id| !follower_has.contains(id) && !pending_delete_ids.contains(id))
                 .copied()
                 .collect();
 
@@ -3295,8 +3317,14 @@ impl Server {
                                 let server_ts = map_loc.written_at.unwrap_or(0);
                                 server_ts > client_ts
                             } else {
-                                // Client has no timestamp: fresh write, always newer than any existing entry
-                                false
+                                // No timestamp: use client_write_seq to distinguish a stale
+                                // replica broadcast (cws=None, server has cws=Some) from a
+                                // genuine fresh write (cws=Some or neither has a seq).
+                                match (loc.client_write_seq, map_loc.client_write_seq) {
+                                    (None, Some(_)) => true,          // server has seq, incoming doesn't → stale
+                                    (Some(inc), Some(ext)) => ext > inc, // server has higher seq → prefer server
+                                    _ => false,                        // incoming has seq or neither has one → accept
+                                }
                             };
                             if should_use_server {
                                 *loc = map_loc.clone();

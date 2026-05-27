@@ -407,6 +407,11 @@ struct FlushHandle {
     flush_in_flight: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>>,
     last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
     dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
+    /// Tracks when each directory was last invalidated (create/mkdir/unlink/rename).
+    /// readdir only inserts into dir_cache if the directory wasn't invalidated
+    /// DURING the in-flight list_directory fetch — prevents stale empty results
+    /// from being cached after a concurrent create() cleared the entry.
+    dir_cache_invalidated_at: Arc<DashMap<String, std::time::Instant>>,
     path_to_inode: Arc<RwLock<HashMap<String, u64>>>,
     /// Inodes that received a setattr(size=0) truncate while a flush was in progress.
     /// Prevents a racing flush from re-populating metadata with stale chunk locations.
@@ -1012,7 +1017,7 @@ impl FlushHandle {
                 }
                 // If not in dir cache yet, just invalidate so next readdir fetches fresh.
                 else {
-                    self.dir_cache.remove(&parent);
+                    DfsFilesystem::invalidate_dir_cache(&self.dir_cache, &self.dir_cache_invalidated_at, &parent);
                 }
             }
 
@@ -1709,8 +1714,24 @@ impl FlushHandle {
                                                             ino, chunk_idx);
                                                         slot_data = reconstructed;
                                                     } else {
-                                                        warn!("flush_buffer_async_one: ino={} chunk={} cache miss — fresh write will zero gap regions (potential data loss in bytes 0..{})",
+                                                        // Cache miss: the gap region (bytes 0..gap_filled_prefix) contains
+                                                        // zeros — not the real server data. A fresh write would overwrite
+                                                        // those bytes with zeros, permanently corrupting the chunk.
+                                                        // Return EIO so the kernel reports the error to the application;
+                                                        // the slot stays dirty and the next fsync retries cleanly.
+                                                        warn!("flush_buffer_async_one: ino={} chunk={} cache miss — aborting to prevent zeroing gap region bytes 0..{} (returning EIO)",
                                                             ino, chunk_idx, gap_filled_prefix);
+                                                        if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                                            let mut state = state_arc.lock().await;
+                                                            if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                                                                slot.flushing = false;
+                                                                slot.consecutive_patch_failures = 0;
+                                                            }
+                                                        }
+                                                        self.notify_chunk_flush_complete(ino, chunk_idx).await;
+                                                        return Err(anyhow::anyhow!(
+                                                            "chunk {} gap-fill cache miss: cannot safely fresh-write without zeroing real data", chunk_idx
+                                                        ));
                                                     }
                                                 }
                                                 break 'try_patch;
@@ -2129,7 +2150,7 @@ impl FlushHandle {
                                 entries.push(meta.clone());
                             }
                         } else {
-                            self.dir_cache.remove(&parent);
+                            DfsFilesystem::invalidate_dir_cache(&self.dir_cache, &self.dir_cache_invalidated_at, &parent);
                         }
                     }
                     self.last_metadata_update.insert(ino, std::time::Instant::now());
@@ -2461,6 +2482,11 @@ pub struct DfsFilesystem {
     /// Cache directory listings for 30 seconds to avoid repeated scans
     dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
 
+    /// Tracks when each directory was last invalidated (create/mkdir/unlink/rename).
+    /// readdir only inserts into dir_cache if the directory wasn't invalidated
+    /// DURING the in-flight list_directory fetch.
+    dir_cache_invalidated_at: Arc<DashMap<String, std::time::Instant>>,
+
     /// Filesystem stats cache: (total, free, avail, timestamp)
     /// Cache statfs results for 30 seconds to avoid repeated expensive queries
     statfs_cache: Arc<RwLock<Option<(u64, u64, u64, std::time::Instant)>>>,
@@ -2554,6 +2580,12 @@ pub struct DfsFilesystem {
     /// Hard cap on total write buffer bytes (~30% of available RAM, min 64MB).
     /// The write task delays reply.written() while this is exceeded, throttling the kernel.
     global_write_buffer_cap: usize,
+
+    /// Inodes for which a write buffer was created this session.
+    /// destroy() uses this to skip flushing metadata for read-only files whose
+    /// metadata_cache was populated only by warmup — flushing those with a
+    /// higher write_seq would reinforce any DB corruption already present.
+    written_inodes: Arc<dashmap::DashSet<u64>>,
 }
 
 impl DfsFilesystem {
@@ -2633,7 +2665,8 @@ impl DfsFilesystem {
 
         let dir_cache_shared: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>> =
             Arc::new(DashMap::new());
-
+        let dir_cache_invalidated_at_shared: Arc<DashMap<String, std::time::Instant>> =
+            Arc::new(DashMap::new());
 
         // Dedicated runtime for chunk network I/O during flush.
         // Isolated from the main runtime so flush sub-tasks (network writes) never
@@ -2696,6 +2729,7 @@ impl DfsFilesystem {
                 flush_in_flight: flush_in_flight_shared.clone(),
                 last_metadata_update: last_metadata_update_shared.clone(),
                 dir_cache: dir_cache_shared.clone(),
+                dir_cache_invalidated_at: dir_cache_invalidated_at_shared.clone(),
                 path_to_inode: path_to_inode_for_bg.clone(),
                 truncated_inodes: truncated_inodes_shared.clone(),
                 flush_runtime: flush_runtime.clone(),
@@ -2862,6 +2896,7 @@ impl DfsFilesystem {
             flush_in_flight: flush_in_flight_shared.clone(),
             last_metadata_update: last_metadata_update_shared.clone(),
             dir_cache: dir_cache_shared.clone(),
+            dir_cache_invalidated_at: dir_cache_invalidated_at_shared.clone(),
             path_to_inode: path_to_inode.clone(),
             truncated_inodes: truncated_inodes_shared.clone(),
             flush_runtime: flush_runtime.clone(),
@@ -2890,6 +2925,7 @@ impl DfsFilesystem {
             last_warm_offset: Arc::new(DashMap::new()),
             chunk_offset_cache: Arc::new(DashMap::new()),
             dir_cache: dir_cache_shared,
+            dir_cache_invalidated_at: dir_cache_invalidated_at_shared,
             statfs_cache: Arc::new(RwLock::new(None)),
             lock_manager: Arc::new(LockManager::new()),
             buffer_flush_threshold,
@@ -2911,6 +2947,7 @@ impl DfsFilesystem {
             global_buffered_bytes,
             flush_notify,
             global_write_buffer_cap,
+            written_inodes: Arc::new(dashmap::DashSet::new()),
         })
     }
 
@@ -3024,6 +3061,19 @@ impl DfsFilesystem {
     /// Convert FileMetadata to FUSE FileAttr
     fn metadata_to_attr(&self, ino: u64, metadata: &FileMetadata) -> FileAttr {
         Self::metadata_to_attr_static(ino, metadata)
+    }
+
+    /// Invalidate the dir_cache entry for `dir_path` and record the invalidation
+    /// timestamp. readdir async tasks check this timestamp after their in-flight
+    /// list_directory() fetch returns; if the directory was invalidated during the
+    /// fetch, the (potentially stale) response is discarded rather than cached.
+    fn invalidate_dir_cache(
+        dir_cache: &DashMap<String, (Vec<FileMetadata>, std::time::Instant)>,
+        dir_cache_invalidated_at: &DashMap<String, std::time::Instant>,
+        dir_path: &str,
+    ) {
+        dir_cache.remove(dir_path);
+        dir_cache_invalidated_at.insert(dir_path.to_string(), std::time::Instant::now());
     }
 
     /// Convert FileMetadata to FUSE FileAttr (static version for async contexts)
@@ -3218,6 +3268,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let release_in_flight = self.release_in_flight.clone();
+        let written_inodes = self.written_inodes.clone();
 
         let flush_handle = FlushHandle {
             client: client.clone(),
@@ -3226,6 +3277,7 @@ impl Filesystem for DfsFilesystem {
             flush_in_flight: flush_in_flight.clone(),
             last_metadata_update: self.last_metadata_update.clone(),
             dir_cache: self.dir_cache.clone(),
+            dir_cache_invalidated_at: self.dir_cache_invalidated_at.clone(),
             path_to_inode: self.path_to_inode.clone(),
             truncated_inodes: self.truncated_inodes.clone(),
             flush_runtime: self.flush_runtime.clone(),
@@ -3293,12 +3345,16 @@ impl Filesystem for DfsFilesystem {
             // (race with create()'s async task) or where the buffer was flushed by the
             // background flusher but the metadata commit was skipped due to cache miss.
             {
+                // Only flush metadata for inodes that were actively written this session.
+                // Flushing read-only files whose metadata_cache was populated solely by
+                // warmup would commit chunks with a higher write_seq, reinforcing any
+                // DB corruption already present on the server.
                 let to_commit: Vec<_> = metadata_cache.iter()
-                    .filter(|e| !e.chunk_locations.is_empty())
+                    .filter(|e| !e.chunk_locations.is_empty() && written_inodes.contains(e.key()))
                     .map(|e| e.clone())
                     .collect();
                 if !to_commit.is_empty() {
-                    info!("destroy: committing metadata for {} inodes with chunks", to_commit.len());
+                    info!("destroy: committing metadata for {} written inodes with chunks", to_commit.len());
                     for meta in to_commit {
                         client.flush_metadata_sync(&meta).await;
                     }
@@ -4243,12 +4299,19 @@ impl Filesystem for DfsFilesystem {
         // Clone all Arc fields needed in the spawned task.
         let client = self.client.clone();
         let dir_cache = self.dir_cache.clone();
+        let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let metadata_cache = self.metadata_cache.clone();
         let path_to_inode = self.path_to_inode.clone();
         let next_inode = self.next_inode.clone();
         let last_metadata_update = self.last_metadata_update.clone();
         let write_buffers = self.write_buffers.clone();
         let write_counters = self.write_counters.clone();
+
+        // Snapshot the invalidation time BEFORE the fetch begins. After the fetch
+        // returns, we only cache the result if this hasn't advanced — i.e., no
+        // concurrent create/mkdir/unlink invalidated the directory during the fetch.
+        let invalidation_at_fetch_start = dir_cache_invalidated_at
+            .get(&path).map(|t| *t);
 
         // Spawn the rest of readdir so we never block_on from the FUSE dispatch
         // thread.  If the runtime is saturated (e.g. concurrent recording writes)
@@ -4262,7 +4325,18 @@ impl Filesystem for DfsFilesystem {
                 debug!("Directory cache MISS for {}", path);
                 match client.list_directory(&path).await {
                     Ok(entries) => {
-                        dir_cache.insert(path.clone(), (entries.clone(), std::time::Instant::now()));
+                        // Only cache if the directory wasn't invalidated during the fetch.
+                        // A concurrent create/mkdir/unlink calls invalidate_dir_cache()
+                        // which advances dir_cache_invalidated_at. If it advanced since
+                        // we captured invalidation_at_fetch_start, our response is stale
+                        // (it was fetched before the new file was on the server) — don't
+                        // cache it, so the next readdir re-fetches and sees the new entry.
+                        let invalidation_now = dir_cache_invalidated_at.get(&path).map(|t| *t);
+                        if invalidation_now == invalidation_at_fetch_start {
+                            dir_cache.insert(path.clone(), (entries.clone(), std::time::Instant::now()));
+                        } else {
+                            debug!("readdir: skipping dir_cache insert for {} — directory was invalidated during fetch", path);
+                        }
                         entries
                     }
                     Err(e) => {
@@ -4486,6 +4560,8 @@ impl Filesystem for DfsFilesystem {
         let direct_write_inodes = self.direct_write_inodes.clone();
         let last_metadata_update = self.last_metadata_update.clone();
         let pending_creates = self.pending_creates.clone();
+        let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
+        let written_inodes_for_create = self.written_inodes.clone();
 
         // Block lookups from overwriting metadata_cache for this path until the create
         // async task inserts the fresh metadata. Set on the FUSE dispatch thread (before
@@ -4542,10 +4618,13 @@ impl Filesystem for DfsFilesystem {
                         });
                     }
 
-                    // Invalidate parent directory cache so 'ls' shows new file immediately
+                    // Invalidate parent directory cache so 'ls' shows new file immediately.
+                    // Also stamps dir_cache_invalidated_at so any in-flight readdir that
+                    // fetched the parent listing BEFORE this create() completed will not
+                    // re-populate dir_cache with a stale (empty) result.
                     let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
                     let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-                    dir_cache.remove(parent_path);
+                    DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, parent_path);
 
                     // Fresh metadata is now in cache — lift the lookup guard.
                     pending_creates.remove(&path);
@@ -4572,6 +4651,7 @@ impl Filesystem for DfsFilesystem {
                         let mut state = InodeWriteState::new(true);
                         state.expected_file_id = Some(metadata.id);
                         write_buffers.insert(ino, Arc::new(Mutex::new(state)));
+                        written_inodes_for_create.insert(ino);
                         info!("create: ino={} pre-created SQLite write buffer (sync_on_fsync=true, file_id={})", ino, metadata.id);
                     }
 
@@ -4624,6 +4704,7 @@ impl Filesystem for DfsFilesystem {
         let req_gid = _req.gid();
         let direct_write_inodes = self.direct_write_inodes.clone();
         let chunk_write_locks = self.chunk_write_locks.clone();
+        let written_inodes = self.written_inodes.clone();
 
         let write_task_counter = self.write_tasks_in_flight
             .entry(ino)
@@ -4670,6 +4751,7 @@ impl Filesystem for DfsFilesystem {
                         if !write_buffers.contains_key(&ino) {
                             let sync = path_for_sqlite_check.as_deref().map(is_sqlite_buffered).unwrap_or(false);
                             write_buffers.insert(ino, Arc::new(Mutex::new(InodeWriteState::new(sync))));
+                            written_inodes.insert(ino);
                         }
                         let state_arc = write_buffers.get(&ino).map(|e| e.clone());
                         if let Some(state_arc) = state_arc {
@@ -5965,6 +6047,7 @@ impl Filesystem for DfsFilesystem {
         let metadata_clone = metadata.clone();
         let metadata_cache = self.metadata_cache.clone();
         let dir_cache = self.dir_cache.clone();
+        let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let path_to_inode = self.path_to_inode.clone();
         let next_inode = self.next_inode.clone();
 
@@ -5987,7 +6070,7 @@ impl Filesystem for DfsFilesystem {
 
                     let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
                     let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-                    dir_cache.remove(parent_path);
+                    DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, parent_path);
 
                     let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
                     reply.entry(&Duration::ZERO, &attr, 0);
@@ -6015,6 +6098,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let dir_cache = self.dir_cache.clone();
+        let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let path_to_inode = self.path_to_inode.clone();
         let write_buffers = self.write_buffers.clone();
         let write_counters = self.write_counters.clone();
@@ -6046,7 +6130,7 @@ impl Filesystem for DfsFilesystem {
             path_to_inode.write().unwrap().remove(&path);
             let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
             let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-            dir_cache.remove(parent_path);
+            DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, parent_path);
 
             // Cancel any queued metadata flush for this file before sending the delete.
             // This prevents the queue worker from resurrecting the file after deletion.
@@ -6083,6 +6167,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let dir_cache = self.dir_cache.clone();
+        let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let path_to_inode = self.path_to_inode.clone();
 
         self.runtime.spawn(async move {
@@ -6101,7 +6186,7 @@ impl Filesystem for DfsFilesystem {
 
                             let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
                             let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
-                            dir_cache.remove(parent_path);
+                            DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, parent_path);
 
                             reply.ok();
                         }
@@ -6153,6 +6238,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let dir_cache = self.dir_cache.clone();
+        let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let path_to_inode = self.path_to_inode.clone();
         let flush_handle = self.flush_handle.clone();
         let write_buffers = self.write_buffers.clone();
@@ -6251,9 +6337,9 @@ impl Filesystem for DfsFilesystem {
                     let old_parent = if raw_old.is_empty() { "/" } else { raw_old };
                     let raw_new = new_path.rsplitn(2, '/').nth(1).unwrap_or("");
                     let new_parent = if raw_new.is_empty() { "/" } else { raw_new };
-                    dir_cache.remove(old_parent);
+                    DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, old_parent);
                     if old_parent != new_parent {
-                        dir_cache.remove(new_parent);
+                        DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, new_parent);
                     }
 
                     info!("Renamed {} -> {} (ino={}, {} chunks)", old_path, new_path, old_ino, metadata.chunk_locations.len());
@@ -6711,6 +6797,7 @@ impl Filesystem for DfsFilesystem {
             flush_in_flight: flush_in_flight.clone(),
             last_metadata_update: self.last_metadata_update.clone(),
             dir_cache: self.dir_cache.clone(),
+            dir_cache_invalidated_at: self.dir_cache_invalidated_at.clone(),
             path_to_inode: self.path_to_inode.clone(),
             truncated_inodes: self.truncated_inodes.clone(),
             flush_runtime: self.flush_runtime.clone(),

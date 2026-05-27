@@ -4516,48 +4516,32 @@ impl Server {
         });
     }
 
-    /// Drain a single delete queue entry: send DeleteChunksBatch to all nodes that hold
-    /// at least one chunk, wait for acks, then clear the entry from all queues.
+    /// Drain a single delete queue entry: send DeleteChunksBatch to all online nodes,
+    /// wait for acks, then clear the entry from all queues.
+    ///
+    /// We broadcast to ALL online nodes (not just chunk holders) because catchup Phase 2
+    /// pushes file metadata to every follower regardless of whether it holds chunks.
+    /// A node that has metadata but no chunks would never be targeted by a chunk-holder-
+    /// only broadcast, leaving zombie metadata that catchup would later resurrect.
     async fn drain_one_delete(&self, entry: dfs_common::DeleteQueueEntry) {
         let nodes = self.cluster.get_all_nodes().await;
         let local_id = self.cluster.local_node_id();
 
-        // Determine which nodes hold at least one chunk from the chunk map.
-        // Fall back to all online nodes if the chunk map entry is gone (already cleaned).
-        let chunk_holders: std::collections::HashSet<dfs_common::NodeId> = {
-            if let Some(map_entry) = self.chunk_map.get(&entry.file_id) {
-                map_entry.0.iter()
-                    .flat_map(|loc| loc.nodes.iter().copied())
-                    .collect()
-            } else {
-                // Chunk map entry already gone — send to all online nodes to be safe.
-                nodes.iter()
-                    .filter(|n| n.status == dfs_common::NodeStatus::Online)
-                    .map(|n| n.id)
-                    .collect()
+        // Always clean up locally — delete chunks if present, metadata unconditionally.
+        for chunk_id in &entry.chunk_ids {
+            let _ = self.metadata.delete_chunk_location(chunk_id);
+            if let Err(e) = self.storage.delete_chunk(chunk_id) {
+                debug!("drain_one_delete: local chunk {} not present: {}", chunk_id, e);
             }
-        };
-
-        // Delete locally if this node is a chunk holder.
-        if chunk_holders.contains(&local_id) {
-            for chunk_id in &entry.chunk_ids {
-                let _ = self.metadata.delete_chunk_location(chunk_id);
-                if let Err(e) = self.storage.delete_chunk(chunk_id) {
-                    debug!("drain_one_delete: local chunk {} not present: {}", chunk_id, e);
-                }
-            }
-            let _ = self.metadata.delete_file(&entry.file_id);
-            let _ = self.metadata.delete_path_index(&entry.path);
-            self.chunk_map_remove(&entry.file_id).await;
         }
+        let _ = self.metadata.delete_file(&entry.file_id);
+        let _ = self.metadata.delete_path_index(&entry.path);
+        self.chunk_map_remove(&entry.file_id).await;
 
-        // Send DeleteChunksBatch to each peer that holds chunks, collect acks.
+        // Send DeleteChunksBatch to every online peer (not just chunk holders).
         let mut all_acked = true;
         for node in &nodes {
             if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                continue;
-            }
-            if !chunk_holders.contains(&node.id) {
                 continue;
             }
 

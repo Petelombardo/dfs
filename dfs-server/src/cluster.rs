@@ -52,6 +52,12 @@ pub struct ClusterManager {
     /// Fired whenever any peer node transitions to Online (recovered or newly joined).
     /// Listeners use this to trigger proactive sync without polling.
     pub node_recovered_notify: Arc<Notify>,
+
+    /// Timestamp of the most recent leader promotion on this node.
+    /// Set by the server when it detects !was_leader && is_leader.
+    /// Used by the healer to enforce a post-election grace period before
+    /// allowing destructive operations (orphan purge, DATA LOSS declarations).
+    became_leader_at: Arc<RwLock<Option<std::time::Instant>>>,
 }
 
 impl ClusterManager {
@@ -78,6 +84,7 @@ impl ClusterManager {
             heartbeat_interval,
             failure_timeout,
             node_recovered_notify: Arc::new(Notify::new()),
+            became_leader_at: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -263,6 +270,16 @@ impl ClusterManager {
             .count();
         let quorum = total / 2 + 1;
         online >= quorum
+    }
+
+    /// Record the moment this node became leader. Call on every leader transition.
+    pub async fn notify_became_leader(&self) {
+        *self.became_leader_at.write().await = Some(std::time::Instant::now());
+    }
+
+    /// How long ago this node became leader, or None if it has never been leader.
+    pub async fn time_since_became_leader(&self) -> Option<std::time::Duration> {
+        self.became_leader_at.read().await.map(|t| t.elapsed())
     }
 
     /// Get online nodes count

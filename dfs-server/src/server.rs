@@ -494,6 +494,7 @@ impl Server {
                 // On leadership acquisition, announce to all peers immediately so any
                 // concurrent split-brain leader with a higher NodeId concedes.
                 if is_leader && !was_leader {
+                    server.cluster.notify_became_leader().await;
                     info!("Became leader — announcing leadership to all peers");
                     let nodes = server.cluster.get_all_nodes().await;
                     let local_id = server.cluster.local_node_id();

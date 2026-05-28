@@ -13,6 +13,12 @@ use crate::metadata::MetadataStore;
 use crate::network::NetworkClient;
 use crate::storage::ChunkStorage;
 
+/// Suspend all destructive healer operations (orphan purge, DATA LOSS declarations,
+/// over-replication cleanup, disk orphan sweep) for this many seconds after a leader
+/// election, to allow the cluster to settle and metadata to catch up before we start
+/// deleting anything.
+const LEADER_CHANGE_GRACE_SECS: u64 = 300;
+
 /// Healing manager - monitors and repairs chunk replication
 /// Optimized for SBC environments (batched operations, configurable intervals)
 pub struct HealingManager {
@@ -329,6 +335,32 @@ impl HealingManager {
     /// Uses a 5-minute grace period to avoid deleting chunks that were just written
     /// but whose routing table entries haven't been committed yet.
     async fn run_disk_orphan_sweep(&self) {
+        // Don't delete local chunks when the cluster is degraded — a copy on a
+        // currently-offline node might be the only remaining replica.
+        {
+            let all_nodes = self.cluster.get_all_nodes().await;
+            let total = all_nodes.len();
+            let online = all_nodes.iter()
+                .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                .count();
+            let nodes_down = total.saturating_sub(online);
+
+            let grace_elapsed = self.cluster.time_since_became_leader().await
+                .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+
+            if nodes_down > 1 {
+                warn!("Skipping disk orphan sweep — {} node(s) down (max 1 allowed for destructive ops)", nodes_down);
+                return;
+            }
+            if !grace_elapsed {
+                let elapsed = self.cluster.time_since_became_leader().await
+                    .map_or(0.0, |d| d.as_secs_f64());
+                warn!("Skipping disk orphan sweep — within grace period after leader election ({:.0}s elapsed of {}s)",
+                    elapsed, LEADER_CHANGE_GRACE_SECS);
+                return;
+            }
+        }
+
         const GRACE_PERIOD_SECS: u64 = 300;
 
         let storage = self.storage.clone();
@@ -427,13 +459,33 @@ impl HealingManager {
             debug!("Running fast discovery pass (pending/under-replicated chunks only)");
         }
 
-        // Gate destructive operations on quorum. Under-replication healing is always
-        // safe (adding replicas can't lose data), but orphan purge and over-replication
-        // cleanup are irreversible — we must not run them if we can only see a minority
-        // of nodes, as the majority partition may still consider that data live.
-        let quorum = self.cluster.has_quorum().await;
-        if !quorum {
-            warn!("Leader does not have quorum — skipping destructive healing operations (orphan purge, over-replication cleanup)");
+        // Gate destructive operations (orphan purge, DATA LOSS declarations,
+        // over-replication cleanup) on strict cluster health:
+        //   1. At most 1 node down — if 2+ nodes are down we might be the only copy.
+        //   2. Past the post-election grace period — cluster must be settled before
+        //      we start deleting anything.
+        // Under-replication healing (adding replicas) is always safe and is not gated.
+        let all_nodes = self.cluster.get_all_nodes().await;
+        let total_nodes = all_nodes.len();
+        let online_nodes = all_nodes.iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online)
+            .count();
+        let nodes_down = total_nodes.saturating_sub(online_nodes);
+
+        let grace_elapsed = self.cluster.time_since_became_leader().await
+            .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+
+        let destructive_allowed = grace_elapsed && nodes_down <= 1;
+
+        if !destructive_allowed {
+            if !grace_elapsed {
+                let elapsed = self.cluster.time_since_became_leader().await
+                    .map_or(0.0, |d| d.as_secs_f64());
+                warn!("Skipping destructive healing operations — within grace period after leader election ({:.0}s elapsed of {}s)",
+                    elapsed, LEADER_CHANGE_GRACE_SECS);
+            } else {
+                warn!("Skipping destructive healing operations — {} node(s) down (max 1 allowed)", nodes_down);
+            }
         }
 
         let local_id = self.cluster.local_node_id();
@@ -571,8 +623,8 @@ impl HealingManager {
                         continue;
                     }
 
-                    if !quorum {
-                        debug!("Skipping orphan purge for {} — no quorum", chunk_id);
+                    if !destructive_allowed {
+                        debug!("Skipping orphan purge for {} — cluster degraded", chunk_id);
                         self.pending_healing.write().await.remove(&chunk_id);
                         continue;
                     }
@@ -746,7 +798,7 @@ impl HealingManager {
             }
 
             // Prune removed (completely unknown) nodes from metadata immediately.
-            if !removed_node_ids.is_empty() && quorum {
+            if !removed_node_ids.is_empty() && destructive_allowed {
                 warn!(
                     "Chunk {} — pruning {} removed node(s) from metadata (not in cluster): {:?}",
                     chunk_id, removed_node_ids.len(), removed_node_ids
@@ -845,13 +897,20 @@ impl HealingManager {
                 drop(pending);
 
                 if delay_passed {
-                    warn!(
-                        "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
-                        chunk_id, location.nodes.len()
-                    );
-                    db_deletes.push(chunk_id);
-                    self.pending_healing.write().await.remove(&chunk_id);
-                    continue;
+                    if !destructive_allowed {
+                        warn!(
+                            "Chunk {} has 0 accessible replicas and delay passed, but skipping DATA LOSS purge — cluster degraded ({} node(s) down or in grace period)",
+                            chunk_id, nodes_down
+                        );
+                    } else {
+                        warn!(
+                            "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
+                            chunk_id, location.nodes.len()
+                        );
+                        db_deletes.push(chunk_id);
+                        self.pending_healing.write().await.remove(&chunk_id);
+                        continue;
+                    }
                 } else {
                     debug!(
                         "Chunk {} has 0 accessible replicas but delay not yet passed — waiting before declaring unrecoverable",
@@ -948,7 +1007,7 @@ impl HealingManager {
                     }
                 }
                 ReplicationStatus::OverReplicated => {
-                    if quorum {
+                    if destructive_allowed {
                         // Add to pending_healing so drain_heal_queue picks it up.
                         // Use a backdated timestamp so the delay check passes immediately —
                         // over-replication is safe to clean up without a wait window.
@@ -957,7 +1016,7 @@ impl HealingManager {
                             .or_insert_with(|| Instant::now() - Duration::from_secs(self.healing_delay_secs + 1));
                         work.push((chunk_id, ReplicationStatus::OverReplicated, confirmed_alive_nodes.clone()));
                     } else {
-                        debug!("Skipping over-replication cleanup for {} — no quorum", chunk_id);
+                        debug!("Skipping over-replication cleanup for {} — cluster degraded", chunk_id);
                     }
                 }
                 ReplicationStatus::Ok => {
@@ -1059,7 +1118,17 @@ impl HealingManager {
     /// in-flight, not stalled). Tasks are spawned-and-forgotten; in_flight_healing
     /// prevents double-dispatch across 15s ticks.
     async fn drain_heal_queue(&self) -> Result<()> {
-        let quorum = self.cluster.has_quorum().await;
+        let destructive_allowed = {
+            let all_nodes = self.cluster.get_all_nodes().await;
+            let total = all_nodes.len();
+            let online = all_nodes.iter()
+                .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                .count();
+            let nodes_down = total.saturating_sub(online);
+            let grace_elapsed = self.cluster.time_since_became_leader().await
+                .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+            grace_elapsed && nodes_down <= 1
+        };
 
         let work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = {
             let pending   = self.pending_healing.read().await;
@@ -1089,7 +1158,7 @@ impl HealingManager {
                 let status = if confirmed_alive.len() < self.replication_factor {
                     ReplicationStatus::UnderReplicated
                 } else if confirmed_alive.len() > self.replication_factor {
-                    if quorum { ReplicationStatus::OverReplicated } else { continue }
+                    if destructive_allowed { ReplicationStatus::OverReplicated } else { continue }
                 } else {
                     continue; // at RF, discovery will clean up pending entry
                 };

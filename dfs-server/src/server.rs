@@ -2958,6 +2958,37 @@ impl Server {
     /// rebuilds chunk_locations from the leader's authoritative chunk_map before
     /// sending — client-originated chunk_locations in pending_broadcasts are ignored.
     /// A full-sweep every 5 minutes catches followers that missed dirty-file pushes.
+    /// Periodic redb compaction — runs every 30 minutes, staggered by node address so
+    /// all nodes never compact simultaneously. Each compaction blocks metadata I/O for
+    /// its duration (seconds on a healthy-sized database); staggering ensures the rest
+    /// of the cluster is always fully operational while any one node is compacting.
+    pub fn start_compaction_loop(self: Arc<Self>) {
+        let metadata = self.metadata.clone();
+        // Stagger initial delay by (addr port % 5) * 6 minutes so in a 5-node cluster
+        // no two nodes start at the same time. All nodes then re-sync to a 30-minute cadence.
+        let port = self.cluster.local_addr().port() as u64;
+        let stagger_secs = (port % 5) * 360; // 0, 6, 12, 18, or 24 minutes
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(stagger_secs)).await;
+            loop {
+                let m = metadata.clone();
+                let result = tokio::task::spawn_blocking(move || m.compact_db()).await;
+                match result {
+                    Ok(Ok((before, after))) => {
+                        if before != after {
+                            info!("redb compacted: {:.1}MB → {:.1}MB",
+                                before as f64 / 1_048_576.0,
+                                after  as f64 / 1_048_576.0);
+                        }
+                    }
+                    Ok(Err(e)) => warn!("redb periodic compact failed: {}", e),
+                    Err(e)    => warn!("redb periodic compact panicked: {}", e),
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(30 * 60)).await;
+            }
+        });
+    }
+
     pub fn start_ops_tracker_loop(self: Arc<Self>) {
         let tracker = self.ops_tracker.clone();
         tokio::spawn(async move {

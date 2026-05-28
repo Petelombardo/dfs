@@ -159,6 +159,11 @@ impl Server {
         replication_factor: usize,
         metadata_dir: PathBuf,
     ) -> Self {
+        // Create tombstones before the struct so the sled_write_tx worker can
+        // capture a clone and guard against writing metadata for deleted files.
+        let delete_tombstones: Arc<DashMap<FileId, std::time::Instant>> = Arc::new(DashMap::new());
+        let tombstones_for_worker = delete_tombstones.clone();
+
         let server = Self {
             storage,
             metadata: metadata.clone(),
@@ -184,7 +189,7 @@ impl Server {
             leader_forward_notify: Arc::new(tokio::sync::Notify::new()),
             recent_writes: Arc::new(DashMap::new()),
             pending_broadcasts: Arc::new(DashMap::new()),
-            delete_tombstones: Arc::new(DashMap::new()),
+            delete_tombstones,
             chunk_tombstones: Arc::new(dashmap::DashSet::new()),
             file_write_seqs: Arc::new(DashMap::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
@@ -195,6 +200,15 @@ impl Server {
                 let meta_bg = metadata.clone();
                 std::thread::spawn(move || {
                     while let Some(m) = rx.blocking_recv() {
+                        // Guard: don't resurrect a file that was deleted after this
+                        // write was queued (race between ReplicateChunkLocation and
+                        // handle_delete_file). The tombstone is set by handle_delete_file
+                        // before removing from sled, so if it's present here the delete
+                        // wins and we discard the stale metadata update.
+                        if tombstones_for_worker.contains_key(&m.id) {
+                            debug!("sled_write_worker: skipping tombstoned file {} ({})", m.path, m.id);
+                            continue;
+                        }
                         if let Err(e) = meta_bg.put_file(&m) {
                             warn!("sled_write_worker: put_file failed for {}: {}", m.path, e);
                         }

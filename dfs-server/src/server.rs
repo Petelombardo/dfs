@@ -2964,11 +2964,19 @@ impl Server {
     /// of the cluster is always fully operational while any one node is compacting.
     pub fn start_compaction_loop(self: Arc<Self>) {
         let metadata = self.metadata.clone();
-        // Stagger initial delay by (addr port % 5) * 6 minutes so in a 5-node cluster
-        // no two nodes start at the same time. All nodes then re-sync to a 30-minute cadence.
-        let port = self.cluster.local_addr().port() as u64;
-        let stagger_secs = (port % 5) * 360; // 0, 6, 12, 18, or 24 minutes
+        let node_byte = self.cluster.local_node_id().as_bytes()[0] as u64;
+        let cluster = self.cluster.clone();
         tokio::spawn(async move {
+            // Wait for the cluster to establish before computing the stagger so we
+            // use the real node count rather than a hardcoded constant.
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            let node_count = cluster.get_all_nodes().await.len().max(1) as u64;
+            // Stagger by slot = (node_id_byte % node_count), spaced evenly across the
+            // 30-minute window. Using a UUID byte gives a stable, port-independent slot
+            // that works whether nodes are on different hosts (same port) or same host
+            // (different ports).
+            let interval_secs = 30 * 60;
+            let stagger_secs = (node_byte % node_count) * (interval_secs / node_count);
             tokio::time::sleep(tokio::time::Duration::from_secs(stagger_secs)).await;
             loop {
                 let m = metadata.clone();

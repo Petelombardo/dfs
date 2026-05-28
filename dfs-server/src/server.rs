@@ -1473,11 +1473,25 @@ impl Server {
             }
         };
 
-        // Fetch the original write timestamp so the receiving node can preserve mtime.
-        let written_at = self.metadata.get_chunk_location(&chunk_id)
-            .ok()
-            .flatten()
-            .and_then(|loc| loc.written_at);
+        // Fetch location metadata for written_at and file_offset.
+        let loc = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
+        let written_at = loc.as_ref().and_then(|l| l.written_at);
+
+        // Verify chunk content before propagating — catches disk corruption at the
+        // source so we don't spread bad data to the rest of the cluster.
+        // The hash is position-aware: blake3(file_offset_le_bytes || data).
+        // We can only verify if we have the file_offset from the chunk location.
+        if let Some(offset) = loc.as_ref().and_then(|l| l.file_offset) {
+            let actual_hash = dfs_common::compute_chunk_hash_at(&data, offset);
+            if actual_hash != chunk_id.hash {
+                warn!("PushChunkTo: chunk {} at offset {} failed content hash verification — disk corruption detected, refusing to propagate",
+                    chunk_id, offset);
+                return Response::Error {
+                    message: format!("Chunk {} content hash mismatch (disk corruption)", chunk_id),
+                    code: ErrorCode::ChecksumMismatch,
+                };
+            }
+        }
 
         let request = Request::ReplicateChunk {
             chunk_id,

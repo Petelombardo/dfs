@@ -6,7 +6,7 @@ use redb::{Database, Durability, ReadableTable, TableDefinition};
 // cache without fdatasync — fast, immediately visible to reads, survives process crashes,
 // only lost on kernel panic/power failure. Acceptable with 5-way replication.
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ pub enum PutFileResult {
 /// Metadata storage using redb embedded database.
 /// Replaces sled to eliminate the u8 fragment-count panic under heavy write loads.
 pub struct MetadataStore {
-    db: Mutex<Database>,
+    db: RwLock<Database>,
     db_path: PathBuf,
 }
 
@@ -114,7 +114,7 @@ impl MetadataStore {
 
         info!("Initialized redb metadata store at {:?}", db_path);
 
-        Ok(Self { db: Mutex::new(db), db_path })
+        Ok(Self { db: RwLock::new(db), db_path })
     }
 
     // -------------------------------------------------------------------------
@@ -126,7 +126,7 @@ impl MetadataStore {
     pub fn repair_path_index(&self) -> Result<()> {
         // Pass 1: find file records whose path index entry is missing.
         let to_repair: Vec<(String, Vec<u8>)> = {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let txn = _db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             let path_table = txn.open_table(PATH_TABLE)?;
@@ -146,7 +146,7 @@ impl MetadataStore {
 
         let repaired = to_repair.len();
         if !to_repair.is_empty() {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
             txn.set_durability(Durability::None);
             {
@@ -161,7 +161,7 @@ impl MetadataStore {
 
         // Pass 2: find path index entries whose file record no longer exists.
         let stale_paths: Vec<String> = {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let txn = _db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             let path_table = txn.open_table(PATH_TABLE)?;
@@ -180,7 +180,7 @@ impl MetadataStore {
 
         let stale_count = stale_paths.len();
         if !stale_paths.is_empty() {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
             txn.set_durability(Durability::None);
             {
@@ -211,7 +211,7 @@ impl MetadataStore {
         let file_id_str = format!("{}", metadata.id);
         let path_str = metadata.path.as_str();
 
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
 
@@ -337,7 +337,7 @@ impl MetadataStore {
     /// Get file metadata by ID.
     pub fn get_file(&self, file_id: &FileId) -> Result<Option<FileMetadata>> {
         let key = format!("{}", file_id);
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         match table.get(key.as_str())? {
@@ -349,7 +349,7 @@ impl MetadataStore {
 
     /// Get file metadata by path.
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(PATH_TABLE)?;
         match table.get(path)? {
@@ -362,7 +362,7 @@ impl MetadataStore {
     /// Delete file metadata (removes both file and path index entries).
     pub fn delete_file(&self, file_id: &FileId) -> Result<()> {
         let file_id_str = format!("{}", file_id);
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
         {
@@ -384,7 +384,7 @@ impl MetadataStore {
 
     /// Delete only the path index entry for a specific path (used during rename).
     pub fn delete_path_index(&self, path: &str) -> Result<()> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
         {
@@ -408,7 +408,7 @@ impl MetadataStore {
     where
         F: FnMut(FileMetadata) -> Result<()>,
     {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         for item in table.range::<&str>(..)? {
@@ -429,7 +429,7 @@ impl MetadataStore {
     ) -> Result<usize> {
         // Collect stale file entries.
         let (stale_file_ids, stale_file_paths): (Vec<String>, Vec<String>) = {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let txn = _db.begin_read()?;
             let table = txn.open_table(FILE_TABLE)?;
             let mut ids = Vec::new();
@@ -450,7 +450,7 @@ impl MetadataStore {
 
         let mut removed = 0usize;
         if !stale_file_ids.is_empty() {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
             txn.set_durability(Durability::None);
             {
@@ -469,7 +469,7 @@ impl MetadataStore {
         // Also sweep path entries independently — a path entry can exist without
         // a file entry if the file entry was removed out-of-order.
         let stale_path_keys: Vec<String> = {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let txn = _db.begin_read()?;
             let table = txn.open_table(PATH_TABLE)?;
             let mut stale = Vec::new();
@@ -485,7 +485,7 @@ impl MetadataStore {
         };
 
         if !stale_path_keys.is_empty() {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
             txn.set_durability(Durability::None);
             {
@@ -517,7 +517,7 @@ impl MetadataStore {
         // Upper bound = increment last char of dir_path ("/" → "0").
         let end = prefix_next(&dir_path);
 
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(PATH_TABLE)?;
         let mut files = Vec::new();
@@ -545,7 +545,7 @@ impl MetadataStore {
         let key = format!("{}", location.chunk_id);
         let value = bincode::serialize(location)
             .context("Failed to serialize chunk location")?;
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
         {
@@ -560,7 +560,7 @@ impl MetadataStore {
     /// Get chunk location information.
     pub fn get_chunk_location(&self, chunk_id: &ChunkId) -> Result<Option<ChunkLocation>> {
         let key = format!("{}", chunk_id);
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(CHUNK_TABLE)?;
         match table.get(key.as_str())? {
@@ -573,7 +573,7 @@ impl MetadataStore {
     /// Delete chunk location.
     pub fn delete_chunk_location(&self, chunk_id: &ChunkId) -> Result<()> {
         let key = format!("{}", chunk_id);
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
         {
@@ -595,7 +595,7 @@ impl MetadataStore {
         if puts.is_empty() && deletes.is_empty() {
             return Ok(());
         }
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
         {
@@ -617,7 +617,7 @@ impl MetadataStore {
 
     /// List all chunk IDs known in metadata.
     pub fn list_all_chunk_ids(&self) -> Result<Vec<ChunkId>> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(CHUNK_TABLE)?;
         let mut ids = Vec::new();
@@ -632,7 +632,7 @@ impl MetadataStore {
 
     /// Return all chunk location records in one scan.
     pub fn list_all_chunk_locations(&self) -> Result<Vec<ChunkLocation>> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(CHUNK_TABLE)?;
         let mut locations = Vec::new();
@@ -650,7 +650,7 @@ impl MetadataStore {
     where
         F: FnMut(ChunkLocation) -> bool,
     {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(CHUNK_TABLE)?;
         for item in table.range::<&str>(..)? {
@@ -666,7 +666,7 @@ impl MetadataStore {
 
     /// Build the set of chunk IDs referenced by any live file in metadata.
     pub fn live_chunk_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         let mut live = std::collections::HashSet::new();
@@ -685,7 +685,7 @@ impl MetadataStore {
     pub fn rebuild_chunk_locations_from_files(&self) -> Result<(usize, usize)> {
         // Collect missing chunk records (read phase).
         let to_write: Vec<(String, Vec<u8>)> = {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let txn = _db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             let chunk_table = txn.open_table(CHUNK_TABLE)?;
@@ -710,7 +710,7 @@ impl MetadataStore {
 
         let written = to_write.len();
         if !to_write.is_empty() {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
             txn.set_durability(Durability::None);
             {
@@ -725,7 +725,7 @@ impl MetadataStore {
 
         // Count already-present entries (skipped).
         let skipped = {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let txn = _db.begin_read()?;
             let table = txn.open_table(CHUNK_TABLE)?;
             let total: usize = table.range::<&str>(..)?.count();
@@ -747,7 +747,7 @@ impl MetadataStore {
 
     /// Increment and return the next metadata sequence number (leader-only).
     pub fn next_meta_sequence(&self) -> Result<u64> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_write()?;
         let next = {
             let mut table = txn.open_table(COUNTERS_TABLE)?;
@@ -762,7 +762,7 @@ impl MetadataStore {
 
     /// Read current metadata sequence number.
     pub fn current_meta_sequence(&self) -> Result<u64> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(COUNTERS_TABLE)?;
         Ok(table.get("meta_seq")?.map(|v| v.value()).unwrap_or(0))
@@ -784,7 +784,7 @@ impl MetadataStore {
         let file_id_hex = metadata.id.0.as_simple().to_string();
         let idx_key = format!("{}:{}", node_hex, file_id_hex);
 
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_write()?;
         {
             let mut queue_table = txn.open_table(META_QUEUE_TABLE)?;
@@ -820,7 +820,7 @@ impl MetadataStore {
         let prefix = format!("{}:", node_hex);
         let prefix_end = prefix_next(&prefix);
 
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(META_QUEUE_TABLE)?;
         let mut items = Vec::new();
@@ -846,7 +846,7 @@ impl MetadataStore {
 
         // Collect keys to remove (read phase — no mutation during iteration).
         let to_remove: Vec<(String, Option<String>)> = {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let txn = _db.begin_read()?;
             let table = txn.open_table(META_QUEUE_TABLE)?;
             let mut items = Vec::new();
@@ -868,7 +868,7 @@ impl MetadataStore {
             return Ok(());
         }
 
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
         {
@@ -907,7 +907,7 @@ impl MetadataStore {
 
         // Read all entries first.
         let entries: Vec<(String, u64, FileId)> = {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let txn = _db.begin_read()?;
             let table = txn.open_table(META_QUEUE_TABLE)?;
             let mut result = Vec::new();
@@ -938,7 +938,7 @@ impl MetadataStore {
         }
 
         if !to_remove.is_empty() {
-            let _db = self.db.lock().unwrap();
+            let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
             txn.set_durability(Durability::None);
             {
@@ -954,7 +954,7 @@ impl MetadataStore {
 
     /// Record the last sequence number received from the leader (follower-only).
     pub fn set_follower_sequence(&self, seq: u64) -> Result<()> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
         {
@@ -967,7 +967,7 @@ impl MetadataStore {
 
     /// Get the last sequence number received from the leader (follower-only).
     pub fn get_follower_sequence(&self) -> Result<u64> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(COUNTERS_TABLE)?;
         Ok(table.get("follower_seq")?.map(|v| v.value()).unwrap_or(0))
@@ -975,7 +975,7 @@ impl MetadataStore {
 
     /// Return a compact inventory of all known files: Vec<(FileId, modified_at)>.
     pub fn get_file_inventory(&self) -> Result<Vec<(FileId, u64)>> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         let mut out = Vec::new();
@@ -990,7 +990,7 @@ impl MetadataStore {
 
     /// Fetch a batch of file records by ID. Missing IDs are silently skipped.
     pub fn get_files_batch(&self, ids: &[FileId]) -> Result<Vec<FileMetadata>> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         let mut out = Vec::new();
@@ -1010,7 +1010,7 @@ impl MetadataStore {
     where
         F: FnMut(FileMetadata) -> Result<()>,
     {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         let mut count = 0usize;
@@ -1034,7 +1034,7 @@ impl MetadataStore {
         let key = format!("del:{}", entry.file_id);
         let value = bincode::serialize(entry)
             .context("Failed to serialize DeleteQueueEntry")?;
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_write()?;
         {
             let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
@@ -1047,7 +1047,7 @@ impl MetadataStore {
     /// Remove a completed deletion from the queue (called after all nodes ack).
     pub fn dequeue_delete(&self, file_id: &FileId) -> Result<()> {
         let key = format!("del:{}", file_id);
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(Durability::None);
         {
@@ -1060,7 +1060,7 @@ impl MetadataStore {
 
     /// Return all pending delete queue entries.
     pub fn get_all_pending_deletes(&self) -> Result<Vec<dfs_common::DeleteQueueEntry>> {
-        let _db = self.db.lock().unwrap();
+        let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
         let table = txn.open_table(DELETE_QUEUE_TABLE)?;
         let mut entries = Vec::new();
@@ -1085,7 +1085,7 @@ impl MetadataStore {
     /// run it is typically fast (seconds, not minutes).
     pub fn compact_db(&self) -> Result<(u64, u64)> {
         let size_before = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.db.write().unwrap();
         db.compact().map_err(|e| anyhow::anyhow!("redb compact: {}", e))?;
         let size_after = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         Ok((size_before, size_after))

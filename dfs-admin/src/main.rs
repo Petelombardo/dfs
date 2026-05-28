@@ -133,6 +133,14 @@ enum FileCommands {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Verify chunk hashes and repair a file: removes corrupt replicas, heals
+    /// under-replicated chunks, and trims over-replicated ones. Bypasses the
+    /// post-election leadership grace period so it can be used immediately after
+    /// a leader change or incident recovery.
+    Repair {
+        /// File path or UUID
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -808,6 +816,23 @@ async fn handle_file_command(
 
         FileCommands::Repack { path, yes } => {
             handle_repack(path, yes, cluster_addrs).await?;
+        }
+        FileCommands::Repair { path } => {
+            let response = send_request(
+                cluster_addrs[0],
+                Request::RepairFile { path: path.clone(), force: true },
+            ).await?;
+            match response {
+                Response::Ok { data } => {
+                    let msg = data.map(|b| String::from_utf8_lossy(&b).to_string())
+                        .unwrap_or_else(|| "Repair complete".to_string());
+                    println!("{}", msg);
+                }
+                Response::Error { message, .. } => {
+                    anyhow::bail!("Repair failed: {}", message);
+                }
+                _ => anyhow::bail!("Unexpected response from server"),
+            }
         }
     }
 

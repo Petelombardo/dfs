@@ -160,6 +160,14 @@ pub enum Request {
         chunk_ids: Vec<ChunkId>,
     },
 
+    /// Verify that a chunk's on-disk data matches its content-addressed ID.
+    /// The hash is position-aware (Blake3 of file_offset || data), so the caller
+    /// must supply the file_offset stored in ChunkLocation. Returns ChunkValid.
+    VerifyChunkIntegrity {
+        chunk_id: ChunkId,
+        file_offset: u64,
+    },
+
     /// Get file metadata by file ID
     GetFileMetadata {
         file_id: FileId,
@@ -379,6 +387,17 @@ pub enum Request {
     /// Safe to run at any time; runs in background and does not block responses.
     TriggerMetadataRepair,
 
+    /// Trigger full integrity repair on a specific file: verifies chunk hashes on all
+    /// replica nodes, removes corrupt copies, heals under-replicated chunks, and trims
+    /// over-replicated ones. When force=true the leadership grace period is bypassed so
+    /// this can be used immediately after a leader election for manual recovery.
+    RepairFile {
+        /// File path (e.g. /podman/dvr/recordings/foo.mpg) or UUID string
+        path: String,
+        /// Bypass the post-election grace period for destructive operations
+        force: bool,
+    },
+
     /// Query a node for the physical sizes of chunks it owns.
     /// Used by quorum-based metadata repair to determine the authoritative file size
     /// from physical consensus rather than trusting any single node's metadata.
@@ -550,6 +569,15 @@ pub enum Response {
     /// Boolean response (for HasChunk, etc.)
     Bool {
         value: bool,
+    },
+
+    /// Chunk integrity response (for VerifyChunkIntegrity).
+    /// `found` = the chunk file exists on this node.
+    /// `valid` = found AND hash matches (true only when found is also true).
+    /// found=false means ghost replica; found=true, valid=false means corruption.
+    ChunkValid {
+        found: bool,
+        valid: bool,
     },
 
     /// Parallel boolean response (for HasChunks) — one entry per requested chunk_id.

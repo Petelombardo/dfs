@@ -17,7 +17,7 @@ use crate::storage::ChunkStorage;
 /// over-replication cleanup, disk orphan sweep) for this many seconds after a leader
 /// election, to allow the cluster to settle and metadata to catch up before we start
 /// deleting anything.
-const LEADER_CHANGE_GRACE_SECS: u64 = 300;
+pub const LEADER_CHANGE_GRACE_SECS: u64 = 1200;
 
 /// Healing manager - monitors and repairs chunk replication
 /// Optimized for SBC environments (batched operations, configurable intervals)
@@ -826,6 +826,13 @@ impl HealingManager {
             // seconds, but the next heal cycle is 60s away). We wait healing_delay_secs
             // before trusting the miss, same patience we apply to under-replication.
             if !nodes_without_chunk.is_empty() && actual_replicas > 0 {
+                // Start the ghost-pruning timer the first time we see these nodes missing.
+                // Without this, chunks at exactly RF alive nodes never enter pending_healing
+                // (they're classified Ok below and evicted), so the delay can never expire.
+                self.pending_healing.write().await
+                    .entry(chunk_id)
+                    .or_insert_with(Instant::now);
+
                 let pending = self.pending_healing.read().await;
                 let delay_passed = pending.get(&chunk_id)
                     .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs));
@@ -846,7 +853,7 @@ impl HealingManager {
                         size: location.size,
                         checksum: location.checksum,
                         file_offset: location.file_offset,
-                        written_at: location.written_at,
+                        written_at: Some(Self::now_ms()),
                         client_write_seq: None,
                     };
                     db_puts.push(updated_location.clone());
@@ -1008,20 +1015,26 @@ impl HealingManager {
                 }
                 ReplicationStatus::OverReplicated => {
                     if destructive_allowed {
-                        // Add to pending_healing so drain_heal_queue picks it up.
-                        // Use a backdated timestamp so the delay check passes immediately —
-                        // over-replication is safe to clean up without a wait window.
+                        // Add to pending_healing with the real detection time so the
+                        // normal healing_delay_secs wait applies before trimming.
+                        // This gives the VerifyChunkIntegrity pass (in do_cleanup_excess_shared)
+                        // time to run after the cluster has settled.
                         self.pending_healing.write().await
                             .entry(chunk_id)
-                            .or_insert_with(|| Instant::now() - Duration::from_secs(self.healing_delay_secs + 1));
+                            .or_insert_with(Instant::now);
                         work.push((chunk_id, ReplicationStatus::OverReplicated, confirmed_alive_nodes.clone()));
                     } else {
                         debug!("Skipping over-replication cleanup for {} — cluster degraded", chunk_id);
                     }
                 }
                 ReplicationStatus::Ok => {
-                    self.pending_healing.write().await.remove(&chunk_id);
-                    self.stalled_healing.write().await.remove(&chunk_id);
+                    // Only evict from pending when there are no ghost nodes remaining.
+                    // If nodes_without_chunk is non-empty we need the pending_healing
+                    // entry to persist as the ghost-pruning delay timer.
+                    if nodes_without_chunk.is_empty() {
+                        self.pending_healing.write().await.remove(&chunk_id);
+                        self.stalled_healing.write().await.remove(&chunk_id);
+                    }
                 }
             }
         }
@@ -1399,11 +1412,17 @@ impl HealingManager {
             return Ok(());
         }
 
-        // Select target nodes: capacity-aware candidates that don't already hold the chunk
+        // Select target nodes: capacity-aware candidates that don't already hold the chunk.
+        // Prefer nodes with lower NodeId values (the deterministic pair) — this restores
+        // the canonical pair (lowest 2 NodeIds among alive nodes) when under-replicated,
+        // regardless of whether the deficit came from corruption or node failure.
         let alive_ids: HashSet<NodeId> = alive.iter().map(|(id, _)| *id).collect();
-        let candidates = cluster
+        let mut candidates = cluster
             .get_nodes_with_capacity_awareness(chunk_id, replication_factor + needed)
             .await;
+        // Sort by NodeId ascending so the canonical pair nodes (lowest 2 NodeIds among
+        // the alive set) are preferred as heal targets when restoring replication.
+        candidates.sort_unstable();
         let targets: Vec<NodeId> = candidates
             .into_iter()
             .filter(|n| !alive_ids.contains(n))
@@ -1500,7 +1519,7 @@ impl HealingManager {
                 size: location.size,
                 checksum: location.checksum,
                 file_offset: location.file_offset,
-                written_at: location.written_at,
+                written_at: Some(Self::now_ms()),
                 client_write_seq: None,
             };
 
@@ -1544,7 +1563,15 @@ impl HealingManager {
         }
     }
 
-    /// Static cleanup implementation — callable from both instance methods and spawned tasks.
+    /// Over-replication cleanup with deterministic pair preference.
+    ///
+    /// Trims one excess replica per cycle. Prefers to remove nodes outside the
+    /// deterministic pair (lowest 2 NodeIds among confirmed-alive nodes), using
+    /// disk utilization as a tiebreaker within each group.
+    ///
+    /// Hash integrity verification is NOT done here — that is too expensive for
+    /// background bulk trimming (reads 4MB from every node per chunk, floods I/O).
+    /// Use `dfs-admin file repair` for explicit integrity checking.
     async fn do_cleanup_excess_shared(
         chunk_id: &ChunkId,
         confirmed_alive_nodes: Vec<NodeId>,
@@ -1557,9 +1584,7 @@ impl HealingManager {
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
-        // Use confirmed_alive_nodes from the bulk scan — these were verified via HasChunks.
-        // Don't re-derive from location.nodes + online check, which could include ghost nodes
-        // and lead to deleting a real replica while leaving a ghost in the metadata.
+        // Resolve confirmed-alive nodes to addresses.
         let mut alive: Vec<(NodeId, std::net::SocketAddr)> = Vec::new();
         for node_id in &confirmed_alive_nodes {
             if let Some(info) = cluster.get_node(node_id).await {
@@ -1572,63 +1597,89 @@ impl HealingManager {
             return Ok(());
         }
 
-        // Remove the replica from the most-utilized node — this naturally rebalances
-        // the cluster over time rather than always shedding from an arbitrary node.
-        let alive_ids: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
-        let excess_id = cluster.most_utilized_node(&alive_ids).await
-            .unwrap_or_else(|| alive_ids[alive_ids.len() - 1]);
-        let (_, excess_addr) = *alive.iter().find(|(id, _)| *id == excess_id).unwrap();
-
-        info!(
-            "Chunk {} over-replicated ({} alive, RF={}): leader instructing node {} to delete excess copy",
-            chunk_id, alive.len(), replication_factor, excess_id
-        );
-
+        // Deterministic pair: lowest 2 NodeIds among confirmed-alive nodes.
+        // Prefer trimming non-pair nodes (highest utilization first).
+        // Fall back to pair nodes if all excess are pair nodes.
         let local_id = cluster.local_node_id();
-        let request = Request::DeleteChunkReplica { chunk_id: *chunk_id, leader_id: local_id };
-        match client.send_message(excess_addr, Message::Request(request)).await {
-            Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
-                info!("Node {} deleted excess copy of chunk {}", excess_id, chunk_id);
+        let mut sorted_alive: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
+        sorted_alive.sort_unstable();
+        let pair: std::collections::HashSet<NodeId> = sorted_alive.iter().take(2).copied().collect();
+
+        let non_pair_ids: Vec<NodeId> = alive.iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !pair.contains(id))
+            .collect();
+
+        let trim_id = if !non_pair_ids.is_empty() {
+            cluster.most_utilized_node(&non_pair_ids).await
+                .unwrap_or(non_pair_ids[non_pair_ids.len() - 1])
+        } else {
+            let all_ids: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
+            cluster.most_utilized_node(&all_ids).await
+                .unwrap_or(all_ids[all_ids.len() - 1])
+        };
+
+        let (_, trim_addr) = match alive.iter().find(|(id, _)| *id == trim_id) {
+            Some(v) => *v,
+            None => return Ok(()),
+        };
+
+        let req = Request::DeleteChunkReplica { chunk_id: *chunk_id, leader_id: local_id };
+        match client.send_message(trim_addr, Message::Request(req)).await {
+            Ok(env) if matches!(env.message, Message::Response(Response::Ok { .. })) => {
+                info!("Chunk {} over-replicated ({} alive, RF={}): trimmed node {} (pair={:?})",
+                      chunk_id, alive.len(), replication_factor, trim_id, pair);
             }
-            Ok(envelope) => {
-                warn!("Node {} failed to delete chunk {}: {:?}", excess_id, chunk_id, envelope.message);
-                return Ok(()); // Don't update metadata if delete failed
+            Ok(env) => {
+                warn!("Node {} refused to trim chunk {}: {:?}", trim_id, chunk_id, env.message);
+                return Ok(());
             }
             Err(e) => {
-                warn!("Failed to contact node {} for chunk {} deletion: {}", excess_id, chunk_id, e);
+                warn!("Failed to reach node {} for chunk {} trim: {}", trim_id, chunk_id, e);
                 return Ok(());
             }
         }
 
-        // Update metadata: remove the excess node
-        let updated_nodes: Vec<NodeId> = alive.iter()
-            .map(|(id, _)| *id)
-            .filter(|id| *id != excess_id)
-            .collect();
+        let removed_nodes = vec![trim_id];
 
-        let updated_location = ChunkLocation {
-            chunk_id: *chunk_id,
-            nodes: updated_nodes,
-            size: location.size,
-            checksum: location.checksum,
-            file_offset: location.file_offset,
-            written_at: location.written_at,
-            client_write_seq: None,
-        };
-
-        let meta = Arc::clone(metadata);
-        let loc = updated_location.clone();
-        let store_result = tokio::task::spawn_blocking(move || meta.put_chunk_location(&loc)).await;
-        match store_result {
-            Ok(Ok(())) => {
-                Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
-                info!("Excess replica cleanup complete for chunk {}", chunk_id);
+        // Update metadata to remove all deleted nodes (corrupt + trim).
+        if !removed_nodes.is_empty() {
+            let updated_nodes: Vec<NodeId> = location.nodes.iter()
+                .filter(|n| !removed_nodes.contains(n))
+                .copied()
+                .collect();
+            let heal_ts = Self::now_ms();
+            let updated_location = ChunkLocation {
+                chunk_id: *chunk_id,
+                nodes: updated_nodes,
+                size: location.size,
+                checksum: location.checksum,
+                file_offset: location.file_offset,
+                written_at: Some(heal_ts),
+                client_write_seq: None,
+            };
+            let meta = Arc::clone(metadata);
+            let loc = updated_location.clone();
+            let store_result = tokio::task::spawn_blocking(move || meta.put_chunk_location(&loc)).await;
+            match store_result {
+                Ok(Ok(())) => {
+                    Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
+                    info!("Excess replica cleanup complete for chunk {} ({} node(s) removed)",
+                          chunk_id, removed_nodes.len());
+                }
+                Ok(Err(e)) => warn!("Failed to update chunk location after cleanup of {}: {}", chunk_id, e),
+                Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
             }
-            Ok(Err(e)) => warn!("Failed to update chunk location after cleanup of {}: {}", chunk_id, e),
-            Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
         }
 
         Ok(())
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 
     /// Scrub all chunks (verify checksums)
@@ -1703,8 +1754,14 @@ impl HealingManager {
     pub async fn queue_chunks_immediate(&self, chunk_ids: Vec<ChunkId>) {
         let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs + 1);
         let mut pending = self.pending_healing.write().await;
+        let mut cache  = self.alive_nodes_cache.write().await;
         for chunk_id in chunk_ids {
             pending.insert(chunk_id, backdated);
+            // Invalidate any stale cache entry for this chunk so drain_heal_queue
+            // doesn't classify a healthy RF=3 chunk as under-replicated based on
+            // old alive-node data from a previous healing cycle. The next discovery
+            // pass will repopulate the cache with a fresh HasChunks scan.
+            cache.remove(&chunk_id);
         }
     }
 

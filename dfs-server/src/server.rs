@@ -875,11 +875,22 @@ impl Server {
         Ok(())
     }
 
-    /// Push all local chunk locations to `target` in 500-record batches.
+    /// Push chunk locations to `target` in 500-record batches.
+    /// Only pushes locations for chunks this node physically holds on disk.
+    /// Pushing stale routing-table entries for chunks we no longer have would
+    /// create ghost replicas on the leader via the expansion rule — if our
+    /// sled record predates a ghost-prune and has a larger node set, the leader
+    /// would re-introduce the ghost on every chunk_location_sync cycle.
     async fn push_locations_to(server: &Arc<Self>, target: std::net::SocketAddr) -> anyhow::Result<()> {
+        let my_node_id = server.cluster.local_node_id();
+        let storage = server.storage.clone();
         let metadata = server.metadata.clone();
         let locations = tokio::task::spawn_blocking(move || {
-            metadata.list_all_chunk_locations()
+            let all = metadata.list_all_chunk_locations()?;
+            let held: Vec<_> = all.into_iter()
+                .filter(|loc| loc.nodes.contains(&my_node_id) && storage.has_chunk(&loc.chunk_id))
+                .collect();
+            Ok::<_, anyhow::Error>(held)
         }).await??;
 
         if locations.is_empty() {
@@ -895,7 +906,7 @@ impl Server {
             server.client.send_message(target, dfs_common::Message::Request(req)).await?;
             sent += batch.len();
         }
-        info!("chunk_location_sync: pushed {}/{} locations to {}", sent, total, target);
+        info!("chunk_location_sync: pushed {}/{} locally-held locations to {}", sent, total, target);
         Ok(())
     }
 
@@ -1256,6 +1267,12 @@ impl Server {
             Request::TriggerMetadataRepair => self.handle_trigger_metadata_repair().await,
             Request::QueryChunkSizes { chunk_ids } => self.handle_query_chunk_sizes(chunk_ids).await,
             Request::HealFile { path } => self.handle_heal_file(path).await,
+            Request::VerifyChunkIntegrity { chunk_id, file_offset } => {
+                let found = self.storage.has_chunk(&chunk_id);
+                let valid = found && self.storage.verify_chunk_at(&chunk_id, file_offset);
+                Response::ChunkValid { found, valid }
+            }
+            Request::RepairFile { path, force } => self.handle_repair_file(path, force).await,
             Request::GetFileInfo { path } => self.handle_get_file_info(path).await,
             Request::GetFileInfoById { file_id } => self.handle_get_file_info_by_id(file_id).await,
             Request::RemoveNode { node_id } => self.handle_remove_node(node_id).await,
@@ -1792,20 +1809,43 @@ impl Server {
                     }
                     merged
                 } else if incoming_count > existing_count {
-                    // Expansion (new replicas added, at least one side is at/above RF) — take incoming.
-                    debug!("Expanding chunk location for {} ({} → {} nodes)",
-                           location.chunk_id, existing_count, incoming_count);
-                    location.nodes.clone()
+                    // Expansion — only accept if the incoming record is at least as fresh
+                    // as the existing one.  A re-joining node's stale sled data can have
+                    // a larger node count than the healed record (it predates the ghost
+                    // prune), and accepting it blindly creates new ghost replicas.
+                    let ts_ok = location.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0);
+                    if ts_ok {
+                        debug!("Expanding chunk location for {} ({} → {} nodes)",
+                               location.chunk_id, existing_count, incoming_count);
+                        location.nodes.clone()
+                    } else {
+                        debug!("Stale expansion for {} ({} → {} nodes, ts {} < {}) — keeping existing",
+                               location.chunk_id, existing_count, incoming_count,
+                               location.written_at.unwrap_or(0), existing.written_at.unwrap_or(0));
+                        existing.nodes.clone()
+                    }
                 } else if incoming_count < rf && existing_count >= rf {
                     // Stale early-write broadcast arriving after healing — ignore.
                     debug!("Ignoring stale chunk location broadcast for {} ({} nodes incoming, existing has {}, RF={})",
                            location.chunk_id, incoming_count, existing_count, rf);
                     return Response::Ok { data: None };
                 } else {
-                    // Healer trim or same-size update — accept.
-                    debug!("Updating chunk location for {} ({} → {} nodes)",
-                           location.chunk_id, existing_count, incoming_count);
-                    location.nodes.clone()
+                    // Healer trim or same-size update — accept only if the incoming
+                    // record is at least as fresh as the existing one.  A stale follower
+                    // sync pushing a same-count but different-nodes record (e.g. the old
+                    // set before a ghost was pruned) would otherwise revert the healer's
+                    // work every 30 seconds.
+                    let ts_ok = location.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0);
+                    if ts_ok {
+                        debug!("Updating chunk location for {} ({} → {} nodes)",
+                               location.chunk_id, existing_count, incoming_count);
+                        location.nodes.clone()
+                    } else {
+                        debug!("Stale same-count update for {} ({} nodes, ts {} < {}) — keeping existing",
+                               location.chunk_id, existing_count,
+                               location.written_at.unwrap_or(0), existing.written_at.unwrap_or(0));
+                        existing.nodes.clone()
+                    }
                 };
                 ChunkLocation {
                     chunk_id: location.chunk_id,
@@ -1884,7 +1924,7 @@ impl Server {
                                 break;
                             }
                         }
-                        if updated {
+                        if updated && !self.delete_tombstones.contains_key(&fid) {
                             let _ = self.sled_write_tx.send(file_meta);
                         }
                     }
@@ -3411,7 +3451,20 @@ impl Server {
             self.pending_broadcasts.insert(metadata.id, metadata.clone());
         }
         self.enqueue_metadata_for_followers(&metadata).await;
-        let _ = self.sled_write_tx.send(metadata);
+
+        // Seq=0 creates (initial open(), no data yet) must be committed to sled
+        // synchronously before we respond.  If we return first and a delete arrives
+        // before the sled_write_tx worker commits, get_file_by_path returns None,
+        // the delete returns NotFound without setting a tombstone, and the worker
+        // later resurrects the file.  Seq>0 writes are safe: sled already has the
+        // file record from the seq=0 commit, so the delete can always find it.
+        if metadata.write_seq == 0 && metadata.chunk_locations.is_empty() {
+            let meta_clone = metadata.clone();
+            let meta_store = self.metadata.clone();
+            let _ = tokio::task::spawn_blocking(move || meta_store.put_file(&meta_clone)).await;
+        } else {
+            let _ = self.sled_write_tx.send(metadata);
+        }
         Response::Ok { data: None }
     }
 
@@ -4401,7 +4454,13 @@ impl Server {
             .map(|loc| loc.chunk_id)
             .collect();
 
-        // Step 1: persist chunk list to delete queue BEFORE removing metadata.
+        // Step 1: tombstone FIRST — matches follower path (handle_delete_metadata).
+        // Any sled_write_tx worker that races with the steps below will see the
+        // tombstone and discard the stale put_file, closing the resurrection window.
+        self.delete_tombstones.insert(metadata.id, std::time::Instant::now());
+        self.pending_broadcasts.remove(&metadata.id);
+
+        // Step 2: persist chunk list to delete queue BEFORE removing metadata.
         let entry = dfs_common::DeleteQueueEntry {
             file_id: metadata.id,
             path: path.clone(),
@@ -4415,7 +4474,7 @@ impl Server {
             };
         }
 
-        // Step 2: remove metadata now that the chunk list is safely queued.
+        // Step 3: remove metadata now that the chunk list is safely queued.
         if let Err(e) = self.metadata.delete_file(&metadata.id) {
             warn!("Failed to delete file metadata for {}: {}", path, e);
             // Queue entry is already written — drain worker will retry.
@@ -4434,9 +4493,7 @@ impl Server {
             }
         }
 
-        // Step 3: tombstone + in-memory chunk_map removal.
-        self.delete_tombstones.insert(metadata.id, std::time::Instant::now());
-        self.pending_broadcasts.remove(&metadata.id);
+        // Step 4: in-memory chunk_map removal (tombstone already set in step 1).
         self.chunk_map_remove(&metadata.id).await;
 
         // Notify the drain worker that there's a new entry (leader only acts on it,
@@ -5215,23 +5272,260 @@ impl Server {
         }
     }
 
+    /// Handle RepairFile: verify chunk hashes on all replicas, remove corrupt copies,
+    /// and queue under/over-replicated chunks for immediate healing.
+    /// Returns immediately — all work runs in the background, logged to server stdout.
+    /// When force=true the post-election leadership grace period is bypassed.
+    async fn handle_repair_file(&self, path: String, force: bool) -> Response {
+        // Must be the leader to issue destructive operations.
+        if !self.cluster.is_leader().await {
+            return Response::Error {
+                message: "This node is not the cluster leader — send RepairFile to the leader".to_string(),
+                code: ErrorCode::NotFound,
+            };
+        }
+
+        // Resolve file metadata up front so we can report errors immediately.
+        let file_meta = if let Ok(uuid) = uuid::Uuid::parse_str(&path) {
+            let file_id = dfs_common::FileId::from_uuid(uuid);
+            match self.metadata.get_file(&file_id) {
+                Ok(Some(m)) => m,
+                Ok(None) => return Response::Error {
+                    message: format!("File not found: {}", path),
+                    code: ErrorCode::NotFound,
+                },
+                Err(e) => return Response::Error {
+                    message: format!("Failed to look up file: {}", e),
+                    code: ErrorCode::InternalError,
+                },
+            }
+        } else {
+            match self.metadata.get_file_by_path(&path) {
+                Ok(Some(m)) => m,
+                Ok(None) => return Response::Error {
+                    message: format!("File not found: {}", path),
+                    code: ErrorCode::NotFound,
+                },
+                Err(e) => return Response::Error {
+                    message: format!("Failed to look up file: {}", e),
+                    code: ErrorCode::InternalError,
+                },
+            }
+        };
+
+        let healing_guard = self.healing.read().await;
+        let healing = match healing_guard.as_ref() {
+            Some(h) => h.clone(),
+            None => return Response::Error {
+                message: "Healing manager not available".to_string(),
+                code: ErrorCode::InternalError,
+            },
+        };
+        drop(healing_guard);
+
+        // Check cluster health — even with force=true we refuse destructive ops
+        // when 2+ nodes are down (the surviving copy might be the last one).
+        let all_nodes = self.cluster.get_all_nodes().await;
+        let total = all_nodes.len();
+        let online = all_nodes.iter().filter(|n| n.status == dfs_common::NodeStatus::Online).count();
+        let nodes_down = total.saturating_sub(online);
+        if nodes_down > 1 {
+            return Response::Error {
+                message: format!(
+                    "Repair refused: {} node(s) down — destructive ops unsafe with 2+ nodes offline",
+                    nodes_down
+                ),
+                code: ErrorCode::InternalError,
+            };
+        }
+
+        let destructive_allowed = force || {
+            let grace_elapsed = self.cluster.time_since_became_leader().await
+                .map_or(true, |d| d.as_secs() >= crate::healing::LEADER_CHANGE_GRACE_SECS);
+            grace_elapsed
+        };
+
+        let total_chunks = file_meta.chunk_locations.len();
+        let file_path = file_meta.path.clone();
+
+        // Clone everything the background task needs.
+        let client = self.client.clone();
+        let metadata = self.metadata.clone();
+        let local_id = self.cluster.local_node_id();
+        let rf = self.replication_factor;
+
+        // Spawn the per-chunk work in the background. Process one chunk at a time so
+        // we don't flood all replica nodes with hundreds of concurrent verify RPCs.
+        tokio::spawn(async move {
+            info!("RepairFile: starting background repair of {} ({} chunks)", file_path, total_chunks);
+            let mut chunks_checked = 0usize;
+            let mut corrupt_removed = 0usize;
+            let mut heal_queued = 0usize;
+
+            for chunk_loc in &file_meta.chunk_locations {
+                let chunk_id = chunk_loc.chunk_id;
+                let file_offset = match chunk_loc.file_offset {
+                    Some(o) => o,
+                    None => continue,
+                };
+                chunks_checked += 1;
+
+                // Refresh the live location from sled (may have more nodes than inline).
+                let live_loc = metadata.get_chunk_location(&chunk_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| chunk_loc.clone());
+
+                // Resolve online replica addresses.
+                let replica_addrs: Vec<(dfs_common::NodeId, std::net::SocketAddr)> = live_loc.nodes.iter()
+                    .filter_map(|node_id| {
+                        all_nodes.iter()
+                            .find(|n| n.id == *node_id && n.status == dfs_common::NodeStatus::Online)
+                            .map(|n| (*node_id, n.addr))
+                    })
+                    .collect();
+
+                if replica_addrs.is_empty() {
+                    continue;
+                }
+
+                // Verify all replicas of this chunk concurrently (N RPCs in parallel,
+                // one per node), then await before moving on to the next chunk.
+                // Carry (found, valid) so we can distinguish ghost from corrupt.
+                let verify_req = dfs_common::Request::VerifyChunkIntegrity { chunk_id, file_offset };
+                let mut verify_set: tokio::task::JoinSet<(dfs_common::NodeId, std::net::SocketAddr, bool, bool)> =
+                    tokio::task::JoinSet::new();
+                for &(node_id, addr) in &replica_addrs {
+                    let c = client.clone();
+                    let req = verify_req.clone();
+                    verify_set.spawn(async move {
+                        let (found, valid) = match c.send_message(addr, dfs_common::Message::Request(req)).await {
+                            Ok(env) => match env.message {
+                                dfs_common::Message::Response(
+                                    dfs_common::Response::ChunkValid { found, valid }
+                                ) => (found, valid),
+                                _ => (false, false), // unexpected response → treat as not found
+                            },
+                            Err(_) => (false, false), // RPC failure → treat as not found
+                        };
+                        (node_id, addr, found, valid)
+                    });
+                }
+
+                // found=true, valid=true  → healthy replica
+                // found=true, valid=false → CORRUPT (file exists but hash mismatch) → delete
+                // found=false             → ghost (file missing) → skip, healer handles it
+                let mut valid_nodes: Vec<dfs_common::NodeId> = Vec::new();
+                let mut corrupt_addrs: Vec<(dfs_common::NodeId, std::net::SocketAddr)> = Vec::new();
+                while let Some(res) = verify_set.join_next().await {
+                    match res {
+                        Ok((nid, _addr, true, true)) => {
+                            valid_nodes.push(nid);
+                        }
+                        Ok((nid, addr, true, false)) => {
+                            warn!("RepairFile: chunk {} on node {} — file found but hash MISMATCH (corrupt)", chunk_id, nid);
+                            corrupt_addrs.push((nid, addr));
+                        }
+                        Ok((nid, _addr, false, _)) => {
+                            debug!("RepairFile: chunk {} on node {} — file not found (ghost replica, healer will prune)", chunk_id, nid);
+                        }
+                        Err(e) => warn!("RepairFile: verify task panicked for chunk {}: {}", chunk_id, e),
+                    }
+                }
+
+                // Delete corrupt replicas.
+                if destructive_allowed {
+                    for (corrupt_id, corrupt_addr) in &corrupt_addrs {
+                        let del = dfs_common::Request::DeleteChunkReplica { chunk_id, leader_id: local_id };
+                        match client.send_message(*corrupt_addr, dfs_common::Message::Request(del)).await {
+                            Ok(env) if matches!(env.message, dfs_common::Message::Response(dfs_common::Response::Ok { .. })) => {
+                                info!("RepairFile: deleted corrupt replica of chunk {} from node {}", chunk_id, corrupt_id);
+                                corrupt_removed += 1;
+                            }
+                            Ok(env) => warn!("RepairFile: node {} refused to delete corrupt chunk {}: {:?}",
+                                             corrupt_id, chunk_id, env.message),
+                            Err(e) => warn!("RepairFile: could not reach {} to delete corrupt chunk {}: {}",
+                                            corrupt_id, chunk_id, e),
+                        }
+                    }
+
+                    if !corrupt_addrs.is_empty() {
+                        let corrupt_ids: Vec<dfs_common::NodeId> = corrupt_addrs.iter().map(|(id, _)| *id).collect();
+                        let clean_nodes: Vec<dfs_common::NodeId> = live_loc.nodes.iter()
+                            .filter(|n| !corrupt_ids.contains(n))
+                            .copied()
+                            .collect();
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let updated = dfs_common::ChunkLocation {
+                            chunk_id,
+                            nodes: clean_nodes,
+                            size: live_loc.size,
+                            checksum: live_loc.checksum,
+                            file_offset: live_loc.file_offset,
+                            written_at: Some(now_ms),
+                            client_write_seq: None,
+                        };
+                        let _ = metadata.put_chunk_location(&updated);
+                        // Broadcast to peers (fire-and-forget).
+                        let bc_loc = updated.clone();
+                        let bc_nodes = all_nodes.clone();
+                        let bc_client = client.clone();
+                        let bc_lid = local_id;
+                        tokio::spawn(async move {
+                            for node in &bc_nodes {
+                                if node.id == bc_lid || node.status != dfs_common::NodeStatus::Online { continue; }
+                                let req = dfs_common::Request::ReplicateChunkLocation {
+                                    location: bc_loc.clone(), file_id: None,
+                                };
+                                let _ = bc_client.send_message(node.addr, dfs_common::Message::Request(req)).await;
+                            }
+                        });
+                    }
+                }
+
+                // Do NOT touch the healer queue here. The normal healer cycle already
+                // discovers and fixes under/over-replication. RepairFile's only job is
+                // to remove genuinely corrupt replicas (hash mismatch on an existing file).
+                // Adding heal queue calls here caused the repair to over-add replicas
+                // by treating ghost replicas as corruption.
+                let _ = (valid_nodes, rf, &healing, &mut heal_queued); // suppress unused warnings
+
+                // Log progress every 50 chunks.
+                if chunks_checked % 50 == 0 {
+                    info!("RepairFile: {}/{} chunks checked ({} corrupt removed, {} queued for healing)",
+                          chunks_checked, total_chunks, corrupt_removed, heal_queued);
+                }
+            }
+
+            info!("RepairFile complete for {}: {} chunks checked, {} corrupt replicas removed, {} chunks queued for healing",
+                  file_path, chunks_checked, corrupt_removed, heal_queued);
+        });
+
+        Response::Ok {
+            data: Some(format!(
+                "Repair started in background for {} ({} chunks). Progress logged to server.",
+                file_meta.path, total_chunks
+            ).into_bytes()),
+        }
+    }
+
     /// Handle get file info request
     async fn handle_get_file_info(&self, path: String) -> Response {
         debug!("Handling get file info: {}", path);
 
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                // Merge sled node lists into inline chunk_locations to pick up any
-                // extra replica nodes added by ReplicateChunkLocation since the file was written.
+                // Use the CHUNK_TABLE sled record as the authoritative node list —
+                // it reflects healer updates (heal, trim, ghost prune) that never
+                // touch the FileMetadata inline copy. Unioning the two sources
+                // creates phantom extra nodes whenever the healer has replaced a
+                // node in the CHUNK_TABLE but the inline still has the old one.
                 let chunk_locations = metadata.chunk_locations.iter().map(|inline| {
                     if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
-                        let mut merged_nodes = inline.nodes.clone();
-                        for node in &sled_loc.nodes {
-                            if !merged_nodes.contains(node) {
-                                merged_nodes.push(*node);
-                            }
-                        }
-                        ChunkLocation { nodes: merged_nodes, ..inline.clone() }
+                        ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
                     } else {
                         inline.clone()
                     }
@@ -5264,13 +5558,7 @@ impl Server {
             Ok(Some(metadata)) => {
                 let chunk_locations = metadata.chunk_locations.iter().map(|inline| {
                     if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
-                        let mut merged_nodes = inline.nodes.clone();
-                        for node in &sled_loc.nodes {
-                            if !merged_nodes.contains(node) {
-                                merged_nodes.push(*node);
-                            }
-                        }
-                        ChunkLocation { nodes: merged_nodes, ..inline.clone() }
+                        ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
                     } else {
                         inline.clone()
                     }

@@ -271,6 +271,20 @@ impl ChunkStorage {
         self.read_chunk(chunk_id)
     }
 
+    /// Verify the on-disk chunk data matches its content-addressed ID.
+    /// The hash is position-aware: Blake3(file_offset_le_bytes || data), so
+    /// the caller must supply the file_offset from ChunkLocation.
+    /// Returns false if the file is missing, unreadable, or hash-mismatched.
+    pub fn verify_chunk_at(&self, chunk_id: &ChunkId, file_offset: u64) -> bool {
+        match self.read_chunk(chunk_id) {
+            Ok(data) => {
+                let expected = dfs_common::compute_chunk_hash_at(&data, file_offset);
+                expected == chunk_id.hash
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Check if a chunk exists in local storage
     pub fn has_chunk(&self, chunk_id: &ChunkId) -> bool {
         let path = self.get_chunk_path(chunk_id);

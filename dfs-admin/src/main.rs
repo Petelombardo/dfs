@@ -1076,10 +1076,23 @@ fn parse_file_id(s: &str) -> Result<FileId> {
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 async fn send_request(addr: SocketAddr, request: Request) -> Result<Response> {
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        send_request_inner(addr, request),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Request to {} timed out after 10s", addr))?
+}
+
+async fn send_request_inner(addr: SocketAddr, request: Request) -> Result<Response> {
     // Connect to node
-    let mut stream = TcpStream::connect(addr)
-        .await
-        .context("Failed to connect to cluster node")?;
+    let mut stream = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Connect to {} timed out", addr))?
+    .context("Failed to connect to cluster node")?;
 
     // Create envelope with request ID
     let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
@@ -1227,12 +1240,50 @@ async fn handle_stats_command(cluster_addrs: &[SocketAddr], watch: bool) -> Resu
         _ => None,
     };
 
+    // For --watch: maintain one persistent connection per node so we don't open and
+    // close a new TCP connection every second. Each poll reuses the same stream;
+    // on failure the stream is discarded and reconnected on the next iteration.
+    let mut persistent: Vec<(SocketAddr, Option<TcpStream>)> = if watch {
+        all_addrs.iter().map(|&a| (a, None)).collect()
+    } else {
+        Vec::new()
+    };
+
     loop {
-        // Query each node sequentially (5 nodes × ~10ms = ~50ms per refresh).
         let mut rows: Vec<(SocketAddr, Option<Response>)> = Vec::new();
-        for &addr in &all_addrs {
-            let resp = send_request(addr, Request::GetNodeStats).await.ok();
-            rows.push((addr, resp));
+
+        if watch {
+            for (addr, slot) in &mut persistent {
+                // Ensure we have a live connection.
+                if slot.is_none() {
+                    *slot = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        TcpStream::connect(*addr),
+                    ).await.ok().and_then(|r| r.ok());
+                    if let Some(s) = slot.as_mut() {
+                        let _ = s.set_nodelay(true);
+                    }
+                }
+
+                let resp = if let Some(stream) = slot.as_mut() {
+                    match stats_poll_persistent(stream, *addr).await {
+                        Ok(r) => Some(r),
+                        Err(_) => {
+                            // Connection broke — drop it; reconnect next iteration.
+                            *slot = None;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                rows.push((*addr, resp));
+            }
+        } else {
+            for &addr in &all_addrs {
+                let resp = send_request(addr, Request::GetNodeStats).await.ok();
+                rows.push((addr, resp));
+            }
         }
 
         if watch {
@@ -1248,6 +1299,35 @@ async fn handle_stats_command(cluster_addrs: &[SocketAddr], watch: bool) -> Resu
     }
 
     Ok(())
+}
+
+/// Send a single GetNodeStats request over an already-open stream and read the response.
+/// Both send and receive are bounded to 5 seconds so a hung node doesn't stall the display.
+async fn stats_poll_persistent(stream: &mut TcpStream, addr: SocketAddr) -> Result<Response> {
+    let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let envelope = MessageEnvelope::new(request_id, Message::Request(Request::GetNodeStats));
+    let encoded = envelope.to_bytes()?;
+    let len = (encoded.len() as u32).to_be_bytes();
+
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        stream.write_all(&len).await?;
+        stream.write_all(&encoded).await?;
+        stream.flush().await?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; msg_len];
+        stream.read_exact(&mut buf).await?;
+
+        let resp_env = MessageEnvelope::from_bytes(&buf)?;
+        match resp_env.message {
+            Message::Response(r) => Ok(r),
+            _ => anyhow::bail!("unexpected message type"),
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("stats poll to {} timed out", addr))?
 }
 
 fn format_uptime(secs: u64) -> String {

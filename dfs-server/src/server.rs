@@ -3027,41 +3027,75 @@ impl Server {
     /// rebuilds chunk_locations from the leader's authoritative chunk_map before
     /// sending — client-originated chunk_locations in pending_broadcasts are ignored.
     /// A full-sweep every 5 minutes catches followers that missed dirty-file pushes.
-    /// Periodic redb compaction — runs every 30 minutes, staggered by node address so
-    /// all nodes never compact simultaneously. Each compaction blocks metadata I/O for
-    /// its duration (seconds on a healthy-sized database); staggering ensures the rest
-    /// of the cluster is always fully operational while any one node is compacting.
+    /// Periodic redb compaction.  Runs every 5 minutes normally; backs off to 2 minutes
+    /// when the local disk is above 70% full so bloated COW pages are reclaimed before
+    /// the disk hits critical levels.  Staggered by node address so all nodes never
+    /// compact simultaneously.  Retries up to 3 times on "transaction in progress" errors
+    /// (a transient race during startup) before giving up for the current cycle.
     pub fn start_compaction_loop(self: Arc<Self>) {
         let metadata = self.metadata.clone();
+        let storage = self.storage.clone();
         let node_byte = self.cluster.local_node_id().as_bytes()[0] as u64;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
-            // Wait for the cluster to establish before computing the stagger so we
-            // use the real node count rather than a hardcoded constant.
+            // Wait for the cluster to establish before computing the stagger.
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             let node_count = cluster.get_all_nodes().await.len().max(1) as u64;
-            // Stagger by slot = (node_id_byte % node_count), spaced evenly across the
-            // 30-minute window. Using a UUID byte gives a stable, port-independent slot
-            // that works whether nodes are on different hosts (same port) or same host
-            // (different ports).
-            let interval_secs = 30 * 60;
+            // Stagger within a 5-minute window so nodes don't all compact at once.
+            let interval_secs: u64 = 5 * 60;
             let stagger_secs = (node_byte % node_count) * (interval_secs / node_count);
             tokio::time::sleep(tokio::time::Duration::from_secs(stagger_secs)).await;
             loop {
-                let m = metadata.clone();
-                let result = tokio::task::spawn_blocking(move || m.compact_db()).await;
-                match result {
-                    Ok(Ok((before, after))) => {
-                        if before != after {
-                            info!("redb compacted: {:.1}MB → {:.1}MB",
-                                before as f64 / 1_048_576.0,
-                                after  as f64 / 1_048_576.0);
+                // Adapt interval based on how full the local disk is.
+                let sleep_secs = match storage.get_filesystem_stats() {
+                    Ok((total, _, avail)) if total > 0 => {
+                        let used_pct = 100 * (total - avail) / total;
+                        if used_pct >= 70 { 2 * 60 } else { 5 * 60 }
+                    }
+                    _ => 5 * 60,
+                };
+
+                // Retry up to 3 times on transient "transaction in progress" errors.
+                let mut last_err = None;
+                for attempt in 0..3u8 {
+                    if attempt > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
+                    let m = metadata.clone();
+                    let result = tokio::task::spawn_blocking(move || m.compact_db()).await;
+                    match result {
+                        Ok(Ok((before, after))) => {
+                            if before != after {
+                                info!("redb compacted: {:.1}MB → {:.1}MB",
+                                    before as f64 / 1_048_576.0,
+                                    after  as f64 / 1_048_576.0);
+                            }
+                            last_err = None;
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            let msg = e.to_string();
+                            if msg.contains("transaction") || msg.contains("in progress") {
+                                last_err = Some(msg);
+                                // transient — retry after brief delay
+                            } else {
+                                warn!("redb periodic compact failed: {}", e);
+                                last_err = None;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("redb periodic compact panicked: {}", e);
+                            last_err = None;
+                            break;
                         }
                     }
-                    Ok(Err(e)) => warn!("redb periodic compact failed: {}", e),
-                    Err(e)    => warn!("redb periodic compact panicked: {}", e),
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(30 * 60)).await;
+                if let Some(e) = last_err {
+                    warn!("redb periodic compact failed after retries: {}", e);
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
             }
         });
     }
@@ -4652,15 +4686,25 @@ impl Server {
         let nodes = self.cluster.get_all_nodes().await;
         let local_id = self.cluster.local_node_id();
 
-        // Always clean up locally — delete chunks if present, metadata unconditionally.
+        // Delete locally first.  If the local metadata delete fails (e.g. disk full /
+        // I/O error), bail out immediately rather than propagating the delete to
+        // followers.  This prevents the "leader poisons followers" scenario where a
+        // full-disk leader silently fails its own delete but still broadcasts
+        // DeleteChunksBatch, causing followers to permanently lose the file while the
+        // leader retains it.  The drain will retry on the next 30-second cycle.
+        if let Err(e) = self.metadata.delete_file(&entry.file_id) {
+            warn!("drain_one_delete: local metadata delete failed for {} — will retry: {}", entry.path, e);
+            return;
+        }
+        if let Err(e) = self.metadata.delete_path_index(&entry.path) {
+            warn!("drain_one_delete: local path index delete failed for {} — will retry: {}", entry.path, e);
+        }
         for chunk_id in &entry.chunk_ids {
             let _ = self.metadata.delete_chunk_location(chunk_id);
             if let Err(e) = self.storage.delete_chunk(chunk_id) {
                 debug!("drain_one_delete: local chunk {} not present: {}", chunk_id, e);
             }
         }
-        let _ = self.metadata.delete_file(&entry.file_id);
-        let _ = self.metadata.delete_path_index(&entry.path);
         self.chunk_map_remove(&entry.file_id).await;
 
         // Send DeleteChunksBatch to every online peer (not just chunk holders).
@@ -4789,27 +4833,54 @@ impl Server {
 
         let nodes_count = self.cluster.get_all_nodes().await.len();
 
-        // Get filesystem statistics (fast - just statvfs syscall)
-        let (total_space, free_space, available_space) = match self.storage.get_filesystem_stats() {
+        // Get local filesystem statistics and register this node's capacity.
+        // This keeps the cluster's per-node capacity map fresh for placement decisions
+        // even though we report aggregate (cluster-wide) stats to the client below.
+        let (local_total, _local_free, local_available) = match self.storage.get_filesystem_stats() {
             Ok(stats) => stats,
             Err(e) => {
-                warn!("Failed to get storage stats: {}", e);
+                warn!("Failed to get local storage stats: {}", e);
                 return Response::Error {
                     message: format!("Failed to get storage stats: {}", e),
                     code: ErrorCode::InternalError,
                 };
             }
         };
-
-        // Calculate total_size as used space on filesystem
-        let total_size = total_space.saturating_sub(available_space);
-
-        // Update local node's capacity for placement decisions
         self.cluster.update_node_capacity(
             self.cluster.local_node_id(),
-            available_space,
-            total_space
+            local_available,
+            local_total,
         ).await;
+
+        // Warn when this node's disk is getting dangerously full.
+        let local_pct = if local_total > 0 { 100 * (local_total - local_available) / local_total } else { 0 };
+        if local_pct >= 95 {
+            warn!("DISK CRITICAL: local storage partition is {}% full ({:.1}GB free)", local_pct,
+                local_available as f64 / 1_073_741_824.0);
+        } else if local_pct >= 85 {
+            warn!("DISK WARNING: local storage partition is {}% full ({:.1}GB free)", local_pct,
+                local_available as f64 / 1_073_741_824.0);
+        } else if local_pct >= 70 {
+            info!("Disk usage: local storage partition is {}% full ({:.1}GB free)", local_pct,
+                local_available as f64 / 1_073_741_824.0);
+        }
+
+        // Aggregate capacity across ALL nodes (divided by RF for logical user-visible capacity).
+        // This prevents a single node whose metadata directory has bloated from causing the
+        // DFS mount to report near-zero free space and triggering DVR or other apps to
+        // delete data.  The RF divisor accounts for replication overhead.
+        let rf = self.replication_factor as u64;
+        let (total_space, available_space) = self.cluster.get_aggregate_capacity(rf).await;
+        // Fallback: if no aggregate data yet (fresh start), use local stats / RF.
+        let (total_space, available_space) = if total_space == 0 {
+            (local_total / rf.max(1), local_available / rf.max(1))
+        } else {
+            (total_space, available_space)
+        };
+        let free_space = available_space;
+
+        // Calculate total_size as used logical space.
+        let total_size = total_space.saturating_sub(available_space);
 
         // Estimate chunk count from used space (4MB chunks)
         // This avoids expensive list_chunks() call for statfs queries

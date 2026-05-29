@@ -1086,6 +1086,19 @@ impl MetadataStore {
     pub fn compact_db(&self) -> Result<(u64, u64)> {
         let size_before = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         let mut db = self.db.write().unwrap();
+
+        // redb's compact() fails if any pending_non_durable_commits exist — it counts
+        // them as live_read_transactions. Durability::None commits (used on every write
+        // for performance) accumulate in this list and are only cleared by a durable
+        // commit. A single empty durable commit drains the entire accumulated list so
+        // compact() can proceed.
+        {
+            let txn = db.begin_write()
+                .map_err(|e| anyhow::anyhow!("compact pre-flush begin: {}", e))?;
+            txn.commit()
+                .map_err(|e| anyhow::anyhow!("compact pre-flush commit: {}", e))?;
+        }
+
         db.compact().map_err(|e| anyhow::anyhow!("redb compact: {}", e))?;
         let size_after = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         Ok((size_before, size_after))

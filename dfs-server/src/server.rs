@@ -4865,19 +4865,12 @@ impl Server {
                 local_available as f64 / 1_073_741_824.0);
         }
 
-        // Aggregate capacity across ALL nodes (divided by RF for logical user-visible capacity).
-        // This prevents a single node whose metadata directory has bloated from causing the
-        // DFS mount to report near-zero free space and triggering DVR or other apps to
-        // delete data.  The RF divisor accounts for replication overhead.
-        let rf = self.replication_factor as u64;
-        let (total_space, available_space) = self.cluster.get_aggregate_capacity(rf).await;
-        // Fallback: if no aggregate data yet (fresh start), use local stats / RF.
-        let (total_space, available_space) = if total_space == 0 {
-            (local_total / rf.max(1), local_available / rf.max(1))
-        } else {
-            (total_space, available_space)
-        };
-        let free_space = available_space;
+        // Return raw local stats. The client queries all N nodes in parallel and
+        // aggregates them, then divides by RF once.  Dividing here too would cause
+        // double-RF division (total = 5 × local / RF² instead of 5 × local / RF).
+        let total_space = local_total;
+        let available_space = local_available;
+        let free_space = local_available;
 
         // Calculate total_size as used logical space.
         let total_size = total_space.saturating_sub(available_space);

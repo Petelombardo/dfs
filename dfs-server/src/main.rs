@@ -96,6 +96,11 @@ async fn main() -> Result<()> {
                 }
             };
 
+            // --log-level flag wins over RUST_LOG env var. Without this, an
+            // Environment="RUST_LOG=warn" in the systemd unit silently overrides
+            // the explicit CLI flag and suppresses INFO/ERROR messages.
+            std::env::set_var("RUST_LOG", &log_level);
+
             // Set up NON-BLOCKING logging to stderr/systemd journal
             // This uses a background thread with a bounded channel (default 8192 messages)
             // If the channel fills up, log messages are DROPPED instead of blocking the process
@@ -249,7 +254,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     // Start network server
     let mut net_server = network::NetworkServer::new(config.node.listen_addr, server.clone());
-    let server_handle = tokio::spawn(async move {
+    let mut server_handle = tokio::spawn(async move {
         if let Err(e) = net_server.start().await {
             tracing::error!("Network server error: {}", e);
         }
@@ -313,11 +318,25 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         info!("No seed nodes or peers configured - running as standalone node");
     }
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
-
-    server_handle.abort();
+    // Wait for either a clean shutdown signal or unexpected network task exit.
+    // If the network task exits (via panic or unexpected return) we exit immediately
+    // so the process manager (systemd Restart=always) can bring us back up cleanly.
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            info!("Shutting down...");
+            server_handle.abort();
+        }
+        result = &mut server_handle => {
+            match result {
+                Ok(()) => tracing::error!("Network server exited unexpectedly — listener is dead"),
+                Err(e) if e.is_panic() => tracing::error!("Network server panicked: {:?}", e),
+                Err(e) => tracing::error!("Network server task error: {}", e),
+            }
+            let _ = std::fs::remove_file(&addr_file);
+            std::process::exit(1);
+        }
+    }
 
     // Clean up addr file so dfs-admin auto-discovery doesn't see a stale entry
     let _ = std::fs::remove_file(&addr_file);

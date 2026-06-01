@@ -390,6 +390,30 @@ async fn handle_cluster_command(
     Ok(())
 }
 
+/// Greedy algorithm: how much can we store given per-node availabilities and RF?
+/// Each iteration picks the RF nodes with the most space, records their bottleneck,
+/// subtracts it, and repeats — correctly handling heterogeneous nodes.
+fn storage_usable_capacity(availabilities: &[u64], rf: usize) -> u64 {
+    if availabilities.is_empty() || rf == 0 { return 0; }
+    let mut caps = availabilities.to_vec();
+    let mut total = 0u64;
+    loop {
+        let mut non_zero: Vec<u64> = caps.iter().copied().filter(|&c| c > 0).collect();
+        if non_zero.len() < rf { break; }
+        non_zero.sort_by(|a, b| b.cmp(a));
+        let decrement = non_zero[rf - 1];
+        total += decrement;
+        let mut done = 0;
+        for cap in &mut caps {
+            if *cap > 0 && done < rf {
+                *cap = cap.saturating_sub(decrement);
+                done += 1;
+            }
+        }
+    }
+    total
+}
+
 async fn handle_storage_command(
     cmd: StorageCommands,
     cluster_addrs: &[SocketAddr],
@@ -397,49 +421,99 @@ async fn handle_storage_command(
 ) -> Result<()> {
     match cmd {
         StorageCommands::Stats => {
-            let response = send_request(cluster_addrs[0], Request::GetStorageStats).await?;
+            // Discover all cluster nodes first, then query them all in parallel.
+            // The caller may only know one address (e.g. auto-detected local node).
+            let all_addrs: Vec<SocketAddr> =
+                if let Ok(Response::ClusterStatus { nodes, .. }) =
+                    send_request(cluster_addrs[0], Request::GetClusterStatus).await
+                {
+                    nodes.iter().map(|n| n.addr).collect()
+                } else {
+                    cluster_addrs.to_vec()
+                };
 
-            match response {
-                Response::StorageStats {
-                    total_chunks,
-                    total_size,
-                    replication_factor,
-                    nodes_count,
-                    total_space,
-                    free_space,
-                    available_space,
-                } => {
-                    if json_output {
-                        let output = serde_json::json!({
-                            "total_chunks": total_chunks,
-                            "total_size": total_size,
-                            "total_size_mb": total_size / (1024 * 1024),
-                            "replication_factor": replication_factor,
-                            "nodes_count": nodes_count,
-                            "total_space_gb": total_space / (1024 * 1024 * 1024),
-                            "free_space_gb": free_space / (1024 * 1024 * 1024),
-                            "available_space_gb": available_space / (1024 * 1024 * 1024),
-                        });
-                        println!("{}", serde_json::to_string_pretty(&output)?);
-                    } else {
-                        println!("DFS Storage Statistics");
-                        println!("======================");
-                        println!("Total Chunks:       {}", total_chunks);
-                        println!("Total Size:         {} MB", total_size / (1024 * 1024));
-                        println!("Replication Factor: {}", replication_factor);
-                        println!("Nodes Count:        {}", nodes_count);
-                        println!("Total Space:        {} GB", total_space / (1024 * 1024 * 1024));
-                        println!("Free Space:         {} GB", free_space / (1024 * 1024 * 1024));
-                        println!("Available Space:    {} GB", available_space / (1024 * 1024 * 1024));
-                    }
+            // Query all nodes in parallel — each returns its raw local disk stats.
+            // We aggregate here with a single RF division so the numbers match `df`.
+            let handles: Vec<_> = all_addrs.iter().map(|&addr| {
+                tokio::spawn(async move {
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        send_request(addr, Request::GetStorageStats),
+                    ).await;
+                    (addr, result)
+                })
+            }).collect();
+
+            struct NodeStat {
+                addr: SocketAddr,
+                total: u64,
+                available: u64,
+            }
+            let mut node_stats: Vec<NodeStat> = Vec::new();
+            let mut rf = 3usize;
+
+            for handle in handles {
+                if let Ok((addr, Ok(Ok(Response::StorageStats {
+                    total_space, available_space, replication_factor, ..
+                })))) = handle.await {
+                    node_stats.push(NodeStat { addr, total: total_space, available: available_space });
+                    rf = replication_factor;
                 }
-                Response::Error { message, .. } => {
-                    error!("Error: {}", message);
-                    anyhow::bail!("Command failed: {}", message);
+            }
+
+            if node_stats.is_empty() {
+                anyhow::bail!("No nodes responded to storage stats query");
+            }
+
+            let total_raw: u64 = node_stats.iter().map(|n| n.total).sum();
+            let avail_raw: Vec<u64> = node_stats.iter().map(|n| n.available).collect();
+            let usable_total = total_raw / rf as u64;
+            let usable_avail = storage_usable_capacity(&avail_raw, rf);
+            let usable_used = usable_total.saturating_sub(usable_avail);
+
+            let gb = |b: u64| b as f64 / 1_073_741_824.0;
+
+            if json_output {
+                let per_node: Vec<_> = node_stats.iter().map(|n| {
+                    serde_json::json!({
+                        "addr": n.addr.to_string(),
+                        "total_gb": gb(n.total),
+                        "used_gb": gb(n.total.saturating_sub(n.available)),
+                        "available_gb": gb(n.available),
+                        "pct_used": if n.total > 0 { 100 * n.total.saturating_sub(n.available) / n.total } else { 0 },
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "replication_factor": rf,
+                    "nodes_responding": node_stats.len(),
+                    "nodes_total": all_addrs.len(),
+                    "cluster": {
+                        "total_gb": gb(usable_total),
+                        "used_gb": gb(usable_used),
+                        "available_gb": gb(usable_avail),
+                    },
+                    "nodes": per_node,
+                }))?);
+            } else {
+                println!("DFS Storage Statistics");
+                println!("======================");
+                println!("Replication Factor:  {}", rf);
+                println!("Nodes:               {}/{}", node_stats.len(), all_addrs.len());
+                println!();
+                println!("Per-node disk usage:");
+                for n in &node_stats {
+                    let used = n.total.saturating_sub(n.available);
+                    let pct = if n.total > 0 { 100 * used / n.total } else { 0 };
+                    println!("  {}  {:6.1} GB used / {:6.1} GB total  ({:3}% full)",
+                        n.addr, gb(used), gb(n.total), pct);
                 }
-                _ => {
-                    anyhow::bail!("Unexpected response type");
-                }
+                println!();
+                println!("Cluster totals (logical, RF={}):", rf);
+                println!("  Total:     {:8.1} GB  ({:.2} TB)", gb(usable_total), gb(usable_total) / 1024.0);
+                println!("  Used:      {:8.1} GB  ({:.2} TB)", gb(usable_used), gb(usable_used) / 1024.0);
+                println!("  Available: {:8.1} GB  ({:.2} TB)", gb(usable_avail), gb(usable_avail) / 1024.0);
+                println!("  Use%:      {:8.1}%",
+                    if usable_total > 0 { 100.0 * usable_used as f64 / usable_total as f64 } else { 0.0 });
             }
         }
         StorageCommands::Scrub => {

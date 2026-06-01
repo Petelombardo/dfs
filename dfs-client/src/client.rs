@@ -5976,15 +5976,26 @@ leader_addr: Arc::new(RwLock::new(None)),
         let all_nodes = self.cluster_nodes.read().await.clone();
         let leader = *self.leader_addr.read().await;
 
-        // Build quorum: leader first, then up to 2 others.
+        // Build quorum: leader first, then up to 2 healthy others.
+        // Skip penalized nodes so a dead node doesn't force a 10s timeout per delete.
         let mut quorum: Vec<SocketAddr> = Vec::with_capacity(3);
         if let Some(leader_addr) = leader {
-            quorum.push(leader_addr);
+            if !self.node_health.is_penalized(leader_addr).await {
+                quorum.push(leader_addr);
+            }
         }
         for &addr in &all_nodes {
             if quorum.len() >= 3 { break; }
-            if !quorum.contains(&addr) {
+            if !quorum.contains(&addr) && !self.node_health.is_penalized(addr).await {
                 quorum.push(addr);
+            }
+        }
+        // Fallback: if all known nodes are penalized, try anyway (better than failing fast).
+        if quorum.is_empty() {
+            if let Some(leader_addr) = leader { quorum.push(leader_addr); }
+            for &addr in &all_nodes {
+                if quorum.len() >= 3 { break; }
+                if !quorum.contains(&addr) { quorum.push(addr); }
             }
         }
         if quorum.is_empty() {
@@ -5993,39 +6004,55 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Fire all quorum RPCs concurrently via independent tasks.
         // Each task gets its own Arc clone so no lifetime issues.
-        let handles: Vec<_> = quorum.iter().map(|&addr| {
+        // The leader handle is always first (quorum[0]). We wait for it specifically
+        // because the leader is the one that durably enqueues the delete.  The other
+        // two handles run in the background for redundancy but we don't block on them:
+        // if the leader acks, the delete is durable regardless of the others.
+        let leader_addr = quorum[0];
+        let mut handles: Vec<_> = quorum.iter().map(|&addr| {
             let req = request.clone();
             let this = self.clone();
             tokio::spawn(async move {
-                tokio::time::timeout(
+                (addr, tokio::time::timeout(
                     tokio::time::Duration::from_secs(10),
                     this.send_request(addr, req),
-                ).await
+                ).await)
             })
         }).collect();
 
         let mut not_found_count = 0usize;
         let mut success_count = 0usize;
         let quorum_len = quorum.len();
-        for h in handles {
-            // h.await: Result<Result<Result<Response, Error>, Elapsed>, JoinError>
-            match h.await {
-                Ok(Ok(Ok(Response::Ok { .. }))) => { success_count += 1; }
-                Ok(Ok(Ok(Response::Error { code: ErrorCode::NotFound, .. }))) => {
+        let mut leader_not_found = false;
+        for h in &mut handles {
+            let join_result = h.await;
+            let (addr, timeout_result) = match join_result {
+                Ok(v) => v,
+                Err(e) => { warn!("delete_file: task panicked for {}: {}", path, e); continue; }
+            };
+            let is_leader = addr == leader_addr;
+            match timeout_result {
+                Ok(Ok(Response::Ok { .. })) => {
+                    success_count += 1;
+                    // Leader acked — delete is durably queued. Return without
+                    // waiting for the background follower RPCs.
+                    if is_leader { return Ok(()); }
+                }
+                Ok(Ok(Response::Error { code: ErrorCode::NotFound, .. })) => {
                     not_found_count += 1;
                     success_count += 1;
+                    if is_leader { leader_not_found = true; }
                 }
-                Ok(Ok(Ok(Response::Error { message, .. }))) => {
+                Ok(Ok(Response::Error { message, .. })) => {
                     warn!("delete_file: node returned error for {}: {}", path, message);
                 }
-                Ok(Ok(Ok(_))) => { warn!("delete_file: unexpected response for {}", path); }
-                Ok(Ok(Err(e))) => { warn!("delete_file: RPC failed for {}: {}", path, e); }
-                Ok(Err(_)) => { warn!("delete_file: RPC timed out for {}", path); }
-                Err(e) => { warn!("delete_file: task panicked for {}: {}", path, e); }
+                Ok(Ok(_)) => { warn!("delete_file: unexpected response for {}", path); }
+                Ok(Err(e)) => { warn!("delete_file: RPC failed for {}: {}", path, e); }
+                Err(_) => { warn!("delete_file: RPC timed out for {}", path); }
             }
         }
 
-        if not_found_count == quorum_len {
+        if leader_not_found || not_found_count == quorum_len {
             // Every node said NotFound — file was already gone.
             return Ok(());
         }

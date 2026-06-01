@@ -147,6 +147,10 @@ pub struct Server {
     /// 3600-bucket ring (one bucket per second). Near-zero overhead: atomic
     /// fetch_add per op, single mutex acquire per second for the ring write.
     ops_tracker: Arc<OpsTracker>,
+
+    /// Shared connection semaphore from the NetworkServer.
+    /// None until set_conn_semaphore() is called from main after the server starts.
+    conn_semaphore: Arc<RwLock<Option<Arc<tokio::sync::Semaphore>>>>,
 }
 
 impl Server {
@@ -195,6 +199,7 @@ impl Server {
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             chunk_patch_locks: Arc::new(DashMap::new()),
             ops_tracker: Arc::new(OpsTracker::new()),
+            conn_semaphore: Arc::new(RwLock::new(None)),
             sled_write_tx: {
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
                 let meta_bg = metadata.clone();
@@ -485,6 +490,86 @@ impl Server {
     /// Called from main() once both Server and HealingManager are created.
     pub async fn set_healing_manager(&self, healing: Arc<HealingManager>) {
         *self.healing.write().await = Some(healing);
+    }
+
+    /// Share the NetworkServer's connection semaphore with the Server.
+    /// Called from main() after NetworkServer is created, before it starts.
+    pub async fn set_conn_semaphore(&self, sem: Arc<tokio::sync::Semaphore>) {
+        *self.conn_semaphore.write().await = Some(sem);
+    }
+
+    /// Background task: monitor TCP connection slot pressure and step down from
+    /// leadership when all slots are exhausted for a sustained period.
+    ///
+    /// Thresholds (MAX_CONNECTIONS = 128):
+    ///   75% used (96+)  → WARN on each accept (done in network.rs)
+    ///   100% for 30s    → check CLOSE_WAIT; if real load, GracefulLeave
+    ///   recovery >50%   → announce_recovery
+    ///   100% for 5 min  → exit(1) so systemd can restart cleanly
+    pub fn start_conn_pressure_watchdog(self: Arc<Self>) {
+        use crate::network::MAX_CONNECTIONS;
+        tokio::spawn(async move {
+            let mut full_since: Option<std::time::Instant> = None;
+            let mut stepped_down = false;
+
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                let sem = match self.conn_semaphore.read().await.clone() {
+                    Some(s) => s,
+                    None => continue, // not wired up yet
+                };
+
+                let available = sem.available_permits();
+                let in_use = MAX_CONNECTIONS - available;
+
+                if in_use >= MAX_CONNECTIONS {
+                    // Fully exhausted.
+                    let since = *full_since.get_or_insert(std::time::Instant::now());
+                    let secs_full = since.elapsed().as_secs();
+
+                    // Last resort: if still stuck after 5 minutes, restart.
+                    if secs_full >= 300 {
+                        tracing::error!(
+                            "Connection slots exhausted for {}s — restarting via exit(1)",
+                            secs_full
+                        );
+                        std::process::exit(1);
+                    }
+
+                    // After 30s at 100%, check whether it's CLOSE_WAIT or real load.
+                    if secs_full >= 30 && !stepped_down {
+                        let port = self.cluster.local_addr().port();
+                        let close_wait = count_close_wait_connections(port);
+                        let half = MAX_CONNECTIONS / 2;
+
+                        if close_wait >= half {
+                            // Mostly leaked CLOSE_WAIT — keepalive will clean these up,
+                            // no need to step down yet.
+                            tracing::warn!(
+                                "Connection pressure: {}/{} in use, {} CLOSE_WAIT — waiting for keepalive cleanup",
+                                in_use, MAX_CONNECTIONS, close_wait
+                            );
+                        } else {
+                            // Genuinely active connections: step down from leadership.
+                            tracing::error!(
+                                "Connection pressure: {}/{} in use ({} CLOSE_WAIT) for {}s — stepping down from leadership",
+                                in_use, MAX_CONNECTIONS, close_wait, secs_full
+                            );
+                            self.cluster.announce_leaving(dfs_common::LeaveReason::ConnectionPressure).await;
+                            stepped_down = true;
+                        }
+                    }
+                } else {
+                    // Pressure has eased.
+                    full_since = None;
+                    if stepped_down && available > MAX_CONNECTIONS / 2 {
+                        stepped_down = false;
+                        self.cluster.announce_recovery().await;
+                    }
+                }
+            }
+        });
     }
 
     /// Start the leader metadata dissemination loop.
@@ -1291,7 +1376,15 @@ impl Server {
             }
 
             Request::GetNodeStats => {
+                use crate::network::MAX_CONNECTIONS;
                 let snap = self.ops_tracker.get_stats();
+                let (active_conn, max_conn) = {
+                    let sem = self.conn_semaphore.read().await;
+                    match sem.as_ref() {
+                        Some(s) => ((MAX_CONNECTIONS - s.available_permits()) as u64, MAX_CONNECTIONS as u64),
+                        None => (0, MAX_CONNECTIONS as u64),
+                    }
+                };
                 Response::NodeStats {
                     reads_live: snap.reads_live,
                     writes_live: snap.writes_live,
@@ -1304,6 +1397,8 @@ impl Server {
                     writes_avg_1h: snap.writes_avg_1h,
                     meta_avg_1h: snap.meta_avg_1h,
                     uptime_secs: snap.uptime_secs,
+                    active_connections: active_conn,
+                    max_connections: max_conn,
                 }
             }
 
@@ -6247,6 +6342,11 @@ impl MessageHandler for Server {
                     }
                     Response::Ok { data: None }
                 }
+                ClusterMessage::GracefulLeave { node_id, addr: _, reason } => {
+                    info!("Node {} is leaving gracefully (reason: {:?})", node_id, reason);
+                    self.cluster.set_leaving(node_id, reason).await;
+                    Response::Ok { data: None }
+                }
                 _ => Response::Error {
                     message: "Cluster message not implemented".to_string(),
                     code: ErrorCode::InternalError,
@@ -6255,6 +6355,36 @@ impl MessageHandler for Server {
         })
     }
 
+}
+
+/// Count TCP connections in CLOSE_WAIT state on the given local port by reading
+/// /proc/net/tcp and /proc/net/tcp6.  Returns 0 if the files can't be read.
+/// Used by the connection pressure watchdog to distinguish real load from leaks.
+fn count_close_wait_connections(port: u16) -> usize {
+    // CLOSE_WAIT = state 8 in Linux /proc/net/tcp
+    const CLOSE_WAIT: &str = "08";
+    let hex_port = format!("{:04X}", port);
+    let mut count = 0usize;
+
+    for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = std::fs::read_to_string(path) else { continue };
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 4 { continue; }
+            // field 1 = local_address (hex IP:port), field 3 = state
+            let local = fields[1];
+            let state = fields[3];
+            // Local port is after the last ':' in the address field
+            if state == CLOSE_WAIT {
+                if let Some(p) = local.rsplit(':').next() {
+                    if p == hex_port {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
 }
 
 impl Server {

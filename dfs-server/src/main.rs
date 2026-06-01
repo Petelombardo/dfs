@@ -252,8 +252,10 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_chunk_tombstone_cleanup_loop();
     info!("✓ Healing manager started");
 
-    // Start network server
+    // Start network server — share its semaphore with the server before spawning.
     let mut net_server = network::NetworkServer::new(config.node.listen_addr, server.clone());
+    server.set_conn_semaphore(net_server.conn_semaphore.clone()).await;
+    server.clone().start_conn_pressure_watchdog();
     let mut server_handle = tokio::spawn(async move {
         if let Err(e) = net_server.start().await {
             tracing::error!("Network server error: {}", e);
@@ -319,11 +321,26 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     }
 
     // Wait for either a clean shutdown signal or unexpected network task exit.
+    // Listens for both SIGINT (Ctrl+C) and SIGTERM (systemctl stop / kill).
     // If the network task exits (via panic or unexpected return) we exit immediately
     // so the process manager (systemd Restart=always) can bring us back up cleanly.
+    let shutdown = {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate()
+        )?;
+        async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        }
+    };
     tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result?;
+        sig = shutdown => {
+            info!("Shutting down ({sig}) — broadcasting GracefulLeave to peers...");
+            server.cluster().announce_leaving(dfs_common::LeaveReason::Shutdown).await;
+            // Brief pause so peers receive the broadcast before we close connections.
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             info!("Shutting down...");
             server_handle.abort();
         }

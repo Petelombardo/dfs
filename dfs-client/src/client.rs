@@ -1085,6 +1085,15 @@ leader_addr: Arc::new(RwLock::new(None)),
             return Err(anyhow::anyhow!("ServerBusy"));
         }
 
+        // NodeLeaving: the node has announced a graceful departure. Clear the cached
+        // leader so the next request triggers a cluster refresh, then return an error
+        // so the caller retries against another node immediately.
+        if let Response::Error { code: dfs_common::ErrorCode::NodeLeaving, .. } = &response {
+            debug!("Node {} is leaving — clearing cached leader to force refresh", addr);
+            *self.leader_addr.write().await = None;
+            return Err(anyhow::anyhow!("NodeLeaving"));
+        }
+
         self.node_health.record_success(addr).await;
         Ok(response)
     }

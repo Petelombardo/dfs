@@ -45,6 +45,8 @@ pub struct NodeStatsSnapshot {
     pub writes_avg_1h: u64,
     pub meta_avg_1h: u64,
     pub uptime_secs: u64,
+    pub active_connections: u64,
+    pub max_connections: u64,
 }
 
 impl OpsTracker {
@@ -108,6 +110,8 @@ impl OpsTracker {
                 writes_avg_1h: 0,
                 meta_avg_1h: 0,
                 uptime_secs: self.started_at.elapsed().as_secs(),
+                active_connections: 0,
+                max_connections: 0,
             };
         }
 
@@ -155,6 +159,9 @@ impl OpsTracker {
             writes_avg_1h: w_sum / count,
             meta_avg_1h: m_sum / count,
             uptime_secs: self.started_at.elapsed().as_secs(),
+            // Filled in by Server::handle_request(GetNodeStats) which has access to the semaphore.
+            active_connections: 0,
+            max_connections: 0,
         }
     }
 }

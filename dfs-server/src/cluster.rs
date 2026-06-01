@@ -282,6 +282,108 @@ impl ClusterManager {
         self.became_leader_at.read().await.map(|t| t.elapsed())
     }
 
+    /// Grace period after a GracefulLeave before healing treats the node as Failed.
+    /// 60s is enough time for a normal restart (stop ~5s + start ~5s + margin).
+    pub const LEAVING_GRACE_SECS: u64 = 60;
+
+    /// Mark a remote node as Leaving immediately, recording when it left.
+    /// Called when we receive a GracefulLeave broadcast from that node.
+    pub async fn set_leaving(&self, node_id: NodeId, reason: dfs_common::LeaveReason) {
+        let now = dfs_common::types::current_timestamp();
+        let mut nodes = self.nodes.write().await;
+        if let Some(info) = nodes.get_mut(&node_id) {
+            info.status = NodeStatus::Leaving;
+            info.leaving_at = now;
+            info.leave_reason = Some(reason);
+            // Set last_heartbeat to 0 so the failure detector's is_timed_out check
+            // is immediately true.  Without this, the stale fresh heartbeat timestamp
+            // triggers the "!is_timed_out → rejoined" branch on the very next tick,
+            // resetting the node back to Online before it's actually gone.
+            info.last_heartbeat = 0;
+        }
+        // Remove from hash ring so no new chunks are placed on a leaving node.
+        let mut ring = self.hash_ring.write().await;
+        ring.remove_node(&node_id);
+    }
+
+    /// Mark THIS node as Leaving and broadcast GracefulLeave to all peers.
+    /// Leadership re-elects immediately on the receiving side.
+    pub async fn announce_leaving(&self, reason: dfs_common::LeaveReason) {
+        use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        // Mark ourselves Leaving locally first.
+        {
+            let now = dfs_common::types::current_timestamp();
+            let mut nodes = self.nodes.write().await;
+            if let Some(info) = nodes.get_mut(&self.local_node_id) {
+                info.status = NodeStatus::Leaving;
+                info.leaving_at = now;
+                info.leave_reason = Some(reason);
+            }
+        }
+
+        let msg = Message::Cluster(ClusterMessage::GracefulLeave {
+            node_id: self.local_node_id,
+            addr: self.local_addr,
+            reason,
+        });
+        let envelope = MessageEnvelope::new(
+            RequestId::new(0),
+            msg,
+        );
+        let encoded = match envelope.to_bytes() {
+            Ok(b) => b,
+            Err(e) => { warn!("announce_leaving: failed to encode message: {}", e); return; }
+        };
+
+        let peers: Vec<SocketAddr> = {
+            let nodes = self.nodes.read().await;
+            nodes.values()
+                .filter(|n| n.id != self.local_node_id && n.status != NodeStatus::Failed)
+                .map(|n| n.addr)
+                .collect()
+        };
+
+        let encoded = Arc::new(encoded);
+        let mut tasks = Vec::new();
+        for addr in peers {
+            let encoded = encoded.clone();
+            tasks.push(tokio::spawn(async move {
+                let timeout = tokio::time::Duration::from_millis(500);
+                if let Ok(Ok(mut stream)) = tokio::time::timeout(
+                    timeout,
+                    TcpStream::connect(addr),
+                ).await {
+                    let len = (encoded.len() as u32).to_be_bytes();
+                    let _ = stream.write_all(&len).await;
+                    let _ = stream.write_all(&encoded).await;
+                    // Read and discard the response so the server-side socket closes cleanly.
+                    let mut buf = [0u8; 4];
+                    let _ = tokio::time::timeout(timeout, stream.read_exact(&mut buf)).await;
+                }
+            }));
+        }
+        for t in tasks { let _ = t.await; }
+    }
+
+    /// Mark THIS node as Online again after connection pressure has resolved.
+    /// The next heartbeat will propagate the recovery to peers.
+    pub async fn announce_recovery(&self) {
+        let mut nodes = self.nodes.write().await;
+        if let Some(info) = nodes.get_mut(&self.local_node_id) {
+            info.status = NodeStatus::Online;
+            info.leaving_at = 0;
+            info.leave_reason = None;
+        }
+        // Re-add to hash ring so chunks can be placed here again.
+        let mut ring = self.hash_ring.write().await;
+        ring.add_node(self.local_node_id);
+        info!("Connection pressure resolved — rejoining cluster as Online");
+        self.node_recovered_notify.notify_waiters();
+    }
+
     /// Get online nodes count
     pub async fn online_node_count(&self) -> usize {
         let nodes = self.nodes.read().await;
@@ -659,7 +761,22 @@ impl ClusterManager {
                     }
                 }
                 NodeStatus::Leaving => {
-                    // Graceful shutdown - leave alone
+                    // After the grace period, treat as Failed so healing can kick in.
+                    // Before that, the node may still come back (rolling restart / recovery).
+                    let grace_expired = node_info.leaving_at > 0
+                        && now.saturating_sub(node_info.leaving_at) > Self::LEAVING_GRACE_SECS;
+                    if grace_expired {
+                        warn!("Node {} leaving grace period expired — treating as Failed", node_id);
+                        node_info.status = NodeStatus::Failed;
+                        failed_nodes.push(*node_id);
+                    } else if !is_timed_out {
+                        // Node sent a heartbeat — it came back before grace expired.
+                        info!("Node {} rejoined after graceful leave", node_id);
+                        node_info.status = NodeStatus::Online;
+                        node_info.leaving_at = 0;
+                        node_info.leave_reason = None;
+                        recovered_nodes.push(*node_id);
+                    }
                 }
             }
         }

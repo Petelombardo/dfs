@@ -1455,8 +1455,8 @@ fn print_stats_table(rows: &[(SocketAddr, Option<Response>)], leader_addr: Optio
     println!();
 
     let hdr = format!(
-        "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}  {}",
-        "Node", "Reads/s", "Writ/s", "Meta/s", "Total/s", "Peak 1h", "Avg 1h", "Uptime"
+        "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}  {:>10}  {}",
+        "Node", "Reads/s", "Writ/s", "Meta/s", "Total/s", "Peak 1h", "Avg 1h", "Conns", "Uptime"
     );
     println!("{}", hdr);
     println!("{}", "─".repeat(hdr.chars().count()));
@@ -1482,7 +1482,7 @@ fn print_stats_table(rows: &[(SocketAddr, Option<Response>)], leader_addr: Optio
             Some(Response::NodeStats {
                 reads_live, writes_live, meta_live,
                 total_peak_1h, reads_avg_1h, writes_avg_1h, meta_avg_1h,
-                uptime_secs, ..
+                uptime_secs, active_connections, max_connections, ..
             }) => {
                 let total_live = reads_live + writes_live + meta_live;
                 let total_avg = reads_avg_1h + writes_avg_1h + meta_avg_1h;
@@ -1494,11 +1494,21 @@ fn print_stats_table(rows: &[(SocketAddr, Option<Response>)], leader_addr: Optio
                 cluster_writes_avg += writes_avg_1h;
                 cluster_meta_avg += meta_avg_1h;
                 nodes_with_data += 1;
+                let conn_str = if *max_connections > 0 {
+                    let pct = 100 * active_connections / max_connections;
+                    if pct >= 75 {
+                        format!("{}/{} !", active_connections, max_connections)
+                    } else {
+                        format!("{}/{}", active_connections, max_connections)
+                    }
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}  {}",
+                    "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}  {:>10}  {}",
                     label,
                     reads_live, writes_live, meta_live, total_live,
-                    total_peak_1h, total_avg,
+                    total_peak_1h, total_avg, conn_str,
                     format_uptime(*uptime_secs)
                 );
             }
@@ -1514,11 +1524,12 @@ fn print_stats_table(rows: &[(SocketAddr, Option<Response>)], leader_addr: Optio
     let cluster_total_avg = cluster_reads_avg + cluster_writes_avg + cluster_meta_avg;
     let avg_divisor = nodes_with_data.max(1) as u64;
     println!(
-        "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}",
+        "{:<23} {:>7}  {:>7}  {:>6}  {:>7}  {:>8}  {:>7}  {:>10}",
         "Cluster",
         cluster_reads_live, cluster_writes_live, cluster_meta_live, cluster_total_live,
         cluster_total_peak,
         cluster_total_avg / avg_divisor,
+        "",
     );
     println!();
 }

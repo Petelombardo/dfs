@@ -58,6 +58,14 @@ pub struct NodeInfo {
 
     /// Last heartbeat timestamp (Unix epoch seconds)
     pub last_heartbeat: u64,
+
+    /// Unix timestamp when this node entered Leaving status (0 = not leaving).
+    #[serde(default)]
+    pub leaving_at: u64,
+
+    /// Why this node is leaving (None if not leaving).
+    #[serde(default)]
+    pub leave_reason: Option<LeaveReason>,
 }
 
 impl NodeInfo {
@@ -68,6 +76,8 @@ impl NodeInfo {
             name,
             status: NodeStatus::Online,
             last_heartbeat: current_timestamp(),
+            leaving_at: 0,
+            leave_reason: None,
         }
     }
 
@@ -94,6 +104,16 @@ pub enum NodeStatus {
     Failed,
     /// Node is leaving the cluster gracefully
     Leaving,
+}
+
+/// Why a node is leaving — carried in GracefulLeave broadcasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaveReason {
+    /// Controlled shutdown (systemctl stop / Ctrl+C).
+    Shutdown,
+    /// All TCP connection slots are exhausted and the node is stepping down from
+    /// leadership until pressure drops. It will auto-recover without restarting.
+    ConnectionPressure,
 }
 
 /// Compact node health information for gossiping

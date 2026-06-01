@@ -25,6 +25,8 @@ pub trait MessageHandler: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>>;
 }
 
+pub const MAX_CONNECTIONS: usize = 128;
+
 /// Network server for handling node-to-node communication
 /// Optimized for SBC environments (connection reuse, async I/O)
 pub struct NetworkServer<H: MessageHandler> {
@@ -40,6 +42,8 @@ pub struct NetworkServer<H: MessageHandler> {
     /// Message handler
     handler: Arc<H>,
 
+    /// Shared semaphore — available_permits() reports free slots; cloned to Server for stats.
+    pub conn_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl<H: MessageHandler + 'static> NetworkServer<H> {
@@ -50,6 +54,7 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
             next_request_id: Arc::new(AtomicU64::new(1)),
             shutdown_tx: None,
             handler,
+            conn_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         }
     }
 
@@ -61,18 +66,7 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
 
         info!("Network server listening on {}", self.listen_addr);
 
-        // Limit concurrent in-flight connections. Each connection holds a permit for
-        // its lifetime, so the runtime never has more than MAX_CONNECTIONS tasks
-        // simultaneously blocked in read/write. Without this cap, a burst of connections
-        // (e.g. rapid-fire small writes from a SQLite WAL session) can exhaust the tokio
-        // thread pool, leaving no threads to service new requests and causing a deadlock.
-        //
-        // 128 is sufficient: the client uses connection pooling and never needs hundreds
-        // of simultaneous connections to a single node. 512 was too high — during a DVR
-        // startup scan, 359 CLOSE-WAIT connections each held a permit permanently, starving
-        // the scheduler and preventing the 30s idle timeout from ever firing.
-        const MAX_CONNECTIONS: usize = 128;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+        let semaphore = self.conn_semaphore.clone();
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
@@ -118,6 +112,10 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                             // the client gets a fast failure rather than a silent hang.
                             match sem.clone().try_acquire_owned() {
                                 Ok(permit) => {
+                                    let in_use = MAX_CONNECTIONS - sem.available_permits();
+                                    if in_use > MAX_CONNECTIONS * 3 / 4 {
+                                        warn!("Connection pressure: {}/{} slots in use", in_use, MAX_CONNECTIONS);
+                                    }
                                     tokio::spawn(async move {
                                         let _permit = permit; // released on drop
                                         if let Err(e) = handle_connection(stream, peer_addr, handler).await {

@@ -762,6 +762,12 @@ pub enum Response {
         meta_avg_1h: u64,
         /// Node uptime in seconds.
         uptime_secs: u64,
+        /// Currently active inbound TCP connections.
+        #[serde(default)]
+        active_connections: u64,
+        /// Maximum allowed inbound TCP connections.
+        #[serde(default)]
+        max_connections: u64,
     },
 }
 
@@ -789,6 +795,8 @@ pub enum ErrorCode {
     OffsetMismatch,
     /// Server is at connection limit and cannot accept more work right now
     ServerBusy,
+    /// Node is intentionally leaving — client should immediately retry with another node
+    NodeLeaving,
 }
 
 /// Cluster management messages
@@ -859,6 +867,15 @@ pub enum ClusterMessage {
     LeaderAnnouncement {
         node_id: NodeId,
         addr: std::net::SocketAddr,
+    },
+
+    /// Broadcast when a node is leaving intentionally (shutdown or connection pressure).
+    /// Peers mark the node Leaving immediately — no need to wait for the heartbeat
+    /// timeout to expire.  The node gets a grace window to come back before healing starts.
+    GracefulLeave {
+        node_id: NodeId,
+        addr: std::net::SocketAddr,
+        reason: crate::types::LeaveReason,
     },
 }
 

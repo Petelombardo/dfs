@@ -339,8 +339,10 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         sig = shutdown => {
             info!("Shutting down ({sig}) — broadcasting GracefulLeave to peers...");
             server.cluster().announce_leaving(dfs_common::LeaveReason::Shutdown).await;
-            // Brief pause so peers receive the broadcast before we close connections.
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            // Brief pause so peers process the broadcast before we close connections.
+            // 100ms is sufficient — announce_leaving() already awaits the TCP sends.
+            // Keeping this short avoids racing with test-suite teardown (pkill + sleep 0.5).
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             info!("Shutting down...");
             server_handle.abort();
         }
@@ -350,6 +352,13 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                 Err(e) if e.is_panic() => tracing::error!("Network server panicked: {:?}", e),
                 Err(e) => tracing::error!("Network server task error: {}", e),
             }
+            // Broadcast GracefulLeave so peers immediately elect a new leader
+            // rather than waiting for the heartbeat timeout (30-120s).
+            // Use a short timeout — if we can't reach peers we still need to exit.
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_millis(500),
+                server.cluster().announce_leaving(dfs_common::LeaveReason::Shutdown),
+            ).await;
             let _ = std::fs::remove_file(&addr_file);
             std::process::exit(1);
         }

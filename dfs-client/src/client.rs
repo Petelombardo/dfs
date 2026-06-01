@@ -796,7 +796,11 @@ leader_addr: Arc::new(RwLock::new(None)),
             if nodes.is_empty() {
                 anyhow::bail!("no cluster nodes available");
             }
-            let target = self.leader_addr.read().await.unwrap_or(nodes[0]);
+            // When leader is known, use it directly.  When unknown (cleared after a
+            // failure), rotate through all known nodes so we don't keep hammering a
+            // dead node — the new leader will be at one of the other addresses.
+            let leader_opt = *self.leader_addr.read().await;
+            let target = leader_opt.unwrap_or_else(|| nodes[attempts as usize % nodes.len()]);
 
             match self.send_request(target, request.clone()).await {
                 Ok(Response::NotLeader { leader_addr: Some(new_leader) }) => {
@@ -823,13 +827,17 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let remaining = deadline - now;
                     let wait = backoff.min(remaining);
                     warn!("leader RPC attempt {}: {} — retrying in {:?}", attempts, e, wait);
+                    // Actively try to discover the new leader from surviving nodes
+                    // before sleeping — this lets a freshly mounted client find the
+                    // new leader in the first retry rather than after the full backoff.
+                    let _ = self.refresh_cluster_nodes().await;
                     tokio::time::sleep(wait).await;
                     backoff = (backoff * 2).min(tokio::time::Duration::from_secs(2));
                     continue;
                 }
             }
 
-            // NotLeader without redirect: backoff and retry.
+            // NotLeader without redirect: refresh and retry.
             attempts += 1;
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -838,6 +846,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let remaining = deadline - now;
             let wait = backoff.min(remaining);
             warn!("leader election in progress (attempt {}), retrying in {:?}", attempts, wait);
+            let _ = self.refresh_cluster_nodes().await;
             tokio::time::sleep(wait).await;
             backoff = (backoff * 2).min(tokio::time::Duration::from_secs(2));
         }

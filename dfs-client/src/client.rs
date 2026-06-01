@@ -777,6 +777,72 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Send a request to a cluster node with retry.
     ///
     /// Tries every known node in order. If all fail, waits briefly then re-bootstraps
+    /// Send a request to the current leader, retrying for up to LEADER_OP_TIMEOUT_SECS on
+    /// transient failures (network errors, NodeLeaving, NotLeader redirect).
+    ///
+    /// Returns Ok(Response) — the caller is responsible for interpreting server-side
+    /// errors (NotFound, etc.) as permanent or not.  Only network-level failures
+    /// (Err) trigger the retry loop; a Response::Error from the server is returned
+    /// immediately without retrying.
+    async fn send_to_leader_with_retry(&self, request: Request) -> Result<Response> {
+        const TIMEOUT_SECS: u64 = 15;
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(TIMEOUT_SECS);
+        let mut backoff = tokio::time::Duration::from_millis(150);
+        let mut attempts = 0u32;
+
+        loop {
+            let nodes = self.cluster_nodes.read().await.clone();
+            if nodes.is_empty() {
+                anyhow::bail!("no cluster nodes available");
+            }
+            let target = self.leader_addr.read().await.unwrap_or(nodes[0]);
+
+            match self.send_request(target, request.clone()).await {
+                Ok(Response::NotLeader { leader_addr: Some(new_leader) }) => {
+                    // Redirect — update cache and retry immediately (no backoff).
+                    *self.leader_addr.write().await = Some(new_leader);
+                    continue;
+                }
+                Ok(Response::NotLeader { leader_addr: None }) => {
+                    // Leader unknown — fall through to backoff + retry.
+                    *self.leader_addr.write().await = None;
+                }
+                Ok(resp) => return Ok(resp), // success or server-side error
+                Err(e) => {
+                    // Network / connection error — transient.
+                    *self.leader_addr.write().await = None;
+                    attempts += 1;
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Err(e.context(format!(
+                            "leader unreachable after {} attempts ({:.0}s)",
+                            attempts, TIMEOUT_SECS
+                        )));
+                    }
+                    let remaining = deadline - now;
+                    let wait = backoff.min(remaining);
+                    warn!("leader RPC attempt {}: {} — retrying in {:?}", attempts, e, wait);
+                    tokio::time::sleep(wait).await;
+                    backoff = (backoff * 2).min(tokio::time::Duration::from_secs(2));
+                    continue;
+                }
+            }
+
+            // NotLeader without redirect: backoff and retry.
+            attempts += 1;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                anyhow::bail!("no leader found after {} attempts ({:.0}s)", attempts, TIMEOUT_SECS);
+            }
+            let remaining = deadline - now;
+            let wait = backoff.min(remaining);
+            warn!("leader election in progress (attempt {}), retrying in {:?}", attempts, wait);
+            tokio::time::sleep(wait).await;
+            backoff = (backoff * 2).min(tokio::time::Duration::from_secs(2));
+        }
+    }
+
     /// from the seed list and tries once more. A small inter-node delay (100ms) prevents
     /// hammering the network when nodes are refusing connections quickly.
     async fn send_request_with_retry(&self, request: Request) -> Result<Response> {
@@ -5630,68 +5696,21 @@ leader_addr: Arc::new(RwLock::new(None)),
             anyhow::bail!("No cluster nodes available for metadata write");
         }
 
-        // --- Step 1: Send to leader, retrying on NotLeader redirect. ---
-        let mut leader_addr = *self.leader_addr.read().await;
-        let mut leader_acked_node: Option<SocketAddr> = None;
-        let mut last_err = String::new();
-
-        for attempt in 0..4u32 {
-            // Pick target: known leader, else first node.
-            let target = leader_addr.unwrap_or_else(|| nodes[0]);
-
-            let req = Request::PutFileMetadata { metadata: metadata.clone() };
-            match self.send_request(target, req).await {
-                Ok(Response::Ok { .. }) => {
-                    // Leader accepted.
-                    *self.leader_addr.write().await = Some(target);
-                    leader_acked_node = Some(target);
-                    break;
-                }
-                Ok(Response::NotLeader { leader_addr: redirect }) => {
-                    debug!("PutFileMetadata: {} said NotLeader, redirecting to {:?}", target, redirect);
-                    if let Some(addr) = redirect {
-                        *self.leader_addr.write().await = Some(addr);
-                        leader_addr = Some(addr);
-                    } else {
-                        // Leader unknown — try next node.
-                        let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
-                        leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
-                    }
-                    if attempt < 3 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100 << attempt)).await;
-                    }
-                }
-                Ok(other) => {
-                    last_err = format!("unexpected response from {}: {:?}", target, other);
-                    warn!("PutFileMetadata: {}", last_err);
-                    // Try next node.
-                    let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
-                    leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
-                }
-                Err(e) => {
-                    last_err = format!("{}: {}", target, e);
-                    warn!("PutFileMetadata to {} failed (attempt {}): {}", target, attempt + 1, e);
-                    // Mark leader unknown; try next node.
-                    leader_addr = None;
-                    *self.leader_addr.write().await = None;
-                    let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
-                    leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
-                    if attempt < 3 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100 << attempt)).await;
-                    }
-                }
-            }
+        // --- Step 1: Send to leader with time-based retry. ---
+        // Uses send_to_leader_with_retry which retries for up to 15s on network failures,
+        // following NotLeader redirects immediately.
+        let req = Request::PutFileMetadata { metadata: metadata.clone() };
+        match self.send_to_leader_with_retry(req).await? {
+            Response::Ok { .. } => {}
+            Response::Error { message, .. } => anyhow::bail!("PutFileMetadata: {}", message),
+            other => anyhow::bail!("PutFileMetadata: unexpected response: {:?}", other),
         }
-
-        if leader_acked_node.is_none() {
-            anyhow::bail!("Metadata write to leader failed after retries: {}", last_err);
-        }
+        let leader = self.leader_addr.read().await.unwrap_or(nodes[0]);
 
         // Step 2: Leader already broadcasts to all followers via broadcast_metadata_to_followers
         // and the durability catch-up queue. No client-side replica needed — sending
         // ReplicateMetadata directly to a follower caused resurrection of deleted files
         // via the follower's leader_forward_queue.
-        let leader = leader_acked_node.unwrap();
 
         // Track SQLite writes for read-after-write consistency.
         if Self::is_sqlite_file(&metadata.path) {
@@ -6066,18 +6085,11 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Purge file metadata without deleting chunks (for rename operations)
     /// This only removes the metadata entry, preserving chunk data
     pub async fn purge_file_metadata(&self, path: &str) -> Result<()> {
-        let request = Request::PurgeFileMetadata {
-            path: path.to_string(),
-        };
-
-        let response = self.send_request_with_retry(request).await?;
-
-        match response {
+        let req = Request::PurgeFileMetadata { path: path.to_string() };
+        match self.send_to_leader_with_retry(req).await? {
             Response::Ok { .. } => Ok(()),
-            Response::Error { message, .. } => {
-                anyhow::bail!("Failed to purge file metadata: {}", message);
-            }
-            _ => anyhow::bail!("Unexpected response type"),
+            Response::Error { message, .. } => anyhow::bail!("purge_file_metadata: {}", message),
+            _ => anyhow::bail!("purge_file_metadata: unexpected response"),
         }
     }
 
@@ -6086,46 +6098,17 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// race conditions where the file disappears during rename
     pub async fn rename_file(&self, old_path: &str, new_path: &str) -> Result<()> {
         // Route to the leader — followers may not have received the file metadata
-        // yet if the broadcast flush window (100ms) hasn't fired since the last
-        // PutFileMetadata. The leader always has authoritative sled state.
-        let nodes = self.cluster_nodes.read().await.clone();
-        let mut leader_addr = *self.leader_addr.read().await;
-
-        for attempt in 0..4u32 {
-            let target = leader_addr.unwrap_or_else(|| nodes[0]);
-            let req = Request::RenameFile {
-                old_path: old_path.to_string(),
-                new_path: new_path.to_string(),
-            };
-            match self.send_request(target, req).await {
-                Ok(Response::Ok { .. }) => {
-                    *self.leader_addr.write().await = Some(target);
-                    return Ok(());
-                }
-                Ok(Response::NotLeader { leader_addr: redirect }) => {
-                    if let Some(addr) = redirect {
-                        *self.leader_addr.write().await = Some(addr);
-                        leader_addr = Some(addr);
-                    } else {
-                        let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
-                        leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
-                    }
-                    if attempt < 3 { continue; }
-                }
-                Ok(Response::Error { message, .. }) => {
-                    anyhow::bail!("Failed to rename file: {}", message);
-                }
-                Ok(_) => anyhow::bail!("rename_file: unexpected response"),
-                Err(e) => {
-                    warn!("rename_file: {} failed: {}", target, e);
-                    let idx = nodes.iter().position(|&n| n == target).unwrap_or(0);
-                    leader_addr = Some(nodes[(idx + 1) % nodes.len()]);
-                    if attempt < 3 { continue; }
-                    anyhow::bail!("rename_file: all nodes failed: {}", e);
-                }
-            }
+        // yet if the broadcast flush window hasn't fired since the last PutFileMetadata.
+        let req = Request::RenameFile {
+            old_path: old_path.to_string(),
+            new_path: new_path.to_string(),
+        };
+        match self.send_to_leader_with_retry(req).await? {
+            Response::Ok { .. } => return Ok(()),
+            Response::Error { message, .. } => anyhow::bail!("rename_file: {}", message),
+            _ => anyhow::bail!("rename_file: unexpected response"),
         }
-        anyhow::bail!("rename_file: could not reach leader after 4 attempts")
+
     }
 
     /// Refresh cluster node list by querying GetClusterStatus.

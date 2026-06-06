@@ -5601,6 +5601,26 @@ impl Filesystem for DfsFilesystem {
         // holes for the range currently being written.
         let has_active_writer = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
         if is_last_open && !has_active_writer {
+            // Evict this file's chunks from the shared chunk_cache before removing the
+            // read engine. Moka uses W-TinyLFU which protects frequently-accessed items:
+            // chunks from this file have high frequency counts after a full read, and
+            // would crowd out the next file's chunks (causing repeated re-fetches and
+            // severe throughput degradation on successive file reads). Evicting them here
+            // ensures the next file starts with a clean cache.
+            if let Some(engine) = self.client.read_engines.get(ino) {
+                let chunk_ids: Vec<_> = engine.snapshot().0
+                    .iter()
+                    .map(|loc| loc.chunk_id)
+                    .collect();
+                if !chunk_ids.is_empty() {
+                    let cache = self.client.chunk_cache.clone();
+                    self.flush_runtime.spawn(async move {
+                        for cid in chunk_ids {
+                            cache.invalidate(&cid).await;
+                        }
+                    });
+                }
+            }
             self.client.read_engines.remove(ino);
         }
 

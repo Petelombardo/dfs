@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use dfs_common::ChunkId;
 use lru::LruCache;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -222,6 +222,41 @@ impl ChunkStorage {
         }
         let end = (offset + length).min(data.len());
         Ok((data, offset, end))
+    }
+
+    /// Read only the requested byte range from a chunk without loading the full chunk
+    /// into memory or the cache. On a cache hit the slice is copied from the warm Arc;
+    /// on a cache miss only [offset, offset+length) is read from disk via seek+read_exact,
+    /// avoiding 4MB of unnecessary disk I/O when the caller needs only a small region
+    /// (e.g., a 32KB random read or one half of a striped sequential read).
+    pub fn read_chunk_range_partial(&self, chunk_id: &ChunkId, offset: usize, length: usize)
+        -> Result<Vec<u8>>
+    {
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(arc) = cache.get(chunk_id) {
+                if offset >= arc.len() {
+                    return Err(anyhow::anyhow!("Offset {} beyond chunk size {}", offset, arc.len()));
+                }
+                let end = (offset + length).min(arc.len());
+                return Ok(arc[offset..end].to_vec());
+            }
+        }
+        let path = self.get_chunk_path(chunk_id);
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("Failed to open chunk file: {:?}", path))?;
+        file.seek(SeekFrom::Start(offset as u64))
+            .with_context(|| format!("Failed to seek chunk {} to offset {}", chunk_id, offset))?;
+        let mut buf = vec![0u8; length];
+        let mut total = 0;
+        while total < length {
+            match file.read(&mut buf[total..])? {
+                0 => break,
+                n => total += n,
+            }
+        }
+        buf.truncate(total);
+        Ok(buf)
     }
 
     /// Warm the cache with a chunk (prefetch hint handler)

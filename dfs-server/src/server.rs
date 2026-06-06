@@ -1469,22 +1469,23 @@ impl Server {
             }
         }
 
-        match self.storage.read_chunk_range_arc(&chunk_id, offset as usize, length as usize) {
-            Ok((arc, start, end)) => {
+        // Use a seeked partial read — avoids loading the full 4MB chunk from disk
+        // on a cache miss when the caller only needs a small byte range.
+        // On a cache hit the slice is still copied from the warm Arc (negligible cost).
+        match self.storage.read_chunk_range_partial(&chunk_id, offset as usize, length as usize) {
+            Ok(data) => {
                 debug!("Returning {} bytes from chunk {} (requested {}, offset {})",
-                       end - start, chunk_id, length, offset);
+                       data.len(), chunk_id, length, offset);
 
                 let (capacity, size) = self.storage.get_cache_stats();
                 let cache_stats = Some((0, capacity, size));
 
-                // Zero-copy: hand the Arc + range to the network layer, which writes
-                // arc[start..end] on the wire without ever cloning the bytes.
                 Response::ChunkData {
                     chunk_id,
-                    data: vec![],
+                    data,
                     cache_stats,
-                    arc_data: Some(arc),
-                    arc_range: Some((start, end)),
+                    arc_data: None,
+                    arc_range: None,
                 }
             }
             Err(e) => {

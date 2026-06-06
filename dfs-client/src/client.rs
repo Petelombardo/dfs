@@ -2196,11 +2196,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         // --- Pipeline lookahead: speculatively fetch the next N chunks. ---
-        // Only prefetch when we're latency-bound (last fetch took >20ms). On weak CPUs
-        // (nanopir3) or fast storage, the spawn overhead costs more than it saves.
+        // Always fire when we're fetching — even on fast local links the spawn overhead
+        // is negligible compared to hiding one additional chunk RTT.
         // Fire-and-forget — their results go into chunk_cache; we don't await them here.
-        let fetch_ms = engine.last_chunk_fetch_ms.load(Ordering::Relaxed);
-        if !to_fetch.is_empty() && fetch_ms >= 20 {
+        if !to_fetch.is_empty() {
             let last_required_idx = needed.last().map(|(i, _, _)| *i).unwrap_or(0);
             let lookahead_candidates = engine.pipeline_lookahead(
                 last_required_idx, chunk_map.len(), &chunk_map,

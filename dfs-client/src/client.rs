@@ -247,6 +247,11 @@ const POOL_SIZE: usize = 20;
 /// reads instead — easy A/B test, easy to revert.
 const STRIPED_READ_ENABLED: bool = false;
 
+// Maximum concurrent background (prefetch/swarm) fetches allowed per server node.
+// Spinning HDDs serve sequential requests faster than concurrent ones; capping at 1
+// prevents seek contention and keeps server disk queues short across successive reads.
+const MAX_BACKGROUND_PER_NODE: usize = 1;
+
 /// Get the SQLite consistency window duration in milliseconds
 /// Can be overridden via DFS_SQLITE_CONSISTENCY_WINDOW_MS environment variable
 /// Default: 500ms (conservative, allows time for async replication)
@@ -2207,11 +2212,23 @@ leader_addr: Arc::new(RwLock::new(None)),
                 if self.chunk_cache.get(&la_cid).await.is_some() {
                     continue;
                 }
-                // Mark in-flight now (after cache check) to prevent duplicate fetches.
-                engine.in_flight.insert(la_cid);
 
                 let loc = &chunk_map[la_idx];
                 let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
+
+                // Cap background fetches per node: spinning HDDs can't efficiently
+                // serve multiple concurrent requests. If the least-loaded replica is
+                // already handling a background fetch, skip — main reads go through
+                // regardless; the next read will re-evaluate after a task completes.
+                let current_load = self.node_inflight.get(&primary)
+                    .map(|e| e.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                if current_load >= MAX_BACKGROUND_PER_NODE {
+                    continue;
+                }
+
+                // Mark in-flight now (after cache + load check) to prevent duplicate fetches.
+                engine.in_flight.insert(la_cid);
                 self.node_inflight_inc(primary);
                 let client = self.clone();
                 let eng = engine.clone();
@@ -2512,6 +2529,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                     if should_swarm {
                         let swarm_loc = &chunk_map[*swarm_idx];
                         let (primary, fallbacks) = self.pick_replica_by_load(swarm_loc, &nim, &nodes);
+
+                        // Skip if the least-loaded replica is already handling a background
+                        // fetch. Spinning HDDs are fastest with one sequential request at a
+                        // time; piling up concurrent requests causes seek contention and
+                        // degrades throughput across successive file reads.
+                        let current_load = self.node_inflight.get(&primary)
+                            .map(|e| e.load(Ordering::Relaxed))
+                            .unwrap_or(0);
+                        if current_load >= MAX_BACKGROUND_PER_NODE {
+                            continue;
+                        }
+
                         engine.in_flight.insert(swarm_cid);
                         self.node_inflight_inc(primary);
 
@@ -2552,25 +2581,31 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                 if should_chain {
                                                     let chain_nodes = client.cluster_nodes.read().await.clone();
                                                     let (next_primary, next_fallbacks) = client.pick_replica_by_load(&cm[next_idx], &nim, &chain_nodes);
-                                                    eng.in_flight.insert(next_cid);
-                                                    client.node_inflight_inc(next_primary);
-                                                    let chain_client = client.clone();
-                                                    let chain_eng = eng.clone();
-                                                    tokio::spawn(async move {
-                                                        match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None).await {
-                                                            Ok(chain_data) => {
-                                                                chain_client.node_inflight_dec(next_primary);
-                                                                chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
-                                                                chain_client.chunk_landed.notify_waiters();
-                                                                debug!("Swarming: chained chunk {}", next_idx);
+                                                    // Same per-node cap for chain fetches.
+                                                    let chain_load = client.node_inflight.get(&next_primary)
+                                                        .map(|e| e.load(Ordering::Relaxed))
+                                                        .unwrap_or(0);
+                                                    if chain_load < MAX_BACKGROUND_PER_NODE {
+                                                        eng.in_flight.insert(next_cid);
+                                                        client.node_inflight_inc(next_primary);
+                                                        let chain_client = client.clone();
+                                                        let chain_eng = eng.clone();
+                                                        tokio::spawn(async move {
+                                                            match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None).await {
+                                                                Ok(chain_data) => {
+                                                                    chain_client.node_inflight_dec(next_primary);
+                                                                    chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
+                                                                    chain_client.chunk_landed.notify_waiters();
+                                                                    debug!("Swarming: chained chunk {}", next_idx);
+                                                                }
+                                                                Err(e) => {
+                                                                    chain_client.node_inflight_dec(next_primary);
+                                                                    debug!("Swarming: chain failed for chunk {}: {}", next_idx, e);
+                                                                }
                                                             }
-                                                            Err(e) => {
-                                                                chain_client.node_inflight_dec(next_primary);
-                                                                debug!("Swarming: chain failed for chunk {}: {}", next_idx, e);
-                                                            }
-                                                        }
-                                                        chain_eng.in_flight.remove(&next_cid);
-                                                    });
+                                                            chain_eng.in_flight.remove(&next_cid);
+                                                        });
+                                                    }
                                                 }
                                             }
                                         }

@@ -245,7 +245,7 @@ const POOL_SIZE: usize = 20;
 /// memcpy per chunk to reassemble. On weak ARM CPUs (Cortex-A55) the reassembly cost can
 /// exceed the bandwidth win on a 1Gbps LAN. Flip to `false` to use single-replica whole-chunk
 /// reads instead — easy A/B test, easy to revert.
-const STRIPED_READ_ENABLED: bool = true;
+const STRIPED_READ_ENABLED: bool = false;
 
 /// Get the SQLite consistency window duration in milliseconds
 /// Can be overridden via DFS_SQLITE_CONSISTENCY_WINDOW_MS environment variable
@@ -560,6 +560,10 @@ pub struct DfsClient {
     /// exhausting server file descriptors.
     fetch_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// In-flight fetch count per server node, used to spread load across replicas.
+    /// Incremented before a fetch task starts, decremented when it completes.
+    node_inflight: Arc<DashMap<SocketAddr, Arc<AtomicUsize>>>,
+
     /// Single broadcast notify woken every time a chunk lands in chunk_cache.
     /// Lets waiters in `wait_for_chunk_in_cache` resume immediately rather than
     /// polling on a 50 ms timer — the polling delay was the dominant source of
@@ -736,6 +740,7 @@ impl DfsClient {
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
 leader_addr: Arc::new(RwLock::new(None)),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            node_inflight: Arc::new(DashMap::new()),
             chunk_landed: Arc::new(Notify::new()),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
@@ -2179,18 +2184,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 continue;
             }
 
-            // 3. Need to fetch.
-            let (primary, fallbacks) = match InodeReadEngine::resolve_primary(
-                loc, &nim, &nodes, selector + idx as u64,
-            ) {
-                Some(pf) => pf,
-                None => {
-                    // No replicas known — fall back to any cluster node.
-                    let p = nodes[selector as usize % nodes.len()];
-                    (p, nodes.iter().filter(|&&a| a != p).copied().collect())
-                }
-            };
-
+            // 3. Need to fetch — pick least-loaded replica so parallel chunk
+            // fetches spread across nodes rather than piling onto one.
+            let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
+            self.node_inflight_inc(primary);
             engine.in_flight.insert(cid);
             to_fetch.push((idx, cid, primary, fallbacks));
         }
@@ -2214,19 +2211,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                 engine.in_flight.insert(la_cid);
 
                 let loc = &chunk_map[la_idx];
-                let (primary, fallbacks) = match InodeReadEngine::resolve_primary(
-                    loc, &nim, &nodes, selector + la_idx as u64,
-                ) {
-                    Some(pf) => pf,
-                    None => {
-                        engine.in_flight.remove(&la_cid);
-                        continue;
-                    }
-                };
+                let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
+                self.node_inflight_inc(primary);
                 let client = self.clone();
                 let eng = engine.clone();
                 tokio::spawn(async move {
                     let result = client.fetch_chunk_with_fallback(la_cid, primary, &fallbacks, None).await;
+                    client.node_inflight_dec(primary);
                     match result {
                         Ok(data) => {
                             let arc = Arc::new(data);
@@ -2273,9 +2264,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await
                             }
                         } else {
-                            let _ = loc; // keep capture warning quiet without changing closure shape
+                            let _ = loc;
                             client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await
                         };
+                        client.node_inflight_dec(primary);
                         (idx, cid, data)
                     })
                 }).collect();
@@ -2295,6 +2287,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let fallbacks = fallbacks.clone();
                     tokio::spawn(async move {
                         let data = client.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await;
+                        client.node_inflight_dec(primary);
                         (idx, cid, data)
                     })
                 }).collect();
@@ -2518,73 +2511,78 @@ leader_addr: Arc::new(RwLock::new(None)),
 
                     if should_swarm {
                         let swarm_loc = &chunk_map[*swarm_idx];
-                        if let Some((primary, fallbacks)) = InodeReadEngine::resolve_primary(
-                            swarm_loc, &nim, &nodes, selector + *swarm_idx as u64,
-                        ) {
-                            engine.in_flight.insert(swarm_cid);
+                        let (primary, fallbacks) = self.pick_replica_by_load(swarm_loc, &nim, &nodes);
+                        engine.in_flight.insert(swarm_cid);
+                        self.node_inflight_inc(primary);
 
-                            // Adaptive stagger: use half of chunk 0's fetch time to ensure chunk N+2
-                            // starts when chunk N+1 is ~50% complete. This auto-adapts to any network
-                            // speed (1G, 10G, etc.) without manual tuning.
-                            let base_stagger_ms = engine.last_chunk_fetch_ms.load(Ordering::Relaxed) / 2;
-                            let stagger_ms = swarm_offset as u64 * base_stagger_ms;
+                        // Adaptive stagger: use half of chunk 0's fetch time to ensure chunk N+2
+                        // starts when chunk N+1 is ~50% complete. This auto-adapts to any network
+                        // speed (1G, 10G, etc.) without manual tuning.
+                        let base_stagger_ms = engine.last_chunk_fetch_ms.load(Ordering::Relaxed) / 2;
+                        let stagger_ms = swarm_offset as u64 * base_stagger_ms;
 
-                            let client = self.clone();
-                            let eng = engine.clone();
-                            let idx_copy = *swarm_idx;
-                            tokio::spawn(async move {
-                                if stagger_ms > 0 {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(stagger_ms)).await;
-                                }
-                                match client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks, None).await {
-                                    Ok(data) => {
-                                        client.chunk_cache.insert(swarm_cid, Arc::new(data)).await;
-                                        client.chunk_landed.notify_waiters();
-                                        debug!("Swarming: fetched chunk {} (stagger {}ms)", idx_copy, stagger_ms);
+                        let client = self.clone();
+                        let eng = engine.clone();
+                        let idx_copy = *swarm_idx;
+                        tokio::spawn(async move {
+                            if stagger_ms > 0 {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(stagger_ms)).await;
+                            }
+                            match client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks, None).await {
+                                Ok(data) => {
+                                    client.node_inflight_dec(primary);
+                                    client.chunk_cache.insert(swarm_cid, Arc::new(data)).await;
+                                    client.chunk_landed.notify_waiters();
+                                    debug!("Swarming: fetched chunk {} (stagger {}ms)", idx_copy, stagger_ms);
 
-                                        // Chain reaction: spawn the next chunk in sequence to maintain pipeline
-                                        // But limit to MAX_AHEAD chunks beyond the pipeline_head to avoid runaway prefetch
-                                        const MAX_AHEAD: usize = 4;
-                                        let next_idx = idx_copy + 2;
-                                        let pipeline_pos = eng.pipeline_head.load(Ordering::Relaxed);
+                                    // Chain reaction: spawn the next chunk in sequence to maintain pipeline
+                                    // But limit to MAX_AHEAD chunks beyond the pipeline_head to avoid runaway prefetch
+                                    const MAX_AHEAD: usize = 4;
+                                    let next_idx = idx_copy + 2;
+                                    let pipeline_pos = eng.pipeline_head.load(Ordering::Relaxed);
 
-                                        // Only chain if we're not too far ahead of the read position
-                                        if next_idx < pipeline_pos + MAX_AHEAD {
-                                            if let Some(e) = client.read_engines.get(eng.inode) {
-                                                let (cm, _co, nim) = e.snapshot();
-                                                if next_idx < cm.len() {
-                                                    let next_cid = cm[next_idx].chunk_id;
-                                                    let should_chain = client.chunk_cache.get(&next_cid).await.is_none()
-                                                        && !eng.in_flight.contains(&next_cid);
-                                                    if should_chain {
-                                                        if let Some((next_primary, next_fallbacks)) = InodeReadEngine::resolve_primary(
-                                                            &cm[next_idx], &nim, &[], 0
-                                                        ) {
-                                                            eng.in_flight.insert(next_cid);
-                                                            let chain_client = client.clone();
-                                                            let chain_eng = eng.clone();
-                                                            tokio::spawn(async move {
-                                                                match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None).await {
-                                                                    Ok(chain_data) => {
-                                                                        chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
-                                                                        chain_client.chunk_landed.notify_waiters();
-                                                                        debug!("Swarming: chained chunk {}", next_idx);
-                                                                    }
-                                                                    Err(e) => debug!("Swarming: chain failed for chunk {}: {}", next_idx, e),
-                                                                }
-                                                                chain_eng.in_flight.remove(&next_cid);
-                                                            });
+                                    // Only chain if we're not too far ahead of the read position
+                                    if next_idx < pipeline_pos + MAX_AHEAD {
+                                        if let Some(e) = client.read_engines.get(eng.inode) {
+                                            let (cm, _co, nim) = e.snapshot();
+                                            if next_idx < cm.len() {
+                                                let next_cid = cm[next_idx].chunk_id;
+                                                let should_chain = client.chunk_cache.get(&next_cid).await.is_none()
+                                                    && !eng.in_flight.contains(&next_cid);
+                                                if should_chain {
+                                                    let chain_nodes = client.cluster_nodes.read().await.clone();
+                                                    let (next_primary, next_fallbacks) = client.pick_replica_by_load(&cm[next_idx], &nim, &chain_nodes);
+                                                    eng.in_flight.insert(next_cid);
+                                                    client.node_inflight_inc(next_primary);
+                                                    let chain_client = client.clone();
+                                                    let chain_eng = eng.clone();
+                                                    tokio::spawn(async move {
+                                                        match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None).await {
+                                                            Ok(chain_data) => {
+                                                                chain_client.node_inflight_dec(next_primary);
+                                                                chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
+                                                                chain_client.chunk_landed.notify_waiters();
+                                                                debug!("Swarming: chained chunk {}", next_idx);
+                                                            }
+                                                            Err(e) => {
+                                                                chain_client.node_inflight_dec(next_primary);
+                                                                debug!("Swarming: chain failed for chunk {}: {}", next_idx, e);
+                                                            }
                                                         }
-                                                    }
+                                                        chain_eng.in_flight.remove(&next_cid);
+                                                    });
                                                 }
                                             }
                                         }
                                     }
-                                    Err(e) => debug!("Swarming failed for chunk {}: {}", idx_copy, e),
                                 }
-                                eng.in_flight.remove(&swarm_cid);
-                            });
-                        }
+                                Err(e) => {
+                                    client.node_inflight_dec(primary);
+                                    debug!("Swarming failed for chunk {}: {}", idx_copy, e);
+                                }
+                            }
+                            eng.in_flight.remove(&swarm_cid);
+                        });
                     }
                 }
             }
@@ -2624,6 +2622,55 @@ leader_addr: Arc::new(RwLock::new(None)),
         engine.last_read_end.store((offset + clamped_size) as u64, Ordering::Relaxed);
 
         Ok(out)
+    }
+
+    /// Pick the replica with the fewest in-flight fetches.
+    /// Sorts all known replicas by ascending in-flight count (ties: deterministic
+    /// by address) and returns (primary, remaining_in_load_order).
+    fn pick_replica_by_load(
+        &self,
+        loc: &ChunkLocation,
+        nim: &HashMap<dfs_common::NodeId, SocketAddr>,
+        cluster_nodes: &[SocketAddr],
+    ) -> (SocketAddr, Vec<SocketAddr>) {
+        let mut addrs: Vec<(SocketAddr, usize)> = loc.nodes.iter()
+            .filter_map(|nid| nim.get(nid).copied())
+            .map(|addr| {
+                let n = self.node_inflight.get(&addr)
+                    .map(|e| e.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                (addr, n)
+            })
+            .collect();
+
+        if addrs.is_empty() {
+            let p = cluster_nodes.iter()
+                .min_by_key(|&&a| self.node_inflight.get(&a)
+                    .map(|e| e.load(Ordering::Relaxed))
+                    .unwrap_or(0))
+                .copied()
+                .unwrap_or(cluster_nodes[0]);
+            let fallbacks = cluster_nodes.iter().filter(|&&a| a != p).copied().collect();
+            return (p, fallbacks);
+        }
+
+        addrs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        let primary = addrs[0].0;
+        let fallbacks = addrs[1..].iter().map(|(a, _)| *a).collect();
+        (primary, fallbacks)
+    }
+
+    fn node_inflight_inc(&self, addr: SocketAddr) {
+        self.node_inflight
+            .entry(addr)
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn node_inflight_dec(&self, addr: SocketAddr) {
+        if let Some(e) = self.node_inflight.get(&addr) {
+            e.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Fetch with primary then fallbacks sequentially.

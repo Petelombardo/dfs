@@ -3161,7 +3161,7 @@ impl Server {
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(u64::MAX);
 
-                if frag_ratio >= 2.0 {
+                if last_compact_size > 0 && frag_ratio >= 2.0 {
                     warn!("redb fragmentation high: {:.1}MB (last compact baseline: {:.1}MB)",
                         current_size as f64 / 1_048_576.0,
                         last_compact_size as f64 / 1_048_576.0);

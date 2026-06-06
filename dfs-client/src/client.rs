@@ -3,7 +3,7 @@ use blake3;
 use dashmap::{DashMap, DashSet};
 use dfs_common::{ChunkId, ChunkLocation, ErrorCode, FileId, FileMetadata, Message, MessageEnvelope, NodeId, Request, RequestId, Response};
 use lru::LruCache;
-use moka::future::Cache as MokaCache;
+use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -492,9 +492,10 @@ pub struct DfsClient {
     /// Current node index (for round-robin)
     current_node: Arc<RwLock<usize>>,
 
-    /// LRU cache for chunks (ChunkId -> data)
-    /// Cache up to 256 chunks (~1GB at 4MB/chunk)
-    pub chunk_cache: MokaCache<ChunkId, Arc<Vec<u8>>>,
+    /// Concurrent LRU cache for chunks (ChunkId -> data).
+    /// Uses quick-cache (clock-based LRU approximation) — no global write lock,
+    /// no W-TinyLFU frequency sketch, so cross-file scan pollution cannot occur.
+    pub chunk_cache: Arc<QuickCache<ChunkId, Arc<Vec<u8>>>>,
 
     /// Byte-range cache for recently-accessed chunks (inode, offset) -> chunk data
     /// This solves the problem of content-addressed chunks changing during live DVR recording
@@ -678,9 +679,7 @@ impl DfsClient {
             NonZeroUsize::new(32).unwrap()
         });
 
-        let cache = MokaCache::builder()
-            .max_capacity(cache_capacity.get() as u64)
-            .build();
+        let cache = Arc::new(QuickCache::new(cache_capacity.get()));
 
         // Byte-range cache: smaller secondary cache for the legacy partial-read path.
         // Sized at a fraction of chunk_cache so it doesn't duplicate the working set.
@@ -1983,7 +1982,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // Also try the full chunk_cache (another path may have loaded the full chunk).
                 // Slice to [offset_in_chunk..offset_in_chunk+len_in_chunk] so the assembly
                 // (which expects data starting at offset_in_chunk) gets correctly positioned bytes.
-                if let Some(data) = self.chunk_cache.get(&cid).await {
+                if let Some(data) = self.chunk_cache.get(&cid) {
                     if offset_in_chunk + len_in_chunk <= data.len() {
                         let slice = Arc::new(data[offset_in_chunk..offset_in_chunk + len_in_chunk].to_vec());
                         result_chunks.push((idx, slice));
@@ -2177,7 +2176,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             // 1. Chunk cache (skip for SQLite).
             if !bypass_cache {
-                if let Some(data) = self.chunk_cache.get(&cid).await {
+                if let Some(data) = self.chunk_cache.get(&cid) {
                     result_chunks.push((idx, data));
                     continue;
                 }
@@ -2209,7 +2208,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             for (la_idx, la_cid) in lookahead_candidates {
                 // Skip if already cached — no need to fetch or mark in-flight.
-                if self.chunk_cache.get(&la_cid).await.is_some() {
+                if self.chunk_cache.get(&la_cid).is_some() {
                     continue;
                 }
 
@@ -2238,7 +2237,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     match result {
                         Ok(data) => {
                             let arc = Arc::new(data);
-                            client.chunk_cache.insert(la_cid, arc).await;
+                            client.chunk_cache.insert(la_cid, arc);
                             client.chunk_landed.notify_waiters();
                         }
                         Err(e) => debug!("Pipeline lookahead fetch failed for {}: {}", la_cid, e),
@@ -2339,7 +2338,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     Ok(data) => {
                         let arc = Arc::new(data);
                         if !bypass_cache {
-                            self.chunk_cache.insert(cid, Arc::clone(&arc)).await;
+                            self.chunk_cache.insert(cid, Arc::clone(&arc));
                             self.chunk_landed.notify_waiters();
                         }
                         result_chunks.push((idx, arc));
@@ -2418,7 +2417,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 Ok(data) => {
                                     let arc = Arc::new(data);
                                     if !bypass_cache {
-                                        self.chunk_cache.insert(local_cid, Arc::clone(&arc)).await;
+                                        self.chunk_cache.insert(local_cid, Arc::clone(&arc));
                                         self.chunk_landed.notify_waiters();
                                     }
                                     resolved.push((idx, arc));
@@ -2453,7 +2452,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 Ok(data) => {
                                     let arc = Arc::new(data);
                                     if !bypass_cache {
-                                        self.chunk_cache.insert(fresh_cid, Arc::clone(&arc)).await;
+                                        self.chunk_cache.insert(fresh_cid, Arc::clone(&arc));
                                         self.chunk_landed.notify_waiters();
                                     }
                                     resolved.push((idx, arc));
@@ -2523,7 +2522,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let swarm_cid = chunk_map[*swarm_idx].chunk_id;
 
                     // Only fetch if not already cached or in-flight
-                    let should_swarm = self.chunk_cache.get(&swarm_cid).await.is_none()
+                    let should_swarm = self.chunk_cache.get(&swarm_cid).is_none()
                         && !engine.in_flight.contains(&swarm_cid);
 
                     if should_swarm {
@@ -2561,7 +2560,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             client.node_inflight_dec(primary);
                             match swarm_result {
                                 Ok(data) => {
-                                    client.chunk_cache.insert(swarm_cid, Arc::new(data)).await;
+                                    client.chunk_cache.insert(swarm_cid, Arc::new(data));
                                     client.chunk_landed.notify_waiters();
                                     debug!("Swarming: fetched chunk {} (stagger {}ms)", idx_copy, stagger_ms);
 
@@ -2577,7 +2576,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                             let (cm, _co, nim) = e.snapshot();
                                             if next_idx < cm.len() {
                                                 let next_cid = cm[next_idx].chunk_id;
-                                                let should_chain = client.chunk_cache.get(&next_cid).await.is_none()
+                                                let should_chain = client.chunk_cache.get(&next_cid).is_none()
                                                     && !eng.in_flight.contains(&next_cid);
                                                 if should_chain {
                                                     let chain_nodes = client.cluster_nodes.read().await.clone();
@@ -2596,7 +2595,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                             chain_client.node_inflight_dec(next_primary);
                                                             match chain_result {
                                                                 Ok(chain_data) => {
-                                                                    chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
+                                                                    chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data));
                                                                     chain_client.chunk_landed.notify_waiters();
                                                                     debug!("Swarming: chained chunk {}", next_idx);
                                                                 }
@@ -2770,7 +2769,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Enable so any subsequent notify_waiters() will wake us.
             notified.as_mut().enable();
 
-            if let Some(data) = self.chunk_cache.get(&cid).await {
+            if let Some(data) = self.chunk_cache.get(&cid) {
                 return Ok(data);
             }
             if !engine.in_flight.contains(&cid) {
@@ -2933,7 +2932,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 locations.iter().map(|l| l.chunk_id).collect();
             for old_id in old_chunk_ids {
                 if !new_ids.contains(&old_id) {
-                    self.chunk_cache.invalidate(&old_id).await;
+                    { let _ = self.chunk_cache.remove(&old_id); };
                 }
             }
         }
@@ -3014,7 +3013,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let mut found = false;
 
             // Check chunk cache first — it's the primary cache for pipeline reads.
-            if let Some(data) = self.chunk_cache.get(chunk_id).await {
+            if let Some(data) = self.chunk_cache.get(chunk_id) {
                 cached_chunks.push((idx, data));
                 found = true;
             }
@@ -3095,7 +3094,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let mut file_idx = last_required_file_idx + 1;
                     while pipeline_chunks.len() < lookahead_needed && file_idx < all_file_chunks.len() {
                         let cid = all_file_chunks[file_idx];
-                        if self.chunk_cache.get(&cid).await.is_none() && !in_flight.contains(&cid) {
+                        if self.chunk_cache.get(&cid).is_none() && !in_flight.contains(&cid) {
                             pipeline_chunks.push(cid);
                         }
                         file_idx += 1;
@@ -3320,7 +3319,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Partial results are still stored in the byte-range cache below, which
             // is keyed by (inode, offset) and is safe for partial use.
             if !was_partial {
-                self.chunk_cache.insert(chunk_id, Arc::clone(&data_arc)).await;
+                self.chunk_cache.insert(chunk_id, Arc::clone(&data_arc));
                 self.chunk_landed.notify_waiters();
                 debug!("Cached chunk {} ({} bytes)", chunk_id, data_arc.len());
             }
@@ -3375,7 +3374,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
                     // Check chunk cache
-                    if let Some(data) = self.chunk_cache.get(&chunk_id).await {
+                    if let Some(data) = self.chunk_cache.get(&chunk_id) {
                         debug!("Waited chunk {} now available after {:?}", chunk_id, wait_start.elapsed());
                         fetched_chunks.push((idx, data));
                         data_found = true;
@@ -3412,7 +3411,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 let data_arc = Arc::new(data);
 
                                 // Cache it
-                                self.chunk_cache.insert(chunk_id, Arc::clone(&data_arc)).await;
+                                self.chunk_cache.insert(chunk_id, Arc::clone(&data_arc));
                                 self.chunk_landed.notify_waiters();
 
                                 fetched_chunks.push((idx, data_arc));

@@ -789,7 +789,7 @@ impl FlushHandle {
                                     let client = self.client.clone();
                                     let old_cid = old_location.chunk_id;
                                     tokio::spawn(async move {
-                                        client.chunk_cache.invalidate(&old_cid).await;
+                                        { let _ = client.chunk_cache.remove(&old_cid); };
                                     });
                                 }
                                 if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
@@ -1023,7 +1023,7 @@ impl FlushHandle {
                                 if old_cid != loc.chunk_id {
                                     let client = self.client.clone();
                                     tokio::spawn(async move {
-                                        client.chunk_cache.invalidate(&old_cid).await;
+                                        { let _ = client.chunk_cache.remove(&old_cid); };
                                     });
                                 }
                                 meta.chunk_locations[pos] = loc.clone();
@@ -1600,7 +1600,7 @@ impl FlushHandle {
                     // a local disk read on the server is far cheaper than a 4MB network fetch
                     // just to compute a hash we'd immediately discard.
                     let expected_new_chunk_id = {
-                        let cached = self.client.chunk_cache.get(&old_location.chunk_id).await;
+                        let cached = self.client.chunk_cache.get(&old_location.chunk_id);
                         if let Some(cached_arc) = cached {
                             let mut patched = (*cached_arc).clone();
                             for (intra, data) in &patches {
@@ -1612,8 +1612,8 @@ impl FlushHandle {
                             }
                             let new_hash = dfs_common::compute_chunk_hash_at(&patched, file_offset);
                             let new_cid = ChunkId::from_hash(new_hash);
-                            self.client.chunk_cache.invalidate(&old_location.chunk_id).await;
-                            self.client.chunk_cache.insert(new_cid, std::sync::Arc::new(patched)).await;
+                            { let _ = self.client.chunk_cache.remove(&old_location.chunk_id); };
+                            self.client.chunk_cache.insert(new_cid, std::sync::Arc::new(patched));
                             Some(new_cid)
                         } else {
                             None
@@ -1648,7 +1648,7 @@ impl FlushHandle {
                                 if exp != loc.chunk_id {
                                     warn!("flush_buffer_async_one: ino={} chunk={} hash MISMATCH — client expected {} server returned {} — evicting stale cache entry",
                                         ino, chunk_idx, exp, loc.chunk_id);
-                                    self.client.chunk_cache.invalidate(&exp).await;
+                                    { let _ = self.client.chunk_cache.remove(&exp); };
                                 }
                             }
                             (loc, sp)
@@ -1749,8 +1749,8 @@ impl FlushHandle {
                                                 // from chunk_cache so the fresh write preserves the
                                                 // gap regions rather than zeroing them.
                                                 if gap_filled_prefix > 0 {
-                                                    let base = self.client.chunk_cache.get(&old_location.chunk_id).await
-                                                        .or(self.client.chunk_cache.get(&loc.chunk_id).await);
+                                                    let base = self.client.chunk_cache.get(&old_location.chunk_id)
+                                                        .or(self.client.chunk_cache.get(&loc.chunk_id));
                                                     if let Some(base_arc) = base {
                                                         let mut reconstructed = (*base_arc).clone();
                                                         if reconstructed.len() < slot_data.len() {
@@ -1877,14 +1877,14 @@ impl FlushHandle {
                     // read the old chunk, overlay the dirty ranges, write the new chunk.
                     // Reads then fall through byte_range_cache (miss, invalidated below) to
                     // chunk_cache (hit) — one authoritative source, no priority race.
-                    if let Some(base) = self.client.chunk_cache.get(&old_location.chunk_id).await {
+                    if let Some(base) = self.client.chunk_cache.get(&old_location.chunk_id) {
                         let mut patched = (*base).clone();
                         for &(s, e) in &dirty_ranges {
                             let e = e.min(slot_data.len());
                             if e > patched.len() { patched.resize(e, 0u8); }
                             if s < e { patched[s..e].copy_from_slice(&slot_data[s..e]); }
                         }
-                        self.client.chunk_cache.insert(new_location.chunk_id, Arc::new(patched)).await;
+                        self.client.chunk_cache.insert(new_location.chunk_id, Arc::new(patched));
                     }
                     // Evict both byte_range_cache and zero_gap_table entries for this chunk
                     // so stale sub-range entries can't win over the freshly-patched chunk_cache.
@@ -2048,7 +2048,7 @@ impl FlushHandle {
                 // know the content is correct — we just wrote it.
                 let slot_arc = std::sync::Arc::new(slot_data.clone());
                 for loc in &locations {
-                    self.client.chunk_cache.insert(loc.chunk_id, Arc::clone(&slot_arc)).await;
+                    self.client.chunk_cache.insert(loc.chunk_id, Arc::clone(&slot_arc));
                 }
 
                 // Evict byte_range_cache and zero_gap_table entries for this chunk.
@@ -2156,7 +2156,7 @@ impl FlushHandle {
                                     if old_cid != loc.chunk_id {
                                         let client = self.client.clone();
                                         tokio::spawn(async move {
-                                            client.chunk_cache.invalidate(&old_cid).await;
+                                            { let _ = client.chunk_cache.remove(&old_cid); };
                                         });
                                     }
                                     meta.chunk_locations[pos] = loc.clone();
@@ -5601,26 +5601,9 @@ impl Filesystem for DfsFilesystem {
         // holes for the range currently being written.
         let has_active_writer = self.write_open_counts.get(&ino).map(|v| *v > 0).unwrap_or(false);
         if is_last_open && !has_active_writer {
-            // Evict this file's chunks from the shared chunk_cache before removing the
-            // read engine. Moka uses W-TinyLFU which protects frequently-accessed items:
-            // chunks from this file have high frequency counts after a full read, and
-            // would crowd out the next file's chunks (causing repeated re-fetches and
-            // severe throughput degradation on successive file reads). Evicting them here
-            // ensures the next file starts with a clean cache.
-            if let Some(engine) = self.client.read_engines.get(ino) {
-                let chunk_ids: Vec<_> = engine.snapshot().0
-                    .iter()
-                    .map(|loc| loc.chunk_id)
-                    .collect();
-                if !chunk_ids.is_empty() {
-                    let cache = self.client.chunk_cache.clone();
-                    self.flush_runtime.spawn(async move {
-                        for cid in chunk_ids {
-                            cache.invalidate(&cid).await;
-                        }
-                    });
-                }
-            }
+            // quick-cache uses clock-based LRU, so no W-TinyLFU frequency pollution.
+            // No explicit eviction needed; the engine drop lets LRU reclaim naturally.
+            // We still remove the engine so the next open starts with a fresh pipeline.
             self.client.read_engines.remove(ino);
         }
 

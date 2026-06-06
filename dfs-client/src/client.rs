@@ -2557,9 +2557,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                             if stagger_ms > 0 {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(stagger_ms)).await;
                             }
-                            match client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks, None).await {
+                            let swarm_result = client.fetch_chunk_with_fallback(swarm_cid, primary, &fallbacks, None).await;
+                            client.node_inflight_dec(primary);
+                            match swarm_result {
                                 Ok(data) => {
-                                    client.node_inflight_dec(primary);
                                     client.chunk_cache.insert(swarm_cid, Arc::new(data)).await;
                                     client.chunk_landed.notify_waiters();
                                     debug!("Swarming: fetched chunk {} (stagger {}ms)", idx_copy, stagger_ms);
@@ -2591,15 +2592,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                                                         let chain_client = client.clone();
                                                         let chain_eng = eng.clone();
                                                         tokio::spawn(async move {
-                                                            match chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None).await {
+                                                            let chain_result = chain_client.fetch_chunk_with_fallback(next_cid, next_primary, &next_fallbacks, None).await;
+                                                            chain_client.node_inflight_dec(next_primary);
+                                                            match chain_result {
                                                                 Ok(chain_data) => {
-                                                                    chain_client.node_inflight_dec(next_primary);
                                                                     chain_client.chunk_cache.insert(next_cid, Arc::new(chain_data)).await;
                                                                     chain_client.chunk_landed.notify_waiters();
                                                                     debug!("Swarming: chained chunk {}", next_idx);
                                                                 }
                                                                 Err(e) => {
-                                                                    chain_client.node_inflight_dec(next_primary);
                                                                     debug!("Swarming: chain failed for chunk {}: {}", next_idx, e);
                                                                 }
                                                             }
@@ -2612,7 +2613,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     }
                                 }
                                 Err(e) => {
-                                    client.node_inflight_dec(primary);
                                     debug!("Swarming failed for chunk {}: {}", idx_copy, e);
                                 }
                             }
@@ -2704,7 +2704,9 @@ leader_addr: Arc::new(RwLock::new(None)),
 
     fn node_inflight_dec(&self, addr: SocketAddr) {
         if let Some(e) = self.node_inflight.get(&addr) {
-            e.fetch_sub(1, Ordering::Relaxed);
+            // Saturating prevents usize::MAX underflow if dec is called without a matching inc.
+            let prev = e.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+            debug_assert!(prev.unwrap_or(0) > 0, "node_inflight underflow for {addr}");
         }
     }
 

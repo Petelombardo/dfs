@@ -2484,6 +2484,14 @@ leader_addr: Arc::new(RwLock::new(None)),
             result_chunks.push((idx, data));
         }
 
+        // Advance pipeline_head to one past the last chunk we just consumed.
+        // The swarming chain reaction gates itself on pipeline_head + MAX_AHEAD, so
+        // this must be updated before swarming fires, otherwise pipeline_head stays 0
+        // forever and chains only run for the first 4 chunks of any sequential read.
+        if let Some((last_idx, _, _)) = needed.last() {
+            engine.pipeline_head.fetch_max(last_idx + 1, Ordering::Relaxed);
+        }
+
         // --- Adaptive staggered 2-chunk swarming for sequential reads ---
         // If we just fetched chunks and they look sequential, proactively fetch the next
         // 2 chunks with an adaptive stagger (based on chunk 0's fetch time / 2) to avoid

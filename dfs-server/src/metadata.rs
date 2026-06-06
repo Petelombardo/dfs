@@ -1117,6 +1117,10 @@ impl MetadataStore {
             .unwrap_or(0);
         Ok(MetadataStats { file_count, size_on_disk })
     }
+
+    pub fn db_size(&self) -> u64 {
+        std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0)
+    }
 }
 
 /// Metadata storage statistics

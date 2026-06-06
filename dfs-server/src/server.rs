@@ -3140,15 +3140,38 @@ impl Server {
             let interval_secs: u64 = 5 * 60;
             let stagger_secs = (node_byte % node_count) * (interval_secs / node_count);
             tokio::time::sleep(tokio::time::Duration::from_secs(stagger_secs)).await;
+            // Tracks the DB size immediately after the last successful compact.
+            // Zero means no baseline yet — compact unconditionally on first run.
+            let mut last_compact_size: u64 = 0;
+            let mut last_compact_time: Option<std::time::Instant> = None;
             loop {
-                // Adapt interval based on how full the local disk is.
-                let sleep_secs = match storage.get_filesystem_stats() {
-                    Ok((total, _, avail)) if total > 0 => {
-                        let used_pct = 100 * (total - avail) / total;
-                        if used_pct >= 70 { 2 * 60 } else { 5 * 60 }
-                    }
-                    _ => 5 * 60,
+                // The fragmentation gate makes this interval cheap (just a stat()
+                // call on most iterations). Keep it at 60s so compaction triggers
+                // promptly when fragmentation crosses the threshold.
+                let sleep_secs = 60u64;
+
+                let current_size = metadata.db_size();
+                let frag_ratio = if last_compact_size > 0 {
+                    current_size as f64 / last_compact_size as f64
+                } else {
+                    f64::INFINITY // first run: always compact
                 };
+                let secs_since_compact = last_compact_time
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(u64::MAX);
+
+                if frag_ratio >= 2.0 {
+                    warn!("redb fragmentation high: {:.1}MB (last compact baseline: {:.1}MB)",
+                        current_size as f64 / 1_048_576.0,
+                        last_compact_size as f64 / 1_048_576.0);
+                }
+
+                // Compact if fragmentation ≥ 20%, or 30 minutes have passed since the
+                // last compact (catches latent free pages that redb only reclaims later).
+                if frag_ratio < 1.20 && secs_since_compact < 30 * 60 {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+                    continue;
+                }
 
                 // Retry up to 3 times on transient "transaction in progress" errors.
                 let mut last_err = None;
@@ -3165,6 +3188,8 @@ impl Server {
                                     before as f64 / 1_048_576.0,
                                     after  as f64 / 1_048_576.0);
                             }
+                            last_compact_size = after; // update baseline only on success
+                            last_compact_time = Some(std::time::Instant::now());
                             last_err = None;
                             break;
                         }

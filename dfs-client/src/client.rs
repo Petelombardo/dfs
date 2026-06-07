@@ -2182,25 +2182,26 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
             }
 
-            // 2. Another request already fetching it?
-            if engine.in_flight.contains(&cid) {
+            // 2. Atomically claim this chunk for fetching (DashSet::insert returns true iff
+            //    newly inserted). This is a single locked operation — no TOCTOU race between
+            //    concurrent FUSE reads that both see "not in-flight" and both start a fetch.
+            if !engine.in_flight.insert(cid) {
                 to_wait.push((idx, cid, loc.clone()));
                 continue;
             }
 
-            // 3. Need to fetch — pick least-loaded replica so parallel chunk
-            // fetches spread across nodes rather than piling onto one.
+            // 3. We own the fetch — pick replica and queue it.
             let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
             self.node_inflight_inc(primary);
-            engine.in_flight.insert(cid);
             to_fetch.push((idx, cid, primary, fallbacks));
         }
 
         // --- Pipeline lookahead: speculatively fetch the next N chunks. ---
-        // Always fire when we're fetching — even on fast local links the spawn overhead
-        // is negligible compared to hiding one additional chunk RTT.
+        // Fire on every sequential read, not only on misses. Without this, cache-hit reads
+        // produce no new prefetch — leaving the chunk two ahead unfetched and causing the
+        // miss→hit→miss→hit alternating stall pattern.
         // Fire-and-forget — their results go into chunk_cache; we don't await them here.
-        if !to_fetch.is_empty() {
+        if !needed.is_empty() && !bypass_cache {
             let last_required_idx = needed.last().map(|(i, _, _)| *i).unwrap_or(0);
             let lookahead_candidates = engine.pipeline_lookahead(
                 last_required_idx, chunk_map.len(), &chunk_map,
@@ -2226,8 +2227,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                     continue;
                 }
 
-                // Mark in-flight now (after cache + load check) to prevent duplicate fetches.
-                engine.in_flight.insert(la_cid);
+                // Atomically claim — if another task already inserted (concurrent FUSE read
+                // also firing lookahead), skip rather than double-fetching.
+                if !engine.in_flight.insert(la_cid) {
+                    continue;
+                }
                 self.node_inflight_inc(primary);
                 let client = self.clone();
                 let eng = engine.clone();
@@ -2540,7 +2544,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                             continue;
                         }
 
-                        engine.in_flight.insert(swarm_cid);
+                        if !engine.in_flight.insert(swarm_cid) {
+                            continue;
+                        }
                         self.node_inflight_inc(primary);
 
                         // Adaptive stagger: use half of chunk 0's fetch time to ensure chunk N+2
@@ -2576,17 +2582,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                                             let (cm, _co, nim) = e.snapshot();
                                             if next_idx < cm.len() {
                                                 let next_cid = cm[next_idx].chunk_id;
-                                                let should_chain = client.chunk_cache.get(&next_cid).is_none()
-                                                    && !eng.in_flight.contains(&next_cid);
-                                                if should_chain {
+                                                if client.chunk_cache.get(&next_cid).is_none() {
                                                     let chain_nodes = client.cluster_nodes.read().await.clone();
                                                     let (next_primary, next_fallbacks) = client.pick_replica_by_load(&cm[next_idx], &nim, &chain_nodes);
                                                     // Same per-node cap for chain fetches.
                                                     let chain_load = client.node_inflight.get(&next_primary)
                                                         .map(|e| e.load(Ordering::Relaxed))
                                                         .unwrap_or(0);
-                                                    if chain_load < MAX_BACKGROUND_PER_NODE {
-                                                        eng.in_flight.insert(next_cid);
+                                                    if chain_load < MAX_BACKGROUND_PER_NODE && eng.in_flight.insert(next_cid) {
                                                         client.node_inflight_inc(next_primary);
                                                         let chain_client = client.clone();
                                                         let chain_eng = eng.clone();

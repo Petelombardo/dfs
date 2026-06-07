@@ -91,7 +91,7 @@ impl InodeReadEngine {
             node_id_to_addr: RwLock::new(Arc::new(HashMap::new())),
             in_flight: DashSet::new(),
             pipeline_head: AtomicUsize::new(0),
-            pipeline_depth: 1,
+            pipeline_depth: 4,
             refresh_in_progress: AtomicBool::new(false),
             last_failed_refresh_ms: AtomicU64::new(0),
             last_window_start: AtomicU32::new(0),

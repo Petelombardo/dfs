@@ -434,9 +434,10 @@ impl InodeWriteState {
 /// large chunks hit the byte limit instead (4 × 4MB = 16MB).
 const PIPELINE_MAX_ITEMS: usize = 16;
 
-/// Maximum total bytes that may be in-flight across all concurrent flush tasks per inode.
-/// Set to 4 × CHUNK_SIZE (16MB) to limit memory and network bandwidth usage.
-/// Whichever limit is hit first (PIPELINE_MAX_ITEMS or PIPELINE_MAX_BYTES) throttles dispatch.
+/// Maximum total bytes in-flight across concurrent flush tasks per inode.
+/// Set to 4 × CHUNK_SIZE (16MB). Used by both the background ticker and flush_all_pipelined.
+/// flush_all_pipelined (fsync/release) uses this limit only — no item cap — so small patches
+/// are all dispatched in one round rather than serialised into ceil(N/16) rounds.
 const PIPELINE_MAX_BYTES: usize = 4 * CHUNK_SIZE;
 
 /// Number of full chunk slots the writer may buffer ahead of the pipeline.
@@ -454,8 +455,8 @@ struct FlushHandle {
     metadata_cache: Arc<DashMap<u64, FileMetadata>>,
     chunk_write_locks: Arc<DashMap<u64, Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>>>,
     /// Tracks how many chunk-flush tasks are currently in-flight per inode.
-    /// Capped at PIPELINE_MAX_ITEMS by the background ticker (item count only;
-    /// the byte limit is enforced separately in flush_all_pipelined).
+    /// Capped at PIPELINE_MAX_ITEMS by the background ticker.
+    /// flush_all_pipelined (fsync/release) uses byte limit only — no item cap.
     flush_in_flight: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>>,
     last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
     dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
@@ -2290,9 +2291,10 @@ impl FlushHandle {
     }
 
     /// Drain ALL dirty slots for `ino` (including partial tail) through a pipeline
-    /// capped at both PIPELINE_MAX_ITEMS (16) and PIPELINE_MAX_BYTES (16MB).
-    /// Used by release() and fsync(). The hybrid limit allows many small patches to
-    /// fill the pipeline efficiently without exceeding memory/bandwidth budgets.
+    /// capped by PIPELINE_MAX_BYTES (16MB) only — no item count limit.
+    /// Used by release() and fsync(). Driving dispatch by bytes lets small patches
+    /// (e.g. 200 × 1KB = 200KB) all go in one round instead of ceil(N/16) rounds,
+    /// while still throttling large 4MB chunks to 4 at a time (4 × 4MB = 16MB).
     async fn flush_all_pipelined(&self, ino: u64) -> Result<()> {
         // Serialize concurrent flush_all_pipelined calls for the same inode.
         // Without this, two sync_release handlers closing in quick succession both
@@ -2331,7 +2333,10 @@ impl FlushHandle {
         let mut first_err: Option<anyhow::Error> = None;
 
         // Keep dispatching concurrent flush_one_chunk calls until no unclaimed slots remain.
-        // Enforce BOTH a count limit (PIPELINE_MAX_ITEMS) and a byte limit (PIPELINE_MAX_BYTES).
+        // Enforce byte limit only (PIPELINE_MAX_BYTES). The item count limit is for
+        // the background ticker; fsync/release should drain all dirty slots as fast as
+        // possible — small patches are negligible in bytes so the item cap was the
+        // binding constraint and serialized what could be a single network round.
         loop {
             // Mark all pending slots as idle on every iteration so flush_one_chunk can claim
             // them. This must be inside the loop: write() calls arriving while a previous
@@ -2373,12 +2378,10 @@ impl FlushHandle {
                 }).unwrap_or((0, 0))
             }).unwrap_or((0, 0));
 
-            // Dispatch if BOTH limits allow it:
-            // - in_flight_count < PIPELINE_MAX_ITEMS (16 items)
-            // - in_flight_bytes < PIPELINE_MAX_BYTES (16MB)
-            // For small patches, the item limit dominates (e.g., 16 × 1KB = 16KB << 16MB).
-            // For large chunks, the byte limit dominates (e.g., 4 × 4MB = 16MB at 4 items).
-            let items_available = PIPELINE_MAX_ITEMS.saturating_sub(in_flight_count);
+            // Dispatch up to PIPELINE_MAX_BYTES (16MB) worth of in-flight data.
+            // No item count limit here — small patches (1KB each) would otherwise be
+            // serialised into ceil(N/16) rounds even though their total byte cost is tiny.
+            // Large 4MB chunks are naturally throttled: 4 × 4MB = 16MB hits the byte cap.
             let bytes_available = PIPELINE_MAX_BYTES.saturating_sub(in_flight_bytes);
 
             // Estimate how many more items we can dispatch based on byte budget.
@@ -2397,11 +2400,10 @@ impl FlushHandle {
             let to_dispatch = if pending_slot_sizes.is_empty() {
                 0
             } else {
-                // Greedily fit as many pending slots as possible within both limits.
+                // Greedily fit as many pending slots as possible within the byte budget.
                 let mut can_fit = 0;
                 let mut bytes_so_far = 0;
                 for &size in &pending_slot_sizes {
-                    if can_fit >= items_available { break; }
                     if bytes_so_far + size > bytes_available { break; }
                     can_fit += 1;
                     bytes_so_far += size;
@@ -2410,7 +2412,7 @@ impl FlushHandle {
             };
 
             if to_dispatch == 0 {
-                // Pipeline is full (either item or byte limit hit) — wait for a slot to complete.
+                // Byte budget exhausted — wait for in-flight slots to complete.
                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 continue;
             }

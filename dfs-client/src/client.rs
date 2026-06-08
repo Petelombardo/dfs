@@ -2806,8 +2806,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let p = nodes[0];
                     (p, nodes[1..].to_vec())
                 });
-        let data = self.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await?;
-        Ok(Arc::new(data))
+        let data = Arc::new(self.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await?);
+        // Cache the result so other concurrent waiters don't need their own direct fetch.
+        // Without this, every waiter that timed out does a separate network fetch for the
+        // same chunk — a thundering herd when the primary fetch is slow (e.g. server throttling).
+        self.chunk_cache.insert(cid, Arc::clone(&data));
+        self.chunk_landed.notify_waiters();
+        Ok(data)
     }
 
     /// Refresh the engine's chunk map from the leader.

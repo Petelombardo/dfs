@@ -2638,6 +2638,11 @@ pub struct DfsFilesystem {
     /// metadata_cache was populated only by warmup — flushing those with a
     /// higher write_seq would reinforce any DB corruption already present.
     written_inodes: Arc<dashmap::DashSet<u64>>,
+
+    /// Inodes unlinked while one or more fds were still open (POSIX deferred delete).
+    /// Maps ino → path. Defers path_to_inode removal and server delete until the last
+    /// fd closes so existing fds can continue writing without ENOENT.
+    unlinked_while_open: Arc<DashMap<u64, String>>,
 }
 
 impl DfsFilesystem {
@@ -2990,6 +2995,7 @@ impl DfsFilesystem {
             read_runtime,
             flush_handle,
             pending_deletes: Arc::new(dashmap::DashSet::new()),
+            unlinked_while_open: Arc::new(DashMap::new()),
             pending_creates: Arc::new(dashmap::DashSet::new()),
             refreshing_inodes: Arc::new(dashmap::DashSet::new()),
             direct_write_inodes: Arc::new(dashmap::DashSet::new()),
@@ -3237,11 +3243,17 @@ impl Filesystem for DfsFilesystem {
             let last_metadata_update = self.last_metadata_update.clone();
             let dir_cache = self.dir_cache.clone();
             let write_open_counts_warmup = self.write_open_counts.clone();
+            // Signal channel so init() can block until warmup finishes. Per the FUSE protocol,
+            // the kernel will not dispatch any operations (lookup, read, write, …) until it
+            // receives our FUSE_INIT reply. Blocking here therefore prevents any filesystem
+            // access until the cache is warm — the DVR and similar daemons are guaranteed to
+            // see a fully populated directory/metadata cache on their very first operation.
+            let (warmup_tx, warmup_rx) = tokio::sync::oneshot::channel::<usize>();
             self.runtime.spawn(async move {
                 info!("Startup: warming metadata cache from leader");
                 let files = match client.list_all_files().await {
                     Ok(f) => f,
-                    Err(e) => { warn!("Startup warm: {}", e); return; }
+                    Err(e) => { warn!("Startup warm: {}", e); let _ = warmup_tx.send(0); return; }
                 };
                 let now = std::time::Instant::now();
                 let count = files.len();
@@ -3295,7 +3307,12 @@ impl Filesystem for DfsFilesystem {
                     dir_cache.insert(dir, (entries, now));
                 }
                 info!("Startup: warmed {} files into metadata/dir cache", count);
+                let _ = warmup_tx.send(count);
             });
+            // Block until the warmup task completes. init() runs on a FUSE dispatch thread;
+            // blocking here is safe because the kernel sends no further FUSE ops until it
+            // receives our FUSE_INIT reply (which only happens when init() returns).
+            let _ = warmup_rx.blocking_recv();
         }
 
         // Enable POSIX file locking - tell kernel to use our setlk/getlk implementations
@@ -5627,6 +5644,62 @@ impl Filesystem for DfsFilesystem {
             false
         };
 
+        // If this inode was unlinked while fds were still open, and this is the last
+        // fd closing, spawn a deferred cleanup task. The task waits for any in-flight
+        // flush tasks (tracked by release_in_flight) to complete before issuing the
+        // server delete — preventing resurrection of a deleted file by a concurrent flush.
+        if is_last_open {
+            if let Some((_, unlinked_path)) = self.unlinked_while_open.remove(&ino) {
+                info!("release: ino={} was unlinked while open — triggering deferred server delete for {}", ino, unlinked_path);
+                let def_client = self.client.clone();
+                let def_path_to_inode = self.path_to_inode.clone();
+                let def_pending_deletes = self.pending_deletes.clone();
+                let def_metadata_cache = self.metadata_cache.clone();
+                let def_write_counters = self.write_counters.clone();
+                let def_last_warm_offset = self.last_warm_offset.clone();
+                let def_chunk_offset_cache = self.chunk_offset_cache.clone();
+                let def_release_in_flight = self.release_in_flight.clone();
+                self.runtime.spawn(async move {
+                    // Wait for any flush task for this inode to finish. The flush task
+                    // (is_last_writer path) sees is_pending_delete=true and returns early
+                    // after cleaning up write_buffers, then decrements release_in_flight.
+                    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+                    loop {
+                        let in_flight = def_release_in_flight.get(&ino)
+                            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(0);
+                        if in_flight == 0 { break; }
+                        if tokio::time::Instant::now() > deadline {
+                            warn!("deferred unlink: timed out waiting for flush for ino={}", ino);
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+                    // Clean up remaining local state that was preserved for open fds.
+                    def_metadata_cache.remove(&ino);
+                    def_write_counters.write().unwrap().remove(&ino);
+                    def_last_warm_offset.remove(&ino);
+                    def_chunk_offset_cache.remove(&ino);
+                    def_client.evict_recent_chunk_writes(ino);
+                    // Remove from path_to_inode only if still our inode — a new file
+                    // created at the same path takes precedence and must not be deleted.
+                    let path_is_ours = def_path_to_inode.read().unwrap()
+                        .get(&unlinked_path).copied() == Some(ino);
+                    if path_is_ours {
+                        def_path_to_inode.write().unwrap()
+                            .remove_entry(&unlinked_path);
+                        match def_client.delete_file(&unlinked_path).await {
+                            Ok(_) => info!("deferred unlink: deleted {} (ino={})", unlinked_path, ino),
+                            Err(e) => error!("deferred unlink: delete_file failed for {}: {}", unlinked_path, e),
+                        }
+                    } else {
+                        info!("deferred unlink: ino={} path={} superseded by new file, orphaning chunks", ino, unlinked_path);
+                    }
+                    def_pending_deletes.remove(&unlinked_path);
+                });
+            }
+        }
+
         let lock_manager = self.lock_manager.clone();
 
         // All release paths spawn async tasks and return immediately.
@@ -6161,6 +6234,8 @@ impl Filesystem for DfsFilesystem {
         let last_warm_offset = self.last_warm_offset.clone();
         let chunk_offset_cache = self.chunk_offset_cache.clone();
         let pending_deletes = self.pending_deletes.clone();
+        let open_counts = self.open_counts.clone();
+        let unlinked_while_open = self.unlinked_while_open.clone();
 
         // Mark as pending-delete immediately so concurrent lookup() returns ENOENT
         // even while the server-side delete is still in flight.
@@ -6168,9 +6243,28 @@ impl Filesystem for DfsFilesystem {
         debug!("unlink: inserted {:?} into pending_deletes (len={}, ptr={:p})", path, pending_deletes.len(), Arc::as_ptr(&pending_deletes));
 
         self.runtime.spawn(async move {
-            // Always clean local cache first — stale entries block future creates even
-            // when the server delete times out. The server/healer will clean up its side.
             let ino_opt = path_to_inode.read().unwrap().get(&path).copied();
+            let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+            let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
+
+            // POSIX unlink-while-open: if any fd is still open, defer path removal and
+            // server delete until the last fd closes. path_to_inode stays so in-flight
+            // writes can resolve the path; pending_deletes prevents new lookups from
+            // seeing the file. release() picks up the deferred cleanup via unlinked_while_open.
+            let still_open = ino_opt
+                .map(|ino| open_counts.get(&ino).map(|c| *c > 0).unwrap_or(false))
+                .unwrap_or(false);
+            if still_open {
+                if let Some(ino) = ino_opt {
+                    info!("unlink: ino={} path={} still open — deferring server delete", ino, path);
+                    unlinked_while_open.insert(ino, path.clone());
+                }
+                DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, parent_path);
+                reply.ok();
+                return;
+            }
+
+            // No open fds — proceed with immediate cleanup.
             let file_id_opt = ino_opt.and_then(|ino| {
                 metadata_cache.remove(&ino).map(|(_, m)| m.id)
             });
@@ -6183,8 +6277,6 @@ impl Filesystem for DfsFilesystem {
                 chunk_offset_cache.remove(&ino);
             }
             path_to_inode.write().unwrap().remove(&path);
-            let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
-            let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
             DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, parent_path);
 
             // Cancel any queued metadata flush for this file before sending the delete.

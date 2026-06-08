@@ -42,7 +42,9 @@ if [ "$1" == "all" ] || [ "$1" == "client" ]; then
 		ssh root@$i "systemctl stop dfs-client"
 		sleep 1
 		scp target/release/dfs-client root@$i:/usr/bin/
-		ssh root@$i "systemctl start dfs-client; sleep 6; podman start dvr"
+		# Wait for the mount to become accessible — init() now blocks until metadata
+		# warmup completes, so a successful ls means the cache is fully warm.
+		ssh root@$i "systemctl start dfs-client; until ls /mnt/test >/dev/null 2>&1; do sleep 0.5; done; podman start dvr"
 		echo ""
 	done
 fi

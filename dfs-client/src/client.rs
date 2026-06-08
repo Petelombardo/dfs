@@ -1850,13 +1850,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        // Bypass cache for SQLite files (always) and for chunks that are currently
-        // dirty in the write buffer (not yet flushed). Bypassing the entire inode
-        // when write-open kills read performance for large files like VM disk images
-        // where QEMU holds the file open O_RDWR but reads and writes are to completely
-        // different regions. Only the unflushed chunks need bypass — flushed chunks
-        // have current chunk IDs and are safe to serve from cache.
-        let bypass_cache = crate::fuse_impl::is_sqlite_for_cache(file_path);
+        // Chunks are content-addressed (ChunkId = hash of data), so there is no
+        // staleness risk from caching: a modified page gets a new ChunkId and the
+        // old cache entry is simply never requested again.  SQLite files previously
+        // bypassed the cache, which also forced every small (4KB) page read through
+        // the full-chunk path — fetching 4MB per 4KB read with no caching.  Now all
+        // files, including SQLite, use the cache and the range-fetch path for small reads.
+        let bypass_cache = false;
 
         let end = offset + size;
         let needed = InodeReadEngine::chunks_for_range(&chunk_offsets, offset, size);
@@ -4534,30 +4534,38 @@ leader_addr: Arc::new(RwLock::new(None)),
         // write_chunk_to_replicas already delivered ChunkLocation to leader (sync) and
         // followers (async). No second broadcast needed here.
 
-        // Populate byte-range cache for immediate read-back
-        if inode > 0 {
-            let mut byte_cache = self.byte_range_cache.lock().await;
+        // Populate caches for immediate read-back of freshly-written data.
+        // chunk_cache (keyed by ChunkId) enables full-chunk reads to hit cache.
+        // byte_range_cache (keyed by inode+offset) enables sub-chunk range reads to hit cache.
+        {
+            let mut byte_cache = if inode > 0 { Some(self.byte_range_cache.lock().await) } else { None };
             let mut current_offset = file_offset;
+            let mut any_inserted = false;
 
             for (idx, location) in chunk_locations.iter().enumerate() {
                 let chunk_start = if idx == 0 { 0 } else {
                     chunk_locations[..idx].iter().map(|l| l.size as u64).sum::<u64>() as usize
                 };
                 let chunk_end = chunk_start + location.size;
-                let chunk_data = data[chunk_start..chunk_end].to_vec();
+                let arc = Arc::new(data[chunk_start..chunk_end].to_vec());
 
-                let key = ByteRangeCacheKey {
-                    inode,
-                    file_offset: current_offset,
-                };
-                let cached = CachedChunk {
-                    data: Arc::new(chunk_data),
-                    chunk_size: location.size,
-                    cached_at: std::time::Instant::now(),
-                };
-                byte_cache.put(key, cached);
+                self.chunk_cache.insert(location.chunk_id, Arc::clone(&arc));
+                any_inserted = true;
+
+                if let Some(ref mut bc) = byte_cache {
+                    let key = ByteRangeCacheKey { inode, file_offset: current_offset };
+                    bc.put(key, CachedChunk {
+                        data: Arc::clone(&arc),
+                        chunk_size: location.size,
+                        cached_at: std::time::Instant::now(),
+                    });
+                }
 
                 current_offset += location.size as u64;
+            }
+
+            if any_inserted {
+                self.chunk_landed.notify_waiters();
             }
         }
 
@@ -4755,30 +4763,38 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        // Populate byte-range cache for immediate read-back
-        if inode > 0 {
-            let mut byte_cache = self.byte_range_cache.lock().await;
+        // Populate caches for immediate read-back of freshly-written data.
+        // chunk_cache (keyed by ChunkId) enables full-chunk reads to hit cache.
+        // byte_range_cache (keyed by inode+offset) enables sub-chunk range reads to hit cache.
+        {
+            let mut byte_cache = if inode > 0 { Some(self.byte_range_cache.lock().await) } else { None };
             let mut current_offset = file_offset;
+            let mut any_inserted = false;
 
             for (idx, location) in chunk_locations.iter().enumerate() {
                 let chunk_start = if idx == 0 { 0 } else {
                     chunk_locations[..idx].iter().map(|l| l.size as u64).sum::<u64>() as usize
                 };
                 let chunk_end = chunk_start + location.size;
-                let chunk_data = data[chunk_start..chunk_end].to_vec();
+                let arc = Arc::new(data[chunk_start..chunk_end].to_vec());
 
-                let key = ByteRangeCacheKey {
-                    inode,
-                    file_offset: current_offset,
-                };
-                let cached = CachedChunk {
-                    data: Arc::new(chunk_data),
-                    chunk_size: location.size,
-                    cached_at: std::time::Instant::now(),
-                };
-                byte_cache.put(key, cached);
+                self.chunk_cache.insert(location.chunk_id, Arc::clone(&arc));
+                any_inserted = true;
+
+                if let Some(ref mut bc) = byte_cache {
+                    let key = ByteRangeCacheKey { inode, file_offset: current_offset };
+                    bc.put(key, CachedChunk {
+                        data: Arc::clone(&arc),
+                        chunk_size: location.size,
+                        cached_at: std::time::Instant::now(),
+                    });
+                }
 
                 current_offset += location.size as u64;
+            }
+
+            if any_inserted {
+                self.chunk_landed.notify_waiters();
             }
         }
 

@@ -474,9 +474,16 @@ impl ClusterManager {
             .as_secs();
 
         // Build (node_id, available, total) for each node.
+        // Staleness windows:
+        //   < 300s — use real values. This ensures a nearly-full node stays vetoed for
+        //            up to 5 minutes after a heartbeat gap (e.g. post-rolling-restart),
+        //            rather than the old 60s window that caused the healer to assume 50%
+        //            free and flood the node during the post-restart heartbeat gap.
+        //   > 300s — very stale / never seen: assume 50% free (new node joining or
+        //            extended connectivity gap — give benefit of the doubt).
         let node_caps: Vec<(NodeId, u64, u64)> = all_nodes.iter().map(|node_id| {
             let (available, total) = if let Some(cap) = capacities.get(node_id) {
-                if cap.total > 0 && now - cap.last_updated < 60 {
+                if cap.total > 0 && now.saturating_sub(cap.last_updated) < 300 {
                     (cap.available, cap.total)
                 } else {
                     (cap.total / 2, cap.total)

@@ -432,12 +432,14 @@ impl InodeWriteState {
 /// Maximum number of chunk-flush tasks that may run concurrently per inode.
 /// Allows small patches to pipeline efficiently (16 × 1KB = 16KB in flight) while
 /// large chunks hit the byte limit instead (4 × 4MB = 16MB).
+/// Background ticker: gentle limit to avoid overwhelming servers during steady-state writes.
 const PIPELINE_MAX_ITEMS: usize = 16;
+/// fsync/release flush: higher limit so small-patch storms (e.g. VM disk installs) don't
+/// take ceil(N/16) rounds, but still bounded to prevent saturating XFS journal on servers.
+const FLUSH_ALL_MAX_ITEMS: usize = 64;
 
 /// Maximum total bytes in-flight across concurrent flush tasks per inode.
 /// Set to 4 × CHUNK_SIZE (16MB). Used by both the background ticker and flush_all_pipelined.
-/// flush_all_pipelined (fsync/release) uses this limit only — no item cap — so small patches
-/// are all dispatched in one round rather than serialised into ceil(N/16) rounds.
 const PIPELINE_MAX_BYTES: usize = 4 * CHUNK_SIZE;
 
 /// Number of full chunk slots the writer may buffer ahead of the pipeline.
@@ -2291,10 +2293,9 @@ impl FlushHandle {
     }
 
     /// Drain ALL dirty slots for `ino` (including partial tail) through a pipeline
-    /// capped by PIPELINE_MAX_BYTES (16MB) only — no item count limit.
-    /// Used by release() and fsync(). Driving dispatch by bytes lets small patches
-    /// (e.g. 200 × 1KB = 200KB) all go in one round instead of ceil(N/16) rounds,
-    /// while still throttling large 4MB chunks to 4 at a time (4 × 4MB = 16MB).
+    /// capped at FLUSH_ALL_MAX_ITEMS (64) and PIPELINE_MAX_BYTES (16MB).
+    /// Used by release() and fsync(). 64 items >> background ticker's 16, so small
+    /// patches (e.g. 200 × 1KB) take 4 rounds instead of 13, without flooding servers.
     async fn flush_all_pipelined(&self, ino: u64) -> Result<()> {
         // Serialize concurrent flush_all_pipelined calls for the same inode.
         // Without this, two sync_release handlers closing in quick succession both
@@ -2378,13 +2379,14 @@ impl FlushHandle {
                 }).unwrap_or((0, 0))
             }).unwrap_or((0, 0));
 
-            // Dispatch up to PIPELINE_MAX_BYTES (16MB) worth of in-flight data.
-            // No item count limit here — small patches (1KB each) would otherwise be
-            // serialised into ceil(N/16) rounds even though their total byte cost is tiny.
-            // Large 4MB chunks are naturally throttled: 4 × 4MB = 16MB hits the byte cap.
+            // Dispatch up to FLUSH_ALL_MAX_ITEMS (64) concurrent tasks and PIPELINE_MAX_BYTES
+            // (16MB) of in-flight data. The item cap prevents saturating the XFS journal on
+            // servers under a burst of many small patches; 64 >> 16 (background ticker) so
+            // 200 small patches still take ceil(200/64)=4 rounds instead of ceil(200/16)=13.
+            let items_available = FLUSH_ALL_MAX_ITEMS.saturating_sub(in_flight_count);
             let bytes_available = PIPELINE_MAX_BYTES.saturating_sub(in_flight_bytes);
 
-            // Estimate how many more items we can dispatch based on byte budget.
+            // Estimate how many more items we can dispatch based on both budgets.
             // Peek at pending slot sizes to make a reasonable guess.
             let pending_slot_sizes: Vec<usize> = self.write_buffers.get(&ino)
                 .and_then(|s| s.try_lock().ok().map(|st| {
@@ -2400,10 +2402,11 @@ impl FlushHandle {
             let to_dispatch = if pending_slot_sizes.is_empty() {
                 0
             } else {
-                // Greedily fit as many pending slots as possible within the byte budget.
+                // Greedily fit as many pending slots as possible within both limits.
                 let mut can_fit = 0;
                 let mut bytes_so_far = 0;
                 for &size in &pending_slot_sizes {
+                    if can_fit >= items_available { break; }
                     if bytes_so_far + size > bytes_available { break; }
                     can_fit += 1;
                     bytes_so_far += size;
@@ -2412,7 +2415,7 @@ impl FlushHandle {
             };
 
             if to_dispatch == 0 {
-                // Byte budget exhausted — wait for in-flight slots to complete.
+                // Item or byte budget exhausted — wait for in-flight slots to complete.
                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 continue;
             }

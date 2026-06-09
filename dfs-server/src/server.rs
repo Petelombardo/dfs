@@ -134,7 +134,13 @@ pub struct Server {
     /// All metadata put_file calls are serialized through here — one std::thread
     /// processes them sequentially, eliminating the futex pile-up from concurrent
     /// spawn_blocking calls all contending on sled's internal write lock.
-    sled_write_tx: tokio::sync::mpsc::UnboundedSender<FileMetadata>,
+    /// Wrapped in Mutex<Option<...>> so drain_sled_writes() can close the channel
+    /// by dropping the sender, then wait for the worker thread to drain completely.
+    sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>>,
+
+    /// Notified by the sled-write worker when it has drained all pending items
+    /// and exited (after the sender is dropped). Used by drain_sled_writes().
+    sled_write_done: Arc<tokio::sync::Notify>,
 
     /// Per-chunk serialization locks for MultiPatch.
     /// Serializes all patches to the same (FileId, chunk_idx) pair so that two
@@ -168,6 +174,35 @@ impl Server {
         let delete_tombstones: Arc<DashMap<FileId, std::time::Instant>> = Arc::new(DashMap::new());
         let tombstones_for_worker = delete_tombstones.clone();
 
+        // Build sled worker channel and done-notify before the struct literal so the
+        // thread captures the correct Arc clones (struct fields can't cross-reference
+        // each other within a single literal).
+        let sled_write_done: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>> = {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
+            let meta_bg = metadata.clone();
+            let done_notify = sled_write_done.clone();
+            std::thread::spawn(move || {
+                while let Some(m) = rx.blocking_recv() {
+                    // Guard: don't resurrect a file that was deleted after this
+                    // write was queued (race between ReplicateChunkLocation and
+                    // handle_delete_file). The tombstone is set by handle_delete_file
+                    // before removing from sled, so if it's present here the delete
+                    // wins and we discard the stale metadata update.
+                    if tombstones_for_worker.contains_key(&m.id) {
+                        debug!("sled_write_worker: skipping tombstoned file {} ({})", m.path, m.id);
+                        continue;
+                    }
+                    if let Err(e) = meta_bg.put_file(&m) {
+                        warn!("sled_write_worker: put_file failed for {}: {}", m.path, e);
+                    }
+                }
+                // All pending items have been committed — signal drain_sled_writes().
+                done_notify.notify_waiters();
+            });
+            Arc::new(std::sync::Mutex::new(Some(tx)))
+        };
+
         let server = Self {
             storage,
             metadata: metadata.clone(),
@@ -200,27 +235,8 @@ impl Server {
             chunk_patch_locks: Arc::new(DashMap::new()),
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
-            sled_write_tx: {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
-                let meta_bg = metadata.clone();
-                std::thread::spawn(move || {
-                    while let Some(m) = rx.blocking_recv() {
-                        // Guard: don't resurrect a file that was deleted after this
-                        // write was queued (race between ReplicateChunkLocation and
-                        // handle_delete_file). The tombstone is set by handle_delete_file
-                        // before removing from sled, so if it's present here the delete
-                        // wins and we discard the stale metadata update.
-                        if tombstones_for_worker.contains_key(&m.id) {
-                            debug!("sled_write_worker: skipping tombstoned file {} ({})", m.path, m.id);
-                            continue;
-                        }
-                        if let Err(e) = meta_bg.put_file(&m) {
-                            warn!("sled_write_worker: put_file failed for {}: {}", m.path, e);
-                        }
-                    }
-                });
-                tx
-            },
+            sled_write_done,
+            sled_write_tx,
         };
 
         server
@@ -228,6 +244,23 @@ impl Server {
 
     pub fn metadata_store(&self) -> Arc<MetadataStore> {
         self.metadata.clone()
+    }
+
+    /// Close the sled-write channel and wait for the worker thread to commit all
+    /// pending metadata writes before returning. Called during graceful shutdown so
+    /// no queued PutFileMetadata writes are lost when the process exits.
+    pub async fn drain_sled_writes(&self) {
+        // Drop the sender — this closes the channel and signals the worker to drain.
+        self.sled_write_tx.lock().unwrap().take();
+        // Wait for the worker thread to finish committing all remaining items.
+        self.sled_write_done.notified().await;
+        // All items are now committed with Durability::None (in OS page cache).
+        // One empty Durability::Immediate commit promotes the entire accumulated list
+        // to physical disk via fdatasync — same trick used by compact_db().
+        if let Err(e) = self.metadata.flush_durable() {
+            warn!("drain_sled_writes: flush_durable failed: {}", e);
+        }
+        info!("drain_sled_writes: all pending metadata writes flushed to disk");
     }
 
     /// Rebuild the in-memory chunk map by scanning all file metadata.
@@ -1738,7 +1771,9 @@ impl Server {
             m
         };
         self.chunk_map_update(&metadata).await;
-        let _ = self.sled_write_tx.send(metadata.clone());
+        if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(metadata.clone());
+        }
 
         // TTL>0: forward to all other nodes with ttl-1 so every node gets
         // every write regardless of which node the client contacted first.
@@ -2021,7 +2056,9 @@ impl Server {
                             }
                         }
                         if updated && !self.delete_tombstones.contains_key(&fid) {
-                            let _ = self.sled_write_tx.send(file_meta);
+                            if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
+                                let _ = tx.send(file_meta);
+                            }
                         }
                     }
                 }
@@ -2266,7 +2303,9 @@ impl Server {
                 m
             };
             self.chunk_map_update(&metadata).await;
-            let _ = self.sled_write_tx.send(metadata.clone());
+            if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
+                let _ = tx.send(metadata.clone());
+            }
         }
         Response::Ok { data: None }
     }
@@ -3618,7 +3657,9 @@ impl Server {
             let meta_store = self.metadata.clone();
             let _ = tokio::task::spawn_blocking(move || meta_store.put_file(&meta_clone)).await;
         } else {
-            let _ = self.sled_write_tx.send(metadata);
+            if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
+                let _ = tx.send(metadata);
+            }
         }
         Response::Ok { data: None }
     }

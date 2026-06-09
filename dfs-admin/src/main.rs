@@ -739,12 +739,24 @@ async fn handle_file_command(
                         println!("Type:       {:?}", metadata.file_type);
                         println!();
                         println!("Chunk Locations:");
-                        println!("{:<20} {:<10} {}", "Chunk ID", "Size", "Nodes");
-                        println!("{}", "-".repeat(70));
+                        println!("{:<20} {:<14} {:<10} {}", "Chunk ID", "Offset", "Size", "Nodes");
+                        println!("{}", "-".repeat(80));
 
-                        for loc in chunk_locations {
+                        // Detect gaps: sort by offset and flag any missing ranges.
+                        let mut sorted = chunk_locations.clone();
+                        sorted.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+                        let mut expected_offset: u64 = 0;
+                        for loc in &sorted {
+                            let offset = loc.file_offset.unwrap_or(u64::MAX);
+                            if offset != u64::MAX && offset > expected_offset {
+                                println!("  *** GAP: missing bytes {:#x}–{:#x} ({} bytes) ***",
+                                    expected_offset, offset - 1, offset - expected_offset);
+                            }
                             let chunk_id_str = loc.chunk_id.to_string();
                             let chunk_id_short = &chunk_id_str[..16.min(chunk_id_str.len())];
+                            let offset_str = loc.file_offset
+                                .map(|o| format!("{:#x}", o))
+                                .unwrap_or_else(|| "?".to_string());
                             let nodes_str = loc
                                 .nodes
                                 .iter()
@@ -754,7 +766,10 @@ async fn handle_file_command(
                                 })
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            println!("{:<20} {:<10} {}", chunk_id_short, loc.size, nodes_str);
+                            println!("{:<20} {:<14} {:<10} {}", chunk_id_short, offset_str, loc.size, nodes_str);
+                            if offset != u64::MAX {
+                                expected_offset = offset + loc.size as u64;
+                            }
                         }
                     }
                 }

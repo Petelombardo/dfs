@@ -343,6 +343,13 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             // 100ms is sufficient — announce_leaving() already awaits the TCP sends.
             // Keeping this short avoids racing with test-suite teardown (pkill + sleep 0.5).
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Drain the sled-write worker: commits any queued PutFileMetadata writes
+            // before the process exits. Without this, writes queued but not yet committed
+            // are lost on restart (the worker std::thread is killed when main() returns).
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_secs(5),
+                server.drain_sled_writes(),
+            ).await;
             info!("Shutting down...");
             server_handle.abort();
         }

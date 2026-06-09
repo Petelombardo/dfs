@@ -81,6 +81,22 @@ impl MetadataStore {
             .create(&db_path)
             .with_context(|| format!("Failed to open redb at {:?}", db_path))?;
 
+        // Check structural integrity on every startup. redb's check_integrity()
+        // validates B-tree page allocations and repairs any inconsistency left by
+        // an unclean shutdown (power loss, kill -9, OOM). Returns true if the DB
+        // was already clean, false if repair was needed. An unrecoverable error
+        // here means the file is truly corrupt — surface it so the admin can
+        // restore from a peer rather than silently serving bad data.
+        match db.check_integrity() {
+            Ok(true)  => info!("redb integrity check passed (clean)"),
+            Ok(false) => warn!("redb integrity check: repaired inconsistency — DB was unclean at last shutdown"),
+            Err(e)    => {
+                // Log but don't abort — a corrupt but partially-readable database
+                // is better than a crash loop. The error is visible in journalctl.
+                warn!("redb integrity check FAILED (possible corruption): {}", e);
+            }
+        }
+
         // Compact on every startup to reclaim dead pages left by previous write
         // sessions. Under heavy MultiPatch load (VM disk patching) each chunk-ID
         // rotation writes a new page and marks the old one free — without compaction
@@ -1106,6 +1122,18 @@ impl MetadataStore {
 
     /// No-op kept for call-site compatibility; compaction is handled by compact_db().
     pub fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Force all pending Durability::None commits to physical disk via a single fdatasync.
+    /// Same trick used by compact_db() — one empty Durability::Immediate commit promotes
+    /// the entire accumulated pending_non_durable_commits list atomically.
+    pub fn flush_durable(&self) -> Result<()> {
+        let mut db = self.db.write().unwrap();
+        let txn = db.begin_write()
+            .map_err(|e| anyhow::anyhow!("flush_durable begin: {}", e))?;
+        txn.commit()
+            .map_err(|e| anyhow::anyhow!("flush_durable commit: {}", e))?;
         Ok(())
     }
 

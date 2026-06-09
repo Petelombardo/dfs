@@ -436,9 +436,9 @@ impl ClusterManager {
     ///
     /// # Algorithm
     ///
-    /// 1. Exclude nodes whose available space is below 10% of their total disk — hard
-    ///    veto for nearly-full nodes.
-    /// 2. Bucket remaining nodes into coarse 10%-wide capacity bands (band 0 = most
+    /// 1. Exclude nodes with less than 20 GB free — hard veto against ENOSPC; banding
+    ///    handles preference among eligible nodes, so this is a last-resort guard only.
+    /// 2. Bucket remaining nodes into 10 equal-width capacity bands (band 0 = most
     ///    available, band 9 = least available).  Nodes within the same band are treated
     ///    as equal for placement purposes.
     /// 3. Use deterministic Fisher-Yates (seeded from the chunk hash) to shuffle
@@ -495,9 +495,13 @@ impl ClusterManager {
         }).collect();
         drop(capacities);
 
-        // Hard veto: skip nodes below 10% free.
+        // Hard veto: skip nodes with less than 20 GB free (absolute, not percentage).
+        // Percentage-based thresholds are wrong for large disks — 10% of 932 GB = 93 GB
+        // reserved, far more than needed to avoid ENOSPC.  20 GB gives ~5 000 × 4 MB chunks
+        // of headroom as a last-resort guard; banding handles preference among eligible nodes.
+        const MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
         let eligible: Vec<(NodeId, u64, u64)> = node_caps.iter()
-            .filter(|(_, avail, total)| *total == 0 || *avail * 10 >= *total)
+            .filter(|(_, avail, total)| *total == 0 || *avail >= MIN_FREE_BYTES)
             .cloned()
             .collect();
 

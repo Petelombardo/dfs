@@ -4534,9 +4534,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             return (nodes[i], nodes[j]);
         }
 
-        // Hard veto: skip nodes below 10% free (mirrors server-side logic).
+        // Hard veto: skip nodes with less than 20 GB free (absolute, not percentage).
+        const MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
         let eligible: Vec<(SocketAddr, u64, u64)> = caps.iter()
-            .filter(|(_, avail, total)| *total == 0 || *avail * 10 >= *total)
+            .filter(|(_, avail, total)| *total == 0 || *avail >= MIN_FREE_BYTES)
             .cloned()
             .collect();
         let candidates = if eligible.len() >= 2 { eligible } else {

@@ -1429,16 +1429,14 @@ impl HealingManager {
         }
 
         // Select target nodes: capacity-aware candidates that don't already hold the chunk.
-        // Prefer nodes with lower NodeId values (the deterministic pair) — this restores
-        // the canonical pair (lowest 2 NodeIds among alive nodes) when under-replicated,
-        // regardless of whether the deficit came from corruption or node failure.
+        // get_nodes_with_capacity_awareness returns nodes in capacity-priority order
+        // (most-available first, seeded by chunk hash for determinism). Do NOT re-sort
+        // by NodeId — that would throw away the capacity ordering and always pick the
+        // lowest-NodeId node regardless of how full it is.
         let alive_ids: HashSet<NodeId> = alive.iter().map(|(id, _)| *id).collect();
-        let mut candidates = cluster
+        let candidates = cluster
             .get_nodes_with_capacity_awareness(chunk_id, replication_factor + needed)
             .await;
-        // Sort by NodeId ascending so the canonical pair nodes (lowest 2 NodeIds among
-        // the alive set) are preferred as heal targets when restoring replication.
-        candidates.sort_unstable();
         let targets: Vec<NodeId> = candidates
             .into_iter()
             .filter(|n| !alive_ids.contains(n))

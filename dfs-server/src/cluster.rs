@@ -412,9 +412,31 @@ impl ClusterManager {
         ring.get_primary_node(chunk_id)
     }
 
-    /// Get nodes for chunk with smart replica set selection
-    /// Picks the replica set with highest minimum capacity to prevent small nodes from bottlenecking
-    /// Works for any replication factor (not hardcoded to triplets)
+    /// Get nodes for chunk with capacity-banded placement.
+    ///
+    /// # Why banded, not sorted
+    ///
+    /// Sorting by exact available bytes makes capacity the total ordering key: a node
+    /// with even 1 byte more space always beats another, so the hash-based distribution
+    /// only fires when capacities are byte-for-byte identical (never in practice).
+    /// Worse, the rotation `(i + seed) % n` only produces CONSECUTIVE pairs in ring
+    /// order — for n=5 RF=2, only 5 of 10 possible pairs are ever selected regardless
+    /// of how uniformly the seed is distributed.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Exclude nodes whose available space is below 10% of their total disk — hard
+    ///    veto for nearly-full nodes.
+    /// 2. Bucket remaining nodes into coarse 10%-wide capacity bands (band 0 = most
+    ///    available, band 9 = least available).  Nodes within the same band are treated
+    ///    as equal for placement purposes.
+    /// 3. Use deterministic Fisher-Yates (seeded from the chunk hash) to shuffle
+    ///    nodes within each band; concatenate bands best-first to form a priority list.
+    /// 4. Take the first `count` nodes.
+    ///
+    /// This lets the hash distribute chunks uniformly across all C(n, count) pairs when
+    /// nodes are similarly loaded, while still steering away from nodes that are
+    /// significantly fuller than their peers.
     pub async fn get_nodes_with_capacity_awareness(
         &self,
         chunk_id: &dfs_common::ChunkId,
@@ -424,14 +446,9 @@ impl ClusterManager {
         let all_nodes: Vec<NodeId> = ring.nodes().to_vec();
         drop(ring);
 
-        // Use first 8 bytes of chunk_id hash as a per-chunk rotation seed.
-        // This ensures that when we take the top 'count' nodes, different chunks
-        // land on different node pairs — distributing write load across the cluster.
         let seed = u64::from_le_bytes(chunk_id.hash[..8].try_into().unwrap_or([0u8; 8]));
 
         if all_nodes.len() <= count {
-            // All nodes are included — but rotate the list so that taking the first
-            // 'immediate_replicas' subset picks a different pair per chunk.
             let n = all_nodes.len();
             let offset = (seed % n as u64) as usize;
             let mut rotated = all_nodes[offset..].to_vec();
@@ -439,69 +456,78 @@ impl ClusterManager {
             return rotated;
         }
 
-        // Get capacity information
         let capacities = self.node_capacities.read().await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        // Build list of (node_id, available_capacity)
-        let mut node_capacities_vec: Vec<(NodeId, u64)> = Vec::new();
-        for node_id in &all_nodes {
-            let available = if let Some(cap) = capacities.get(node_id) {
+        // Build (node_id, available, total) for each node.
+        let node_caps: Vec<(NodeId, u64, u64)> = all_nodes.iter().map(|node_id| {
+            let (available, total) = if let Some(cap) = capacities.get(node_id) {
                 if cap.total > 0 && now - cap.last_updated < 60 {
-                    cap.available
+                    (cap.available, cap.total)
                 } else {
-                    // Stale data, assume moderate capacity
-                    cap.total / 2
+                    (cap.total / 2, cap.total)
                 }
             } else {
-                // No capacity data, assume moderate capacity (1TB)
-                1_000_000_000_000
+                (1_000_000_000_000u64, 2_000_000_000_000u64)
             };
-            node_capacities_vec.push((*node_id, available));
-        }
+            (*node_id, available, total)
+        }).collect();
+        drop(capacities);
 
-        // SMART REPLICA SET SELECTION (Greedy Algorithm with tiebreak by chunk hash):
-        // Sort nodes by available capacity descending and take top 'count' nodes.
-        // When capacities are equal, use the chunk_id hash to break ties differently
-        // per chunk — this distributes chunks evenly across nodes without sacrificing
-        // capacity-awareness.
-        //
-        // Example: RF=2, 3 nodes all equal (100G each)
-        //   chunk hash rotates the starting position → chunks spread across all 3 nodes
-        //
-        // Example: RF=3, nodes (100G, 100G, 100G, 10G)
-        //   capacity sort still excludes the 10G node; hash only breaks ties within
-        //   the top-capacity group → min=100G is still guaranteed
-
-        let n = node_capacities_vec.len() as u64;
-
-        // Assign each node a stable index (by current position), then compute its
-        // rotated rank using the chunk seed.
-        let mut indexed: Vec<(usize, NodeId, u64)> = node_capacities_vec
-            .into_iter()
-            .enumerate()
-            .map(|(i, (id, cap))| (i, id, cap))
+        // Hard veto: skip nodes below 10% free.
+        let eligible: Vec<(NodeId, u64, u64)> = node_caps.iter()
+            .filter(|(_, avail, total)| *total == 0 || *avail * 10 >= *total)
+            .cloned()
             .collect();
 
-        indexed.sort_by_key(|(i, _, cap)| {
-            // Primary: higher capacity is better (sort ascending by negated capacity).
-            // Secondary: rotate node index by seed so equal-capacity nodes appear in
-            //            a different order for each chunk.
-            let rotated_rank = (*i as u64 + seed) % n;
-            // Pack into a u128: high bits = inverse capacity (so more cap = lower key),
-            // low bits = rotated rank.
-            let inv_cap = u64::MAX - cap;
-            (inv_cap as u128) << 64 | rotated_rank as u128
-        });
+        // If the veto left fewer than `count` nodes, fall back to all nodes sorted by
+        // most available — we need to place somewhere even if everything is nearly full.
+        let mut candidates: Vec<(NodeId, u64, u64)> = if eligible.len() >= count {
+            eligible
+        } else {
+            let mut all = node_caps;
+            all.sort_by(|a, b| b.1.cmp(&a.1));
+            all
+        };
 
-        indexed
-            .into_iter()
-            .take(count)
-            .map(|(_, node_id, _)| node_id)
-            .collect()
+        // Compute capacity bands: 10 equal-width buckets spanning [min_avail, max_avail].
+        // Nodes in band 0 are the most available, band 9 the least.
+        let max_avail = candidates.iter().map(|(_, a, _)| *a).max().unwrap_or(1).max(1);
+        let min_avail = candidates.iter().map(|(_, a, _)| *a).min().unwrap_or(0);
+        let band_width = (max_avail - min_avail) / 10 + 1;
+
+        // Group nodes by band (0 = best).
+        let mut bands: Vec<Vec<NodeId>> = vec![Vec::new(); 10];
+        for (node_id, avail, _) in &candidates {
+            let band = (max_avail - avail) / band_width;
+            bands[band.min(9) as usize].push(*node_id);
+        }
+
+        // Deterministic Fisher-Yates shuffle within each band using the chunk seed.
+        // A different multiplier per band so adjacent bands don't correlate.
+        let mut result: Vec<NodeId> = Vec::with_capacity(count);
+        for (band_idx, band) in bands.iter_mut().enumerate() {
+            if band.is_empty() { continue; }
+            let band_seed = seed.wrapping_add(band_idx as u64 * 0x9e3779b97f4a7c15);
+            // Knuth shuffle: for i from len-1 down to 1, swap i with j = hash(i,seed)%i+1
+            let n = band.len();
+            for i in (1..n).rev() {
+                let mix = band_seed.wrapping_mul(i as u64 + 1).wrapping_add(0x517cc1b727220a95);
+                let j = (mix >> 33) as usize % (i + 1);
+                band.swap(i, j);
+            }
+            for node_id in band.iter() {
+                result.push(*node_id);
+                if result.len() == count { return result; }
+            }
+        }
+
+        // Fallback: shouldn't be reached if candidates.len() >= count.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.into_iter().take(count).map(|(id, _, _)| id).collect()
     }
 
     /// From a given set of node IDs, return the one with the least available space

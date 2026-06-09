@@ -214,11 +214,14 @@ impl HealingManager {
                 was_leader = is_leader;
             }
 
-            // Disk orphan sweep: runs on EVERY node every 5 cycles (5 minutes).
-            // Must run on followers too — they accumulate orphaned files when they miss
-            // DeleteChunk RPCs while offline. Intentionally before the is_leader gate.
+            // Disk orphan sweep: runs on EVERY node every 2 cycles (2 minutes).
+            // First fire is at the 2-minute mark (120s startup grace from the 60s
+            // per-cycle sleep × 2 cycles).  Must run on followers too — they accumulate
+            // orphaned files when they miss DeleteChunk RPCs while offline, and also when
+            // patch operations re-place a chunk on different nodes without the old node
+            // receiving a DeleteChunk.  Intentionally before the is_leader gate.
             disk_sweep_counter += 1;
-            if disk_sweep_counter >= 5 {
+            if disk_sweep_counter >= 2 {
                 disk_sweep_counter = 0;
                 self.run_disk_orphan_sweep().await;
             }
@@ -365,6 +368,7 @@ impl HealingManager {
 
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
+        let local_node_id = self.cluster.local_node_id();
 
         let result = tokio::task::spawn_blocking(move || {
             let chunks = storage.list_chunks()?;
@@ -378,29 +382,41 @@ impl HealingManager {
             let mut too_recent = 0usize;
 
             for chunk_id in &chunks {
-                match metadata.get_chunk_location(chunk_id) {
-                    Ok(Some(_)) => { kept += 1; } // In routing table — keep
-                    Ok(None) => {
-                        // Not in routing table — orphaned file. Apply grace period
-                        // so we don't delete chunks that were just written.
-                        let age_secs = storage.get_chunk_mtime(chunk_id)
-                            .map(|mtime| now_secs.saturating_sub(mtime))
-                            .unwrap_or(u64::MAX);
-
-                        if age_secs > GRACE_PERIOD_SECS {
-                            if let Err(e) = storage.delete_chunk(chunk_id) {
-                                debug!("Disk orphan sweep: failed to delete {}: {}", chunk_id, e);
-                            } else {
-                                debug!("Disk orphan sweep: deleted local orphan {}", chunk_id);
-                                deleted += 1;
-                            }
-                        } else {
-                            too_recent += 1;
-                        }
-                    }
+                // Determine whether this local file is still our responsibility.
+                // The routing table is cluster-wide, so Ok(Some(loc)) only means
+                // the chunk exists somewhere — we must also verify this node is
+                // still listed.  A stale local copy where loc.nodes = [other, nodes]
+                // is an orphan that DeleteChunk RPCs should have cleaned up but didn't.
+                let is_ours = match metadata.get_chunk_location(chunk_id) {
+                    Ok(Some(loc)) => loc.nodes.contains(&local_node_id),
+                    Ok(None) => false,
                     Err(e) => {
                         debug!("Disk orphan sweep: routing table error for {}: {}", chunk_id, e);
+                        continue;
                     }
+                };
+
+                if is_ours {
+                    kept += 1;
+                    continue;
+                }
+
+                // Not our chunk (missing entry or our node not listed).
+                // Apply grace period so we don't race with in-flight writes that
+                // haven't had their routing entry committed yet.
+                let age_secs = storage.get_chunk_mtime(chunk_id)
+                    .map(|mtime| now_secs.saturating_sub(mtime))
+                    .unwrap_or(u64::MAX);
+
+                if age_secs > GRACE_PERIOD_SECS {
+                    if let Err(e) = storage.delete_chunk(chunk_id) {
+                        debug!("Disk orphan sweep: failed to delete {}: {}", chunk_id, e);
+                    } else {
+                        debug!("Disk orphan sweep: deleted local orphan {}", chunk_id);
+                        deleted += 1;
+                    }
+                } else {
+                    too_recent += 1;
                 }
             }
 
@@ -410,7 +426,7 @@ impl HealingManager {
         match result {
             Ok(Ok((deleted, kept, too_recent, total))) => {
                 if deleted > 0 || too_recent > 0 {
-                    info!("Disk orphan sweep: {} local chunks checked — {} orphans deleted, {} kept (in routing table), {} too recent",
+                    info!("Disk orphan sweep: {} local chunks checked — {} orphans deleted, {} kept (legitimately ours), {} too recent",
                           total, deleted, kept, too_recent);
                 } else {
                     debug!("Disk orphan sweep: {} chunks checked, all accounted for", total);

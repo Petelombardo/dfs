@@ -204,7 +204,18 @@ impl ClusterManager {
     /// Get all nodes in the cluster
     pub async fn get_all_nodes(&self) -> Vec<NodeInfo> {
         let nodes = self.nodes.read().await;
-        nodes.values().cloned().collect()
+        let capacities = self.node_capacities.read().await;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        nodes.values().map(|n| {
+            let mut info = n.clone();
+            if let Some(cap) = capacities.get(&n.id) {
+                if cap.total > 0 && now.saturating_sub(cap.last_updated) < 120 {
+                    info.available_bytes = cap.available;
+                    info.total_bytes = cap.total;
+                }
+            }
+            info
+        }).collect()
     }
 
     /// Returns true if this node is the current cluster leader.

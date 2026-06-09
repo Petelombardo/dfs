@@ -66,6 +66,14 @@ pub struct NodeInfo {
     /// Why this node is leaving (None if not leaving).
     #[serde(default)]
     pub leave_reason: Option<LeaveReason>,
+
+    /// Available disk bytes on this node (0 = unknown). Populated by ClusterStatus responses.
+    #[serde(default)]
+    pub available_bytes: u64,
+
+    /// Total disk bytes on this node (0 = unknown). Populated by ClusterStatus responses.
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 impl NodeInfo {
@@ -78,6 +86,8 @@ impl NodeInfo {
             last_heartbeat: current_timestamp(),
             leaving_at: 0,
             leave_reason: None,
+            available_bytes: 0,
+            total_bytes: 0,
         }
     }
 

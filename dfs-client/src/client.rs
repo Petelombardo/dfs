@@ -560,6 +560,11 @@ pub struct DfsClient {
     /// Updated during refresh_cluster_nodes(). Falls back to any node if unknown.
     leader_addr: Arc<RwLock<Option<SocketAddr>>>,
 
+    /// Per-node capacity (available_bytes, total_bytes), keyed by SocketAddr.
+    /// Updated during refresh_cluster_nodes() from NodeInfo fields.
+    /// Used for capacity-banded write placement (same algorithm as server-side).
+    node_capacities: Arc<DashMap<SocketAddr, (u64, u64)>>,
+
     /// Global semaphore capping total concurrent chunk fetches across ALL simultaneous
     /// read_data calls. Without this, a seek causes N parallel FUSE reads each spawning
     /// their own 20-slot semaphore, producing N*20 simultaneous connections and
@@ -743,6 +748,7 @@ impl DfsClient {
             addr_to_node_id: Arc::new(RwLock::new(HashMap::new())),
             warm_cache_map: Arc::new(Mutex::new(warm_cache_map)),
 leader_addr: Arc::new(RwLock::new(None)),
+            node_capacities: Arc::new(DashMap::new()),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             node_inflight: Arc::new(DashMap::new()),
             chunk_landed: Arc::new(Notify::new()),
@@ -4501,6 +4507,72 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
+    /// Select two write-replica nodes from `nodes` using capacity-banded Fisher-Yates.
+    /// Nodes are bucketed into 10 equal-width bands by available disk space (band 0 = most free).
+    /// Within each band, nodes are shuffled deterministically by `seed`.  The first two nodes
+    /// from the resulting priority list are returned as (preferred1, preferred2).
+    ///
+    /// Falls back to consecutive-pair rotation when capacity data is unavailable for all nodes.
+    fn select_write_pair(&self, nodes: &[SocketAddr], seed: u64) -> (SocketAddr, SocketAddr) {
+        if nodes.len() < 2 {
+            return (nodes[0], nodes[0]);
+        }
+
+        // Build (addr, available, total) for each node from cached capacity data.
+        let caps: Vec<(SocketAddr, u64, u64)> = nodes.iter().map(|&addr| {
+            let (avail, total) = self.node_capacities.get(&addr)
+                .map(|e| *e)
+                .unwrap_or((0u64, 0u64));
+            (addr, avail, total)
+        }).collect();
+
+        // If no capacity data yet, fall back to seeded rotation across all pairs.
+        let has_capacity = caps.iter().any(|(_, _, total)| *total > 0);
+        if !has_capacity {
+            let i = (seed as usize) % nodes.len();
+            let j = (i + 1) % nodes.len();
+            return (nodes[i], nodes[j]);
+        }
+
+        // Hard veto: skip nodes below 10% free (mirrors server-side logic).
+        let eligible: Vec<(SocketAddr, u64, u64)> = caps.iter()
+            .filter(|(_, avail, total)| *total == 0 || *avail * 10 >= *total)
+            .cloned()
+            .collect();
+        let candidates = if eligible.len() >= 2 { eligible } else {
+            let mut all = caps.clone();
+            all.sort_by(|a, b| b.1.cmp(&a.1));
+            all
+        };
+
+        let max_avail = candidates.iter().map(|(_, a, _)| *a).max().unwrap_or(1).max(1);
+        let min_avail = candidates.iter().map(|(_, a, _)| *a).min().unwrap_or(0);
+        let band_width = (max_avail - min_avail) / 10 + 1;
+
+        let mut bands: Vec<Vec<SocketAddr>> = vec![Vec::new(); 10];
+        for (addr, avail, _) in &candidates {
+            let band = ((max_avail - avail) / band_width).min(9) as usize;
+            bands[band].push(*addr);
+        }
+
+        // Fisher-Yates shuffle within each band, then concatenate best-first.
+        let mut priority: Vec<SocketAddr> = Vec::with_capacity(candidates.len());
+        for (band_idx, band) in bands.iter_mut().enumerate() {
+            if band.is_empty() { continue; }
+            let band_seed = seed.wrapping_add(band_idx as u64 * 0x9e3779b97f4a7c15);
+            let n = band.len();
+            for i in (1..n).rev() {
+                let mix = band_seed.wrapping_mul(i as u64 + 1).wrapping_add(0x517cc1b727220a95);
+                let j = (mix >> 33) as usize % (i + 1);
+                band.swap(i, j);
+            }
+            priority.extend_from_slice(band);
+            if priority.len() >= 2 { break; }
+        }
+
+        (priority[0], priority[1])
+    }
+
     /// Write data with synchronous dual-replica replication
     /// NEW: Writes each chunk to 2 nodes synchronously (not striped)
     /// Returns chunk_locations with replica tracking
@@ -4510,11 +4582,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
         }
 
-        // Rotate the preferred pair by chunk index so each 4MB chunk lands on a different
-        // node pair. Without this, all chunks of a file go to nodes[0]+nodes[1].
+        // Capacity-banded placement: prefer nodes with more available disk space, using
+        // the same banded Fisher-Yates algorithm as the server's get_nodes_with_capacity_awareness.
+        // Seed from chunk offset so different chunks of the same file land on different pairs.
         let chunk_idx = (file_offset / (4 * 1024 * 1024)) as usize;
-        let preferred1 = nodes[chunk_idx % nodes.len()];
-        let preferred2 = nodes[(chunk_idx + 1) % nodes.len()];
+        let seed = chunk_idx as u64 ^ (inode.wrapping_mul(0x9e3779b97f4a7c15));
+        let (preferred1, preferred2) = self.select_write_pair(&nodes, seed);
 
         info!("Writing {} bytes with synchronous dual-replica (preferred: {}, {})",
               data.len(), preferred1, preferred2);
@@ -6272,6 +6345,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                             for node in &cluster_nodes {
                                 if node.status == dfs_common::NodeStatus::Online {
                                     mapping.insert(node.addr, node.id);
+                                    if node.total_bytes > 0 {
+                                        self.node_capacities.insert(node.addr, (node.available_bytes, node.total_bytes));
+                                    }
                                 }
                             }
                         }

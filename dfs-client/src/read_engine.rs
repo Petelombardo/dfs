@@ -337,7 +337,13 @@ impl InodeReadEngine {
             if la_idx >= chunk_map_len {
                 break;
             }
-            let la_cid = chunk_map[la_idx].chunk_id;
+            let loc = &chunk_map[la_idx];
+            // Sparse-hole placeholder (chunk never written) — nothing to prefetch,
+            // and no real node holds this all-zero chunk_id.
+            if loc.nodes.is_empty() {
+                continue;
+            }
+            let la_cid = loc.chunk_id;
             if !self.in_flight.contains(&la_cid) {
                 result.push((la_idx, la_cid));
             }

@@ -1819,6 +1819,107 @@ T28_EIO=${T28_EIO:-0}
 rm -f "$T28_FILE" "$T/t28_orig.bin" "$T/t28_expected.bin" "$T/t28_patch.bin"
 fi # should_run T28
 
+# ── Test 29: sparse-file interior-gap prefetch (nil-chunk lookahead/swarm regression) ──
+#
+# Reproduces the "Chunk 0000...0000 not found on this node" log burst seen on
+# staging during sequential reads of sparse VM disk images (grub-install on
+# VM108, kdiskmark on VM100). The chunk map for a sparse file pads unwritten
+# chunk indices with a nil placeholder (chunk_id = all-zero hash, nodes = []).
+# pipeline_lookahead and the swarm/chain-reaction prefetch used to index into
+# these placeholders directly and try to fetch the all-zero chunk_id from
+# every cluster node, flooding the log with "not found on this node" for a
+# chunk that can never exist anywhere.
+#
+# Layout: 24MB file (6 x 4MB chunks). Chunks 0,1,2 and 5 are written;
+# chunks 3,4 are an interior gap (never written). A cold-cache sequential
+# read across chunks 0->5 should:
+#   - return correct data (gap reads as zeros)
+#   - NOT emit any "Chunk 000...000 not found on this node" log lines
+if should_run T29; then
+snapshot_log T29
+echo ""
+echo "=== T29: sparse-file interior-gap prefetch (nil-chunk lookahead/swarm regression) ==="
+
+T29_FILE="$MOUNT/t29_sparse.bin"
+
+echo "  Writing 24MB sparse file: chunks 0-2 and 5 written, chunks 3-4 left as a gap..."
+python3 - "$T29_FILE" "$T/t29_expected.bin" << 'PYEOF'
+import os, sys
+dfs_path, expected_path = sys.argv[1], sys.argv[2]
+CHUNK = 4 * 1024 * 1024
+
+# Expected full-file contents: pattern byte = (offset // 4096) & 0xff for
+# written chunks (0,1,2,5); zeros for the gap chunks (3,4).
+expected = bytearray()
+for chunk_idx in range(6):
+    if chunk_idx in (3, 4):
+        expected += bytes(CHUNK)
+    else:
+        for b in range(0, CHUNK, 4096):
+            off = chunk_idx * CHUNK + b
+            expected += bytes([(off // 4096) & 0xff]) * 4096
+open(expected_path, 'wb').write(expected)
+
+# Write chunks 0-2 (first 12MB), then seek past the gap and write chunk 5.
+# Chunks 3-4 (offsets 12MB-20MB) are never written -> interior sparse hole.
+fd = os.open(dfs_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fd, bytes(expected[0:3*CHUNK]))
+os.lseek(fd, 5 * CHUNK, os.SEEK_SET)
+os.write(fd, bytes(expected[5*CHUNK:6*CHUNK]))
+os.close(fd)
+PYEOF
+dfs_sync
+
+# Remount for cold cache — forces a fresh chunk map fetch with nil placeholders
+# for the gap, and resets pipeline_head/in_flight so prefetch fires from scratch.
+fusermount -u "$MOUNT" 2>/dev/null || true
+sleep 0.3
+kill $CLIENT_PID2 2>/dev/null || true
+sleep 1
+T29_CLIENT_LOG="$LOG/client_t29.log"
+: > "$T29_CLIENT_LOG"
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$T29_CLIENT_LOG" --allow-other --log-level debug &
+CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$T29_CLIENT_LOG"
+sleep 2
+mountpoint -q "$MOUNT" || { check "T29 remount" FAIL; }
+
+# Sequential read of the full 24MB file in 4KB blocks (matches T24's pattern,
+# which exercises the full-chunk pipeline/swarm prefetch path).
+echo "  Reading 24MB sequentially across the gap..."
+T29_ERRORS=$(python3 -c "
+size = 6 * 4 * 1024 * 1024
+block = 4096
+errors = 0
+expected = open('$T/t29_expected.bin', 'rb').read()
+with open('$T29_FILE', 'rb') as f:
+    for i in range(size // block):
+        data = f.read(block)
+        exp = expected[i*block:(i+1)*block]
+        if data != exp:
+            errors += 1
+print(errors)
+")
+[ "$T29_ERRORS" -eq 0 ] \
+    && check "T29a sparse read across interior gap correct (gap=zeros)" PASS \
+    || check "T29a sparse read across interior gap errors=$T29_ERRORS" FAIL
+
+# Allow background lookahead/swarm/chain-reaction tasks to finish and log their results.
+sleep 1
+
+# The all-zero ChunkId — must NEVER be looked up, since it represents an
+# unwritten sparse-hole placeholder, not a real chunk on any node.
+T29_NIL_HASH=$(printf '0%.0s' $(seq 1 64))
+T29_NIL_LINES=$(grep -c "$T29_NIL_HASH" "$T29_CLIENT_LOG" 2>/dev/null || true)
+T29_NIL_LINES=${T29_NIL_LINES:-0}
+[ "$T29_NIL_LINES" -eq 0 ] \
+    && check "T29b no nil-chunk (all-zero hash) lookups for sparse holes" PASS \
+    || check "T29b nil-chunk lookups for sparse holes ($T29_NIL_LINES lines) — pipeline_lookahead/swarm regression" FAIL
+
+rm -f "$T29_FILE" "$T/t29_expected.bin"
+fi # should_run T29
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

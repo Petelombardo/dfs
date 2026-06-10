@@ -2523,9 +2523,11 @@ leader_addr: Arc::new(RwLock::new(None)),
 
             if is_sequential && last_fetched_idx > 0 && last_fetched_idx + 1 < chunk_map.len() {
                 // Spawn staggered fetches for next 2 chunks
+                // Skip sparse-hole placeholders (nodes.is_empty()) — there's no real
+                // chunk to prefetch and no node holds the all-zero chunk_id.
                 let swarm_indices = vec![last_fetched_idx + 1]
                     .into_iter()
-                    .filter(|&idx| idx < chunk_map.len())
+                    .filter(|&idx| idx < chunk_map.len() && !chunk_map[idx].nodes.is_empty())
                     .collect::<Vec<_>>();
 
                 for (swarm_offset, swarm_idx) in swarm_indices.iter().enumerate() {
@@ -2586,7 +2588,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     if next_idx < pipeline_pos + MAX_AHEAD {
                                         if let Some(e) = client.read_engines.get(eng.inode) {
                                             let (cm, _co, nim) = e.snapshot();
-                                            if next_idx < cm.len() {
+                                            // Skip sparse-hole placeholders — no real chunk/node to chase.
+                                            if next_idx < cm.len() && !cm[next_idx].nodes.is_empty() {
                                                 let next_cid = cm[next_idx].chunk_id;
                                                 if client.chunk_cache.get(&next_cid).is_none() {
                                                     let chain_nodes = client.cluster_nodes.read().await.clone();

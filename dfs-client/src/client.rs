@@ -5455,22 +5455,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok((new_loc, fresh_meta))
     }
 
-    /// Fire-and-forget delete of a specific chunk from one node.
-    /// Used by flush_all_pipelined to clean up the skipped 3rd replica after metadata commit.
-    pub async fn delete_chunk_from_node(&self, addr: SocketAddr, chunk_id: ChunkId) {
-        let req = Request::DeleteChunk { chunk_id };
-        if let Err(e) = self.send_request(addr, req).await {
-            debug!("delete_chunk_from_node: {} chunk {} failed (healer will clean up): {}", addr, chunk_id, e);
-        }
-    }
-
-    pub async fn tombstone_chunk_on_node(&self, addr: SocketAddr, chunk_id: ChunkId) {
-        let req = Request::TombstoneChunk { chunk_id };
-        if let Err(e) = self.send_request(addr, req).await {
-            warn!("tombstone_chunk_on_node: {} chunk {} failed — healer may revert patch: {}", addr, chunk_id, e);
-        }
-    }
-
     /// Apply multiple non-contiguous byte-range patches to a chunk in a single RPC.
     /// Equivalent to patch_chunk_on_replicas but sends all dirty ranges in one request,
     /// so the server applies them atomically without serial round-trips or gap zero-fills.

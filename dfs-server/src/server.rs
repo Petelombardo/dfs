@@ -357,8 +357,17 @@ impl Server {
                 metadata.chunk_locations.clone()
             };
             self.chunk_map.insert(metadata.id, (new_locs, metadata.modified_at));
+        } else if self.chunk_map.contains_key(&metadata.id) {
+            // Empty chunk_locations on a file that already has a chunk_map entry means
+            // truncate-to-zero. Reset the entry instead of leaving it untouched —
+            // otherwise the stale pre-truncate chunks would linger in chunk_map and
+            // get resurrected by handle_put_file_metadata's chunk_map union (below)
+            // on the next write to this file.
+            self.chunk_map.insert(metadata.id, (vec![], metadata.modified_at));
         }
-        // If the file has no chunks yet (new empty file), no map entry is needed.
+        // If the file has no chunks yet (new empty file) and no map entry exists,
+        // no map entry is needed — chunk_map_update_location_for_file will create
+        // one lazily on the first ReplicateChunkLocation.
     }
 
     /// Update a single chunk location within the chunk map (used during healing).
@@ -3634,6 +3643,25 @@ impl Server {
                         }
                     }
                 }
+                // Union: chunk_map grows incrementally as each chunk's RCL lands
+                // (chunk_map_update_location_for_file), but concurrent per-chunk
+                // flushes for the same file race to send their own non-cumulative
+                // chunk_locations snapshot — a later write_seq can easily carry
+                // FEWER entries than an earlier one. Append any chunk_map entry
+                // whose file_offset isn't already in the incoming list, so the
+                // persisted chunk_locations never regresses below what RCL has
+                // already confirmed. Skip when the incoming list is empty — that's
+                // an intentional truncate-to-zero, not an incomplete snapshot.
+                if !m.chunk_locations.is_empty() {
+                    for map_loc in map_locs.iter() {
+                        if let Some(file_offset) = map_loc.file_offset {
+                            if !m.chunk_locations.iter().any(|l| l.file_offset == Some(file_offset)) {
+                                m.chunk_locations.push(map_loc.clone());
+                            }
+                        }
+                    }
+                    m.chunk_locations.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+                }
             }
             m
         };
@@ -4173,9 +4201,6 @@ impl Server {
         intra_offset: usize,
         patch_data: Vec<u8>,
     ) -> Response {
-        use std::fs;
-        use std::io::{Read, Seek, SeekFrom, Write};
-
         // Validate chunk_id against local chunk map when file_id + chunk_idx are provided.
         // If our record for (file_id, chunk_idx) differs, the client has a stale view —
         // return ChunkStale so the client can retry with the correct chunk_id.
@@ -4206,46 +4231,31 @@ impl Server {
 
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
-            use std::io::{Read, Seek, SeekFrom, Write};
 
             if !old_path.exists() {
                 return Err(("Chunk not found".to_string(), ErrorCode::NotFound));
             }
 
-            let patch_end = (intra_offset + patch_data.len()) as u64;
-            let write_result: Result<u64, anyhow::Error> = (|| {
-                let mut f = fs::OpenOptions::new().write(true).open(&old_path)?;
-                let current_len = f.metadata()?.len();
-                if patch_end > current_len {
-                    f.set_len(patch_end)?;
-                }
-                f.seek(SeekFrom::Start(intra_offset as u64))?;
-                f.write_all(&patch_data)?;
-                f.sync_data()?;
-                Ok(patch_end.max(current_len))
-            })();
+            // Read the base chunk into memory and apply the patch there — never
+            // mutate old_path in place. See handle_multi_patch for why: chunk_id is
+            // content-addressed, so the same chunk_id can be the current base for
+            // multiple (file, chunk_idx) slots at once.
+            let mut buf = fs::read(&old_path)
+                .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?;
 
-            let final_size = match write_result {
-                Ok(s) => s as usize,
-                Err(e) => return Err((format!("Failed to write patch: {}", e), ErrorCode::InternalError)),
-            };
+            let patch_end = intra_offset + patch_data.len();
+            if patch_end > buf.len() {
+                buf.resize(patch_end, 0);
+            }
+            buf[intra_offset..patch_end].copy_from_slice(&patch_data);
 
-            let new_hash: Result<[u8; 32], anyhow::Error> = (|| {
-                let mut f = fs::File::open(&old_path)?;
+            let final_size = buf.len();
+
+            let new_chunk_id = {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(&chunk_file_offset.to_le_bytes());
-                let mut buf = [0u8; 65536];
-                loop {
-                    let n = f.read(&mut buf)?;
-                    if n == 0 { break; }
-                    hasher.update(&buf[..n]);
-                }
-                Ok(*hasher.finalize().as_bytes())
-            })();
-
-            let new_chunk_id = match new_hash {
-                Ok(h) => ChunkId::from_hash(h),
-                Err(e) => return Err((format!("Failed to hash patched chunk: {}", e), ErrorCode::InternalError)),
+                hasher.update(&buf);
+                ChunkId::from_hash(*hasher.finalize().as_bytes())
             };
 
             if new_chunk_id != chunk_id {
@@ -4255,7 +4265,21 @@ impl Server {
                         return Err((format!("Failed to create chunk directory: {}", e), ErrorCode::InternalError));
                     }
                 }
-                // Same pre-registration as handle_multi_patch — see comment there.
+                if !new_path.exists() {
+                    let tmp_path = new_path.with_extension(format!("tmp.{}.{:?}",
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+                        std::thread::current().id()));
+                    fs::write(&tmp_path, &buf)
+                        .map_err(|e| (format!("Failed to write patched chunk: {}", e), ErrorCode::InternalError))?;
+                    fs::File::open(&tmp_path)
+                        .and_then(|f| f.sync_data())
+                        .map_err(|e| (format!("Failed to sync patched chunk: {}", e), ErrorCode::InternalError))?;
+                    fs::rename(&tmp_path, &new_path)
+                        .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
+                }
+                // Same as handle_multi_patch: pre-register new_chunk_id, and
+                // deliberately leave the old chunk_id's routing entry & on-disk file
+                // alone for the deep orphan-purge sweep — see comment there.
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -4274,16 +4298,6 @@ impl Server {
                         warn!("PatchChunk: failed to pre-register {} in sled: {}", new_chunk_id, e);
                     }
                 }
-                if let Err(e) = fs::rename(&old_path, &new_path) {
-                    return Err((format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError));
-                }
-                if let Err(e) = metadata.delete_chunk_location(&chunk_id) {
-                    warn!("PatchChunk: failed to remove old sled entry {}: {}", chunk_id, e);
-                }
-            }
-
-            storage.invalidate_cache(&chunk_id);
-            if new_chunk_id != chunk_id {
                 storage.invalidate_cache(&new_chunk_id);
             }
 
@@ -4336,14 +4350,13 @@ impl Server {
         _expected_new_chunk_id: Option<dfs_common::ChunkId>,
         client_write_seq: Option<u64>,
     ) -> Response {
-        use std::fs;
-        use std::io::{Read, Seek, SeekFrom, Write};
-
-        // Serialize all patches to the same (file_id, chunk_idx). This prevents the race
-        // where patch2 (B→C) passes the stale check and enters spawn_blocking while patch1
-        // (A→B) is still renaming file A to B — causing patch2 to fail with "file not found".
-        // Without this lock, even the chunk_map pre-update below can't prevent patch2 from
-        // racing ahead into the I/O before patch1 finishes the rename.
+        // Serialize all patches to the same (file_id, chunk_idx). Without this lock,
+        // two concurrent patches against the same base (e.g. duplicate flush retries)
+        // could both succeed independently and then race on the final chunk_map
+        // update below, leaving (file_id, chunk_idx) pointing at whichever patch's
+        // result lost the race — even though the OTHER patch's RPC response (and any
+        // ReplicateChunkLocation derived from it) already told the client/leader
+        // about its own new_chunk_id.
         let _chunk_patch_guard = if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
             let lock = self.chunk_patch_locks
                 .entry((fid, cidx))
@@ -4395,7 +4408,6 @@ impl Server {
 
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
-            use std::io::{Read, Seek, SeekFrom, Write};
 
             // If the chunk file doesn't exist on disk, refuse the patch.
             // A ghost chunk_map entry (chunk_id in metadata but no file on disk)
@@ -4407,50 +4419,40 @@ impl Server {
                 return Err((format!("Failed to read chunk range: Failed to open chunk file: {:?}", old_path), ErrorCode::NotFound));
             }
 
-            let mut f = fs::OpenOptions::new().read(false).write(true).open(&old_path)
-                .map_err(|e| (format!("Failed to open chunk: {}", e), ErrorCode::InternalError))?;
+            // Read the base chunk into memory and apply patches there — never mutate
+            // old_path in place. chunk_id is content-addressed (blake3(offset||data)),
+            // so the SAME chunk_id can be the "current" base for multiple (file,
+            // chunk_idx) slots at once whenever their content+offset match (e.g.
+            // duplicate files). Renaming/deleting the shared base out from under a
+            // concurrent patch for another file made that file's MultiPatch fail with
+            // "chunk data missing on this node", falling back to a fresh write of only
+            // the dirty range and corrupting the un-patched bytes. Chunks are capped
+            // at 4MB, so reading the whole base into memory is cheap.
+            let mut buf = fs::read(&old_path)
+                .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?;
 
-            let current_len = f.metadata()
-                .map_err(|e| (format!("Failed to stat chunk: {}", e), ErrorCode::InternalError))?.len();
             let needed_len = patches.iter()
-                .map(|(off, d)| (off + d.len()) as u64)
+                .map(|(off, d)| off + d.len())
                 .max()
                 .unwrap_or(0)
-                .max(current_len);
-
-            if needed_len > current_len {
-                f.set_len(needed_len)
-                    .map_err(|e| (format!("Failed to extend chunk: {}", e), ErrorCode::InternalError))?;
-            }
+                .max(buf.len());
+            buf.resize(needed_len, 0);
 
             for (intra_offset, patch_data) in &patches {
-                f.seek(SeekFrom::Start(*intra_offset as u64))
-                    .map_err(|e| (format!("Failed to seek: {}", e), ErrorCode::InternalError))?;
-                f.write_all(patch_data)
-                    .map_err(|e| (format!("Failed to write patch: {}", e), ErrorCode::InternalError))?;
+                buf[*intra_offset..*intra_offset + patch_data.len()].copy_from_slice(patch_data);
             }
 
-            f.sync_data()
-                .map_err(|e| (format!("Failed to sync chunk: {}", e), ErrorCode::InternalError))?;
+            let final_size = buf.len();
 
-            let final_size = needed_len as usize;
-
-            // Always compute the actual hash from disk so the leader and client get
-            // ground truth. Trusting the client's pre-computed expected hash is wrong:
-            // if the server's on-disk base differed (stale client cache, healer update)
-            // the file would be named with the wrong hash, silently corrupting the chunk.
+            // Always compute the actual hash from the patched buffer so the leader
+            // and client get ground truth. Trusting the client's pre-computed expected
+            // hash is wrong: if the server's on-disk base differed (stale client
+            // cache, healer update) the file would be named with the wrong hash,
+            // silently corrupting the chunk.
             let new_chunk_id = {
-                let mut f2 = fs::File::open(&old_path)
-                    .map_err(|e| (format!("Failed to open chunk for hashing: {}", e), ErrorCode::InternalError))?;
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(&chunk_file_offset.to_le_bytes());
-                let mut buf = [0u8; 65536];
-                loop {
-                    let n = f2.read(&mut buf)
-                        .map_err(|e| (format!("Failed to hash patched chunk: {}", e), ErrorCode::InternalError))?;
-                    if n == 0 { break; }
-                    hasher.update(&buf[..n]);
-                }
+                hasher.update(&buf);
                 ChunkId::from_hash(*hasher.finalize().as_bytes())
             };
 
@@ -4460,13 +4462,25 @@ impl Server {
                     fs::create_dir_all(parent)
                         .map_err(|e| (format!("Failed to create chunk directory: {}", e), ErrorCode::InternalError))?;
                 }
-                // Register new_chunk_id in sled BEFORE the rename. Linux rename(2)
-                // preserves the source file's mtime on the destination, so the renamed
-                // file may appear older than the orphan-sweep grace period (300 s).
-                // If sled isn't updated until after the rename, the sweep can see the
-                // new file as an orphan and delete it — causing permanent data loss.
-                // Order: put_new → rename → delete_old ensures no window where a live
-                // chunk file is absent from the routing table.
+                if !new_path.exists() {
+                    let tmp_path = new_path.with_extension(format!("tmp.{}.{:?}",
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+                        std::thread::current().id()));
+                    fs::write(&tmp_path, &buf)
+                        .map_err(|e| (format!("Failed to write patched chunk: {}", e), ErrorCode::InternalError))?;
+                    fs::File::open(&tmp_path)
+                        .and_then(|f| f.sync_data())
+                        .map_err(|e| (format!("Failed to sync patched chunk: {}", e), ErrorCode::InternalError))?;
+                    fs::rename(&tmp_path, &new_path)
+                        .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
+                }
+                // Register new_chunk_id in sled, reusing the old location's node list.
+                // The OLD chunk_id's routing entry and on-disk file are deliberately
+                // left in place — they may still be the current base for ANOTHER
+                // (file, chunk_idx) slot with identical content+offset. The deep
+                // orphan-purge sweep reclaims them once live_chunk_ids() (scanned from
+                // file metadata) no longer references the old chunk_id, after its
+                // grace period.
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -4485,15 +4499,6 @@ impl Server {
                         warn!("MultiPatch: failed to pre-register {} in sled: {}", new_chunk_id, e);
                     }
                 }
-                fs::rename(&old_path, &new_path)
-                    .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
-                if let Err(e) = metadata.delete_chunk_location(&chunk_id) {
-                    warn!("MultiPatch: failed to remove old sled entry {}: {}", chunk_id, e);
-                }
-            }
-
-            storage.invalidate_cache(&chunk_id);
-            if new_chunk_id != chunk_id {
                 storage.invalidate_cache(&new_chunk_id);
             }
 

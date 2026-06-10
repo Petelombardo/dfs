@@ -490,14 +490,9 @@ struct FlushHandle {
     /// out-of-order patches on the server (T22b / qcow2 header corruption).
     flush_pipeline_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     /// When true, MultiPatch writes to only 2 replicas (leader-preferred, deterministic).
-    /// flush_all_pipelined enables this for fsync/release flushes so deferred chunk
-    /// cleanup fires after metadata commits. Background ticker leaves this false.
+    /// flush_all_pipelined enables this for fsync/release flushes. Background ticker
+    /// leaves this false.
     use_dual_rf: bool,
-    /// Old chunk_ids replaced by patches this flush cycle. Drained by flush_all_pipelined
-    /// AFTER flush_metadata_sync: broadcasts TombstoneChunk+DeleteChunk to every cluster
-    /// node so orphaned old chunks are removed from all replicas and routing tables —
-    /// not just the dual-RF skip node — preventing healer copies from accumulating.
-    pending_old_chunks: Arc<tokio::sync::Mutex<Vec<dfs_common::ChunkId>>>,
     /// Per-inode count of active write-mode open file descriptors. Used by
     /// flush_all_pipelined to skip flush_metadata_sync when a writer still has
     /// the file open — metadata_cache may only partially reflect the current
@@ -1669,7 +1664,7 @@ impl FlushHandle {
                             self.use_dual_rf,
                         ).await
                     };
-                    let (mut new_location, skip_pairs) = match patch_result {
+                    let (mut new_location, _skip_pairs) = match patch_result {
                         Ok((loc, sp)) => {
                             // Compare client's expected hash vs server's actual hash.
                             // They should agree when the client's cached content was correct.
@@ -1864,21 +1859,13 @@ impl FlushHandle {
                     // second divergent chunk_id — making state worse, not better.
                     // The healer's freshness check correctly converges replica state without
                     // introducing further divergence.
-
-                    // Record old_chunk_id for broadcast cleanup after metadata sync.
-                    // flush_all_pipelined tombstones + deletes it from ALL cluster nodes,
-                    // not just the dual-RF skip node — clearing healer copies everywhere.
-                    // skip_pairs is no longer used; old_chunk_id covers the same need.
                     //
-                    // Guard: only queue cleanup when the chunk actually changed. If the
-                    // patch was idempotent (same bytes already on disk → same hash →
-                    // old_chunk_id == new_chunk_id), pushing old_chunk_id would broadcast-
-                    // delete the live current chunk, making it unreadable (EIO) even though
-                    // metadata still references it.
-                    let _ = skip_pairs; // skip_pairs dropped: cleanup is now broadcast
-                    if old_location.chunk_id != new_location.chunk_id {
-                        self.pending_old_chunks.lock().await.push(old_location.chunk_id);
-                    }
+                    // old_location.chunk_id is intentionally left untouched on disk and in the
+                    // routing table: chunk_id is content-addressed (blake3(offset||data)), so
+                    // the same chunk_id can simultaneously be the current base for OTHER
+                    // (file_id, chunk_idx) slots with identical content+offset (e.g. duplicate
+                    // files) that haven't patched yet. The leader's deep orphan-purge sweep
+                    // reclaims it once live_chunk_ids() no longer references it cluster-wide.
 
                     // Record new chunk_id AND patched node list so the next flush uses
                     // the correct nodes — not the stale node list from metadata_cache,
@@ -2148,7 +2135,6 @@ impl FlushHandle {
                 // can find the correct server-confirmed chunk_id without relying on the
                 // leader's metadata (which may be behind by up to one flush cycle when the
                 // previous ReplicateChunkLocation arrived while the old guard was active).
-                // is_full_replacement also queues the old chunk for broadcast-delete cleanup.
                 if let Some(loc) = locations.first() {
                     if let Some(file_id) = file_id_at_flush_start {
                         let mut sorted_nodes = loc.nodes.clone();
@@ -2158,15 +2144,6 @@ impl FlushHandle {
                             (ino, chunk_idx),
                             (loc.chunk_id, file_id, std::time::Instant::now(), sorted_nodes),
                         );
-                    }
-                }
-                if is_full_replacement {
-                    if let Some(loc) = locations.first() {
-                        if let Some(old_cid) = full_replacement_old_chunk_id {
-                            if loc.chunk_id != old_cid {
-                                self.pending_old_chunks.lock().await.push(old_cid);
-                            }
-                        }
                     }
                 }
 
@@ -2383,7 +2360,6 @@ impl FlushHandle {
         // deletes from this flush session don't bleed into the background ticker's handle.
         let sync_handle = FlushHandle {
             use_dual_rf: true,
-            pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
             ..self.clone()
         };
 
@@ -2510,30 +2486,14 @@ impl FlushHandle {
             ).await;
         }
 
-        // Metadata is committed. Broadcast tombstone+delete for every old chunk_id
-        // replaced this flush cycle to ALL cluster nodes. This ensures:
-        //   - Skip node: old chunk removed (was the sole target before)
-        //   - Patched nodes: routing entry removed (physical file already renamed away)
-        //   - Healer-replicated nodes: any stale copy removed from disk + routing table
-        // Tombstone fires first so HasChunks returns false everywhere before delete,
-        // preventing the healer from copying an old chunk to a new node in the gap.
-        let old_chunks = sync_handle.pending_old_chunks.lock().await.drain(..).collect::<Vec<_>>();
-        if !old_chunks.is_empty() {
-            let client = self.client.clone();
-            let all_nodes = client.cluster_nodes.read().await.clone();
-            tokio::spawn(async move {
-                for &old_chunk_id in &old_chunks {
-                    for &addr in &all_nodes {
-                        client.tombstone_chunk_on_node(addr, old_chunk_id).await;
-                    }
-                }
-                for old_chunk_id in old_chunks {
-                    for &addr in &all_nodes {
-                        client.delete_chunk_from_node(addr, old_chunk_id).await;
-                    }
-                }
-            });
-        }
+        // Old chunk_ids superseded by this flush's patches/replacements are intentionally
+        // left on disk and in the routing table on their original nodes. Because chunk_id
+        // is content-addressed (blake3(offset||data)), the same chunk_id can still be the
+        // live base for another (file_id, chunk_idx) slot with identical content+offset
+        // that hasn't been patched yet — eagerly broadcast-deleting it here could remove
+        // data a sibling file's in-flight MultiPatch is about to read. The leader's deep
+        // orphan-purge sweep (live_chunk_ids()-based, with grace period) reclaims these
+        // once no file's metadata references them anymore.
 
         Ok(())
     }
@@ -2857,7 +2817,6 @@ impl DfsFilesystem {
                 chunk_write_locks: chunk_write_locks_for_bg.clone(),
                 flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
                 use_dual_rf: false,
-                pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
                 write_open_counts: write_open_counts_for_bg.clone(),
             };
             runtime.spawn(async move {
@@ -3024,7 +2983,6 @@ impl DfsFilesystem {
             chunk_write_locks: chunk_write_locks_shared.clone(),
             flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
             use_dual_rf: false,
-            pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
             write_open_counts: write_open_counts.clone(),
         };
 
@@ -3417,7 +3375,6 @@ impl Filesystem for DfsFilesystem {
             chunk_write_locks: self.chunk_write_locks.clone(),
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
             use_dual_rf: false,
-            pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
             write_open_counts: self.write_open_counts.clone(),
         };
 
@@ -7015,7 +6972,6 @@ impl Filesystem for DfsFilesystem {
             chunk_write_locks: self.chunk_write_locks.clone(),
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
             use_dual_rf: false,
-            pending_old_chunks: Arc::new(tokio::sync::Mutex::new(vec![])),
             write_open_counts: self.write_open_counts.clone(),
         };
 

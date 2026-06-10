@@ -274,6 +274,25 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         debug!("Wrote server address to {}", addr_file);
     }
 
+    // Periodically refresh the address file. /tmp is subject to systemd-tmpfiles
+    // cleanup (files untouched for 30 days get swept), and this process can run for
+    // months without restarting — refresh the mtime (and recreate the file if it was
+    // swept) so `dfs-admin`'s auto-discovery keeps working for the life of the server.
+    {
+        let addr_file = addr_file.clone();
+        let listen_addr = config.node.listen_addr;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await; // skip immediate tick; already wrote above
+            loop {
+                interval.tick().await;
+                if let Err(e) = std::fs::write(&addr_file, listen_addr.to_string()) {
+                    warn!("Failed to refresh address file {}: {}", addr_file, e);
+                }
+            }
+        });
+    }
+
     // Try to join cluster using both seed nodes AND persisted peers
     // This ensures any node can rejoin even if the seed node is down
     let metadata_dir = std::path::PathBuf::from(&config.storage.metadata_dir);

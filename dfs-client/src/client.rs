@@ -4507,6 +4507,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
+    /// Resolve NodeIds to their current SocketAddrs using the addr→id map, dropping any
+    /// NodeIds that don't resolve (stale/unknown).
+    pub async fn resolve_node_addrs(&self, node_ids: &[dfs_common::NodeId]) -> Vec<SocketAddr> {
+        let addr_map = self.addr_to_node_id.read().await;
+        let id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = addr_map.iter().map(|(&addr, &id)| (id, addr)).collect();
+        node_ids.iter().filter_map(|nid| id_to_addr.get(nid).copied()).collect()
+    }
+
     /// Select two write-replica nodes from `nodes` using capacity-banded Fisher-Yates.
     /// Nodes are bucketed into 10 equal-width bands by available disk space (band 0 = most free).
     /// Within each band, nodes are shuffled deterministically by `seed`.  The first two nodes
@@ -4577,18 +4585,29 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Write data with synchronous dual-replica replication
     /// NEW: Writes each chunk to 2 nodes synchronously (not striped)
     /// Returns chunk_locations with replica tracking
-    pub async fn write_data_dual_replica(&self, data: &[u8], inode: u64, file_offset: u64, file_id: Option<dfs_common::FileId>) -> Result<Vec<dfs_common::ChunkLocation>> {
+    pub async fn write_data_dual_replica(&self, data: &[u8], inode: u64, file_offset: u64, file_id: Option<dfs_common::FileId>, preferred_nodes: Option<&[SocketAddr]>) -> Result<Vec<dfs_common::ChunkLocation>> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
             anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
         }
 
-        // Capacity-banded placement: prefer nodes with more available disk space, using
-        // the same banded Fisher-Yates algorithm as the server's get_nodes_with_capacity_awareness.
-        // Seed from chunk offset so different chunks of the same file land on different pairs.
-        let chunk_idx = (file_offset / (4 * 1024 * 1024)) as usize;
-        let seed = chunk_idx as u64 ^ (inode.wrapping_mul(0x9e3779b97f4a7c15));
-        let (preferred1, preferred2) = self.select_write_pair(&nodes, seed);
+        // Rewrites of existing chunk data: target the nodes that already hold it rather
+        // than re-deriving placement via capacity-band randomization. Banding in
+        // select_write_pair is for *new* chunk placement — applying it to a full-chunk
+        // rewrite would migrate the chunk to a different pair whenever relative capacity
+        // shifts cross a band boundary, causing constant cross-node churn for chunks that
+        // get rewritten repeatedly (e.g. VM disk blocks).
+        let (preferred1, preferred2) = match preferred_nodes {
+            Some(existing) if existing.len() >= 2 => (existing[0], existing[1]),
+            _ => {
+                // Capacity-banded placement: prefer nodes with more available disk space, using
+                // the same banded Fisher-Yates algorithm as the server's get_nodes_with_capacity_awareness.
+                // Seed from chunk offset so different chunks of the same file land on different pairs.
+                let chunk_idx = (file_offset / (4 * 1024 * 1024)) as usize;
+                let seed = chunk_idx as u64 ^ (inode.wrapping_mul(0x9e3779b97f4a7c15));
+                self.select_write_pair(&nodes, seed)
+            }
+        };
 
         info!("Writing {} bytes with synchronous dual-replica (preferred: {}, {})",
               data.len(), preferred1, preferred2);
@@ -5005,7 +5024,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Write data and populate byte-range cache for immediate read-back
     /// This enables zero-latency reads of just-written data (DVR use case)
     /// Returns (chunk_ids, chunk_sizes, chunk_locations) - locations include full replica node tracking
-    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64, file_id: Option<dfs_common::FileId>) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
+    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64, file_id: Option<dfs_common::FileId>, preferred_nodes: Option<&[SocketAddr]>) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
             // Single-node cluster: fall back to server-side replication
@@ -5015,7 +5034,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
-        let chunk_locations = self.write_data_dual_replica(data, inode, file_offset, file_id).await?;
+        let chunk_locations = self.write_data_dual_replica(data, inode, file_offset, file_id, preferred_nodes).await?;
 
         // Extract chunk IDs and sizes for backward compatibility
         let chunk_ids: Vec<ChunkId> = chunk_locations.iter().map(|loc| loc.chunk_id).collect();

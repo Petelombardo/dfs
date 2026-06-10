@@ -920,7 +920,7 @@ impl FlushHandle {
             let idx = *chunk_idx;
             tokio::spawn(async move {
                 info!("flush_buffer_async: writing chunk {} ({} bytes at offset {})", idx, data.len(), offset);
-                let result = client.write_data_with_cache(&data, ino, offset, None).await;
+                let result = client.write_data_with_cache(&data, ino, offset, None, None).await;
                 result.map(|(_, _, locs)| (idx, locs))
             })
         }).collect();
@@ -1311,6 +1311,35 @@ impl FlushHandle {
                 debug!("notify_chunk_flush_complete: ino={} chunk={} notified waiters", ino, chunk_idx);
             }
         }
+    }
+
+    /// Resolve which nodes currently hold the data for `chunk_idx` of `ino`, using the same
+    /// priority as the patch path: canonical_write_nodes (this session's last successful
+    /// write/patch) > recent_chunk_writes (matching file_id, < 120s old) > metadata_cache.
+    /// Used to target full-chunk-replacement writes at the chunk's existing replica holders
+    /// instead of re-deriving placement via capacity-band randomization.
+    async fn existing_chunk_nodes(&self, ino: u64, chunk_idx: u64) -> Option<Vec<dfs_common::NodeId>> {
+        if let Some(state_arc) = self.write_buffers.get(&ino) {
+            if let Ok(st) = state_arc.try_lock() {
+                if let Some(nodes) = st.canonical_write_nodes.get(&chunk_idx) {
+                    if !nodes.is_empty() {
+                        return Some(nodes.clone());
+                    }
+                }
+            }
+        }
+        let meta_id = self.metadata_cache.get(&ino).map(|m| m.id);
+        if let Some(fid) = meta_id {
+            if let Some(r) = self.client.recent_chunk_writes.get(&(ino, chunk_idx)) {
+                let (_, rfid, ts, nodes) = r.value();
+                if *rfid == fid && ts.elapsed().as_secs() < 120 && !nodes.is_empty() {
+                    return Some(nodes.clone());
+                }
+            }
+        }
+        self.metadata_cache.get(&ino)
+            .and_then(|m| m.chunk_location_for_idx(chunk_idx).map(|l| l.nodes.clone()))
+            .filter(|n| !n.is_empty())
     }
 
     /// Internal: flush exactly the chunk at `chunk_idx` for `ino`.
@@ -2038,9 +2067,36 @@ impl FlushHandle {
         // Normal fresh write path (contiguous data, no gaps)
         // Acquire the per-chunk write lock for the fresh-write path too.
         let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, chunk_idx).await;
+
+        // Full-chunk replacements rewrite data that already lives somewhere — target the
+        // existing replica nodes instead of re-deriving placement via capacity-band
+        // randomization (which would migrate the chunk to a different pair on every
+        // rewrite as relative capacity shifts cross band boundaries).
+        let preferred_nodes: Option<Vec<SocketAddr>> = if is_full_replacement {
+            match self.existing_chunk_nodes(ino, chunk_idx).await {
+                Some(node_ids) => {
+                    let mut addrs = self.client.resolve_node_addrs(&node_ids).await;
+                    if addrs.len() >= 2 {
+                        // Deterministic pair: same selection regardless of map iteration order,
+                        // matching the sorted-first-2 convention used elsewhere for dual_rf.
+                        addrs.sort_unstable();
+                        addrs.truncate(2);
+                        info!("flush_buffer_async_one: ino={} chunk={} full-replacement targeting existing replica nodes {:?}",
+                              ino, chunk_idx, addrs);
+                        Some(addrs)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         info!("flush_buffer_async_one: ino={} chunk={} calling write_data_with_cache with {} bytes at file_offset={}",
               ino, chunk_idx, slot_data.len(), file_offset);
-        let result = self.client.write_data_with_cache(&slot_data, ino, file_offset, file_id_at_flush_start).await;
+        let result = self.client.write_data_with_cache(&slot_data, ino, file_offset, file_id_at_flush_start, preferred_nodes.as_deref()).await;
         match result {
             Ok((_, _, Some(locations))) => {
                 let flushed_len = slot_data.len();
@@ -5150,7 +5206,7 @@ impl Filesystem for DfsFilesystem {
                         }
                     } else {
                         // Target is beyond all committed chunks — new chunk, write directly.
-                        match client.write_data_with_cache(&data_vec, ino, offset as u64, None).await {
+                        match client.write_data_with_cache(&data_vec, ino, offset as u64, None, None).await {
                             Ok((_, _, chunk_locations_opt)) => {
                                 let mut metadata = meta_snap.unwrap_or_else(|| metadata.clone());
                                 let new_size = (offset_usize + data_vec.len()).max(current_size).max(metadata.size as usize);
@@ -5413,14 +5469,14 @@ impl Filesystem for DfsFilesystem {
             let write_start = std::time::Instant::now();
             let result = if is_append {
                 let file_offset = write_file_offset_override.unwrap_or(current_size as u64);
-                client.write_data_with_cache(&new_data, cache_inode, file_offset, None).await
+                client.write_data_with_cache(&new_data, cache_inode, file_offset, None, None).await
             } else {
                 let write_file_offset = if let Some((first_idx, _)) = affected_chunk_range {
                     metadata.chunk_locations[..first_idx].iter().map(|l| l.size as u64).sum::<u64>()
                 } else {
                     0
                 };
-                client.write_data_with_cache(&new_data, cache_inode, write_file_offset, None).await
+                client.write_data_with_cache(&new_data, cache_inode, write_file_offset, None, None).await
             };
             debug!("write_data took {:?}", write_start.elapsed());
 
@@ -6637,7 +6693,7 @@ impl Filesystem for DfsFilesystem {
                             let truncated_chunk = &last_chunk_data[..bytes_in_last_chunk as usize];
 
                             match self.block_on(async {
-                                client.write_data_with_cache(truncated_chunk, ino, chunk_offset, None).await
+                                client.write_data_with_cache(truncated_chunk, ino, chunk_offset, None, None).await
                             }) {
                                 Ok((_, _, chunk_locations_opt)) => {
                                     let mut new_locs = metadata.chunk_locations[..last_chunk_idx].to_vec();

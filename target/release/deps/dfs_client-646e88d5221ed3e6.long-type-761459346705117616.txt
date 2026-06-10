@@ -1,1 +1,0 @@
-Option<(Arc<Vec<ChunkLocation>>, Arc<Vec<(usize, usize)>>, Arc<HashMap<NodeId, std::net::SocketAddr>>)>

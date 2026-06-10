@@ -13,4 +13,9 @@ dist/
 *.log
 /tmp/
 
-# Build artifacts are already ignored by Cargo
+# Build artifacts (was tracked by mistake — every cargo build dirtied the
+# working tree with ~10GB of binaries/fingerprints)
+/target/
+
+# Local Claude Code settings/state (machine-specific, not shared)
+/.claude/

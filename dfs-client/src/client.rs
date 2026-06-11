@@ -1843,9 +1843,16 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         if chunk_map.is_empty() {
-            // Still empty — leader has no chunk map yet (file is being written, first chunk
-            // not yet committed). Return empty; player will retry naturally.
-            return Ok(Vec::new());
+            // Still empty after a synchronous refresh: the file has zero chunks anywhere
+            // (e.g. a VM disk image created via ftruncate and never written — fully
+            // sparse). offset < file_size was already checked at function entry, so this
+            // is a hole within the file's logical extent: return zero-filled bytes, same
+            // as the "Hole (sparse file)" case below. Returning an empty Vec here signals
+            // EOF to FUSE/the kernel; O_DIRECT readers (e.g. QEMU with cache=none) treat a
+            // short read at a non-EOF offset as an I/O error — which is exactly what turns
+            // fdisk/mkfs/fsck on a freshly created VM disk into "lots of corruption".
+            let len = (file_size as usize).min(offset + size).saturating_sub(offset);
+            return Ok(vec![0u8; len]);
         }
 
         // Populate write_seq cache for all chunks in this file so read_chunk_from_server

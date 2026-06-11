@@ -5240,7 +5240,9 @@ impl Server {
             // listed as holding it and ask for the physical on-disk byte count.
             // If ≥ majority of replica nodes agree on a size, that size is authoritative.
             // A node that disagrees has a corrupt/truncated copy — mark it for healing.
-            // The file's authoritative size = sum of per-chunk authoritative sizes.
+            // The file's authoritative size = max(chunk offset + authoritative size)
+            // across all chunks — NOT a sum, since sparse files have gaps between
+            // chunks and the chunks present don't tile the full logical extent.
             //
             // This is correct even when stored metadata sizes are corrupted: we read
             // from the physical layer and take the majority view.
@@ -5300,11 +5302,19 @@ impl Server {
                 }
 
                 // Per-chunk voting: for each chunk, find the majority physical size
-                // among nodes that are listed as holding it.
+                // among nodes that are listed as holding it. The authoritative file
+                // size is max(offset + majority_size) across chunks, not a sum:
+                // sparse files have gaps between chunks, so summing physical chunk
+                // sizes undercounts the true logical size (and previously corrupted
+                // FileMetadata.size for sparse files like VM disk images down to the
+                // sum of their populated chunks).
+                const CHUNK_SIZE_FOR_REPAIR: u64 = 4 * 1024 * 1024;
                 let mut authoritative_file_size: u64 = 0;
                 let mut any_chunk_ambiguous = false;
 
                 for (chunk_idx, loc) in file.chunk_locations.iter().enumerate() {
+                    let chunk_offset = loc.file_offset.unwrap_or(chunk_idx as u64 * CHUNK_SIZE_FOR_REPAIR);
+
                     // Collect physical sizes from nodes listed as holding this chunk.
                     let mut size_votes: std::collections::HashMap<u64, Vec<dfs_common::NodeId>> =
                         std::collections::HashMap::new();
@@ -5318,7 +5328,7 @@ impl Server {
 
                     if size_votes.is_empty() {
                         // No replica node responded — can't determine authoritative size.
-                        authoritative_file_size += loc.size as u64;
+                        authoritative_file_size = authoritative_file_size.max(chunk_offset + loc.size as u64);
                         any_chunk_ambiguous = true;
                         continue;
                     }
@@ -5332,12 +5342,12 @@ impl Server {
                     if majority_size == 0 {
                         // Majority says chunk is absent — file may still be recording.
                         // Don't trust this for size repair; use stored loc.size.
-                        authoritative_file_size += loc.size as u64;
+                        authoritative_file_size = authoritative_file_size.max(chunk_offset + loc.size as u64);
                         any_chunk_ambiguous = true;
                         continue;
                     }
 
-                    authoritative_file_size += majority_size;
+                    authoritative_file_size = authoritative_file_size.max(chunk_offset + majority_size);
 
                     // Mark nodes whose physical size disagrees with the majority.
                     for (&reported_size, bad_nodes) in &size_votes {

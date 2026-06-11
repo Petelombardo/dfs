@@ -1920,6 +1920,119 @@ T29_NIL_LINES=${T29_NIL_LINES:-0}
 rm -f "$T29_FILE" "$T/t29_expected.bin"
 fi # should_run T29
 
+# ── Test 30: sparse-file metadata-repair size regression (sum-vs-max) ─────────
+#
+# handle_trigger_metadata_repair's quorum size-check used to compute
+# authoritative_file_size as a SUM of each chunk's physical on-disk size.
+# For a sparse file (logical size larger than the sum of its populated
+# chunks, due to gaps), sum(chunk_sizes) < max(offset+size) == true logical
+# size. Running `dfs-admin healing repair` against such a file silently
+# shrunk FileMetadata.size to that sum — e.g. a 512MB VM disk image with 9
+# populated chunks got shrunk to ~21MB. Fix: authoritative_file_size =
+# max(offset + majority_size) across chunks.
+#
+# Layout: 12MB sparse file, only chunk 0 (offset 0) and chunk 2 (offset 8MB)
+# written; chunk 1 is an unwritten gap. sum(chunk sizes)=8MB,
+# max(offset+size)=12MB == true file size.
+if should_run T30; then
+snapshot_log T30
+echo ""
+echo "=== T30: sparse-file metadata-repair size (sum-vs-max regression) ==="
+
+T30_FILE="$MOUNT/t30_sparse.raw"
+T30_CHUNK=$(( 4 * 1024 * 1024 ))
+
+python3 -c "
+import os
+fd = os.open('$T30_FILE', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fd, bytes([0xAB]) * $T30_CHUNK)        # chunk 0
+os.lseek(fd, 2 * $T30_CHUNK, os.SEEK_SET)
+os.write(fd, bytes([0xCD]) * $T30_CHUNK)        # chunk 2 (chunk 1 is a gap)
+os.close(fd)
+"
+dfs_sync
+
+T30_SIZE_BEFORE=$(stat -c %s "$T30_FILE")
+
+echo "  Triggering metadata repair on all nodes..."
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing repair >/dev/null 2>&1 || true
+
+# Repair runs as a background task on each node; give it time to complete.
+sleep 8
+
+# Cold remount to bypass any client-side size cache.
+fusermount -u "$MOUNT" 2>/dev/null || true
+sleep 0.3
+kill $CLIENT_PID2 2>/dev/null || true
+sleep 1
+T30_CLIENT_LOG="$LOG/client_t30.log"
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$T30_CLIENT_LOG" --allow-other --log-level debug &
+CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$T30_CLIENT_LOG"
+sleep 2
+mountpoint -q "$MOUNT" || { check "T30 remount" FAIL; }
+
+T30_SIZE_AFTER=$(stat -c %s "$T30_FILE" 2>/dev/null || echo 0)
+
+[ "$T30_SIZE_AFTER" -eq "$T30_SIZE_BEFORE" ] \
+    && check "T30 sparse-file size preserved after metadata repair (size=$T30_SIZE_AFTER)" PASS \
+    || check "T30 sparse-file size corrupted by metadata repair (before=$T30_SIZE_BEFORE after=$T30_SIZE_AFTER)" FAIL
+
+rm -f "$T30_FILE"
+fi # should_run T30
+
+# ── Test 31: read of never-written sparse file returns zeros, not EOF ─────────
+#
+# read_file() returned Ok(Vec::new()) whenever a file's chunk_map was completely
+# empty (e.g. a VM disk image created via ftruncate and never written), even for
+# in-bounds offsets (offset < file_size). Buffered reads tolerate this as a
+# 0-byte/EOF response, but O_DIRECT readers (e.g. QEMU with cache=none, the PVE
+# default) treat a short read at a non-EOF offset as an I/O error — turning every
+# fdisk/mkfs/grub-install/fsck on a freshly created VM disk into "lots of
+# corruption" (confirmed via losetup --direct-io=on + fdisk -> EIO on staging).
+# Fix: an empty chunk_map with offset < file_size is a sparse hole; return
+# zero-filled bytes instead of an empty Vec.
+if should_run T31; then
+snapshot_log T31
+echo ""
+echo "=== T31: read of never-written sparse file returns zeros (O_DIRECT + buffered) ==="
+
+T31_FILE="$MOUNT/t31_sparse.raw"
+T31_SIZE=$(( 64 * 1024 * 1024 ))
+
+truncate -s $T31_SIZE "$T31_FILE"
+dfs_sync
+
+T31_RESULT=$(python3 -c "
+import os
+
+def probe(flags, offset, label):
+    fd = os.open('$T31_FILE', os.O_RDONLY | flags)
+    os.lseek(fd, offset, os.SEEK_SET)
+    data = os.read(fd, 4096)
+    os.close(fd)
+    status = 'allzero' if data and all(b == 0 for b in data) else 'notzero'
+    print(f'{label}: {len(data)} {status}')
+
+probe(os.O_DIRECT, 0, 'direct_start')
+probe(os.O_DIRECT, $T31_SIZE - 4096, 'direct_end')
+probe(0, 0, 'buffered_start')
+probe(0, $T31_SIZE - 4096, 'buffered_end')
+")
+
+echo "$T31_RESULT" | sed 's/^/  /'
+
+echo "$T31_RESULT" | grep -q '^direct_start: 4096 allzero$' \
+    && echo "$T31_RESULT" | grep -q '^direct_end: 4096 allzero$' \
+    && echo "$T31_RESULT" | grep -q '^buffered_start: 4096 allzero$' \
+    && echo "$T31_RESULT" | grep -q '^buffered_end: 4096 allzero$' \
+    && check "T31 reads of never-written sparse file return zero-filled bytes" PASS \
+    || check "T31 reads of never-written sparse file returned EOF/short read" FAIL
+
+rm -f "$T31_FILE"
+fi # should_run T31
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

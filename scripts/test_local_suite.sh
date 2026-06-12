@@ -2033,6 +2033,133 @@ echo "$T31_RESULT" | grep -q '^direct_start: 4096 allzero$' \
 rm -f "$T31_FILE"
 fi # should_run T31
 
+# ── Test 32: concurrent multi-chunk pwrite/pread isolation with sparse holes ──
+#
+# Extensive investigation chased a suspected "cross-chunk contamination" bug:
+# concurrent positional writes to one chunk appearing to leak into reads of a
+# different chunk of the same file. Root-caused to a TEST HARNESS bug, not a
+# DFS bug — the repro shared one fd's seek cursor across writer threads via
+# lseek()+writev()/readv(), which races (thread A seeks, thread B's seek
+# overwrites the shared cursor, thread A's writev lands at thread B's offset).
+# Switching to positional pwritev()/preadv() (what real I/O stacks like QEMU
+# use) eliminated the errors entirely (0/71359 and 0/61906 across two runs).
+# This test codifies that workload as a permanent regression guard: concurrent
+# pwritev/preadv across multiple chunks (some never written — must read as
+# zero, exercising the T31 sparse-hole fix) with periodic fsync to cross the
+# write-buffer→network transition.
+if should_run T32; then
+snapshot_log T32
+echo ""
+echo "=== T32: concurrent multi-chunk pwrite/pread isolation with sparse holes ==="
+
+T32_FILE="$MOUNT/t32_concurrent.raw"
+T32_NUM_CHUNKS=4
+T32_SIZE=$(( T32_NUM_CHUNKS * 4 * 1024 * 1024 ))
+
+truncate -s $T32_SIZE "$T32_FILE"
+dfs_sync
+
+T32_RESULT=$(python3 -c "
+import os, mmap, random, threading, time
+
+CHUNK = 4 * 1024 * 1024
+BLK = 1024
+NUM_CHUNKS = $T32_NUM_CHUNKS
+PATH = '$T32_FILE'
+
+fd_w = os.open(PATH, os.O_RDWR | os.O_DIRECT)
+fd_r = os.open(PATH, os.O_RDONLY | os.O_DIRECT)
+
+WRITTEN = [0, 2]
+HOLES = [1, 3]
+FILL = {c: 0xA0 + c for c in WRITTEN}
+
+stop = threading.Event()
+errors = []
+reads = [0]
+fsyncs = [0]
+
+def writer(c):
+    rng = random.Random(1000 + c)
+    fill = FILL[c]
+    base = c * CHUNK
+    while not stop.is_set():
+        nb = rng.randint(1, 8)
+        blk = rng.randint(0, (CHUNK // BLK) - nb)
+        off = base + blk * BLK
+        size = nb * BLK
+        buf = mmap.mmap(-1, size)
+        buf.write(bytes([fill]) * size)
+        os.pwritev(fd_w, [buf], off)
+
+def fsyncer():
+    while not stop.is_set():
+        time.sleep(0.3)
+        try:
+            os.fsync(fd_w)
+            fsyncs[0] += 1
+        except OSError:
+            pass
+
+def reader():
+    rng = random.Random(7777)
+    while not stop.is_set():
+        c = rng.randint(0, NUM_CHUNKS - 1)
+        base = c * CHUNK
+        blk = rng.randint(0, (CHUNK // BLK) - 1)
+        off = base + blk * BLK
+        buf = mmap.mmap(-1, BLK)
+        n = os.preadv(fd_r, [buf], off)
+        reads[0] += 1
+        if n == 0:
+            continue
+        data = bytes(buf[:n])
+        if c in HOLES:
+            if any(b != 0 for b in data):
+                errors.append(('HOLE_NONZERO', c, off, n))
+                if len(errors) >= 5:
+                    stop.set()
+        else:
+            allowed = FILL[c]
+            for b in data:
+                if b != 0 and b != allowed:
+                    errors.append(('WRONG_FILL', c, off, n))
+                    if len(errors) >= 5:
+                        stop.set()
+                    break
+
+threads = [threading.Thread(target=writer, args=(c,)) for c in WRITTEN]
+threads += [threading.Thread(target=reader) for _ in range(4)]
+threads += [threading.Thread(target=fsyncer)]
+for t in threads:
+    t.start()
+
+start = time.time()
+while time.time() - start < 5 and not stop.is_set():
+    time.sleep(0.05)
+stop.set()
+for t in threads:
+    t.join()
+
+os.close(fd_w)
+os.close(fd_r)
+print(f'reads={reads[0]} fsyncs={fsyncs[0]} errors={len(errors)}')
+for e in errors[:5]:
+    print(f'  {e}')
+print(len(errors))
+")
+
+echo "$T32_RESULT" | sed 's/^/  /'
+T32_ERR_COUNT=$(echo "$T32_RESULT" | tail -1)
+T32_ERR_COUNT=${T32_ERR_COUNT:-1}
+
+[ "$T32_ERR_COUNT" = "0" ] \
+    && check "T32 concurrent multi-chunk pwrite/pread, 0 errors" PASS \
+    || check "T32 concurrent multi-chunk pwrite/pread, $T32_ERR_COUNT errors" FAIL
+
+rm -f "$T32_FILE"
+fi # should_run T32
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::ChunkId;
+use dfs_common::{ChunkId, FileId};
 use lru::LruCache;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -307,13 +307,19 @@ impl ChunkStorage {
     }
 
     /// Verify the on-disk chunk data matches its content-addressed ID.
-    /// The hash is position-aware: Blake3(file_offset_le_bytes || data), so
-    /// the caller must supply the file_offset from ChunkLocation.
+    /// The hash is file-scoped and position-aware: Blake3(file_id || file_offset || data),
+    /// so the caller must supply both the file_offset and file_id from ChunkLocation.
+    /// If file_id is None (record predates file-scoped IDs, or was reconstructed
+    /// without file context), verification is skipped and this returns true.
     /// Returns false if the file is missing, unreadable, or hash-mismatched.
-    pub fn verify_chunk_at(&self, chunk_id: &ChunkId, file_offset: u64) -> bool {
+    pub fn verify_chunk_at(&self, chunk_id: &ChunkId, file_offset: u64, file_id: Option<FileId>) -> bool {
+        let file_id = match file_id {
+            Some(id) => id,
+            None => return true,
+        };
         match self.read_chunk(chunk_id) {
             Ok(data) => {
-                let expected = dfs_common::compute_chunk_hash_at(&data, file_offset);
+                let expected = dfs_common::compute_chunk_hash_at(&data, file_offset, file_id);
                 expected == chunk_id.hash
             }
             Err(_) => false,

@@ -206,6 +206,7 @@ impl InodeReadEngine {
                 file_offset: None,
                 written_at: None,
                 client_write_seq: None,
+                file_id: None,
             });
         }
 

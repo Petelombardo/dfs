@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Cached storage statistics to avoid expensive stat calls
 #[derive(Clone)]
@@ -1358,13 +1358,13 @@ impl Server {
                 self.ops_tracker.inc_meta();
                 self.handle_list_directory(path).await
             }
-            Request::WriteFile { data } => {
+            Request::WriteFile { data, file_id } => {
                 self.ops_tracker.inc_write();
-                self.handle_write_file(data).await
+                self.handle_write_file(data, file_id).await
             }
-            Request::WriteFileLocalOnly { data, file_offset } => {
+            Request::WriteFileLocalOnly { data, file_offset, file_id } => {
                 self.ops_tracker.inc_write();
-                self.handle_write_file_local_only(data, file_offset).await
+                self.handle_write_file_local_only(data, file_offset, file_id).await
             }
             Request::PatchChunk { chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data } => {
                 self.ops_tracker.inc_write();
@@ -1394,9 +1394,9 @@ impl Server {
             Request::TriggerMetadataRepair => self.handle_trigger_metadata_repair().await,
             Request::QueryChunkSizes { chunk_ids } => self.handle_query_chunk_sizes(chunk_ids).await,
             Request::HealFile { path } => self.handle_heal_file(path).await,
-            Request::VerifyChunkIntegrity { chunk_id, file_offset } => {
+            Request::VerifyChunkIntegrity { chunk_id, file_offset, file_id } => {
                 let found = self.storage.has_chunk(&chunk_id);
-                let valid = found && self.storage.verify_chunk_at(&chunk_id, file_offset);
+                let valid = found && self.storage.verify_chunk_at(&chunk_id, file_offset, file_id);
                 Response::ChunkValid { found, valid }
             }
             Request::RepairFile { path, force } => self.handle_repair_file(path, force).await,
@@ -1649,10 +1649,13 @@ impl Server {
 
         // Verify chunk content before propagating — catches disk corruption at the
         // source so we don't spread bad data to the rest of the cluster.
-        // The hash is position-aware: blake3(file_offset_le_bytes || data).
-        // We can only verify if we have the file_offset from the chunk location.
-        if let Some(offset) = loc.as_ref().and_then(|l| l.file_offset) {
-            let actual_hash = dfs_common::compute_chunk_hash_at(&data, offset);
+        // The hash is file-scoped and position-aware: blake3(file_id || file_offset || data).
+        // We can only verify if we have both the file_offset and file_id from the chunk location.
+        if let (Some(offset), Some(file_id)) = (
+            loc.as_ref().and_then(|l| l.file_offset),
+            loc.as_ref().and_then(|l| l.file_id),
+        ) {
+            let actual_hash = dfs_common::compute_chunk_hash_at(&data, offset, file_id);
             if actual_hash != chunk_id.hash {
                 warn!("PushChunkTo: chunk {} at offset {} failed content hash verification — disk corruption detected, refusing to propagate",
                     chunk_id, offset);
@@ -1995,6 +1998,7 @@ impl Server {
                     file_offset: location.file_offset.or(existing.file_offset),
                     written_at: existing.written_at.or(location.written_at),
                     client_write_seq: location.client_write_seq.or(existing.client_write_seq),
+                    file_id: location.file_id.or(existing.file_id),
                 }
             }
             Ok(None) => {
@@ -2228,6 +2232,7 @@ impl Server {
                 file_offset: location.file_offset.or_else(|| existing.as_ref().and_then(|e| e.file_offset)),
                 written_at: location.written_at.or_else(|| existing.as_ref().and_then(|e| e.written_at)),
                 client_write_seq: None,
+                file_id: location.file_id.or_else(|| existing.as_ref().and_then(|e| e.file_id)),
             };
             if let Err(e) = self.metadata.put_chunk_location(&merged) {
                 warn!("Failed to replicate chunk location {}: {}", location.chunk_id, e);
@@ -2425,13 +2430,13 @@ impl Server {
     }
 
     /// Write data to the cluster with replication
-    pub async fn write_data(&self, data: &[u8]) -> Result<Vec<(ChunkId, u64, Vec<dfs_common::NodeId>)>> {
+    pub async fn write_data(&self, data: &[u8], file_id: dfs_common::FileId) -> Result<Vec<(ChunkId, u64, Vec<dfs_common::NodeId>)>> {
         let total_start = std::time::Instant::now();
         info!("Writing {} bytes to cluster", data.len());
 
         // Chunk the data
         let chunk_start = std::time::Instant::now();
-        let chunks = self.chunker.chunk_data(data);
+        let chunks = self.chunker.chunk_data(data, file_id);
         let chunk_time = chunk_start.elapsed();
         info!("Chunking took {:?} for {} chunks", chunk_time, chunks.len());
 
@@ -2578,6 +2583,7 @@ impl Server {
                     file_offset: None,  // Server-side replication doesn't track file offsets
                     written_at: None,
                     client_write_seq: None,
+                    file_id: Some(file_id),
                 };
 
                 let metadata_start = std::time::Instant::now();
@@ -2654,12 +2660,12 @@ impl Server {
     /// Write data locally only (no replication)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
     /// Healing creates the 3rd replica in background
-    pub async fn write_data_local_only(&self, data: &[u8]) -> Result<Vec<(ChunkId, u64)>> {
+    pub async fn write_data_local_only(&self, data: &[u8], file_id: dfs_common::FileId) -> Result<Vec<(ChunkId, u64)>> {
         let total_start = std::time::Instant::now();
         info!("Writing {} bytes locally (no replication)", data.len());
 
         // Chunk the data
-        let chunks = self.chunker.chunk_data(data);
+        let chunks = self.chunker.chunk_data(data, file_id);
         info!("Chunked into {} chunks (local write only)", chunks.len());
 
         // Write all chunks locally in parallel
@@ -2686,6 +2692,7 @@ impl Server {
                     file_offset: None,  // Server-side local-only writes don't track file offsets
                     written_at: None,
                     client_write_seq: None,
+                    file_id: Some(file_id),
                 };
 
                 metadata.put_chunk_location(&location)
@@ -2722,11 +2729,11 @@ impl Server {
         Ok(chunk_ids_with_sizes)
     }
 
-    pub async fn write_data_local_only_at(&self, data: &[u8], file_offset: u64) -> Result<Vec<(ChunkId, u64)>> {
+    pub async fn write_data_local_only_at(&self, data: &[u8], file_offset: u64, file_id: dfs_common::FileId) -> Result<Vec<(ChunkId, u64)>> {
         let total_start = std::time::Instant::now();
         info!("Writing {} bytes locally (no replication) at offset {}", data.len(), file_offset);
 
-        let chunks = self.chunker.chunk_data_at(data, file_offset);
+        let chunks = self.chunker.chunk_data_at(data, file_offset, file_id);
         info!("Chunked into {} chunks (local write only)", chunks.len());
 
         let local_node_id = self.cluster.local_node_id();
@@ -2748,6 +2755,7 @@ impl Server {
                     file_offset: None,
                     written_at: None,
                     client_write_seq: None,
+                    file_id: Some(file_id),
                 };
 
                 metadata.put_chunk_location(&location)
@@ -2904,6 +2912,7 @@ impl Server {
                 file_offset: None,
                 written_at: Some(now_ms),
                 client_write_seq: None,
+                file_id: None,
             })
         }
     }
@@ -3229,7 +3238,28 @@ impl Server {
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     }
                     let m = metadata.clone();
-                    let result = tokio::task::spawn_blocking(move || m.compact_db()).await;
+                    let task = tokio::task::spawn_blocking(move || m.compact_db());
+                    // compact_db() holds MetadataStore's exclusive write lock for its
+                    // entire duration; with the periodic durability flush (see
+                    // next_write_durability()) it should complete in milliseconds even
+                    // for a large DB. If it ever takes minutes, the write lock is
+                    // permanently wedged and every metadata read on this node will
+                    // block forever too — there is no way to un-stick that lock from
+                    // here. Restart so the other replicas (HA) keep serving while a
+                    // fresh process gets a clean redb handle (compact on startup is
+                    // fast on a freshly-opened handle even for the same file).
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(60), task).await;
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(_) => {
+                            error!(
+                                "redb compact_db() exceeded 60s — exclusive metadata write \
+                                 lock is permanently wedged on this node. Restarting so HA \
+                                 replicas can continue serving."
+                            );
+                            std::process::exit(1);
+                        }
+                    };
                     match result {
                         Ok(Ok((before, after))) => {
                             if before != after {
@@ -3946,7 +3976,7 @@ impl Server {
         };
 
         // --- Step 4+5: Chunk the combined data ---
-        let chunks = self.chunker.chunk_data(&write_data);
+        let chunks = self.chunker.chunk_data(&write_data, file_id);
         if chunks.is_empty() {
             // Nothing to write — return current metadata unchanged
             let remaining = chunk_size - (metadata.size % chunk_size);
@@ -4043,6 +4073,7 @@ impl Server {
                 file_offset: Some(current_offset),
                 written_at: None,
                 client_write_seq: None,
+                file_id: Some(file_id),
             };
 
             // Persist chunk location locally
@@ -4143,10 +4174,10 @@ impl Server {
     }
 
     /// Handle write file request (client writes entire file)
-    async fn handle_write_file(&self, data: Vec<u8>) -> Response {
+    async fn handle_write_file(&self, data: Vec<u8>, file_id: dfs_common::FileId) -> Response {
         debug!("Handling write file: {} bytes", data.len());
 
-        match self.write_data(&data).await {
+        match self.write_data(&data, file_id).await {
             Ok(chunk_ids_with_sizes_and_nodes) => {
                 let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes_and_nodes.iter().map(|(id, _, _)| *id).collect();
                 let chunk_sizes: Vec<u64> = chunk_ids_with_sizes_and_nodes.iter().map(|(_, size, _)| *size).collect();
@@ -4165,11 +4196,11 @@ impl Server {
 
     /// Handle write file request (local only, no replication)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
-    async fn handle_write_file_local_only(&self, data: Vec<u8>, file_offset: u64) -> Response {
+    async fn handle_write_file_local_only(&self, data: Vec<u8>, file_offset: u64, file_id: dfs_common::FileId) -> Response {
         debug!("Handling write file local only: {} bytes at offset {}", data.len(), file_offset);
 
         let local_node_id = self.cluster.local_node_id();
-        match self.write_data_local_only_at(&data, file_offset).await {
+        match self.write_data_local_only_at(&data, file_offset, file_id).await {
             Ok(chunk_ids_with_sizes) => {
                 let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _)| *id).collect();
                 let chunk_sizes: Vec<u64> = chunk_ids_with_sizes.iter().map(|(_, size)| *size).collect();
@@ -4195,23 +4226,23 @@ impl Server {
     async fn handle_patch_chunk(
         &self,
         chunk_id: ChunkId,
-        file_id: Option<dfs_common::FileId>,
+        file_id: dfs_common::FileId,
         chunk_idx: Option<u64>,
         chunk_file_offset: u64,
         intra_offset: usize,
         patch_data: Vec<u8>,
     ) -> Response {
-        // Validate chunk_id against local chunk map when file_id + chunk_idx are provided.
+        // Validate chunk_id against local chunk map when chunk_idx is provided.
         // If our record for (file_id, chunk_idx) differs, the client has a stale view —
         // return ChunkStale so the client can retry with the correct chunk_id.
-        if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
-            if let Some(entry) = self.chunk_map.get(&fid) {
+        if let Some(cidx) = chunk_idx {
+            if let Some(entry) = self.chunk_map.get(&file_id) {
                 let (locations, _) = entry.value();
                 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
                 if let Some(loc) = locations.iter().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)) {
                     if loc.chunk_id != chunk_id {
-                        info!("PatchChunk: stale chunk_id from client — file {:?} chunk {} client={} server={}",
-                            fid, cidx, chunk_id, loc.chunk_id);
+                        info!("PatchChunk: stale chunk_id from client — file {} chunk {} client={} server={}",
+                            file_id, cidx, chunk_id, loc.chunk_id);
                         return Response::ChunkStale {
                             current_chunk_id: loc.chunk_id,
                             current_nodes: loc.nodes.clone(),
@@ -4251,12 +4282,9 @@ impl Server {
 
             let final_size = buf.len();
 
-            let new_chunk_id = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&chunk_file_offset.to_le_bytes());
-                hasher.update(&buf);
-                ChunkId::from_hash(*hasher.finalize().as_bytes())
-            };
+            let new_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&buf, chunk_file_offset, file_id)
+            );
 
             if new_chunk_id != chunk_id {
                 let new_path = storage.get_chunk_path(&new_chunk_id);
@@ -4293,6 +4321,7 @@ impl Server {
                         file_offset: old_loc.file_offset,
                         written_at: Some(now_secs),
                         client_write_seq: None,
+                        file_id: Some(file_id),
                     };
                     if let Err(e) = metadata.put_chunk_location(&new_loc) {
                         warn!("PatchChunk: failed to pre-register {} in sled: {}", new_chunk_id, e);
@@ -4312,8 +4341,8 @@ impl Server {
                 // spawn_blocking before the rename — see comment there.
                 if new_chunk_id != chunk_id {
                     const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-                    if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
-                        if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
+                    if let Some(cidx) = chunk_idx {
+                        if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
                             let (locations, _) = entry.value_mut();
                             if let Some(loc) = locations.iter_mut().find(|l| {
                                 l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)
@@ -4343,7 +4372,7 @@ impl Server {
     async fn handle_multi_patch(
         &self,
         chunk_id: ChunkId,
-        file_id: Option<dfs_common::FileId>,
+        file_id: dfs_common::FileId,
         chunk_idx: Option<u64>,
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
@@ -4357,9 +4386,9 @@ impl Server {
         // result lost the race — even though the OTHER patch's RPC response (and any
         // ReplicateChunkLocation derived from it) already told the client/leader
         // about its own new_chunk_id.
-        let _chunk_patch_guard = if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+        let _chunk_patch_guard = if let Some(cidx) = chunk_idx {
             let lock = self.chunk_patch_locks
-                .entry((fid, cidx))
+                .entry((file_id, cidx))
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone();
             Some(lock.lock_owned().await)
@@ -4367,8 +4396,8 @@ impl Server {
             None
         };
 
-        if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
-            if let Some(entry) = self.chunk_map.get(&fid) {
+        if let Some(cidx) = chunk_idx {
+            if let Some(entry) = self.chunk_map.get(&file_id) {
                 const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
                 let (locations, _) = entry.value();
                 if let Some(loc) = locations.iter().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)) {
@@ -4382,12 +4411,12 @@ impl Server {
                         // chunk_id; if it exists we patch correctly, if not it returns NotFound.
                         let current_path = self.storage.get_chunk_path(&loc.chunk_id);
                         if !current_path.exists() {
-                            warn!("[GHOST-stale-check] chunk_map has {} for file {:?} chunk {} (written_at={:?}) but file NOT on disk — chunk_map is stale/reverted; proceeding with client's {} (file exists={})",
-                                loc.chunk_id, fid, cidx, loc.written_at, chunk_id,
+                            warn!("[GHOST-stale-check] chunk_map has {} for file {} chunk {} (written_at={:?}) but file NOT on disk — chunk_map is stale/reverted; proceeding with client's {} (file exists={})",
+                                loc.chunk_id, file_id, cidx, loc.written_at, chunk_id,
                                 self.storage.get_chunk_path(&chunk_id).exists());
                         } else {
-                            info!("MultiPatch: stale chunk_id from client — file {:?} chunk {} client={} server={}",
-                                fid, cidx, chunk_id, loc.chunk_id);
+                            info!("MultiPatch: stale chunk_id from client — file {} chunk {} client={} server={}",
+                                file_id, cidx, chunk_id, loc.chunk_id);
                             return Response::ChunkStale {
                                 current_chunk_id: loc.chunk_id,
                                 current_nodes: loc.nodes.clone(),
@@ -4449,12 +4478,9 @@ impl Server {
             // hash is wrong: if the server's on-disk base differed (stale client
             // cache, healer update) the file would be named with the wrong hash,
             // silently corrupting the chunk.
-            let new_chunk_id = {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&chunk_file_offset.to_le_bytes());
-                hasher.update(&buf);
-                ChunkId::from_hash(*hasher.finalize().as_bytes())
-            };
+            let new_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&buf, chunk_file_offset, file_id)
+            );
 
             if new_chunk_id != chunk_id {
                 let new_path = storage.get_chunk_path(&new_chunk_id);
@@ -4494,6 +4520,7 @@ impl Server {
                         file_offset: old_loc.file_offset,
                         written_at: Some(now_secs),
                         client_write_seq: None,
+                        file_id: Some(file_id),
                     };
                     if let Err(e) = metadata.put_chunk_location(&new_loc) {
                         warn!("MultiPatch: failed to pre-register {} in sled: {}", new_chunk_id, e);
@@ -4534,9 +4561,9 @@ impl Server {
                     .as_millis() as u64;
                 if new_chunk_id != chunk_id {
                     const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-                    if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
+                    if let Some(cidx) = chunk_idx {
                         // Targeted: O(1) lookup by file_id.
-                        if let Some(mut entry) = self.chunk_map.get_mut(&fid) {
+                        if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
                             let (locations, _) = entry.value_mut();
                             if let Some(loc) = locations.iter_mut().find(|l| {
                                 l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)
@@ -4585,10 +4612,11 @@ impl Server {
                         file_offset: Some(chunk_file_offset),
                         written_at: Some(patch_ts),
                         client_write_seq,
+                        file_id: Some(file_id),
                     };
                     if let Some(leader_addr) = self.cluster.get_leader_addr().await {
                         if leader_addr != self.cluster.local_addr() {
-                            let req = Request::ReplicateChunkLocation { location, file_id };
+                            let req = Request::ReplicateChunkLocation { location, file_id: Some(file_id) };
                             let client = self.client.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = client.send_message(leader_addr, Message::Request(req)).await {
@@ -4598,7 +4626,7 @@ impl Server {
                         } else {
                             // We ARE the leader — update chunk_map directly, then sled.
                             // Reuse handle_replicate_chunk_location's merge + sled logic.
-                            self.handle_replicate_chunk_location(location, file_id).await;
+                            self.handle_replicate_chunk_location(location, Some(file_id)).await;
                         }
                     }
                 }
@@ -5633,7 +5661,11 @@ impl Server {
                 // Verify all replicas of this chunk concurrently (N RPCs in parallel,
                 // one per node), then await before moving on to the next chunk.
                 // Carry (found, valid) so we can distinguish ghost from corrupt.
-                let verify_req = dfs_common::Request::VerifyChunkIntegrity { chunk_id, file_offset };
+                let verify_req = dfs_common::Request::VerifyChunkIntegrity {
+                    chunk_id,
+                    file_offset,
+                    file_id: live_loc.file_id.or(chunk_loc.file_id),
+                };
                 let mut verify_set: tokio::task::JoinSet<(dfs_common::NodeId, std::net::SocketAddr, bool, bool)> =
                     tokio::task::JoinSet::new();
                 for &(node_id, addr) in &replica_addrs {
@@ -5708,6 +5740,7 @@ impl Server {
                             file_offset: live_loc.file_offset,
                             written_at: Some(now_ms),
                             client_write_seq: None,
+                            file_id: live_loc.file_id,
                         };
                         let _ = metadata.put_chunk_location(&updated);
                         // Broadcast to peers (fire-and-forget).
@@ -6199,7 +6232,7 @@ mod tests {
 
         // Write data
         let data = b"Hello, distributed filesystem!";
-        let chunk_ids_with_sizes = server.write_data(data).await.unwrap();
+        let chunk_ids_with_sizes = server.write_data(data, dfs_common::FileId::new()).await.unwrap();
 
         assert!(!chunk_ids_with_sizes.is_empty());
 

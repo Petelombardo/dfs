@@ -2160,6 +2160,99 @@ T32_ERR_COUNT=${T32_ERR_COUNT:-1}
 rm -f "$T32_FILE"
 fi # should_run T32
 
+# ── Test 33: fresh-chunk rewrite-before-flush-completes (silent data loss) ────
+#
+# A chunk filled to exactly CHUNK_SIZE via sequential writes triggers an async
+# is_full() flush (FRESH WRITE PATH, chunk_exists=false). flush_buffer_async_one
+# claims the slot (flushing=true) and snapshots its data/dirty_ranges/
+# last_modified before sending it to the storage nodes. If a small in-place
+# rewrite to an already-buffered offset (e.g. offset 0) arrives while that
+# flush is in flight, write_at finds the still-present slot and mutates
+# slot.data in place — slot.data.len() does NOT grow, since this is an
+# overwrite, not an append.
+#
+# The completion handler used to decide whether to remove the slot based only
+# on `current_len <= flushed_len` (did the slot grow past what was just
+# flushed?). An in-place overwrite leaves current_len == flushed_len, so the
+# slot — now holding the new dirty rewrite — was removed, silently discarding
+# it. This is exactly the write pattern QEMU/grub-install produces on VM disk
+# images: sequential 128KB writes fill a 4MB chunk, then a small fsync-adjacent
+# rewrite touches the start of that same chunk (e.g. an ext4 journal
+# superblock rewrite) — the trigger pattern behind staging VM 108's
+# "/images/108/vm-108-disk-2.raw" chunk 28 anomaly.
+#
+# Fix: flush_buffer_async_one's FRESH WRITE PATH now also checks
+# `last_modified > last_modified_snap` (matching the PATCH path's existing
+# T26 fix), keeping the slot alive (flushing=false, flushed_sizes populated)
+# so the rewrite is flushed on the next cycle as a full-replacement.
+if should_run T33; then
+snapshot_log T33
+echo ""
+echo "=== T33: fresh-chunk rewrite-before-flush-completes (silent data loss) ==="
+
+T33_FILE="$MOUNT/t33_rewrite.bin"
+
+T33_RESULT=$(python3 -c "
+import os, time
+
+CHUNK = 4 * 1024 * 1024
+path = '$T33_FILE'
+
+fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+os.ftruncate(fd, 2 * CHUNK)
+
+# Fill chunk 0 fully via 32x 128KB writes of pattern A (0xAA). The last write
+# makes the slot is_full(), triggering an async FRESH WRITE flush of the
+# whole 4MB chunk.
+patA = bytes([0xAA]) * (128 * 1024)
+for off in range(0, CHUNK, len(patA)):
+    n = os.pwrite(fd, patA, off)
+    assert n == len(patA), n
+
+# Give the async flush time to claim the slot and start sending it.
+time.sleep(0.1)
+
+# Second small write to offset 0, pattern B (0xBB) — an in-place overwrite of
+# already-buffered bytes (slot.data.len() does not grow).
+patB = bytes([0xBB]) * 4096
+n = os.pwrite(fd, patB, 0)
+assert n == 4096, n
+
+os.fsync(fd)
+os.close(fd)
+
+# Verify final content: [4096 bytes 0xBB][remaining 0xAA fill], read back
+# through the mount after fsync.
+fd = os.open(path, os.O_RDONLY)
+head = os.pread(fd, 4096, 0)
+tail = os.pread(fd, CHUNK - 4096, 4096)
+os.close(fd)
+
+errors = []
+if head != patB:
+    errors.append(f'head mismatch: first16={head[:16].hex()}')
+if tail != bytes([0xAA]) * (CHUNK - 4096):
+    bad = next((i for i, b in enumerate(tail) if b != 0xAA), -1)
+    errors.append(f'tail mismatch: first bad byte at offset {bad}, value={tail[bad]:#x}' if bad >= 0 else 'tail mismatch')
+
+for e in errors:
+    print(e)
+print(len(errors))
+")
+
+echo "$T33_RESULT" | sed 's/^/  /'
+T33_ERR_COUNT=$(echo "$T33_RESULT" | tail -1)
+T33_ERR_COUNT=${T33_ERR_COUNT:-1}
+
+dfs_sync
+
+[ "$T33_ERR_COUNT" = "0" ] \
+    && check "T33 in-place rewrite during in-flight fresh-chunk flush preserved" PASS \
+    || check "T33 in-place rewrite during in-flight fresh-chunk flush lost ($T33_ERR_COUNT errors)" FAIL
+
+rm -f "$T33_FILE"
+fi # should_run T33
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

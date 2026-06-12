@@ -1076,6 +1076,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
             let (ids1, sizes1, addr1) = match send_request(node1, Request::WriteFileLocalOnly {
                 data: flush_data.clone(),
                 file_offset: 0,
+                file_id: metadata.id,
             }).await? {
                 Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes, node1),
                 Response::Error { message, .. } => anyhow::bail!("Write to {} failed: {}", node1, message),
@@ -1085,6 +1086,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
             let (ids2, _sizes2, addr2) = match send_request(node2, Request::WriteFileLocalOnly {
                 data: flush_data,
                 file_offset: 0,
+                file_id: metadata.id,
             }).await? {
                 Response::ChunkIds { chunk_ids, chunk_sizes, .. } => (chunk_ids, chunk_sizes, node2),
                 Response::Error { message, .. } => anyhow::bail!("Write to {} failed: {}", node2, message),
@@ -1117,6 +1119,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
                     file_offset: Some(current_offset),
                     written_at: None,
                     client_write_seq: None,
+                    file_id: Some(metadata.id),
                 });
                 current_offset += chunk_size;
             }

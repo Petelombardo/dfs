@@ -831,6 +831,7 @@ impl HealingManager {
                     file_offset: location.file_offset,
                     written_at: location.written_at,
                     client_write_seq: None,
+                    file_id: location.file_id,
                 };
                 db_puts.push(updated_location.clone());
                 location_updates.push(updated_location);
@@ -871,6 +872,7 @@ impl HealingManager {
                         file_offset: location.file_offset,
                         written_at: Some(Self::now_ms()),
                         client_write_seq: None,
+                        file_id: location.file_id,
                     };
                     db_puts.push(updated_location.clone());
                     location_updates.push(updated_location);
@@ -968,6 +970,7 @@ impl HealingManager {
                     file_offset: location.file_offset,
                     written_at: location.written_at,
                     client_write_seq: None,
+                    file_id: location.file_id,
                 };
                 db_puts.push(updated_location.clone());
                 location_updates.push(updated_location.clone());
@@ -1535,6 +1538,7 @@ impl HealingManager {
                 file_offset: location.file_offset,
                 written_at: Some(Self::now_ms()),
                 client_write_seq: None,
+                file_id: location.file_id,
             };
 
             let meta = Arc::clone(metadata);
@@ -1671,6 +1675,7 @@ impl HealingManager {
                 file_offset: location.file_offset,
                 written_at: Some(heal_ts),
                 client_write_seq: None,
+                file_id: location.file_id,
             };
             let meta = Arc::clone(metadata);
             let loc = updated_location.clone();

@@ -6,6 +6,7 @@ use redb::{Database, Durability, ReadableTable, TableDefinition};
 // cache without fdatasync — fast, immediately visible to reads, survives process crashes,
 // only lost on kernel panic/power failure. Acceptable with 5-way replication.
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -64,6 +65,9 @@ pub enum PutFileResult {
 pub struct MetadataStore {
     db: RwLock<Database>,
     db_path: PathBuf,
+    /// Counts Durability::None commits since the last Durability::Immediate one.
+    /// See next_write_durability() for why this exists.
+    non_durable_commits: AtomicU64,
 }
 
 impl MetadataStore {
@@ -130,7 +134,31 @@ impl MetadataStore {
 
         info!("Initialized redb metadata store at {:?}", db_path);
 
-        Ok(Self { db: RwLock::new(db), db_path })
+        Ok(Self { db: RwLock::new(db), db_path, non_durable_commits: AtomicU64::new(0) })
+    }
+
+    /// Every Nth Durability::None write is instead committed with
+    /// Durability::Immediate, which as a side effect drains redb's
+    /// pending_non_durable_commits list (see compact_db()'s pre-flush comment).
+    ///
+    /// Without this, a sustained burst of insert+delete churn on the same table
+    /// (e.g. MultiPatch chunk-ID rotation while qemu-img rewrites a qcow2 image's
+    /// L2/refcount tables) lets that list grow unboundedly: the file balloons far
+    /// beyond its live-data size, and compact()'s cost scales with the churn
+    /// history rather than live data — turning a "should be milliseconds"
+    /// compaction into one that can run for tens of minutes while holding
+    /// the exclusive metadata write lock, freezing the whole node. A periodic
+    /// durable flush (measured: every 200 commits) keeps the file size and
+    /// compact() time proportional to live data instead.
+    const DURABILITY_FLUSH_INTERVAL: u64 = 200;
+
+    fn next_write_durability(&self) -> Durability {
+        let n = self.non_durable_commits.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % Self::DURABILITY_FLUSH_INTERVAL == 0 {
+            Durability::Immediate
+        } else {
+            Durability::None
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -164,7 +192,7 @@ impl MetadataStore {
         if !to_repair.is_empty() {
             let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
-            txn.set_durability(Durability::None);
+            txn.set_durability(self.next_write_durability());
             {
                 let mut path_table = txn.open_table(PATH_TABLE)?;
                 for (path, bytes) in &to_repair {
@@ -198,7 +226,7 @@ impl MetadataStore {
         if !stale_paths.is_empty() {
             let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
-            txn.set_durability(Durability::None);
+            txn.set_durability(self.next_write_durability());
             {
                 let mut path_table = txn.open_table(PATH_TABLE)?;
                 for path in &stale_paths {
@@ -229,7 +257,7 @@ impl MetadataStore {
 
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
 
         // Read-before-write: open both tables once and keep them alive for the
         // duration of the transaction so all reads and writes are atomic.
@@ -380,7 +408,7 @@ impl MetadataStore {
         let file_id_str = format!("{}", file_id);
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
         {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut path_table = txn.open_table(PATH_TABLE)?;
@@ -402,7 +430,7 @@ impl MetadataStore {
     pub fn delete_path_index(&self, path: &str) -> Result<()> {
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(PATH_TABLE)?;
             table.remove(path)?;
@@ -468,7 +496,7 @@ impl MetadataStore {
         if !stale_file_ids.is_empty() {
             let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
-            txn.set_durability(Durability::None);
+            txn.set_durability(self.next_write_durability());
             {
                 let mut file_table = txn.open_table(FILE_TABLE)?;
                 let mut path_table = txn.open_table(PATH_TABLE)?;
@@ -503,7 +531,7 @@ impl MetadataStore {
         if !stale_path_keys.is_empty() {
             let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
-            txn.set_durability(Durability::None);
+            txn.set_durability(self.next_write_durability());
             {
                 let mut table = txn.open_table(PATH_TABLE)?;
                 for path in &stale_path_keys {
@@ -563,7 +591,7 @@ impl MetadataStore {
             .context("Failed to serialize chunk location")?;
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             table.insert(key.as_str(), value.as_slice())?;
@@ -591,7 +619,7 @@ impl MetadataStore {
         let key = format!("{}", chunk_id);
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             table.remove(key.as_str())?;
@@ -613,7 +641,7 @@ impl MetadataStore {
         }
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             for location in puts {
@@ -728,7 +756,7 @@ impl MetadataStore {
         if !to_write.is_empty() {
             let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
-            txn.set_durability(Durability::None);
+            txn.set_durability(self.next_write_durability());
             {
                 let mut table = txn.open_table(CHUNK_TABLE)?;
                 for (key, bytes) in &to_write {
@@ -886,7 +914,7 @@ impl MetadataStore {
 
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
         {
             let mut queue_table = txn.open_table(META_QUEUE_TABLE)?;
             let mut idx_table = txn.open_table(META_QUEUE_IDX)?;
@@ -956,7 +984,7 @@ impl MetadataStore {
         if !to_remove.is_empty() {
             let _db = self.db.read().unwrap();
             let mut txn = _db.begin_write()?;
-            txn.set_durability(Durability::None);
+            txn.set_durability(self.next_write_durability());
             {
                 let mut table = txn.open_table(META_QUEUE_TABLE)?;
                 for key in &to_remove {
@@ -972,7 +1000,7 @@ impl MetadataStore {
     pub fn set_follower_sequence(&self, seq: u64) -> Result<()> {
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(COUNTERS_TABLE)?;
             table.insert("follower_seq", seq)?;
@@ -1065,7 +1093,7 @@ impl MetadataStore {
         let key = format!("del:{}", file_id);
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
-        txn.set_durability(Durability::None);
+        txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
             table.remove(key.as_str())?;
@@ -1238,6 +1266,7 @@ mod tests {
             file_offset: None,
             written_at: None,
             client_write_seq: None,
+            file_id: None,
         };
 
         store.put_chunk_location(&location).unwrap();

@@ -3599,6 +3599,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         &self,
         location: &dfs_common::ChunkLocation,
         file_offset: u64,
+        file_id: dfs_common::FileId,
         patches: &[(usize, Vec<u8>)],
     ) -> Option<(ChunkId, Vec<u8>)> {
         let addr = {
@@ -3616,7 +3617,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
             patched[*intra..end].copy_from_slice(data);
         }
-        let new_hash = dfs_common::compute_chunk_hash_at(&patched, file_offset);
+        let new_hash = dfs_common::compute_chunk_hash_at(&patched, file_offset, file_id);
         let new_cid = ChunkId::from_hash(new_hash);
         Some((new_cid, patched))
     }
@@ -4595,7 +4596,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Write data with synchronous dual-replica replication
     /// NEW: Writes each chunk to 2 nodes synchronously (not striped)
     /// Returns chunk_locations with replica tracking
-    pub async fn write_data_dual_replica(&self, data: &[u8], inode: u64, file_offset: u64, file_id: Option<dfs_common::FileId>, preferred_nodes: Option<&[SocketAddr]>) -> Result<Vec<dfs_common::ChunkLocation>> {
+    pub async fn write_data_dual_replica(&self, data: &[u8], inode: u64, file_offset: u64, file_id: dfs_common::FileId, preferred_nodes: Option<&[SocketAddr]>) -> Result<Vec<dfs_common::ChunkLocation>> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
             anyhow::bail!("Need at least 2 nodes for writes (only {} available)", nodes.len());
@@ -4686,7 +4687,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         inode: u64,
         file_offset: u64,
         all_nodes: &[SocketAddr],
-        file_id: Option<dfs_common::FileId>,
+        file_id: dfs_common::FileId,
     ) -> Result<Vec<dfs_common::ChunkLocation>> {
         const WRITE_TIMEOUT_SECS: u64 = 30;
 
@@ -4722,7 +4723,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             // This eliminates bincode overhead (~20-40ms) plus one 4MB copy (~25ms) = ~45-65ms savings.
             let request = Request::WriteFileLocalOnly {
                 data: Vec::new(),  // Empty = split-frame indicator
-                file_offset
+                file_offset,
+                file_id,
             };
             let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
             let envelope = MessageEnvelope::new(request_id, Message::Request(request));
@@ -4763,7 +4765,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Use split-frame encoding for serial fallback too
             let request = Request::WriteFileLocalOnly {
                 data: Vec::new(),  // Empty = split-frame indicator
-                file_offset
+                file_offset,
+                file_id,
             };
             let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
             let envelope = MessageEnvelope::new(request_id, Message::Request(request));
@@ -4830,7 +4833,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                 checksum: chunk_id.hash,
                 file_offset: Some(current_offset),
                 written_at: None, // fresh writes use None — see build_chunk_locations_from_ids
-                client_write_seq: file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e)),
+                client_write_seq: self.write_seq.get(&file_id).map(|e| *e),
+                file_id: Some(file_id),
             };
 
             chunk_locations.push(location);
@@ -4852,7 +4856,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // Without file_id, a new chunk (not yet in chunk_map) produces no match
                 // and the chunk_map stays stale — causing handle_put_file_metadata to
                 // override the correct new hash with the old chunk_map entry.
-                let req = Request::ReplicateChunkLocation { location, file_id };
+                let req = Request::ReplicateChunkLocation { location, file_id: Some(file_id) };
                 let mut backoff_ms = 250u64;
                 for attempt in 1u32..=4 {
                     match tokio::time::timeout(Duration::from_secs(3), client.send_request(leader, req.clone())).await {
@@ -5034,13 +5038,13 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Write data and populate byte-range cache for immediate read-back
     /// This enables zero-latency reads of just-written data (DVR use case)
     /// Returns (chunk_ids, chunk_sizes, chunk_locations) - locations include full replica node tracking
-    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64, file_id: Option<dfs_common::FileId>, preferred_nodes: Option<&[SocketAddr]>) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
+    pub async fn write_data_with_cache(&self, data: &[u8], inode: u64, file_offset: u64, file_id: dfs_common::FileId, preferred_nodes: Option<&[SocketAddr]>) -> Result<(Vec<ChunkId>, Vec<u64>, Option<Vec<dfs_common::ChunkLocation>>)> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.len() < 2 {
             // Single-node cluster: fall back to server-side replication
-            let (chunk_ids, chunk_sizes, replica_nodes_per_chunk) = self.write_data_single_chunk_tracked(data).await?;
-            let cws = file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e));
-            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk, cws);
+            let (chunk_ids, chunk_sizes, replica_nodes_per_chunk) = self.write_data_single_chunk_tracked(data, file_id).await?;
+            let cws = self.write_seq.get(&file_id).map(|e| *e);
+            let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk, cws, file_id);
             return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 
@@ -5054,11 +5058,11 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Write a chunk to a specific server
-    async fn write_chunk_to_server(server_addr: SocketAddr, data: Vec<u8>) -> Result<(Vec<ChunkId>, Vec<u64>)> {
+    async fn write_chunk_to_server(server_addr: SocketAddr, data: Vec<u8>, file_id: dfs_common::FileId) -> Result<(Vec<ChunkId>, Vec<u64>)> {
         let total_start = std::time::Instant::now();
         let data_len = data.len();
 
-        let request = Request::WriteFile { data };
+        let request = Request::WriteFile { data, file_id };
 
         // Create connection
         let connect_start = std::time::Instant::now();
@@ -5115,11 +5119,11 @@ leader_addr: Arc::new(RwLock::new(None)),
 
     /// Write a chunk to a specific server (local only, no replication)
     /// Used for optimized RF=3+ writes
-    async fn write_chunk_to_server_local_only(server_addr: SocketAddr, data: Vec<u8>, file_offset: u64) -> Result<(Vec<ChunkId>, Vec<u64>)> {
+    async fn write_chunk_to_server_local_only(server_addr: SocketAddr, data: Vec<u8>, file_offset: u64, file_id: dfs_common::FileId) -> Result<(Vec<ChunkId>, Vec<u64>)> {
         let total_start = std::time::Instant::now();
         let data_len = data.len();
 
-        let request = Request::WriteFileLocalOnly { data, file_offset };
+        let request = Request::WriteFileLocalOnly { data, file_offset, file_id };
 
         // Create connection
         let mut stream = tokio::time::timeout(
@@ -5165,16 +5169,17 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Write small data via single server (old path)
-    pub async fn write_data_single_chunk(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>)> {
-        let (chunk_ids, chunk_sizes, _) = self.write_data_single_chunk_tracked(data).await?;
+    pub async fn write_data_single_chunk(&self, data: &[u8], file_id: dfs_common::FileId) -> Result<(Vec<ChunkId>, Vec<u64>)> {
+        let (chunk_ids, chunk_sizes, _) = self.write_data_single_chunk_tracked(data, file_id).await?;
         Ok((chunk_ids, chunk_sizes))
     }
 
     /// Like write_data_single_chunk but also returns per-chunk replica node lists.
     /// The server includes all replica NodeIds in the ChunkIds response.
-    async fn write_data_single_chunk_tracked(&self, data: &[u8]) -> Result<(Vec<ChunkId>, Vec<u64>, Vec<Vec<NodeId>>)> {
+    async fn write_data_single_chunk_tracked(&self, data: &[u8], file_id: dfs_common::FileId) -> Result<(Vec<ChunkId>, Vec<u64>, Vec<Vec<NodeId>>)> {
         let request = Request::WriteFile {
             data: data.to_vec(),
+            file_id,
         };
 
         let nodes = self.cluster_nodes.read().await.clone();
@@ -5223,12 +5228,13 @@ leader_addr: Arc::new(RwLock::new(None)),
     pub async fn patch_chunk_on_replicas(
         &self,
         old_chunk_id: ChunkId,
+        file_id: FileId,
         chunk_file_offset: u64,
         intra_offset: usize,
         patch_data: Vec<u8>,
         old_location: &dfs_common::ChunkLocation,
     ) -> Result<dfs_common::ChunkLocation> {
-        self.patch_chunk_on_replicas_inner(old_chunk_id, None, None, chunk_file_offset, intra_offset, patch_data, old_location).await
+        self.patch_chunk_on_replicas_inner(old_chunk_id, file_id, None, chunk_file_offset, intra_offset, patch_data, old_location).await
     }
 
     pub async fn patch_chunk_on_replicas_verified(
@@ -5241,13 +5247,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         patch_data: Vec<u8>,
         old_location: &dfs_common::ChunkLocation,
     ) -> Result<dfs_common::ChunkLocation> {
-        self.patch_chunk_on_replicas_inner(old_chunk_id, Some(file_id), Some(chunk_idx), chunk_file_offset, intra_offset, patch_data, old_location).await
+        self.patch_chunk_on_replicas_inner(old_chunk_id, file_id, Some(chunk_idx), chunk_file_offset, intra_offset, patch_data, old_location).await
     }
 
     async fn patch_chunk_on_replicas_inner(
         &self,
         mut old_chunk_id: ChunkId,
-        file_id: Option<FileId>,
+        file_id: FileId,
         chunk_idx: Option<u64>,
         chunk_file_offset: u64,
         intra_offset: usize,
@@ -5355,7 +5361,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                         checksum: corrected_id.hash,
                         file_offset: current_location.file_offset,
                         written_at: None,
-                        client_write_seq: file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e)),
+                        client_write_seq: self.write_seq.get(&file_id).map(|e| *e),
+                        file_id: Some(file_id),
                     };
                     continue;
                 }
@@ -5383,7 +5390,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             checksum: new_chunk_id.hash,
             file_offset: current_location.file_offset,
             written_at: Some(patch_written_at),
-            client_write_seq: file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e)),
+            client_write_seq: self.write_seq.get(&file_id).map(|e| *e),
+            file_id: Some(file_id),
         };
         let leader_addr = *self.leader_addr.read().await;
         // Send ReplicateChunkLocation only to the leader — same rationale as MultiPatch path.
@@ -5391,7 +5399,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // creates racing stale updates. flush_metadata_sync delivers authoritative full state.
         if let Some(leader) = leader_addr {
             let client = self.clone();
-            let req = Request::ReplicateChunkLocation { location: new_location.clone(), file_id };
+            let req = Request::ReplicateChunkLocation { location: new_location.clone(), file_id: Some(file_id) };
             let mut backoff_ms = 250u64;
             for attempt in 1u32..=4 {
                 match tokio::time::timeout(
@@ -5451,8 +5459,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 chunk_idx, expected_chunk_id, current_loc.chunk_id);
         }
 
-        let new_loc = self.patch_chunk_on_replicas(
+        let new_loc = self.patch_chunk_on_replicas_verified(
             current_loc.chunk_id,
+            fresh_meta.id,
+            chunk_idx,
             chunk_file_offset,
             intra_offset,
             patch_data,
@@ -5468,13 +5478,14 @@ leader_addr: Arc::new(RwLock::new(None)),
     pub async fn multi_patch_chunk_on_replicas(
         &self,
         old_chunk_id: ChunkId,
+        file_id: FileId,
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
         dual_rf: bool,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
-        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, None, None, chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf).await
+        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, file_id, None, chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf).await
     }
 
     pub async fn multi_patch_chunk_on_replicas_verified(
@@ -5488,13 +5499,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         expected_new_chunk_id: Option<ChunkId>,
         dual_rf: bool,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
-        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, Some(file_id), Some(chunk_idx), chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf).await
+        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, file_id, Some(chunk_idx), chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf).await
     }
 
     async fn multi_patch_chunk_on_replicas_inner(
         &self,
         mut old_chunk_id: ChunkId,
-        file_id: Option<FileId>,
+        file_id: FileId,
         chunk_idx: Option<u64>,
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
@@ -5542,8 +5553,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             if replica_addrs.is_empty() {
                 warn!("MultiPatch: chunk {} NodeIds still unresolved after cluster refresh — querying leader for current location",
                       old_chunk_id);
-                if let (Some(fid), Some(cidx)) = (file_id, chunk_idx) {
-                    if let Ok(Some(fresh_loc)) = self.get_single_chunk_location(fid, cidx).await {
+                if let Some(cidx) = chunk_idx {
+                    if let Ok(Some(fresh_loc)) = self.get_single_chunk_location(file_id, cidx).await {
                         let fresh_addrs: Vec<SocketAddr> = fresh_loc.nodes.iter()
                             .filter_map(|nid| refreshed_node_id_to_addr.get(nid).copied())
                             .collect();
@@ -5597,7 +5608,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Capture the current write_seq for this file so the leader can use it to order
         // concurrent RCL notifications from the same file without relying on wall clocks.
-        let patch_client_write_seq = file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e));
+        let patch_client_write_seq = self.write_seq.get(&file_id).map(|e| *e);
 
         // Split-frame MultiPatch: when total patch data is large enough that bincode
         // serialization overhead matters (>= 32KB), serialize the envelope once with
@@ -5695,7 +5706,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                             checksum: current_chunk_id.hash,
                             file_offset: current_location.file_offset,
                             written_at: None,
-                            client_write_seq: file_id.and_then(|fid| self.write_seq.get(&fid).map(|e| *e)),
+                            client_write_seq: self.write_seq.get(&file_id).map(|e| *e),
+                            file_id: Some(file_id),
                         }));
                     }
                     replica_results.push((addr, Err(anyhow::anyhow!("chunk stale"))));
@@ -5806,6 +5818,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             // correctly identifies this patched chunk as newer than the old chunk it replaced.
             // Without this, Rule 2 sees (None, Some(old_seq)) and keeps the pre-patch chunk_id.
             client_write_seq: patch_client_write_seq,
+            file_id: Some(file_id),
         };
 
         // Send ReplicateChunkLocation ONLY to the leader.
@@ -5818,7 +5831,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // authoritative file state to leader + one follower with write_seq ordering.
         if let Some(leader) = leader_addr {
             let client = self.clone();
-            let req = Request::ReplicateChunkLocation { location: new_location.clone(), file_id };
+            let req = Request::ReplicateChunkLocation { location: new_location.clone(), file_id: Some(file_id) };
             let mut backoff_ms = 250u64;
             for attempt in 1u32..=4 {
                 match tokio::time::timeout(
@@ -5863,6 +5876,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         file_offset: u64,
         replica_nodes_per_chunk: Vec<Vec<NodeId>>,
         client_write_seq: Option<u64>,
+        file_id: dfs_common::FileId,
     ) -> Vec<dfs_common::ChunkLocation> {
         // written_at intentionally None for fresh writes. Using the client clock here
         // creates a timestamp that can exceed any server-side patch_ts (client ahead of
@@ -5881,6 +5895,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 file_offset: Some(current_offset),
                 written_at: None,
                 client_write_seq,
+                file_id: Some(file_id),
             });
             current_offset += size;
         }

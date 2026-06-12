@@ -1,4 +1,4 @@
-use crate::types::{ChunkId, NodeId};
+use crate::types::{ChunkId, FileId, NodeId};
 use blake3::Hasher;
 use std::collections::BTreeMap;
 
@@ -119,13 +119,17 @@ pub fn compute_chunk_hash(data: &[u8]) -> [u8; 32] {
     *hash.as_bytes()
 }
 
-/// Compute Blake3 hash of data mixed with its file offset.
-/// This prevents content-addressed deduplication from aliasing identical
-/// blocks at different positions (e.g. zero-filled sparse regions in a
-/// qcow2 image). Two chunks with identical bytes but different file offsets
-/// will get distinct ChunkIds and can be updated independently.
-pub fn compute_chunk_hash_at(data: &[u8], file_offset: u64) -> [u8; 32] {
+/// Compute Blake3 hash of data mixed with its file offset and owning file.
+/// Mixing in `file_id` makes every ChunkId file-scoped: two different files
+/// with byte-identical content at the same chunk-grid offset (e.g. zero-filled
+/// regions in two qcow2 images, or two test files with the same fill pattern)
+/// get distinct ChunkIds and can never alias each other in the global
+/// chunk_locations table or on-disk chunk path. Mixing in file_offset still
+/// prevents identical blocks at different positions *within* the same file
+/// from aliasing (e.g. zero-filled sparse regions in a qcow2 image).
+pub fn compute_chunk_hash_at(data: &[u8], file_offset: u64, file_id: FileId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(file_id.0.as_bytes());
     hasher.update(&file_offset.to_le_bytes());
     hasher.update(data);
     *hasher.finalize().as_bytes()

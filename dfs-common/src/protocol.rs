@@ -161,11 +161,14 @@ pub enum Request {
     },
 
     /// Verify that a chunk's on-disk data matches its content-addressed ID.
-    /// The hash is position-aware (Blake3 of file_offset || data), so the caller
-    /// must supply the file_offset stored in ChunkLocation. Returns ChunkValid.
+    /// The hash is file-scoped and position-aware (Blake3 of file_id || file_offset || data),
+    /// so the caller must supply the file_offset and file_id stored in ChunkLocation.
+    /// file_id of None skips verification (legacy record). Returns ChunkValid.
     VerifyChunkIntegrity {
         chunk_id: ChunkId,
         file_offset: u64,
+        #[serde(default)]
+        file_id: Option<FileId>,
     },
 
     /// Get file metadata by file ID
@@ -199,16 +202,19 @@ pub enum Request {
     /// Write file data (returns chunk IDs)
     WriteFile {
         data: Vec<u8>,
+        file_id: FileId,
     },
 
     /// Write file data locally only (no replication, returns chunk IDs)
     /// Used for optimized RF=3+ writes where client sends to 2 servers in parallel
     /// and healing creates the 3rd replica in background.
-    /// file_offset is mixed into the chunk hash to prevent deduplication aliasing
-    /// (identical blocks at different file positions must get distinct ChunkIds).
+    /// file_offset and file_id are mixed into the chunk hash to prevent
+    /// deduplication aliasing: identical blocks at different file positions, or
+    /// at the same position in different files, must get distinct ChunkIds.
     WriteFileLocalOnly {
         data: Vec<u8>,
         file_offset: u64,
+        file_id: FileId,
     },
 
     /// Delete file by path
@@ -307,10 +313,10 @@ pub enum Request {
         /// Existing chunk to patch
         chunk_id: ChunkId,
         /// File this chunk belongs to — used by the server to validate chunk_id against
-        /// its local chunk map. If the server's record for (file_id, chunk_idx) differs
-        /// from chunk_id it returns ChunkStale instead of applying the patch.
-        #[serde(default)]
-        file_id: Option<FileId>,
+        /// its local chunk map (if the server's record for (file_id, chunk_idx) differs
+        /// from chunk_id it returns ChunkStale instead of applying the patch), and mixed
+        /// into the post-patch chunk hash so the new ChunkId stays file-scoped.
+        file_id: FileId,
         /// Index of this chunk within the file (chunk_file_offset / CHUNK_SIZE).
         #[serde(default)]
         chunk_idx: Option<u64>,
@@ -329,9 +335,9 @@ pub enum Request {
     MultiPatch {
         /// Existing chunk to patch
         chunk_id: ChunkId,
-        /// File this chunk belongs to — for server-side chunk_id validation.
-        #[serde(default)]
-        file_id: Option<FileId>,
+        /// File this chunk belongs to — for server-side chunk_id validation, and
+        /// mixed into the post-patch chunk hash so the new ChunkId stays file-scoped.
+        file_id: FileId,
         /// Index of this chunk within the file.
         #[serde(default)]
         chunk_idx: Option<u64>,

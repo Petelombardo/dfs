@@ -345,6 +345,14 @@ pub struct ChunkLocation {
     /// Higher value = newer patch. None for fresh writes and legacy records.
     #[serde(default)]
     pub client_write_seq: Option<u64>,
+
+    /// File this chunk's ChunkId was derived from (chunk_id is now
+    /// blake3(file_id || file_offset || data), so this is the file_id input
+    /// to that hash). Used to re-verify a chunk's content hash during healing
+    /// and scrubbing. None for records written before this field was added or
+    /// reconstructed without file context — verification is skipped in that case.
+    #[serde(default)]
+    pub file_id: Option<FileId>,
 }
 
 impl ChunkLocation {

@@ -2,7 +2,7 @@
 // Measures: chunking, serialization, network I/O, disk I/O, metadata updates
 
 use dfs_client::DfsClient;
-use dfs_common::{compute_chunk_hash, ChunkId, Message, MessageEnvelope, Request, RequestId};
+use dfs_common::{compute_chunk_hash, ChunkId, FileId, Message, MessageEnvelope, Request, RequestId};
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,7 +66,7 @@ async fn benchmark_write_local_only(server_addr: SocketAddr, data: Vec<u8>) -> a
 
     // Stage 2: Serialization
     let serialize_start = Instant::now();
-    let request = Request::WriteFileLocalOnly { data, file_offset: 0 };
+    let request = Request::WriteFileLocalOnly { data, file_offset: 0, file_id: FileId::new() };
     let request_id = RequestId::new(1);
     let envelope = MessageEnvelope::new(request_id, Message::Request(request));
     let encoded = envelope.to_bytes()?;

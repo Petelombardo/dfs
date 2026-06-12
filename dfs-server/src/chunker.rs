@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use dfs_common::{compute_chunk_hash, compute_chunk_hash_at, ChunkId};
+use dfs_common::{compute_chunk_hash, compute_chunk_hash_at, ChunkId, FileId};
 use std::io::Read;
 
 /// File chunker - splits files into fixed-size chunks
@@ -21,20 +21,22 @@ impl Chunker {
 
     /// Split data into chunks and return chunk IDs and data
     /// Uses streaming to avoid loading entire file into memory
-    pub fn chunk_data(&self, data: &[u8]) -> Vec<(ChunkId, Vec<u8>)> {
-        self.chunk_data_at(data, 0)
+    pub fn chunk_data(&self, data: &[u8], file_id: FileId) -> Vec<(ChunkId, Vec<u8>)> {
+        self.chunk_data_at(data, 0, file_id)
     }
 
-    /// Split data into chunks with position-aware chunk IDs.
+    /// Split data into chunks with position-aware, file-scoped chunk IDs.
     /// file_offset is the byte offset of data[0] within the file.
-    /// Mixing the offset into the hash prevents content-addressed deduplication
-    /// from aliasing identical blocks (e.g. zero regions) at different positions.
-    pub fn chunk_data_at(&self, data: &[u8], file_offset: u64) -> Vec<(ChunkId, Vec<u8>)> {
+    /// Mixing the offset and file_id into the hash prevents content-addressed
+    /// deduplication from aliasing identical blocks (e.g. zero regions) at
+    /// different positions within a file, or at the same position across
+    /// different files.
+    pub fn chunk_data_at(&self, data: &[u8], file_offset: u64, file_id: FileId) -> Vec<(ChunkId, Vec<u8>)> {
         let mut chunks = Vec::new();
         let mut current_offset = file_offset;
 
         for chunk_data in data.chunks(self.chunk_size) {
-            let hash = compute_chunk_hash_at(chunk_data, current_offset);
+            let hash = compute_chunk_hash_at(chunk_data, current_offset, file_id);
             let chunk_id = ChunkId::from_hash(hash);
             chunks.push((chunk_id, chunk_data.to_vec()));
             current_offset += chunk_data.len() as u64;
@@ -95,7 +97,7 @@ mod tests {
         let chunker = Chunker::new(1024); // 1KB chunks
         let data = b"Hello, World!";
 
-        let chunks = chunker.chunk_data(data);
+        let chunks = chunker.chunk_data(data, FileId::new());
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].1, data);
     }
@@ -105,7 +107,7 @@ mod tests {
         let chunker = Chunker::new(10); // 10 byte chunks for testing
         let data = b"This is a test string that is longer than 10 bytes";
 
-        let chunks = chunker.chunk_data(data);
+        let chunks = chunker.chunk_data(data, FileId::new());
         assert!(chunks.len() > 1);
 
         // Verify reassembly
@@ -134,7 +136,7 @@ mod tests {
         let chunker = Chunker::new(10);
         let data = vec![1u8; 30]; // Exactly 3 chunks
 
-        let chunks = chunker.chunk_data(&data);
+        let chunks = chunker.chunk_data(&data, FileId::new());
         assert_eq!(chunks.len(), 3);
         for (_, chunk_data) in chunks {
             assert_eq!(chunk_data.len(), 10);
@@ -158,7 +160,7 @@ mod tests {
         let chunker = Chunker::new(1024);
         let data = b"";
 
-        let chunks = chunker.chunk_data(data);
+        let chunks = chunker.chunk_data(data, FileId::new());
         assert_eq!(chunks.len(), 0); // No chunks for empty data
     }
 
@@ -166,9 +168,10 @@ mod tests {
     fn test_chunk_deterministic() {
         let chunker = Chunker::new(100);
         let data = b"Deterministic test data";
+        let file_id = FileId::new();
 
-        let chunks1 = chunker.chunk_data(data);
-        let chunks2 = chunker.chunk_data(data);
+        let chunks1 = chunker.chunk_data(data, file_id);
+        let chunks2 = chunker.chunk_data(data, file_id);
 
         // Same data should produce same chunk IDs
         assert_eq!(chunks1.len(), chunks2.len());

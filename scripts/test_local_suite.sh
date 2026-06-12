@@ -52,9 +52,12 @@ pkill -f "dfs-server" 2>/dev/null || true
 pkill -f "dfs-client" 2>/dev/null || true
 sleep 0.5
 fusermount -u $MOUNT 2>/dev/null || true
-# Keep $LOG (test logs) — cleared only here at run start, never at end.
-# Per-test T<N>.log snapshots persist for post-mortem debugging.
-sudo rm -rf $BASE $MOUNT $T 2>/dev/null || rm -rf $BASE $MOUNT $T 2>/dev/null || true
+# Remove all artifacts from previous runs: $BASE/$MOUNT/$T, any stale
+# dfs-suite-tmp-* dirs left behind by a crashed/interrupted run (different
+# $$), and last run's $LOG so debug-level logs don't accumulate across runs.
+# Per-test T<N>.log snapshots from the run that just finished remain available
+# until this cleanup runs again at the start of the next invocation.
+sudo rm -rf $BASE $MOUNT $T $LOG /tmp/dfs-suite-tmp-* 2>/dev/null || rm -rf $BASE $MOUNT $T $LOG /tmp/dfs-suite-tmp-* 2>/dev/null || true
 mkdir -p $MOUNT $LOG $T
 
 echo "=== Building ==="

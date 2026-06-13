@@ -583,35 +583,6 @@ impl ClusterManager {
     }
 
     /// Update capacity information for a node
-    /// Return aggregate (total_space, available_space) across all nodes with recent capacity
-    /// data, divided by replication_factor so the result reflects logical (user-visible)
-    /// capacity rather than raw physical capacity.  Nodes whose data is stale (> 5 min old)
-    /// are excluded so a dead node doesn't permanently deflate reported free space.
-    pub async fn get_aggregate_capacity(&self, replication_factor: u64) -> (u64, u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        const STALE_SECS: u64 = 300;
-        let rf = replication_factor.max(1);
-
-        let capacities = self.node_capacities.read().await;
-        let mut total_sum: u64 = 0;
-        let mut available_sum: u64 = 0;
-        let mut count: u64 = 0;
-        for cap in capacities.values() {
-            if now.saturating_sub(cap.last_updated) <= STALE_SECS {
-                total_sum = total_sum.saturating_add(cap.total);
-                available_sum = available_sum.saturating_add(cap.available);
-                count += 1;
-            }
-        }
-        if count == 0 {
-            return (0, 0);
-        }
-        (total_sum / rf, available_sum / rf)
-    }
-
     pub async fn update_node_capacity(&self, node_id: NodeId, available: u64, total: u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)

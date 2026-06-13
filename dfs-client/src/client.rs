@@ -6513,7 +6513,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         //   Iteration 2: Pick top 3 (0,0,0), min=0G, done
         //   → Total = 100G (NOT 13G from naive formula!)
         let usable_total = total_raw_space / replication_factor as u64;
-        let usable_available = calculate_usable_capacity(
+        let usable_available = dfs_common::calculate_usable_capacity(
             &node_capacities.iter().map(|(_, avail)| *avail).collect::<Vec<_>>(),
             replication_factor
         );
@@ -6543,59 +6543,4 @@ leader_addr: Arc::new(RwLock::new(None)),
             _ => anyhow::bail!("Unexpected response type"),
         }
     }
-}
-
-/// Calculate usable capacity using greedy algorithm for smart replica set selection
-///
-/// This algorithm correctly handles heterogeneous clusters by iteratively selecting
-/// the best replica sets (top RF nodes by capacity) and accounting for their bottleneck.
-///
-/// Example: RF=3, nodes (100G, 100G, 100G, 10G)
-///   - Iteration 1: Pick top 3 (100,100,100), min=100G, add 100G to total
-///   - Iteration 2: Pick top 3 (0,0,0), min=0G, done
-///   - Result: 100G (NOT 13G from naive min×nodes/RF formula)
-///
-/// This matches the bash algorithm provided by the user and works for any RF value.
-fn calculate_usable_capacity(node_capacities: &[u64], replication_factor: usize) -> u64 {
-    if node_capacities.is_empty() || replication_factor == 0 {
-        return 0;
-    }
-
-    let mut capacities = node_capacities.to_vec();
-    let mut total = 0u64;
-
-    loop {
-        // Filter out zeros and sort descending
-        let mut non_zero: Vec<u64> = capacities.iter()
-            .copied()
-            .filter(|&c| c > 0)
-            .collect();
-
-        // Check if we have at least RF nodes with capacity > 0
-        if non_zero.len() < replication_factor {
-            break;
-        }
-
-        // Sort descending
-        non_zero.sort_by(|a, b| b.cmp(a));
-
-        // The decrement is the minimum of the top RF nodes (the RF-th largest value)
-        let decrement = non_zero[replication_factor - 1];
-        total += decrement;
-
-        // Subtract decrement ONLY from the top RF nodes
-        let mut decremented_count = 0;
-        for val in &non_zero[0..replication_factor] {
-            // Find this value in the original capacities array and decrement it
-            for capacity in &mut capacities {
-                if *capacity == *val && decremented_count < replication_factor {
-                    *capacity = capacity.saturating_sub(decrement);
-                    decremented_count += 1;
-                    break; // Move to next value in the top RF
-                }
-            }
-        }
-    }
-
-    total
 }

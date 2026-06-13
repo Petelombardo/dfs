@@ -390,30 +390,6 @@ async fn handle_cluster_command(
     Ok(())
 }
 
-/// Greedy algorithm: how much can we store given per-node availabilities and RF?
-/// Each iteration picks the RF nodes with the most space, records their bottleneck,
-/// subtracts it, and repeats — correctly handling heterogeneous nodes.
-fn storage_usable_capacity(availabilities: &[u64], rf: usize) -> u64 {
-    if availabilities.is_empty() || rf == 0 { return 0; }
-    let mut caps = availabilities.to_vec();
-    let mut total = 0u64;
-    loop {
-        let mut non_zero: Vec<u64> = caps.iter().copied().filter(|&c| c > 0).collect();
-        if non_zero.len() < rf { break; }
-        non_zero.sort_by(|a, b| b.cmp(a));
-        let decrement = non_zero[rf - 1];
-        total += decrement;
-        let mut done = 0;
-        for cap in &mut caps {
-            if *cap > 0 && done < rf {
-                *cap = cap.saturating_sub(decrement);
-                done += 1;
-            }
-        }
-    }
-    total
-}
-
 async fn handle_storage_command(
     cmd: StorageCommands,
     cluster_addrs: &[SocketAddr],
@@ -468,7 +444,7 @@ async fn handle_storage_command(
             let total_raw: u64 = node_stats.iter().map(|n| n.total).sum();
             let avail_raw: Vec<u64> = node_stats.iter().map(|n| n.available).collect();
             let usable_total = total_raw / rf as u64;
-            let usable_avail = storage_usable_capacity(&avail_raw, rf);
+            let usable_avail = dfs_common::calculate_usable_capacity(&avail_raw, rf);
             let usable_used = usable_total.saturating_sub(usable_avail);
 
             let gb = |b: u64| b as f64 / 1_073_741_824.0;

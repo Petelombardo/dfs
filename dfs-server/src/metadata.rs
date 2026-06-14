@@ -36,7 +36,26 @@ const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counter
 /// "del:{file_id}" → bincode(DeleteQueueEntry)
 const DELETE_QUEUE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("delete_queue");
 
+/// chunk_id hex string → unix seconds when first detected as needing healing.
+/// Persists HealingManager's per-chunk debounce timer across restarts so a
+/// process restart doesn't reset the healing_delay_secs clock for the whole
+/// backlog at once.
+const PENDING_HEALING_TABLE: TableDefinition<&str, u64> = TableDefinition::new("pending_healing");
+
 // ---------------------------------------------------------------------------
+
+/// Decode a 64-character lowercase hex string (as produced by `ChunkId::to_hex`)
+/// back into 32 raw bytes. Returns `None` on malformed input.
+fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
 
 /// Increment the last byte of a prefix to produce its exclusive upper bound.
 /// All prefix strings used here end with ASCII characters far below 0xFF.
@@ -129,6 +148,7 @@ impl MetadataStore {
             txn.open_table(META_QUEUE_IDX)?;
             txn.open_table(COUNTERS_TABLE)?;
             txn.open_table(DELETE_QUEUE_TABLE)?;
+            txn.open_table(PENDING_HEALING_TABLE)?;
             txn.commit()?;
         }
 
@@ -628,6 +648,59 @@ impl MetadataStore {
         Ok(())
     }
 
+    // -------------------------------------------------------------------------
+    // Pending healing (per-chunk debounce timer, survives process restart)
+    // -------------------------------------------------------------------------
+
+    /// Record that `chunk_id` was first observed as needing healing at
+    /// `detected_at_secs` (unix seconds). Idempotent — callers should only
+    /// write this once per detection (on first insert into the in-memory map).
+    pub fn put_pending_healing(&self, chunk_id: &ChunkId, detected_at_secs: u64) -> Result<()> {
+        let key = format!("{}", chunk_id);
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
+            table.insert(key.as_str(), detected_at_secs)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Clear the persisted debounce timer for `chunk_id` (chunk reached RF, or
+    /// was purged).
+    pub fn delete_pending_healing(&self, chunk_id: &ChunkId) -> Result<()> {
+        let key = format!("{}", chunk_id);
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
+            table.remove(key.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Read all persisted (chunk_id, first_detected_at_secs) entries. Used at
+    /// HealingManager startup to seed the in-memory pending_healing map so the
+    /// healing_delay_secs debounce reflects time elapsed before this process
+    /// started, not just since this process started.
+    pub fn get_pending_healing_inventory(&self) -> Result<Vec<(ChunkId, u64)>> {
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let table = txn.open_table(PENDING_HEALING_TABLE)?;
+        let mut out = Vec::new();
+        for item in table.range::<&str>(..)? {
+            let (k, v) = item?;
+            if let Some(hash) = decode_hex_32(k.value()) {
+                out.push((ChunkId::from_hash(hash), v.value()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Batch apply chunk location updates — all puts and deletes in one write transaction.
     /// Use this from async code via `spawn_blocking` to avoid blocking Tokio worker threads
     /// on redb's exclusive write lock.
@@ -810,6 +883,48 @@ impl MetadataStore {
         let txn = _db.begin_read()?;
         let table = txn.open_table(COUNTERS_TABLE)?;
         Ok(table.get("meta_seq")?.map(|v| v.value()).unwrap_or(0))
+    }
+
+    /// Persist which node most recently became cluster leader, and the unix
+    /// epoch second its current leadership episode began. On the next startup,
+    /// if this node becomes leader again and matches the persisted NodeId, the
+    /// grace period (LEADER_CHANGE_GRACE_SECS) carries over from `since_secs`
+    /// instead of restarting — see `cluster::resolve_became_leader_epoch`.
+    pub fn put_leader_state(&self, node_id: NodeId, since_secs: u64) -> Result<()> {
+        let bytes = node_id.as_bytes();
+        let hi = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let lo = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        {
+            let mut table = txn.open_table(COUNTERS_TABLE)?;
+            table.insert("leader_state_hi", hi)?;
+            table.insert("leader_state_lo", lo)?;
+            table.insert("leader_state_since_secs", since_secs)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Read back the last-persisted leader NodeId and its leadership-episode
+    /// start time (unix seconds), if any has ever been recorded.
+    pub fn get_leader_state(&self) -> Result<(Option<NodeId>, Option<u64>)> {
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let table = txn.open_table(COUNTERS_TABLE)?;
+        let hi = table.get("leader_state_hi")?.map(|v| v.value());
+        let lo = table.get("leader_state_lo")?.map(|v| v.value());
+        let since = table.get("leader_state_since_secs")?.map(|v| v.value());
+        let node_id = match (hi, lo) {
+            (Some(h), Some(l)) => {
+                let mut bytes = [0u8; 16];
+                bytes[0..8].copy_from_slice(&h.to_be_bytes());
+                bytes[8..16].copy_from_slice(&l.to_be_bytes());
+                Some(NodeId::from_bytes(bytes))
+            }
+            _ => None,
+        };
+        Ok((node_id, since))
     }
 
     /// Format node_id as a fixed-length hex string for use as a key prefix.
@@ -1276,5 +1391,48 @@ mod tests {
         let retrieved = store.get_chunk_location(&chunk_id).unwrap().unwrap();
         assert_eq!(retrieved.nodes.len(), 2);
         assert_eq!(retrieved.size, 4096);
+    }
+
+    #[test]
+    fn test_pending_healing_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let chunk_a = ChunkId::from_hash([3u8; 32]);
+        let chunk_b = ChunkId::from_hash([4u8; 32]);
+
+        store.put_pending_healing(&chunk_a, 1_000).unwrap();
+        store.put_pending_healing(&chunk_b, 2_000).unwrap();
+
+        let mut inventory = store.get_pending_healing_inventory().unwrap();
+        inventory.sort_by_key(|(_, secs)| *secs);
+        assert_eq!(inventory, vec![(chunk_a, 1_000), (chunk_b, 2_000)]);
+
+        store.delete_pending_healing(&chunk_a).unwrap();
+        let inventory = store.get_pending_healing_inventory().unwrap();
+        assert_eq!(inventory, vec![(chunk_b, 2_000)]);
+    }
+
+    #[test]
+    fn test_leader_state_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        // No leader recorded yet.
+        assert_eq!(store.get_leader_state().unwrap(), (None, None));
+
+        let node_id = NodeId::new();
+        store.put_leader_state(node_id, 12_345).unwrap();
+
+        let (leader, since) = store.get_leader_state().unwrap();
+        assert_eq!(leader, Some(node_id));
+        assert_eq!(since, Some(12_345));
+
+        // Overwrite with a different node/time.
+        let node_id2 = NodeId::new();
+        store.put_leader_state(node_id2, 67_890).unwrap();
+        let (leader, since) = store.get_leader_state().unwrap();
+        assert_eq!(leader, Some(node_id2));
+        assert_eq!(since, Some(67_890));
     }
 }

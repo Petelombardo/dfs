@@ -60,6 +60,27 @@ pub struct ClusterManager {
     became_leader_at: Arc<RwLock<Option<std::time::Instant>>>,
 }
 
+/// Decide the epoch (unix secs) this leadership episode "started" at.
+///
+/// If the same node was already the leader before (persisted), carry over its
+/// original start time so the post-election grace period
+/// (`healing::LEADER_CHANGE_GRACE_SECS`) doesn't restart on a simple process
+/// restart of the same perpetual leader. Otherwise — a different node was
+/// previously leader, or there's no prior record — this is a genuine new
+/// election, so start the clock now.
+pub fn resolve_became_leader_epoch(
+    prev_leader: Option<NodeId>,
+    prev_since_secs: Option<u64>,
+    local_id: NodeId,
+    now_secs: u64,
+) -> u64 {
+    if prev_leader == Some(local_id) {
+        prev_since_secs.unwrap_or(now_secs)
+    } else {
+        now_secs
+    }
+}
+
 impl ClusterManager {
     /// Create a new cluster manager
     pub fn new(
@@ -291,6 +312,19 @@ impl ClusterManager {
     /// How long ago this node became leader, or None if it has never been leader.
     pub async fn time_since_became_leader(&self) -> Option<std::time::Duration> {
         self.became_leader_at.read().await.map(|t| t.elapsed())
+    }
+
+    /// Set `became_leader_at` so that `time_since_became_leader()` reflects
+    /// `became_leader_at_secs` (a unix-epoch second), not just "now". Used on a
+    /// leader-election transition together with `resolve_became_leader_epoch` so
+    /// that the LEADER_CHANGE_GRACE_SECS countdown carries over across a restart
+    /// of the same perpetual leader instead of restarting from zero.
+    pub async fn set_became_leader_epoch(&self, became_leader_at_secs: u64, now_secs: u64) {
+        let age = now_secs.saturating_sub(became_leader_at_secs);
+        let became_leader_at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(age))
+            .unwrap_or_else(std::time::Instant::now);
+        *self.became_leader_at.write().await = Some(became_leader_at);
     }
 
     /// Grace period after a GracefulLeave before healing treats the node as Failed.
@@ -1086,5 +1120,44 @@ mod tests {
         assert_eq!(stats.total_nodes, 1);
         assert_eq!(stats.online_nodes, 1);
         assert_eq!(stats.failed_nodes, 0);
+    }
+
+    /// resolve_became_leader_epoch: same node regaining leadership carries over its
+    /// original start time; a different (or no) prior leader gets a fresh clock.
+    #[test]
+    fn test_resolve_became_leader_epoch() {
+        let node_x = NodeId::new();
+        let node_y = NodeId::new();
+        let now = 1_000_000u64;
+
+        // Same node was leader before — carry over the original start time.
+        assert_eq!(
+            resolve_became_leader_epoch(Some(node_x), Some(now - 1000), node_x, now),
+            now - 1000
+        );
+
+        // A different node was leader before — fresh clock for the new leader.
+        assert_eq!(
+            resolve_became_leader_epoch(Some(node_y), Some(now - 1000), node_x, now),
+            now
+        );
+
+        // No prior record at all — fresh clock.
+        assert_eq!(resolve_became_leader_epoch(None, None, node_x, now), now);
+    }
+
+    /// set_became_leader_epoch: time_since_became_leader() reflects the carried-over
+    /// start time, not just "now".
+    #[tokio::test]
+    async fn test_set_became_leader_epoch_carries_over() {
+        let local_id = NodeId::new();
+        let local_addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let manager = ClusterManager::new(local_id, local_addr, 10, 30);
+
+        let now = dfs_common::types::current_timestamp();
+        manager.set_became_leader_epoch(now - 1000, now).await;
+
+        let elapsed = manager.time_since_became_leader().await.unwrap();
+        assert!(elapsed.as_secs() >= 1000, "expected >=1000s elapsed, got {}s", elapsed.as_secs());
     }
 }

@@ -634,7 +634,18 @@ impl Server {
                 // On leadership acquisition, announce to all peers immediately so any
                 // concurrent split-brain leader with a higher NodeId concedes.
                 if is_leader && !was_leader {
-                    server.cluster.notify_became_leader().await;
+                    // Carry over the post-election grace period (LEADER_CHANGE_GRACE_SECS)
+                    // if this node was already the leader before a restart, instead of
+                    // resetting it to zero every time the perpetual lowest-NodeId leader
+                    // restarts. A genuinely different leader still gets a fresh grace period.
+                    let now_secs = dfs_common::types::current_timestamp();
+                    let local_id = server.cluster.local_node_id();
+                    let (prev_leader, prev_since) = server.metadata.get_leader_state().unwrap_or((None, None));
+                    let became_leader_at_secs = crate::cluster::resolve_became_leader_epoch(prev_leader, prev_since, local_id, now_secs);
+                    server.cluster.set_became_leader_epoch(became_leader_at_secs, now_secs).await;
+                    if let Err(e) = server.metadata.put_leader_state(local_id, became_leader_at_secs) {
+                        warn!("Failed to persist leader state: {}", e);
+                    }
                     info!("Became leader — announcing leadership to all peers");
                     let nodes = server.cluster.get_all_nodes().await;
                     let local_id = server.cluster.local_node_id();

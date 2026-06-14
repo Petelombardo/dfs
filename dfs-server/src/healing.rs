@@ -121,6 +121,30 @@ impl HealingManager {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(120); // 2 minutes per transfer before timing out
 
+        // Restore pending_healing first-detection times across process restarts.
+        // Without this, every restart resets the whole backlog's debounce timer to
+        // "just now", and a busy leader that restarts more often than
+        // healing_delay_secs never heals anything.
+        let mut pending_healing_map = HashMap::new();
+        match metadata.get_pending_healing_inventory() {
+            Ok(entries) => {
+                let now_secs = dfs_common::types::current_timestamp();
+                for (chunk_id, detected_at_secs) in entries {
+                    let age = now_secs.saturating_sub(detected_at_secs);
+                    let detected_at = Instant::now()
+                        .checked_sub(Duration::from_secs(age))
+                        .unwrap_or_else(Instant::now);
+                    pending_healing_map.insert(chunk_id, detected_at);
+                }
+                if !pending_healing_map.is_empty() {
+                    info!("Restored {} pending-healing entries from persisted state", pending_healing_map.len());
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load persisted pending_healing inventory: {}", e);
+            }
+        }
+
         Self {
             storage,
             metadata,
@@ -133,7 +157,7 @@ impl HealingManager {
             max_heal_per_cycle,
             heal_semaphore,
             heal_semaphore_capacity,
-            pending_healing: Arc::new(RwLock::new(HashMap::new())),
+            pending_healing: Arc::new(RwLock::new(pending_healing_map)),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
             stalled_healing: Arc::new(RwLock::new(HashSet::new())),
@@ -279,36 +303,75 @@ impl HealingManager {
         }
     }
 
+    /// Insert `chunk_id` into pending_healing if not already present, recording the
+    /// current time as its first-detection time, and persist that detection time so
+    /// a process restart doesn't lose track of how long this chunk has been waiting.
+    /// No-op (and no metadata write) if the chunk is already pending.
+    async fn mark_pending(&self, chunk_id: ChunkId) {
+        let mut pending = self.pending_healing.write().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = pending.entry(chunk_id) {
+            e.insert(Instant::now());
+            drop(pending);
+            if let Err(err) = self.metadata.put_pending_healing(&chunk_id, dfs_common::types::current_timestamp()) {
+                warn!("Failed to persist pending_healing entry for {}: {}", chunk_id, err);
+            }
+        }
+    }
+
+    /// Remove `chunk_id` from pending_healing (it reached RF, was purged, or is no
+    /// longer relevant) and clear its persisted detection time.
+    async fn clear_pending(&self, chunk_id: &ChunkId) {
+        Self::clear_pending_static(&self.pending_healing, &self.metadata, chunk_id).await;
+    }
+
+    /// Free-function equivalent of `clear_pending` for static/spawned contexts
+    /// (e.g. `do_heal_chunk_inner`) that don't have a `&self`.
+    async fn clear_pending_static(
+        pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
+        metadata: &Arc<MetadataStore>,
+        chunk_id: &ChunkId,
+    ) {
+        let existed = pending_healing.write().await.remove(chunk_id).is_some();
+        if existed {
+            if let Err(err) = metadata.delete_pending_healing(chunk_id) {
+                warn!("Failed to delete pending_healing entry for {}: {}", chunk_id, err);
+            }
+        }
+    }
+
     /// Cleanup stale entries from pending_healing map
     /// Removes chunks that no longer exist or have been pending for too long
     async fn cleanup_stale_pending(&self) -> Result<()> {
-        let mut pending = self.pending_healing.write().await;
         let max_pending_time = Duration::from_secs(self.healing_delay_secs * 20); // 20x healing delay
 
-        let mut to_remove = Vec::new();
+        let to_remove: Vec<ChunkId> = {
+            let pending = self.pending_healing.read().await;
+            pending.iter()
+                .filter_map(|(chunk_id, detected_at)| {
+                    // Remove if pending for too long (likely deleted or unrecoverable)
+                    if detected_at.elapsed() > max_pending_time {
+                        debug!("Removing stale pending healing entry for chunk {} (pending for {}s)",
+                               chunk_id, detected_at.elapsed().as_secs());
+                        return Some(*chunk_id);
+                    }
 
-        for (chunk_id, detected_at) in pending.iter() {
-            // Remove if pending for too long (likely deleted or unrecoverable)
-            if detected_at.elapsed() > max_pending_time {
-                debug!("Removing stale pending healing entry for chunk {} (pending for {}s)",
-                       chunk_id, detected_at.elapsed().as_secs());
-                to_remove.push(*chunk_id);
-                continue;
-            }
+                    // Remove if the chunk: location record is gone — this means the file was
+                    // deleted (or the chunk was legitimately purged as an orphan).  There is
+                    // nothing left to heal regardless of whether raw chunk data still exists
+                    // on disk (stale data will be cleaned up separately).
+                    if self.metadata.get_chunk_location(chunk_id).ok().flatten().is_none() {
+                        debug!("Removing pending healing entry for chunk {} — no location record", chunk_id);
+                        return Some(*chunk_id);
+                    }
 
-            // Remove if the chunk: location record is gone — this means the file was
-            // deleted (or the chunk was legitimately purged as an orphan).  There is
-            // nothing left to heal regardless of whether raw chunk data still exists
-            // on disk (stale data will be cleaned up separately).
-            if self.metadata.get_chunk_location(chunk_id).ok().flatten().is_none() {
-                debug!("Removing pending healing entry for chunk {} — no location record", chunk_id);
-                to_remove.push(*chunk_id);
-            }
-        }
+                    None
+                })
+                .collect()
+        };
 
         let removed_count = to_remove.len();
         for chunk_id in to_remove {
-            pending.remove(&chunk_id);
+            self.clear_pending(&chunk_id).await;
         }
 
         if removed_count > 0 {
@@ -641,7 +704,7 @@ impl HealingManager {
 
                     if !destructive_allowed {
                         debug!("Skipping orphan purge for {} — cluster degraded", chunk_id);
-                        self.pending_healing.write().await.remove(&chunk_id);
+                        self.clear_pending(&chunk_id).await;
                         continue;
                     }
                     if prev_candidates.contains(&chunk_id) {
@@ -653,7 +716,7 @@ impl HealingManager {
                         db_deletes.push(chunk_id);
                         disk_deletes.push(chunk_id);
                         purged_orphans.push(chunk_id);
-                        self.pending_healing.write().await.remove(&chunk_id);
+                        self.clear_pending(&chunk_id).await;
                         orphan_count += 1;
                     } else {
                         new_candidates.insert(chunk_id);
@@ -846,9 +909,7 @@ impl HealingManager {
                 // Start the ghost-pruning timer the first time we see these nodes missing.
                 // Without this, chunks at exactly RF alive nodes never enter pending_healing
                 // (they're classified Ok below and evicted), so the delay can never expire.
-                self.pending_healing.write().await
-                    .entry(chunk_id)
-                    .or_insert_with(Instant::now);
+                self.mark_pending(chunk_id).await;
 
                 let pending = self.pending_healing.read().await;
                 let delay_passed = pending.get(&chunk_id)
@@ -933,7 +994,7 @@ impl HealingManager {
                             chunk_id, location.nodes.len()
                         );
                         db_deletes.push(chunk_id);
-                        self.pending_healing.write().await.remove(&chunk_id);
+                        self.clear_pending(&chunk_id).await;
                         continue;
                     }
                 } else {
@@ -997,9 +1058,7 @@ impl HealingManager {
                         self.stalled_healing.write().await.insert(chunk_id);
                         // Keep first_detected timestamp in pending so we know how long
                         // it has been under-replicated, but mark it explicitly stalled.
-                        self.pending_healing.write().await
-                            .entry(chunk_id)
-                            .or_insert_with(Instant::now);
+                        self.mark_pending(chunk_id).await;
                         pending_count += 1;
                         continue;
                     }
@@ -1025,9 +1084,7 @@ impl HealingManager {
                         if never_fully_replicated {
                             // Ensure pending_healing entry exists so should_heal() starts
                             // tracking the delay from first discovery.
-                            self.pending_healing.write().await
-                                .entry(chunk_id)
-                                .or_insert_with(Instant::now);
+                            self.mark_pending(chunk_id).await;
                         }
                         pending_count += 1;
                     }
@@ -1038,9 +1095,7 @@ impl HealingManager {
                         // normal healing_delay_secs wait applies before trimming.
                         // This gives the VerifyChunkIntegrity pass (in do_cleanup_excess_shared)
                         // time to run after the cluster has settled.
-                        self.pending_healing.write().await
-                            .entry(chunk_id)
-                            .or_insert_with(Instant::now);
+                        self.mark_pending(chunk_id).await;
                         work.push((chunk_id, ReplicationStatus::OverReplicated, confirmed_alive_nodes.clone()));
                     } else {
                         debug!("Skipping over-replication cleanup for {} — cluster degraded", chunk_id);
@@ -1051,7 +1106,7 @@ impl HealingManager {
                     // If nodes_without_chunk is non-empty we need the pending_healing
                     // entry to persist as the ghost-pruning delay timer.
                     if nodes_without_chunk.is_empty() {
-                        self.pending_healing.write().await.remove(&chunk_id);
+                        self.clear_pending(&chunk_id).await;
                         self.stalled_healing.write().await.remove(&chunk_id);
                     }
                 }
@@ -1309,12 +1364,14 @@ impl HealingManager {
 
     /// Check if a chunk should be healed (delay has passed)
     async fn should_heal(&self, chunk_id: &ChunkId) -> bool {
-        let mut pending = self.pending_healing.write().await;
+        let elapsed = {
+            let pending = self.pending_healing.read().await;
+            pending.get(chunk_id).map(|detected_at| detected_at.elapsed())
+        };
 
-        match pending.get(chunk_id) {
-            Some(detected_at) => {
+        match elapsed {
+            Some(elapsed) => {
                 // Check if delay has passed
-                let elapsed = detected_at.elapsed();
                 if elapsed >= Duration::from_secs(self.healing_delay_secs) {
                     true
                 } else {
@@ -1329,7 +1386,7 @@ impl HealingManager {
             }
             None => {
                 // First time detecting under-replication
-                pending.insert(*chunk_id, Instant::now());
+                self.mark_pending(*chunk_id).await;
                 debug!(
                     "Chunk {} marked for healing (delay: {}s)",
                     chunk_id, self.healing_delay_secs
@@ -1427,7 +1484,7 @@ impl HealingManager {
         };
         let needed = replication_factor.saturating_sub(replica_count);
         if needed == 0 {
-            pending_healing.write().await.remove(chunk_id);
+            Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
             return Ok(());
         }
 
@@ -1523,7 +1580,7 @@ impl HealingManager {
 
             if !source_still_valid {
                 info!("Healer: chunk {} no longer on source {} (superseded by a newer write) — discarding healed replica", chunk_id, source_addr);
-                pending_healing.write().await.remove(chunk_id);
+                Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
                 return Ok(());
             }
 
@@ -1552,7 +1609,7 @@ impl HealingManager {
                 Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
             }
 
-            pending_healing.write().await.remove(chunk_id);
+            Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
         }
 
         Ok(())
@@ -1745,10 +1802,7 @@ impl HealingManager {
                     warn!("Scrub hash mismatch for chunk {} (mtime={:?} written_at={:?}): {}",
                         chunk_id, mtime, written_at, e);
                     errors += 1;
-                    self.pending_healing
-                        .write()
-                        .await
-                        .insert(chunk_id, Instant::now());
+                    self.mark_pending(chunk_id).await;
                 }
             }
         }
@@ -1766,16 +1820,21 @@ impl HealingManager {
     /// Remove a chunk from the healer's pending queue. Used by PatchChunk to prevent
     /// the healer from replicating the old chunk file during the rename window.
     pub async fn evict_from_pending(&self, chunk_id: &ChunkId) {
-        self.pending_healing.write().await.remove(chunk_id);
+        self.clear_pending(chunk_id).await;
         self.stalled_healing.write().await.remove(chunk_id);
     }
 
     pub async fn queue_chunks_immediate(&self, chunk_ids: Vec<ChunkId>) {
         let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs + 1);
+        let backdated_secs = dfs_common::types::current_timestamp()
+            .saturating_sub(self.healing_delay_secs + 1);
         let mut pending = self.pending_healing.write().await;
         let mut cache  = self.alive_nodes_cache.write().await;
         for chunk_id in chunk_ids {
             pending.insert(chunk_id, backdated);
+            if let Err(err) = self.metadata.put_pending_healing(&chunk_id, backdated_secs) {
+                warn!("Failed to persist backdated pending_healing entry for {}: {}", chunk_id, err);
+            }
             // Invalidate any stale cache entry for this chunk so drain_heal_queue
             // doesn't classify a healthy RF=3 chunk as under-replicated based on
             // old alive-node data from a previous healing cycle. The next discovery
@@ -1903,6 +1962,43 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Now should heal
+        assert!(healing.should_heal(&chunk_id).await);
+    }
+
+    /// A chunk's pending-healing "first detected" time must survive a process
+    /// restart: HealingManager::new seeds pending_healing from the persisted
+    /// PENDING_HEALING_TABLE, so the healing_delay_secs debounce reflects total
+    /// elapsed time (pre- and post-restart), not just time-since-this-process-started.
+    #[tokio::test]
+    async fn test_pending_healing_survives_restart() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"restart-test"));
+
+        // Simulate a chunk a *prior process* detected as needing healing 8s ago.
+        let detected_at_secs = dfs_common::types::current_timestamp() - 8;
+        metadata.put_pending_healing(&chunk_id, detected_at_secs).unwrap();
+
+        // Construct a fresh HealingManager against the same MetadataStore —
+        // simulates a process restart. healing_delay_secs = 10, so the 8s that
+        // already elapsed before restart must carry over.
+        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 10, 24, true);
+
+        // 8s < 10s — not ready yet, but the persisted age must have been restored
+        // (not reset to 0s on restart).
+        assert!(!healing.should_heal(&chunk_id).await);
+
+        // 8s (carried over) + 3s (elapsed since restart) = 11s >= 10s.
+        tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(healing.should_heal(&chunk_id).await);
     }
 }

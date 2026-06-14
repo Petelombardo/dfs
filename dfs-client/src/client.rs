@@ -2686,22 +2686,18 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Pick the replica with the fewest in-flight fetches.
-    /// Sorts all known replicas by ascending in-flight count (ties: deterministic
-    /// by address) and returns (primary, remaining_in_load_order).
+    /// Ties (the common case — all replicas equally loaded) break by a hash of
+    /// chunk_id rather than by address, so different chunks that share the same
+    /// replica set fan out across all of them instead of always favoring the
+    /// lowest-address node. Returns (primary, remaining_in_load_order).
     fn pick_replica_by_load(
         &self,
         loc: &ChunkLocation,
         nim: &HashMap<dfs_common::NodeId, SocketAddr>,
         cluster_nodes: &[SocketAddr],
     ) -> (SocketAddr, Vec<SocketAddr>) {
-        let mut addrs: Vec<(SocketAddr, usize)> = loc.nodes.iter()
+        let mut addrs: Vec<SocketAddr> = loc.nodes.iter()
             .filter_map(|nid| nim.get(nid).copied())
-            .map(|addr| {
-                let n = self.node_inflight.get(&addr)
-                    .map(|e| e.load(Ordering::Relaxed))
-                    .unwrap_or(0);
-                (addr, n)
-            })
             .collect();
 
         if addrs.is_empty() {
@@ -2715,9 +2711,23 @@ leader_addr: Arc::new(RwLock::new(None)),
             return (p, fallbacks);
         }
 
-        addrs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        let primary = addrs[0].0;
-        let fallbacks = addrs[1..].iter().map(|(a, _)| *a).collect();
+        // Sort deterministically by address, then rotate by a hash of chunk_id —
+        // gives a stable per-chunk starting point that varies across chunks.
+        addrs.sort_unstable();
+        let idx = (loc.chunk_id.hash[0] as usize) % addrs.len();
+        addrs.rotate_left(idx);
+
+        // Stable sort by in-flight load: ties preserve the hash-rotated order
+        // (the chunk-hash pick wins when all replicas are equally loaded), but
+        // a genuinely busier replica is still passed over.
+        let mut scored: Vec<(SocketAddr, usize)> = addrs.iter().map(|&addr| {
+            let n = self.node_inflight.get(&addr).map(|e| e.load(Ordering::Relaxed)).unwrap_or(0);
+            (addr, n)
+        }).collect();
+        scored.sort_by_key(|&(_, n)| n);
+
+        let primary = scored[0].0;
+        let fallbacks = scored[1..].iter().map(|&(a, _)| a).collect();
         (primary, fallbacks)
     }
 
@@ -6570,5 +6580,85 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
             _ => anyhow::bail!("Unexpected response type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk_id_with_hash0(b: u8) -> ChunkId {
+        let mut hash = [0u8; 32];
+        hash[0] = b;
+        ChunkId::from_hash(hash)
+    }
+
+    fn loc_with_nodes(chunk_id: ChunkId, nodes: Vec<dfs_common::NodeId>) -> ChunkLocation {
+        ChunkLocation {
+            chunk_id,
+            nodes,
+            size: 4 * 1024 * 1024,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: None,
+            file_id: None,
+        }
+    }
+
+    /// With equal load (the common case), different chunks on the same 2-replica
+    /// set must spread across both replicas by chunk_id hash, not always favor
+    /// the lower-address node.
+    #[test]
+    fn test_pick_replica_by_load_spreads_on_equal_load() {
+        let addr_a: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+        let client = DfsClient::new(vec![addr_a, addr_b]).unwrap();
+
+        let node_a = dfs_common::NodeId::new();
+        let node_b = dfs_common::NodeId::new();
+        let mut nim = HashMap::new();
+        nim.insert(node_a, addr_a);
+        nim.insert(node_b, addr_b);
+
+        let nodes = vec![node_a, node_b];
+        let cluster = [addr_a, addr_b];
+
+        let loc0 = loc_with_nodes(chunk_id_with_hash0(0), nodes.clone());
+        let (p0, _) = client.pick_replica_by_load(&loc0, &nim, &cluster);
+        assert_eq!(p0, addr_a);
+
+        let loc1 = loc_with_nodes(chunk_id_with_hash0(1), nodes.clone());
+        let (p1, _) = client.pick_replica_by_load(&loc1, &nim, &cluster);
+        assert_eq!(p1, addr_b);
+    }
+
+    /// A busier replica must be passed over even if the chunk-hash points at it —
+    /// load is the primary signal, chunk-hash only breaks ties.
+    #[test]
+    fn test_pick_replica_by_load_prefers_least_loaded() {
+        let addr_a: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+        let client = DfsClient::new(vec![addr_a, addr_b]).unwrap();
+
+        let node_a = dfs_common::NodeId::new();
+        let node_b = dfs_common::NodeId::new();
+        let mut nim = HashMap::new();
+        nim.insert(node_a, addr_a);
+        nim.insert(node_b, addr_b);
+
+        let nodes = vec![node_a, node_b];
+        let cluster = [addr_a, addr_b];
+
+        // hash[0]=0 would normally pick addr_a (see test above) — load it up
+        // heavily so addr_b (idle) wins despite the hash.
+        client.node_inflight_inc(addr_a);
+        client.node_inflight_inc(addr_a);
+        client.node_inflight_inc(addr_a);
+
+        let loc0 = loc_with_nodes(chunk_id_with_hash0(0), nodes.clone());
+        let (primary, fallbacks) = client.pick_replica_by_load(&loc0, &nim, &cluster);
+        assert_eq!(primary, addr_b);
+        assert_eq!(fallbacks, vec![addr_a]);
     }
 }

@@ -310,8 +310,11 @@ impl InodeReadEngine {
         // (leader + all other nodes) caused spurious "not found on this node"
         // failures and false health penalties on nodes that simply don't hold
         // the chunk. Leader priority is for metadata reads only, not data reads.
-        // Sort deterministically by address so the same chunk always routes to
-        // the same primary, enabling warm server-side caches.
+        // Sort deterministically by address, then rotate by a hash of chunk_id
+        // so the SAME chunk always picks the SAME primary (warm server-side
+        // caches, deterministic routing) while DIFFERENT chunks that happen to
+        // share the same replica set spread across all of them — avoiding a
+        // single node absorbing 100% of read traffic for every chunk on a pair.
         let mut addrs: Vec<SocketAddr> = loc.nodes.iter()
             .filter_map(|nid| nim.get(nid).copied())
             .collect();
@@ -319,6 +322,8 @@ impl InodeReadEngine {
             return None;
         }
         addrs.sort_unstable();
+        let idx = (loc.chunk_id.hash[0] as usize) % addrs.len();
+        addrs.rotate_left(idx);
         let primary = addrs[0];
         let fallbacks = addrs[1..].to_vec();
         Some((primary, fallbacks))
@@ -389,4 +394,116 @@ fn build_offsets(locations: &[ChunkLocation]) -> Vec<(usize, usize)> {
         let size = loc.size as usize;
         (start, size)
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk_id_with_hash0(b: u8) -> ChunkId {
+        let mut hash = [0u8; 32];
+        hash[0] = b;
+        ChunkId::from_hash(hash)
+    }
+
+    fn loc_with_nodes(chunk_id: ChunkId, nodes: Vec<dfs_common::NodeId>) -> ChunkLocation {
+        ChunkLocation {
+            chunk_id,
+            nodes,
+            size: 4 * 1024 * 1024,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: None,
+            file_id: None,
+        }
+    }
+
+    /// Different chunks on the same 2-replica set must spread across both
+    /// replicas (not always favor the lower-address node), while the SAME
+    /// chunk always picks the SAME primary (cache warmth / determinism).
+    #[test]
+    fn test_resolve_primary_spreads_across_replicas_by_chunk_id() {
+        let node_a = dfs_common::NodeId::new();
+        let node_b = dfs_common::NodeId::new();
+        let addr_a: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+
+        let mut nim = HashMap::new();
+        nim.insert(node_a, addr_a);
+        nim.insert(node_b, addr_b);
+
+        let nodes = vec![node_a, node_b];
+
+        // hash[0] = 0 -> rotate_left(0) -> primary = addr_a (sorted first)
+        let loc0 = loc_with_nodes(chunk_id_with_hash0(0), nodes.clone());
+        let (p0, f0) = InodeReadEngine::resolve_primary(&loc0, &nim, &[], 0).unwrap();
+        assert_eq!(p0, addr_a);
+        assert_eq!(f0, vec![addr_b]);
+
+        // hash[0] = 1 -> rotate_left(1) -> primary = addr_b
+        let loc1 = loc_with_nodes(chunk_id_with_hash0(1), nodes.clone());
+        let (p1, f1) = InodeReadEngine::resolve_primary(&loc1, &nim, &[], 0).unwrap();
+        assert_eq!(p1, addr_b);
+        assert_eq!(f1, vec![addr_a]);
+
+        // Repeated calls for the same chunk_id are stable.
+        let (p0_again, _) = InodeReadEngine::resolve_primary(&loc0, &nim, &[], 0).unwrap();
+        assert_eq!(p0, p0_again);
+    }
+
+    /// With RF=3, different chunks must spread primary selection across all
+    /// 3 replicas (not just 2), and fallbacks always cover the remaining holders.
+    #[test]
+    fn test_resolve_primary_rf3_uses_all_replicas() {
+        let nodes: Vec<dfs_common::NodeId> = (0..3).map(|_| dfs_common::NodeId::new()).collect();
+        let addrs: Vec<SocketAddr> = (0..3)
+            .map(|i| format!("127.0.0.1:{}", 8900 + i).parse().unwrap())
+            .collect();
+
+        let mut nim = HashMap::new();
+        for (n, a) in nodes.iter().zip(addrs.iter()) {
+            nim.insert(*n, *a);
+        }
+
+        let mut sorted_addrs = addrs.clone();
+        sorted_addrs.sort_unstable();
+
+        let mut seen = std::collections::HashSet::new();
+        for b in 0u8..3 {
+            let loc = loc_with_nodes(chunk_id_with_hash0(b), nodes.clone());
+            let (primary, fallbacks) = InodeReadEngine::resolve_primary(&loc, &nim, &[], 0).unwrap();
+            assert_eq!(sorted_addrs[b as usize % 3], primary);
+            assert_eq!(fallbacks.len(), 2);
+            seen.insert(primary);
+        }
+        assert_eq!(seen.len(), 3, "all 3 replicas should be used as primary across different chunks");
+    }
+
+    /// resolve_primary must never invent a node outside loc.nodes ∩ nim — e.g.
+    /// right after a patch (RF temporarily 2) it must restrict to those 2,
+    /// even though `nim` may contain a 3rd cluster node that doesn't hold this chunk yet.
+    #[test]
+    fn test_resolve_primary_restricted_to_chunk_holders() {
+        let node_a = dfs_common::NodeId::new();
+        let node_b = dfs_common::NodeId::new();
+        let node_c_not_a_holder = dfs_common::NodeId::new();
+        let addr_a: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.1:8902".parse().unwrap();
+
+        let mut nim = HashMap::new();
+        nim.insert(node_a, addr_a);
+        nim.insert(node_b, addr_b);
+        nim.insert(node_c_not_a_holder, addr_c);
+
+        let loc = loc_with_nodes(chunk_id_with_hash0(0), vec![node_a, node_b]);
+        for b in 0u8..=255 {
+            let loc_b = ChunkLocation { chunk_id: chunk_id_with_hash0(b), ..loc.clone() };
+            let (primary, fallbacks) = InodeReadEngine::resolve_primary(&loc_b, &nim, &[], 0).unwrap();
+            assert!(primary == addr_a || primary == addr_b);
+            assert_ne!(primary, addr_c);
+            assert!(!fallbacks.contains(&addr_c));
+        }
+    }
 }

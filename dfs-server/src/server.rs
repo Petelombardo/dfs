@@ -282,7 +282,7 @@ impl Server {
                 if !file.chunk_locations.is_empty() {
                     // or_insert_with: don't overwrite entries already added by incoming RCLs
                     // while the scan is running — the RCL is always newer than redb state.
-                    chunk_map.entry(file.id).or_insert_with(|| (file.chunk_locations.clone(), file.modified_at));
+                    chunk_map.entry(file.id).or_insert_with(|| (file.chunk_locations.clone(), file.write_seq));
                     built += 1;
                 }
                 // Seed file_write_seqs so the bypass guard has a correct baseline
@@ -356,14 +356,14 @@ impl Server {
             } else {
                 metadata.chunk_locations.clone()
             };
-            self.chunk_map.insert(metadata.id, (new_locs, metadata.modified_at));
+            self.chunk_map.insert(metadata.id, (new_locs, metadata.write_seq));
         } else if self.chunk_map.contains_key(&metadata.id) {
             // Empty chunk_locations on a file that already has a chunk_map entry means
             // truncate-to-zero. Reset the entry instead of leaving it untouched —
             // otherwise the stale pre-truncate chunks would linger in chunk_map and
             // get resurrected by handle_put_file_metadata's chunk_map union (below)
             // on the next write to this file.
-            self.chunk_map.insert(metadata.id, (vec![], metadata.modified_at));
+            self.chunk_map.insert(metadata.id, (vec![], metadata.write_seq));
         }
         // If the file has no chunks yet (new empty file) and no map entry exists,
         // no map entry is needed — chunk_map_update_location_for_file will create
@@ -406,15 +406,14 @@ impl Server {
     /// timestamp) for legacy records that predate the client_write_seq field.
     /// Fresh writes carry client_write_seq=None so any patch (seq > 0) always wins.
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         // Use entry() to atomically create-or-get: for brand-new files that have no
         // chunk_map entry yet, this inserts an empty Vec so subsequent logic can push
         // the first chunk in. Without this, every ReplicateChunkLocation for a new file
         // was a silent no-op and chunk_map stayed empty for the entire recording session.
-        let mut entry = self.chunk_map.entry(file_id).or_insert_with(|| (vec![], now));
+        // Seed the 2nd field from this location's client_write_seq (clock-agnostic) —
+        // not wall-clock — since chunk_map's 2nd field is write_seq-space.
+        let mut entry = self.chunk_map.entry(file_id)
+            .or_insert_with(|| (vec![], location.client_write_seq.unwrap_or(0)));
         let (locs, _) = entry.value_mut();
         // First try exact chunk_id match.
         for loc in locs.iter_mut() {
@@ -1112,13 +1111,13 @@ impl Server {
             // Skip files in the pending delete queue — they were removed from our DB by
             // handle_delete_file and would otherwise be resurrected here.
             let missing: Vec<FileId> = follower_inventory.iter()
-                .filter_map(|(id, follower_modified_at)| {
+                .filter_map(|(id, follower_write_seq)| {
                     if pending_delete_ids.contains(id) {
                         return None;
                     }
                     match my_inventory.get(id) {
                         None => Some(*id),  // we don't have it at all
-                        Some(our_modified_at) if follower_modified_at > our_modified_at => Some(*id),
+                        Some(our_write_seq) if follower_write_seq > our_write_seq => Some(*id),
                         _ => None,
                     }
                 })
@@ -1162,7 +1161,7 @@ impl Server {
                         // Re-check: only store if still missing or newer.
                         let should_store = match metadata.get_file(&item.id)? {
                             None => true,
-                            Some(existing) => item.modified_at > existing.modified_at,
+                            Some(existing) => item.write_seq > existing.write_seq,
                         };
                         if should_store {
                             metadata.put_file(item)?;
@@ -2942,19 +2941,20 @@ impl Server {
                 // The chunk_map is updated synchronously in handle_put_file_metadata
                 // before the client gets its Ok response, so it's always current.
                 if let Some(entry) = self.chunk_map.get(&metadata.id) {
-                    let (map_locs, map_modified_at) = entry.value();
+                    let (map_locs, map_write_seq) = entry.value();
                     if !map_locs.is_empty() {
                         metadata.chunk_locations = map_locs.clone();
-                        if *map_modified_at > metadata.modified_at {
-                            metadata.modified_at = *map_modified_at;
+                        if *map_write_seq > metadata.write_seq {
+                            metadata.write_seq = *map_write_seq;
                         }
                     }
                 }
 
-                // Check if client has provided if_modified_since timestamp
-                if let Some(cached_timestamp) = if_modified_since {
-                    if metadata.modified_at <= cached_timestamp {
-                        debug!("Metadata not modified for {}: {} <= {}", path, metadata.modified_at, cached_timestamp);
+                // Check if client has provided a cached write_seq (clock-agnostic —
+                // modified_at is user-settable via setattr and not safe for this check).
+                if let Some(cached_write_seq) = if_modified_since {
+                    if metadata.write_seq <= cached_write_seq {
+                        debug!("Metadata not modified for {}: write_seq {} <= {}", path, metadata.write_seq, cached_write_seq);
                         return Response::NotModified;
                     }
                 }
@@ -5202,7 +5202,7 @@ impl Server {
                         let _ = metadata.scan_files(|file| {
                             total += 1;
                             if !file.chunk_locations.is_empty() {
-                                chunk_map.insert(file.id, (file.chunk_locations.clone(), file.modified_at));
+                                chunk_map.insert(file.id, (file.chunk_locations.clone(), file.write_seq));
                                 built += 1;
                             }
                             Ok(())
@@ -5862,7 +5862,7 @@ impl Server {
     /// Returns the sparse list as-is with total_chunks = max chunk index + 1 so the client
     /// can place each entry at its correct position using file_offset.
     async fn handle_get_file_chunk_map(&self, file_id: FileId, from_chunk: u32, count: u32) -> Response {
-        let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, modified_at: u64| {
+        let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, write_seq: u64| {
             const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             // total_chunks = max chunk index + 1 (not list length) so the client knows
             // the true density of the file and can size its engine map correctly.
@@ -5893,13 +5893,13 @@ impl Server {
                 locations: window,
                 from_chunk,
                 total_chunks,
-                modified_at,
+                write_seq,
             }
         };
 
         if let Some(entry) = self.chunk_map.get(&file_id) {
-            let (locations, modified_at) = entry.value();
-            return slice_response(locations, *modified_at);
+            let (locations, write_seq) = entry.value();
+            return slice_response(locations, *write_seq);
         }
 
         // Cache miss — fall back to sled (chunk map may still be rebuilding after restart,
@@ -5909,8 +5909,8 @@ impl Server {
         match result {
             Ok(Ok(Some(metadata))) if !metadata.chunk_locations.is_empty() => {
                 // Populate cache for future lookups.
-                self.chunk_map.insert(file_id, (metadata.chunk_locations.clone(), metadata.modified_at));
-                slice_response(&metadata.chunk_locations, metadata.modified_at)
+                self.chunk_map.insert(file_id, (metadata.chunk_locations.clone(), metadata.write_seq));
+                slice_response(&metadata.chunk_locations, metadata.write_seq)
             }
             _ => Response::Error {
                 message: format!("No chunk map entry for file {}", file_id),

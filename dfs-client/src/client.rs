@@ -3562,7 +3562,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     }
 
     /// Query the leader for the full chunk location map of a file.
-    /// Returns (locations, modified_at). Falls back to any node if leader is unknown.
+    /// Returns (locations, from_chunk, total_chunks, write_seq). Falls back to any node if leader is unknown.
     pub async fn get_file_chunk_map(&self, file_id: FileId, from_chunk: u32, count: u32) -> Result<(Vec<dfs_common::ChunkLocation>, u32, u32, u64)> {
         let target = {
             let leader = self.leader_addr.read().await;
@@ -3604,8 +3604,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
 
         match response {
-            Response::FileChunkMap { locations, from_chunk, total_chunks, modified_at, .. } => {
-                Ok((locations, from_chunk, total_chunks, modified_at))
+            Response::FileChunkMap { locations, from_chunk, total_chunks, write_seq, .. } => {
+                Ok((locations, from_chunk, total_chunks, write_seq))
             }
             Response::Error { message, .. } => anyhow::bail!("GetFileChunkMap error: {}", message),
             _ => anyhow::bail!("Unexpected response to GetFileChunkMap"),

@@ -659,8 +659,8 @@ pub enum Response {
         from_chunk: u32,
         /// Total number of chunks in the file (so client knows the full extent)
         total_chunks: u32,
-        /// Server-side modified_at timestamp so client can detect changes
-        modified_at: u64,
+        /// Server-side write_seq (clock-agnostic) so client can detect changes
+        write_seq: u64,
     },
 
     /// Returned by AppendFile on success. Contains the authoritative updated

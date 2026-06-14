@@ -1017,7 +1017,9 @@ impl MetadataStore {
         Ok(table.get("follower_seq")?.map(|v| v.value()).unwrap_or(0))
     }
 
-    /// Return a compact inventory of all known files: Vec<(FileId, modified_at)>.
+    /// Return a compact inventory of all known files: Vec<(FileId, write_seq)>.
+    /// write_seq (not modified_at) so catchup/healing comparisons are clock-agnostic —
+    /// modified_at is user-settable (setattr/utimes) and not safe for ordering.
     pub fn get_file_inventory(&self) -> Result<Vec<(FileId, u64)>> {
         let _db = self.db.read().unwrap();
         let txn = _db.begin_read()?;
@@ -1026,7 +1028,7 @@ impl MetadataStore {
         for item in table.range::<&str>(..)? {
             let (_, v) = item?;
             if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
-                out.push((m.id, m.modified_at));
+                out.push((m.id, m.write_seq));
             }
         }
         Ok(out)

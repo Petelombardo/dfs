@@ -2450,6 +2450,63 @@ dfs_sync
 rm -f "$T35_FILE"
 fi # should_run T35
 
+if should_run T36; then
+snapshot_log T36
+echo ""
+echo "=== T36: setattr honors explicit mtime (rsync -a timestamp preservation) ==="
+
+T36_FILE="$MOUNT/t36_mtime.bin"
+
+T36_RESULT=$(python3 -c "
+import os
+
+PATH = '$T36_FILE'
+OLD_MTIME = 1577836800   # 2020-01-01T00:00:00Z
+NEWER_MTIME = 1609459200 # 2021-01-01T00:00:00Z
+
+errors = []
+
+fd = os.open(PATH, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fd, b'hello dfs')
+os.close(fd)
+
+# Simulate rsync -a: after the transfer, restore the source file's mtime.
+os.utime(PATH, (OLD_MTIME, OLD_MTIME))
+
+st = os.stat(PATH)
+if int(st.st_mtime) != OLD_MTIME:
+    errors.append(f'after utime: st_mtime={int(st.st_mtime)}, expected {OLD_MTIME}')
+
+# A plain chmod (mode-only setattr) must not bump mtime.
+os.chmod(PATH, 0o600)
+st = os.stat(PATH)
+if int(st.st_mtime) != OLD_MTIME:
+    errors.append(f'after chmod: st_mtime={int(st.st_mtime)}, expected {OLD_MTIME} (unchanged)')
+
+# A second utime (e.g. a later rsync run with an updated source file) must take effect.
+os.utime(PATH, (NEWER_MTIME, NEWER_MTIME))
+st = os.stat(PATH)
+if int(st.st_mtime) != NEWER_MTIME:
+    errors.append(f'after second utime: st_mtime={int(st.st_mtime)}, expected {NEWER_MTIME}')
+
+for e in errors:
+    print(e)
+print(len(errors))
+")
+
+echo "$T36_RESULT" | sed 's/^/  /'
+T36_ERR_COUNT=$(echo "$T36_RESULT" | tail -1)
+T36_ERR_COUNT=${T36_ERR_COUNT:-1}
+
+dfs_sync
+
+[ "$T36_ERR_COUNT" = "0" ] \
+    && check "T36 setattr honors explicit mtime, 0 errors" PASS \
+    || check "T36 setattr honors explicit mtime, $T36_ERR_COUNT errors" FAIL
+
+rm -f "$T36_FILE"
+fi # should_run T36
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

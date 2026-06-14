@@ -3530,10 +3530,10 @@ impl Filesystem for DfsFilesystem {
         // thread waiting for a runtime thread.  When all worker threads are busy
         // (e.g. 44 concurrent getattr tasks after a readdir) a block_on here would
         // deadlock — the FUSE thread parks waiting for a thread that will never free.
-        let cached_modified_at = {
+        let cached_write_seq = {
             let path_map = self.path_to_inode.read().unwrap();
             if let Some(&ino) = path_map.get(&path) {
-                self.metadata_cache.get(&ino).map(|m| m.modified_at)
+                self.metadata_cache.get(&ino).map(|m| m.write_seq)
             } else {
                 None
             }
@@ -3548,7 +3548,7 @@ impl Filesystem for DfsFilesystem {
         let pending_creates = self.pending_creates.clone();
 
         self.runtime.spawn(async move {
-            let result = client.get_file_metadata_conditional(&path, cached_modified_at).await;
+            let result = client.get_file_metadata_conditional(&path, cached_write_seq).await;
 
             match result {
                 Ok(Some(metadata)) => {
@@ -3584,7 +3584,7 @@ impl Filesystem for DfsFilesystem {
                 }
                 Ok(None) => {
                     // Either 304 not-modified (cache still valid) OR 404 not-found.
-                    if cached_modified_at.is_some() {
+                    if cached_write_seq.is_some() {
                         // We sent a conditional GET — None means "not modified", use cache.
                         let path_map = path_to_inode.read().unwrap();
                         if let Some(&ino) = path_map.get(&path) {
@@ -4028,7 +4028,7 @@ impl Filesystem for DfsFilesystem {
                         let last_metadata_update_bg = last_metadata_update.clone();
                         let refreshing_inodes_bg = refreshing_inodes.clone();
                         let path_bg = metadata.path.clone();
-                        let current_modified_at = metadata.modified_at;
+                        let current_write_seq = metadata.write_seq;
                         let current_size = metadata.size;
                         let current_chunks = metadata.chunk_locations.len();
                         tokio::spawn(async move {
@@ -4037,8 +4037,8 @@ impl Filesystem for DfsFilesystem {
                                 client_bg.get_file_metadata(&path_bg),
                             ).await;
                             if let Ok(Ok(Some(fresh))) = result {
-                                let server_is_newer = fresh.modified_at > current_modified_at
-                                    || (fresh.modified_at == current_modified_at
+                                let server_is_newer = fresh.write_seq > current_write_seq
+                                    || (fresh.write_seq == current_write_seq
                                         && (fresh.size > current_size
                                             || fresh.chunk_locations.len() > current_chunks));
                                 if server_is_newer {
@@ -6594,7 +6594,7 @@ impl Filesystem for DfsFilesystem {
         gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -6744,10 +6744,31 @@ impl Filesystem for DfsFilesystem {
             }
         }
 
-        metadata.modified_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        // Honor an explicit utimes()/utimensat() request (e.g. rsync -a restoring the
+        // source mtime after a transfer) so the stored mtime round-trips correctly.
+        // Without this, every setattr stamped modified_at=now(), so a client that
+        // preserves mtimes would see its restored timestamp overwritten on the very
+        // call that set it — making every subsequent quick-check comparison fail and
+        // forcing re-transfers on every run.
+        if let Some(mt) = mtime {
+            metadata.modified_at = match mt {
+                fuser::TimeOrNow::SpecificTime(t) => t
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                fuser::TimeOrNow::Now => SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            };
+        } else if size.is_some() {
+            // No explicit mtime, but the size changed (truncate): POSIX bumps mtime to now.
+            metadata.modified_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+        }
+        // else: pure chmod/chown with no size/mtime change — leave modified_at as-is.
 
         // Store updated metadata — stamp write_seq so the server doesn't drop it as stale
         // (the last flush_metadata_sync incremented write_seq on the server, so sending the

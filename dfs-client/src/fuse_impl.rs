@@ -3432,7 +3432,7 @@ impl Filesystem for DfsFilesystem {
                     let h = flush_handle.clone();
                     let flush_rt = h.flush_runtime.clone();
                     flush_rt.spawn(async move {
-                        if let Err(e) = h.flush_buffer_async(ino, true).await {
+                        if let Err(e) = h.flush_all_pipelined(ino).await {
                             error!("destroy: flush failed for inode {}: {}", ino, e);
                         }
                     })
@@ -4218,20 +4218,30 @@ impl Filesystem for DfsFilesystem {
                     let intra = InodeWriteState::intra_offset(offset as u64);
                     if let Some(slot) = state.slots.get(&chunk_idx) {
                         // Slot present — data is buffered and not yet fully committed.
-                        // CRITICAL: Always serve buffered data to ensure read-after-write consistency.
-                        // For qcow2: write header → write L1 table → read header must get buffered header,
-                        // not zeros from the server (which hasn't been written yet).
-                        if intra < slot.data.len() {
-                            // Buffer has data at this offset — serve it for read-after-write consistency.
-                            let avail = slot.data.len() - intra;
+                        // CRITICAL: serve buffered data for read-after-write consistency,
+                        // but ONLY for bytes the app actually wrote this session
+                        // (dirty_ranges). Bytes elsewhere in slot.data are synthetic
+                        // gap-fill zeros (gap_filled_prefix prefix, or mid-slot gaps from
+                        // non-sequential writes) — placeholders for data the server
+                        // already has from a prior flush, not real content. Serving those
+                        // directly would shadow real committed server data with zeros.
+                        // Fall through to network for those, same as "beyond the buffered
+                        // frontier" below.
+                        if let Some(&(_, range_end)) = slot.dirty_ranges.iter()
+                            .find(|&&(s, e)| s <= intra && intra < e)
+                        {
+                            // Buffer has real data at this offset — serve it, capped at
+                            // the end of this dirty range so we never cross into a gap.
+                            let avail = range_end - intra;
                             let n = avail.min(size);
                             reply.data(&slot.data[intra..intra + n]);
                             return;
                         }
 
-                        // Beyond this slot's buffered frontier. The server may have
-                        // committed data here from a prior flush (e.g. mkfs.ext4 writes
-                        // non-sequentially within a chunk). Fall through to the network
+                        // Beyond this slot's buffered frontier, or within a gap-fill
+                        // placeholder region. The server may have committed data here
+                        // from a prior flush (e.g. mkfs.ext4 writes non-sequentially
+                        // within a chunk). Fall through to the network
                         // unless we're past the committed metadata size (true live edge).
                         let committed_size = metadata_cache.get(&ino).map(|m| m.size as usize).unwrap_or(0);
                         if offset >= committed_size {
@@ -7055,7 +7065,7 @@ impl Filesystem for DfsFilesystem {
                     let h = flush_handle.clone();
                     let rt = h.flush_runtime.clone();
                     rt.spawn(async move {
-                        if let Err(e) = h.flush_buffer_async(i, true).await {
+                        if let Err(e) = h.flush_all_pipelined(i).await {
                             error!("fsyncdir: flush failed for inode {}: {}", i, e);
                         }
                     })
@@ -7305,10 +7315,17 @@ impl Filesystem for DfsFilesystem {
                     // Flush any buffered writes for this inode.
                     // This ensures all pending writes reach the server before returning.
                     // qemu-nbd and mkfs.ext4 rely on this for data durability.
-                    if let Err(e) = flush_handle.flush_buffer_async(ino, true).await {
+                    // Use flush_all_pipelined (same path as release()/fsync) so chunk_cache,
+                    // byte_range_cache and zero_gap_table stay coherent — the legacy
+                    // flush_buffer_async path does not invalidate/reseed those caches,
+                    // which left stale byte-range entries readable after a patch/rewrite.
+                    if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                         error!("ioctl BLKFLSBUF: flush failed for ino={}: {}", ino, e);
                         reply.error(libc::EIO);
                         return;
+                    }
+                    if let Some(meta) = metadata_cache.get(&ino).map(|m| m.clone()) {
+                        client.flush_metadata_sync(&meta).await;
                     }
 
                     reply.ioctl(0, &[]);

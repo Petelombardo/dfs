@@ -22,6 +22,7 @@ Run with: `bash scripts/test_local_suite.sh`
 The suite runs 5-node local cluster on ports 8900–8904, mounts at /tmp/dfs-mount, and exercises
 T1–T22. Logs go to /tmp/dfs-test-logs/. The client runs at **debug** log level so all events are
 captured. Per-test snapshots are written to T<N>.log (e.g. T7.log) so each test's log is isolated.
+When we create a new test, we should run it in an isolated manner and reproduce it, first, without the fixes so that we know if the fixes actually work.
 
 ### Reading logs effectively
 

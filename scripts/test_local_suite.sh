@@ -2366,6 +2366,90 @@ dfs_sync
 rm -f "$T34_FILE"
 fi # should_run T34
 
+if should_run T35; then
+snapshot_log T35
+echo ""
+echo "=== T35: rapid same-chunk rotation read-after-write monotonicity ==="
+
+T35_FILE="$MOUNT/t35_hotrotate.bin"
+
+T35_RESULT=$(python3 -c "
+import os, time, struct
+
+CHUNK = 4 * 1024 * 1024
+PATH = '$T35_FILE'
+
+fd = os.open(PATH, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+
+# Establish chunk0 as an existing in-place-patchable chunk (matches qcow2
+# preallocation: every subsequent tiny write is a MultiPatch against an
+# existing_loc, not a fresh-chunk write).
+os.pwrite(fd, bytes(CHUNK), 0)
+os.fsync(fd)
+
+# Replicate VM108's mkfs.ext4 hot-spot on staging: two 8-byte fields (an
+# L2-table entry at offset 196640 and a refcount-block entry at offset
+# 65544) within chunk0, each rewritten ~once per ~27ms by the background
+# flush ticker, for 50 rotations -- with NO fsync between writes (matches
+# the live trace). After every few rotations, pread a region covering each
+# field WITHOUT fsync, alternating between a >32KB read (full-chunk path)
+# and a <=32KB read (range-fetch path), and verify the field reflects the
+# LATEST write. A stale-rotation read here reproduces the read-after-write
+# regression suspected of triggering QEMU's 'Marking image as corrupt'.
+OFF_A = 196640   # within cluster [196608, 262144)
+OFF_B = 65544    # within cluster [65536, 131072)
+N = 50
+
+errors = []
+for i in range(N):
+    os.pwrite(fd, struct.pack('<Q', i), OFF_A)
+    os.pwrite(fd, struct.pack('<Q', i), OFF_B)
+    time.sleep(0.03)
+
+    if i % 3 == 2:
+        size = 65536 if (i % 6 == 2) else 4096
+        dataA = os.pread(fd, size, 196608)
+        dataB = os.pread(fd, size, 65536)
+        gotA = struct.unpack('<Q', dataA[32:40])[0]
+        gotB = struct.unpack('<Q', dataB[8:16])[0]
+        if gotA != i:
+            errors.append(f'iter {i} (size={size}): field A read back {gotA}, expected {i}')
+        if gotB != i:
+            errors.append(f'iter {i} (size={size}): field B read back {gotB}, expected {i}')
+
+os.fsync(fd)
+os.close(fd)
+
+# Final check via a fresh fd, after full flush.
+fd2 = os.open(PATH, os.O_RDONLY)
+dataA = os.pread(fd2, 65536, 196608)
+dataB = os.pread(fd2, 65536, 65536)
+os.close(fd2)
+gotA = struct.unpack('<Q', dataA[32:40])[0]
+gotB = struct.unpack('<Q', dataB[8:16])[0]
+if gotA != N - 1:
+    errors.append(f'final: field A = {gotA}, expected {N-1}')
+if gotB != N - 1:
+    errors.append(f'final: field B = {gotB}, expected {N-1}')
+
+for e in errors:
+    print(e)
+print(len(errors))
+")
+
+echo "$T35_RESULT" | sed 's/^/  /'
+T35_ERR_COUNT=$(echo "$T35_RESULT" | tail -1)
+T35_ERR_COUNT=${T35_ERR_COUNT:-1}
+
+dfs_sync
+
+[ "$T35_ERR_COUNT" = "0" ] \
+    && check "T35 rapid same-chunk rotation read-after-write, 0 errors" PASS \
+    || check "T35 rapid same-chunk rotation read-after-write, $T35_ERR_COUNT errors" FAIL
+
+rm -f "$T35_FILE"
+fi # should_run T35
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

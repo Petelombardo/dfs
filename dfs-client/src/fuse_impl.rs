@@ -472,6 +472,12 @@ struct FlushHandle {
     /// Prevents a racing flush from re-populating metadata with stale chunk locations.
     /// Cleared once fresh write data lands (first successful chunk update).
     truncated_inodes: Arc<dashmap::DashSet<u64>>,
+    /// Inodes for which setattr just stamped an explicit mtime (utimes/utimensat)
+    /// that hasn't yet been picked up by a flush. flush_buffer_async consumes
+    /// (removes) this on its next run for the inode and skips its own
+    /// modified_at=now() stamp, so a pending chunk flush can't clobber the
+    /// explicit mtime the user just set (rsync -a temp-file restore pattern).
+    explicit_mtime_pending: Arc<dashmap::DashSet<u64>>,
     /// Dedicated runtime for chunk network I/O. Isolated from the main runtime so
     /// flush sub-tasks (which do blocking network writes) never starve write reply
     /// tasks, which must run to unblock the kernel's FUSE write queue.
@@ -1051,10 +1057,15 @@ impl FlushHandle {
                 {
                     meta.size = meta.size.max(last);
                 }
-                meta.modified_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                // Don't clobber an mtime the user explicitly just set via setattr
+                // (utimes/utimensat) — e.g. rsync -a's temp-file restore can land
+                // before this flush completes (T37).
+                if self.explicit_mtime_pending.remove(&ino).is_none() {
+                    meta.modified_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                }
             }
         }
 
@@ -2233,10 +2244,15 @@ impl FlushHandle {
                     {
                         meta.size = meta.size.max(last);
                     }
-                    meta.modified_at = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    // Don't clobber an mtime the user explicitly just set via setattr
+                    // (utimes/utimensat) — e.g. rsync -a's temp-file restore can land
+                    // before this flush completes (T37).
+                    if self.explicit_mtime_pending.remove(&ino).is_none() {
+                        meta.modified_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                    }
                 }
 
                 let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
@@ -2616,6 +2632,9 @@ pub struct DfsFilesystem {
     /// See FlushHandle::truncated_inodes for details.
     truncated_inodes: Arc<dashmap::DashSet<u64>>,
 
+    /// See FlushHandle::explicit_mtime_pending for details.
+    explicit_mtime_pending: Arc<dashmap::DashSet<u64>>,
+
     /// Shared reference to the background flusher's in-flight count map.
     /// Set by the background flusher task after spawn; flush_buffer_async (fsync/close)
     /// waits until the count reaches zero before sending its own flush
@@ -2762,6 +2781,7 @@ impl DfsFilesystem {
         let flush_in_flight_shared: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>> =
             Arc::new(RwLock::new(None));
         let truncated_inodes_shared: Arc<dashmap::DashSet<u64>> = Arc::new(dashmap::DashSet::new());
+        let explicit_mtime_pending_shared: Arc<dashmap::DashSet<u64>> = Arc::new(dashmap::DashSet::new());
         let last_metadata_update_shared: Arc<DashMap<u64, std::time::Instant>> =
             Arc::new(DashMap::new());
 
@@ -2837,6 +2857,7 @@ impl DfsFilesystem {
                 dir_cache_invalidated_at: dir_cache_invalidated_at_shared.clone(),
                 path_to_inode: path_to_inode_for_bg.clone(),
                 truncated_inodes: truncated_inodes_shared.clone(),
+                explicit_mtime_pending: explicit_mtime_pending_shared.clone(),
                 flush_runtime: flush_runtime.clone(),
                 global_buffered_bytes: global_buffered_bytes.clone(),
                 flush_notify: flush_notify.clone(),
@@ -3003,6 +3024,7 @@ impl DfsFilesystem {
             dir_cache_invalidated_at: dir_cache_invalidated_at_shared.clone(),
             path_to_inode: path_to_inode.clone(),
             truncated_inodes: truncated_inodes_shared.clone(),
+            explicit_mtime_pending: explicit_mtime_pending_shared.clone(),
             flush_runtime: flush_runtime.clone(),
             global_buffered_bytes: global_buffered_bytes.clone(),
             flush_notify: flush_notify.clone(),
@@ -3036,6 +3058,7 @@ impl DfsFilesystem {
             open_counts,
             size_high_water: Arc::new(DashMap::new()),
             truncated_inodes: truncated_inodes_shared,
+            explicit_mtime_pending: explicit_mtime_pending_shared,
             flush_in_flight: flush_in_flight_shared,
             flush_runtime,
             read_runtime,
@@ -3395,6 +3418,7 @@ impl Filesystem for DfsFilesystem {
             dir_cache_invalidated_at: self.dir_cache_invalidated_at.clone(),
             path_to_inode: self.path_to_inode.clone(),
             truncated_inodes: self.truncated_inodes.clone(),
+            explicit_mtime_pending: self.explicit_mtime_pending.clone(),
             flush_runtime: self.flush_runtime.clone(),
             global_buffered_bytes: self.global_buffered_bytes.clone(),
             flush_notify: self.flush_notify.clone(),
@@ -6555,13 +6579,12 @@ impl Filesystem for DfsFilesystem {
                     path_to_inode.write().unwrap().remove(&old_path);
                     path_to_inode.write().unwrap().insert(new_path.clone(), old_ino);
 
-                    // Update local metadata cache with new path.
+                    // Update local metadata cache with new path. Per POSIX, rename()
+                    // does not change mtime (only ctime) — don't stamp modified_at=now()
+                    // here, or it clobbers an explicit mtime set via setattr() just
+                    // before the rename (T37: rsync -a's write -> utimes -> rename).
                     let mut new_metadata = metadata.clone();
                     new_metadata.path = new_path.clone();
-                    new_metadata.modified_at = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
                     metadata_cache.insert(old_ino, new_metadata);
 
                     // Invalidate directory caches.
@@ -6752,10 +6775,16 @@ impl Filesystem for DfsFilesystem {
         // forcing re-transfers on every run.
         if let Some(mt) = mtime {
             metadata.modified_at = match mt {
-                fuser::TimeOrNow::SpecificTime(t) => t
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
+                fuser::TimeOrNow::SpecificTime(t) => {
+                    // Flag this inode so a chunk flush still in flight from an
+                    // earlier write() doesn't stamp modified_at=now() and clobber
+                    // the explicit mtime we're about to set (T37: rsync -a's
+                    // write -> utimes -> chmod -> rename temp-file pattern).
+                    self.explicit_mtime_pending.insert(ino);
+                    t.duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                }
                 fuser::TimeOrNow::Now => SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -7053,6 +7082,7 @@ impl Filesystem for DfsFilesystem {
             dir_cache_invalidated_at: self.dir_cache_invalidated_at.clone(),
             path_to_inode: self.path_to_inode.clone(),
             truncated_inodes: self.truncated_inodes.clone(),
+            explicit_mtime_pending: self.explicit_mtime_pending.clone(),
             flush_runtime: self.flush_runtime.clone(),
             global_buffered_bytes: self.global_buffered_bytes.clone(),
             flush_notify: self.flush_notify.clone(),

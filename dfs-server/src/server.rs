@@ -3660,6 +3660,17 @@ impl Server {
         // is strictly greater than the client's.
         let metadata = {
             let mut m = metadata;
+            // A regular metadata update (write/setattr/release) must never move a
+            // file's path — only RenameFile does that. This request may have been
+            // built before a concurrent rename completed, so it can carry the old
+            // path. Snap to the current canonical path so it can't resurrect the
+            // old path index entry or strand its fields (e.g. modified_at) under
+            // a stale path key that get_file_by_path will never see again.
+            if let Ok(Some(existing)) = self.metadata.get_file(&m.id) {
+                if existing.path != m.path {
+                    m.path = existing.path;
+                }
+            }
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
                 for loc in m.chunk_locations.iter_mut() {
@@ -6106,12 +6117,9 @@ impl Server {
             Ok(Some(mut metadata)) => {
                 let file_id = metadata.id;
 
-                // Update path and timestamp
+                // Update path. Per POSIX, rename(2) does not change the file's
+                // mtime, so modified_at carries over unchanged from the source.
                 metadata.path = new_path.clone();
-                metadata.modified_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
                 // Bump write_seq so put_file's stale-drop guard never rejects this.
                 // The path: index entry may have write_seq=0 (loaded from sled via
                 // get_file_by_path), while the file: entry has a higher write_seq

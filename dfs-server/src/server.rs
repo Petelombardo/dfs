@@ -6320,6 +6320,79 @@ mod tests {
             _ => panic!("Expected Bool response"),
         }
     }
+
+    /// chunk_map_update_location_for_file must converge on the location with the
+    /// highest client_write_seq for a given file_offset, regardless of the order in
+    /// which ReplicateChunkLocation messages physically arrive at the leader.
+    ///
+    /// This is the invariant a burst of rapid same-chunk MultiPatch rotations relies
+    /// on (e.g. qcow2 preallocation rewriting two adjacent 64KB clusters back-to-back
+    /// many times before the next flush_metadata_sync). Each rotation fires its RCL
+    /// via an independent tokio::spawn, so arrival order at the leader is not
+    /// guaranteed to match send order. As long as each rotation carries a distinct,
+    /// monotonically increasing client_write_seq (see Client::next_write_seq, called
+    /// once per MultiPatch), the `inc >= ext` guard below correctly keeps the
+    /// highest-seq (chronologically last) location even when it arrives before an
+    /// earlier (lower-seq) rotation's RCL.
+    ///
+    /// If client_write_seq were instead shared across all rotations in one flush
+    /// cycle (the pre-fix behavior), `inc >= ext` degenerates to "last arrival wins"
+    /// for ties — letting an intermediate rotation overwrite the final one and
+    /// leaving the leader's chunk_map pointing at stale chunk data.
+    #[tokio::test]
+    async fn test_chunk_map_update_converges_on_highest_write_seq_despite_reordering() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+
+        let file_id = dfs_common::FileId::new();
+        let file_offset = 2 * 1024 * 1024u64; // chunk 512's file_offset
+
+        // 8 rotations (V1..V7, then the final/converged G), each with a distinct
+        // chunk_id and a distinct, monotonically increasing client_write_seq.
+        let rotations: Vec<ChunkLocation> = (1u64..=8).map(|seq| {
+            let hash = compute_chunk_hash(format!("rotation-{}", seq).as_bytes());
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash(hash),
+                nodes: vec![],
+                size: 65536,
+                checksum: hash,
+                file_offset: Some(file_offset),
+                written_at: Some(1000 + seq),
+                client_write_seq: Some(seq),
+                file_id: None,
+            }
+        }).collect();
+        let final_chunk_id = rotations[7].chunk_id; // seq=8, the last rotation (G)
+
+        // Deliver out of order: G (seq=8) arrives 6th, before V7 (seq=7) and V8... wait,
+        // there is no V8 — arrival order below interleaves seq=8 ahead of seq=6,7.
+        let arrival_order = [1usize, 3, 2, 5, 4, 8, 6, 7];
+        for seq in arrival_order {
+            let loc = &rotations[seq - 1];
+            server.chunk_map_update_location_for_file(file_id, loc).await;
+        }
+
+        // The leader's chunk_map must reflect the highest-seq (last) rotation, even
+        // though it arrived 6th out of 8.
+        let entry = server.chunk_map.get(&file_id).expect("chunk_map entry must exist");
+        let (locs, _) = entry.value();
+        let loc = locs.iter().find(|l| l.file_offset == Some(file_offset))
+            .expect("location for file_offset must exist");
+        assert_eq!(loc.chunk_id, final_chunk_id,
+            "chunk_map must converge on the highest client_write_seq location (G), \
+             not whichever RCL happened to arrive last");
+        assert_eq!(loc.client_write_seq, Some(8));
+    }
 }
 
 /// Implement MessageHandler trait for Server

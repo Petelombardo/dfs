@@ -2185,7 +2185,15 @@ leader_addr: Arc::new(RwLock::new(None)),
         for (chunk_idx, _chunk_start, _chunk_size) in &needed {
             let idx = *chunk_idx;
             let loc = &chunk_map[idx];
-            let cid = loc.chunk_id;
+            // Prefer the chunk_id confirmed by our own write path over chunk_map, which is
+            // fed by the leader's RCL-merged view and can lag behind (or, if multiple rapid
+            // same-chunk patches raced with equal client_write_seq, regress past) our most
+            // recent write. The client is authoritative for chunks it has written — same
+            // reasoning as the range-fetch path above.
+            let cid = self.recent_chunk_writes
+                .get(&(inode, idx as u64))
+                .map(|e| e.0)
+                .unwrap_or(loc.chunk_id);
 
             // 1. Chunk cache (skip for SQLite).
             if !bypass_cache {
@@ -5619,9 +5627,16 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let addr_to_node_id_snap = self.addr_to_node_id.read().await.clone();
 
-        // Capture the current write_seq for this file so the leader can use it to order
+        // Consume a fresh write_seq for this patch so the leader can use it to order
         // concurrent RCL notifications from the same file without relying on wall clocks.
-        let patch_client_write_seq = self.write_seq.get(&file_id).map(|e| *e);
+        // MUST increment (not just read): a single flush cycle can issue several rapid
+        // MultiPatch rotations for the same chunk (e.g. qcow2 preallocation patching
+        // adjacent 64KB clusters back-to-back) before the next flush_metadata_sync bumps
+        // write_seq. If they all carried the same seq, the leader's chunk_map merge
+        // (`inc >= ext`) accepts whichever RCL physically arrives last — which can be an
+        // intermediate rotation, not the final one — leaving chunk_map pointing at stale
+        // chunk data that a later full-chunk read serves to the application.
+        let patch_client_write_seq = Some(self.next_write_seq(file_id));
 
         // Split-frame MultiPatch: when total patch data is large enough that bincode
         // serialization overhead matters (>= 32KB), serialize the envelope once with

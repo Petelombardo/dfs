@@ -2256,6 +2256,116 @@ dfs_sync
 rm -f "$T33_FILE"
 fi # should_run T33
 
+if should_run T34; then
+snapshot_log T34
+echo ""
+echo "=== T34: cross-path same-chunk patch race (server_chunk_id invariant) ==="
+
+T34_FILE="$MOUNT/t34_crosspath.bin"
+
+T34_RESULT=$(python3 -c "
+import os, threading, time, random
+
+CHUNK = 4 * 1024 * 1024
+PATH = '$T34_FILE'
+
+fd = os.open(PATH, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+
+# Establish two existing 4MB chunks (0xAA / 0xCC) and fsync, so chunk0 has an
+# existing_loc on the server — every subsequent write into chunk0 is an
+# in-place overwrite (PatchChunk/MultiPatch), not a fresh-chunk write.
+patA = bytes([0xAA]) * (128 * 1024)
+patC = bytes([0xCC]) * (128 * 1024)
+for off in range(0, CHUNK, len(patA)):
+    os.pwrite(fd, patA, off)
+for off in range(0, CHUNK, len(patC)):
+    os.pwrite(fd, patC, CHUNK + off)
+os.fsync(fd)
+
+# 16 threads, each repeatedly patching its OWN disjoint 4KB region within the
+# first 64KB of chunk0 with its OWN fixed pattern. A fsyncer thread calls
+# fsync (path 1: flush_buffer_async force=true) every ~80ms while writers and
+# the 50ms background ticker (path 2) are also flushing chunk0. Because each
+# thread always rewrites the SAME pattern to the SAME region, the only way a
+# region can end up wrong is if a concurrent flush from another path silently
+# loses the update (stale slot.server_chunk_id base for a MultiPatch).
+N_WRITERS = 16
+REGION = 4096
+DURATION = 3.0
+
+stop = threading.Event()
+
+def writer(t):
+    rng = random.Random(t)
+    pattern = bytes([0x10 + t]) * REGION
+    off = t * REGION
+    while not stop.is_set():
+        os.pwrite(fd, pattern, off)
+        time.sleep(rng.uniform(0.001, 0.005))
+
+def fsyncer():
+    while not stop.is_set():
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        time.sleep(0.08)
+
+threads = [threading.Thread(target=writer, args=(t,)) for t in range(N_WRITERS)]
+threads.append(threading.Thread(target=fsyncer))
+for th in threads:
+    th.start()
+
+time.sleep(DURATION)
+stop.set()
+for th in threads:
+    th.join()
+
+os.fsync(fd)
+os.close(fd)
+
+# Verify via a fresh fd: each thread's region must hold its own pattern, and
+# the untouched remainder of chunk0/chunk1 must be unchanged.
+fd2 = os.open(PATH, os.O_RDONLY)
+chunk0 = os.pread(fd2, CHUNK, 0)
+chunk1 = os.pread(fd2, CHUNK, CHUNK)
+os.close(fd2)
+
+errors = []
+for t in range(N_WRITERS):
+    off = t * REGION
+    expected = bytes([0x10 + t]) * REGION
+    got = chunk0[off:off+REGION]
+    if got != expected:
+        errors.append(f'region {t} (offset {off}): expected {expected[:8].hex()}, got {got[:8].hex()}')
+
+rest = chunk0[N_WRITERS*REGION:]
+if rest != bytes([0xAA]) * len(rest):
+    bad = next((i for i, b in enumerate(rest) if b != 0xAA), -1)
+    errors.append(f'chunk0 tail corrupted at offset {N_WRITERS*REGION + bad}, value={rest[bad]:#x}')
+
+if chunk1 != bytes([0xCC]) * CHUNK:
+    bad = next((i for i, b in enumerate(chunk1) if b != 0xCC), -1)
+    errors.append(f'chunk1 corrupted at offset {bad}, value={chunk1[bad]:#x}')
+
+for e in errors:
+    print(e)
+print(len(errors))
+")
+
+echo "$T34_RESULT" | sed 's/^/  /'
+T34_ERR_COUNT=$(echo "$T34_RESULT" | tail -1)
+T34_ERR_COUNT=${T34_ERR_COUNT:-1}
+
+dfs_sync
+
+[ "$T34_ERR_COUNT" = "0" ] \
+    && check "T34 cross-path same-chunk patch race, 0 errors" PASS \
+    || check "T34 cross-path same-chunk patch race, $T34_ERR_COUNT errors" FAIL
+
+rm -f "$T34_FILE"
+fi # should_run T34
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

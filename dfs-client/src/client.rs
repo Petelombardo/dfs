@@ -2922,7 +2922,20 @@ leader_addr: Arc::new(RwLock::new(None)),
             .and_then(|l| l.file_offset)
             .map(|o| (o / CHUNK_SIZE_U64) as u32)
             .unwrap_or(0);
-        let total_chunks = from_chunk + locations.len() as u32;
+        // chunk_locations is a sparse list sorted by file_offset, NOT indexed by chunk_idx —
+        // for large sparse files (e.g. VM disk images) locations.len() can be far smaller
+        // than the highest chunk_idx present. update_chunk_map_window places each entry at
+        // new_map[chunk_idx] and only does so if chunk_idx < total_chunks, so total_chunks
+        // must cover the highest chunk_idx referenced here (matching the server's
+        // handle_get_file_chunk_map: total_chunks = max_chunk_idx + 1). Otherwise the
+        // highest-indexed chunk in this batch is silently dropped from the engine's map:
+        // chunks_for_range then finds no entry covering that file range and treats it as a
+        // sparse hole, returning zeros for a chunk that was actually written and replicated.
+        let max_chunk_idx = locations.iter()
+            .filter_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE_U64) as u32))
+            .max()
+            .unwrap_or(from_chunk);
+        let total_chunks = (from_chunk + locations.len() as u32).max(max_chunk_idx + 1);
 
         // Snapshot old chunk IDs for the slots we're about to update so we can evict
         // them from the chunk cache. Without this, a reader near the write edge can get

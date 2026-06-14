@@ -211,7 +211,6 @@ impl InodeReadEngine {
         }
 
         const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
-        let window_len = window.len() as u32;
         for loc in window.into_iter() {
             let idx = if let Some(offset) = loc.file_offset {
                 (offset / CHUNK_SIZE_U64) as usize
@@ -244,7 +243,11 @@ impl InodeReadEngine {
         }
 
         let offsets = build_offsets(&new_map);
-        let window_end = from_chunk + window_len;
+        // window_end reflects the engine map's actual coverage [0, new_map.len()), not just
+        // the (possibly sparse) entry count in this batch — otherwise needs_refresh() sees
+        // current_chunk >= window_end for any chunk beyond the batch size and triggers a
+        // redundant background leader refresh on every read into that region.
+        let window_end = new_map.len() as u32;
         info!("Engine inode={}: chunk map window merged ({} chunks, {} bytes, window from={} end={})",
               self.inode, new_map.len(), file_size, from_chunk, window_end);
 

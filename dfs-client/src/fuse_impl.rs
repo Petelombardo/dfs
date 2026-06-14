@@ -779,6 +779,16 @@ impl FlushHandle {
                                     (ino, *chunk_idx),
                                     (new_location.chunk_id, file_id_legacy, std::time::Instant::now(), new_location.nodes.clone()),
                                 );
+                                // Update slot.server_chunk_id so a concurrent flush_buffer_async_one
+                                // for this chunk (background ticker) sees this patch's result as its
+                                // base, instead of a stale metadata_cache/recent_chunk_writes snapshot
+                                // taken before this patch completed.
+                                if let Some(state_arc) = self.write_buffers.get(&ino) {
+                                    let mut state = state_arc.lock().await;
+                                    if let Some(slot) = state.slots.get_mut(chunk_idx) {
+                                        slot.server_chunk_id = Some(new_location.chunk_id);
+                                    }
+                                }
                                 // Evict the old chunk_id — the file at that hash path has been
                                 // renamed away on the server. Any cached entry for it would cause
                                 // an I/O error on the next read. The new chunk_id will be fetched
@@ -5153,6 +5163,20 @@ impl Filesystem for DfsFilesystem {
                             old_loc.chunk_id, file_id, target_chunk_idx, offset as u64, target_intra, data_vec.clone(), &old_loc,
                         ).await {
                             Ok(new_loc) => {
+                                // Record the new chunk_id/nodes so a concurrent flush_buffer_async_one
+                                // for this chunk (background ticker) doesn't resolve its base from a
+                                // metadata_cache/recent_chunk_writes snapshot taken before this patch
+                                // completed — same invariant as flush_buffer_async's patch path.
+                                client.recent_chunk_writes.insert(
+                                    (ino, target_chunk_idx),
+                                    (new_loc.chunk_id, file_id, std::time::Instant::now(), new_loc.nodes.clone()),
+                                );
+                                if let Some(state_arc) = write_buffers.get(&ino) {
+                                    let mut state = state_arc.lock().await;
+                                    if let Some(slot) = state.slots.get_mut(&target_chunk_idx) {
+                                        slot.server_chunk_id = Some(new_loc.chunk_id);
+                                    }
+                                }
                                 // Re-read metadata_cache after the network call to pick up
                                 // any updates from other chunks that completed while we waited.
                                 let mut meta = metadata_cache.get(&ino).map(|m| m.clone())
@@ -5481,6 +5505,20 @@ impl Filesystem for DfsFilesystem {
                         metadata.size = metadata.size.max(physical_size);
                         info!("After splice: {} total chunks, {} total bytes",
                               metadata.chunk_locations.len(), metadata.size);
+                        // The splice may not map 1:1 onto the old chunk indices (the new
+                        // chunk count can differ from the old range size), so we can't assign
+                        // correct per-index server_chunk_id values here. Clear server_chunk_id
+                        // for every affected slot instead, so a concurrent flush_buffer_async_one
+                        // falls back to the metadata_cache entry just written above (fresh)
+                        // rather than trusting a chunk_id confirmed before this RMW replaced it.
+                        if let Some(state_arc) = write_buffers.get(&ino) {
+                            let mut state = state_arc.lock().await;
+                            for cidx in first_idx..=last_idx {
+                                if let Some(slot) = state.slots.get_mut(&(cidx as u64)) {
+                                    slot.server_chunk_id = None;
+                                }
+                            }
+                        }
                     } else {
                         warn!("Full file rewrite with {} bytes", new_data.len());
                         metadata.chunk_locations = chunk_locations_opt.unwrap_or_default();

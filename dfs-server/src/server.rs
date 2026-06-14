@@ -5891,12 +5891,20 @@ impl Server {
             let total_chunks = max_chunk_idx + 1;
 
             // Return only entries whose chunk index falls within [from_chunk, from_chunk+count).
+            // Override `nodes` from the CHUNK_TABLE sled record — same correction
+            // handle_get_file_info applies. The healer (ghost pruning, re-replication,
+            // over-replication trim) updates CHUNK_TABLE directly but never touches
+            // this in-memory/inline chunk_locations copy, so without this clients can
+            // be routed to a node the healer already moved the chunk away from.
             let window: Vec<dfs_common::ChunkLocation> = locations.iter()
                 .filter(|l| {
                     let idx = l.file_offset.map(|o| (o / CHUNK_SIZE) as u32).unwrap_or(0);
                     idx >= from_chunk && idx < from_chunk.saturating_add(count)
                 })
-                .cloned()
+                .map(|l| match self.metadata.get_chunk_location(&l.chunk_id) {
+                    Ok(Some(sled_loc)) => ChunkLocation { nodes: sled_loc.nodes, ..l.clone() },
+                    _ => l.clone(),
+                })
                 .collect();
 
             Response::FileChunkMap {
@@ -6403,6 +6411,69 @@ mod tests {
             "chunk_map must converge on the highest client_write_seq location (G), \
              not whichever RCL happened to arrive last");
         assert_eq!(loc.client_write_seq, Some(8));
+    }
+
+    /// GetFileChunkMap must report CHUNK_TABLE's current node list for each chunk,
+    /// not the in-memory chunk_map / inline FileMetadata.chunk_locations copy.
+    ///
+    /// The healer (ghost-node pruning, re-replication, over-replication trim) writes
+    /// its results directly to CHUNK_TABLE via batch_update_chunk_locations, and
+    /// broadcasts ReplicateChunkLocations to other nodes — but a node that was just
+    /// restarted rebuilds chunk_map from the inline FileMetadata.chunk_locations
+    /// (FILE_TABLE), which the healer never touches. If GetFileChunkMap serves that
+    /// stale copy, clients are routed to a node the healer already moved the chunk
+    /// away from, producing "Chunk ... not found on this node" on every read.
+    #[tokio::test]
+    async fn test_get_file_chunk_map_uses_chunk_table_authoritative_nodes() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+
+        let file_id = dfs_common::FileId::new();
+        let hash = compute_chunk_hash(b"chunk-data");
+        let chunk_id = ChunkId::from_hash(hash);
+
+        let stale_node = NodeId::new();   // node the healer has already moved this chunk OFF of
+        let current_node = NodeId::new(); // node CHUNK_TABLE says actually holds it now
+
+        let loc = ChunkLocation {
+            chunk_id,
+            nodes: vec![stale_node],
+            size: 65536,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: Some(1000),
+            client_write_seq: Some(1),
+            file_id: None,
+        };
+
+        // Simulate the in-memory chunk_map (e.g. rebuilt from inline FileMetadata.chunk_locations
+        // after a restart) — still pointing at the node the chunk used to live on.
+        server.chunk_map.insert(file_id, (vec![loc.clone()], 1));
+
+        // Simulate the healer having relocated the chunk to `current_node` and recorded
+        // that in CHUNK_TABLE, without updating chunk_map/inline (the actual drift).
+        server.metadata.put_chunk_location(&ChunkLocation { nodes: vec![current_node], ..loc.clone() }).unwrap();
+
+        let response = server.handle_get_file_chunk_map(file_id, 0, u32::MAX).await;
+        match response {
+            Response::FileChunkMap { locations, .. } => {
+                assert_eq!(locations.len(), 1);
+                assert_eq!(locations[0].nodes, vec![current_node],
+                    "GetFileChunkMap must report CHUNK_TABLE's current node list, \
+                     not the stale chunk_map/inline copy the healer already moved the chunk away from");
+            }
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        }
     }
 }
 

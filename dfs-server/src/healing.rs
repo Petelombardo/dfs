@@ -1456,8 +1456,6 @@ impl HealingManager {
 
         // Also check local storage — the chunk may exist here but not be in metadata
         // (e.g. node ID was incorrectly pruned by a previous healer bug).
-        // NOTE: we track whether the local node was added via fallback so we don't
-        // count it toward replica_count — the routing table is authoritative for that.
         let mut local_added_via_fallback = false;
         if !alive.iter().any(|(id, _)| *id == local_id) && storage.has_chunk(chunk_id) {
             if let Some(info) = cluster.get_node(&local_id).await {
@@ -1474,16 +1472,41 @@ impl HealingManager {
             anyhow::bail!("No alive nodes have chunk {}", chunk_id);
         }
 
-        // Use confirmed_alive count (excluding the local fallback) for replica accounting.
-        // The routing table is authoritative for how many replicas exist; the local fallback
-        // is a source-of-data only and shouldn't inflate the replica count.
-        let replica_count = if local_added_via_fallback {
-            alive.len().saturating_sub(1)
-        } else {
-            alive.len()
-        };
+        // `alive` (including any verified local-fallback copy) is exactly the node set
+        // that will end up holding this chunk once healing completes, so count all of
+        // it toward replica_count. Chunk IDs are content hashes, so a fallback copy
+        // confirmed via storage.has_chunk() is guaranteed correct, not stale — treating
+        // it as "just a source" (prior behavior) under-counted replica_count by one
+        // while still including it in the final node list, over-replicating to RF+1.
+        let replica_count = alive.len();
         let needed = replication_factor.saturating_sub(replica_count);
+        let base_nodes: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
         if needed == 0 {
+            if local_added_via_fallback {
+                // Reconcile routing table: this node holds a verified copy the routing
+                // table doesn't know about. Record it now so discovery stops reporting
+                // this chunk as under-replicated and the orphan sweep doesn't delete
+                // this now-needed replica.
+                let updated_location = ChunkLocation {
+                    chunk_id: *chunk_id,
+                    nodes: base_nodes,
+                    size: location.size,
+                    checksum: location.checksum,
+                    file_offset: location.file_offset,
+                    written_at: Some(Self::now_ms()),
+                    client_write_seq: None,
+                    file_id: location.file_id,
+                };
+                let meta = Arc::clone(metadata);
+                let loc = updated_location.clone();
+                match tokio::task::spawn_blocking(move || meta.put_chunk_location(&loc)).await {
+                    Ok(Ok(())) => {
+                        Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
+                    }
+                    Ok(Err(e)) => warn!("Failed to reconcile chunk location for {}: {}", chunk_id, e),
+                    Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
+                }
+            }
             Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
             return Ok(());
         }
@@ -1502,6 +1525,11 @@ impl HealingManager {
             .filter(|n| !alive_ids.contains(n))
             .take(needed)
             .collect();
+
+        debug!(
+            "Healing chunk {}: alive={:?} replica_count={} needed={} targets={:?}",
+            chunk_id, alive_ids, replica_count, needed, targets
+        );
 
         if targets.is_empty() {
             warn!("No suitable target nodes for healing chunk {}", chunk_id);
@@ -1544,6 +1572,8 @@ impl HealingManager {
                         warn!("Chunk {} push from {} to {} error: {}", chunk_id, source_id, target_id, e);
                     }
                 }
+            } else {
+                warn!("Chunk {}: target node {} not found in cluster registry — skipping", chunk_id, target_id);
             }
         }
 
@@ -1584,7 +1614,7 @@ impl HealingManager {
                 return Ok(());
             }
 
-            let mut updated_nodes: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
+            let mut updated_nodes = base_nodes;
             updated_nodes.extend(replicated);
 
             let updated_location = ChunkLocation {

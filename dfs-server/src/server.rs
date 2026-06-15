@@ -2222,12 +2222,31 @@ impl Server {
             }
 
             // Re-use existing merge logic from the single-item handler inline.
+            //
+            // Mirrors handle_replicate_chunk_location's branching: chunks are
+            // content-addressed, so when both the incoming and existing records
+            // are under-RF, any node listed in either genuinely holds the data —
+            // union rather than overwrite. Without this, chunk_location_sync's
+            // periodic self-report (each replica pushes its own single-node local
+            // record) can clobber a freshly-written 2-node record down to 1 node:
+            // node A reports {A}, overwriting {A,B} to {A}; then node B reports
+            // {B}, overwriting {A} to {B} — net result stuck at 1 replica until
+            // the healer's deep scan eventually corrects it.
             let existing = self.metadata.get_chunk_location(&location.chunk_id)
                 .ok().flatten();
             let incoming_count = location.nodes.len();
             let existing_count = existing.as_ref().map_or(0, |e| e.nodes.len());
             let rf = self.replication_factor;
-            let nodes = if incoming_count > existing_count {
+            let nodes = if incoming_count < rf && existing_count < rf {
+                // Both sides are under-RF — union the node sets.
+                let mut merged: Vec<_> = existing.as_ref().map_or_else(Vec::new, |e| e.nodes.clone());
+                for n in &location.nodes {
+                    if !merged.contains(n) {
+                        merged.push(*n);
+                    }
+                }
+                merged
+            } else if incoming_count > existing_count {
                 location.nodes.clone()
             } else if incoming_count < rf && existing_count >= rf {
                 continue; // stale early-write — skip
@@ -2240,8 +2259,14 @@ impl Server {
                 size: location.size,
                 checksum: location.checksum,
                 file_offset: location.file_offset.or_else(|| existing.as_ref().and_then(|e| e.file_offset)),
-                written_at: location.written_at.or_else(|| existing.as_ref().and_then(|e| e.written_at)),
-                client_write_seq: None,
+                // Prefer the existing record's written_at (mirrors handle_replicate_chunk_location's
+                // merge at line ~2009): `existing` is the leader's already-merged record, stamped
+                // at merge time. `location` is this reporting node's own pre-merge self-registration,
+                // stamped at its local write time — always <= the leader's merge timestamp. Taking
+                // `location.written_at` here would regress the leader's CHUNK_TABLE entry to an
+                // older timestamp on every periodic self-report.
+                written_at: existing.as_ref().and_then(|e| e.written_at).or(location.written_at),
+                client_write_seq: location.client_write_seq.or_else(|| existing.as_ref().and_then(|e| e.client_write_seq)),
                 file_id: location.file_id.or_else(|| existing.as_ref().and_then(|e| e.file_id)),
             };
             if let Err(e) = self.metadata.put_chunk_location(&merged) {
@@ -5809,21 +5834,39 @@ impl Server {
     }
 
     /// Handle get file info request
+    /// Resolve the node list to report for a chunk, choosing between the per-node
+    /// CHUNK_TABLE record and the inline record from FileMetadata/chunk_map.
+    ///
+    /// CHUNK_TABLE normally wins: it reflects healer updates (heal, trim, ghost
+    /// prune) that never touch the FileMetadata inline copy, and unioning the two
+    /// sources would create phantom extra nodes once the healer has replaced a
+    /// node in CHUNK_TABLE but the inline still has the old one.
+    ///
+    /// But a node's own CHUNK_TABLE entry for a chunk it just wrote starts life as
+    /// a single-node self-registration stamped at local-write time — strictly
+    /// *before* the leader's merge that produced the inline record (a node's local
+    /// write always completes before the client can report it to the leader). If
+    /// that self-record is older than the inline record, it hasn't been touched by
+    /// a healer since the write and overriding with it would clobber the leader's
+    /// correctly-merged node list with a stale single-node view. So CHUNK_TABLE
+    /// only wins when it's at least as fresh as the inline record.
+    fn resolve_chunk_nodes(inline: &ChunkLocation, sled_loc: ChunkLocation) -> ChunkLocation {
+        if sled_loc.written_at.unwrap_or(0) >= inline.written_at.unwrap_or(0) {
+            ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
+        } else {
+            inline.clone()
+        }
+    }
+
     async fn handle_get_file_info(&self, path: String) -> Response {
         debug!("Handling get file info: {}", path);
 
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                // Use the CHUNK_TABLE sled record as the authoritative node list —
-                // it reflects healer updates (heal, trim, ghost prune) that never
-                // touch the FileMetadata inline copy. Unioning the two sources
-                // creates phantom extra nodes whenever the healer has replaced a
-                // node in the CHUNK_TABLE but the inline still has the old one.
                 let chunk_locations = metadata.chunk_locations.iter().map(|inline| {
-                    if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
-                        ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
-                    } else {
-                        inline.clone()
+                    match self.metadata.get_chunk_location(&inline.chunk_id) {
+                        Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(inline, sled_loc),
+                        _ => inline.clone(),
                     }
                 }).collect();
 
@@ -5853,10 +5896,9 @@ impl Server {
         match self.metadata.get_file(&file_id) {
             Ok(Some(metadata)) => {
                 let chunk_locations = metadata.chunk_locations.iter().map(|inline| {
-                    if let Ok(Some(sled_loc)) = self.metadata.get_chunk_location(&inline.chunk_id) {
-                        ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
-                    } else {
-                        inline.clone()
+                    match self.metadata.get_chunk_location(&inline.chunk_id) {
+                        Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(inline, sled_loc),
+                        _ => inline.clone(),
                     }
                 }).collect();
 
@@ -5902,18 +5944,18 @@ impl Server {
             let total_chunks = max_chunk_idx + 1;
 
             // Return only entries whose chunk index falls within [from_chunk, from_chunk+count).
-            // Override `nodes` from the CHUNK_TABLE sled record — same correction
-            // handle_get_file_info applies. The healer (ghost pruning, re-replication,
-            // over-replication trim) updates CHUNK_TABLE directly but never touches
-            // this in-memory/inline chunk_locations copy, so without this clients can
-            // be routed to a node the healer already moved the chunk away from.
+            // Resolve `nodes` against the CHUNK_TABLE sled record — same correction
+            // handle_get_file_info applies (see resolve_chunk_nodes). The healer (ghost
+            // pruning, re-replication, over-replication trim) updates CHUNK_TABLE directly
+            // but never touches this in-memory/inline chunk_locations copy, so without this
+            // clients can be routed to a node the healer already moved the chunk away from.
             let window: Vec<dfs_common::ChunkLocation> = locations.iter()
                 .filter(|l| {
                     let idx = l.file_offset.map(|o| (o / CHUNK_SIZE) as u32).unwrap_or(0);
                     idx >= from_chunk && idx < from_chunk.saturating_add(count)
                 })
                 .map(|l| match self.metadata.get_chunk_location(&l.chunk_id) {
-                    Ok(Some(sled_loc)) => ChunkLocation { nodes: sled_loc.nodes, ..l.clone() },
+                    Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(l, sled_loc),
                     _ => l.clone(),
                 })
                 .collect();

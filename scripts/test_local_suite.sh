@@ -2605,6 +2605,71 @@ dfs_sync
 rm -f "$T37_FILE" "$T37_TMP"
 fi # should_run T37
 
+# ── Test 38: rolling node restart during slow write — replica convergence ────
+#
+# Reproduces a staging observation (live DVR recording, RF=3 cluster): a
+# rolling restart of all server nodes while a long write is in flight left
+# some chunks under-replicated (< RF=3) until the healer caught up. Verifies:
+#   1. Data written across the restart window is intact (md5 match).
+#   2. The healer converges every chunk back to RF=3 within a short window.
+if should_run T38; then
+snapshot_log T38
+echo ""
+echo "=== T38: rolling node restart during slow write (replica convergence) ==="
+
+T38_FILE="$MOUNT/t38_slow.bin"
+T38_SIZE_MB=40
+
+dd if=/dev/urandom of="$T/t38_src.bin" bs=1M count=$T38_SIZE_MB 2>/dev/null
+
+# Write at ~2MB/s so the 40MB/10-chunk write spans the whole rolling restart.
+pv -q -L 2m "$T/t38_src.bin" > "$T38_FILE" &
+T38_PV_PID=$!
+
+sleep 2   # let the write get going before the first restart
+
+echo "  Rolling restart of all 5 server nodes (one at a time)..."
+for i in 1 2 3 4 5; do
+    pkill -f "dfs-server start --config $BASE/node${i}/config.toml" 2>/dev/null || true
+    sleep 0.5
+    RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
+        >> "$LOG/server${i}.log" 2>&1 &
+    sleep 2
+done
+
+wait $T38_PV_PID
+dfs_sync
+
+T38_GOT_MD5=$(md5sum "$T38_FILE" | awk '{print $1}')
+T38_REF_MD5=$(md5sum "$T/t38_src.bin" | awk '{print $1}')
+[ "$T38_GOT_MD5" = "$T38_REF_MD5" ] \
+    && check "T38a data intact after rolling restart during write (md5 match)" PASS \
+    || check "T38a data corrupt after rolling restart (want $T38_REF_MD5 got $T38_GOT_MD5)" FAIL
+
+# Inspect chunk replication immediately after the restart settles.
+T38_UNDER_BEFORE=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t38_slow.bin 2>/dev/null \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 2))")
+echo "  Under-replicated chunks immediately after restart: ${T38_UNDER_BEFORE:-?}"
+
+# Give the healer time to converge (local healing_delay_secs=10).
+echo "  Waiting for healer to converge replicas..."
+sleep 15
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing file /t38_slow.bin 2>/dev/null || true
+# Run healing trigger
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
+"$BIN/dfs-admin" --cluster "$CLUSTER" file info /t38_slow.bin
+sleep 8
+
+T38_UNDER_AFTER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t38_slow.bin 2>/dev/null \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 2))")
+
+[ "$T38_UNDER_AFTER" = "0" ] \
+    && check "T38b all chunks reach RF=3 after healing (was ${T38_UNDER_BEFORE:-?} under-replicated)" PASS \
+    || check "T38b ${T38_UNDER_AFTER:-?} chunks still under-replicated after healing (was ${T38_UNDER_BEFORE:-?})" FAIL
+
+rm -f "$T38_FILE" "$T/t38_src.bin"
+fi # should_run T38
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

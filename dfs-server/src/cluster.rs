@@ -491,6 +491,21 @@ impl ClusterManager {
         let all_nodes: Vec<NodeId> = ring.nodes().to_vec();
         drop(ring);
 
+        // Prefer online nodes for placement. The Fisher-Yates ordering below is seeded
+        // by chunk_id, so for a given chunk the candidate order is deterministic — an
+        // offline node (e.g. mid-restart during a rolling restart) would otherwise be
+        // picked first on every healing cycle for that chunk, and the healer would keep
+        // retrying an unreachable target instead of falling back to a node that can
+        // actually receive the chunk now. Offline nodes are appended after online ones
+        // so they're still used as a last resort if too few online nodes remain.
+        let nodes_registry = self.nodes.read().await;
+        let (mut all_nodes, offline_nodes): (Vec<NodeId>, Vec<NodeId>) = all_nodes.into_iter()
+            .partition(|id| nodes_registry.get(id).map_or(true, |n| n.status == NodeStatus::Online));
+        drop(nodes_registry);
+        if all_nodes.len() < count {
+            all_nodes.extend(offline_nodes);
+        }
+
         let seed = u64::from_le_bytes(chunk_id.hash[..8].try_into().unwrap_or([0u8; 8]));
 
         if all_nodes.len() <= count {

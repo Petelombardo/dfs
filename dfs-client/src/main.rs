@@ -509,7 +509,10 @@ CapabilityBoundingSet=CAP_SYS_ADMIN
 AmbientCapabilities=CAP_SYS_ADMIN
 # Allow clean unmount on stop
 ExecStop=/bin/fusermount -u {:?}
-TimeoutStopSec=10
+# destroy() drains write buffers and commits metadata before unmount completes;
+# its internal timeouts total up to ~60s under a degraded cluster, so this must
+# exceed that or systemd SIGKILLs mid-drain and silently drops unflushed writes.
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target

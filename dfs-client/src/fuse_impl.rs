@@ -7015,9 +7015,23 @@ impl Filesystem for DfsFilesystem {
                         // boundary — metadata must be committed here so followers receive
                         // routing updates before the next read. The server's authoritative
                         // chunk_map guard makes mid-session metadata syncs ghost-free.
+                        //
+                        // Debounce: skip redundant PutFileMetadata RPCs on rapid fsyncs
+                        // (e.g. VM-disk random writes). The per-chunk RCL fired by each
+                        // replica already keeps the leader's in-memory chunk_map current
+                        // for routing; a full PutFileMetadata is only needed periodically.
+                        // release() always calls flush_metadata_sync unconditionally,
+                        // guaranteeing a final durable commit on file close.
+                        const METADATA_SYNC_DEBOUNCE_MS: u128 = 500;
                         if let Some(meta) = handle.metadata_cache.get(&ino).map(|m| m.clone()) {
-                            handle.client.flush_metadata_sync(&meta).await;
-                            handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                            let needs_sync = handle.last_metadata_update
+                                .get(&ino)
+                                .map(|t| t.elapsed().as_millis() >= METADATA_SYNC_DEBOUNCE_MS)
+                                .unwrap_or(true);
+                            if needs_sync {
+                                handle.client.flush_metadata_sync(&meta).await;
+                                handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                            }
                         }
                         reply.ok();
                     }

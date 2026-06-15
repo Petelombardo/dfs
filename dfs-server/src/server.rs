@@ -2089,6 +2089,16 @@ impl Server {
                 info!("Successfully replicated chunk location for {} (total nodes: {})",
                       merged_location.chunk_id, merged_location.nodes.len());
 
+                // If this write landed below RF (the normal 2-of-3 sync write-pair
+                // case), don't wait for the next discovery pass (up to 60s) to notice
+                // — the leader already knows right now. Queue it for the next heal
+                // loop tick (~15s) instead, skipping the discovery debounce.
+                if merged_location.nodes.len() < self.replication_factor {
+                    if let Some(healing) = self.healing.read().await.as_ref() {
+                        healing.queue_chunks_immediate(vec![merged_location.chunk_id]).await;
+                    }
+                }
+
                 // Do NOT re-broadcast to followers. The client sends ReplicateChunkLocation
                 // only to the leader; followers receive authoritative full-file state via
                 // PutFileMetadata (flush_metadata_sync) with write_seq ordering at the end
@@ -2214,6 +2224,7 @@ impl Server {
 
         let mut failed = 0usize;
         let mut rejected = 0usize;
+        let mut under_replicated: Vec<ChunkId> = Vec::new();
         for location in &locations {
             // Reject locations for chunks not referenced by any live file.
             if !live_chunks.contains(&location.chunk_id) {
@@ -2269,9 +2280,21 @@ impl Server {
                 client_write_seq: location.client_write_seq.or_else(|| existing.as_ref().and_then(|e| e.client_write_seq)),
                 file_id: location.file_id.or_else(|| existing.as_ref().and_then(|e| e.file_id)),
             };
-            if let Err(e) = self.metadata.put_chunk_location(&merged) {
-                warn!("Failed to replicate chunk location {}: {}", location.chunk_id, e);
-                failed += 1;
+            match self.metadata.put_chunk_location(&merged) {
+                Ok(_) => {
+                    if merged.nodes.len() < rf {
+                        under_replicated.push(merged.chunk_id);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to replicate chunk location {}: {}", location.chunk_id, e);
+                    failed += 1;
+                }
+            }
+        }
+        if !under_replicated.is_empty() {
+            if let Some(healing) = self.healing.read().await.as_ref() {
+                healing.queue_chunks_immediate(under_replicated).await;
             }
         }
         if rejected > 0 {
@@ -5843,18 +5866,20 @@ impl Server {
     /// node in CHUNK_TABLE but the inline still has the old one.
     ///
     /// But a node's own CHUNK_TABLE entry for a chunk it just wrote starts life as
-    /// a single-node self-registration stamped at local-write time — strictly
-    /// *before* the leader's merge that produced the inline record (a node's local
-    /// write always completes before the client can report it to the leader). If
-    /// that self-record is older than the inline record, it hasn't been touched by
-    /// a healer since the write and overriding with it would clobber the leader's
+    /// an untimestamped (`written_at: None`) single-node self-registration — it
+    /// hasn't been touched by a healer/merge since the local write, so it carries
+    /// no freshness signal at all. Overriding with it would clobber the leader's
     /// correctly-merged node list with a stale single-node view. So CHUNK_TABLE
-    /// only wins when it's at least as fresh as the inline record.
+    /// only wins when it has actually been stamped by a freshness-conferring merge
+    /// (`written_at: Some(_)`) and that stamp is at least as fresh as the inline
+    /// record's. An untimestamped CHUNK_TABLE entry never overrides inline, even
+    /// when inline is itself untimestamped (`None` is not a tied timestamp of 0).
     fn resolve_chunk_nodes(inline: &ChunkLocation, sled_loc: ChunkLocation) -> ChunkLocation {
-        if sled_loc.written_at.unwrap_or(0) >= inline.written_at.unwrap_or(0) {
-            ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
-        } else {
-            inline.clone()
+        match sled_loc.written_at {
+            Some(ts) if ts >= inline.written_at.unwrap_or(0) => {
+                ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
+            }
+            _ => inline.clone(),
         }
     }
 
@@ -6524,6 +6549,76 @@ mod tests {
             }
             other => panic!("expected FileChunkMap response, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_resolve_chunk_nodes_untimestamped_chunk_table_does_not_win_tie() {
+        let hash = compute_chunk_hash(b"chunk-data-tie");
+        let chunk_id = ChunkId::from_hash(hash);
+
+        let correct_node_a = NodeId::new();
+        let correct_node_b = NodeId::new();
+        let self_registered_node = NodeId::new();
+
+        // Inline (FILE_TABLE) record: correctly-merged 2-node list from the leader,
+        // never stamped by a healer (written_at: None).
+        let inline = ChunkLocation {
+            chunk_id,
+            nodes: vec![correct_node_a, correct_node_b],
+            size: 65536,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: Some(1),
+            file_id: None,
+        };
+
+        // CHUNK_TABLE record: this node's own untimestamped single-node
+        // self-registration from write_data_local_only_at — never touched by a
+        // healer/merge since the local write.
+        let sled_loc = ChunkLocation {
+            nodes: vec![self_registered_node],
+            written_at: None,
+            ..inline.clone()
+        };
+
+        let resolved = Server::resolve_chunk_nodes(&inline, sled_loc);
+        assert_eq!(resolved.nodes, vec![correct_node_a, correct_node_b],
+            "an untimestamped CHUNK_TABLE self-registration must never override \
+             a correctly-merged inline record, even when both are untimestamped \
+             (None is not a tied timestamp of 0)");
+    }
+
+    #[test]
+    fn test_resolve_chunk_nodes_stamped_chunk_table_wins_over_untimestamped_inline() {
+        let hash = compute_chunk_hash(b"chunk-data-healed");
+        let chunk_id = ChunkId::from_hash(hash);
+
+        let old_node = NodeId::new();
+        let healed_node_a = NodeId::new();
+        let healed_node_b = NodeId::new();
+
+        let inline = ChunkLocation {
+            chunk_id,
+            nodes: vec![old_node],
+            size: 65536,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: Some(1),
+            file_id: None,
+        };
+
+        // CHUNK_TABLE has since been updated by a healer/merge and stamped with a real timestamp.
+        let sled_loc = ChunkLocation {
+            nodes: vec![healed_node_a, healed_node_b],
+            written_at: Some(1_700_000_000),
+            ..inline.clone()
+        };
+
+        let resolved = Server::resolve_chunk_nodes(&inline, sled_loc);
+        assert_eq!(resolved.nodes, vec![healed_node_a, healed_node_b],
+            "a CHUNK_TABLE entry stamped by a healer must override an untimestamped inline record");
     }
 }
 

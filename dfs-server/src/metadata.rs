@@ -99,10 +99,30 @@ impl MetadataStore {
 
         // Cap redb's page cache to prevent OOM on low-RAM nodes (default is 1GB).
         // 256MB is plenty for our working set; the rest stays on disk.
-        let mut db = Database::builder()
-            .set_cache_size(256 * 1024 * 1024)
-            .create(&db_path)
-            .with_context(|| format!("Failed to open redb at {:?}", db_path))?;
+        //
+        // Retry briefly on DatabaseAlreadyOpen: a just-killed previous instance's
+        // graceful-shutdown flush can still hold the file lock for a moment after
+        // the process exits, which would otherwise turn a fast restart (SIGTERM
+        // immediately followed by respawn) into a permanent crash loop.
+        let mut db = {
+            let mut attempt = 0;
+            loop {
+                match Database::builder()
+                    .set_cache_size(256 * 1024 * 1024)
+                    .create(&db_path)
+                {
+                    Ok(db) => break db,
+                    Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt < 10 => {
+                        attempt += 1;
+                        warn!("redb at {:?} still locked by previous instance, retrying ({}/10)...", db_path, attempt);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("Failed to open redb at {:?}", db_path));
+                    }
+                }
+            }
+        };
 
         // Check structural integrity on every startup. redb's check_integrity()
         // validates B-tree page allocations and repairs any inconsistency left by

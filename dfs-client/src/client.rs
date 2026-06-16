@@ -1894,8 +1894,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             && (offset / CHUNK_SIZE_BYTES) == (last_end.saturating_sub(1) / CHUNK_SIZE_BYTES);
 
         // Range-fetch for small random reads — fetches only the requested bytes rather
-        // than a full 4MB chunk. Keeps latency low for random 4K I/O patterns.
-        const RANGE_FETCH_MAX: usize = 32 * 1024;
+        // than a full 4MB chunk. Keeps latency low for random 4K–64K I/O patterns
+        // (QEMU O_DIRECT, VM page faults). 128KB FUSE coalesced reads still exceed
+        // this threshold and take the full-chunk path, preserving pipeline prefetch.
+        const RANGE_FETCH_MAX: usize = 64 * 1024;
         let use_range_fetch = !bypass_cache && !is_sequential && size <= RANGE_FETCH_MAX && inode > 0;
 
         if use_range_fetch {

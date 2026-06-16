@@ -81,6 +81,7 @@ if [ "$1" == "all" ]; then
 		echo ""
 	done
 	echo ""
+	sleep 3
 fi
 
 # ─── server rolling update ────────────────────────────────────────────────────

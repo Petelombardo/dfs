@@ -1,48 +1,37 @@
 #!/bin/bash
-# Raw-disk write benchmark: sequential, whole-chunk overwrite, multi-patch.
+# Raw-disk write+read benchmark: sequential write, whole-chunk overwrite, multi-patch,
+# sequential read, random read.
 #
 # Usage: ./scripts/raw_disk_bench.sh [mount_point] [label]
-#   mount_point  default: current directory. Run this either as
-#                   /path/to/raw_disk_bench.sh /mnt/test
-#                 from anywhere, or `cd /mnt/test` and run the script with
-#                 no args (e.g. via its full path) -- both write the bench
-#                 files into /mnt/test.
+#   mount_point  default: current directory. Run from a NON-DFS location, e.g.:
+#                   ~/dfs/scripts/raw_disk_bench.sh /mnt/test
+#                 The script restarts dfs-client mid-run to clear the in-memory
+#                 LRU cache before the read tests, so the script file itself must
+#                 NOT be on the DFS mount.
 #   label        default: timestamp; recorded alongside results for tracking
 #
-# Test 1 (sequential): writes a new SEQ_SIZE_MB file in 1MB writes, one
-#   fsync at the end -- baseline fresh-chunk write throughput, no existing
-#   chunks to replace or patch.
+# Sequence:
+#   T1  Sequential write  (32MB new file, 1 fsync at end)
+#   T2  Whole-chunk write (8x4MB chunks, fsync/op — is_full_replacement path)
+#   T3  Multi-patch write (50 ops 1KB-1MB, fsync/op — PatchChunk RPC path)
+#       [pre-fill T4/T5 read test files — NOT timed]
+#       [systemctl restart dfs-client  — clears in-memory chunk_cache LRU]
+#       [echo 3 > /proc/sys/vm/drop_caches — clears OS page cache]
+#   T4  Sequential read   (32MB file, 256KB blocks)
+#   T5  Random read       (50 ops 1KB-512KB, seed=42)
 #
-# Test 2 (whole-chunk overwrite): pre-fills a CHUNK_SIZE-aligned raw disk
-#   image, then overwrites NUM_CHUNK_OPS whole 4MB chunks (chunk-aligned
-#   offset, exactly CHUNK_SIZE bytes, fsync per op). This is the
-#   "is_full_replacement" path: the client has the complete new chunk
-#   content, so it skips MultiPatch and does a fresh parallel dual-replica
-#   write with no server-side read of the old chunk.
-#
-# Test 3 (multi-patch): pre-fills a DISK_SIZE_MB raw disk image, then
-#   performs NUM_OPS writes at random offsets with random sizes (1KB-1MB),
-#   fsync'ing after each write. None of these cover a full chunk, so each
-#   goes through the MultiPatch/PatchChunk RPC -- the server reads the
-#   existing chunk and patches it. This is the realistic small-write
-#   VM-disk pattern and the slow path.
-#
-# A fixed RNG seed makes the multi-patch op sequence (offsets + sizes)
-# identical across runs, so results before/after a change are directly
-# comparable. Keep SEQ_SIZE_MB / NUM_CHUNK_OPS / DISK_SIZE_MB / NUM_OPS
-# unchanged between runs you want to compare.
-#
-# Default sizes are chosen so each test takes roughly 10-20s at a
-# conservative ~1.8MB/s. Sequential and whole-chunk writes are expected to
-# be much faster than that (no server-side read), so they'll finish
-# sooner -- that's fine, the reported MB/s is what matters.
-#
-# Results are appended to $CSV (default /tmp/dfs-bench-results.csv) for
-# tracking over time.
+# Fixed RNG seeds make op sequences identical across runs for before/after comparison.
+# Results are appended to $CSV (default /tmp/dfs-bench-results.csv).
 
 set -e
 
-MOUNT=${1:-.}
+if [ -z "$1" ]; then
+    echo "Usage: $0 <mount_point> [label]" >&2
+    echo "  e.g.: $0 /mnt/test" >&2
+    exit 1
+fi
+
+MOUNT=$1
 LABEL=${2:-$(date +%Y%m%d-%H%M%S)}
 CSV=${CSV:-/tmp/dfs-bench-results.csv}
 
@@ -55,134 +44,216 @@ MOUNT=$(cd "$MOUNT" && pwd)
 SEQ_FILE="$MOUNT/bench-seq.bin"
 CHUNK_FILE="$MOUNT/bench-wholechunk.img"
 PATCH_FILE="$MOUNT/bench-multipatch.img"
+READ_SEQ_FILE="$MOUNT/bench-seqread.bin"
+READ_RAND_FILE="$MOUNT/bench-randread.img"
 
 SEQ_SIZE_MB=${SEQ_SIZE_MB:-32}
-NUM_CHUNK_OPS=${NUM_CHUNK_OPS:-8}     # 8 * 4MB = 32MB of whole-chunk overwrites
+NUM_CHUNK_OPS=${NUM_CHUNK_OPS:-8}
 DISK_SIZE_MB=${DISK_SIZE_MB:-64}
 NUM_OPS=${NUM_OPS:-50}
 
-echo "=== DFS Raw-Disk Write Benchmark: $LABEL ==="
+echo "=== DFS Raw-Disk Write+Read Benchmark: $LABEL ==="
 echo "Mount: $MOUNT"
 echo "Date: $(date)"
 echo "Params: SEQ_SIZE_MB=$SEQ_SIZE_MB NUM_CHUNK_OPS=$NUM_CHUNK_OPS DISK_SIZE_MB=$DISK_SIZE_MB NUM_OPS=$NUM_OPS"
 echo ""
 
-rm -f "$SEQ_FILE" "$CHUNK_FILE" "$PATCH_FILE"
+rm -f "$SEQ_FILE" "$CHUNK_FILE" "$PATCH_FILE" "$READ_SEQ_FILE" "$READ_RAND_FILE"
 
 MOUNT="$MOUNT" SEQ_FILE="$SEQ_FILE" CHUNK_FILE="$CHUNK_FILE" PATCH_FILE="$PATCH_FILE" \
+READ_SEQ_FILE="$READ_SEQ_FILE" READ_RAND_FILE="$READ_RAND_FILE" \
 SEQ_SIZE_MB="$SEQ_SIZE_MB" NUM_CHUNK_OPS="$NUM_CHUNK_OPS" DISK_SIZE_MB="$DISK_SIZE_MB" NUM_OPS="$NUM_OPS" \
 LABEL="$LABEL" CSV="$CSV" \
 python3 - <<'PYEOF'
-import os, random, time
+import os, random, subprocess, time
 
-seq_file     = os.environ['SEQ_FILE']
-chunk_file   = os.environ['CHUNK_FILE']
-patch_file   = os.environ['PATCH_FILE']
-seq_size_mb  = int(os.environ['SEQ_SIZE_MB'])
-num_chunk_ops= int(os.environ['NUM_CHUNK_OPS'])
-disk_size_mb = int(os.environ['DISK_SIZE_MB'])
-num_ops      = int(os.environ['NUM_OPS'])
-label        = os.environ['LABEL']
-csv_path     = os.environ['CSV']
+mount         = os.environ['MOUNT']
+seq_file      = os.environ['SEQ_FILE']
+chunk_file    = os.environ['CHUNK_FILE']
+patch_file    = os.environ['PATCH_FILE']
+read_seq_file = os.environ['READ_SEQ_FILE']
+read_rand_file= os.environ['READ_RAND_FILE']
+seq_size_mb   = int(os.environ['SEQ_SIZE_MB'])
+num_chunk_ops = int(os.environ['NUM_CHUNK_OPS'])
+disk_size_mb  = int(os.environ['DISK_SIZE_MB'])
+num_ops       = int(os.environ['NUM_OPS'])
+label         = os.environ['LABEL']
+csv_path      = os.environ['CSV']
 
-MB = 1024 * 1024
-CHUNK_SIZE = 4 * MB  # matches CHUNK_SIZE in dfs-client/dfs-server
+MB         = 1024 * 1024
+CHUNK_SIZE = 4 * MB
 
-# --- Test 1: Sequential write (new file, fresh chunks) ---
+# ── Test 1: Sequential write ───────────────────────────────────────────────
 print(f"--- Test 1: Sequential write ({seq_size_mb}MB, fsync at end) ---")
 buf = os.urandom(MB)
-start = time.time()
+t0 = time.time()
 with open(seq_file, 'wb') as f:
     for _ in range(seq_size_mb):
         f.write(buf)
     f.flush()
     os.fsync(f.fileno())
-seq_elapsed = time.time() - start
+seq_elapsed = time.time() - t0
 seq_mbps = seq_size_mb / seq_elapsed
-print(f"  {seq_size_mb}MB in {seq_elapsed:.2f}s = {seq_mbps:.2f} MB/s")
-print("")
+print(f"  {seq_size_mb}MB in {seq_elapsed:.2f}s = {seq_mbps:.2f} MB/s\n")
 
-# --- Test 2: Whole-chunk overwrite (full-replacement fast path) ---
-print(f"--- Test 2: Whole-chunk overwrite ({num_chunk_ops} x 4MB chunks, fsync per op) ---")
-chunk_disk_size = num_chunk_ops * CHUNK_SIZE
-print(f"  Pre-filling {chunk_disk_size // MB}MB raw disk image (not timed)...")
+# ── Test 2: Whole-chunk overwrite ──────────────────────────────────────────
+print(f"--- Test 2: Whole-chunk overwrite ({num_chunk_ops} x 4MB, fsync per op) ---")
+print(f"  Pre-filling {num_chunk_ops * 4}MB (not timed)...")
 zero_chunk = b'\x00' * CHUNK_SIZE
 with open(chunk_file, 'wb') as f:
     for _ in range(num_chunk_ops):
         f.write(zero_chunk)
-    f.flush()
-    os.fsync(f.fileno())
+    f.flush(); os.fsync(f.fileno())
 
 fd = os.open(chunk_file, os.O_WRONLY)
-start = time.time()
+t0 = time.time()
 for i in range(num_chunk_ops):
     os.lseek(fd, i * CHUNK_SIZE, os.SEEK_SET)
     os.write(fd, os.urandom(CHUNK_SIZE))
     os.fsync(fd)
-chunk_elapsed = time.time() - start
+chunk_elapsed = time.time() - t0
 os.close(fd)
-
-chunk_mb = (num_chunk_ops * CHUNK_SIZE) / MB
+chunk_mb   = num_chunk_ops * CHUNK_SIZE / MB
 chunk_mbps = chunk_mb / chunk_elapsed
-print(f"  {num_chunk_ops} ops, {chunk_mb:.2f}MB total in {chunk_elapsed:.2f}s "
-      f"= {chunk_mbps:.2f} MB/s")
-print("")
+print(f"  {num_chunk_ops} ops, {chunk_mb:.0f}MB in {chunk_elapsed:.2f}s = {chunk_mbps:.2f} MB/s\n")
 
-# --- Test 3: Multi-patch write (partial-chunk overwrite, PatchChunk RPC) ---
-print(f"--- Test 3: Multi-patch write ({num_ops} ops, 1KB-1MB each, fsync per op) ---")
+# ── Test 3: Multi-patch write ──────────────────────────────────────────────
+print(f"--- Test 3: Multi-patch write ({num_ops} ops, 1KB-1MB, fsync per op) ---")
 disk_size = disk_size_mb * MB
-print(f"  Pre-filling {disk_size_mb}MB raw disk image (not timed)...")
+print(f"  Pre-filling {disk_size_mb}MB (not timed)...")
 zero = b'\x00' * MB
 with open(patch_file, 'wb') as f:
     for _ in range(disk_size_mb):
         f.write(zero)
-    f.flush()
-    os.fsync(f.fileno())
+    f.flush(); os.fsync(f.fileno())
 
-random.seed(42)  # fixed seed: identical op sequence across runs for fair comparison
+random.seed(42)
+ops = [(random.randint(0, disk_size - (s := random.randint(1024, MB))), s) for _ in range(num_ops)]
+# Regenerate cleanly (above is a bit tricky with walrus; redo simply):
+random.seed(42)
 ops = []
 for _ in range(num_ops):
-    size = random.randint(1024, MB)
-    offset = random.randint(0, disk_size - size)
-    ops.append((offset, size))
-total_bytes = sum(size for _, size in ops)
+    s = random.randint(1024, MB)
+    o = random.randint(0, disk_size - s)
+    ops.append((o, s))
+total_patch_bytes = sum(s for _, s in ops)
 
 fd = os.open(patch_file, os.O_WRONLY)
-start = time.time()
-for offset, size in ops:
-    os.lseek(fd, offset, os.SEEK_SET)
-    os.write(fd, os.urandom(size))
+t0 = time.time()
+for off, sz in ops:
+    os.lseek(fd, off, os.SEEK_SET)
+    os.write(fd, os.urandom(sz))
     os.fsync(fd)
-patch_elapsed = time.time() - start
+patch_elapsed = time.time() - t0
 os.close(fd)
-
-patch_mb = total_bytes / MB
+patch_mb   = total_patch_bytes / MB
 patch_mbps = patch_mb / patch_elapsed
 patch_iops = num_ops / patch_elapsed
-print(f"  {num_ops} ops, {patch_mb:.2f}MB total in {patch_elapsed:.2f}s "
-      f"= {patch_mbps:.2f} MB/s ({patch_iops:.1f} ops/s)")
+print(f"  {num_ops} ops, {patch_mb:.2f}MB in {patch_elapsed:.2f}s = {patch_mbps:.2f} MB/s ({patch_iops:.1f} ops/s)\n")
+
+# ── Pre-fill read test files (not timed) ──────────────────────────────────
+print("--- Pre-filling read test files (not timed) ---")
+print(f"  {seq_size_mb}MB sequential read file...")
+with open(read_seq_file, 'wb') as f:
+    for _ in range(seq_size_mb):
+        f.write(os.urandom(MB))
+    f.flush(); os.fsync(f.fileno())
+
+print(f"  {disk_size_mb}MB random read file...")
+with open(read_rand_file, 'wb') as f:
+    for _ in range(disk_size_mb):
+        f.write(os.urandom(MB))
+    f.flush(); os.fsync(f.fileno())
 print("")
 
-# --- Summary ---
+# ── Restart dfs-client to clear in-memory chunk_cache LRU ─────────────────
+print("--- Restarting dfs-client (clears in-memory LRU) ---")
+try:
+    subprocess.run(['systemctl', 'restart', 'dfs-client'], check=True, timeout=30)
+    print("  Restarted. Waiting for mount...")
+    for i in range(60):
+        time.sleep(1)
+        try:
+            os.stat(mount)
+            print(f"  Mount back after {i+1}s.")
+            break
+        except OSError:
+            pass
+    else:
+        print("  WARNING: mount did not come back within 60s — read results may be invalid.")
+except Exception as e:
+    print(f"  WARNING: could not restart dfs-client ({e}).")
+    print("  Reads will use warm cache — results are not a cold-cache baseline.")
+
+# ── Drop OS page cache ─────────────────────────────────────────────────────
+try:
+    with open('/proc/sys/vm/drop_caches', 'w') as f:
+        f.write('3\n')
+    print("  OS page cache dropped.")
+except Exception as e:
+    print(f"  Note: could not drop page cache ({e}).")
+print("")
+
+# ── Test 4: Sequential read ────────────────────────────────────────────────
+print(f"--- Test 4: Sequential read ({seq_size_mb}MB, 256KB blocks, cold cache) ---")
+READ_BLOCK = 256 * 1024
+t0 = time.time()
+read_total = 0
+with open(read_seq_file, 'rb') as f:
+    while True:
+        data = f.read(READ_BLOCK)
+        if not data:
+            break
+        read_total += len(data)
+seq_read_elapsed = time.time() - t0
+seq_read_mbps = (read_total / MB) / seq_read_elapsed
+print(f"  {read_total // MB}MB in {seq_read_elapsed:.2f}s = {seq_read_mbps:.2f} MB/s\n")
+
+# ── Test 5: Random read ────────────────────────────────────────────────────
+print(f"--- Test 5: Random read ({num_ops} ops, 1KB-512KB, seed=42, cold cache) ---")
+rand_size = disk_size_mb * MB
+random.seed(42)
+rand_ops = []
+for _ in range(num_ops):
+    sz  = random.randint(1024, 512 * 1024)
+    off = random.randint(0, rand_size - sz)
+    rand_ops.append((off, sz))
+rand_total_bytes = sum(sz for _, sz in rand_ops)
+
+fd = os.open(read_rand_file, os.O_RDONLY)
+t0 = time.time()
+for off, sz in rand_ops:
+    os.lseek(fd, off, os.SEEK_SET)
+    os.read(fd, sz)
+rand_read_elapsed = time.time() - t0
+os.close(fd)
+rand_read_mb   = rand_total_bytes / MB
+rand_read_mbps = rand_read_mb / rand_read_elapsed
+rand_read_iops = num_ops / rand_read_elapsed
+print(f"  {num_ops} ops, {rand_read_mb:.2f}MB in {rand_read_elapsed:.2f}s = {rand_read_mbps:.2f} MB/s ({rand_read_iops:.1f} ops/s)\n")
+
+# ── Summary ────────────────────────────────────────────────────────────────
 print("=== Summary ===")
-print(f"  Sequential       : {seq_mbps:6.2f} MB/s  ({seq_size_mb}MB in {seq_elapsed:.2f}s)")
-print(f"  Whole-chunk write: {chunk_mbps:6.2f} MB/s  ({chunk_mb:.2f}MB / {num_chunk_ops} ops in {chunk_elapsed:.2f}s)")
+print(f"  Sequential write : {seq_mbps:6.2f} MB/s  ({seq_size_mb}MB in {seq_elapsed:.2f}s)")
+print(f"  Whole-chunk write: {chunk_mbps:6.2f} MB/s  ({chunk_mb:.0f}MB / {num_chunk_ops} ops in {chunk_elapsed:.2f}s)")
 print(f"  Multi-patch write: {patch_mbps:6.2f} MB/s  ({patch_mb:.2f}MB / {num_ops} ops in {patch_elapsed:.2f}s, {patch_iops:.1f} ops/s)")
+print(f"  Sequential read  : {seq_read_mbps:6.2f} MB/s  ({read_total // MB}MB in {seq_read_elapsed:.2f}s)")
+print(f"  Random read      : {rand_read_mbps:6.2f} MB/s  ({rand_read_mb:.2f}MB / {num_ops} ops in {rand_read_elapsed:.2f}s, {rand_read_iops:.1f} ops/s)")
 
 write_header = not os.path.exists(csv_path)
 with open(csv_path, 'a') as f:
     if write_header:
         f.write("timestamp,label,"
-                "seq_mb,seq_seconds,seq_mbps,"
-                "chunk_ops,chunk_mb,chunk_seconds,chunk_mbps,"
-                "patch_ops,patch_mb,patch_seconds,patch_mbps,patch_iops\n")
+                "seq_mb,seq_s,seq_mbps,"
+                "chunk_ops,chunk_mb,chunk_s,chunk_mbps,"
+                "patch_ops,patch_mb,patch_s,patch_mbps,patch_iops,"
+                "seq_read_mb,seq_read_s,seq_read_mbps,"
+                "rand_read_ops,rand_read_mb,rand_read_s,rand_read_mbps,rand_read_iops\n")
     f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{label},"
             f"{seq_size_mb},{seq_elapsed:.4f},{seq_mbps:.4f},"
             f"{num_chunk_ops},{chunk_mb:.4f},{chunk_elapsed:.4f},{chunk_mbps:.4f},"
-            f"{num_ops},{patch_mb:.4f},{patch_elapsed:.4f},{patch_mbps:.4f},{patch_iops:.4f}\n")
-
+            f"{num_ops},{patch_mb:.4f},{patch_elapsed:.4f},{patch_mbps:.4f},{patch_iops:.4f},"
+            f"{read_total // MB},{seq_read_elapsed:.4f},{seq_read_mbps:.4f},"
+            f"{num_ops},{rand_read_mb:.4f},{rand_read_elapsed:.4f},{rand_read_mbps:.4f},{rand_read_iops:.4f}\n")
 print(f"\nResults appended to {csv_path}")
 PYEOF
-
-# Final flush to ensure everything is durable on storage nodes (not timed).
-sync "$MOUNT"

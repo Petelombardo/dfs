@@ -1893,14 +1893,19 @@ leader_addr: Arc::new(RwLock::new(None)),
             && offset + size > last_end
             && (offset / CHUNK_SIZE_BYTES) == (last_end.saturating_sub(1) / CHUNK_SIZE_BYTES);
 
-        // Range-fetch for small random reads — fetches only the requested bytes rather
-        // than a full 4MB chunk. Keeps latency low for random 4K–32K I/O patterns.
-        // Must stay below 64KB: qcow2 default cluster size is 64KB, so QEMU sequential
-        // reads arrive as 64KB FUSE calls. Those need to hit the full-chunk path so the
-        // pipeline can prefetch ahead. 128KB FUSE coalesced reads also exceed this
-        // threshold, preserving pipeline throughput for all sequential workloads.
-        const RANGE_FETCH_MAX: usize = 32 * 1024;
-        let use_range_fetch = !bypass_cache && !is_sequential && size <= RANGE_FETCH_MAX && inode > 0;
+        // Broad sequential: reading from offset 0 (start of file, assumed sequential) or
+        // continuing exactly from where the last read ended (cross-chunk sequential).
+        // Sequential reads always take the full-chunk path so the pipeline can prefetch
+        // ahead. is_sequential (above) is kept for the within-chunk striped-read path.
+        let is_broad_sequential = offset == 0 || (last_end > 0 && offset == last_end);
+
+        // Range-fetch for random reads: fetches only the requested bytes rather than a
+        // full 4MB chunk. Threshold raised to 1MB so that medium-sized random reads
+        // (QEMU 64KB cluster reads at non-sequential offsets, our benchmark 32KB–512KB
+        // random ops) avoid the 4MB amplification. Sequential reads are fully protected
+        // by is_broad_sequential and never take this path regardless of size.
+        const RANGE_FETCH_MAX: usize = 1024 * 1024;
+        let use_range_fetch = !bypass_cache && !is_broad_sequential && size <= RANGE_FETCH_MAX && inode > 0;
 
         if use_range_fetch {
             let mut result_chunks: Vec<(usize, Arc<Vec<u8>>)> = Vec::new();
@@ -2994,6 +2999,15 @@ leader_addr: Arc::new(RwLock::new(None)),
                     { let _ = self.chunk_cache.remove(&old_id); };
                 }
             }
+        }
+
+        // Also evict byte_range_cache entries for the written chunk slots. The
+        // byte_range_cache is keyed by (inode, file_offset), not chunk_id, so we
+        // invalidate by range. Without this, a range-fetch read immediately after a
+        // same-chunk overwrite can return stale cached bytes.
+        for i in 0..locations.len() {
+            let chunk_file_offset = (from_chunk as u64 + i as u64) * CHUNK_SIZE_U64;
+            self.invalidate_byte_range_cache_for_chunk(inode, chunk_file_offset, CHUNK_SIZE_U64 as usize).await;
         }
     }
 

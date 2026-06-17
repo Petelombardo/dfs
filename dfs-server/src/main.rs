@@ -213,6 +213,11 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     ));
     info!("✓ Server instance created");
 
+    // Recover any in-place patch interrupted by a crash, before accepting any
+    // PatchChunk/ReadChunk requests.
+    server.recover_patch_journal();
+    info!("✓ Patch journal recovery complete");
+
     // Rebuild in-memory chunk map from persistent metadata.
     // This is required on every startup — GetFileChunkMap is served from this
     // in-memory map, so without it every file returns "no chunk map from leader".

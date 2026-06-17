@@ -56,6 +56,20 @@ const PENDING_HEALING_TABLE: TableDefinition<&str, u64> = TableDefinition::new("
 /// missing entry.
 const CHUNK_REFCOUNT_TABLE: TableDefinition<&str, u64> = TableDefinition::new("chunk_refcount");
 
+/// old_chunk_id hex string → bincode(PatchJournalEntry).
+///
+/// Write-ahead undo record for in-place chunk patching. Written (durably
+/// committed) before any byte of the existing chunk file is touched, and
+/// deleted only after the patch's rename + chunk_location update have both
+/// committed. If a leftover entry is found at startup, the old chunk file's
+/// presence tells us how far the in-flight patch got: still present means
+/// the rename never happened (replay the undo bytes to restore it exactly);
+/// absent means the rename already completed and the data under
+/// new_chunk_id is intact (just discard the entry — same residual
+/// metadata-propagation gap the orphan reconciliation sweep already covers,
+/// not a new failure mode).
+const CHUNK_PATCH_JOURNAL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("chunk_patch_journal");
+
 // ---------------------------------------------------------------------------
 
 /// Decode a 64-character lowercase hex string (as produced by `ChunkId::to_hex`)
@@ -91,6 +105,17 @@ pub enum PutFileResult {
     /// The existing (newer) record is returned so the caller can propagate
     /// it back to whoever sent the stale write, converging the cluster.
     Stale(FileMetadata),
+}
+
+/// Write-ahead undo record for an in-place chunk patch. `patches` is recorded
+/// in application order so recovery can unwind multiple sub-patches (from
+/// MultiPatch) in reverse.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PatchJournalEntry {
+    pub old_chunk_id: ChunkId,
+    pub new_chunk_id: ChunkId,
+    /// (offset within chunk, original bytes that were about to be overwritten)
+    pub patches: Vec<(usize, Vec<u8>)>,
 }
 
 /// Metadata storage using redb embedded database.
@@ -183,6 +208,7 @@ impl MetadataStore {
             txn.open_table(COUNTERS_TABLE)?;
             txn.open_table(DELETE_QUEUE_TABLE)?;
             txn.open_table(PENDING_HEALING_TABLE)?;
+            txn.open_table(CHUNK_PATCH_JOURNAL_TABLE)?;
             txn.commit()?;
         }
 
@@ -735,6 +761,58 @@ impl MetadataStore {
         }
         txn.commit()?;
         Ok(result)
+    }
+
+    // -------------------------------------------------------------------------
+    // Chunk patch journal (write-ahead undo for in-place patching)
+    // -------------------------------------------------------------------------
+
+    /// Durably record the undo info for an in-flight in-place patch. Must be
+    /// committed before the patcher writes a single byte to the existing
+    /// chunk file.
+    pub fn put_patch_journal(&self, entry: &PatchJournalEntry) -> Result<()> {
+        let key = format!("{}", entry.old_chunk_id);
+        let value = bincode::serialize(entry)
+            .context("Failed to serialize patch journal entry")?;
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(CHUNK_PATCH_JOURNAL_TABLE)?;
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Remove the journal entry for `old_chunk_id`. Call only after the
+    /// rename and the new chunk_location have both committed.
+    pub fn delete_patch_journal(&self, old_chunk_id: &ChunkId) -> Result<()> {
+        let key = format!("{}", old_chunk_id);
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(CHUNK_PATCH_JOURNAL_TABLE)?;
+            table.remove(key.as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Read every leftover journal entry. Used once at startup to recover
+    /// from a crash that interrupted an in-place patch.
+    pub fn scan_patch_journal(&self) -> Result<Vec<PatchJournalEntry>> {
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let table = txn.open_table(CHUNK_PATCH_JOURNAL_TABLE)?;
+        let mut out = Vec::new();
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            out.push(bincode::deserialize::<PatchJournalEntry>(v.value())
+                .context("Failed to deserialize patch journal entry")?);
+        }
+        Ok(out)
     }
 
     // -------------------------------------------------------------------------

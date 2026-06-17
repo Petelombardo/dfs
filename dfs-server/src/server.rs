@@ -1,7 +1,7 @@
 use crate::chunker::Chunker;
 use crate::cluster::ClusterManager;
 use crate::healing::HealingManager;
-use crate::metadata::MetadataStore;
+use crate::metadata::{MetadataStore, PatchJournalEntry};
 use crate::network::{MessageHandler, NetworkClient};
 use crate::stats::OpsTracker;
 use crate::storage::ChunkStorage;
@@ -149,6 +149,19 @@ pub struct Server {
     /// while the first is still renaming A→B, and fails with "file not found".
     chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
 
+    /// Per-chunk_id read-exclusion lock for in-place patching. The in-place
+    /// patch path (handle_patch_chunk/handle_multi_patch) mutates the
+    /// existing chunk file's bytes directly rather than writing a new file,
+    /// so a concurrent ReadChunk/ReadChunkRange for that exact chunk_id must
+    /// not be allowed to read mid-write. chunk_patch_locks above already
+    /// serializes writers against each other (keyed by (file_id, chunk_idx),
+    /// and patch-derived chunk_ids are file+offset-scoped so they're never
+    /// shared across slots — see compute_chunk_hash_at) — this lock's only
+    /// job is mediating against an independent reader holding a stale cached
+    /// chunk_id. Entries are removed as soon as the writer releases, since
+    /// chunk_id changes every patch and would otherwise grow unboundedly.
+    chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>>,
+
     /// Per-node ops/sec tracker — read, write, and metadata op counts in a
     /// 3600-bucket ring (one bucket per second). Near-zero overhead: atomic
     /// fetch_add per op, single mutex acquire per second for the ring write.
@@ -233,6 +246,7 @@ impl Server {
             file_write_seqs: Arc::new(DashMap::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             chunk_patch_locks: Arc::new(DashMap::new()),
+            chunk_io_locks: Arc::new(DashMap::new()),
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
             sled_write_done,
@@ -261,6 +275,63 @@ impl Server {
             warn!("drain_sled_writes: flush_durable failed: {}", e);
         }
         info!("drain_sled_writes: all pending metadata writes flushed to disk");
+    }
+
+    /// Replay or discard leftover patch-journal entries from a crash that
+    /// interrupted handle_patch_chunk/handle_multi_patch's in-place mutation.
+    /// Must run once at startup, before the server accepts any PatchChunk or
+    /// ReadChunk request.
+    pub fn recover_patch_journal(&self) {
+        let entries = match self.metadata.scan_patch_journal() {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("recover_patch_journal: failed to scan journal: {}", e);
+                return;
+            }
+        };
+        if entries.is_empty() {
+            return;
+        }
+        info!("recover_patch_journal: replaying {} leftover patch journal entries", entries.len());
+        for entry in entries {
+            let old_path = self.storage.get_chunk_path(&entry.old_chunk_id);
+            if old_path.exists() {
+                // Crash happened before (or during) the in-place write — restore
+                // old_path's bytes exactly so its content matches old_chunk_id
+                // again. Unwind sub-patches in reverse in case any of them
+                // overlapped within the same journal entry.
+                let restore = (|| -> std::io::Result<()> {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let mut f = std::fs::OpenOptions::new().write(true).open(&old_path)?;
+                    for (offset, undo_bytes) in entry.patches.iter().rev() {
+                        f.seek(SeekFrom::Start(*offset as u64))?;
+                        f.write_all(undo_bytes)?;
+                    }
+                    f.sync_data()
+                })();
+                match restore {
+                    Ok(()) => {
+                        info!("recover_patch_journal: restored {} from undo journal", entry.old_chunk_id);
+                        self.storage.invalidate_cache(&entry.old_chunk_id);
+                    }
+                    Err(e) => {
+                        warn!("recover_patch_journal: failed to restore {}: {} — leaving journal entry for next attempt",
+                            entry.old_chunk_id, e);
+                        continue;
+                    }
+                }
+            } else {
+                // old_path is gone — the rename completed before the crash, so the
+                // data under new_chunk_id is intact. This degrades to the same
+                // metadata-propagation gap the orphan reconciliation sweep already
+                // covers, not a new failure mode — just discard the journal entry.
+                info!("recover_patch_journal: {} already renamed to {} — discarding journal entry",
+                    entry.old_chunk_id, entry.new_chunk_id);
+            }
+            if let Err(e) = self.metadata.delete_patch_journal(&entry.old_chunk_id) {
+                warn!("recover_patch_journal: failed to clear journal entry for {}: {}", entry.old_chunk_id, e);
+            }
+        }
     }
 
     /// Rebuild the in-memory chunk map by scanning all file metadata.
@@ -1482,6 +1553,14 @@ impl Server {
     }
 
     /// Handle read chunk request (try local first, then forward to other nodes)
+    /// If `chunk_id` is currently being in-place patched, wait for the
+    /// writer to finish before reading. Returns immediately (no lock taken)
+    /// in the common case where no patch is in flight for this chunk_id.
+    async fn chunk_io_read_guard(&self, chunk_id: &ChunkId) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let lock = self.chunk_io_locks.get(chunk_id).map(|e| e.value().clone())?;
+        Some(lock.read_owned().await)
+    }
+
     async fn handle_read_chunk(&self, chunk_id: ChunkId, client_write_seq: Option<u64>) -> Response {
         debug!("Handling read chunk: {}", chunk_id);
 
@@ -1501,6 +1580,10 @@ impl Server {
                 }
             }
         }
+
+        // Wait out any in-place patch currently mutating this exact chunk_id
+        // (no-op unless one is in flight — see chunk_io_locks).
+        let _io_guard = self.chunk_io_read_guard(&chunk_id).await;
 
         // Serve from local storage only — never proxy to other nodes.
         // If the client sends a ReadChunk to a node that doesn't hold the chunk,
@@ -1540,6 +1623,10 @@ impl Server {
                 }
             }
         }
+
+        // Wait out any in-place patch currently mutating this exact chunk_id
+        // (no-op unless one is in flight — see chunk_io_locks).
+        let _io_guard = self.chunk_io_read_guard(&chunk_id).await;
 
         // Use a seeked partial read — avoids loading the full 4MB chunk from disk
         // on a cache miss when the caller only needs a small byte range.
@@ -4393,10 +4480,7 @@ impl Server {
         // Serialize all patches to the same (file_id, chunk_idx) — same lock
         // handle_multi_patch uses and for the same reason: two concurrent patches
         // against the same base could otherwise both read it, both succeed
-        // independently, and race on the final chunk_map update. Since the base is
-        // now fast-evicted as soon as a patch supersedes it (see fast-evict below),
-        // this also prevents a concurrent reader of the same base from having it
-        // deleted out from under it mid-read.
+        // independently, and race on the final chunk_map update.
         let _chunk_patch_guard = if let Some(cidx) = chunk_idx {
             let lock = self.chunk_patch_locks
                 .entry((file_id, cidx))
@@ -4435,17 +4519,29 @@ impl Server {
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
 
+        // Acquired up front (cheap — no contention from other writers, since
+        // chunk_patch_locks above already excludes them) and moved into the
+        // blocking closure, held for the entire in-place mutation so a
+        // concurrent ReadChunk/ReadChunkRange for this exact chunk_id
+        // (chunk_io_read_guard) blocks instead of racing the write.
+        let io_guard = self.chunk_io_locks
+            .entry(chunk_id)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+            .write_owned()
+            .await;
+
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
+            use std::io::{Seek, SeekFrom, Write};
+            let _io_guard = io_guard;
 
             if !old_path.exists() {
                 return Err(("Chunk not found".to_string(), ErrorCode::NotFound));
             }
 
-            // Read the base chunk into memory and apply the patch there — never
-            // mutate old_path in place. See handle_multi_patch for why: chunk_id is
-            // content-addressed, so the same chunk_id can be the current base for
-            // multiple (file, chunk_idx) slots at once.
+            // Need the full buffer regardless of write strategy: compute_chunk_hash_at
+            // hashes the whole chunk, not just the patched range.
             let mut buf = fs::read(&old_path)
                 .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?;
 
@@ -4453,6 +4549,8 @@ impl Server {
             if patch_end > buf.len() {
                 buf.resize(patch_end, 0);
             }
+            // Snapshot the undo bytes for the journal before applying the patch.
+            let undo_bytes = buf[intra_offset..patch_end].to_vec();
             buf[intra_offset..patch_end].copy_from_slice(&patch_data);
 
             let final_size = buf.len();
@@ -4462,25 +4560,51 @@ impl Server {
             );
 
             if new_chunk_id != chunk_id {
+                // Durably record the undo BEFORE touching a single byte of old_path.
+                // If we crash before this commits, old_path is still untouched and
+                // there's nothing to recover. If we crash after, startup recovery
+                // uses this to restore old_path exactly if the rename below never
+                // happened, or discards it harmlessly if it did.
+                let journal = PatchJournalEntry {
+                    old_chunk_id: chunk_id,
+                    new_chunk_id,
+                    patches: vec![(intra_offset, undo_bytes)],
+                };
+                metadata.put_patch_journal(&journal)
+                    .map_err(|e| (format!("Failed to write patch journal: {}", e), ErrorCode::InternalError))?;
+
+                // In-place: pwrite only the patched bytes (not the whole buffer) into
+                // the existing file, then rename it to its new content-addressed
+                // name. Never write a second full copy — see PatchJournalEntry doc
+                // comment for why this is safe (chunk_io_locks excludes readers;
+                // chunk_id is file+offset-scoped so never aliased; the journal above
+                // covers the crash window).
+                let write_result = (|| -> Result<(), (String, ErrorCode)> {
+                    let mut f = fs::OpenOptions::new().write(true).open(&old_path)
+                        .map_err(|e| (format!("Failed to open chunk for patch: {}", e), ErrorCode::InternalError))?;
+                    f.seek(SeekFrom::Start(intra_offset as u64))
+                        .map_err(|e| (format!("Failed to seek chunk: {}", e), ErrorCode::InternalError))?;
+                    f.write_all(&patch_data)
+                        .map_err(|e| (format!("Failed to write patch: {}", e), ErrorCode::InternalError))?;
+                    f.sync_data()
+                        .map_err(|e| (format!("Failed to sync patched chunk: {}", e), ErrorCode::InternalError))?;
+                    Ok(())
+                })();
+                if let Err(e) = write_result {
+                    // Leave the journal entry — startup recovery (or a future
+                    // online-repair path) will restore old_path from it.
+                    return Err(e);
+                }
+
                 let new_path = storage.get_chunk_path(&new_chunk_id);
                 if let Some(parent) = new_path.parent() {
                     if let Err(e) = fs::create_dir_all(parent) {
                         return Err((format!("Failed to create chunk directory: {}", e), ErrorCode::InternalError));
                     }
                 }
-                if !new_path.exists() {
-                    let tmp_path = new_path.with_extension(format!("tmp.{}.{:?}",
-                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
-                        std::thread::current().id()));
-                    fs::write(&tmp_path, &buf)
-                        .map_err(|e| (format!("Failed to write patched chunk: {}", e), ErrorCode::InternalError))?;
-                    fs::File::open(&tmp_path)
-                        .and_then(|f| f.sync_data())
-                        .map_err(|e| (format!("Failed to sync patched chunk: {}", e), ErrorCode::InternalError))?;
-                    fs::rename(&tmp_path, &new_path)
-                        .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
-                }
-                // Same as handle_multi_patch: pre-register new_chunk_id.
+                fs::rename(&old_path, &new_path)
+                    .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
+
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -4497,35 +4621,26 @@ impl Server {
                         file_id: Some(file_id),
                     };
                     if let Err(e) = metadata.put_chunk_location(&new_loc) {
-                        warn!("PatchChunk: failed to pre-register {} in sled: {}", new_chunk_id, e);
+                        warn!("PatchChunk: failed to register {} in metadata: {}", new_chunk_id, e);
                     }
                 }
+                let _ = metadata.delete_chunk_location(&chunk_id);
+                // old_chunk_id's file no longer exists (renamed away) — make sure a
+                // stale cache entry can't outlive it.
+                storage.invalidate_cache(&chunk_id);
                 storage.invalidate_cache(&new_chunk_id);
 
-                // Fast-path eviction: new_chunk_id is file+offset-scoped (see
-                // compute_chunk_hash_at), so it can never alias another slot — safe to
-                // track and act on immediately instead of waiting for the deep
-                // orphan-purge sweep. Done here (inside spawn_blocking, alongside the
-                // rest of the redb/disk work for this patch) rather than after the
-                // .await — these are synchronous redb transactions and must never run
-                // directly on the async executor thread.
-                let _ = metadata.incr_chunk_refcount(&new_chunk_id);
-                match metadata.decr_chunk_refcount(&chunk_id) {
-                    Ok(Some(0)) => {
-                        if let Err(e) = storage.delete_chunk(&chunk_id) {
-                            debug!("Fast-evict: failed to delete superseded chunk {}: {}", chunk_id, e);
-                        } else {
-                            debug!("Fast-evict: deleted superseded chunk {} (refcount reached 0)", chunk_id);
-                        }
-                        let _ = metadata.delete_chunk_location(&chunk_id);
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!("Fast-evict: refcount decrement failed for {}: {}", chunk_id, e),
+                // Safe point reached: rename + metadata commit both done. The undo
+                // record is no longer needed.
+                if let Err(e) = metadata.delete_patch_journal(&chunk_id) {
+                    warn!("PatchChunk: failed to clear patch journal for {}: {}", chunk_id, e);
                 }
             }
 
             Ok((new_chunk_id, final_size, patch_data.len()))
         }).await;
+
+        self.chunk_io_locks.remove(&chunk_id);
 
         match result {
             Ok(Ok((new_chunk_id, final_size, patch_len))) => {
@@ -4629,8 +4744,20 @@ impl Server {
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
 
+        // See handle_patch_chunk for why this is acquired up front and moved
+        // into the blocking closure: it excludes concurrent ReadChunk/
+        // ReadChunkRange for this exact chunk_id during the in-place mutation.
+        let io_guard = self.chunk_io_locks
+            .entry(chunk_id)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+            .write_owned()
+            .await;
+
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
+            use std::io::{Seek, SeekFrom, Write};
+            let _io_guard = io_guard;
 
             // If the chunk file doesn't exist on disk, refuse the patch.
             // A ghost chunk_map entry (chunk_id in metadata but no file on disk)
@@ -4642,15 +4769,10 @@ impl Server {
                 return Err((format!("Failed to read chunk range: Failed to open chunk file: {:?}", old_path), ErrorCode::NotFound));
             }
 
-            // Read the base chunk into memory and apply patches there — never mutate
-            // old_path in place. chunk_id is content-addressed (blake3(offset||data)),
-            // so the SAME chunk_id can be the "current" base for multiple (file,
-            // chunk_idx) slots at once whenever their content+offset match (e.g.
-            // duplicate files). Renaming/deleting the shared base out from under a
-            // concurrent patch for another file made that file's MultiPatch fail with
-            // "chunk data missing on this node", falling back to a fresh write of only
-            // the dirty range and corrupting the un-patched bytes. Chunks are capped
-            // at 4MB, so reading the whole base into memory is cheap.
+            // Still need the full buffer in memory: compute_chunk_hash_at hashes the
+            // whole chunk, not just the patched ranges. Chunks are capped at 4MB, so
+            // this read is cheap; only the *write* below is now scoped to the actual
+            // patch bytes instead of rewriting the whole buffer to a new file.
             let mut buf = fs::read(&old_path)
                 .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?;
 
@@ -4661,8 +4783,13 @@ impl Server {
                 .max(buf.len());
             buf.resize(needed_len, 0);
 
+            // Snapshot undo bytes for each patch, in application order, before
+            // applying it.
+            let mut undo_patches: Vec<(usize, Vec<u8>)> = Vec::with_capacity(patches.len());
             for (intra_offset, patch_data) in &patches {
-                buf[*intra_offset..*intra_offset + patch_data.len()].copy_from_slice(patch_data);
+                let end = *intra_offset + patch_data.len();
+                undo_patches.push((*intra_offset, buf[*intra_offset..end].to_vec()));
+                buf[*intra_offset..end].copy_from_slice(patch_data);
             }
 
             let final_size = buf.len();
@@ -4677,30 +4804,47 @@ impl Server {
             );
 
             if new_chunk_id != chunk_id {
+                // Durable undo record before touching old_path — see PatchJournalEntry
+                // and handle_patch_chunk for the full crash-recovery rationale.
+                let journal = PatchJournalEntry {
+                    old_chunk_id: chunk_id,
+                    new_chunk_id,
+                    patches: undo_patches,
+                };
+                metadata.put_patch_journal(&journal)
+                    .map_err(|e| (format!("Failed to write patch journal: {}", e), ErrorCode::InternalError))?;
+
+                // In-place: pwrite only the actual patch bytes into the existing file,
+                // one fsync at the end, then rename to the new content-addressed name.
+                let write_result = (|| -> Result<(), (String, ErrorCode)> {
+                    let mut f = fs::OpenOptions::new().write(true).open(&old_path)
+                        .map_err(|e| (format!("Failed to open chunk for patch: {}", e), ErrorCode::InternalError))?;
+                    for (intra_offset, patch_data) in &patches {
+                        f.seek(SeekFrom::Start(*intra_offset as u64))
+                            .map_err(|e| (format!("Failed to seek chunk: {}", e), ErrorCode::InternalError))?;
+                        f.write_all(patch_data)
+                            .map_err(|e| (format!("Failed to write patch: {}", e), ErrorCode::InternalError))?;
+                    }
+                    f.sync_data()
+                        .map_err(|e| (format!("Failed to sync patched chunk: {}", e), ErrorCode::InternalError))?;
+                    Ok(())
+                })();
+                if let Err(e) = write_result {
+                    // Leave the journal entry — startup recovery restores old_path.
+                    return Err(e);
+                }
+
                 let new_path = storage.get_chunk_path(&new_chunk_id);
                 if let Some(parent) = new_path.parent() {
                     fs::create_dir_all(parent)
                         .map_err(|e| (format!("Failed to create chunk directory: {}", e), ErrorCode::InternalError))?;
                 }
-                if !new_path.exists() {
-                    let tmp_path = new_path.with_extension(format!("tmp.{}.{:?}",
-                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
-                        std::thread::current().id()));
-                    fs::write(&tmp_path, &buf)
-                        .map_err(|e| (format!("Failed to write patched chunk: {}", e), ErrorCode::InternalError))?;
-                    fs::File::open(&tmp_path)
-                        .and_then(|f| f.sync_data())
-                        .map_err(|e| (format!("Failed to sync patched chunk: {}", e), ErrorCode::InternalError))?;
-                    fs::rename(&tmp_path, &new_path)
-                        .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
-                }
-                // Register new_chunk_id in sled, reusing the old location's node list.
-                // The OLD chunk_id's routing entry and on-disk file are deliberately
-                // left in place — they may still be the current base for ANOTHER
-                // (file, chunk_idx) slot with identical content+offset. The deep
-                // orphan-purge sweep reclaims them once live_chunk_ids() (scanned from
-                // file metadata) no longer references the old chunk_id, after its
-                // grace period.
+                fs::rename(&old_path, &new_path)
+                    .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
+
+                // Register new_chunk_id in metadata, reusing the old location's node
+                // list. Unlike before, there is no separate old file left behind to
+                // worry about — the rename above consumed it.
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -4717,14 +4861,23 @@ impl Server {
                         file_id: Some(file_id),
                     };
                     if let Err(e) = metadata.put_chunk_location(&new_loc) {
-                        warn!("MultiPatch: failed to pre-register {} in sled: {}", new_chunk_id, e);
+                        warn!("MultiPatch: failed to register {} in metadata: {}", new_chunk_id, e);
                     }
                 }
+                let _ = metadata.delete_chunk_location(&chunk_id);
+                storage.invalidate_cache(&chunk_id);
                 storage.invalidate_cache(&new_chunk_id);
+
+                // Safe point reached — discard the undo journal.
+                if let Err(e) = metadata.delete_patch_journal(&chunk_id) {
+                    warn!("MultiPatch: failed to clear patch journal for {}: {}", chunk_id, e);
+                }
             }
 
             Ok::<_, (String, ErrorCode)>((new_chunk_id, final_size, patches))
         }).await;
+
+        self.chunk_io_locks.remove(&chunk_id);
 
         match result {
             Ok(Ok((new_chunk_id, final_size, patches))) => {
@@ -4784,24 +4937,9 @@ impl Server {
                             }
                         }
                     }
-
-                    // Fast-path eviction: new_chunk_id is file+offset-scoped (see
-                    // compute_chunk_hash_at), so it can never alias another slot —
-                    // safe to track and act on immediately instead of waiting for
-                    // the deep orphan-purge sweep.
-                    let _ = self.metadata.incr_chunk_refcount(&new_chunk_id);
-                    match self.metadata.decr_chunk_refcount(&chunk_id) {
-                        Ok(Some(0)) => {
-                            if let Err(e) = self.storage.delete_chunk(&chunk_id) {
-                                debug!("Fast-evict: failed to delete superseded chunk {}: {}", chunk_id, e);
-                            } else {
-                                debug!("Fast-evict: deleted superseded chunk {} (refcount reached 0)", chunk_id);
-                            }
-                            let _ = self.metadata.delete_chunk_location(&chunk_id);
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("Fast-evict: refcount decrement failed for {}: {}", chunk_id, e),
-                    }
+                    // No fast-evict step needed here: the in-place rename inside
+                    // spawn_blocking already consumed old_chunk_id's file directly —
+                    // there is no second copy left behind to clean up.
                 }
 
                 // Notify the leader of the actual computed hash before returning to the

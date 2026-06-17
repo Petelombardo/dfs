@@ -3735,9 +3735,21 @@ impl Server {
             }
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
+                const CHUNK_SIZE_RECONCILE: u64 = 4 * 1024 * 1024;
                 for loc in m.chunk_locations.iter_mut() {
                     if let Some(file_offset) = loc.file_offset {
-                        if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
+                        // Match by chunk_idx, not exact file_offset: a fresh write's explicit
+                        // leader RCL and the client's own later metadata_cache splice are two
+                        // independent channels confirming the same chunk. If either ever
+                        // carries a non-boundary-aligned file_offset (e.g. a delayed/retried
+                        // RCL for a different intra-chunk position), exact matching here would
+                        // miss the correspondence and this reconcile would treat them as
+                        // unrelated chunks — appending a duplicate below instead of recognizing
+                        // it as the same slot (observed live on staging as exact-duplicate rows).
+                        let incoming_cidx = file_offset / CHUNK_SIZE_RECONCILE;
+                        if let Some(map_loc) = map_locs.iter().find(|l| {
+                            l.file_offset.map(|o| o / CHUNK_SIZE_RECONCILE) == Some(incoming_cidx)
+                        }) {
                             let should_use_server = if let Some(client_ts) = loc.written_at {
                                 let server_ts = map_loc.written_at.unwrap_or(0);
                                 server_ts > client_ts
@@ -3762,14 +3774,20 @@ impl Server {
                 // flushes for the same file race to send their own non-cumulative
                 // chunk_locations snapshot — a later write_seq can easily carry
                 // FEWER entries than an earlier one. Append any chunk_map entry
-                // whose file_offset isn't already in the incoming list, so the
+                // whose chunk_idx isn't already in the incoming list, so the
                 // persisted chunk_locations never regresses below what RCL has
                 // already confirmed. Skip when the incoming list is empty — that's
                 // an intentional truncate-to-zero, not an incomplete snapshot.
+                // Matched by chunk_idx (not exact file_offset) for the same reason as
+                // above — otherwise a non-aligned map_loc offset would never be
+                // recognized as already-present and gets appended as a duplicate.
                 if !m.chunk_locations.is_empty() {
                     for map_loc in map_locs.iter() {
                         if let Some(file_offset) = map_loc.file_offset {
-                            if !m.chunk_locations.iter().any(|l| l.file_offset == Some(file_offset)) {
+                            let map_cidx = file_offset / CHUNK_SIZE_RECONCILE;
+                            if !m.chunk_locations.iter().any(|l| {
+                                l.file_offset.map(|o| o / CHUNK_SIZE_RECONCILE) == Some(map_cidx)
+                            }) {
                                 m.chunk_locations.push(map_loc.clone());
                             }
                         }
@@ -3847,9 +3865,14 @@ impl Server {
                 let (map_locs, _) = map_entry.value();
                 for loc in m.chunk_locations.iter_mut() {
                     if let Some(file_offset) = loc.file_offset {
-                        if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
+                        // Match by chunk_idx, not exact file_offset — same reasoning as the
+                        // PutFileMetadata reconcile: a non-boundary-aligned chunk_map entry
+                        // must still be recognized as the same slot.
+                        let chunk_idx = file_offset / CHUNK_SIZE_RECONCILE;
+                        if let Some(map_loc) = map_locs.iter().find(|l| {
+                            l.file_offset.map(|o| o / CHUNK_SIZE_RECONCILE) == Some(chunk_idx)
+                        }) {
                             if map_loc.chunk_id != loc.chunk_id {
-                                let chunk_idx = file_offset / CHUNK_SIZE_RECONCILE;
                                 debug!("disseminate: reconcile file {} chunk {} {} -> {} (chunk_map newer)",
                                     m.id, chunk_idx, loc.chunk_id, map_loc.chunk_id);
                                 *loc = map_loc.clone();

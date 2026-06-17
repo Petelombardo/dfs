@@ -506,6 +506,47 @@ struct FlushHandle {
     write_open_counts: Arc<DashMap<u64, usize>>,
 }
 
+/// Splice a freshly-confirmed chunk location into a file's chunk_locations list,
+/// replacing any existing entry for the same chunk_idx (file_offset / CHUNK_SIZE).
+///
+/// Must match by chunk_idx, not exact file_offset or "chunk_id present anywhere":
+/// the same confirmed location can get spliced more than once (a client-side retry
+/// whose first attempt actually succeeded server-side, or two flush paths racing on
+/// the same inode) and a check that's too narrow lets the second splice insert a
+/// byte-for-byte duplicate entry instead of recognizing it as the same slot — this
+/// was observed live on staging as exact-duplicate rows in dfs-admin file info,
+/// every field identical, immediately after a fresh chunk_idx RCL-matching fix
+/// closed off the other half of this bug class on the server.
+fn splice_chunk_location(
+    chunk_locations: &mut Vec<dfs_common::ChunkLocation>,
+    loc: dfs_common::ChunkLocation,
+    client: &Arc<DfsClient>,
+) {
+    let chunk_idx = loc.file_offset.map(|o| o / CHUNK_SIZE as u64);
+    if let Some(pos) = chunk_locations.iter().position(|l| {
+        chunk_idx.is_some() && l.file_offset.map(|o| o / CHUNK_SIZE as u64) == chunk_idx
+    }) {
+        let old_cid = chunk_locations[pos].chunk_id;
+        if old_cid != loc.chunk_id {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let _ = client.chunk_cache.remove(&old_cid);
+            });
+        }
+        chunk_locations[pos] = loc;
+        return;
+    }
+    match loc.file_offset {
+        Some(offset) => {
+            let insert_pos = chunk_locations.iter()
+                .position(|l| l.file_offset.map(|o| o > offset).unwrap_or(false))
+                .unwrap_or(chunk_locations.len());
+            chunk_locations.insert(insert_pos, loc);
+        }
+        None => chunk_locations.push(loc),
+    }
+}
+
 impl FlushHandle {
     /// Flush dirty chunk slots for `ino`.
     ///
@@ -1027,26 +1068,7 @@ impl FlushHandle {
                     return Ok(());
                 }
                 for loc in &all_locations {
-                    if !meta.chunk_locations.iter().any(|l| l.chunk_id == loc.chunk_id) {
-                        // Replace any existing entry at the same file_offset (from a previous
-                        // partial flush of this slot). Content-addressed hashes differ when the
-                        // same slot is flushed twice (partial then full), so chunk_id dedup alone
-                        // misses this — we must also dedup by file_offset.
-                        if let Some(offset) = loc.file_offset {
-                            if let Some(pos) = meta.chunk_locations.iter().position(|l| l.file_offset == Some(offset)) {
-                                let old_cid = meta.chunk_locations[pos].chunk_id;
-                                if old_cid != loc.chunk_id {
-                                    let client = self.client.clone();
-                                    tokio::spawn(async move {
-                                        { let _ = client.chunk_cache.remove(&old_cid); };
-                                    });
-                                }
-                                meta.chunk_locations[pos] = loc.clone();
-                                continue;
-                            }
-                        }
-                        meta.chunk_locations.push(loc.clone());
-                    }
+                    splice_chunk_location(&mut meta.chunk_locations, loc.clone(), &self.client);
                 }
                 // File size = max of logical size (set by truncate) and physical chunk end.
                 // A sparse file grown via truncate has a logical size larger than its written
@@ -2213,34 +2235,7 @@ impl FlushHandle {
                         return Ok(());
                     }
                     for loc in &locations {
-                        if !meta.chunk_locations.iter().any(|l| l.chunk_id == loc.chunk_id) {
-                            if let Some(offset) = loc.file_offset {
-                                if let Some(pos) = meta.chunk_locations.iter().position(|l| l.file_offset == Some(offset)) {
-                                    // Evict the old chunk_id from the read cache so stale partial
-                                    // data can't be served after the slot is replaced with a larger
-                                    // (or different) flush of the same chunk offset.
-                                    let old_cid = meta.chunk_locations[pos].chunk_id;
-                                    if old_cid != loc.chunk_id {
-                                        let client = self.client.clone();
-                                        tokio::spawn(async move {
-                                            { let _ = client.chunk_cache.remove(&old_cid); };
-                                        });
-                                    }
-                                    meta.chunk_locations[pos] = loc.clone();
-                                    continue;
-                                }
-                                // Insert at the correct position based on file_offset to keep
-                                // chunk_locations sorted. This prevents out-of-order chunks when
-                                // concurrent flush tasks complete in non-sequential order.
-                                let insert_pos = meta.chunk_locations.iter()
-                                    .position(|l| l.file_offset.map(|o| o > offset).unwrap_or(false))
-                                    .unwrap_or(meta.chunk_locations.len());
-                                meta.chunk_locations.insert(insert_pos, loc.clone());
-                            } else {
-                                // No file_offset — append to end (shouldn't happen in normal operation)
-                                meta.chunk_locations.push(loc.clone());
-                            }
-                        }
+                        splice_chunk_location(&mut meta.chunk_locations, loc.clone(), &self.client);
                     }
                     if let Some(last) = meta.chunk_locations.iter()
                         .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))

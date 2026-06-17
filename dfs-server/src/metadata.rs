@@ -42,6 +42,20 @@ const DELETE_QUEUE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("d
 /// backlog at once.
 const PENDING_HEALING_TABLE: TableDefinition<&str, u64> = TableDefinition::new("pending_healing");
 
+/// chunk_id hex string → reference count (u64).
+///
+/// Only ever populated for chunk_ids produced by PatchChunk/MultiPatch
+/// (file+offset-scoped hashes — see compute_chunk_hash_at). Those hashes bake
+/// in file_id and file_offset, so they can never alias another (file,
+/// chunk_idx) slot; a tracked count hitting zero means the chunk is provably
+/// dead, not just "absent from the last scan". Chunk_ids from the original
+/// chunker (plain compute_chunk_hash, no file scoping) are never inserted
+/// here — they can legitimately be shared across files (dedup), so they're
+/// left for the deep orphan-purge sweep to handle as before. Absence of an
+/// entry means "untracked", not "zero" — callers must never delete on a
+/// missing entry.
+const CHUNK_REFCOUNT_TABLE: TableDefinition<&str, u64> = TableDefinition::new("chunk_refcount");
+
 // ---------------------------------------------------------------------------
 
 /// Decode a 64-character lowercase hex string (as produced by `ChunkId::to_hex`)
@@ -666,6 +680,61 @@ impl MetadataStore {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Chunk refcounts (fast-path eviction for patch-generated chunk_ids)
+    // -------------------------------------------------------------------------
+
+    /// Mark `chunk_id` as live for one (file, chunk_idx) slot. Call exactly
+    /// once per chunk_id, when it becomes the new value produced by a patch.
+    pub fn incr_chunk_refcount(&self, chunk_id: &ChunkId) -> Result<u64> {
+        let key = format!("{}", chunk_id);
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        let new_count;
+        {
+            let mut table = txn.open_table(CHUNK_REFCOUNT_TABLE)?;
+            let current = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
+            new_count = current + 1;
+            table.insert(key.as_str(), new_count)?;
+        }
+        txn.commit()?;
+        Ok(new_count)
+    }
+
+    /// Decrement the refcount for `chunk_id`. Returns:
+    /// - `Some(n)` — chunk_id was tracked; `n` is the count after decrementing
+    ///   (0 means no other slot references it under this scheme — safe to
+    ///   delete immediately; the table entry is removed in that case).
+    /// - `None` — chunk_id was never tracked (e.g. an original chunker-hash
+    ///   chunk, potentially dedup-shared with another file). Callers MUST NOT
+    ///   delete the chunk in this case; leave it for the deep sweep.
+    pub fn decr_chunk_refcount(&self, chunk_id: &ChunkId) -> Result<Option<u64>> {
+        let key = format!("{}", chunk_id);
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        let result;
+        {
+            let mut table = txn.open_table(CHUNK_REFCOUNT_TABLE)?;
+            let existing: Option<u64> = table.get(key.as_str())?.map(|v| v.value());
+            match existing {
+                None => result = None,
+                Some(current) => {
+                    let new_count = current.saturating_sub(1);
+                    if new_count == 0 {
+                        table.remove(key.as_str())?;
+                    } else {
+                        table.insert(key.as_str(), new_count)?;
+                    }
+                    result = Some(new_count);
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(result)
     }
 
     // -------------------------------------------------------------------------

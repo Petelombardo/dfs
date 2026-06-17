@@ -4461,6 +4461,24 @@ impl Server {
                             }
                         }
                     }
+
+                    // Fast-path eviction: new_chunk_id is file+offset-scoped (see
+                    // compute_chunk_hash_at), so it can never alias another slot —
+                    // safe to track and act on immediately instead of waiting for
+                    // the deep orphan-purge sweep.
+                    let _ = self.metadata.incr_chunk_refcount(&new_chunk_id);
+                    match self.metadata.decr_chunk_refcount(&chunk_id) {
+                        Ok(Some(0)) => {
+                            if let Err(e) = self.storage.delete_chunk(&chunk_id) {
+                                debug!("Fast-evict: failed to delete superseded chunk {}: {}", chunk_id, e);
+                            } else {
+                                debug!("Fast-evict: deleted superseded chunk {} (refcount reached 0)", chunk_id);
+                            }
+                            let _ = self.metadata.delete_chunk_location(&chunk_id);
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("Fast-evict: refcount decrement failed for {}: {}", chunk_id, e),
+                    }
                 }
 
                 Response::PatchChunkResult { new_chunk_id, size: final_size }
@@ -4696,6 +4714,24 @@ impl Server {
                                 break;
                             }
                         }
+                    }
+
+                    // Fast-path eviction: new_chunk_id is file+offset-scoped (see
+                    // compute_chunk_hash_at), so it can never alias another slot —
+                    // safe to track and act on immediately instead of waiting for
+                    // the deep orphan-purge sweep.
+                    let _ = self.metadata.incr_chunk_refcount(&new_chunk_id);
+                    match self.metadata.decr_chunk_refcount(&chunk_id) {
+                        Ok(Some(0)) => {
+                            if let Err(e) = self.storage.delete_chunk(&chunk_id) {
+                                debug!("Fast-evict: failed to delete superseded chunk {}: {}", chunk_id, e);
+                            } else {
+                                debug!("Fast-evict: deleted superseded chunk {} (refcount reached 0)", chunk_id);
+                            }
+                            let _ = self.metadata.delete_chunk_location(&chunk_id);
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("Fast-evict: refcount decrement failed for {}: {}", chunk_id, e),
                     }
                 }
 
@@ -6667,6 +6703,82 @@ mod tests {
             }
             other => panic!("expected FileChunkMap response, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_multi_patch_fast_evicts_chain_intermediate_but_not_original() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_file_offset = 0u64;
+
+        // Original chunk: plain content hash, as produced by the chunker on initial
+        // write — never tracked by the refcount scheme, dedup-shareable across files.
+        let original_data = vec![0u8; 4096];
+        let original_hash = compute_chunk_hash(&original_data);
+        let original_chunk_id = ChunkId::from_hash(original_hash);
+        storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+        let original_loc = ChunkLocation {
+            chunk_id: original_chunk_id,
+            nodes: vec![node_id],
+            size: original_data.len(),
+            checksum: original_hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(1000),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        };
+        server.chunk_map.insert(file_id, (vec![original_loc.clone()], 1));
+        server.metadata.put_chunk_location(&original_loc).unwrap();
+
+        // First patch (simulates the VM's first COW write to this chunk): original -> gen1.
+        let resp1 = server.handle_multi_patch(
+            original_chunk_id, file_id, Some(0), chunk_file_offset,
+            vec![(0, vec![1u8; 100])], None, None,
+        ).await;
+        let gen1_id = match resp1 {
+            Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
+            other => panic!("expected MultiPatchResult, got {:?}", other),
+        };
+        assert_ne!(gen1_id, original_chunk_id);
+
+        // Untracked original must survive — it may still be the live base for another
+        // file/slot via dedup; only the deep sweep may reclaim it.
+        assert!(storage.get_chunk_path(&original_chunk_id).exists(),
+            "untracked original chunk must NOT be fast-evicted");
+
+        // Second patch (the VM's next COW write to the same offset): gen1 -> gen2.
+        let resp2 = server.handle_multi_patch(
+            gen1_id, file_id, Some(0), chunk_file_offset,
+            vec![(0, vec![2u8; 100])], None, None,
+        ).await;
+        let gen2_id = match resp2 {
+            Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
+            other => panic!("expected MultiPatchResult, got {:?}", other),
+        };
+        assert_ne!(gen2_id, gen1_id);
+
+        // gen1 was itself produced by a patch (file+offset-scoped hash, can't alias
+        // anything else) and is now superseded — it must be gone immediately, not
+        // left for the 30-minute deep sweep.
+        assert!(!storage.get_chunk_path(&gen1_id).exists(),
+            "chain-intermediate chunk must be fast-evicted as soon as it's superseded");
+
+        // The untracked original is still untouched by any of this.
+        assert!(storage.get_chunk_path(&original_chunk_id).exists(),
+            "untracked original chunk must remain untouched after downstream patches");
     }
 
     #[test]

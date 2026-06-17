@@ -2605,6 +2605,85 @@ dfs_sync
 rm -f "$T37_FILE" "$T37_TMP"
 fi # should_run T37
 
+# ── Test 39: explicit mtime preserved across concurrent flush tasks ───────────
+#
+# Reproduces the rsync re-transfer bug: when a file spans multiple chunk slots
+# and utimes() is called before all flush tasks complete, two concurrent flush
+# tasks both check explicit_mtime_pending.  The old code used remove() — the
+# first task consumed the flag; the second saw None and stamped mtime=now(),
+# clobbering the utimes value with a higher write_seq (server accepted it).
+# The fix uses contains() (non-destructive) in flush tasks and clears the flag
+# only in write(), making all concurrent tasks preserve the explicit mtime.
+if should_run T39; then
+snapshot_log T39
+echo ""
+echo "=== T39: explicit mtime preserved with multi-chunk file (concurrent flush race) ==="
+
+T39_FILE="$MOUNT/t39_mtime_race.bin"
+OLD_MTIME=1609459200   # 2021-01-01T00:00:00 UTC
+
+T39_RESULT=$(python3 -c "
+import os, time
+
+PATH = '$T39_FILE'
+OLD_MTIME = $OLD_MTIME
+CHUNK = 4 * 1024 * 1024
+N_CHUNKS = 3
+
+errors = []
+
+# Write 3 chunks (12 MB) to create multiple flush slots.
+fd = os.open(PATH, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+data = os.urandom(CHUNK)
+ref_md5 = None
+import hashlib
+h = hashlib.md5()
+for _ in range(N_CHUNKS):
+    os.write(fd, data)
+    h.update(data)
+ref_md5 = h.hexdigest()
+os.close(fd)
+
+# Set explicit historical mtime AFTER writes, simulating rsync utimes().
+os.utime(PATH, (OLD_MTIME, OLD_MTIME))
+
+# fsync to flush everything (may spawn N_CHUNKS flush tasks concurrently).
+fd2 = os.open(PATH, os.O_RDONLY)
+os.fsync(fd2)
+os.close(fd2)
+
+# Give any in-flight flush tasks a moment to complete.
+time.sleep(1)
+
+st = os.stat(PATH)
+got_mtime = int(st.st_mtime)
+if got_mtime != OLD_MTIME:
+    errors.append(f'mtime clobbered by concurrent flush: got {got_mtime}, expected {OLD_MTIME}')
+
+# Verify data integrity too.
+with open(PATH, 'rb') as f:
+    got_md5 = hashlib.md5(f.read()).hexdigest()
+if got_md5 != ref_md5:
+    errors.append(f'data corrupt: got {got_md5}, expected {ref_md5}')
+
+for e in errors:
+    print(e)
+print(len(errors))
+")
+
+echo "$T39_RESULT" | sed 's/^/  /'
+T39_ERR_COUNT=$(echo "$T39_RESULT" | tail -1)
+T39_ERR_COUNT=${T39_ERR_COUNT:-1}
+
+dfs_sync
+
+[ "$T39_ERR_COUNT" = "0" ] \
+    && check "T39 explicit mtime preserved across concurrent flush slots, 0 errors" PASS \
+    || check "T39 explicit mtime race: $T39_ERR_COUNT errors" FAIL
+
+rm -f "$T39_FILE"
+fi # should_run T39
+
 # ── Test 38: rolling node restart during slow write — replica convergence ────
 #
 # Reproduces a staging observation (live DVR recording, RF=3 cluster): a
@@ -2669,6 +2748,31 @@ T38_UNDER_AFTER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info 
 
 rm -f "$T38_FILE" "$T/t38_src.bin"
 fi # should_run T38
+
+# ── Test 40: zero_gap stale-read + gap fill regression ───────────────────────
+#
+# Reproduces the qcow2 corruption root cause (local simulation):
+#   1. Write sparse ranges to a chunk, fsync → zero_gap seeded for the gaps.
+#   2. Write real data into a gap position → PATCH path.
+#   3. Read back BEFORE fsync  → must come from slot (not zero_gap zeros).
+#   4. Read back AFTER fsync   → zero_gap cleared; chunk_cache has correct data.
+#   5. Wait 2s and read again  → no stale zero_gap TTL re-serves zeros.
+if should_run T40; then
+snapshot_log T40
+echo ""
+echo "=== T40: zero_gap stale-read + gap fill regression ==="
+
+T40_RESULT=$(python3 "$(dirname "$0")/test_qcow2_gap.py" "$MOUNT" 2>&1)
+echo "$T40_RESULT" | sed 's/^/  /'
+
+if echo "$T40_RESULT" | grep -q "ALL TESTS PASSED"; then
+    check "T40 zero_gap gap-fill: all reads correct" PASS
+else
+    check "T40 zero_gap gap-fill: data corruption detected" FAIL
+fi
+
+dfs_sync
+fi # should_run T40
 
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""

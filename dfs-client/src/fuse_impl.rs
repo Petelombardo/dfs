@@ -1060,7 +1060,11 @@ impl FlushHandle {
                 // Don't clobber an mtime the user explicitly just set via setattr
                 // (utimes/utimensat) — e.g. rsync -a's temp-file restore can land
                 // before this flush completes (T37).
-                if self.explicit_mtime_pending.remove(&ino).is_none() {
+                // Use contains() not remove(): two concurrent flush tasks for the same
+                // inode both run this check, and remove() would let the second task see
+                // None and stamp now(), clobbering the explicit mtime. The flag is
+                // cleared only in write() when new data arrives.
+                if !self.explicit_mtime_pending.contains(&ino) {
                     meta.modified_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -2247,7 +2251,11 @@ impl FlushHandle {
                     // Don't clobber an mtime the user explicitly just set via setattr
                     // (utimes/utimensat) — e.g. rsync -a's temp-file restore can land
                     // before this flush completes (T37).
-                    if self.explicit_mtime_pending.remove(&ino).is_none() {
+                    // Use contains() not remove(): two concurrent flush tasks for the same
+                    // inode both run this check, and remove() would let the second task see
+                    // None and stamp now(), clobbering the explicit mtime. The flag is
+                    // cleared only in write() when new data arrives.
+                    if !self.explicit_mtime_pending.contains(&ino) {
                         meta.modified_at = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -4262,6 +4270,45 @@ impl Filesystem for DfsFilesystem {
                             return;
                         }
 
+                        // The read doesn't START inside a dirty range, but a dirty range
+                        // may still start somewhere INSIDE the read window (e.g. an 8-byte
+                        // field a few bytes past the read's start — VM108's mkfs.ext4
+                        // hot-spot pattern, T35). Falling straight through to the network
+                        // for the whole window would miss those just-written, not-yet-
+                        // flushed bytes and return stale data. Splice: fetch the window
+                        // from network/cache, then overlay each overlapping dirty
+                        // sub-range with the slot's real bytes.
+                        let read_end = intra + size;
+                        let overlaps: Vec<(usize, usize)> = slot.dirty_ranges.iter()
+                            .filter(|&&(s, e)| s < read_end && e > intra)
+                            .copied()
+                            .collect();
+                        if !overlaps.is_empty() {
+                            let slot_data = slot.data.clone();
+                            drop(state);
+                            let net_result = client.read_file(
+                                ino, file_size, file_id, &file_path, offset, size, false, write_seq,
+                            ).await;
+                            let mut buf = match net_result {
+                                Ok(mut data) => { data.resize(size, 0); data }
+                                Err(e) => {
+                                    error!("read failed (slot-overlap splice): {}", e);
+                                    reply.error(libc::EIO);
+                                    return;
+                                }
+                            };
+                            for (s, e) in overlaps {
+                                let ov_start = s.max(intra);
+                                let ov_end = e.min(read_end).min(slot_data.len());
+                                if ov_end <= ov_start { continue; }
+                                let buf_start = ov_start - intra;
+                                let buf_end = ov_end - intra;
+                                buf[buf_start..buf_end].copy_from_slice(&slot_data[ov_start..ov_end]);
+                            }
+                            reply.data(&buf);
+                            return;
+                        }
+
                         // Beyond this slot's buffered frontier, or within a gap-fill
                         // placeholder region. The server may have committed data here
                         // from a prior flush (e.g. mkfs.ext4 writes non-sequentially
@@ -4834,6 +4881,13 @@ impl Filesystem for DfsFilesystem {
         reply: fuser::ReplyWrite,
     ) {
         debug!("write FUSE: ino={} offset={} len={}", ino, offset, data.len());
+
+        // A new write invalidates any explicit mtime set by a prior utimes() call.
+        // Flush tasks now use contains() (not remove()) so ALL concurrent flush tasks
+        // for the same inode preserve the explicit mtime. Clearing here (on the FUSE
+        // dispatch thread, before any async task is spawned) is the only place it's
+        // removed — ensuring that after a write(), the next flush stamps mtime=now().
+        self.explicit_mtime_pending.remove(&ino);
 
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();

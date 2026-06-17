@@ -2078,6 +2078,24 @@ leader_addr: Arc::new(RwLock::new(None)),
                 for (rf, res) in range_fetches.iter().zip(fetch_results) {
                     match res.context("Range fetch task panicked").and_then(|r| r) {
                         Ok((idx, chunk_start, offset_in_chunk, data)) => {
+                            // Guard against a race where a concurrent flush rotated this
+                            // chunk to a new chunk_id WHILE this fetch was in flight (T35:
+                            // rapid same-chunk MultiPatch rotation). The fetch was issued
+                            // against rf.cid, captured before the request went out; if our
+                            // own write path has since confirmed a newer id for this
+                            // (inode, idx), these bytes are from the stale base and must not
+                            // be cached or returned under the (inode, file_offset) key — a
+                            // later read at the same key would get a stale HIT. Retry against
+                            // the fresh id instead, same as a missing-chunk stale response.
+                            let is_stale = self.recent_chunk_writes
+                                .get(&(inode, idx as u64))
+                                .map(|e| e.0 != rf.cid)
+                                .unwrap_or(false);
+                            if is_stale {
+                                warn!("Range fetch for chunk {} (idx={}) completed after a newer write rotated the chunk — discarding stale bytes and retrying", rf.cid, idx);
+                                stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk));
+                                continue;
+                            }
                             let arc = Arc::new(data);
                             {
                                 let cache_key = ByteRangeCacheKey {

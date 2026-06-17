@@ -316,10 +316,18 @@ impl Server {
             // applies even when neither file exists locally (e.g., on non-replica nodes).
             let new_locs: Vec<ChunkLocation> = if let Some(existing_entry) = self.chunk_map.get(&metadata.id) {
                 let (existing_locs, _) = existing_entry.value();
+                const CHUNK_SIZE_4M: u64 = 4 * 1024 * 1024;
                 let mut locs = metadata.chunk_locations.clone();
                 for loc in locs.iter_mut() {
                     if loc.file_offset.is_none() { continue; }
-                    if let Some(old_loc) = existing_locs.iter().find(|l| l.file_offset == loc.file_offset) {
+                    // Match by chunk_idx (not exact file_offset): a non-aligned write and a
+                    // boundary-aligned write for the same chunk produce different file_offsets
+                    // but the same chunk_idx. Exact matching misses the guard, letting stale
+                    // metadata revert a freshly-updated chunk_map entry.
+                    let incoming_cidx = loc.file_offset.map(|o| o / CHUNK_SIZE_4M);
+                    if let Some(old_loc) = existing_locs.iter().find(|l| {
+                        incoming_cidx.is_some() && l.file_offset.map(|o| o / CHUNK_SIZE_4M) == incoming_cidx
+                    }) {
                         if old_loc.chunk_id == loc.chunk_id { continue; }
                         // Staleness guard: prefer client_write_seq (monotone, clock-agnostic)
                         // then fall back to written_at. Rejects stale follower metadata that
@@ -422,12 +430,18 @@ impl Server {
                 return;
             }
         }
-        // Fallback: match by file_offset (covers PatchChunk where chunk_id changes).
-        // Guard: reject if incoming is older than what we already have.
-        // Prefer client_write_seq (clock-agnostic monotone counter) over written_at.
+        // Fallback: match by chunk_idx (file_offset / CHUNK_SIZE), NOT exact file_offset.
+        // Two writes to the same chunk_idx can arrive with different file_offsets: the first
+        // may use the actual intra-chunk write position (e.g., 2148007936 for a 65536-byte
+        // write at byte 524288 of chunk 512), while the second uses the chunk boundary
+        // (2147483648). Exact-offset matching would push both as separate entries; the stale
+        // first entry then causes handle_multi_patch to return ChunkStale for the newer chunk.
+        // Matching by chunk_idx ensures the newer entry always replaces the older one.
         if let Some(file_offset) = location.file_offset {
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+            let incoming_chunk_idx = file_offset / CHUNK_SIZE;
             for loc in locs.iter_mut() {
-                if loc.file_offset == Some(file_offset) {
+                if loc.file_offset.map(|o| o / CHUNK_SIZE) == Some(incoming_chunk_idx) {
                     let should_update = match (location.client_write_seq, loc.client_write_seq) {
                         (Some(inc), Some(ext)) => inc >= ext,
                         (Some(_), None)        => true,  // incoming has seq, existing is legacy → accept
@@ -441,15 +455,15 @@ impl Server {
                         *loc = location.clone();
                     } else {
                         // Stale RCL rejected: log so we can confirm the guard is working.
-                        debug!("[RCL-stale-rejected] file={:?} offset={:?} kept={} (seq={:?}) dropped={} (seq={:?})",
-                            file_id, location.file_offset, loc.chunk_id, loc.client_write_seq,
+                        debug!("[RCL-stale-rejected] file={:?} chunk_idx={} kept={} (seq={:?}) dropped={} (seq={:?})",
+                            file_id, incoming_chunk_idx, loc.chunk_id, loc.client_write_seq,
                             location.chunk_id, location.client_write_seq);
                     }
                     return;
                 }
             }
         }
-        // No existing entry matched by chunk_id or file_offset — new chunk for this file.
+        // No existing entry matched by chunk_id or chunk_idx — new chunk for this file.
         // Push so chunk_map grows incrementally as chunks are written rather than waiting
         // until file close (PutFileMetadata) to learn about the file's chunks.
         locs.push(location.clone());
@@ -5866,17 +5880,24 @@ impl Server {
     /// node in CHUNK_TABLE but the inline still has the old one.
     ///
     /// But a node's own CHUNK_TABLE entry for a chunk it just wrote starts life as
-    /// an untimestamped (`written_at: None`) single-node self-registration — it
-    /// hasn't been touched by a healer/merge since the local write, so it carries
-    /// no freshness signal at all. Overriding with it would clobber the leader's
-    /// correctly-merged node list with a stale single-node view. So CHUNK_TABLE
-    /// only wins when it has actually been stamped by a freshness-conferring merge
-    /// (`written_at: Some(_)`) and that stamp is at least as fresh as the inline
-    /// record's. An untimestamped CHUNK_TABLE entry never overrides inline, even
-    /// when inline is itself untimestamped (`None` is not a tied timestamp of 0).
+    /// a single-node self-registration. handle_replicate_chunk_location stamps
+    /// written_at on *every* incoming record with written_at=None at receipt time
+    /// (so the leader's own clock, not the client's, orders the staleness guard) —
+    /// which means a bare self-registration is indistinguishable from a real merge
+    /// by timestamp alone: both end up with written_at=Some(now). If the write's own
+    /// multi-node RCL never reached this node's CHUNK_TABLE (e.g. dropped during a
+    /// leadership change mid-restart) but a later 1-node self-registration did, the
+    /// timestamp comparison alone would let that incomplete record override the
+    /// durable inline node list — reporting a chunk as under-replicated when it
+    /// isn't (T38 rolling-restart false alarm). So CHUNK_TABLE only wins when it is
+    /// at least as fresh AND has at least as many nodes as inline — it can add
+    /// information (healer moved/expanded the set) but never regress the count
+    /// inline already knows about.
     fn resolve_chunk_nodes(inline: &ChunkLocation, sled_loc: ChunkLocation) -> ChunkLocation {
         match sled_loc.written_at {
-            Some(ts) if ts >= inline.written_at.unwrap_or(0) => {
+            Some(ts) if ts >= inline.written_at.unwrap_or(0)
+                && sled_loc.nodes.len() >= inline.nodes.len() =>
+            {
                 ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
             }
             _ => inline.clone(),
@@ -6488,6 +6509,80 @@ mod tests {
         assert_eq!(loc.client_write_seq, Some(8));
     }
 
+    /// Non-aligned write followed by boundary-aligned write to the same chunk_idx must not
+    /// produce duplicate chunk_map entries. The RCL for the boundary write (file_offset =
+    /// chunk_idx * CHUNK_SIZE) must REPLACE the entry from the non-aligned write
+    /// (file_offset = chunk_idx * CHUNK_SIZE + intra_offset), not be pushed as a second entry.
+    ///
+    /// Without the fix: iter().find(|l| l.file_offset / CHUNK_SIZE == chunk_idx) picks the
+    /// first (stale) entry → MultiPatch returns ChunkStale even though the newer chunk exists.
+    ///
+    /// Root cause of qcow2 VM crash: prealloc writes at non-chunk-boundary offsets created
+    /// stale RCL entries that blocked subsequent full-slot writes from updating chunk_map.
+    #[tokio::test]
+    async fn test_chunk_map_rcl_coerces_nonaligned_offset_to_chunk_idx() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+
+        let file_id = dfs_common::FileId::new();
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        // chunk_idx = 512 (the 2 GB boundary in a 16 GB qcow2 disk)
+        let chunk_boundary: u64 = 512 * CHUNK_SIZE;       // 2147483648
+        let intra_offset: u64   = chunk_boundary + 524288; // 2148007936
+
+        // Step 1: non-aligned prealloc write → chunk_A stored in chunk_map at intra_offset.
+        let hash_a = compute_chunk_hash(b"small-prealloc-write-65536-bytes");
+        let chunk_a = ChunkId::from_hash(hash_a);
+        let rcl_a = ChunkLocation {
+            chunk_id: chunk_a,
+            nodes: vec![],
+            size: 65536,
+            checksum: hash_a,
+            file_offset: Some(intra_offset),
+            written_at: None,
+            client_write_seq: Some(5),
+            file_id: None,
+        };
+        server.chunk_map_update_location_for_file(file_id, &rcl_a).await;
+
+        // Step 2: full-slot write at chunk boundary → chunk_B, RCL at chunk_boundary.
+        let hash_b = compute_chunk_hash(b"full-slot-589824-bytes-at-chunk-boundary");
+        let chunk_b = ChunkId::from_hash(hash_b);
+        let rcl_b = ChunkLocation {
+            chunk_id: chunk_b,
+            nodes: vec![],
+            size: 589824,
+            checksum: hash_b,
+            file_offset: Some(chunk_boundary),
+            written_at: None,
+            client_write_seq: Some(5), // same seq (both in-flight before flush_metadata_sync)
+            file_id: None,
+        };
+        server.chunk_map_update_location_for_file(file_id, &rcl_b).await;
+
+        // chunk_map must have exactly ONE entry for chunk_idx=512, and it must be chunk_B.
+        let entry = server.chunk_map.get(&file_id).expect("chunk_map entry must exist");
+        let (locs, _) = entry.value();
+        let matching: Vec<_> = locs.iter()
+            .filter(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(512))
+            .collect();
+        assert_eq!(matching.len(), 1,
+            "chunk_map must have exactly 1 entry for chunk_idx=512, found {}. \
+             Duplicate entries cause handle_multi_patch to pick the stale first entry → ChunkStale.",
+            matching.len());
+        assert_eq!(matching[0].chunk_id, chunk_b,
+            "chunk_map entry for chunk_idx=512 must be chunk_B (the boundary-aligned write), \
+             not chunk_A (the stale non-aligned prealloc write)");
+    }
+
     /// GetFileChunkMap must report CHUNK_TABLE's current node list for each chunk,
     /// not the in-memory chunk_map / inline FileMetadata.chunk_locations copy.
     ///
@@ -6619,6 +6714,50 @@ mod tests {
         let resolved = Server::resolve_chunk_nodes(&inline, sled_loc);
         assert_eq!(resolved.nodes, vec![healed_node_a, healed_node_b],
             "a CHUNK_TABLE entry stamped by a healer must override an untimestamped inline record");
+    }
+
+    /// T38 rolling-restart false alarm: a write's own multi-node RCL confirms 2 nodes
+    /// and lands in the inline (FILE_TABLE) record, untimestamped. Separately, one of
+    /// those nodes restarts and re-broadcasts a 1-node self-registration for the same
+    /// chunk_id, which DOES reach this node's CHUNK_TABLE and gets stamped on receipt
+    /// (handle_replicate_chunk_location stamps every written_at=None record at receipt
+    /// time, so a bare self-registration is timestamped exactly like a real merge).
+    /// Without the node-count guard, the timestamp comparison alone would let this
+    /// strictly-smaller, less-informative record override the durable 2-node inline
+    /// list — reporting the chunk as under-replicated when it never lost a copy.
+    #[test]
+    fn test_resolve_chunk_nodes_stamped_but_smaller_chunk_table_does_not_regress_inline() {
+        let hash = compute_chunk_hash(b"chunk-data-restart-selfreg");
+        let chunk_id = ChunkId::from_hash(hash);
+
+        let node_a = NodeId::new();
+        let node_b = NodeId::new();
+
+        // Inline: the write's own confirmed 2-node RCL, never stamped (its RCL-to-leader
+        // never landed here, e.g. dropped during a leadership change mid-restart).
+        let inline = ChunkLocation {
+            chunk_id,
+            nodes: vec![node_a, node_b],
+            size: 65536,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: Some(1),
+            file_id: None,
+        };
+
+        // CHUNK_TABLE: node_a's own restart self-registration — only proves node_a has
+        // the chunk, not that node_b lost it. Stamped on receipt, so it looks "fresher."
+        let sled_loc = ChunkLocation {
+            nodes: vec![node_a],
+            written_at: Some(1_700_000_000),
+            ..inline.clone()
+        };
+
+        let resolved = Server::resolve_chunk_nodes(&inline, sled_loc);
+        assert_eq!(resolved.nodes, vec![node_a, node_b],
+            "a stamped CHUNK_TABLE self-registration with FEWER nodes than the durable \
+             inline record must not regress the reported replica count");
     }
 }
 

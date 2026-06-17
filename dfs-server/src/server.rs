@@ -1352,6 +1352,12 @@ impl Server {
             Request::PurgeChunkLocations { chunk_ids } => {
                 self.handle_purge_chunk_locations(chunk_ids).await
             }
+            Request::ConfirmChunksLive { chunk_ids } => {
+                self.handle_confirm_chunks_live(chunk_ids).await
+            }
+            Request::TriggerOrphanCleanup => {
+                self.handle_trigger_orphan_cleanup().await
+            }
             Request::ReconcileMetadata { live_file_ids } => {
                 self.handle_reconcile_metadata(live_file_ids).await
             }
@@ -2150,6 +2156,51 @@ impl Server {
                     code: ErrorCode::InternalError,
                 }
             }
+        }
+    }
+
+    /// Answer ConfirmChunksLive using this node's OWN local file metadata — no
+    /// cluster-wide coordination. The caller decides whose answer to trust (normally
+    /// the leader, as the most caught-up replica); this handler just reports the
+    /// truth as this node currently sees it.
+    async fn handle_confirm_chunks_live(&self, chunk_ids: Vec<ChunkId>) -> Response {
+        let metadata = self.metadata.clone();
+        let result = tokio::task::spawn_blocking(move || metadata.live_chunk_ids()).await;
+        match result {
+            Ok(Ok(live_set)) => {
+                let live: Vec<ChunkId> = chunk_ids.into_iter().filter(|id| live_set.contains(id)).collect();
+                Response::ChunkLiveness { live }
+            }
+            Ok(Err(e)) => {
+                warn!("handle_confirm_chunks_live: failed to build live_chunk_ids: {}", e);
+                Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError }
+            }
+            Err(e) => {
+                warn!("handle_confirm_chunks_live: spawn_blocking panicked: {}", e);
+                Response::Error { message: "Internal error".to_string(), code: ErrorCode::InternalError }
+            }
+        }
+    }
+
+    /// Run this node's local orphan reconciliation sweep right now instead of
+    /// waiting for the next scheduled cycle. Fire-and-forget — all the usual safety
+    /// gating (age grace, two-pass confirmation, leader cross-check / stability
+    /// check) still applies inside the sweep itself.
+    async fn handle_trigger_orphan_cleanup(&self) -> Response {
+        let healing_guard = self.healing.read().await;
+        match healing_guard.as_ref() {
+            Some(healing) => {
+                let healing = healing.clone();
+                drop(healing_guard);
+                tokio::spawn(async move {
+                    healing.run_disk_orphan_sweep().await;
+                });
+                Response::Ok { data: None }
+            }
+            None => Response::Error {
+                message: "Healing manager not available".to_string(),
+                code: ErrorCode::InternalError,
+            },
         }
     }
 
@@ -4339,6 +4390,23 @@ impl Server {
         intra_offset: usize,
         patch_data: Vec<u8>,
     ) -> Response {
+        // Serialize all patches to the same (file_id, chunk_idx) — same lock
+        // handle_multi_patch uses and for the same reason: two concurrent patches
+        // against the same base could otherwise both read it, both succeed
+        // independently, and race on the final chunk_map update. Since the base is
+        // now fast-evicted as soon as a patch supersedes it (see fast-evict below),
+        // this also prevents a concurrent reader of the same base from having it
+        // deleted out from under it mid-read.
+        let _chunk_patch_guard = if let Some(cidx) = chunk_idx {
+            let lock = self.chunk_patch_locks
+                .entry((file_id, cidx))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            Some(lock.lock_owned().await)
+        } else {
+            None
+        };
+
         // Validate chunk_id against local chunk map when chunk_idx is provided.
         // If our record for (file_id, chunk_idx) differs, the client has a stale view —
         // return ChunkStale so the client can retry with the correct chunk_id.
@@ -4412,9 +4480,7 @@ impl Server {
                     fs::rename(&tmp_path, &new_path)
                         .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
                 }
-                // Same as handle_multi_patch: pre-register new_chunk_id, and
-                // deliberately leave the old chunk_id's routing entry & on-disk file
-                // alone for the deep orphan-purge sweep — see comment there.
+                // Same as handle_multi_patch: pre-register new_chunk_id.
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -4435,6 +4501,27 @@ impl Server {
                     }
                 }
                 storage.invalidate_cache(&new_chunk_id);
+
+                // Fast-path eviction: new_chunk_id is file+offset-scoped (see
+                // compute_chunk_hash_at), so it can never alias another slot — safe to
+                // track and act on immediately instead of waiting for the deep
+                // orphan-purge sweep. Done here (inside spawn_blocking, alongside the
+                // rest of the redb/disk work for this patch) rather than after the
+                // .await — these are synchronous redb transactions and must never run
+                // directly on the async executor thread.
+                let _ = metadata.incr_chunk_refcount(&new_chunk_id);
+                match metadata.decr_chunk_refcount(&chunk_id) {
+                    Ok(Some(0)) => {
+                        if let Err(e) = storage.delete_chunk(&chunk_id) {
+                            debug!("Fast-evict: failed to delete superseded chunk {}: {}", chunk_id, e);
+                        } else {
+                            debug!("Fast-evict: deleted superseded chunk {} (refcount reached 0)", chunk_id);
+                        }
+                        let _ = metadata.delete_chunk_location(&chunk_id);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("Fast-evict: refcount decrement failed for {}: {}", chunk_id, e),
+                }
             }
 
             Ok((new_chunk_id, final_size, patch_data.len()))
@@ -4460,24 +4547,6 @@ impl Server {
                                 loc.size = final_size;
                             }
                         }
-                    }
-
-                    // Fast-path eviction: new_chunk_id is file+offset-scoped (see
-                    // compute_chunk_hash_at), so it can never alias another slot —
-                    // safe to track and act on immediately instead of waiting for
-                    // the deep orphan-purge sweep.
-                    let _ = self.metadata.incr_chunk_refcount(&new_chunk_id);
-                    match self.metadata.decr_chunk_refcount(&chunk_id) {
-                        Ok(Some(0)) => {
-                            if let Err(e) = self.storage.delete_chunk(&chunk_id) {
-                                debug!("Fast-evict: failed to delete superseded chunk {}: {}", chunk_id, e);
-                            } else {
-                                debug!("Fast-evict: deleted superseded chunk {} (refcount reached 0)", chunk_id);
-                            }
-                            let _ = self.metadata.delete_chunk_location(&chunk_id);
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("Fast-evict: refcount decrement failed for {}: {}", chunk_id, e),
                     }
                 }
 

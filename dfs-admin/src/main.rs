@@ -101,6 +101,11 @@ enum HealingCommands {
         /// File path or UUID
         path: String,
     },
+    /// Trigger an immediate orphan-reconciliation sweep on every node (not leader-only —
+    /// each node reconciles its own disk against its own metadata). Safety gating
+    /// (age grace, two-pass confirmation, leader cross-check or all-nodes-stability)
+    /// still applies; this only skips the wait between scheduled cycles.
+    Cleanup,
 }
 
 #[derive(Subcommand)]
@@ -652,6 +657,24 @@ async fn handle_healing_command(
                     eprintln!("Error: {}", message);
                 }
                 _ => {}
+            }
+        }
+        HealingCommands::Cleanup => {
+            // Broadcast to all nodes — orphan reconciliation is per-node now, not
+            // leader-only. Each node still applies its own safety gating (age grace,
+            // two-pass confirmation, leader cross-check or all-nodes-stability) —
+            // this just skips the wait for the next scheduled cycle.
+            for &addr in cluster_addrs {
+                let response = send_request(addr, Request::TriggerOrphanCleanup).await?;
+                match response {
+                    Response::Ok { .. } => {
+                        println!("{}: orphan cleanup triggered", addr);
+                    }
+                    Response::Error { message, .. } => {
+                        eprintln!("{}: error — {}", addr, message);
+                    }
+                    _ => {}
+                }
             }
         }
     }

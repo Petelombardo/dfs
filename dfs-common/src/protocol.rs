@@ -483,6 +483,21 @@ pub enum Request {
         chunk_ids: Vec<ChunkId>,
     },
 
+    /// Ask another node whether each of these chunk_ids is still referenced by a
+    /// live file, per ITS OWN local file metadata. Used by a non-leader node before
+    /// fast-evicting a chunk it locally believes is orphaned — cross-checks against
+    /// the leader (normally the most caught-up replica) instead of trusting only its
+    /// own potentially-stale metadata copy.
+    ConfirmChunksLive {
+        chunk_ids: Vec<ChunkId>,
+    },
+
+    /// Ask any node to immediately run its local orphan reconciliation sweep instead
+    /// of waiting for the next scheduled cycle. Safety gating (age grace, two-pass
+    /// confirmation, leader cross-check or all-nodes-stability) still applies —
+    /// this only skips the wait, never the checks.
+    TriggerOrphanCleanup,
+
     /// Metadata reconciliation — sent by the leader after a repair pass.
     /// Contains the authoritative set of live file IDs. Followers remove any
     /// file: and path: records whose ID is not in this set, eliminating stale
@@ -589,6 +604,14 @@ pub enum Response {
     /// Parallel boolean response (for HasChunks) — one entry per requested chunk_id.
     BoolVec {
         values: Vec<bool>,
+    },
+
+    /// Response to ConfirmChunksLive: the subset of the requested chunk_ids that the
+    /// responding node's own file metadata still references. Anything NOT in this
+    /// list should be treated as "not confirmed live" by the caller — but absence
+    /// alone is not sufficient to delete; see ConfirmChunksLive's doc comment.
+    ChunkLiveness {
+        live: Vec<ChunkId>,
     },
 
     /// Chunk IDs response (for WriteFile)

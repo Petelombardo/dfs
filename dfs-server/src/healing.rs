@@ -391,16 +391,27 @@ impl HealingManager {
     }
 
     /// Run periodic scrubber
-    /// Disk-level orphan sweep — runs on every node every 5 minutes.
+    /// Disk-level orphan sweep — runs on every node every 5 minutes (or immediately
+    /// via TriggerOrphanCleanup).
     ///
-    /// Walks the local chunk directory and deletes any chunk file whose chunk_id is
-    /// absent from the local routing table. This catches the case where a node missed
-    /// DeleteChunk RPCs while offline: the routing table entries are gone (cleaned up
-    /// by the leader while the node was absent), but the physical files remain.
+    /// Two independent checks, each catching a different leak:
+    ///  1. Routing-table membership: deletes chunk files whose ChunkLocation record
+    ///     no longer lists this node — catches missed DeleteChunk RPCs while offline.
+    ///  2. Live-file membership: deletes chunks still listed as ours in the routing
+    ///     table, but no longer referenced by ANY live file — catches patch-superseded
+    ///     chunks the routing table was deliberately left stale for (see
+    ///     handle_patch_chunk/handle_multi_patch) that the inline fast-evict missed
+    ///     (e.g. this node was offline when the patch happened).
     ///
-    /// Uses a 5-minute grace period to avoid deleting chunks that were just written
-    /// but whose routing table entries haven't been committed yet.
-    async fn run_disk_orphan_sweep(&self) {
+    /// Category 2 is the more dangerous one to get wrong, since it relies on this
+    /// node's own (eventually-consistent) metadata replica, which might be stale. So
+    /// in addition to the existing grace period and a two-pass confirmation, it
+    /// requires either explicit confirmation from the leader (non-leader nodes) or
+    /// proof the whole cluster has been stable for several minutes (leader nodes,
+    /// which have no one more authoritative to ask) — see
+    /// authorize_live_file_orphan_deletes(). Any ambiguity (RPC failure, timeout,
+    /// unreachable leader) defers deletion to the next cycle rather than proceeding.
+    pub async fn run_disk_orphan_sweep(&self) {
         // Don't delete local chunks when the cluster is degraded — a copy on a
         // currently-offline node might be the only remaining replica.
         {
@@ -429,11 +440,18 @@ impl HealingManager {
 
         const GRACE_PERIOD_SECS: u64 = 300;
 
+        // 2x the periodic full-reconciliation interval (server.rs RECONCILE_INTERVAL =
+        // 300s) — that loop is the slowest *guaranteed* metadata-catchup path in the
+        // system, so doubling it bounds how stale this node's live_chunk_ids() view
+        // could legitimately still be for a routine (non-degraded) cluster.
+        const LIVE_FILE_GRACE_SECS: u64 = 600;
+
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
         let local_node_id = self.cluster.local_node_id();
 
         let result = tokio::task::spawn_blocking(move || {
+            let live_chunks = metadata.live_chunk_ids()?;
             let chunks = storage.list_chunks()?;
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -443,6 +461,10 @@ impl HealingManager {
             let mut deleted = 0usize;
             let mut kept = 0usize;
             let mut too_recent = 0usize;
+            // (chunk_id, age_secs) — still routed to us, but no live file references
+            // it. Collected for the async leader-confirm/stability gate below; never
+            // deleted inside this blocking closure.
+            let mut live_file_candidates: Vec<(ChunkId, u64)> = Vec::new();
 
             for chunk_id in &chunks {
                 // Determine whether this local file is still our responsibility.
@@ -459,44 +481,189 @@ impl HealingManager {
                     }
                 };
 
-                if is_ours {
+                if !is_ours {
+                    // Not our chunk (missing entry or our node not listed).
+                    // Apply grace period so we don't race with in-flight writes that
+                    // haven't had their routing entry committed yet.
+                    let age_secs = storage.get_chunk_mtime(chunk_id)
+                        .map(|mtime| now_secs.saturating_sub(mtime))
+                        .unwrap_or(u64::MAX);
+
+                    if age_secs > GRACE_PERIOD_SECS {
+                        if let Err(e) = storage.delete_chunk(chunk_id) {
+                            debug!("Disk orphan sweep: failed to delete {}: {}", chunk_id, e);
+                        } else {
+                            debug!("Disk orphan sweep: deleted local orphan {}", chunk_id);
+                            deleted += 1;
+                        }
+                    } else {
+                        too_recent += 1;
+                    }
+                    continue;
+                }
+
+                // Still routed to us. Check the second, independent leak: no live file
+                // references this chunk_id at all (e.g. a patch-superseded chunk whose
+                // routing entry was deliberately left in place for this sweep).
+                if live_chunks.contains(chunk_id) {
                     kept += 1;
                     continue;
                 }
 
-                // Not our chunk (missing entry or our node not listed).
-                // Apply grace period so we don't race with in-flight writes that
-                // haven't had their routing entry committed yet.
                 let age_secs = storage.get_chunk_mtime(chunk_id)
                     .map(|mtime| now_secs.saturating_sub(mtime))
                     .unwrap_or(u64::MAX);
-
-                if age_secs > GRACE_PERIOD_SECS {
-                    if let Err(e) = storage.delete_chunk(chunk_id) {
-                        debug!("Disk orphan sweep: failed to delete {}: {}", chunk_id, e);
-                    } else {
-                        debug!("Disk orphan sweep: deleted local orphan {}", chunk_id);
-                        deleted += 1;
-                    }
-                } else {
-                    too_recent += 1;
-                }
+                live_file_candidates.push((*chunk_id, age_secs));
             }
 
-            Ok::<_, anyhow::Error>((deleted, kept, too_recent, chunks.len()))
+            Ok::<_, anyhow::Error>((deleted, kept, too_recent, chunks.len(), live_file_candidates))
         }).await;
 
-        match result {
-            Ok(Ok((deleted, kept, too_recent, total))) => {
-                if deleted > 0 || too_recent > 0 {
-                    info!("Disk orphan sweep: {} local chunks checked — {} orphans deleted, {} kept (legitimately ours), {} too recent",
-                          total, deleted, kept, too_recent);
-                } else {
-                    debug!("Disk orphan sweep: {} chunks checked, all accounted for", total);
+        let (deleted, kept, too_recent, total, live_file_candidates) = match result {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => { warn!("Disk orphan sweep error: {}", e); return; }
+            Err(e) => { warn!("Disk orphan sweep panicked: {}", e); return; }
+        };
+
+        if deleted > 0 || too_recent > 0 {
+            info!("Disk orphan sweep: {} local chunks checked — {} orphans deleted, {} kept (legitimately ours), {} too recent",
+                  total, deleted, kept, too_recent);
+        } else {
+            debug!("Disk orphan sweep: {} chunks checked, all accounted for", total);
+        }
+
+        self.reconcile_live_file_candidates(live_file_candidates, LIVE_FILE_GRACE_SECS).await;
+    }
+
+    /// Two-pass + age-gate + leader-confirm/stability check for category-2 candidates
+    /// (routed to us, but absent from our own live_chunk_ids()). Reuses
+    /// orphan_candidates as the per-node two-pass debounce set.
+    async fn reconcile_live_file_candidates(&self, candidates: Vec<(ChunkId, u64)>, grace_secs: u64) {
+        if candidates.is_empty() {
+            self.orphan_candidates.write().await.clear();
+            return;
+        }
+
+        let prev_candidates = self.orphan_candidates.read().await.clone();
+        let mut new_candidates: HashSet<ChunkId> = HashSet::new();
+        let mut ready_to_delete: Vec<ChunkId> = Vec::new();
+
+        for (chunk_id, age_secs) in &candidates {
+            if *age_secs < grace_secs {
+                debug!("Live-file orphan grace: skipping {} (age={}s, grace={}s)", chunk_id, age_secs, grace_secs);
+                continue;
+            }
+            if prev_candidates.contains(chunk_id) {
+                ready_to_delete.push(*chunk_id);
+            } else {
+                new_candidates.insert(*chunk_id);
+                debug!("Live-file orphan candidate (first sighting, will re-check next pass): {}", chunk_id);
+            }
+        }
+        *self.orphan_candidates.write().await = new_candidates;
+
+        if ready_to_delete.is_empty() {
+            return;
+        }
+
+        let authorized = self.authorize_live_file_orphan_deletes(&ready_to_delete).await;
+        if authorized.is_empty() {
+            debug!("Live-file orphan sweep: {} candidate(s) confirmed-absent locally but not authorized for deletion this cycle",
+                   ready_to_delete.len());
+            return;
+        }
+
+        let mut evicted = 0usize;
+        for chunk_id in &authorized {
+            if let Err(e) = self.storage.delete_chunk(chunk_id) {
+                debug!("Live-file orphan sweep: failed to delete {}: {}", chunk_id, e);
+                continue;
+            }
+            let _ = self.metadata.delete_chunk_location(chunk_id);
+            evicted += 1;
+        }
+        if evicted > 0 {
+            info!("Live-file orphan sweep: evicted {}/{} authorized chunk(s) (patch-superseded, missed by inline fast-evict)",
+                  evicted, authorized.len());
+        }
+    }
+
+    /// Decide which of `candidates` are safe to actually delete right now.
+    ///
+    /// - Not the leader: ask the leader via ConfirmChunksLive — it's normally the
+    ///   most caught-up replica. Anything the leader confirms live is excluded. Any
+    ///   RPC failure, timeout, or unexpected response authorizes NOTHING this cycle
+    ///   (fail safe — retried next sweep, no data loss risk from being conservative).
+    /// - Is the leader (no one more authoritative to ask): require every other known
+    ///   node to be Online AND to report at least STABILITY_SECS of continuous
+    ///   process uptime via GetNodeStats. A node that recently restarted may not have
+    ///   finished catching up its own metadata replica yet — proceeding before that
+    ///   settles is exactly the "split-brain mass delete" scenario this guards
+    ///   against. Any node failing either check authorizes NOTHING this cycle.
+    async fn authorize_live_file_orphan_deletes(&self, candidates: &[ChunkId]) -> Vec<ChunkId> {
+        const STABILITY_SECS: u64 = 300;
+        const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+        if self.cluster.is_leader().await {
+            let nodes = self.cluster.get_all_nodes().await;
+            let local_id = self.cluster.local_node_id();
+            for node in &nodes {
+                if node.id == local_id {
+                    continue;
+                }
+                if node.status != dfs_common::NodeStatus::Online {
+                    debug!("Live-file orphan sweep: deferring — node {} is not online", node.id);
+                    return Vec::new();
+                }
+                let req = Request::GetNodeStats;
+                match tokio::time::timeout(RPC_TIMEOUT, self.client.send_message(node.addr, Message::Request(req))).await {
+                    Ok(Ok(envelope)) => match envelope.message {
+                        Message::Response(Response::NodeStats { uptime_secs, .. }) => {
+                            if uptime_secs < STABILITY_SECS {
+                                debug!("Live-file orphan sweep: deferring — node {} uptime {}s < {}s stability requirement",
+                                       node.id, uptime_secs, STABILITY_SECS);
+                                return Vec::new();
+                            }
+                        }
+                        _ => {
+                            debug!("Live-file orphan sweep: deferring — unexpected response to GetNodeStats from {}", node.id);
+                            return Vec::new();
+                        }
+                    },
+                    _ => {
+                        debug!("Live-file orphan sweep: deferring — GetNodeStats failed/timed out for node {}", node.id);
+                        return Vec::new();
+                    }
                 }
             }
-            Ok(Err(e)) => warn!("Disk orphan sweep error: {}", e),
-            Err(e) => warn!("Disk orphan sweep panicked: {}", e),
+            // Every other node is online and has been stable for long enough —
+            // this leader's own local view is authoritative.
+            candidates.to_vec()
+        } else {
+            let leader_addr = match self.cluster.get_leader_addr().await {
+                Some(addr) => addr,
+                None => {
+                    debug!("Live-file orphan sweep: deferring — no known leader to confirm with");
+                    return Vec::new();
+                }
+            };
+            let req = Request::ConfirmChunksLive { chunk_ids: candidates.to_vec() };
+            match tokio::time::timeout(RPC_TIMEOUT, self.client.send_message(leader_addr, Message::Request(req))).await {
+                Ok(Ok(envelope)) => match envelope.message {
+                    Message::Response(Response::ChunkLiveness { live }) => {
+                        let live_set: HashSet<ChunkId> = live.into_iter().collect();
+                        candidates.iter().copied().filter(|id| !live_set.contains(id)).collect()
+                    }
+                    _ => {
+                        debug!("Live-file orphan sweep: deferring — unexpected response to ConfirmChunksLive from leader");
+                        Vec::new()
+                    }
+                },
+                _ => {
+                    debug!("Live-file orphan sweep: deferring — ConfirmChunksLive failed/timed out against leader {}", leader_addr);
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -595,17 +762,14 @@ impl HealingManager {
         struct ScanResult {
             /// Locations to verify with HasChunks this cycle.
             chunks_to_check: Vec<ChunkLocation>,
-            /// live_chunk_ids from file records (deep scan only, else None).
-            live_chunks: Option<HashSet<ChunkId>>,
-            /// All chunk IDs from routing table (deep scan only, for orphan diff).
-            /// Paired with written_at (ms since epoch) for the grace-period check.
-            all_chunk_ids: Option<Vec<(ChunkId, Option<u64>)>>,
         }
 
         // Fast path: no sled scan at all. We fetch locations only for chunks already
         // in pending_healing — O(pending) individual lookups, not O(all_chunks).
-        // Deep path: full streaming sled scan for orphan detection and finding under-RF
-        // chunks that haven't entered pending_healing yet.
+        // Deep path: full streaming sled scan for finding under-RF chunks that
+        // haven't entered pending_healing yet. (Orphan detection used to live here
+        // too — it now runs per-node in run_disk_orphan_sweep(), independent of
+        // leadership; see that function's doc comment.)
         let scan_result = if !deep {
             // Fast: look up only pending chunks by ID.
             let mut chunks_to_check = Vec::with_capacity(pending_snapshot.len());
@@ -614,30 +778,21 @@ impl HealingManager {
                     chunks_to_check.push(loc);
                 }
             }
-            ScanResult { chunks_to_check, live_chunks: None, all_chunk_ids: None }
+            ScanResult { chunks_to_check }
         } else {
             tokio::task::spawn_blocking(move || {
-                let live = Some(metadata_scan.live_chunk_ids()?);
+                let live = metadata_scan.live_chunk_ids()?;
 
                 let mut chunks_to_check = Vec::new();
-                let mut all_chunk_ids_for_orphan_check: Vec<(ChunkId, Option<u64>)> = Vec::new();
 
                 metadata_scan.scan_chunk_locations(|loc| {
-                    all_chunk_ids_for_orphan_check.push((loc.chunk_id, loc.written_at));
-                    // Deep: include all live chunks for HasChunks verification.
-                    if let Some(ref live_set) = live {
-                        if live_set.contains(&loc.chunk_id) {
-                            chunks_to_check.push(loc);
-                        }
+                    if live.contains(&loc.chunk_id) {
+                        chunks_to_check.push(loc);
                     }
                     true
                 })?;
 
-                Ok::<_, anyhow::Error>(ScanResult {
-                    chunks_to_check,
-                    live_chunks: live,
-                    all_chunk_ids: Some(all_chunk_ids_for_orphan_check),
-                })
+                Ok::<_, anyhow::Error>(ScanResult { chunks_to_check })
             })
             .await
             .context("spawn_blocking for chunk scan panicked")??
@@ -651,18 +806,11 @@ impl HealingManager {
             return Ok(());
         }
 
-        let ScanResult {
-            chunks_to_check: mut chunks_to_check,
-            live_chunks: live_chunks_opt,
-            all_chunk_ids: all_chunk_ids_opt,
-        } = scan_result;
+        let ScanResult { chunks_to_check } = scan_result;
 
         // work carries (chunk_id, status, confirmed_alive_node_ids) from the bulk scan.
         let mut work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = Vec::new();
         let mut pending_count = 0;
-        let mut orphan_count = 0;
-        let mut purged_orphans: Vec<ChunkId> = Vec::new();
-        let mut new_candidates: HashSet<ChunkId> = HashSet::new();
 
         // Pending DB writes — applied in a single spawn_blocking after all classification.
         // Direct calls to metadata.put_chunk_location() / delete_chunk_location() call
@@ -671,86 +819,12 @@ impl HealingManager {
         // end up blocked on the mutex, freezing the entire async runtime.
         let mut db_puts: Vec<ChunkLocation> = Vec::new();
         let mut db_deletes: Vec<ChunkId> = Vec::new();
-        // Physical file deletions for orphaned chunks — applied in the same spawn_blocking.
-        let mut disk_deletes: Vec<ChunkId> = Vec::new();
 
-        // --- Orphan detection (deep scan only) ---
-        if let (Some(ref live_chunks), Some(all_chunk_ids)) = (live_chunks_opt.as_ref(), all_chunk_ids_opt) {
-            // Grace period: chunks written within this window are never touched by the
-            // orphan purge, even if they're absent from live file metadata.  The META
-            // QUEUE can lag many minutes behind chunk writes on large files, so a short
-            // two-pass guard (2 × 5 min) is not sufficient.  30 minutes comfortably
-            // covers any realistic META QUEUE backlog.
-            const ORPHAN_GRACE_SECS: u64 = 1800;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            // Snapshot prev_candidates and immediately drop the read lock so we can
-            // take the write lock at the end of this block without deadlocking.
-            let prev_candidates: HashSet<ChunkId> = self.orphan_candidates.read().await.clone();
-            for (chunk_id, written_at_ms) in all_chunk_ids {
-                if !live_chunks.contains(&chunk_id) {
-                    // Skip chunks that were recently registered in the routing table —
-                    // their file metadata may still be in transit through the META QUEUE.
-                    let age_secs = written_at_ms
-                        .map(|ts| now_ms.saturating_sub(ts) / 1000)
-                        .unwrap_or(u64::MAX);
-                    if age_secs < ORPHAN_GRACE_SECS {
-                        debug!("Orphan grace: skipping {} (written {}s ago, grace={}s)", chunk_id, age_secs, ORPHAN_GRACE_SECS);
-                        continue;
-                    }
-
-                    if !destructive_allowed {
-                        debug!("Skipping orphan purge for {} — cluster degraded", chunk_id);
-                        self.clear_pending(&chunk_id).await;
-                        continue;
-                    }
-                    if prev_candidates.contains(&chunk_id) {
-                        debug!("Purging orphaned chunk location record and physical file: {}", chunk_id);
-                        // Deferred: collected into db_deletes/disk_deletes and applied in
-                        // spawn_blocking below. Optimistically add to purged_orphans for
-                        // broadcasting — if the db delete fails it logs a warning and
-                        // the purge is retried next cycle.
-                        db_deletes.push(chunk_id);
-                        disk_deletes.push(chunk_id);
-                        purged_orphans.push(chunk_id);
-                        self.clear_pending(&chunk_id).await;
-                        orphan_count += 1;
-                    } else {
-                        new_candidates.insert(chunk_id);
-                        debug!("Orphan candidate (first sighting, will purge next pass if still absent): {}", chunk_id);
-                    }
-                }
-            }
-            *self.orphan_candidates.write().await = new_candidates;
-            // Remove purged chunks from chunks_to_check.
-            if !purged_orphans.is_empty() {
-                let purged_set: HashSet<ChunkId> = purged_orphans.iter().copied().collect();
-                chunks_to_check.retain(|loc| !purged_set.contains(&loc.chunk_id));
-            }
-        }
-
-        // Broadcast orphan purges to followers (deep scan only, but only if any occurred).
-        if !purged_orphans.is_empty() {
-            let cluster = self.cluster.clone();
-            let client = self.client.clone();
-            let orphans_to_broadcast = purged_orphans.clone();
-            tokio::spawn(async move {
-                let nodes = cluster.get_all_nodes().await;
-                for node in &nodes {
-                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                        continue;
-                    }
-                    let req = Request::PurgeChunkLocations { chunk_ids: orphans_to_broadcast.clone() };
-                    if let Err(e) = client.send_message(node.addr, Message::Request(req)).await {
-                        debug!("Failed to batch-broadcast PurgeChunkLocations ({} chunks) to node {}: {}",
-                               orphans_to_broadcast.len(), node.id, e);
-                    }
-                }
-            });
-        }
+        // Orphan detection/purging used to live here (leader-only, gated on
+        // destructive_allowed + a 30-minute age grace + two-pass confirmation). It now
+        // runs on every node via run_disk_orphan_sweep()/reconcile_live_file_candidates(),
+        // independent of leadership, with a leader-confirm-or-cluster-stability gate
+        // replacing the old grace-period-only check — see authorize_live_file_orphan_deletes().
 
         // --- Build per-node chunk assignment maps ---
         // For each online node, collect only the chunk IDs where that node is listed
@@ -1119,21 +1193,10 @@ impl HealingManager {
         // storm (many concurrent tasks) blocks all Tokio worker threads, freezing
         // the runtime. One batched spawn_blocking keeps the OS thread off the
         // async executor and reduces total lock contention to a single acquisition.
-        if !db_puts.is_empty() || !db_deletes.is_empty() || !disk_deletes.is_empty() {
+        if !db_puts.is_empty() || !db_deletes.is_empty() {
             let metadata = Arc::clone(&self.metadata);
-            let storage = Arc::clone(&self.storage);
-            let has_orphans = !disk_deletes.is_empty();
             let result = tokio::task::spawn_blocking(move || {
                 metadata.batch_update_chunk_locations(&db_puts, &db_deletes)?;
-                for chunk_id in &disk_deletes {
-                    if let Err(e) = storage.delete_chunk(chunk_id) {
-                        debug!("Orphan {} not on local disk (ok): {}", chunk_id, e);
-                    }
-                }
-                if has_orphans {
-                    // Compact redb after bulk orphan purge so the OS can reclaim page-cache.
-                    metadata.flush()?;
-                }
                 Ok::<_, anyhow::Error>(())
             }).await;
             match result {
@@ -1159,10 +1222,6 @@ impl HealingManager {
                     .flatten()
                     .is_some()
             });
-        }
-
-        if orphan_count > 0 {
-            info!("Purged {} orphaned chunk location records", orphan_count);
         }
 
         // Batch-broadcast all chunk location updates accumulated during this pass.
@@ -1192,8 +1251,8 @@ impl HealingManager {
         let over_count  = work.iter().filter(|(_, s, _)| *s == ReplicationStatus::OverReplicated).count();
         if under_count > 0 || over_count > 0 || pending_count > 0 {
             info!(
-                "Discovery complete: under={}, over={}, pending_delay={}, orphans={}",
-                under_count, over_count, pending_count, orphan_count
+                "Discovery complete: under={}, over={}, pending_delay={}",
+                under_count, over_count, pending_count
             );
         }
 
@@ -2030,5 +2089,143 @@ mod tests {
         // 8s (carried over) + 3s (elapsed since restart) = 11s >= 10s.
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(healing.should_heal(&chunk_id).await);
+    }
+
+    fn make_healing(node_id: NodeId, addr: SocketAddr) -> (Arc<ChunkStorage>, Arc<MetadataStore>, HealingManager, TempDir, TempDir) {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
+        let healing = HealingManager::new(storage.clone(), metadata.clone(), cluster, client, 3, 300, 24, true);
+        (storage, metadata, healing, temp_storage, temp_metadata)
+    }
+
+    /// Single-node cluster: this node is trivially its own leader with no peers to
+    /// check, so the stability gate has nothing to fail on — every candidate must be
+    /// authorized.
+    #[tokio::test]
+    async fn test_authorize_live_file_orphan_deletes_leader_no_peers_authorizes_all() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let candidates = vec![
+            ChunkId::from_hash(compute_chunk_hash(b"a")),
+            ChunkId::from_hash(compute_chunk_hash(b"b")),
+        ];
+        let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
+        assert_eq!(authorized.len(), 2, "no peers to fail the stability check — must authorize everything");
+    }
+
+    /// Leader with an unreachable peer: the stability check cannot confirm the peer
+    /// has been up long enough, so nothing may be deleted this cycle. This is the
+    /// core split-brain guard — when in doubt, defer instead of deleting.
+    #[tokio::test]
+    async fn test_authorize_live_file_orphan_deletes_leader_unreachable_peer_defers() {
+        let (id_a, id_b) = {
+            let a = NodeId::new();
+            let b = NodeId::new();
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let local_addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(id_a, local_addr);
+
+        // id_a < id_b, so id_a (local) is the leader by construction (min NodeId).
+        // Peer address is unreachable — GetNodeStats must fail/timeout.
+        let peer_addr: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        healing.cluster.add_node(dfs_common::NodeInfo::new(id_b, peer_addr, None)).await.unwrap();
+        assert!(healing.cluster.is_leader().await, "local node (min id) must be leader");
+
+        let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"c"))];
+        let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
+        assert!(authorized.is_empty(), "unreachable peer must defer the whole batch, not authorize anything");
+    }
+
+    /// Non-leader node with an unreachable leader: ConfirmChunksLive cannot be
+    /// answered, so nothing may be deleted this cycle.
+    #[tokio::test]
+    async fn test_authorize_live_file_orphan_deletes_follower_unreachable_leader_defers() {
+        let (id_a, id_b) = {
+            let a = NodeId::new();
+            let b = NodeId::new();
+            if a < b { (a, b) } else { (b, a) }
+        };
+        // Local node is id_b (NOT the minimum) — id_a is the leader.
+        let local_addr: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(id_b, local_addr);
+
+        let leader_addr: SocketAddr = "127.0.0.1:19998".parse().unwrap(); // unreachable
+        healing.cluster.add_node(dfs_common::NodeInfo::new(id_a, leader_addr, None)).await.unwrap();
+        assert!(!healing.cluster.is_leader().await, "local node (not min id) must not be leader");
+
+        let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"d"))];
+        let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
+        assert!(authorized.is_empty(), "unreachable leader must defer, never authorize blindly");
+    }
+
+    /// End-to-end: a chunk still routed to us in the local CHUNK_TABLE, but with no
+    /// live file referencing it (a patch-superseded chunk the inline fast-evict
+    /// missed), must survive the first sighting (two-pass guard) and only be evicted
+    /// on a second pass once it's both old enough and authorized.
+    #[tokio::test]
+    async fn test_disk_orphan_sweep_evicts_live_file_orphan_after_two_pass_when_authorized() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"live-file-orphan-test"));
+        storage.write_chunk(&chunk_id, b"some data").unwrap();
+        let old_ts = dfs_common::types::current_timestamp().saturating_sub(700);
+        storage.set_chunk_mtime(&chunk_id, old_ts);
+
+        // Still routed to us, but no file metadata references it at all.
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: 9,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: Some(old_ts * 1000),
+            client_write_seq: None,
+            file_id: None,
+        }).unwrap();
+
+        healing.run_disk_orphan_sweep().await;
+        assert!(storage.get_chunk_path(&chunk_id).exists(), "must survive first sighting (two-pass guard)");
+
+        healing.run_disk_orphan_sweep().await;
+        assert!(!storage.get_chunk_path(&chunk_id).exists(), "must be evicted on second pass once old enough and authorized");
+    }
+
+    /// A live-file-orphan candidate younger than LIVE_FILE_GRACE_SECS must never be
+    /// deleted, even across many sweep passes — age is checked every pass, not just
+    /// before the first sighting.
+    #[tokio::test]
+    async fn test_disk_orphan_sweep_never_evicts_recent_live_file_orphan() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"too-recent-orphan"));
+        storage.write_chunk(&chunk_id, b"some data").unwrap();
+        // mtime left at "now" — well within the 600s grace window.
+
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: 9,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: Some(dfs_common::types::current_timestamp() * 1000),
+            client_write_seq: None,
+            file_id: None,
+        }).unwrap();
+
+        for _ in 0..3 {
+            healing.run_disk_orphan_sweep().await;
+        }
+        assert!(storage.get_chunk_path(&chunk_id).exists(), "must never evict a candidate still inside the age grace");
     }
 }

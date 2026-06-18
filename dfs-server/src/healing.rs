@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use dfs_common::{ChunkId, ChunkLocation, Message, NodeId, Request, Response};
+use dashmap::DashMap;
+use dfs_common::{ChunkId, ChunkLocation, FileId, Message, NodeId, Request, Response};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +28,14 @@ pub struct HealingManager {
 
     /// Metadata store
     metadata: Arc<MetadataStore>,
+
+    /// Leader-maintained in-memory chunk map, shared with Server (same Arc).
+    /// Unlike MetadataStore::live_chunk_ids() (durable FILE_TABLE, only refreshed on
+    /// a full PutFileMetadata), this is updated synchronously by every patch/replicate-
+    /// location handler, so it never goes stale for actively-patched files. Used as an
+    /// additional liveness source so the live-file orphan sweep doesn't mistake "FILE_TABLE
+    /// hasn't caught up yet" for "patch-superseded" — see reconcile_live_file_candidates.
+    chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
 
     /// Cluster manager
     cluster: Arc<ClusterManager>,
@@ -101,6 +110,7 @@ impl HealingManager {
         healing_delay_secs: u64,
         scrub_interval_hours: u64,
         auto_heal: bool,
+        chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
     ) -> Self {
         let max_heal_per_cycle = 200;
 
@@ -148,6 +158,7 @@ impl HealingManager {
         Self {
             storage,
             metadata,
+            chunk_map,
             cluster,
             client,
             replication_factor,
@@ -411,6 +422,20 @@ impl HealingManager {
     /// which have no one more authoritative to ask) — see
     /// authorize_live_file_orphan_deletes(). Any ambiguity (RPC failure, timeout,
     /// unreachable leader) defers deletion to the next cycle rather than proceeding.
+    /// Snapshot of every chunk_id currently referenced by any file's in-memory
+    /// chunk_map entry. See the `chunk_map` field doc comment for why this is a
+    /// fresher liveness source than `MetadataStore::live_chunk_ids()`.
+    fn live_chunk_ids_from_chunk_map(&self) -> HashSet<ChunkId> {
+        let mut live = HashSet::new();
+        for entry in self.chunk_map.iter() {
+            let (locs, _) = entry.value();
+            for loc in locs {
+                live.insert(loc.chunk_id);
+            }
+        }
+        live
+    }
+
     pub async fn run_disk_orphan_sweep(&self) {
         // Don't delete local chunks when the cluster is degraded — a copy on a
         // currently-offline node might be the only remaining replica.
@@ -449,9 +474,18 @@ impl HealingManager {
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
         let local_node_id = self.cluster.local_node_id();
+        // Union of the durable (FILE_TABLE) view and the in-memory chunk_map view.
+        // FILE_TABLE only refreshes on a full PutFileMetadata, so a long-lived,
+        // repeatedly in-place-patched file (e.g. a mounted qcow2 disk) can have a
+        // current chunk_id that's missing from it for an unbounded amount of time —
+        // chunk_map is kept synchronously fresh by every patch/replicate-location
+        // handler and never has that gap. Taking the union means a chunk is only
+        // ever treated as "not live" if BOTH sources agree it's gone.
+        let live_from_chunk_map = self.live_chunk_ids_from_chunk_map();
 
         let result = tokio::task::spawn_blocking(move || {
-            let live_chunks = metadata.live_chunk_ids()?;
+            let mut live_chunks = metadata.live_chunk_ids()?;
+            live_chunks.extend(live_from_chunk_map);
             let chunks = storage.list_chunks()?;
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2016,7 +2050,7 @@ mod tests {
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
         let client = Arc::new(NetworkClient::new());
 
-        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 300, 24, true);
+        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 300, 24, true, Arc::new(DashMap::new()));
 
         let stats = healing.get_stats().await;
         assert_eq!(stats.pending_healing, 0);
@@ -2037,7 +2071,7 @@ mod tests {
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
         let client = Arc::new(NetworkClient::new());
 
-        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 2, 24, true); // 2s delay
+        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 2, 24, true, Arc::new(DashMap::new())); // 2s delay
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"test"));
 
@@ -2080,7 +2114,7 @@ mod tests {
         // Construct a fresh HealingManager against the same MetadataStore —
         // simulates a process restart. healing_delay_secs = 10, so the 8s that
         // already elapsed before restart must carry over.
-        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 10, 24, true);
+        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 10, 24, true, Arc::new(DashMap::new()));
 
         // 8s < 10s — not ready yet, but the persisted age must have been restored
         // (not reset to 0s on restart).
@@ -2098,7 +2132,7 @@ mod tests {
         let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
         let client = Arc::new(NetworkClient::new());
-        let healing = HealingManager::new(storage.clone(), metadata.clone(), cluster, client, 3, 300, 24, true);
+        let healing = HealingManager::new(storage.clone(), metadata.clone(), cluster, client, 3, 300, 24, true, Arc::new(DashMap::new()));
         (storage, metadata, healing, temp_storage, temp_metadata)
     }
 

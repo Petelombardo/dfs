@@ -612,6 +612,12 @@ impl Server {
         self.client.clone()
     }
 
+    /// Get reference to the in-memory chunk map — shared with HealingManager so the
+    /// live-file orphan sweep can use it as an always-fresh liveness source.
+    pub fn chunk_map_ref(&self) -> Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>> {
+        self.chunk_map.clone()
+    }
+
     /// Wire in the healing manager after construction.
     /// Called from main() once both Server and HealingManager are created.
     pub async fn set_healing_manager(&self, healing: Arc<HealingManager>) {

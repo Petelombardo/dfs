@@ -4534,7 +4534,9 @@ impl Server {
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
             use std::io::{Seek, SeekFrom, Write};
+            use std::time::Instant;
             let _io_guard = io_guard;
+            let t_start = Instant::now();
 
             if !old_path.exists() {
                 return Err(("Chunk not found".to_string(), ErrorCode::NotFound));
@@ -4544,6 +4546,7 @@ impl Server {
             // hashes the whole chunk, not just the patched range.
             let mut buf = fs::read(&old_path)
                 .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?;
+            let t_read = t_start.elapsed();
 
             let patch_end = intra_offset + patch_data.len();
             if patch_end > buf.len() {
@@ -4558,6 +4561,7 @@ impl Server {
             let new_chunk_id = ChunkId::from_hash(
                 dfs_common::compute_chunk_hash_at(&buf, chunk_file_offset, file_id)
             );
+            let t_hash = t_start.elapsed();
 
             if new_chunk_id != chunk_id {
                 // Durably record the undo BEFORE touching a single byte of old_path.
@@ -4572,6 +4576,7 @@ impl Server {
                 };
                 metadata.put_patch_journal(&journal)
                     .map_err(|e| (format!("Failed to write patch journal: {}", e), ErrorCode::InternalError))?;
+                let t_journal = t_start.elapsed();
 
                 // In-place: pwrite only the patched bytes (not the whole buffer) into
                 // the existing file, then rename it to its new content-addressed
@@ -4595,6 +4600,7 @@ impl Server {
                     // online-repair path) will restore old_path from it.
                     return Err(e);
                 }
+                let t_pwrite = t_start.elapsed();
 
                 let new_path = storage.get_chunk_path(&new_chunk_id);
                 if let Some(parent) = new_path.parent() {
@@ -4604,6 +4610,7 @@ impl Server {
                 }
                 fs::rename(&old_path, &new_path)
                     .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
+                let t_rename = t_start.elapsed();
 
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -4629,12 +4636,26 @@ impl Server {
                 // stale cache entry can't outlive it.
                 storage.invalidate_cache(&chunk_id);
                 storage.invalidate_cache(&new_chunk_id);
+                let t_meta = t_start.elapsed();
 
                 // Safe point reached: rename + metadata commit both done. The undo
                 // record is no longer needed.
                 if let Err(e) = metadata.delete_patch_journal(&chunk_id) {
                     warn!("PatchChunk: failed to clear patch journal for {}: {}", chunk_id, e);
                 }
+                let t_journal_del = t_start.elapsed();
+
+                debug!("PatchChunk timing {} bytes: read={:.1}ms hash={:.1}ms journal_put={:.1}ms pwrite+fsync={:.1}ms rename={:.1}ms meta={:.1}ms journal_del={:.1}ms total={:.1}ms",
+                    patch_data.len(),
+                    t_read.as_secs_f64() * 1000.0,
+                    (t_hash - t_read).as_secs_f64() * 1000.0,
+                    (t_journal - t_hash).as_secs_f64() * 1000.0,
+                    (t_pwrite - t_journal).as_secs_f64() * 1000.0,
+                    (t_rename - t_pwrite).as_secs_f64() * 1000.0,
+                    (t_meta - t_rename).as_secs_f64() * 1000.0,
+                    (t_journal_del - t_meta).as_secs_f64() * 1000.0,
+                    t_journal_del.as_secs_f64() * 1000.0,
+                );
             }
 
             Ok((new_chunk_id, final_size, patch_data.len()))
@@ -4757,7 +4778,9 @@ impl Server {
         let result = tokio::task::spawn_blocking(move || {
             use std::fs;
             use std::io::{Seek, SeekFrom, Write};
+            use std::time::Instant;
             let _io_guard = io_guard;
+            let t_start = Instant::now();
 
             // If the chunk file doesn't exist on disk, refuse the patch.
             // A ghost chunk_map entry (chunk_id in metadata but no file on disk)
@@ -4775,6 +4798,7 @@ impl Server {
             // patch bytes instead of rewriting the whole buffer to a new file.
             let mut buf = fs::read(&old_path)
                 .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?;
+            let t_read = t_start.elapsed();
 
             let needed_len = patches.iter()
                 .map(|(off, d)| off + d.len())
@@ -4793,6 +4817,7 @@ impl Server {
             }
 
             let final_size = buf.len();
+            let total_patch_bytes: usize = patches.iter().map(|(_, d)| d.len()).sum();
 
             // Always compute the actual hash from the patched buffer so the leader
             // and client get ground truth. Trusting the client's pre-computed expected
@@ -4802,6 +4827,7 @@ impl Server {
             let new_chunk_id = ChunkId::from_hash(
                 dfs_common::compute_chunk_hash_at(&buf, chunk_file_offset, file_id)
             );
+            let t_hash = t_start.elapsed();
 
             if new_chunk_id != chunk_id {
                 // Durable undo record before touching old_path — see PatchJournalEntry
@@ -4813,6 +4839,7 @@ impl Server {
                 };
                 metadata.put_patch_journal(&journal)
                     .map_err(|e| (format!("Failed to write patch journal: {}", e), ErrorCode::InternalError))?;
+                let t_journal = t_start.elapsed();
 
                 // In-place: pwrite only the actual patch bytes into the existing file,
                 // one fsync at the end, then rename to the new content-addressed name.
@@ -4833,6 +4860,7 @@ impl Server {
                     // Leave the journal entry — startup recovery restores old_path.
                     return Err(e);
                 }
+                let t_pwrite = t_start.elapsed();
 
                 let new_path = storage.get_chunk_path(&new_chunk_id);
                 if let Some(parent) = new_path.parent() {
@@ -4841,6 +4869,7 @@ impl Server {
                 }
                 fs::rename(&old_path, &new_path)
                     .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
+                let t_rename = t_start.elapsed();
 
                 // Register new_chunk_id in metadata, reusing the old location's node
                 // list. Unlike before, there is no separate old file left behind to
@@ -4867,11 +4896,25 @@ impl Server {
                 let _ = metadata.delete_chunk_location(&chunk_id);
                 storage.invalidate_cache(&chunk_id);
                 storage.invalidate_cache(&new_chunk_id);
+                let t_meta = t_start.elapsed();
 
                 // Safe point reached — discard the undo journal.
                 if let Err(e) = metadata.delete_patch_journal(&chunk_id) {
                     warn!("MultiPatch: failed to clear patch journal for {}: {}", chunk_id, e);
                 }
+                let t_journal_del = t_start.elapsed();
+
+                debug!("MultiPatch timing {} patches, {} bytes: read={:.1}ms hash={:.1}ms journal_put={:.1}ms pwrite+fsync={:.1}ms rename={:.1}ms meta={:.1}ms journal_del={:.1}ms total={:.1}ms",
+                    patches.len(), total_patch_bytes,
+                    t_read.as_secs_f64() * 1000.0,
+                    (t_hash - t_read).as_secs_f64() * 1000.0,
+                    (t_journal - t_hash).as_secs_f64() * 1000.0,
+                    (t_pwrite - t_journal).as_secs_f64() * 1000.0,
+                    (t_rename - t_pwrite).as_secs_f64() * 1000.0,
+                    (t_meta - t_rename).as_secs_f64() * 1000.0,
+                    (t_journal_del - t_meta).as_secs_f64() * 1000.0,
+                    t_journal_del.as_secs_f64() * 1000.0,
+                );
             }
 
             Ok::<_, (String, ErrorCode)>((new_chunk_id, final_size, patches))

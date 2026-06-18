@@ -5163,11 +5163,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         let encoded = envelope.to_bytes().context("Failed to serialize message")?;
         let serialize_time = serialize_start.elapsed();
 
-        // Send request
+        // Send request — coalesced into one write to cut packet/RTT overhead.
         let send_start = std::time::Instant::now();
         let len = encoded.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&encoded).await?;
+        let mut framed = Vec::with_capacity(4 + encoded.len());
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(&encoded);
+        stream.write_all(&framed).await?;
         stream.flush().await?;
         let send_time = send_start.elapsed();
 
@@ -5220,10 +5222,12 @@ leader_addr: Arc::new(RwLock::new(None)),
         let envelope = MessageEnvelope::new(request_id, Message::Request(request));
         let encoded = envelope.to_bytes().context("Failed to serialize message")?;
 
-        // Send request
+        // Send request — coalesced into one write to cut packet/RTT overhead.
         let len = encoded.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&encoded).await?;
+        let mut framed = Vec::with_capacity(4 + encoded.len());
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(&encoded);
+        stream.write_all(&framed).await?;
         stream.flush().await?;
 
         // Read response

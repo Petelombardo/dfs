@@ -58,10 +58,16 @@ where
     let envelope_len = encoded_envelope.len() as u32;
     let data_len = raw_data.len() as u32;
 
-    stream.write_all(&envelope_len.to_be_bytes()).await?;
-    stream.write_all(encoded_envelope).await?;
-    stream.write_all(&data_len.to_be_bytes()).await?;
-    stream.write_all(raw_data).await?;
+    // Coalesce all four pieces into one buffer so the request goes out as a single
+    // packet instead of four — mirrors the write_chunk_response fix above. This path
+    // is hit on every dual-replica chunk write and repair/multi-patch flow.
+    let mut framed = Vec::with_capacity(4 + encoded_envelope.len() + 4 + raw_data.len());
+    framed.extend_from_slice(&envelope_len.to_be_bytes());
+    framed.extend_from_slice(encoded_envelope);
+    framed.extend_from_slice(&data_len.to_be_bytes());
+    framed.extend_from_slice(raw_data);
+
+    stream.write_all(&framed).await?;
     stream.flush().await
 }
 

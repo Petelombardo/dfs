@@ -1220,6 +1220,17 @@ leader_addr: Arc::new(RwLock::new(None)),
     async fn send_encoded_request(&self, addr: SocketAddr, encoded: &[u8]) -> Result<Response> {
         debug!("Sending pre-serialized request to {} ({} bytes)", addr, encoded.len());
 
+        // Coalesce the length prefix and body once up front (reused across the primary
+        // send and both stale-connection retries below) so each attempt is a single
+        // write_all instead of two — fewer packets on this latency-bound RPC path.
+        let framed = {
+            let len = encoded.len() as u32;
+            let mut f = Vec::with_capacity(4 + encoded.len());
+            f.extend_from_slice(&len.to_be_bytes());
+            f.extend_from_slice(encoded);
+            f
+        };
+
         // Try pooled connection first; on failure (stale) fall back to a fresh one.
         let pooled = {
             let mutex_opt = self.connection_pool.get(&addr).map(|e| Arc::clone(&*e));
@@ -1271,9 +1282,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Send and receive with a 3s timeout
         let io_future = async {
-            let len = encoded.len() as u32;
-            stream.write_all(&len.to_be_bytes()).await?;
-            stream.write_all(encoded).await?;
+            stream.write_all(&framed).await?;
             stream.flush().await?;
 
             let mut len_buf = [0u8; 4];
@@ -1306,10 +1315,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                         return Err(anyhow::anyhow!("Failed to connect to node: connect timeout"));
                     }
                 };
-                let len = encoded.len() as u32;
                 let retry_result = async {
-                    fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
-                    fresh.write_all(encoded).await.context("write body")?;
+                    fresh.write_all(&framed).await.context("write request")?;
                     fresh.flush().await.context("flush")?;
                     let mut len_buf = [0u8; 4];
                     fresh.read_exact(&mut len_buf).await.context("read len")?;
@@ -1353,10 +1360,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                 };
 
-                let len = encoded.len() as u32;
                 let retry_result = async {
-                    fresh.write_all(&len.to_be_bytes()).await.context("write len")?;
-                    fresh.write_all(encoded).await.context("write body")?;
+                    fresh.write_all(&framed).await.context("write request")?;
                     fresh.flush().await.context("flush")?;
                     let mut len_buf = [0u8; 4];
                     fresh.read_exact(&mut len_buf).await.context("read len")?;
@@ -4075,10 +4080,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             // the split-frame 4MB payload read unbounded — causing indefinite hangs when the
             // server was slow under concurrent write load (T19 regression).
             let io_future = async {
-                // Send request
+                // Send request — coalesced into one write to cut packet/RTT overhead.
                 let len = encoded.len() as u32;
-                stream.write_all(&len.to_be_bytes()).await?;
-                stream.write_all(&encoded).await?;
+                let mut framed = Vec::with_capacity(4 + encoded.len());
+                framed.extend_from_slice(&len.to_be_bytes());
+                framed.extend_from_slice(&encoded);
+                stream.write_all(&framed).await?;
                 stream.flush().await?;
 
                 // Read envelope
@@ -4223,13 +4230,15 @@ leader_addr: Arc::new(RwLock::new(None)),
             ).await.map_err(|_| anyhow::anyhow!("connect timeout"))??,
         };
 
-        // Send request + read 4-byte length prefix (tiny, fast).
+        // Send request (coalesced into one write) + read 4-byte length prefix (tiny, fast).
         let len = encoded.len() as u32;
+        let mut framed = Vec::with_capacity(4 + encoded.len());
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(&encoded);
         let write_result = tokio::time::timeout(
             tokio::time::Duration::from_secs(5),
             async {
-                stream.write_all(&len.to_be_bytes()).await?;
-                stream.write_all(&encoded).await?;
+                stream.write_all(&framed).await?;
                 stream.flush().await
             },
         ).await.map_err(|_| anyhow::anyhow!("Timeout sending request to {}", server_addr))?;

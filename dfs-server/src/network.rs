@@ -397,8 +397,13 @@ async fn write_message(stream: &mut TcpStream, envelope: &MessageEnvelope) -> Re
 
     let message_bytes = envelope.to_bytes()?;
     let length = message_bytes.len() as u32;
-    stream.write_all(&length.to_be_bytes()).await?;
-    stream.write_all(&message_bytes).await?;
+    // Coalesce the length prefix and body into one buffer/write — this is the generic
+    // response path for every write/patch/metadata/heartbeat ack, so the extra packet
+    // from a separate write_all directly adds RTT to those latency-bound RPCs.
+    let mut framed = Vec::with_capacity(4 + message_bytes.len());
+    framed.extend_from_slice(&length.to_be_bytes());
+    framed.extend_from_slice(&message_bytes);
+    stream.write_all(&framed).await?;
     stream.flush().await?;
     Ok(())
 }

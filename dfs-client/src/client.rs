@@ -252,6 +252,20 @@ const STRIPED_READ_ENABLED: bool = false;
 // prevents seek contention and keeps server disk queues short across successive reads.
 const MAX_BACKGROUND_PER_NODE: usize = 1;
 
+/// Get the cap on concurrent in-flight range-fetch requests a single file may have
+/// outstanding to a single storage node. Without this, one file's random-read
+/// workload (e.g. a benchmark with a high queue depth) can open unbounded
+/// connections to a node and starve other files reading from the same node.
+/// Can be overridden via DFS_RANGE_FETCH_MAX_PER_FILE_NODE for cap-tuning trials.
+/// Default: 2.
+fn range_fetch_max_per_file_node() -> usize {
+    std::env::var("DFS_RANGE_FETCH_MAX_PER_FILE_NODE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v: &usize| v > 0)
+        .unwrap_or(2)
+}
+
 /// Get the SQLite consistency window duration in milliseconds
 /// Can be overridden via DFS_SQLITE_CONSISTENCY_WINDOW_MS environment variable
 /// Default: 500ms (conservative, allows time for async replication)
@@ -575,6 +589,12 @@ pub struct DfsClient {
     /// Incremented before a fetch task starts, decremented when it completes.
     node_inflight: Arc<DashMap<SocketAddr, Arc<AtomicUsize>>>,
 
+    /// Per-(inode, node) semaphore bounding concurrent random-read range-fetch
+    /// requests one file may have outstanding to one storage node. Created lazily;
+    /// caps a single file's benchmark-style high queue depth from monopolizing a
+    /// node's connections and starving other files' reads to the same node.
+    range_fetch_node_limit: Arc<DashMap<(u64, SocketAddr), Arc<tokio::sync::Semaphore>>>,
+
     /// Single broadcast notify woken every time a chunk lands in chunk_cache.
     /// Lets waiters in `wait_for_chunk_in_cache` resume immediately rather than
     /// polling on a 50 ms timer — the polling delay was the dominant source of
@@ -751,6 +771,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             node_capacities: Arc::new(DashMap::new()),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             node_inflight: Arc::new(DashMap::new()),
+            range_fetch_node_limit: Arc::new(DashMap::new()),
             chunk_landed: Arc::new(Notify::new()),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
@@ -942,10 +963,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed")))
     }
 
-    /// Acquire an in-flight permit for the given node address.
-    /// Limits concurrent RPCs per server to prevent overwhelming it.
-    /// The permit is released when dropped (end of the calling function).
     /// Send a request to a specific node, reusing a pooled connection when available.
+    /// No concurrency limiting happens here — callers needing a per-node or
+    /// per-(file, node) cap (e.g. range_fetch_permit_for) must acquire it themselves
+    /// before calling this.
     async fn send_request(&self, addr: SocketAddr, request: Request) -> Result<Response> {
         debug!("Sending request to {}: {:?}", addr, request);
 
@@ -1009,9 +1030,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         // write payloads (4MB+) on a slow HDD node, but should fail quickly enough that the
         // caller can fall back to a different node rather than blocking the write pipeline.
         let io_future = async {
+            // Coalesce the length prefix and body into one buffer so the write hits the
+            // wire as a single packet instead of two — halves the packet count (and
+            // associated kernel/NIC/ACK overhead) on this RTT-bound RPC path.
             let len = encoded.len() as u32;
-            stream.write_all(&len.to_be_bytes()).await?;
-            stream.write_all(&encoded).await?;
+            let mut framed = Vec::with_capacity(4 + encoded.len());
+            framed.extend_from_slice(&len.to_be_bytes());
+            framed.extend_from_slice(&encoded);
+            stream.write_all(&framed).await?;
             stream.flush().await?;
 
             let mut len_buf = [0u8; 4];
@@ -2012,15 +2038,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                 }
 
-                let (primary, fallbacks) = match InodeReadEngine::resolve_primary(
-                    loc, &nim, &nodes, selector + idx as u64,
-                ) {
-                    Some(pf) => pf,
-                    None => {
-                        let p = nodes[selector as usize % nodes.len()];
-                        (p, nodes.iter().filter(|&&a| a != p).copied().collect())
-                    }
-                };
+                // Load-aware pick (same logic the prefetch/swarm paths use): prefers the
+                // replica with fewer in-flight requests over a busier one, with chunk-hash
+                // rotation breaking ties so chunks still fan out across replicas.
+                let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
 
                 range_fetches.push(RangeFetch { idx, chunk_start, offset_in_chunk, len_in_chunk, cid, primary, fallbacks });
             }
@@ -2037,11 +2058,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let primary = rf.primary;
                     let fallbacks = rf.fallbacks.clone();
                     let ws = write_seq; // Capture for async block
+                    let inode = inode; // Capture for async block
                     tokio::spawn(async move {
                         // Try primary then fallbacks.
                         let mut last_err = None;
                         let mut all_not_found = true;
                         for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
+                            // Bound concurrent range-fetch requests this file has outstanding
+                            // to this node so one high-queue-depth file can't monopolize a
+                            // node's connections and starve other files reading from it.
+                            // Waits (rather than skipping) once the cap is reached.
+                            let permit_sem = client.range_fetch_permit_for(inode, addr);
+                            let _permit = permit_sem.acquire_owned().await;
                             match client.read_chunk_range_from_server(
                                 addr, cid, offset_in_chunk as u64, len_in_chunk as u64, ws,
                             ).await {
@@ -2771,6 +2799,16 @@ leader_addr: Arc::new(RwLock::new(None)),
             let prev = e.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
             debug_assert!(prev.unwrap_or(0) > 0, "node_inflight underflow for {addr}");
         }
+    }
+
+    /// Get (or lazily create) the semaphore bounding concurrent range-fetch requests
+    /// for this (inode, node) pair. The cap is fixed at first creation per pair from
+    /// range_fetch_max_per_file_node() (DFS_RANGE_FETCH_MAX_PER_FILE_NODE override).
+    fn range_fetch_permit_for(&self, inode: u64, addr: SocketAddr) -> Arc<tokio::sync::Semaphore> {
+        self.range_fetch_node_limit
+            .entry((inode, addr))
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(range_fetch_max_per_file_node())))
+            .clone()
     }
 
     /// Fetch with primary then fallbacks sequentially.

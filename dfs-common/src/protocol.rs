@@ -17,10 +17,17 @@ where
     let frame_len = frame.len() as u32;
     let data_len = raw_data.len() as u32;
 
-    stream.write_all(&frame_len.to_be_bytes()).await?;
-    stream.write_all(&frame).await?;
-    stream.write_all(&data_len.to_be_bytes()).await?;
-    stream.write_all(raw_data).await?;
+    // Coalesce all four pieces into one buffer so the response goes out as a single
+    // packet instead of four — this is on the hot path for every chunk read response,
+    // including RTT-bound random-read range fetches where the extra packets/ACKs
+    // dominate latency.
+    let mut framed = Vec::with_capacity(4 + frame.len() + 4 + raw_data.len());
+    framed.extend_from_slice(&frame_len.to_be_bytes());
+    framed.extend_from_slice(&frame);
+    framed.extend_from_slice(&data_len.to_be_bytes());
+    framed.extend_from_slice(raw_data);
+
+    stream.write_all(&framed).await?;
     stream.flush().await
 }
 

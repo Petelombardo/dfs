@@ -1662,26 +1662,20 @@ impl FlushHandle {
                         loc
                     };
 
-                    // Try to compute the post-patch hash locally so the server can skip
-                    // its read-back pass entirely (write patches + rename, no read).
-                    //
-                    // Three sources for the full pre-patch chunk content, tried in order:
-                    //   1. chunk_cache — free if warm (recently read)
-                    //   2. Fetch from a replica — one network read of ~4MB, but eliminates
-                    //      the server read-back on *each* replica (net win for RF>=2).
-                    //      This is the key fix for "chunk evicted by the time we exit":
-                    //      chunk 0 of a fully-watched recording is always cold, so we'd
-                    //      previously pass None and pay a read-back per replica. Now we do
-                    //      one fetch here instead.
-                    //   3. None — only if the replica fetch also fails; server falls back.
-                    // Pre-compute the post-patch hash only if the full chunk is already
-                    // in chunk_cache. This lets the server skip its read-back hash pass.
-                    // If the chunk is not cached, send None and let the server hash locally —
-                    // a local disk read on the server is far cheaper than a 4MB network fetch
-                    // just to compute a hash we'd immediately discard.
-                    let expected_new_chunk_id = {
+                    // The server always recomputes the post-patch hash itself from its own
+                    // on-disk base (it can never safely trust a client-supplied hash — a
+                    // stale client cache could otherwise silently corrupt a chunk under the
+                    // wrong name). So pre-hashing here client-side bought nothing but an
+                    // extra full Blake3 pass over the same buffer the server was about to
+                    // hash anyway, paid serially before the RPC even goes out. Don't compute
+                    // it. We still apply the patch locally when the pre-patch chunk is warm
+                    // in chunk_cache, so we can re-cache the patched buffer under the
+                    // server's authoritative new chunk_id below — that's the only part of
+                    // this that's actually worth keeping (avoids a cold read-back on the
+                    // next access to this chunk).
+                    let pending_cache_update = {
                         let cached = self.client.chunk_cache.get(&old_location.chunk_id);
-                        if let Some(cached_arc) = cached {
+                        cached.map(|cached_arc| {
                             let mut patched = (*cached_arc).clone();
                             for (intra, data) in &patches {
                                 let end = intra + data.len();
@@ -1690,46 +1684,35 @@ impl FlushHandle {
                                 }
                                 patched[*intra..end].copy_from_slice(data);
                             }
-                            let new_hash = dfs_common::compute_chunk_hash_at(&patched, file_offset, effective_file_id);
-                            let new_cid = ChunkId::from_hash(new_hash);
-                            { let _ = self.client.chunk_cache.remove(&old_location.chunk_id); };
-                            self.client.chunk_cache.insert(new_cid, std::sync::Arc::new(patched));
-                            Some(new_cid)
-                        } else {
-                            None
-                        }
+                            patched
+                        })
                     };
 
                     // Send all dirty ranges in a single MultiPatch RPC — one round trip,
-                    // atomic server-side write+rename, no read-back when hash is pre-computed.
+                    // atomic server-side write+rename.
                     // Pass file_id + chunk_idx so the server validates chunk_id and returns
                     // ChunkStale if stale; client retries automatically with corrected id.
                     let patch_result = if let Some(fid) = file_id_at_flush_start {
                         self.client.multi_patch_chunk_on_replicas_verified(
                             old_location.chunk_id, fid, chunk_idx,
-                            file_offset, patches.clone(), &old_location, expected_new_chunk_id,
+                            file_offset, patches.clone(), &old_location, None,
                             self.use_dual_rf,
                         ).await
                     } else {
                         self.client.multi_patch_chunk_on_replicas(
                             old_location.chunk_id, effective_file_id, file_offset, patches.clone(),
-                            &old_location, expected_new_chunk_id,
+                            &old_location, None,
                             self.use_dual_rf,
                         ).await
                     };
                     let (mut new_location, _skip_pairs) = match patch_result {
                         Ok((loc, sp)) => {
-                            // Compare client's expected hash vs server's actual hash.
-                            // They should agree when the client's cached content was correct.
-                            // A mismatch means the server's copy differed from what we thought —
-                            // evict the wrong client-side cache entry and warn. Either way the
-                            // server's hash is authoritative.
-                            if let Some(exp) = expected_new_chunk_id {
-                                if exp != loc.chunk_id {
-                                    warn!("flush_buffer_async_one: ino={} chunk={} hash MISMATCH — client expected {} server returned {} — evicting stale cache entry",
-                                        ino, chunk_idx, exp, loc.chunk_id);
-                                    { let _ = self.client.chunk_cache.remove(&exp); };
-                                }
+                            // Re-cache the patched buffer under the server's authoritative
+                            // chunk_id (not a client-guessed one) so the next read of this
+                            // chunk doesn't pay a cold read-back.
+                            if let Some(patched) = pending_cache_update {
+                                let _ = self.client.chunk_cache.remove(&old_location.chunk_id);
+                                self.client.chunk_cache.insert(loc.chunk_id, std::sync::Arc::new(patched));
                             }
                             (loc, sp)
                         }

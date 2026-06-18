@@ -3658,37 +3658,6 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Fetch a chunk from one of its known replicas, apply patches, return the patched
-    /// bytes and the new ChunkId. Used by the flush path to pre-compute the post-patch
-    /// hash client-side so MultiPatch can skip its server-side read-back entirely.
-    /// Returns None if the replica fetch fails (caller falls back to server read-back).
-    pub async fn fetch_and_patch_chunk(
-        &self,
-        location: &dfs_common::ChunkLocation,
-        file_offset: u64,
-        file_id: dfs_common::FileId,
-        patches: &[(usize, Vec<u8>)],
-    ) -> Option<(ChunkId, Vec<u8>)> {
-        let addr = {
-            let addr_map = self.addr_to_node_id.read().await;
-            let id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> =
-                addr_map.iter().map(|(&a, &id)| (id, a)).collect();
-            location.nodes.iter().find_map(|nid| id_to_addr.get(nid).copied())
-        }?;
-        let base = self.read_chunk_from_server(addr, location.chunk_id, None).await.ok()?;
-        let mut patched: Vec<u8> = base;
-        for (intra, data) in patches {
-            let end = intra + data.len();
-            if end > patched.len() {
-                patched.resize(end, 0u8);
-            }
-            patched[*intra..end].copy_from_slice(data);
-        }
-        let new_hash = dfs_common::compute_chunk_hash_at(&patched, file_offset, file_id);
-        let new_cid = ChunkId::from_hash(new_hash);
-        Some((new_cid, patched))
-    }
-
     /// Remove all recent_chunk_writes entries for an inode.
     /// Call this wherever write_buffers is removed (release, unlink, rename, truncate).
     pub fn evict_recent_chunk_writes(&self, ino: u64) {

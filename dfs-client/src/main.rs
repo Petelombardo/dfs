@@ -228,6 +228,41 @@ fn mount_filesystem(
     let runtime_handle = runtime.handle().clone();
     let fs = DfsFilesystem::new_with_runtime(addrs, write_buffer, runtime_handle)?;
 
+    // Capture a drain handle before `fs` is moved into spawn_mount2 below.
+    // Normally ExecStop runs `fusermount -u`, which the kernel turns into a
+    // FUSE destroy() call that drains write buffers before the process exits.
+    // But if unmount fails (e.g. "device or resource busy" because something
+    // still has the mount open), destroy() never runs and systemd just SIGTERMs
+    // this process directly — silently dropping any buffered-but-unflushed
+    // writes. Listening for the signal ourselves and draining here closes that
+    // gap regardless of whether the unmount itself succeeds.
+    let shutdown_handle = fs.shutdown_handle();
+    runtime.spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", e);
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to install SIGINT handler: {}", e);
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => info!("Received SIGTERM"),
+            _ = sigint.recv() => info!("Received SIGINT"),
+        }
+        info!("Draining write buffers before shutdown");
+        shutdown_handle.drain().await;
+        info!("Shutdown drain complete, exiting");
+        std::process::exit(0);
+    });
+
     // Mount options
     let mut options = vec![
         fuser::MountOption::FSName("dfs".to_string()),

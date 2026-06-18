@@ -506,6 +506,105 @@ struct FlushHandle {
     write_open_counts: Arc<DashMap<u64, usize>>,
 }
 
+/// Cheaply-cloneable handle for graceful-shutdown buffer draining. Built from a
+/// FlushHandle plus the couple of fields destroy() needs that FlushHandle doesn't
+/// carry. Exists so main.rs can capture it before the filesystem is moved into
+/// spawn_mount2, letting a signal handler drain buffers independently of whether
+/// the FUSE unmount (and thus destroy()) ever actually runs.
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    flush_handle: FlushHandle,
+    release_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
+    written_inodes: Arc<dashmap::DashSet<u64>>,
+}
+
+impl ShutdownHandle {
+    /// Drains all write buffers and commits pending metadata. Idempotent — safe to
+    /// call even if destroy() already ran (e.g. unmount succeeded before a signal
+    /// arrived); buffers are already empty so it's a fast no-op.
+    pub async fn drain(&self) {
+        let write_buffers = self.flush_handle.write_buffers.clone();
+        let flush_in_flight = self.flush_handle.flush_in_flight.clone();
+        let client = self.flush_handle.client.clone();
+        let metadata_cache = self.flush_handle.metadata_cache.clone();
+        let release_in_flight = self.release_in_flight.clone();
+        let written_inodes = self.written_inodes.clone();
+        let flush_handle = self.flush_handle.clone();
+
+        // Step 0: Wait for any in-flight release() flush tasks to complete.
+        // release() spawns async tasks that aren't tracked by flush_in_flight.
+        // Without this wait, a release flush that started just before shutdown
+        // may be interrupted mid-write, losing the final metadata commit.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        loop {
+            let total: usize = release_in_flight.iter()
+                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .sum();
+            if total == 0 { break; }
+            if tokio::time::Instant::now() > deadline {
+                warn!("shutdown drain: timed out waiting for release tasks");
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        // Step 1: Force-flush all dirty write buffers (catches buffers not yet
+        // picked up by a release task, e.g. files open when shutdown began).
+        let inodes: Vec<u64> = write_buffers.iter().map(|e| *e.key()).collect();
+        if !inodes.is_empty() {
+            info!("shutdown drain: force-flushing {} open write buffers", inodes.len());
+            let handles: Vec<_> = inodes.into_iter().map(|ino| {
+                let h = flush_handle.clone();
+                let flush_rt = h.flush_runtime.clone();
+                flush_rt.spawn(async move {
+                    if let Err(e) = h.flush_all_pipelined(ino).await {
+                        error!("shutdown drain: flush failed for inode {}: {}", ino, e);
+                    }
+                })
+            }).collect();
+            for h in handles {
+                let _ = h.await;
+            }
+        }
+
+        // Step 2: Wait for any background in-flight flushes to drain.
+        let in_flight = flush_in_flight.read().unwrap().clone();
+        if let Some(in_flight) = in_flight {
+            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+            while !in_flight.is_empty() {
+                if tokio::time::Instant::now() > deadline {
+                    warn!("shutdown drain: timed out waiting for in-flight flushes");
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // Step 3: Commit metadata for any inode that has chunk_locations in cache.
+        // Catches files where flush_buffer_async ran but metadata_cache was missing
+        // (race with create()'s async task) or where the buffer was flushed by the
+        // background flusher but the metadata commit was skipped due to cache miss.
+        {
+            // Only flush metadata for inodes that were actively written this session.
+            // Flushing read-only files whose metadata_cache was populated solely by
+            // warmup would commit chunks with a higher write_seq, reinforcing any
+            // DB corruption already present on the server.
+            let to_commit: Vec<_> = metadata_cache.iter()
+                .filter(|e| !e.chunk_locations.is_empty() && written_inodes.contains(e.key()))
+                .map(|e| e.clone())
+                .collect();
+            if !to_commit.is_empty() {
+                info!("shutdown drain: committing metadata for {} written inodes with chunks", to_commit.len());
+                for meta in to_commit {
+                    client.flush_metadata_sync(&meta).await;
+                }
+            }
+        }
+
+        info!("shutdown drain: all buffers flushed and metadata committed");
+    }
+}
+
 /// Splice a freshly-confirmed chunk location into a file's chunk_locations list,
 /// replacing any existing entry for the same chunk_idx (file_offset / CHUNK_SIZE).
 ///
@@ -3084,6 +3183,19 @@ impl DfsFilesystem {
         self.runtime.block_on(future)
     }
 
+    /// Cheaply-cloneable handle carrying everything needed to drain write buffers
+    /// and commit pending metadata. Captured from outside (e.g. main.rs, before
+    /// the filesystem is moved into spawn_mount2) so a SIGTERM/SIGINT handler can
+    /// drain on shutdown even when fusermount -u never runs destroy() — e.g. when
+    /// unmount fails with "device or resource busy" and systemd just kills the process.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            flush_handle: self.flush_handle.clone(),
+            release_in_flight: self.release_in_flight.clone(),
+            written_inodes: self.written_inodes.clone(),
+        }
+    }
+
     /// Acquire the per-(ino, chunk_idx) write lock, creating it on demand.
     /// Returns the guard; dropping it releases the lock.
     async fn lock_chunk(chunk_write_locks: &Arc<DashMap<u64, Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>>>, ino: u64, chunk_idx: u64) -> tokio::sync::OwnedMutexGuard<()> {
@@ -3386,107 +3498,8 @@ impl Filesystem for DfsFilesystem {
 
     fn destroy(&mut self) {
         info!("DFS filesystem destroy: flushing all write buffers and metadata queue");
-
-        let write_buffers = self.write_buffers.clone();
-        let flush_in_flight = self.flush_in_flight.clone();
-        let client = self.client.clone();
-        let metadata_cache = self.metadata_cache.clone();
-        let release_in_flight = self.release_in_flight.clone();
-        let written_inodes = self.written_inodes.clone();
-
-        let flush_handle = FlushHandle {
-            client: client.clone(),
-            write_buffers: write_buffers.clone(),
-            metadata_cache: metadata_cache.clone(),
-            flush_in_flight: flush_in_flight.clone(),
-            last_metadata_update: self.last_metadata_update.clone(),
-            dir_cache: self.dir_cache.clone(),
-            dir_cache_invalidated_at: self.dir_cache_invalidated_at.clone(),
-            path_to_inode: self.path_to_inode.clone(),
-            truncated_inodes: self.truncated_inodes.clone(),
-            explicit_mtime_pending: self.explicit_mtime_pending.clone(),
-            flush_runtime: self.flush_runtime.clone(),
-            global_buffered_bytes: self.global_buffered_bytes.clone(),
-            flush_notify: self.flush_notify.clone(),
-            write_tasks_in_flight: self.write_tasks_in_flight.clone(),
-            chunk_write_locks: self.chunk_write_locks.clone(),
-            flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
-            use_dual_rf: false,
-            write_open_counts: self.write_open_counts.clone(),
-        };
-
-        self.block_on(async move {
-            // Step 0: Wait for any in-flight release() flush tasks to complete.
-            // release() spawns async tasks that aren't tracked by flush_in_flight.
-            // Without this wait, a release flush that started just before unmount
-            // may be interrupted mid-write, losing the final metadata commit.
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-            loop {
-                let total: usize = release_in_flight.iter()
-                    .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
-                    .sum();
-                if total == 0 { break; }
-                if tokio::time::Instant::now() > deadline {
-                    warn!("destroy: timed out waiting for release tasks");
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-
-            // Step 1: Force-flush all dirty write buffers (catches buffers not yet
-            // picked up by a release task, e.g. files open when unmount was called).
-            let inodes: Vec<u64> = write_buffers.iter().map(|e| *e.key()).collect();
-            if !inodes.is_empty() {
-                info!("destroy: force-flushing {} open write buffers", inodes.len());
-                let handles: Vec<_> = inodes.into_iter().map(|ino| {
-                    let h = flush_handle.clone();
-                    let flush_rt = h.flush_runtime.clone();
-                    flush_rt.spawn(async move {
-                        if let Err(e) = h.flush_all_pipelined(ino).await {
-                            error!("destroy: flush failed for inode {}: {}", ino, e);
-                        }
-                    })
-                }).collect();
-                for h in handles {
-                    let _ = h.await;
-                }
-            }
-
-            // Step 2: Wait for any background in-flight flushes to drain.
-            if let Some(in_flight) = flush_in_flight.read().unwrap().as_ref() {
-                let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-                while !in_flight.is_empty() {
-                    if tokio::time::Instant::now() > deadline {
-                        warn!("destroy: timed out waiting for in-flight flushes");
-                        break;
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                }
-            }
-
-            // Step 3: Commit metadata for any inode that has chunk_locations in cache.
-            // Catches files where flush_buffer_async ran but metadata_cache was missing
-            // (race with create()'s async task) or where the buffer was flushed by the
-            // background flusher but the metadata commit was skipped due to cache miss.
-            {
-                // Only flush metadata for inodes that were actively written this session.
-                // Flushing read-only files whose metadata_cache was populated solely by
-                // warmup would commit chunks with a higher write_seq, reinforcing any
-                // DB corruption already present on the server.
-                let to_commit: Vec<_> = metadata_cache.iter()
-                    .filter(|e| !e.chunk_locations.is_empty() && written_inodes.contains(e.key()))
-                    .map(|e| e.clone())
-                    .collect();
-                if !to_commit.is_empty() {
-                    info!("destroy: committing metadata for {} written inodes with chunks", to_commit.len());
-                    for meta in to_commit {
-                        client.flush_metadata_sync(&meta).await;
-                    }
-                }
-            }
-
-            info!("destroy: all buffers flushed and metadata committed");
-        });
+        let handle = self.shutdown_handle();
+        self.block_on(handle.drain());
     }
 
     fn lookup(&mut self, _req: &FuseRequest, parent: u64, name: &OsStr, reply: ReplyEntry) {

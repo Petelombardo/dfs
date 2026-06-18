@@ -2774,6 +2774,84 @@ fi
 dfs_sync
 fi # should_run T40
 
+# ── Test 41: SIGTERM without a clean unmount must still drain write buffers ──
+#
+# Reproduces the staging "corrupted dvr.conf after deploy-build.sh" bug: the
+# deploy script does `podman stop` then `systemctl stop dfs-client`, whose
+# ExecStop runs `fusermount -u`. If something still has the mount busy at that
+# moment, fusermount fails, destroy() (which normally drains write buffers) never
+# runs, and systemd just SIGTERMs the client directly — silently dropping any
+# buffered-but-unflushed write. This test skips fusermount entirely and sends
+# SIGTERM straight to the client while a write is still sitting in the buffer
+# (well under the 500ms idle-flush window), simulating exactly that fallback path.
+if should_run T41; then
+snapshot_log T41
+echo ""
+echo "=== T41: SIGTERM mid-write must drain buffers (no clean unmount) ==="
+
+T41_FILE="$MOUNT/t41_sigterm.bin"
+dd if=/dev/urandom of="$T/t41_ref.bin" bs=1M count=1 2>/dev/null
+
+# Find whichever dfs-client is currently serving the mount — don't assume
+# CLIENT_PID vs CLIENT_PID2, since this test may run alone (T41 only) before
+# any remount test has set CLIENT_PID2.
+T41_CLIENT_PID=$(pgrep -f "dfs-client mount $MOUNT" | head -1)
+
+# Open, write, and hold the fd open in the background — release()'s flush
+# must not run, since we want the data to still be sitting unflushed when we
+# signal the client.
+python3 -c "
+import os, time
+fd = os.open('$T41_FILE', os.O_WRONLY | os.O_CREAT, 0o644)
+with open('$T/t41_ref.bin', 'rb') as f:
+    os.write(fd, f.read())
+time.sleep(10)
+try:
+    os.close(fd)
+except OSError:
+    pass
+" &
+T41_WRITER_PID=$!
+
+sleep 0.15   # land in the write buffer, stay under the 500ms idle-flush window
+kill -TERM "$T41_CLIENT_PID"
+
+# Our SIGTERM handler drains buffers then calls process::exit — wait for it.
+T41_WAITED=0
+while kill -0 "$T41_CLIENT_PID" 2>/dev/null; do
+    sleep 0.2
+    T41_WAITED=$((T41_WAITED+1))
+    [ "$T41_WAITED" -gt 150 ] && break   # 30s safety cap
+done
+kill -0 "$T41_CLIENT_PID" 2>/dev/null \
+    && check "T41a client exited after SIGTERM" FAIL \
+    || check "T41a client exited after SIGTERM" PASS
+
+# The writer's fd is now attached to a dead FUSE connection — kill it and force
+# the stale mount out of the way before remounting fresh.
+kill -9 "$T41_WRITER_PID" 2>/dev/null || true
+wait "$T41_WRITER_PID" 2>/dev/null || true
+fusermount -uz "$MOUNT" 2>/dev/null || true
+sleep 0.5
+
+T41_CLIENT_LOG="$LOG/client_t41.log"
+: > "$T41_CLIENT_LOG"
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$T41_CLIENT_LOG" --allow-other --log-level debug &
+CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$T41_CLIENT_LOG"
+sleep 2
+mountpoint -q "$MOUNT" || { check "T41b remount after SIGTERM" FAIL; }
+
+T41_GOT_MD5=$(md5sum "$T41_FILE" 2>/dev/null | awk '{print $1}')
+T41_REF_MD5=$(md5sum "$T/t41_ref.bin" | awk '{print $1}')
+[ -n "$T41_GOT_MD5" ] && [ "$T41_GOT_MD5" = "$T41_REF_MD5" ] \
+    && check "T41c write survives SIGTERM-without-unmount (md5 match)" PASS \
+    || check "T41c write lost/corrupted after SIGTERM-without-unmount (want $T41_REF_MD5 got ${T41_GOT_MD5:-<missing>})" FAIL
+
+rm -f "$T41_FILE" "$T/t41_ref.bin"
+fi # should_run T41
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

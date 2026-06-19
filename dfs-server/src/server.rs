@@ -582,7 +582,7 @@ impl Server {
                     .map(|m| m.write_seq)
                     .unwrap_or(0);
                 if metadata.write_seq > local_seq {
-                    self.metadata.put_file(&metadata)?;
+                    self.metadata.put_file_async(metadata.clone()).await?;
                     self.chunk_map_update(&metadata).await;
                     info!("Successfully pulled fresh metadata from leader: file_id={} seq={} size={}",
                           file_id, metadata.write_seq, metadata.size);
@@ -905,7 +905,7 @@ impl Server {
                                 debug!("leader_forward: skipping deleted file {} on leader drain", metadata.path);
                                 continue;
                             }
-                            match server.metadata.put_file(&metadata) {
+                            match server.metadata.put_file_async(metadata.clone()).await {
                                 Ok(_) => { server.chunk_map_update(&metadata).await; }
                                 Err(e) => warn!("leader_forward: local store failed for {}: {}", metadata.path, e),
                             }
@@ -1699,7 +1699,7 @@ impl Server {
         if let Ok(mut location) = self.get_or_create_chunk_location(&chunk_id, data.len()).await {
             if !location.nodes.contains(&local_node_id) && location.nodes.len() < self.replication_factor {
                 location.nodes.push(local_node_id);
-                let _ = self.metadata.put_chunk_location(&location);
+                let _ = self.metadata.put_chunk_location_async(location).await;
             }
         }
 
@@ -1964,14 +1964,14 @@ impl Server {
         // to followers 100ms later, resurrecting the file there.
         self.pending_broadcasts.remove(&file_id);
 
-        if let Err(e) = self.metadata.delete_file(&file_id) {
+        if let Err(e) = self.metadata.delete_file_async(file_id).await {
             warn!("Failed to delete file record {} on peer: {}", file_id, e);
         }
-        if let Err(e) = self.metadata.delete_path_index(&path) {
+        if let Err(e) = self.metadata.delete_path_index_async(path.clone()).await {
             warn!("Failed to delete path index {} on peer: {}", path, e);
         }
         for chunk_id in &chunk_ids {
-            if let Err(e) = self.metadata.delete_chunk_location(chunk_id) {
+            if let Err(e) = self.metadata.delete_chunk_location_async(*chunk_id).await {
                 warn!("Failed to delete chunk location {} on peer: {}", chunk_id, e);
             }
         }
@@ -2012,7 +2012,7 @@ impl Server {
 
     /// Handle path-index-only deletion (used by rename to clean up stale old-path entries on peers).
     async fn handle_delete_path_index(&self, path: String) -> Response {
-        if let Err(e) = self.metadata.delete_path_index(&path) {
+        if let Err(e) = self.metadata.delete_path_index_async(path.clone()).await {
             warn!("Failed to delete path index {} on peer: {}", path, e);
         }
         debug!("Deleted path index entry for {} on peer", path);
@@ -2135,7 +2135,7 @@ impl Server {
         };
 
         // Store merged location
-        match self.metadata.put_chunk_location(&merged_location) {
+        match self.metadata.put_chunk_location_async(merged_location.clone()).await {
             Ok(_) => {
                 // Patch the in-memory chunk map. When file_id is known, do a targeted
                 // update — no need to scan all files. Without file_id (legacy path),
@@ -2237,7 +2237,7 @@ impl Server {
     /// stay in sync and don't accumulate stale records indefinitely.
     async fn handle_purge_chunk_location(&self, chunk_id: ChunkId) -> Response {
         debug!("Handling purge chunk location: {}", chunk_id);
-        match self.metadata.delete_chunk_location(&chunk_id) {
+        match self.metadata.delete_chunk_location_async(chunk_id).await {
             Ok(_) => {
                 debug!("Purged chunk location record: {}", chunk_id);
                 Response::Ok { data: None }
@@ -2301,7 +2301,7 @@ impl Server {
         debug!("Handling batch purge of {} chunk locations", chunk_ids.len());
         let mut failed = 0usize;
         for chunk_id in &chunk_ids {
-            if let Err(e) = self.metadata.delete_chunk_location(chunk_id) {
+            if let Err(e) = self.metadata.delete_chunk_location_async(*chunk_id).await {
                 warn!("Failed to purge chunk location {}: {}", chunk_id, e);
                 failed += 1;
             } else {
@@ -2438,7 +2438,7 @@ impl Server {
                 client_write_seq: location.client_write_seq.or_else(|| existing.as_ref().and_then(|e| e.client_write_seq)),
                 file_id: location.file_id.or_else(|| existing.as_ref().and_then(|e| e.file_id)),
             };
-            match self.metadata.put_chunk_location(&merged) {
+            match self.metadata.put_chunk_location_async(merged.clone()).await {
                 Ok(_) => {
                     if merged.nodes.len() < rf {
                         under_replicated.push(merged.chunk_id);
@@ -2616,7 +2616,7 @@ impl Server {
         // Always delete the chunk location record, even if the chunk data isn't here.
         // A node may have a location record without the actual bytes — that stale record
         // must be purged too, otherwise it causes ghost entries after delete+rewrite.
-        if let Err(e) = self.metadata.delete_chunk_location(&chunk_id) {
+        if let Err(e) = self.metadata.delete_chunk_location_async(chunk_id).await {
             warn!("Failed to delete chunk location record for {}: {}", chunk_id, e);
         }
 
@@ -2804,7 +2804,8 @@ impl Server {
 
                 let metadata_start = std::time::Instant::now();
                 metadata
-                    .put_chunk_location(&location)
+                    .put_chunk_location_async(location.clone())
+                    .await
                     .context("Failed to store chunk location")?;
                 let metadata_time = metadata_start.elapsed();
 
@@ -2911,7 +2912,7 @@ impl Server {
                     file_id: Some(file_id),
                 };
 
-                metadata.put_chunk_location(&location)
+                metadata.put_chunk_location_async(location).await
                     .context("Failed to store chunk location")?;
 
                 // Do NOT broadcast a single-node location here. The client is the authoritative
@@ -2974,7 +2975,7 @@ impl Server {
                     file_id: Some(file_id),
                 };
 
-                metadata.put_chunk_location(&location)
+                metadata.put_chunk_location_async(location).await
                     .context("Failed to store chunk location")?;
 
                 Ok::<(ChunkId, u64), anyhow::Error>((chunk_id, chunk_data.len() as u64))
@@ -3296,7 +3297,7 @@ impl Server {
             return;
         }
 
-        let seq = match self.metadata.next_meta_sequence() {
+        let seq = match self.metadata.next_meta_sequence_async().await {
             Ok(s) => s,
             Err(e) => {
                 warn!("Failed to increment meta sequence: {}", e);
@@ -3305,7 +3306,7 @@ impl Server {
         };
 
         for node in &offline_followers {
-            if let Err(e) = self.metadata.enqueue_meta_for_node(node.id, seq, metadata) {
+            if let Err(e) = self.metadata.enqueue_meta_for_node_async(node.id, seq, metadata.clone()).await {
                 warn!("Failed to enqueue metadata for node {}: {}", node.id, e);
             }
         }
@@ -4076,7 +4077,7 @@ impl Server {
         // Record the highest sequence we've received.
         // up_to_sequence=0 is the gossip sentinel — don't overwrite the real sequence.
         if up_to_sequence > 0 {
-            if let Err(e) = self.metadata.set_follower_sequence(up_to_sequence) {
+            if let Err(e) = self.metadata.set_follower_sequence_async(up_to_sequence).await {
                 warn!("disseminate: failed to record follower sequence {}: {}", up_to_sequence, e);
             }
         }
@@ -4328,7 +4329,7 @@ impl Server {
             };
 
             // Persist chunk location locally
-            let _ = self.metadata.put_chunk_location(&location);
+            let _ = self.metadata.put_chunk_location_async(location.clone()).await;
 
             // Broadcast chunk location to remaining nodes fire-and-forget
             {
@@ -4369,7 +4370,7 @@ impl Server {
             .as_secs();
 
         // --- Step 9: Persist metadata locally ---
-        if let Err(e) = self.metadata.put_file(&metadata) {
+        if let Err(e) = self.metadata.put_file_async(metadata.clone()).await {
             return Response::Error {
                 message: format!("Failed to persist metadata: {}", e),
                 code: ErrorCode::InternalError,
@@ -5094,7 +5095,7 @@ impl Server {
             path: path.clone(),
             chunk_ids: chunk_ids.clone(),
         };
-        if let Err(e) = self.metadata.enqueue_delete(&entry) {
+        if let Err(e) = self.metadata.enqueue_delete_async(entry).await {
             warn!("Failed to enqueue delete for {}: {}", path, e);
             return Response::Error {
                 message: format!("Failed to enqueue delete: {}", e),
@@ -5103,7 +5104,7 @@ impl Server {
         }
 
         // Step 3: remove metadata now that the chunk list is safely queued.
-        if let Err(e) = self.metadata.delete_file(&metadata.id) {
+        if let Err(e) = self.metadata.delete_file_async(metadata.id).await {
             warn!("Failed to delete file metadata for {}: {}", path, e);
             // Queue entry is already written — drain worker will retry.
             // Still return error so client knows metadata removal may have failed.
@@ -5112,11 +5113,11 @@ impl Server {
                 code: ErrorCode::InternalError,
             };
         }
-        if let Err(e) = self.metadata.delete_path_index(&path) {
+        if let Err(e) = self.metadata.delete_path_index_async(path.clone()).await {
             warn!("Failed to delete path index for {}: {}", path, e);
         }
         for chunk_id in &chunk_ids {
-            if let Err(e) = self.metadata.delete_chunk_location(chunk_id) {
+            if let Err(e) = self.metadata.delete_chunk_location_async(*chunk_id).await {
                 warn!("Failed to delete chunk location {}: {}", chunk_id, e);
             }
         }
@@ -5147,13 +5148,13 @@ impl Server {
         self.pending_broadcasts.remove(&file_id);
 
         // Wipe metadata (idempotent — already gone on quorum nodes).
-        let _ = self.metadata.delete_file(&file_id);
-        let _ = self.metadata.delete_path_index(&path);
+        let _ = self.metadata.delete_file_async(file_id).await;
+        let _ = self.metadata.delete_path_index_async(path).await;
         self.chunk_map_remove(&file_id).await;
 
         for chunk_id in &chunk_ids {
             self.chunk_tombstones.remove(chunk_id);
-            let _ = self.metadata.delete_chunk_location(chunk_id);
+            let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
             if let Err(e) = self.storage.delete_chunk(chunk_id) {
                 // Not present locally — fine, log at debug.
                 debug!("DeleteChunksBatch: chunk {} not local: {}", chunk_id, e);
@@ -5165,7 +5166,7 @@ impl Server {
 
     /// Handle ClearDeleteQueueEntry — leader broadcasts this after all nodes ack.
     async fn handle_clear_delete_queue_entry(&self, file_id: FileId) -> Response {
-        if let Err(e) = self.metadata.dequeue_delete(&file_id) {
+        if let Err(e) = self.metadata.dequeue_delete_async(file_id).await {
             warn!("ClearDeleteQueueEntry: failed to remove {} from queue: {}", file_id, e);
         }
         Response::Ok { data: None }
@@ -5230,7 +5231,7 @@ impl Server {
                                 let existing = server.metadata.get_all_pending_deletes().unwrap_or_default();
                                 for entry in entries {
                                     if !existing.iter().any(|e| e.file_id == entry.file_id) {
-                                        if let Err(e) = server.metadata.enqueue_delete(&entry) {
+                                        if let Err(e) = server.metadata.enqueue_delete_async(entry.clone()).await {
                                             warn!("delete_drain: failed to merge entry from {}: {}", node.id, e);
                                         } else {
                                             info!("delete_drain: merged queued delete for {} from {}", entry.path, node.id);
@@ -5286,15 +5287,15 @@ impl Server {
         // full-disk leader silently fails its own delete but still broadcasts
         // DeleteChunksBatch, causing followers to permanently lose the file while the
         // leader retains it.  The drain will retry on the next 30-second cycle.
-        if let Err(e) = self.metadata.delete_file(&entry.file_id) {
+        if let Err(e) = self.metadata.delete_file_async(entry.file_id).await {
             warn!("drain_one_delete: local metadata delete failed for {} — will retry: {}", entry.path, e);
             return;
         }
-        if let Err(e) = self.metadata.delete_path_index(&entry.path) {
+        if let Err(e) = self.metadata.delete_path_index_async(entry.path.clone()).await {
             warn!("drain_one_delete: local path index delete failed for {} — will retry: {}", entry.path, e);
         }
         for chunk_id in &entry.chunk_ids {
-            let _ = self.metadata.delete_chunk_location(chunk_id);
+            let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
             if let Err(e) = self.storage.delete_chunk(chunk_id) {
                 debug!("drain_one_delete: local chunk {} not present: {}", chunk_id, e);
             }
@@ -5343,7 +5344,7 @@ impl Server {
 
         // All chunk-holding nodes acked. Clear the queue entry from all nodes.
         info!("drain_one_delete: all nodes acked deletion of {} — clearing queue", entry.path);
-        if let Err(e) = self.metadata.dequeue_delete(&entry.file_id) {
+        if let Err(e) = self.metadata.dequeue_delete_async(entry.file_id).await {
             warn!("drain_one_delete: failed to clear local queue entry for {}: {}", entry.path, e);
         }
 
@@ -5816,7 +5817,7 @@ impl Server {
                         "Metadata repair: file {} size corrected by chunk quorum: metadata={} → physical={}",
                         file.path, file.size, authoritative_file_size
                     );
-                    match metadata.put_file(&fixed) {
+                    match metadata.put_file_async(fixed.clone()).await {
                         Ok(_) => repaired_files.push(fixed),
                         Err(e) => warn!("Metadata repair: failed to write corrected size for {}: {}", file.path, e),
                     }
@@ -6141,7 +6142,7 @@ impl Server {
                             client_write_seq: None,
                             file_id: live_loc.file_id,
                         };
-                        let _ = metadata.put_chunk_location(&updated);
+                        let _ = metadata.put_chunk_location_async(updated.clone()).await;
                         // Broadcast to peers (fire-and-forget).
                         let bc_loc = updated.clone();
                         let bc_nodes = all_nodes.clone();
@@ -6402,7 +6403,7 @@ impl Server {
                 let file_id = metadata.id;
 
                 // Delete from local metadata store only (not chunks)
-                match self.metadata.delete_file(&file_id) {
+                match self.metadata.delete_file_async(file_id).await {
                     Ok(_) => {
                         info!("Purged local metadata for file: {}", path);
 
@@ -6466,7 +6467,7 @@ impl Server {
         info!("Handling purge file metadata by ID: {}", file_id);
 
         // Delete from local node first
-        match self.metadata.delete_file(&file_id) {
+        match self.metadata.delete_file_async(file_id).await {
             Ok(_) => {
                 info!("Purged metadata for file ID {} from local node", file_id);
 
@@ -6530,7 +6531,7 @@ impl Server {
                 metadata.write_seq = metadata.write_seq.saturating_add(1);
 
                 // Store new metadata locally first
-                match self.metadata.put_file(&metadata) {
+                match self.metadata.put_file_async(metadata.clone()).await {
                     Ok(_) => {
                         // Now replicate to all servers BEFORE deleting old path
                         // This ensures the new metadata exists everywhere before we delete the old
@@ -6564,7 +6565,7 @@ impl Server {
 
                         // Delete the OLD path index entry locally first, then replicate
                         // synchronously to all peers so no peer can resolve the old path.
-                        if let Err(e) = self.metadata.delete_path_index(&old_path) {
+                        if let Err(e) = self.metadata.delete_path_index_async(old_path.clone()).await {
                             warn!("Failed to delete old path index during rename: {}", e);
                         }
 

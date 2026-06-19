@@ -2852,6 +2852,106 @@ T41_REF_MD5=$(md5sum "$T/t41_ref.bin" | awk '{print $1}')
 rm -f "$T41_FILE" "$T/t41_ref.bin"
 fi # should_run T41
 
+# ── Test 42: chunk-write flood must not starve the leader's async runtime ────
+#
+# Repro for the staging gluster1 hang (2026-06-19): handle_replicate_chunk_location
+# (server.rs) calls metadata.put_chunk_location() directly — a synchronous redb
+# begin_write()/commit() — on the Tokio worker thread. The heal-scan path already
+# carries an explicit warning about this exact failure mode (healing.rs:850-853:
+# "every Tokio worker thread can end up blocked on the mutex, freezing the entire
+# async runtime") and was fixed there via batching through spawn_blocking, but the
+# live per-write RPC path (handle_replicate_chunk_location) never got the same fix.
+#
+# Under a burst of concurrent chunk writes — many overlapping ReplicateChunkLocation
+# RPCs landing on the leader at once — every worker thread can end up blocked inside
+# redb's single-writer transaction lock simultaneously, starving the whole runtime,
+# including unrelated requests like `cluster status`.
+if should_run T42; then
+snapshot_log T42
+echo ""
+echo "=== T42: replicate-chunk-location flood must not starve the leader ==="
+
+# Leader isn't pinned to a fixed port — discover it from the client's own log
+# (set right after mount: "Leader node: <id> (<addr>)"). snapshot_log just
+# moved the mount-time log lines into T42.log and truncated client.log, so
+# look there first; fall back to client.log in case this test ran without
+# the snapshot (e.g. invoked standalone after other tests already ran).
+LEADER_ADDR=$( { cat "$LOG/T42.log" "$LOG/client.log" 2>/dev/null || true; } \
+    | grep -oE "Leader node: [^(]+\(([0-9.]+:[0-9]+)\)" \
+    | tail -1 | grep -oE "[0-9.]+:[0-9]+" || true)
+[ -z "$LEADER_ADDR" ] && LEADER_ADDR="127.0.0.1:8900"
+echo "  T42: leader is $LEADER_ADDR"
+
+T42_NUM_PROCS=100
+T42_DURATION=15
+# Hard cap on the flood subprocess itself — if writes/fsyncs against the
+# starved leader block indefinitely (the bug also wedges the client, not just
+# the server), this guarantees the test fails loudly instead of hanging the
+# suite forever.
+T42_FLOOD_CAP=$(( T42_DURATION + 15 ))
+
+# Flood the leader with concurrent small fsync'd writes from many separate
+# *processes* (not threads — avoids the GIL throttling request rate below what
+# the server can actually keep up with). Each write+fsync triggers a
+# ReplicateChunkLocation RPC to the leader. Small payload (well under one 4MB
+# chunk) keeps disk usage bounded; what matters here is RPC concurrency, not
+# data volume.
+T42_FLOOD_PIDS=()
+for i in $(seq 0 $((T42_NUM_PROCS-1))); do
+    timeout --kill-after=5 "${T42_FLOOD_CAP}s" python3 -c "
+import os, time
+path = '$MOUNT/t42_flood_$i.bin'
+buf = bytes([$i % 256]) * (4 * 1024)
+stop_at = time.time() + $T42_DURATION
+while time.time() < stop_at:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.write(fd, buf)
+    os.fsync(fd)
+    os.close(fd)
+" &
+    T42_FLOOD_PIDS+=($!)
+done
+
+# While the flood runs, repeatedly poll cluster status against the leader with
+# a hard 3s timeout. A healthy node answers in well under 100ms; any timeout
+# here means the leader's runtime was starved.
+T42_TIMEOUTS=0
+T42_CALLS=0
+T42_MAX_MS=0
+T42_POLL_END=$(( $(date +%s) + T42_DURATION + 2 ))
+while [ "$(date +%s)" -lt "$T42_POLL_END" ]; do
+    T42_START_MS=$(date +%s%3N)
+    if timeout 3 "$BIN/dfs-admin" -c "$LEADER_ADDR" cluster status >/dev/null 2>&1; then
+        T42_ELAPSED=$(( $(date +%s%3N) - T42_START_MS ))
+        [ "$T42_ELAPSED" -gt "$T42_MAX_MS" ] && T42_MAX_MS=$T42_ELAPSED
+    else
+        T42_TIMEOUTS=$((T42_TIMEOUTS+1))
+    fi
+    T42_CALLS=$((T42_CALLS+1))
+    sleep 0.2
+done
+
+# Bounded by T42_FLOOD_CAP above — cannot hang the suite even if the flood
+# itself is stuck inside a blocked write()/fsync() syscall.
+T42_FLOOD_RC=0
+for pid in "${T42_FLOOD_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || T42_FLOOD_RC=$?
+done
+dfs_sync 2>/dev/null || true
+
+echo "  T42: $T42_CALLS cluster-status calls during flood, $T42_TIMEOUTS timeouts, max latency ${T42_MAX_MS}ms, flood_rc=$T42_FLOOD_RC"
+
+if [ "$T42_FLOOD_RC" -ge 124 ]; then
+    check "T42 leader hung under chunk-write flood (writer threads themselves got stuck — flood killed after ${T42_FLOOD_CAP}s)" FAIL
+elif [ "$T42_TIMEOUTS" -eq 0 ]; then
+    check "T42 leader stayed responsive under chunk-write flood" PASS
+else
+    check "T42 leader hung under chunk-write flood ($T42_TIMEOUTS/$T42_CALLS cluster-status calls timed out, max ${T42_MAX_MS}ms)" FAIL
+fi
+
+for i in $(seq 0 $((T42_NUM_PROCS-1))); do rm -f "$MOUNT/t42_flood_${i}.bin" 2>/dev/null || true; done
+fi # should_run T42
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

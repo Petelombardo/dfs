@@ -7,7 +7,7 @@ use redb::{Database, Durability, ReadableTable, TableDefinition};
 // only lost on kernel panic/power failure. Acceptable with 5-way replication.
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -520,6 +520,34 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Async wrapper for put_file — offloads the blocking redb commit to a dedicated
+    /// blocking thread so it never blocks a Tokio worker thread. Call sites that
+    /// already route through the dedicated sled_write_tx writer thread (see
+    /// server.rs) don't need this; use it anywhere else put_file is called directly
+    /// from async code. See put_chunk_location_async for why this matters.
+    pub async fn put_file_async(self: &Arc<Self>, metadata: FileMetadata) -> Result<PutFileResult> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_file(&metadata))
+            .await
+            .context("spawn_blocking panicked in put_file_async")?
+    }
+
+    /// Async wrapper for delete_file — see put_file_async.
+    pub async fn delete_file_async(self: &Arc<Self>, file_id: FileId) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_file(&file_id))
+            .await
+            .context("spawn_blocking panicked in delete_file_async")?
+    }
+
+    /// Async wrapper for delete_path_index — see put_file_async.
+    pub async fn delete_path_index_async(self: &Arc<Self>, path: String) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_path_index(&path))
+            .await
+            .context("spawn_blocking panicked in delete_path_index_async")?
+    }
+
     /// List all files — loads all records into memory. Use scan_files for streaming.
     pub fn list_files(&self) -> Result<Vec<FileMetadata>> {
         let mut files = Vec::new();
@@ -708,6 +736,29 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Async wrapper for put_chunk_location. This is THE hot path: it's called
+    /// once per confirmed chunk write via ReplicateChunkLocation, at whatever rate
+    /// clients are writing/healing. Calling put_chunk_location directly from async
+    /// code (no .await inside it) lets a burst of concurrent callers monopolize
+    /// every Tokio worker thread simultaneously inside redb's write-transaction
+    /// lock, starving the whole runtime — this is what froze gluster1 in staging
+    /// on 2026-06-19 (see metadata::tests::test_put_chunk_location_does_not_starve_runtime_under_concurrency).
+    /// Always call this instead of put_chunk_location from request-handling code.
+    pub async fn put_chunk_location_async(self: &Arc<Self>, location: ChunkLocation) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_chunk_location(&location))
+            .await
+            .context("spawn_blocking panicked in put_chunk_location_async")?
+    }
+
+    /// Async wrapper for delete_chunk_location — see put_chunk_location_async.
+    pub async fn delete_chunk_location_async(self: &Arc<Self>, chunk_id: ChunkId) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_chunk_location(&chunk_id))
+            .await
+            .context("spawn_blocking panicked in delete_chunk_location_async")?
+    }
+
     // -------------------------------------------------------------------------
     // Chunk refcounts (fast-path eviction for patch-generated chunk_ids)
     // -------------------------------------------------------------------------
@@ -800,6 +851,23 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Async wrapper for put_patch_journal — patches are a normal-volume client
+    /// write path; see put_chunk_location_async for why this matters.
+    pub async fn put_patch_journal_async(self: &Arc<Self>, entry: PatchJournalEntry) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_patch_journal(&entry))
+            .await
+            .context("spawn_blocking panicked in put_patch_journal_async")?
+    }
+
+    /// Async wrapper for delete_patch_journal — see put_chunk_location_async.
+    pub async fn delete_patch_journal_async(self: &Arc<Self>, old_chunk_id: ChunkId) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_patch_journal(&old_chunk_id))
+            .await
+            .context("spawn_blocking panicked in delete_patch_journal_async")?
+    }
+
     /// Read every leftover journal entry. Used once at startup to recover
     /// from a crash that interrupted an in-place patch.
     pub fn scan_patch_journal(&self) -> Result<Vec<PatchJournalEntry>> {
@@ -848,6 +916,24 @@ impl MetadataStore {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Async wrapper for put_pending_healing — fires once per chunk at the start
+    /// of a heal storm, exactly the burst scenario that starved gluster1; see
+    /// put_chunk_location_async.
+    pub async fn put_pending_healing_async(self: &Arc<Self>, chunk_id: ChunkId, detected_at_secs: u64) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_pending_healing(&chunk_id, detected_at_secs))
+            .await
+            .context("spawn_blocking panicked in put_pending_healing_async")?
+    }
+
+    /// Async wrapper for delete_pending_healing — see put_chunk_location_async.
+    pub async fn delete_pending_healing_async(self: &Arc<Self>, chunk_id: ChunkId) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_pending_healing(&chunk_id))
+            .await
+            .context("spawn_blocking panicked in delete_pending_healing_async")?
     }
 
     /// Read all persisted (chunk_id, first_detected_at_secs) entries. Used at
@@ -1044,6 +1130,20 @@ impl MetadataStore {
         Ok(next)
     }
 
+    /// Async wrapper for next_meta_sequence — see put_chunk_location_async. There's
+    /// a known case (enqueue_metadata_for_followers in server.rs) where calling this
+    /// directly was already observed to block worker threads under a write storm
+    /// (3500 calls/sec during an rsync of thousands of files); it was patched around
+    /// by skipping the call when there are no offline followers, but the direct call
+    /// remains unwrapped for the case where there IS at least one offline follower —
+    /// exactly when healing/dissemination load is also highest.
+    pub async fn next_meta_sequence_async(self: &Arc<Self>) -> Result<u64> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.next_meta_sequence())
+            .await
+            .context("spawn_blocking panicked in next_meta_sequence_async")?
+    }
+
     /// Read current metadata sequence number.
     pub fn current_meta_sequence(&self) -> Result<u64> {
         let _db = self.db.read().unwrap();
@@ -1135,6 +1235,19 @@ impl MetadataStore {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Async wrapper for enqueue_meta_for_node — see put_chunk_location_async.
+    pub async fn enqueue_meta_for_node_async(
+        self: &Arc<Self>,
+        node_id: NodeId,
+        sequence: u64,
+        metadata: FileMetadata,
+    ) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.enqueue_meta_for_node(node_id, sequence, &metadata))
+            .await
+            .context("spawn_blocking panicked in enqueue_meta_for_node_async")?
     }
 
     /// Return all queued metadata entries for `node_id`, in sequence order.
@@ -1291,6 +1404,15 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Async wrapper for set_follower_sequence — called once per incoming
+    /// dissemination batch on every follower; see put_chunk_location_async.
+    pub async fn set_follower_sequence_async(self: &Arc<Self>, seq: u64) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.set_follower_sequence(seq))
+            .await
+            .context("spawn_blocking panicked in set_follower_sequence_async")?
+    }
+
     /// Get the last sequence number received from the leader (follower-only).
     pub fn get_follower_sequence(&self) -> Result<u64> {
         let _db = self.db.read().unwrap();
@@ -1372,6 +1494,14 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Async wrapper for enqueue_delete — see put_chunk_location_async.
+    pub async fn enqueue_delete_async(self: &Arc<Self>, entry: dfs_common::DeleteQueueEntry) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.enqueue_delete(&entry))
+            .await
+            .context("spawn_blocking panicked in enqueue_delete_async")?
+    }
+
     /// Remove a completed deletion from the queue (called after all nodes ack).
     pub fn dequeue_delete(&self, file_id: &FileId) -> Result<()> {
         let key = format!("del:{}", file_id);
@@ -1384,6 +1514,14 @@ impl MetadataStore {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Async wrapper for dequeue_delete — see put_chunk_location_async.
+    pub async fn dequeue_delete_async(self: &Arc<Self>, file_id: FileId) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.dequeue_delete(&file_id))
+            .await
+            .context("spawn_blocking panicked in dequeue_delete_async")?
     }
 
     /// Return all pending delete queue entries.
@@ -1558,6 +1696,99 @@ mod tests {
         let retrieved = store.get_chunk_location(&chunk_id).unwrap().unwrap();
         assert_eq!(retrieved.nodes.len(), 2);
         assert_eq!(retrieved.size, 4096);
+    }
+
+    /// Regression test for the staging gluster1 hang (2026-06-19):
+    /// handle_replicate_chunk_location (server.rs) used to call put_chunk_location()
+    /// directly on the Tokio worker thread — a synchronous redb begin_write()/commit()
+    /// with no .await inside. A spawned async task with no yield points runs to
+    /// completion in a single poll, monopolizing whichever worker thread picks it up
+    /// for the task's entire duration. Under concurrent load (many such tasks queued
+    /// against a small worker pool — exactly what a chunk-write/heal-storm burst
+    /// produces on the leader), that starved every *other* task on the runtime,
+    /// including unrelated requests like `cluster status`.
+    ///
+    /// Every production call site now goes through put_chunk_location_async (which
+    /// offloads to spawn_blocking) instead of calling put_chunk_location directly.
+    /// This test proves the wrapper actually fixes the starvation, using the same
+    /// concurrent-flood shape that reproduced the bug against the raw sync method.
+    ///
+    /// This reproduces the mechanism directly against the metadata layer, independent
+    /// of disk speed — the E2E version of this test (test_local_suite.sh T42) passed
+    /// even under heavy concurrency on fast local storage, because individual redb
+    /// commits complete in the low single-digit milliseconds here; staging's hang took
+    /// over an hour to surface because slower storage plus sustained load (a 16MB/s+
+    /// VM disk write competing for the same physical disk) widened the same starvation
+    /// window from milliseconds to effectively forever.
+    ///
+    /// A "heartbeat" task with a real yield point (tokio::time::sleep) should never be
+    /// delayed by more than its own sleep duration plus scheduling jitter — unrelated
+    /// async work must not be able to block it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_put_chunk_location_async_does_not_starve_runtime_under_concurrency() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+
+        let max_gap_ms = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let heartbeat = {
+            let max_gap_ms = max_gap_ms.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut last = std::time::Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    let now = std::time::Instant::now();
+                    let gap = now.duration_since(last).as_millis() as u64;
+                    max_gap_ms.fetch_max(gap, Ordering::Relaxed);
+                    last = now;
+                }
+            })
+        };
+
+        // More concurrent flooders than worker threads, each issuing a burst of
+        // synchronous chunk-location writes with no yield points in between —
+        // mirrors a burst of concurrent ReplicateChunkLocation RPCs landing on the
+        // leader during a write/heal storm.
+        let mut handles = Vec::new();
+        for i in 0..32u8 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                for j in 0..40u8 {
+                    let mut hash = [0u8; 32];
+                    hash[0] = i;
+                    hash[1] = j;
+                    let location = ChunkLocation {
+                        chunk_id: ChunkId::from_hash(hash),
+                        nodes: vec![NodeId::new(), NodeId::new()],
+                        size: 4096,
+                        checksum: [0u8; 32],
+                        file_offset: None,
+                        written_at: None,
+                        client_write_seq: None,
+                        file_id: None,
+                    };
+                    store.put_chunk_location_async(location).await.unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        heartbeat.await.unwrap();
+
+        let gap = max_gap_ms.load(Ordering::Relaxed);
+        assert!(
+            gap < 150,
+            "heartbeat task starved for {}ms — put_chunk_location_async should offload \
+             to spawn_blocking and never block a Tokio worker thread for this long",
+            gap
+        );
     }
 
     #[test]

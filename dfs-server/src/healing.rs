@@ -323,7 +323,7 @@ impl HealingManager {
         if let std::collections::hash_map::Entry::Vacant(e) = pending.entry(chunk_id) {
             e.insert(Instant::now());
             drop(pending);
-            if let Err(err) = self.metadata.put_pending_healing(&chunk_id, dfs_common::types::current_timestamp()) {
+            if let Err(err) = self.metadata.put_pending_healing_async(chunk_id, dfs_common::types::current_timestamp()).await {
                 warn!("Failed to persist pending_healing entry for {}: {}", chunk_id, err);
             }
         }
@@ -344,7 +344,7 @@ impl HealingManager {
     ) {
         let existed = pending_healing.write().await.remove(chunk_id).is_some();
         if existed {
-            if let Err(err) = metadata.delete_pending_healing(chunk_id) {
+            if let Err(err) = metadata.delete_pending_healing_async(*chunk_id).await {
                 warn!("Failed to delete pending_healing entry for {}: {}", chunk_id, err);
             }
         }
@@ -613,7 +613,7 @@ impl HealingManager {
                 debug!("Live-file orphan sweep: failed to delete {}: {}", chunk_id, e);
                 continue;
             }
-            let _ = self.metadata.delete_chunk_location(chunk_id);
+            let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
             evicted += 1;
         }
         if evicted > 0 {
@@ -1955,7 +1955,7 @@ impl HealingManager {
         let mut cache  = self.alive_nodes_cache.write().await;
         for chunk_id in chunk_ids {
             pending.insert(chunk_id, backdated);
-            if let Err(err) = self.metadata.put_pending_healing(&chunk_id, backdated_secs) {
+            if let Err(err) = self.metadata.put_pending_healing_async(chunk_id, backdated_secs).await {
                 warn!("Failed to persist backdated pending_healing entry for {}: {}", chunk_id, err);
             }
             // Invalidate any stale cache entry for this chunk so drain_heal_queue

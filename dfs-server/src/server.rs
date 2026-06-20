@@ -1498,6 +1498,7 @@ impl Server {
             Request::EnableHealing => self.handle_enable_healing().await,
             Request::DisableHealing => self.handle_disable_healing().await,
             Request::TriggerHealing => self.handle_trigger_healing().await,
+            Request::TriggerPhantomReconciliation => self.handle_trigger_phantom_reconciliation().await,
             Request::TriggerMetadataRepair => self.handle_trigger_metadata_repair().await,
             Request::QueryChunkSizes { chunk_ids } => self.handle_query_chunk_sizes(chunk_ids).await,
             Request::HealFile { path } => self.handle_heal_file(path).await,
@@ -5560,6 +5561,24 @@ impl Server {
                     if let Err(e) = healing.trigger_heal_now().await {
                         warn!("Manual heal cycle error: {}", e);
                     }
+                });
+                Response::Ok { data: None }
+            }
+            None => Response::Error {
+                message: "Healing manager not available".to_string(),
+                code: dfs_common::ErrorCode::InternalError,
+            },
+        }
+    }
+
+    async fn handle_trigger_phantom_reconciliation(&self) -> Response {
+        let healing_guard = self.healing.read().await;
+        match healing_guard.as_ref() {
+            Some(healing) => {
+                let healing = healing.clone();
+                drop(healing_guard);
+                tokio::spawn(async move {
+                    healing.run_phantom_reconciliation_pass().await;
                 });
                 Response::Ok { data: None }
             }

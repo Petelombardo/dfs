@@ -211,6 +211,14 @@ impl HealingManager {
         tokio::spawn(async move {
             scrubber.run_scrubber().await;
         });
+
+        // Phantom reconciliation: independent periodic verify-and-prune pass (see
+        // run_phantom_reconciliation_pass doc comment for why this exists alongside
+        // the discovery loop's own ghost-pruning).
+        let reconciler = self.clone();
+        tokio::spawn(async move {
+            reconciler.run_phantom_reconciliation_loop().await;
+        });
     }
 
     /// Discovery loop — runs every 60s on the cluster leader.
@@ -434,6 +442,242 @@ impl HealingManager {
             }
         }
         live
+    }
+
+    /// Phantom-replica reconciliation: walks every live ChunkLocation in CHUNK_TABLE,
+    /// verifies actual presence on every listed online node via a fresh HasChunks/
+    /// has_chunk check, and immediately prunes any node confirmed not to hold the
+    /// chunk — as long as at least one other listed node DOES hold it, so a chunk
+    /// is never stranded at zero replicas. If pruning drops a chunk below RF, it's
+    /// queued for immediate healing via queue_chunks_immediate.
+    ///
+    /// This runs independently of the discovery fast/deep cadence and the
+    /// pending_healing interplay used by ghost-pruning in run_discovery_pass. In
+    /// practice that existing path has been observed to leave large backlogs of
+    /// confirmed-ghost entries unpruned for hours after an incident (e.g. a node
+    /// losing its disk) without the root interaction ever being fully isolated.
+    /// This pass acts directly on freshly-verified presence each time it runs,
+    /// rather than depending on that pipeline, so it reconciles phantoms even when
+    /// the other path stalls.
+    pub async fn run_phantom_reconciliation_pass(&self) {
+        if !self.cluster.is_leader().await {
+            return;
+        }
+
+        let all_nodes = self.cluster.get_all_nodes().await;
+        let total_nodes = all_nodes.len();
+        let online_nodes: Vec<_> = all_nodes.iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online)
+            .cloned()
+            .collect();
+        let nodes_down = total_nodes.saturating_sub(online_nodes.len());
+
+        let grace_elapsed = self.cluster.time_since_became_leader().await
+            .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+
+        if nodes_down > 1 || !grace_elapsed {
+            debug!("Phantom reconciliation: skipping — nodes_down={} grace_elapsed={}", nodes_down, grace_elapsed);
+            return;
+        }
+
+        let local_id = self.cluster.local_node_id();
+
+        // Full streaming scan of CHUNK_TABLE, restricted to chunks referenced by a
+        // live file (same liveness source as the deep discovery scan) with more
+        // than one listed node — a single-node record can't have a "phantom" to
+        // prune without risking stranding the chunk at zero replicas.
+        let metadata = self.metadata.clone();
+        let scan_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ChunkLocation>> {
+            let live = metadata.live_chunk_ids()?;
+            let mut chunks = Vec::new();
+            metadata.scan_chunk_locations(|loc| {
+                if live.contains(&loc.chunk_id) && loc.nodes.len() > 1 {
+                    chunks.push(loc);
+                }
+                true
+            })?;
+            Ok(chunks)
+        }).await;
+
+        let chunks_to_check = match scan_result {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => { warn!("Phantom reconciliation: scan error: {}", e); return; }
+            Err(e) => { warn!("Phantom reconciliation: scan panicked: {}", e); return; }
+        };
+
+        if chunks_to_check.is_empty() {
+            return;
+        }
+
+        info!("Phantom reconciliation: verifying presence for {} chunks", chunks_to_check.len());
+
+        // Build per-node assignment, scoped like the discovery pass — each node is
+        // only asked about chunks it's actually listed for.
+        let mut node_assigned: HashMap<NodeId, Vec<ChunkId>> = HashMap::new();
+        for loc in &chunks_to_check {
+            for &node_id in &loc.nodes {
+                node_assigned.entry(node_id).or_default().push(loc.chunk_id);
+            }
+        }
+
+        let mut node_chunk_presence: HashMap<NodeId, HashSet<ChunkId>> = HashMap::new();
+
+        // Local presence check: up to tens of thousands of has_chunk() stat calls.
+        // Must run in spawn_blocking — doing this inline on the async runtime blocks
+        // a tokio worker thread with no yield points, the same class of bug fixed
+        // in 67b4d12 for synchronous metadata writes. Running it inline here froze
+        // the leader for ~2.5 hours with zero log output (incident: 2026-06-20).
+        if let Some(assigned) = node_assigned.get(&local_id) {
+            let storage = self.storage.clone();
+            let assigned = assigned.clone();
+            let local_set = tokio::task::spawn_blocking(move || {
+                let mut set = HashSet::new();
+                for chunk_id in &assigned {
+                    if storage.has_chunk(chunk_id) {
+                        set.insert(*chunk_id);
+                    }
+                }
+                set
+            }).await;
+            match local_set {
+                Ok(set) => { node_chunk_presence.insert(local_id, set); }
+                Err(e) => warn!("Phantom reconciliation: local presence check panicked: {}", e),
+            }
+        }
+
+        for node_info in &online_nodes {
+            if node_info.id == local_id {
+                continue;
+            }
+            if !self.cluster.is_leader().await {
+                debug!("Phantom reconciliation: leadership changed mid-scan — aborting");
+                return;
+            }
+            let assigned = match node_assigned.get(&node_info.id) {
+                Some(ids) if !ids.is_empty() => ids.clone(),
+                _ => continue,
+            };
+            let request = Request::HasChunks { chunk_ids: assigned.clone() };
+            match self.client.send_message(node_info.addr, Message::Request(request)).await {
+                Ok(envelope) => {
+                    if let Message::Response(Response::BoolVec { values }) = envelope.message {
+                        let mut present = HashSet::new();
+                        for (chunk_id, has) in assigned.iter().zip(values.iter()) {
+                            if *has {
+                                present.insert(*chunk_id);
+                            }
+                        }
+                        node_chunk_presence.insert(node_info.id, present);
+                    } else {
+                        warn!("Phantom reconciliation: unexpected response to HasChunks from node {}", node_info.id);
+                    }
+                }
+                Err(e) => {
+                    // RPC failure means "unknown," not "missing" — the node is simply
+                    // excluded from node_chunk_presence and treated as unverified below.
+                    debug!("Phantom reconciliation: HasChunks failed for node {} ({}): skipping node this pass", node_info.id, e);
+                }
+            }
+        }
+
+        let mut to_heal: Vec<ChunkId> = Vec::new();
+        let mut db_puts: Vec<ChunkLocation> = Vec::new();
+        let mut broadcasts: Vec<ChunkLocation> = Vec::new();
+
+        for loc in chunks_to_check {
+            let mut confirmed_present: Vec<NodeId> = Vec::new();
+            let mut confirmed_missing: Vec<NodeId> = Vec::new();
+
+            for &node_id in &loc.nodes {
+                // Only a verdict we actually obtained this pass counts — an offline
+                // node or one whose HasChunks RPC failed is "unknown," never "missing."
+                if let Some(present_set) = node_chunk_presence.get(&node_id) {
+                    if present_set.contains(&loc.chunk_id) {
+                        confirmed_present.push(node_id);
+                    } else {
+                        confirmed_missing.push(node_id);
+                    }
+                }
+            }
+
+            // Never strand a chunk at zero replicas — only prune when at least one
+            // other listed node is confirmed to actually hold it.
+            if confirmed_missing.is_empty() || confirmed_present.is_empty() {
+                continue;
+            }
+
+            let pruned_nodes: Vec<NodeId> = loc.nodes.iter()
+                .filter(|n| !confirmed_missing.contains(n))
+                .copied()
+                .collect();
+
+            warn!("Phantom reconciliation: chunk {} — pruning {} confirmed-absent node(s): {:?}",
+                loc.chunk_id, confirmed_missing.len(), confirmed_missing);
+
+            let updated = ChunkLocation {
+                chunk_id: loc.chunk_id,
+                nodes: pruned_nodes,
+                size: loc.size,
+                checksum: loc.checksum,
+                file_offset: loc.file_offset,
+                written_at: Some(Self::now_ms()),
+                client_write_seq: None,
+                file_id: loc.file_id,
+            };
+
+            if confirmed_present.len() < self.replication_factor {
+                to_heal.push(loc.chunk_id);
+            }
+
+            db_puts.push(updated.clone());
+            broadcasts.push(updated);
+        }
+
+        let pruned_count = db_puts.len();
+
+        if !db_puts.is_empty() {
+            let metadata = Arc::clone(&self.metadata);
+            let puts = db_puts;
+            let result = tokio::task::spawn_blocking(move || {
+                metadata.batch_update_chunk_locations(&puts, &[])
+            }).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Phantom reconciliation: batch metadata update failed: {}", e),
+                Err(e) => warn!("Phantom reconciliation: batch update spawn_blocking panicked: {}", e),
+            }
+        }
+
+        for loc in &broadcasts {
+            Self::broadcast_chunk_location_shared(loc, &self.cluster, &self.client).await;
+        }
+
+        if !to_heal.is_empty() {
+            info!("Phantom reconciliation: {} chunk(s) now under RF after pruning — queuing for immediate healing", to_heal.len());
+            self.queue_chunks_immediate(to_heal).await;
+        }
+
+        if pruned_count > 0 {
+            info!("Phantom reconciliation: pass complete — {} chunk(s) corrected", pruned_count);
+        } else {
+            debug!("Phantom reconciliation: pass complete — no phantoms found");
+        }
+    }
+
+    /// Background loop for run_phantom_reconciliation_pass(). Runs on a fixed
+    /// interval (default 10 minutes, DFS_PHANTOM_RECONCILE_INTERVAL_SECS override)
+    /// regardless of the discovery loop's own cadence.
+    async fn run_phantom_reconciliation_loop(&self) {
+        let interval_secs = std::env::var("DFS_PHANTOM_RECONCILE_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(600);
+        let mut timer = interval(Duration::from_secs(interval_secs));
+        timer.tick().await; // skip immediate first tick — let the cluster settle on startup
+        loop {
+            timer.tick().await;
+            self.run_phantom_reconciliation_pass().await;
+        }
     }
 
     pub async fn run_disk_orphan_sweep(&self) {
@@ -893,14 +1137,28 @@ impl HealingManager {
         let mut rpc_failed_nodes: HashSet<NodeId> = HashSet::new();
 
         // Local node: check storage directly (no network hop).
+        // Must run in spawn_blocking — on a deep cycle `assigned` can be tens of
+        // thousands of entries, and doing that many has_chunk() stat calls inline
+        // on the async runtime blocks a tokio worker thread with no yield points
+        // (the same class of bug fixed in 67b4d12 for synchronous metadata writes;
+        // this copy of the pattern froze the leader for ~2.5 hours with zero log
+        // output — incident 2026-06-20).
         if let Some(assigned) = node_assigned.get(&local_id) {
-            let mut local_set = HashSet::new();
-            for chunk_id in assigned {
-                if self.storage.has_chunk(chunk_id) {
-                    local_set.insert(*chunk_id);
+            let storage = self.storage.clone();
+            let assigned = assigned.clone();
+            let local_set = tokio::task::spawn_blocking(move || {
+                let mut set = HashSet::new();
+                for chunk_id in &assigned {
+                    if storage.has_chunk(chunk_id) {
+                        set.insert(*chunk_id);
+                    }
                 }
+                set
+            }).await;
+            match local_set {
+                Ok(set) => { node_chunk_presence.insert(local_id, set); }
+                Err(e) => warn!("Discovery pass: local presence check panicked: {}", e),
             }
-            node_chunk_presence.insert(local_id, local_set);
         }
 
         // Remote nodes: one HasChunks RPC each, scoped to that node's assignments.

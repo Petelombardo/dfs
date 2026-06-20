@@ -106,6 +106,11 @@ enum HealingCommands {
     /// (age grace, two-pass confirmation, leader cross-check or all-nodes-stability)
     /// still applies; this only skips the wait between scheduled cycles.
     Cleanup,
+    /// Trigger an immediate phantom-replica reconciliation pass (leader-only):
+    /// verifies actual presence on every listed node for every live chunk and
+    /// prunes confirmed-absent ones, queuing under-RF results for immediate
+    /// healing. Runs automatically every 10 minutes; this skips the wait.
+    Reconcile,
 }
 
 #[derive(Subcommand)]
@@ -674,6 +679,23 @@ async fn handle_healing_command(
                         eprintln!("{}: error — {}", addr, message);
                     }
                     _ => {}
+                }
+            }
+        }
+        HealingCommands::Reconcile => {
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, Request::TriggerPhantomReconciliation).await?;
+
+            match response {
+                Response::Ok { .. } => {
+                    println!("Phantom reconciliation triggered on leader ({})", leader);
+                }
+                Response::Error { message, .. } => {
+                    error!("Error: {}", message);
+                    anyhow::bail!("Command failed: {}", message);
+                }
+                _ => {
+                    anyhow::bail!("Unexpected response type");
                 }
             }
         }

@@ -545,6 +545,19 @@ pub enum Request {
     /// Request per-node ops/sec statistics (reads, writes, metadata).
     /// Returns NodeStats. Safe to call on any node at any time.
     GetNodeStats,
+
+    /// Trigger an immediate phantom-replica reconciliation pass: verifies actual
+    /// presence on every listed node for every live chunk and prunes confirmed-
+    /// absent ones, queuing under-RF results for immediate healing. Independent
+    /// of the normal discovery cadence — see run_phantom_reconciliation_pass.
+    /// Appended at the end of the enum, not inserted mid-list: Request/Response
+    /// use plain derive(Serialize, Deserialize) with no explicit tag, so bincode
+    /// encodes variants by positional index — inserting a variant in the middle
+    /// shifts every later variant's wire index and breaks compatibility with any
+    /// peer running a binary built before the insertion (see incident: gluster1
+    /// healing recovery, 2026-06-20, where this exact mistake corrupted
+    /// GetFileChunkMap on the wire for an unrebuilt client).
+    TriggerPhantomReconciliation,
 }
 
 /// Response types

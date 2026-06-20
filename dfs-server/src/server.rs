@@ -6210,9 +6210,19 @@ impl Server {
     /// information (healer moved/expanded the set) but never regress the count
     /// inline already knows about.
     fn resolve_chunk_nodes(inline: &ChunkLocation, sled_loc: ChunkLocation) -> ChunkLocation {
+        // A bare single-node self-registration (e.g. a node that just restarted) can
+        // race a multi-node RCL that hasn't landed yet; both end up with the same
+        // written_at=now, so timestamp alone can't tell them apart — that's the
+        // narrow case this guard exists to reject (T38). But a sled record with
+        // more than one node is always a deliberate multi-party result (healer
+        // prune/heal/trim, or a patch's confirmed replica set), never an
+        // incomplete self-registration — trust it even when it has fewer nodes
+        // than the stale inline count. Rejecting on raw count alone was masking
+        // real ghost-prunes and newly-patched under-replicated chunks behind a
+        // falsely-healthy display.
         match sled_loc.written_at {
             Some(ts) if ts >= inline.written_at.unwrap_or(0)
-                && sled_loc.nodes.len() >= inline.nodes.len() =>
+                && (sled_loc.nodes.len() >= inline.nodes.len() || sled_loc.nodes.len() > 1) =>
             {
                 ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
             }
@@ -7150,6 +7160,46 @@ mod tests {
         assert_eq!(resolved.nodes, vec![node_a, node_b],
             "a stamped CHUNK_TABLE self-registration with FEWER nodes than the durable \
              inline record must not regress the reported replica count");
+    }
+
+    #[test]
+    /// A multi-node CHUNK_TABLE record with fewer nodes than inline is a deliberate
+    /// result (healer ghost-prune, or a patch's confirmed replica set) — never a bare
+    /// self-registration — and must be trusted even though it shrinks the count.
+    /// Without this, a correctly-pruned ghost or a newly-patched under-replicated
+    /// chunk keeps reporting the old (larger, partly-dead) node list forever.
+    fn test_resolve_chunk_nodes_multi_node_smaller_chunk_table_is_trusted() {
+        let hash = compute_chunk_hash(b"chunk-data-ghost-pruned");
+        let chunk_id = ChunkId::from_hash(hash);
+
+        let node_a = NodeId::new();
+        let node_b = NodeId::new();
+        let node_ghost = NodeId::new();
+
+        // Inline: the write-time snapshot, still listing the now-confirmed-ghost node.
+        let inline = ChunkLocation {
+            chunk_id,
+            nodes: vec![node_a, node_b, node_ghost],
+            size: 65536,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: Some(1_000),
+            client_write_seq: Some(1),
+            file_id: None,
+        };
+
+        // CHUNK_TABLE: healer pruned node_ghost after confirming it doesn't hold the
+        // chunk. Two real nodes — a deliberate multi-party result, not a self-registration.
+        let sled_loc = ChunkLocation {
+            nodes: vec![node_a, node_b],
+            written_at: Some(2_000),
+            ..inline.clone()
+        };
+
+        let resolved = Server::resolve_chunk_nodes(&inline, sled_loc);
+        assert_eq!(resolved.nodes, vec![node_a, node_b],
+            "a fresher CHUNK_TABLE record with >1 nodes must win even when it has \
+             fewer nodes than inline — that shrinkage is the whole point of pruning");
     }
 }
 

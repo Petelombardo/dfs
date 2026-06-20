@@ -506,40 +506,49 @@ impl HealingManager {
                 // the chunk exists somewhere — we must also verify this node is
                 // still listed.  A stale local copy where loc.nodes = [other, nodes]
                 // is an orphan that DeleteChunk RPCs should have cleaned up but didn't.
-                let is_ours = match metadata.get_chunk_location(chunk_id) {
-                    Ok(Some(loc)) => loc.nodes.contains(&local_node_id),
-                    Ok(None) => false,
+                let loc_record = match metadata.get_chunk_location(chunk_id) {
+                    Ok(v) => v,
                     Err(e) => {
                         debug!("Disk orphan sweep: routing table error for {}: {}", chunk_id, e);
                         continue;
                     }
                 };
 
-                if !is_ours {
-                    // Not our chunk (missing entry or our node not listed).
-                    // Apply grace period so we don't race with in-flight writes that
-                    // haven't had their routing entry committed yet.
-                    let age_secs = storage.get_chunk_mtime(chunk_id)
-                        .map(|mtime| now_secs.saturating_sub(mtime))
-                        .unwrap_or(u64::MAX);
+                // Ok(Some(loc)) that explicitly excludes us: the routing table is
+                // authoritative and confidently says this chunk belongs elsewhere.
+                // Safe to age-grace-delete locally without a cluster round trip.
+                if let Some(loc) = &loc_record {
+                    if !loc.nodes.contains(&local_node_id) {
+                        let age_secs = storage.get_chunk_mtime(chunk_id)
+                            .map(|mtime| now_secs.saturating_sub(mtime))
+                            .unwrap_or(u64::MAX);
 
-                    if age_secs > GRACE_PERIOD_SECS {
-                        if let Err(e) = storage.delete_chunk(chunk_id) {
-                            debug!("Disk orphan sweep: failed to delete {}: {}", chunk_id, e);
+                        if age_secs > GRACE_PERIOD_SECS {
+                            if let Err(e) = storage.delete_chunk(chunk_id) {
+                                debug!("Disk orphan sweep: failed to delete {}: {}", chunk_id, e);
+                            } else {
+                                debug!("Disk orphan sweep: deleted local orphan {}", chunk_id);
+                                deleted += 1;
+                            }
                         } else {
-                            debug!("Disk orphan sweep: deleted local orphan {}", chunk_id);
-                            deleted += 1;
+                            too_recent += 1;
                         }
-                    } else {
-                        too_recent += 1;
+                        continue;
                     }
-                    continue;
                 }
 
-                // Still routed to us. Check the second, independent leak: no live file
-                // references this chunk_id at all (e.g. a patch-superseded chunk whose
-                // routing entry was deliberately left in place for this sweep).
-                if live_chunks.contains(chunk_id) {
+                // Either still routed to us (Some(loc) containing us), or Ok(None) —
+                // no location record at all. A bare `None` is NOT proof the chunk is
+                // dead: it just as easily means this node's local metadata hasn't
+                // caught up (e.g. after a leadership change or a metadata-replication
+                // backlog) while the chunk is still legitimately live elsewhere.
+                // Treating a bare absence as a confirmed orphan caused real data loss —
+                // a node whose metadata fell behind cannibalized its entire chunk store
+                // because every chunk looked unassigned locally. Route both cases
+                // through the same leader-confirm + cluster-stability gate used below
+                // for "no live file references this chunk", instead of deleting on
+                // local age alone.
+                if loc_record.is_some() && live_chunks.contains(chunk_id) {
                     kept += 1;
                     continue;
                 }

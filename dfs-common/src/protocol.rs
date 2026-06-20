@@ -558,6 +558,15 @@ pub enum Request {
     /// healing recovery, 2026-06-20, where this exact mistake corrupted
     /// GetFileChunkMap on the wire for an unrebuilt client).
     TriggerPhantomReconciliation,
+
+    /// Debug: return CHUNK_TABLE's raw stored ChunkLocation for a chunk_id, with no
+    /// inline-merge or resolve_chunk_nodes fallback applied — the only way to see
+    /// ground truth when the merged view (file info, GetFileChunkMap) is suspected
+    /// of masking what's actually persisted. Added 2026-06-20 while chasing a chunk
+    /// that never appeared in any healer log despite being queued for healing twice.
+    DebugGetRawChunkLocation {
+        chunk_id: ChunkId,
+    },
 }
 
 /// Response types
@@ -823,6 +832,12 @@ pub enum Response {
         /// Maximum allowed inbound TCP connections.
         #[serde(default)]
         max_connections: u64,
+    },
+
+    /// Response to DebugGetRawChunkLocation. `location` is None if CHUNK_TABLE has
+    /// no record at all for the requested chunk_id.
+    DebugRawChunkLocation {
+        location: Option<ChunkLocation>,
     },
 }
 

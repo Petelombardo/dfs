@@ -125,6 +125,13 @@ enum FileCommands {
         /// Chunk ID (hex string)
         chunk_id: String,
     },
+    /// Debug: show CHUNK_TABLE's raw stored record for a chunk_id on every node, with
+    /// no inline-merge/resolve_chunk_nodes fallback — ground truth when `file info`'s
+    /// merged view is suspected of masking what's actually persisted.
+    RawLocation {
+        /// Chunk ID (hex string)
+        chunk_id: String,
+    },
     /// List all files in metadata database
     List,
     /// Purge file metadata from database (without deleting chunks). Accepts path or UUID.
@@ -832,6 +839,23 @@ async fn handle_file_command(
             }
             if !found {
                 println!("Chunk {} not found in any file's metadata.", chunk_id);
+            }
+        }
+        FileCommands::RawLocation { chunk_id } => {
+            let cid = parse_chunk_id(&chunk_id)?;
+            for &addr in cluster_addrs {
+                let response = send_request(addr, Request::DebugGetRawChunkLocation { chunk_id: cid }).await;
+                match response {
+                    Ok(Response::DebugRawChunkLocation { location: Some(loc) }) => {
+                        println!("{}: nodes={:?} size={} written_at={:?} client_write_seq={:?} file_id={:?}",
+                            addr, loc.nodes, loc.size, loc.written_at, loc.client_write_seq, loc.file_id);
+                    }
+                    Ok(Response::DebugRawChunkLocation { location: None }) => {
+                        println!("{}: no CHUNK_TABLE record", addr);
+                    }
+                    Ok(other) => println!("{}: unexpected response {:?}", addr, other),
+                    Err(e) => println!("{}: request failed — {}", addr, e),
+                }
             }
         }
         FileCommands::List => {

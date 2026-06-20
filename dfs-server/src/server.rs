@@ -1499,6 +1499,10 @@ impl Server {
             Request::DisableHealing => self.handle_disable_healing().await,
             Request::TriggerHealing => self.handle_trigger_healing().await,
             Request::TriggerPhantomReconciliation => self.handle_trigger_phantom_reconciliation().await,
+            Request::DebugGetRawChunkLocation { chunk_id } => {
+                let location = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
+                Response::DebugRawChunkLocation { location }
+            }
             Request::TriggerMetadataRepair => self.handle_trigger_metadata_repair().await,
             Request::QueryChunkSizes { chunk_ids } => self.handle_query_chunk_sizes(chunk_ids).await,
             Request::HealFile { path } => self.handle_heal_file(path).await,
@@ -2416,11 +2420,23 @@ impl Server {
                     }
                 }
                 merged
-            } else if incoming_count > existing_count {
-                location.nodes.clone()
-            } else if incoming_count < rf && existing_count >= rf {
+            } else if existing_count >= rf {
+                // Existing already meets target. A bare self-report (this handler's
+                // only caller, push_locations_to) can't distinguish "stale, hasn't
+                // caught up to a ghost-prune yet" from "legitimately expanded" — it's
+                // just one node's local view. Keep existing rather than trusting a
+                // stale-but-larger incoming count: this used to take incoming whenever
+                // incoming_count > existing_count, which let a follower's outdated
+                // self-report revert the healer's own ghost-prune the moment it ran
+                // (the healer's authoritative paths write CHUNK_TABLE directly via
+                // put_chunk_location, bypassing this merge entirely — a real change
+                // always lands through there, never through here).
+                continue;
+            } else if incoming_count < rf {
                 continue; // stale early-write — skip
             } else {
+                // existing_count < rf and incoming_count >= rf: incoming brings the
+                // chunk up to target — accept it.
                 location.nodes.clone()
             };
             let merged = ChunkLocation {
@@ -2640,9 +2656,30 @@ impl Server {
         // A tombstoned chunk must not be reported as present — the healer would
         // otherwise select this node as a source and replicate the old chunk_id
         // back to the two dual-RF patched replicas before metadata is committed.
-        let values = chunk_ids.iter()
-            .map(|id| !self.chunk_tombstones.contains(id) && self.storage.has_chunk(id))
-            .collect();
+        //
+        // Bulk discovery/reconciliation scans send a node its entire assignment in
+        // one request — tens of thousands of chunk_ids at cluster scale. One
+        // list_chunks() directory walk plus HashSet lookups is far cheaper than
+        // that many individual has_chunk() stat() calls, and (like the per-chunk
+        // loop this replaced) still runs in spawn_blocking since it's real disk
+        // I/O — running it inline on the async runtime blocks a tokio worker
+        // thread with no yield points (the same class of bug fixed in 67b4d12 and
+        // in run_phantom_reconciliation_pass / the deep discovery scan), this time
+        // on the *receiving* end, where it can stall the responding node and make
+        // the caller's RPC look hung.
+        let storage = self.storage.clone();
+        let tombstones = self.chunk_tombstones.clone();
+        let values = tokio::task::spawn_blocking(move || {
+            let present: std::collections::HashSet<ChunkId> = storage.list_chunks()
+                .map(|v| v.into_iter().collect())
+                .unwrap_or_default();
+            chunk_ids.iter()
+                .map(|id| !tombstones.contains(id) && present.contains(id))
+                .collect()
+        }).await.unwrap_or_else(|e| {
+            warn!("handle_has_chunks: spawn_blocking panicked: {}", e);
+            Vec::new()
+        });
         Response::BoolVec { values }
     }
 
@@ -6229,23 +6266,26 @@ impl Server {
     /// information (healer moved/expanded the set) but never regress the count
     /// inline already knows about.
     fn resolve_chunk_nodes(inline: &ChunkLocation, sled_loc: ChunkLocation) -> ChunkLocation {
-        // A bare single-node self-registration (e.g. a node that just restarted) can
-        // race a multi-node RCL that hasn't landed yet; both end up with the same
-        // written_at=now, so timestamp alone can't tell them apart — that's the
-        // narrow case this guard exists to reject (T38). But a sled record with
-        // more than one node is always a deliberate multi-party result (healer
-        // prune/heal/trim, or a patch's confirmed replica set), never an
-        // incomplete self-registration — trust it even when it has fewer nodes
-        // than the stale inline count. Rejecting on raw count alone was masking
-        // real ghost-prunes and newly-patched under-replicated chunks behind a
-        // falsely-healthy display.
-        match sled_loc.written_at {
-            Some(ts) if ts >= inline.written_at.unwrap_or(0)
-                && (sled_loc.nodes.len() >= inline.nodes.len() || sled_loc.nodes.len() > 1) =>
-            {
-                ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
-            }
-            _ => inline.clone(),
+        // A bare single-node self-registration (e.g. a node that just restarted) is
+        // the only case that needs disambiguating from a genuine durable record —
+        // that's the narrow case this guard exists to reject (T38). A sled record
+        // with more than one node is always a deliberate multi-party result (healer
+        // prune/heal/trim, or a patch's confirmed replica set), never an incomplete
+        // self-registration — trust it even when it has fewer nodes than the stale
+        // inline count.
+        //
+        // Deliberately NOT timestamp-gated. inline.written_at is the whole FILE's
+        // last-save time, not a per-chunk freshness signal — any write to a
+        // *different* chunk in the same file re-saves the file's full metadata and
+        // re-stamps every other chunk's inline written_at to "now," even though its
+        // node list is untouched. That let an unrelated later write permanently mask
+        // a real, correct ghost-prune behind a stale inline display forever
+        // (incident 2026-06-20: a chunk pruned to 3 real nodes kept showing the
+        // pruned ghost because a sibling chunk's write happened 221ms later).
+        if sled_loc.nodes.len() > 1 || sled_loc.nodes.len() >= inline.nodes.len() {
+            ChunkLocation { nodes: sled_loc.nodes, ..inline.clone() }
+        } else {
+            inline.clone()
         }
     }
 
@@ -6989,6 +7029,98 @@ mod tests {
             }
             other => panic!("expected FileChunkMap response, got {:?}", other),
         }
+    }
+
+    /// handle_replicate_chunk_locations (the batch self-report path a follower uses
+    /// to periodically push its own locally-held chunk locations to the leader) must
+    /// not let a stale, larger incoming node list overwrite an already-healthy
+    /// existing record. Without this, the healer's own ghost-prune gets reverted the
+    /// moment a follower's next periodic self-report lands, because that follower's
+    /// local CHUNK_TABLE hasn't caught up to the prune yet — incident 2026-06-20,
+    /// where a confirmed-ghost-pruned chunk kept reappearing with the ghost back in
+    /// its node list every cycle.
+    #[tokio::test]
+    async fn test_replicate_chunk_locations_batch_does_not_revert_healthy_prune() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+
+        let file_id = dfs_common::FileId::new();
+        let hash = compute_chunk_hash(b"chunk-data-ghost-pruned-batch");
+        let chunk_id = ChunkId::from_hash(hash);
+
+        let node_a = NodeId::new();
+        let node_b = NodeId::new();
+        let node_c = NodeId::new();
+        let ghost = NodeId::new(); // confirmed-absent, already pruned by the healer
+
+        // FILE_TABLE: the chunk must be "live" or the batch handler rejects it as a
+        // stale orphan before the merge logic is even reached.
+        let file_meta = dfs_common::FileMetadata {
+            id: file_id,
+            path: "/test-file".to_string(),
+            size: 65536,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            file_type: dfs_common::FileType::RegularFile,
+            created_at: 0,
+            modified_at: 0,
+            write_seq: 1,
+            chunk_locations: vec![ChunkLocation {
+                chunk_id,
+                nodes: vec![node_a, node_b, node_c],
+                size: 65536,
+                checksum: hash,
+                file_offset: Some(0),
+                written_at: None,
+                client_write_seq: None,
+                file_id: None,
+            }],
+        };
+        server.metadata.put_file(&file_meta).unwrap();
+
+        // Existing CHUNK_TABLE record: already healthy at RF=3, ghost already pruned.
+        server.metadata.put_chunk_location(&ChunkLocation {
+            chunk_id,
+            nodes: vec![node_a, node_b, node_c],
+            size: 65536,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: Some(2_000),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // Incoming batch self-report: a follower's stale local copy, still including
+        // the ghost, larger than the existing (already-healthy) record.
+        let stale_incoming = ChunkLocation {
+            chunk_id,
+            nodes: vec![node_a, node_b, node_c, ghost],
+            size: 65536,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: Some(1_000), // older than existing — also stale by timestamp
+            client_write_seq: None,
+            file_id: Some(file_id),
+        };
+
+        let response = server.handle_replicate_chunk_locations(vec![stale_incoming]).await;
+        assert!(matches!(response, Response::Ok { .. }), "expected Ok, got {:?}", response);
+
+        let resolved = server.metadata.get_chunk_location(&chunk_id).unwrap().unwrap();
+        assert_eq!(resolved.nodes, vec![node_a, node_b, node_c],
+            "a stale, larger batch self-report must not revert an already-healthy \
+             (>= RF) CHUNK_TABLE record — the ghost must stay pruned");
     }
 
     #[tokio::test]

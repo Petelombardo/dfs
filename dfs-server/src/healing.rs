@@ -97,6 +97,15 @@ pub struct HealingManager {
     /// Per-transfer timeout for a single PushChunkTo (seconds). On expiry the chunk
     /// stays in pending (retried next drain tick) and the semaphore slot is released.
     heal_transfer_timeout_secs: u64,
+
+    /// Guards run_phantom_reconciliation_pass against overlapping itself — the
+    /// periodic loop and a manual `dfs-admin healing reconcile` trigger can land
+    /// close enough together to both be mid-scan at once. Each concurrent pass
+    /// doubles the per-node HasChunks fan-out; piling up unbounded overlaps is
+    /// exactly the kind of compounding load that turned a single slow node into
+    /// the leader freeze on 2026-06-20. A second pass now logs and exits instead
+    /// of running alongside the first.
+    phantom_reconcile_in_progress: std::sync::atomic::AtomicBool,
 }
 
 impl HealingManager {
@@ -174,6 +183,7 @@ impl HealingManager {
             stalled_healing: Arc::new(RwLock::new(HashSet::new())),
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
             heal_transfer_timeout_secs,
+            phantom_reconcile_in_progress: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -460,6 +470,29 @@ impl HealingManager {
     /// rather than depending on that pipeline, so it reconciles phantoms even when
     /// the other path stalls.
     pub async fn run_phantom_reconciliation_pass(&self) {
+        use std::sync::atomic::Ordering;
+        if self.phantom_reconcile_in_progress.compare_exchange(
+            false, true, Ordering::AcqRel, Ordering::Relaxed,
+        ).is_err() {
+            warn!("Phantom reconciliation: previous pass is still running — skipping this trigger \
+                   instead of running alongside it (overlapping passes compound RPC load on every node)");
+            return;
+        }
+
+        // RAII guard: clears the in-progress flag on every exit path from the inner
+        // pass, including early returns and a panic unwind, not just the happy path.
+        struct ResetGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for ResetGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _guard = ResetGuard(&self.phantom_reconcile_in_progress);
+
+        self.run_phantom_reconciliation_pass_inner().await;
+    }
+
+    async fn run_phantom_reconciliation_pass_inner(&self) {
         if !self.cluster.is_leader().await {
             return;
         }
@@ -522,26 +555,22 @@ impl HealingManager {
 
         let mut node_chunk_presence: HashMap<NodeId, HashSet<ChunkId>> = HashMap::new();
 
-        // Local presence check: up to tens of thousands of has_chunk() stat calls.
-        // Must run in spawn_blocking — doing this inline on the async runtime blocks
-        // a tokio worker thread with no yield points, the same class of bug fixed
-        // in 67b4d12 for synchronous metadata writes. Running it inline here froze
-        // the leader for ~2.5 hours with zero log output (incident: 2026-06-20).
-        if let Some(assigned) = node_assigned.get(&local_id) {
+        // Local presence check: one recursive directory walk of the chunk store
+        // (list_chunks(), the same bulk crawl run_disk_orphan_sweep already uses)
+        // instead of tens of thousands of individual has_chunk() stat() calls — a
+        // sequential directory read is far cheaper than that many scattered random
+        // lookups, and it still must run in spawn_blocking since it's real disk I/O
+        // (the inline version of the per-chunk loop froze the leader for ~2.5 hours
+        // with zero log output — incident 2026-06-20).
+        if node_assigned.contains_key(&local_id) {
             let storage = self.storage.clone();
-            let assigned = assigned.clone();
             let local_set = tokio::task::spawn_blocking(move || {
-                let mut set = HashSet::new();
-                for chunk_id in &assigned {
-                    if storage.has_chunk(chunk_id) {
-                        set.insert(*chunk_id);
-                    }
-                }
-                set
+                storage.list_chunks().map(|v| v.into_iter().collect::<HashSet<_>>())
             }).await;
             match local_set {
-                Ok(set) => { node_chunk_presence.insert(local_id, set); }
-                Err(e) => warn!("Phantom reconciliation: local presence check panicked: {}", e),
+                Ok(Ok(set)) => { node_chunk_presence.insert(local_id, set); }
+                Ok(Err(e)) => warn!("Phantom reconciliation: local chunk listing failed: {}", e),
+                Err(e) => warn!("Phantom reconciliation: local chunk listing panicked: {}", e),
             }
         }
 
@@ -558,8 +587,16 @@ impl HealingManager {
                 _ => continue,
             };
             let request = Request::HasChunks { chunk_ids: assigned.clone() };
-            match self.client.send_message(node_info.addr, Message::Request(request)).await {
-                Ok(envelope) => {
+            // Bounded wait: a node whose own HasChunks handler is slow (e.g. a large
+            // assignment, or it's mid-handling another bulk request) must not be able
+            // to stall this entire pass. A timeout is treated the same as any other
+            // RPC failure below — "unknown," not "missing."
+            const HAS_CHUNKS_TIMEOUT: Duration = Duration::from_secs(30);
+            match tokio::time::timeout(
+                HAS_CHUNKS_TIMEOUT,
+                self.client.send_message(node_info.addr, Message::Request(request)),
+            ).await {
+                Ok(Ok(envelope)) => {
                     if let Message::Response(Response::BoolVec { values }) = envelope.message {
                         let mut present = HashSet::new();
                         for (chunk_id, has) in assigned.iter().zip(values.iter()) {
@@ -572,10 +609,14 @@ impl HealingManager {
                         warn!("Phantom reconciliation: unexpected response to HasChunks from node {}", node_info.id);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     // RPC failure means "unknown," not "missing" — the node is simply
                     // excluded from node_chunk_presence and treated as unverified below.
                     debug!("Phantom reconciliation: HasChunks failed for node {} ({}): skipping node this pass", node_info.id, e);
+                }
+                Err(_) => {
+                    debug!("Phantom reconciliation: HasChunks timed out for node {} after {:?}: skipping node this pass",
+                        node_info.id, HAS_CHUNKS_TIMEOUT);
                 }
             }
         }
@@ -603,6 +644,20 @@ impl HealingManager {
             // Never strand a chunk at zero replicas — only prune when at least one
             // other listed node is confirmed to actually hold it.
             if confirmed_missing.is_empty() || confirmed_present.is_empty() {
+                if !confirmed_missing.is_empty() && confirmed_present.is_empty() {
+                    // We have absences but no confirmations either way for the
+                    // remaining nodes — this is the case that's otherwise silently
+                    // skipped. Surface it: either the safety guard is correctly
+                    // protecting a genuinely at-risk chunk, or something upstream
+                    // (RPC failure, an unverified node) is hiding a real holder.
+                    let unverified: Vec<NodeId> = loc.nodes.iter()
+                        .filter(|n| !confirmed_missing.contains(n))
+                        .copied()
+                        .collect();
+                    warn!("Phantom reconciliation: chunk {} has {} confirmed-absent node(s) {:?} \
+                           but no other listed node confirmed present (unverified: {:?}) — skipping to avoid stranding",
+                        loc.chunk_id, confirmed_missing.len(), confirmed_missing, unverified);
+                }
                 continue;
             }
 
@@ -1137,27 +1192,20 @@ impl HealingManager {
         let mut rpc_failed_nodes: HashSet<NodeId> = HashSet::new();
 
         // Local node: check storage directly (no network hop).
-        // Must run in spawn_blocking — on a deep cycle `assigned` can be tens of
-        // thousands of entries, and doing that many has_chunk() stat calls inline
-        // on the async runtime blocks a tokio worker thread with no yield points
-        // (the same class of bug fixed in 67b4d12 for synchronous metadata writes;
-        // this copy of the pattern froze the leader for ~2.5 hours with zero log
-        // output — incident 2026-06-20).
-        if let Some(assigned) = node_assigned.get(&local_id) {
+        // One recursive directory walk (list_chunks()) instead of tens of thousands
+        // of individual has_chunk() stat() calls on a deep cycle — far cheaper than
+        // that many scattered random lookups, and still run via spawn_blocking since
+        // it's real disk I/O (the inline per-chunk version of this loop froze the
+        // leader for ~2.5 hours with zero log output — incident 2026-06-20).
+        if node_assigned.contains_key(&local_id) {
             let storage = self.storage.clone();
-            let assigned = assigned.clone();
             let local_set = tokio::task::spawn_blocking(move || {
-                let mut set = HashSet::new();
-                for chunk_id in &assigned {
-                    if storage.has_chunk(chunk_id) {
-                        set.insert(*chunk_id);
-                    }
-                }
-                set
+                storage.list_chunks().map(|v| v.into_iter().collect::<HashSet<_>>())
             }).await;
             match local_set {
-                Ok(set) => { node_chunk_presence.insert(local_id, set); }
-                Err(e) => warn!("Discovery pass: local presence check panicked: {}", e),
+                Ok(Ok(set)) => { node_chunk_presence.insert(local_id, set); }
+                Ok(Err(e)) => warn!("Discovery pass: local chunk listing failed: {}", e),
+                Err(e) => warn!("Discovery pass: local chunk listing panicked: {}", e),
             }
         }
 

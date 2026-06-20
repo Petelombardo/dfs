@@ -1623,6 +1623,7 @@ impl FlushHandle {
                     .and_then(|s| s.try_lock().ok()
                         .and_then(|st| st.slots.get(&chunk_idx)
                             .and_then(|sl| sl.server_chunk_id)));
+                let mut recent_write_present = false;
                 let old_location = {
                     let cached_loc = meta.chunk_location_for_idx(chunk_idx).cloned();
                     let recent = self.client.recent_chunk_writes.get(&(ino, chunk_idx))
@@ -1634,6 +1635,7 @@ impl FlushHandle {
                             let (cid, _, _, nodes) = r.value();
                             (*cid, nodes.clone())
                         });
+                    recent_write_present = recent.as_ref().is_some_and(|(_, nodes)| !nodes.is_empty());
                     match (cached_loc, recent) {
                         (Some(mut loc), Some((recent_id, recent_nodes))) => {
                             // Use recent_chunk_writes NODES — these are the 2 nodes we actually
@@ -1697,6 +1699,43 @@ impl FlushHandle {
                     }
                     loc
                 });
+
+                // Without a recent_chunk_writes or canonical_write_nodes override, the
+                // node list above came straight from metadata_cache's raw, cached
+                // FileMetadata.chunk_locations — the same frozen-at-write-time inline
+                // copy that resolve_chunk_nodes corrects for reads (GetFileChunkMap),
+                // but patches never went through that correction. A chunk untouched in
+                // this session (no recent write, no canonical pair yet) can carry a
+                // node list the leader's CHUNK_TABLE has long since pruned a ghost out
+                // of, sending the very first patch of the session at a node that
+                // doesn't hold the chunk. One extra round trip here, only on that first
+                // touch, gets the leader's authoritative current node list before we
+                // commit to a target — every subsequent patch in the session is
+                // protected by recent_chunk_writes/canonical_write_nodes and skips this.
+                let has_session_override = recent_write_present
+                    || self.write_buffers.get(&ino)
+                        .and_then(|s| s.try_lock().ok()
+                            .and_then(|st| st.canonical_write_nodes.get(&chunk_idx).cloned()))
+                        .is_some_and(|nodes| !nodes.is_empty());
+                let old_location = if has_session_override {
+                    old_location
+                } else {
+                    match old_location {
+                        Some(loc) => {
+                            match self.client.get_single_chunk_location(meta.id, chunk_idx).await {
+                                Ok(Some(fresh)) if fresh.chunk_id == loc.chunk_id && fresh.nodes != loc.nodes => {
+                                    info!("flush_buffer_async_one: ino={} chunk={} no session override yet — \
+                                           refreshing node list from leader before first patch this session ({:?} -> {:?})",
+                                        ino, chunk_idx, loc.nodes, fresh.nodes);
+                                    Some(ChunkLocation { nodes: fresh.nodes, ..loc })
+                                }
+                                _ => Some(loc),
+                            }
+                        }
+                        None => None,
+                    }
+                };
+
                 if let Some(old_location) = old_location {
                     // Stale-write guard: if another session already patched this chunk
                     // between our open() and now, the current chunk_id will differ from

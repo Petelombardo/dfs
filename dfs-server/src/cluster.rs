@@ -457,31 +457,37 @@ impl ClusterManager {
         ring.get_primary_node(chunk_id)
     }
 
-    /// Get nodes for chunk with capacity-banded placement.
+    /// Get nodes for chunk with capacity-weighted placement.
     ///
-    /// # Why banded, not sorted
+    /// # Why weighted-random, not sorted or banded
     ///
-    /// Sorting by exact available bytes makes capacity the total ordering key: a node
+    /// Sorting by exact available bytes makes capacity a total ordering key: a node
     /// with even 1 byte more space always beats another, so the hash-based distribution
     /// only fires when capacities are byte-for-byte identical (never in practice).
-    /// Worse, the rotation `(i + seed) % n` only produces CONSECUTIVE pairs in ring
-    /// order — for n=5 RF=2, only 5 of 10 possible pairs are ever selected regardless
-    /// of how uniformly the seed is distributed.
+    ///
+    /// An earlier version of this function bucketed nodes into 10 equal-width bands
+    /// over `[min_avail, max_avail]` and shuffled within each band. That degrades badly
+    /// when one node is an outlier (e.g. a freshly added/wiped node with hundreds of GB
+    /// free while the rest of the cluster is 90%+ full): the band width is dominated by
+    /// the outlier's span, so every other node — even ones with meaningfully different
+    /// free space — collapses into the same bottom band and gets picked with equal
+    /// probability, silently undoing the preference for the relatively emptier ones.
     ///
     /// # Algorithm
     ///
-    /// 1. Exclude nodes with less than 20 GB free — hard veto against ENOSPC; banding
+    /// 1. Exclude nodes with less than 20 GB free — hard veto against ENOSPC; weighting
     ///    handles preference among eligible nodes, so this is a last-resort guard only.
-    /// 2. Bucket remaining nodes into 10 equal-width capacity bands (band 0 = most
-    ///    available, band 9 = least available).  Nodes within the same band are treated
-    ///    as equal for placement purposes.
-    /// 3. Use deterministic Fisher-Yates (seeded from the chunk hash) to shuffle
-    ///    nodes within each band; concatenate bands best-first to form a priority list.
-    /// 4. Take the first `count` nodes.
+    /// 2. Assign each eligible node a weighted-random priority key using Efraimidis-Spirakis
+    ///    weighted sampling without replacement: `key = u^(1/weight)` where `weight` is
+    ///    available GB and `u` is a deterministic pseudo-random value seeded from the
+    ///    chunk hash and node ID. Sorting by key descending yields a list where the
+    ///    probability of ranking first is proportional to available space.
+    /// 3. Take the first `count` nodes.
     ///
-    /// This lets the hash distribute chunks uniformly across all C(n, count) pairs when
-    /// nodes are similarly loaded, while still steering away from nodes that are
-    /// significantly fuller than their peers.
+    /// This both prefers emptier nodes (higher weight -> more likely to rank high) and
+    /// load-balances across nodes with similar free space — since `u` varies per chunk,
+    /// nodes with comparable weight take turns ranking first across many chunks rather
+    /// than one of them winning every single time, the way a strict sort would.
     pub async fn get_nodes_with_capacity_awareness(
         &self,
         chunk_id: &dfs_common::ChunkId,
@@ -547,7 +553,7 @@ impl ClusterManager {
         // Hard veto: skip nodes with less than 20 GB free (absolute, not percentage).
         // Percentage-based thresholds are wrong for large disks — 10% of 932 GB = 93 GB
         // reserved, far more than needed to avoid ENOSPC.  20 GB gives ~5 000 × 4 MB chunks
-        // of headroom as a last-resort guard; banding handles preference among eligible nodes.
+        // of headroom as a last-resort guard; weighting handles preference among eligible nodes.
         const MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
         let eligible: Vec<(NodeId, u64, u64)> = node_caps.iter()
             .filter(|(_, avail, total)| *total == 0 || *avail >= MIN_FREE_BYTES)
@@ -556,7 +562,7 @@ impl ClusterManager {
 
         // If the veto left fewer than `count` nodes, fall back to all nodes sorted by
         // most available — we need to place somewhere even if everything is nearly full.
-        let mut candidates: Vec<(NodeId, u64, u64)> = if eligible.len() >= count {
+        let candidates: Vec<(NodeId, u64, u64)> = if eligible.len() >= count {
             eligible
         } else {
             let mut all = node_caps;
@@ -564,41 +570,30 @@ impl ClusterManager {
             all
         };
 
-        // Compute capacity bands: 10 equal-width buckets spanning [min_avail, max_avail].
-        // Nodes in band 0 are the most available, band 9 the least.
-        let max_avail = candidates.iter().map(|(_, a, _)| *a).max().unwrap_or(1).max(1);
-        let min_avail = candidates.iter().map(|(_, a, _)| *a).min().unwrap_or(0);
-        let band_width = (max_avail - min_avail) / 10 + 1;
+        // Weighted-random priority order: probability of ranking first is proportional
+        // to available space (Efraimidis-Spirakis weighted sampling without replacement).
+        let mut keyed: Vec<(f64, NodeId)> = candidates.iter().map(|(node_id, avail, _)| {
+            let weight_gb = (*avail as f64 / 1_000_000_000.0).max(0.01);
+            let u = Self::seeded_unit_interval(seed, *node_id);
+            (u.powf(1.0 / weight_gb), *node_id)
+        }).collect();
+        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Group nodes by band (0 = best).
-        let mut bands: Vec<Vec<NodeId>> = vec![Vec::new(); 10];
-        for (node_id, avail, _) in &candidates {
-            let band = (max_avail - avail) / band_width;
-            bands[band.min(9) as usize].push(*node_id);
-        }
+        keyed.into_iter().take(count).map(|(_, id)| id).collect()
+    }
 
-        // Deterministic Fisher-Yates shuffle within each band using the chunk seed.
-        // A different multiplier per band so adjacent bands don't correlate.
-        let mut result: Vec<NodeId> = Vec::with_capacity(count);
-        for (band_idx, band) in bands.iter_mut().enumerate() {
-            if band.is_empty() { continue; }
-            let band_seed = seed.wrapping_add(band_idx as u64 * 0x9e3779b97f4a7c15);
-            // Knuth shuffle: for i from len-1 down to 1, swap i with j = hash(i,seed)%i+1
-            let n = band.len();
-            for i in (1..n).rev() {
-                let mix = band_seed.wrapping_mul(i as u64 + 1).wrapping_add(0x517cc1b727220a95);
-                let j = (mix >> 33) as usize % (i + 1);
-                band.swap(i, j);
-            }
-            for node_id in band.iter() {
-                result.push(*node_id);
-                if result.len() == count { return result; }
-            }
-        }
-
-        // Fallback: shouldn't be reached if candidates.len() >= count.
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
-        candidates.into_iter().take(count).map(|(id, _, _)| id).collect()
+    /// Deterministic pseudo-random value in (0, 1), seeded from a chunk hash and a node
+    /// ID. Used to drive weighted-random placement: same chunk + node always yields the
+    /// same value, but different chunks spread their preference across same-weight nodes.
+    fn seeded_unit_interval(seed: u64, node_id: NodeId) -> f64 {
+        let node_bits = u64::from_le_bytes(node_id.0.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
+        let mut x = seed ^ node_bits.wrapping_mul(0x9e3779b97f4a7c15);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51afd7ed558ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+        x ^= x >> 33;
+        ((x >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
     }
 
     /// From a given set of node IDs, return the one with the least available space

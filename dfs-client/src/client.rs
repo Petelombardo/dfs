@@ -4648,32 +4648,40 @@ leader_addr: Arc::new(RwLock::new(None)),
             all
         };
 
-        let max_avail = candidates.iter().map(|(_, a, _)| *a).max().unwrap_or(1).max(1);
-        let min_avail = candidates.iter().map(|(_, a, _)| *a).min().unwrap_or(0);
-        let band_width = (max_avail - min_avail) / 10 + 1;
+        // Weighted-random priority order: probability of ranking first is proportional
+        // to available space (Efraimidis-Spirakis weighted sampling without replacement).
+        // Mirrors the server's get_nodes_with_capacity_awareness in dfs-server/src/cluster.rs —
+        // equal-width banding degrades badly when one node's free space vastly exceeds the
+        // rest (the band width is dominated by the outlier, collapsing the others into the
+        // same bottom band regardless of how differently full they actually are).
+        let mut keyed: Vec<(f64, SocketAddr)> = candidates.iter().map(|(addr, avail, _)| {
+            let weight_gb = (*avail as f64 / 1_000_000_000.0).max(0.01);
+            let u = Self::seeded_unit_interval(seed, *addr);
+            (u.powf(1.0 / weight_gb), *addr)
+        }).collect();
+        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        let mut bands: Vec<Vec<SocketAddr>> = vec![Vec::new(); 10];
-        for (addr, avail, _) in &candidates {
-            let band = ((max_avail - avail) / band_width).min(9) as usize;
-            bands[band].push(*addr);
-        }
+        (keyed[0].1, keyed[1].1)
+    }
 
-        // Fisher-Yates shuffle within each band, then concatenate best-first.
-        let mut priority: Vec<SocketAddr> = Vec::with_capacity(candidates.len());
-        for (band_idx, band) in bands.iter_mut().enumerate() {
-            if band.is_empty() { continue; }
-            let band_seed = seed.wrapping_add(band_idx as u64 * 0x9e3779b97f4a7c15);
-            let n = band.len();
-            for i in (1..n).rev() {
-                let mix = band_seed.wrapping_mul(i as u64 + 1).wrapping_add(0x517cc1b727220a95);
-                let j = (mix >> 33) as usize % (i + 1);
-                band.swap(i, j);
+    /// Deterministic pseudo-random value in (0, 1), seeded from a placement seed and a
+    /// node address. See dfs-server/src/cluster.rs::seeded_unit_interval — same algorithm,
+    /// kept independent since the client has no dependency on dfs-server internals.
+    fn seeded_unit_interval(seed: u64, addr: SocketAddr) -> f64 {
+        let addr_bits = match addr.ip() {
+            std::net::IpAddr::V4(v4) => u32::from(v4) as u64 ^ ((addr.port() as u64) << 32),
+            std::net::IpAddr::V6(v6) => {
+                let octets = v6.octets();
+                u64::from_le_bytes(octets[..8].try_into().unwrap()) ^ (addr.port() as u64)
             }
-            priority.extend_from_slice(band);
-            if priority.len() >= 2 { break; }
-        }
-
-        (priority[0], priority[1])
+        };
+        let mut x = seed ^ addr_bits.wrapping_mul(0x9e3779b97f4a7c15);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51afd7ed558ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+        x ^= x >> 33;
+        ((x >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
     }
 
     /// Write data with synchronous dual-replica replication

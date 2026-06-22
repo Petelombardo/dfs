@@ -726,42 +726,41 @@ dd if=/dev/urandom of="$T/t22_base.bin" bs=1M count=$T22_SIZE_MB 2>/dev/null
 cp "$T/t22_base.bin" "$T22_IMG"
 dfs_sync  # ensure all chunks are flushed and metadata is committed before patches
 
-# Step 2: run N random patches concurrently, measuring total wall time
-echo "  Running $T22_PATCH_COUNT patches ($T22_CONCURRENCY concurrent, ${T22_PATCH_SIZE}B each)..."
-dd if=/dev/urandom of="$T/t22_patch.bin" bs=$T22_PATCH_SIZE count=1 2>/dev/null
+# Step 2: run N concurrent patches, each writing a unique, position-derived tag at a
+# deterministic, non-overlapping offset — not a shared random buffer. This is what
+# makes Step 3 below a real integrity check instead of just an emptiness check: with a
+# shared buffer there's no way to tell whether any individual patch actually landed at
+# the right place, survived concurrent batched metadata updates, or got silently lost —
+# every job's content would look the same either way. With per-job unique content we
+# can verify every one of the 50 regions byte-for-byte after the storm.
+#
+# Offset formula (job is 0-indexed): chunk_idx = job % n_chunks, slot = job / n_chunks,
+# intra = slot * 65536 (well above the 12032B patch size, so adjacent slots in the same
+# chunk never overlap). With 50 jobs / 8 chunks that's at most 7 slots per chunk,
+# 7*65536=458752 — comfortably inside one 4MB chunk.
+echo "  Running $T22_PATCH_COUNT patches ($T22_CONCURRENCY concurrent, ${T22_PATCH_SIZE}B each, unique tagged content)..."
 
 T22_START=$(date +%s%3N)
 
-# Debug: run one patch with visible stderr to capture any error
-python3 -c "
-import sys, os
-img, patch_file = sys.argv[1], sys.argv[2]
-data = open(patch_file,'rb').read()
-fd = os.open(img, os.O_WRONLY)
-os.lseek(fd, 0, 0)
-os.write(fd, data)
-os.close(fd)
-" "$T22_IMG" "$T/t22_patch.bin" 2>&1 | head -3 && echo "  DEBUG: single patch OK" || echo "  DEBUG: single patch FAILED"
-
-# Each job: pick a random 4MB-aligned chunk offset, patch T22_PATCH_SIZE bytes at a
-# random intra-chunk offset. Use dd conv=notrunc so the rest of the chunk is preserved.
+T22_N_CHUNKS=$(( T22_SIZE_MB / 4 ))
 T22_ERRORS=0
-seq 1 $T22_PATCH_COUNT | xargs -P$T22_CONCURRENCY -I{} bash -c '
-    img="$1"; patch="$2"; size_mb="$3"; patch_size="$4"; errfile="$5"
-    # random chunk (0..N-1) then random intra-chunk offset aligned to 4KB
-    chunk=$(( RANDOM % (size_mb / 4) ))
-    intra=$(( (RANDOM % ((4*1024*1024 - patch_size) / 4096)) * 4096 ))
+seq 0 $((T22_PATCH_COUNT-1)) | xargs -P$T22_CONCURRENCY -I{} bash -c '
+    img="$1"; patch_size="$2"; n_chunks="$3"; errfile="$4"; job="$5"
+    chunk=$(( job % n_chunks ))
+    slot=$(( job / n_chunks ))
+    intra=$(( slot * 65536 ))
     byte_off=$(( chunk * 4 * 1024 * 1024 + intra ))
     python3 -c "
 import sys, os
-img, patch_file, byte_off = sys.argv[1], sys.argv[2], int(sys.argv[3])
-data = open(patch_file,\"rb\").read()
+img, byte_off, patch_size, job = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+tag = (\"T22_JOB_%04d_\" % job).encode()
+data = (tag + bytes([job % 256]) * (patch_size - len(tag)))[:patch_size]
 fd = os.open(img, os.O_WRONLY)
 os.lseek(fd, byte_off, 0)
 os.write(fd, data)
 os.close(fd)
-" "$img" "$patch" "$byte_off" 2>>"$errfile" || echo FAIL
-' _ "$T22_IMG" "$T/t22_patch.bin" "$T22_SIZE_MB" "$T22_PATCH_SIZE" "/tmp/t22_py_errors_$$" \
+" "$img" "$byte_off" "$patch_size" "$job" 2>>"$errfile" || echo FAIL
+' _ "$T22_IMG" "$T22_PATCH_SIZE" "$T22_N_CHUNKS" "/tmp/t22_py_errors_$$" {} \
   | grep -c FAIL > /tmp/t22_errors_$$ 2>/dev/null || true
 if [ -s "/tmp/t22_py_errors_$$" ]; then
     echo "  Sample python error: $(head -1 /tmp/t22_py_errors_$$)"
@@ -780,11 +779,47 @@ T22_PER_PATCH_MS=$(( T22_MS / T22_PATCH_COUNT ))
 
 echo "  Throughput: ${T22_PATCH_COUNT} patches in ${T22_MS}ms (~${T22_PER_PATCH_MS}ms/patch)"
 
-# Step 3: read back and verify the image is still consistent (no corruption)
-cp "$T22_IMG" "$T/t22_readback.bin" 2>/dev/null
-[ -s "$T/t22_readback.bin" ] \
-    && check "T22c image readable after patch storm" PASS \
-    || check "T22c image unreadable after patch storm" FAIL
+dfs_sync  # ensure every patch's chunk data AND metadata are durably committed before verifying
+
+# Step 3: byte-for-byte integrity check — recompute each job's expected offset and
+# content with the same formula used to write it, and confirm it's actually there.
+# Catches silent corruption that T22's old "file is non-empty" check could never see:
+# a patch landing at the wrong offset, a dropped/misapplied chunk-location update, or
+# a stale chunk_id being read back instead of the patched one.
+T22_INTEGRITY=$(python3 -c "
+import sys, os
+img, patch_size, n_chunks, patch_count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+mismatches = []
+with open(img, 'rb') as f:
+    for job in range(patch_count):
+        chunk = job % n_chunks
+        slot = job // n_chunks
+        intra = slot * 65536
+        byte_off = chunk * 4 * 1024 * 1024 + intra
+        tag = ('T22_JOB_%04d_' % job).encode()
+        expected = (tag + bytes([job % 256]) * (patch_size - len(tag)))[:patch_size]
+        f.seek(byte_off)
+        actual = f.read(patch_size)
+        if actual != expected:
+            # Identify what's actually there: another job's tag (cross-contamination /
+            # wrong-offset landing) vs non-tag bytes (never patched at all, still base image).
+            actual_tag = actual[:13]
+            looks_like_other_job = actual_tag.startswith(b'T22_JOB_') and actual_tag != tag
+            kind = f'belongs to a DIFFERENT job ({actual_tag!r})' if looks_like_other_job else 'not a T22 tag at all (patch never landed?)'
+            mismatches.append(f'job {job} offset {byte_off}: expected {tag!r}, got {actual[:64]!r} -- {kind}')
+for m in mismatches[:10]:
+    print(m)
+print(len(mismatches))
+" "$T22_IMG" "$T22_PATCH_SIZE" "$T22_N_CHUNKS" "$T22_PATCH_COUNT")
+
+T22_MISMATCH_COUNT=$(echo "$T22_INTEGRITY" | tail -1)
+if [ "$T22_MISMATCH_COUNT" -gt 0 ]; then
+    echo "  Mismatch details:"
+    echo "$T22_INTEGRITY" | head -n -1 | sed 's/^/    /'
+fi
+[ "$T22_MISMATCH_COUNT" -eq 0 ] \
+    && check "T22c all $T22_PATCH_COUNT patched regions verified byte-for-byte after storm" PASS \
+    || check "T22c $T22_MISMATCH_COUNT/$T22_PATCH_COUNT patched regions corrupted after storm" FAIL
 
 rm -f "$T22_IMG" 2>/dev/null || true
 fi # should_run T22

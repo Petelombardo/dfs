@@ -614,6 +614,15 @@ pub struct DfsClient {
     /// synchronously via flush_metadata_sync().
     pub(crate) metadata_queue: Arc<MetadataQueue>,
 
+    /// Pending per-chunk ReplicateChunkLocation notifications, coalesced into batched
+    /// ReplicateChunkLocations RPCs by a background drain task instead of each patch
+    /// sending its own individual RPC. Safe to batch/delay: no caller depends on this
+    /// landing before it proceeds (each just logs+retries today, never branching
+    /// control flow on the outcome), and flush_metadata_sync delivers the file's
+    /// complete, authoritative chunk_locations state at the end of every flush cycle
+    /// regardless — see send_chunk_locations_batched's doc comment.
+    pending_chunk_locations: Arc<tokio::sync::Mutex<Vec<dfs_common::ChunkLocation>>>,
+
     /// Per-file monotonic write sequence counter. Each metadata enqueue increments
     /// the counter for that file_id and stamps it on the metadata before queuing.
     /// Prevents out-of-order dissemination from overwriting newer records with stale ones.
@@ -776,6 +785,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
+            pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             write_seq: Arc::new(DashMap::new()),
             read_write_seq_cache: Arc::new(DashMap::new()),
             read_engines: ReadEngineMap::new(),
@@ -4767,6 +4777,32 @@ leader_addr: Arc::new(RwLock::new(None)),
         Ok(chunk_locations)
     }
 
+    /// Send a batch of chunk locations to the leader in one RPC (ReplicateChunkLocations,
+    /// the plural wire message), with the same 4-attempt exponential-backoff retry shape
+    /// every per-location call site already used individually. Used both directly (where a
+    /// call site already has a Vec<ChunkLocation> in hand) and as the sink for the queued
+    /// single-location call sites (see pending_chunk_locations / its drain task) — either
+    /// way, callers never depend on this succeeding before proceeding: flush_metadata_sync
+    /// delivers the file's complete, authoritative chunk_locations state at the end of every
+    /// flush cycle regardless, so this is strictly a latency optimization, not a correctness
+    /// requirement. A no-op for an empty batch.
+    async fn send_chunk_locations_batched(&self, leader: SocketAddr, locations: Vec<dfs_common::ChunkLocation>) -> Result<()> {
+        if locations.is_empty() {
+            return Ok(());
+        }
+        let req = Request::ReplicateChunkLocations { locations };
+        let mut backoff_ms = 250u64;
+        for attempt in 1u32..=4 {
+            match tokio::time::timeout(Duration::from_secs(3), self.send_request(leader, req.clone())).await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) => warn!("ReplicateChunkLocations to leader {} failed (attempt {}): {}", leader, attempt, e),
+                Err(_)    => warn!("ReplicateChunkLocations to leader {} timed out (attempt {})", leader, attempt),
+            }
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms * 2).min(4_000);
+        }
+        anyhow::bail!("ReplicateChunkLocations to leader {} failed after 4 attempts", leader)
+    }
 
     /// Write a single chunk to 2 replica nodes, with fallback to other nodes if either fails.
     /// The server healer is responsible for lazily replicating to additional nodes up to RF.
@@ -4938,26 +4974,21 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Non-leader followers get the full authoritative state via flush_metadata_sync
         // (PutFileMetadata with write_seq ordering) at the end of the flush cycle.
         // Sending to replica nodes or other followers creates stale broadcast races.
+        //
+        // One batched ReplicateChunkLocations RPC for the whole multi-chunk write
+        // instead of one ReplicateChunkLocation per chunk (each previously with its own
+        // sequentially-awaited 4-attempt retry — N chunks could mean N round trips,
+        // sequentially). Each location already carries file_id (set at construction
+        // above), which the leader's handle_replicate_chunk_locations uses the same way
+        // the singular handler's top-level file_id parameter used to (chunk_map update
+        // by file_offset, and the file-record patch so DisseminateMetadata broadcasts
+        // the correct chunk_id) — see metadata::live_file_ids and
+        // handle_replicate_chunk_locations's orphan-gate/parity fix for why a per-item
+        // embedded file_id is required here, not optional.
         let leader_addr = *self.leader_addr.read().await;
         if let Some(leader) = leader_addr {
-            for location in chunk_locations.iter().cloned() {
-                let client = self.clone();
-                // Include file_id so the leader can update chunk_map by file_offset
-                // (chunk_map_update_location_for_file), not just by chunk_id match.
-                // Without file_id, a new chunk (not yet in chunk_map) produces no match
-                // and the chunk_map stays stale — causing handle_put_file_metadata to
-                // override the correct new hash with the old chunk_map entry.
-                let req = Request::ReplicateChunkLocation { location, file_id: Some(file_id) };
-                let mut backoff_ms = 250u64;
-                for attempt in 1u32..=4 {
-                    match tokio::time::timeout(Duration::from_secs(3), client.send_request(leader, req.clone())).await {
-                        Ok(Ok(_)) => break,
-                        Ok(Err(e)) => warn!("WriteChunk: ChunkLocation to leader {} failed (attempt {}): {}", leader, attempt, e),
-                        Err(_)    => warn!("WriteChunk: ChunkLocation to leader {} timed out (attempt {})", leader, attempt),
-                    }
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(4_000);
-                }
+            if let Err(e) = self.send_chunk_locations_batched(leader, chunk_locations.clone()).await {
+                warn!("WriteChunk: batched ChunkLocations to leader {} failed: {}", leader, e);
             }
         }
 
@@ -5488,27 +5519,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             client_write_seq: self.write_seq.get(&file_id).map(|e| *e),
             file_id: Some(file_id),
         };
-        let leader_addr = *self.leader_addr.read().await;
-        // Send ReplicateChunkLocation only to the leader — same rationale as MultiPatch path.
-        // Patched replicas update their own chunk_map atomically. Broadcasting to replicas
-        // creates racing stale updates. flush_metadata_sync delivers authoritative full state.
-        if let Some(leader) = leader_addr {
-            let client = self.clone();
-            let req = Request::ReplicateChunkLocation { location: new_location.clone(), file_id: Some(file_id) };
-            let mut backoff_ms = 250u64;
-            for attempt in 1u32..=4 {
-                match tokio::time::timeout(
-                    Duration::from_secs(3),
-                    client.send_request(leader, req.clone()),
-                ).await {
-                    Ok(Ok(_)) => break,
-                    Ok(Err(e)) => warn!("PatchChunk: ChunkLocation to leader {} failed (attempt {}): {}", leader, attempt, e),
-                    Err(_)    => warn!("PatchChunk: ChunkLocation to leader {} timed out (attempt {})", leader, attempt),
-                }
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(4_000);
-            }
-        }
+        // Hand off to the background batch worker instead of sending+retrying inline —
+        // see pending_chunk_locations's doc comment for why this is safe. new_location
+        // already carries file_id (set above), which is all the batched leader-side
+        // handler needs (no separate top-level parameter the way the old per-item
+        // request shape had one).
+        self.enqueue_chunk_location(new_location.clone()).await;
 
         // Step 4 (removed): We no longer eagerly delete old_chunk_id from non-replica nodes.
         // Under concurrent patches (A→B→C), the async delete of A would race with B being
@@ -5923,31 +5939,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             file_id: Some(file_id),
         };
 
-        // Send ReplicateChunkLocation ONLY to the leader.
-        // Patched replicas already updated their own chunk_map atomically before returning
-        // the response. Sending to non-leader nodes creates stale broadcasts that race with
-        // subsequent patch updates — a late-arriving broadcast for an older chunk_id can
-        // overwrite a newer one in the chunk_map, making the file unreadable.
-        // The leader's chunk_map stays current for GetFileChunkMap queries between patches.
-        // flush_metadata_sync (called once at end of flush_all_pipelined) delivers the full
-        // authoritative file state to leader + one follower with write_seq ordering.
-        if let Some(leader) = leader_addr {
-            let client = self.clone();
-            let req = Request::ReplicateChunkLocation { location: new_location.clone(), file_id: Some(file_id) };
-            let mut backoff_ms = 250u64;
-            for attempt in 1u32..=4 {
-                match tokio::time::timeout(
-                    Duration::from_secs(3),
-                    client.send_request(leader, req.clone()),
-                ).await {
-                    Ok(Ok(_)) => break,
-                    Ok(Err(e)) => warn!("MultiPatch: ChunkLocation to leader {} failed (attempt {}): {}", leader, attempt, e),
-                    Err(_)    => warn!("MultiPatch: ChunkLocation to leader {} timed out (attempt {})", leader, attempt),
-                }
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms * 2).min(4_000);
-            }
-        }
+        // Hand off to the background batch worker instead of sending+retrying inline —
+        // see pending_chunk_locations's doc comment for why this is safe. The worker
+        // resolves the leader itself at flush time; if it's unknown there, the batch is
+        // dropped for that round, same as this code's old "skip entirely if leader_addr
+        // is None right now" behavior — not a new gap, flush_metadata_sync is still the
+        // authoritative backstop regardless.
+        self.enqueue_chunk_location(new_location.clone()).await;
 
         // Collect skip pairs for deferred tombstone+delete after metadata commits.
         // Tombstone is NOT sent here — sending it before metadata sync creates a read
@@ -6209,8 +6207,93 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// The FUSE thread is parked in block_on but tokio worker threads keep running,
     /// so the metadata queue worker proceeds without starvation.
     pub async fn flush_metadata_sync(&self, metadata: &FileMetadata) {
+        // Drain and synchronously send any pending chunk-location notifications first.
+        // Without this, fsync/release could return (metadata_queue's push_and_wait
+        // below confirmed) while some chunk-location updates from this same flush
+        // cycle are still sitting in pending_chunk_locations, not yet sent — the
+        // background batch worker only flushes on its own ~10ms tick. The underlying
+        // chunk data is already safely replicated regardless of this notification's
+        // timing, but a read shortly after this call returns can still race ahead of
+        // the background worker and see the leader's pre-patch chunk_map/CHUNK_TABLE
+        // state if that read needs to consult the leader rather than relying entirely
+        // on already-patched local state. This closes that window at the one point
+        // every flush path already calls to confirm metadata is fully committed,
+        // instead of needing a drain call at each of flush_metadata_sync's ~10 call
+        // sites individually.
+        let batch = {
+            let mut pending = self.pending_chunk_locations.lock().await;
+            std::mem::take(&mut *pending)
+        };
+        if !batch.is_empty() {
+            let chunk_ids: Vec<_> = batch.iter().map(|l| l.chunk_id).collect();
+            let leader_addr = *self.leader_addr.read().await;
+            match leader_addr {
+                Some(leader) => {
+                    info!("[RCL-QUEUE] flush_metadata_sync draining {} locations to leader {}: {:?}", chunk_ids.len(), leader, chunk_ids);
+                    if let Err(e) = self.send_chunk_locations_batched(leader, batch).await {
+                        warn!("flush_metadata_sync: draining pending chunk locations failed: {}", e);
+                    } else {
+                        info!("[RCL-QUEUE] flush_metadata_sync drain succeeded: {:?}", chunk_ids);
+                    }
+                }
+                None => {
+                    warn!("[RCL-QUEUE] flush_metadata_sync dropped {} locations — no known leader: {:?}", chunk_ids.len(), chunk_ids);
+                }
+            }
+        }
+
         let stamped = self.stamp_write_seq(metadata);
         self.metadata_queue.push_and_wait(stamped).await;
+    }
+
+    /// Spawn the background chunk-location batch drain task onto the given runtime.
+    /// Must be called once after construction. Wakes on a short fixed interval,
+    /// drains whatever has accumulated in pending_chunk_locations, and sends it as one
+    /// batched ReplicateChunkLocations RPC to the current leader. 10ms is short enough
+    /// not to add meaningfully to per-chunk latency, long enough to coalesce the
+    /// concurrent burst flush_all_pipelined's dispatched flush_one_chunk tasks produce
+    /// (that's the actual VM-fsync-driven case this exists for).
+    pub fn start_chunk_location_batch_worker(&self, runtime: &tokio::runtime::Handle) {
+        let client = self.clone();
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                let batch = {
+                    let mut pending = client.pending_chunk_locations.lock().await;
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    std::mem::take(&mut *pending)
+                };
+                let chunk_ids: Vec<_> = batch.iter().map(|l| l.chunk_id).collect();
+                // Resolved fresh here, not at enqueue time — uses the most current
+                // leader knowledge for whatever accumulated since the last tick.
+                let leader_addr = *client.leader_addr.read().await;
+                match leader_addr {
+                    Some(leader) => {
+                        info!("[RCL-QUEUE] worker draining {} locations to leader {}: {:?}", chunk_ids.len(), leader, chunk_ids);
+                        if let Err(e) = client.send_chunk_locations_batched(leader, batch).await {
+                            warn!("chunk_location_batch_worker: batched send to leader {} failed: {}", leader, e);
+                        } else {
+                            info!("[RCL-QUEUE] worker drain succeeded: {:?}", chunk_ids);
+                        }
+                    }
+                    None => {
+                        warn!("[RCL-QUEUE] worker dropped {} locations — no known leader: {:?}", chunk_ids.len(), chunk_ids);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Enqueue a single chunk location for the background batch worker to send,
+    /// instead of sending it immediately inline. See pending_chunk_locations's doc
+    /// comment for why this is safe for every current caller.
+    async fn enqueue_chunk_location(&self, location: dfs_common::ChunkLocation) {
+        info!("[RCL-QUEUE] enqueue chunk={} offset={:?} file_id={:?}",
+            location.chunk_id, location.file_offset, location.file_id);
+        self.pending_chunk_locations.lock().await.push(location);
     }
 
     /// Spawn the background metadata queue worker onto the given runtime.
@@ -6668,6 +6751,51 @@ mod tests {
             client_write_seq: None,
             file_id: None,
         }
+    }
+
+    /// An empty batch must be a no-op — no network call, no error — since callers
+    /// (e.g. write_chunk_to_replicas with zero chunks, or a queue drain that found
+    /// nothing pending) shouldn't need to special-case this themselves.
+    #[tokio::test]
+    async fn test_send_chunk_locations_batched_empty_is_noop() {
+        // An unreachable address: if this were attempted as a real send, the test
+        // would hang/timeout instead of returning immediately.
+        let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let client = DfsClient::new(vec![unreachable]).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.send_chunk_locations_batched(unreachable, vec![]),
+        ).await;
+        assert!(result.is_ok(), "empty batch must return immediately, not attempt a send");
+        assert!(result.unwrap().is_ok(), "empty batch must return Ok(())");
+    }
+
+    /// Concurrent callers (mirroring the concurrent flush_one_chunk tasks one
+    /// flush_all_pipelined call dispatches) must all land in the shared queue before
+    /// any send happens, rather than each firing its own RPC immediately — that
+    /// accumulation is the actual coalescing opportunity the background drain worker
+    /// (start_chunk_location_batch_worker) acts on. Doesn't start that worker, so this
+    /// deterministically captures the queue's behavior in isolation, with no race
+    /// against an active drain.
+    #[tokio::test]
+    async fn test_enqueue_chunk_location_coalesces_concurrent_callers() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let client = DfsClient::new(vec![addr]).unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..20u8 {
+            let client = client.clone();
+            let chunk_id = chunk_id_with_hash0(i);
+            handles.push(tokio::spawn(async move {
+                client.enqueue_chunk_location(loc_with_nodes(chunk_id, vec![])).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let pending = client.pending_chunk_locations.lock().await;
+        assert_eq!(pending.len(), 20, "all 20 concurrent enqueues should land in the shared queue");
     }
 
     /// With equal load (the common case), different chunks on the same 2-replica

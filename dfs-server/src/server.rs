@@ -2391,32 +2391,52 @@ impl Server {
     async fn handle_replicate_chunk_locations(&self, locations: Vec<ChunkLocation>) -> Response {
         debug!("Handling batch replicate of {} chunk locations", locations.len());
 
-        // Build the live chunk set once. Only accept locations for chunks that are
-        // referenced by at least one active file. This prevents rejoining nodes from
-        // resurrecting deleted files' chunks: when a node was offline, the leader deleted
-        // those routing entries, but the node still has them in its local sled and pushes
-        // them all back via chunk_location_sync on rejoin — causing the healer to
-        // replicate them cluster-wide and inflating disk usage on every node.
-        let live_chunks: std::collections::HashSet<dfs_common::ChunkId> = {
+        // Build the live sets once. Only accept locations that are either (a) for a
+        // chunk_id already referenced by some active file, or (b) carrying a file_id
+        // whose file still exists. (b) matters for a chunk freshly written but not yet
+        // reflected in that file's chunk_locations (FILE_TABLE only catches up at the
+        // end of the flush cycle via flush_metadata_sync) — without it, this gate would
+        // reject every fresh-write batch as a "stale orphan" the instant it's sent, and
+        // nothing re-delivers that specific update afterward. (a) alone is kept as the
+        // fallback for legacy callers that don't supply file_id. Either way this
+        // prevents rejoining nodes from resurrecting deleted files' chunks: when a node
+        // was offline, the leader deleted those routing entries, but the node still has
+        // them in its local sled and pushes them all back via chunk_location_sync on
+        // rejoin — causing the healer to replicate them cluster-wide and inflating disk
+        // usage on every node. A deleted file has no FILE_TABLE record at all, so check
+        // (b) still correctly rejects it.
+        let (live_chunks, live_files): (std::collections::HashSet<dfs_common::ChunkId>, std::collections::HashSet<String>) = {
             let metadata = self.metadata.clone();
-            match tokio::task::spawn_blocking(move || metadata.live_chunk_ids()).await {
-                Ok(Ok(ids)) => ids,
+            match tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
+                Ok((metadata.live_chunk_ids()?, metadata.live_file_ids()?))
+            }).await {
+                Ok(Ok(sets)) => sets,
                 _ => {
-                    // Can't load live set — accept everything to avoid silently dropping
+                    // Can't load live sets — accept everything to avoid silently dropping
                     // valid locations (safe fallback: healer will orphan-purge stale ones).
-                    warn!("handle_replicate_chunk_locations: failed to load live chunk IDs, accepting all {} locations",
+                    warn!("handle_replicate_chunk_locations: failed to load live sets, accepting all {} locations",
                           locations.len());
-                    locations.iter().map(|l| l.chunk_id).collect()
+                    (locations.iter().map(|l| l.chunk_id).collect(), locations.iter().filter_map(|l| l.file_id).map(|f| f.to_string()).collect())
                 }
             }
         };
 
-        let mut failed = 0usize;
         let mut rejected = 0usize;
         let mut under_replicated: Vec<ChunkId> = Vec::new();
+        // Accumulates this batch's final merged result per chunk, committed as one
+        // transaction at the end instead of one transaction per item — this is also
+        // the same-batch "pending" view: if the same chunk_id appears more than once
+        // in one batch, a later occurrence must merge against the earlier one's result
+        // here, not stale on-disk data (the old per-item-commit design didn't need
+        // this, since every iteration committed before the next one ran).
+        let mut pending: std::collections::HashMap<ChunkId, ChunkLocation> = std::collections::HashMap::new();
         for location in &locations {
-            // Reject locations for chunks not referenced by any live file.
-            if !live_chunks.contains(&location.chunk_id) {
+            // Reject orphans: see the live_chunks/live_files comment above.
+            let is_live = match location.file_id {
+                Some(fid) => live_files.contains(&fid.to_string()),
+                None => live_chunks.contains(&location.chunk_id),
+            };
+            if !is_live {
                 rejected += 1;
                 continue;
             }
@@ -2432,8 +2452,10 @@ impl Server {
             // node A reports {A}, overwriting {A,B} to {A}; then node B reports
             // {B}, overwriting {A} to {B} — net result stuck at 1 replica until
             // the healer's deep scan eventually corrects it.
-            let existing = self.metadata.get_chunk_location(&location.chunk_id)
-                .ok().flatten();
+            let existing = match pending.get(&location.chunk_id) {
+                Some(p) => Some(p.clone()),
+                None => self.metadata.get_chunk_location(&location.chunk_id).ok().flatten(),
+            };
             let incoming_count = location.nodes.len();
             let existing_count = existing.as_ref().map_or(0, |e| e.nodes.len());
             let rf = self.replication_factor;
@@ -2481,18 +2503,30 @@ impl Server {
                 client_write_seq: location.client_write_seq.or_else(|| existing.as_ref().and_then(|e| e.client_write_seq)),
                 file_id: location.file_id.or_else(|| existing.as_ref().and_then(|e| e.file_id)),
             };
-            match self.metadata.put_chunk_location_async(merged.clone()).await {
-                Ok(_) => {
-                    if merged.nodes.len() < rf {
-                        under_replicated.push(merged.chunk_id);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to replicate chunk location {}: {}", location.chunk_id, e);
-                    failed += 1;
-                }
+            if merged.nodes.len() < rf {
+                under_replicated.push(merged.chunk_id);
+            } else {
+                // A later occurrence of this chunk_id in the same batch resolved it
+                // above RF — drop any earlier under-replicated entry for it.
+                under_replicated.retain(|id| *id != merged.chunk_id);
             }
+            pending.insert(merged.chunk_id, merged);
         }
+
+        let to_commit: Vec<ChunkLocation> = pending.into_values().collect();
+        let attempted = to_commit.len();
+        let failed = match self.metadata.put_chunk_locations_batch_async(to_commit.clone()).await {
+            Ok(()) => 0,
+            Err(e) => {
+                // One transaction for the whole batch — it lands or it doesn't, no
+                // partial commits. On failure don't queue heals for locations that
+                // were never actually persisted; the caller's own periodic push cycle
+                // (chunk_location_sync / healer batch) will simply retry next time.
+                warn!("handle_replicate_chunk_locations: batch commit of {} locations failed: {}", attempted, e);
+                under_replicated.clear();
+                attempted
+            }
+        };
         if !under_replicated.is_empty() {
             if let Some(healing) = self.healing.read().await.as_ref() {
                 healing.queue_chunks_immediate(under_replicated).await;
@@ -2500,8 +2534,89 @@ impl Server {
         }
         if rejected > 0 {
             info!("handle_replicate_chunk_locations: rejected {} stale orphan locations (deleted files), accepted {}",
-                  rejected, locations.len().saturating_sub(rejected + failed));
+                  rejected, locations.len().saturating_sub(rejected));
         }
+
+        // Mirror handle_replicate_chunk_location's two post-commit side effects for
+        // every location actually persisted above — without these, this batch path
+        // would silently skip what the singular path always does for the same kind of
+        // update, regressing chunk_map staleness and DisseminateMetadata's broadcast
+        // (see the singular handler's comments for why each one matters).
+        if failed == 0 {
+            // 1. Patch the in-memory chunk map per location (targeted when file_id is
+            //    known, scan-based fallback otherwise — same as the singular handler).
+            for location in &to_commit {
+                if let Some(fid) = location.file_id {
+                    self.chunk_map_update_location_for_file(fid, location).await;
+                } else {
+                    self.chunk_map_update_location(location).await;
+                }
+            }
+
+            // 2. Patch each affected file's record in the metadata store so
+            //    DisseminateMetadata broadcasts the correct chunk_id — grouped by
+            //    resolved file_id so a batch touching multiple chunks of the same file
+            //    does one read-modify-write per file, not per chunk.
+            let mut by_file: std::collections::HashMap<FileId, Vec<&ChunkLocation>> = std::collections::HashMap::new();
+            for location in &to_commit {
+                let sled_file_id = location.file_id.or_else(|| {
+                    // Legacy fallback: find the file by chunk_id in the chunk_map.
+                    location.file_offset.and_then(|file_offset| {
+                        for entry in self.chunk_map.iter() {
+                            let fid = *entry.key();
+                            let (locs, _) = entry.value();
+                            if locs.iter().any(|l| l.file_offset == Some(file_offset) && l.chunk_id == location.chunk_id) {
+                                return Some(fid);
+                            }
+                        }
+                        None
+                    })
+                });
+                if let Some(fid) = sled_file_id {
+                    by_file.entry(fid).or_default().push(location);
+                }
+            }
+            for (fid, file_locations) in by_file {
+                if let Ok(Some(mut file_meta)) = self.metadata.get_file(&fid) {
+                    let mut updated = false;
+                    for merged_location in file_locations {
+                        for loc in file_meta.chunk_locations.iter_mut() {
+                            if loc.chunk_id == merged_location.chunk_id {
+                                *loc = merged_location.clone();
+                                updated = true;
+                                break;
+                            } else if loc.file_offset == merged_location.file_offset {
+                                let should_update = match (merged_location.client_write_seq, loc.client_write_seq) {
+                                    (Some(inc), Some(ext)) => inc >= ext,
+                                    (Some(_), None)        => true,
+                                    (None, Some(_))        => false,
+                                    (None, None)           => true,
+                                };
+                                if should_update {
+                                    *loc = merged_location.clone();
+                                    updated = true;
+                                } else {
+                                    debug!("RCL batch sled update skipped: stale client_write_seq {:?} < existing {:?} for file {:?} offset {:?}",
+                                        merged_location.client_write_seq, loc.client_write_seq, fid, loc.file_offset);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if updated && !self.delete_tombstones.contains_key(&fid) {
+                        if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
+                            let _ = tx.send(file_meta);
+                        }
+                    }
+                }
+            }
+
+            for location in &to_commit {
+                info!("Successfully replicated chunk location for {} (total nodes: {})",
+                      location.chunk_id, location.nodes.len());
+            }
+        }
+
         if failed == 0 {
             Response::Ok { data: None }
         } else {
@@ -7185,6 +7300,224 @@ mod tests {
         assert_eq!(resolved.nodes, vec![node_a, node_b, node_c],
             "a stale, larger batch self-report must not revert an already-healthy \
              (>= RF) CHUNK_TABLE record — the ghost must stay pruned");
+    }
+
+    #[tokio::test]
+    async fn test_replicate_chunk_locations_batch_commits_distinct_chunks_together() {
+        // handle_replicate_chunk_locations now defers all commits to a single
+        // put_chunk_locations_batch_async call at the end instead of one transaction
+        // per item (see metadata::put_chunk_locations_batch). Confirm multiple distinct
+        // chunks in one batch all actually land.
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+
+        let file_id = dfs_common::FileId::new();
+        let nodes = vec![NodeId::new(), NodeId::new(), NodeId::new()];
+
+        let mut locations = Vec::new();
+        let mut chunk_ids = Vec::new();
+        for i in 0..5u8 {
+            let hash = compute_chunk_hash(format!("distinct-chunk-{}", i).as_bytes());
+            let chunk_id = ChunkId::from_hash(hash);
+            chunk_ids.push(chunk_id);
+            locations.push(ChunkLocation {
+                chunk_id,
+                nodes: nodes.clone(),
+                size: 4096,
+                checksum: hash,
+                file_offset: Some(i as u64 * 4096),
+                written_at: None,
+                client_write_seq: None,
+                file_id: Some(file_id),
+            });
+        }
+
+        let file_meta = dfs_common::FileMetadata {
+            id: file_id,
+            path: "/test-multi-chunk-file".to_string(),
+            size: 4096 * locations.len() as u64,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            file_type: dfs_common::FileType::RegularFile,
+            created_at: 0,
+            modified_at: 0,
+            write_seq: 1,
+            chunk_locations: locations.clone(),
+        };
+        server.metadata.put_file(&file_meta).unwrap();
+
+        let response = server.handle_replicate_chunk_locations(locations).await;
+        assert!(matches!(response, Response::Ok { .. }), "expected Ok, got {:?}", response);
+
+        for chunk_id in chunk_ids {
+            let resolved = server.metadata.get_chunk_location(&chunk_id).unwrap();
+            assert!(resolved.is_some(), "chunk {} missing after batch commit", chunk_id);
+            assert_eq!(resolved.unwrap().nodes, nodes);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replicate_chunk_locations_batch_updates_chunk_map_and_file_record() {
+        // Regression guard: handle_replicate_chunk_locations originally only persisted to
+        // CHUNK_TABLE and skipped the two side effects handle_replicate_chunk_location
+        // (singular) always does — updating the in-memory chunk_map and patching the
+        // file's record in the metadata store (needed so DisseminateMetadata broadcasts
+        // the new chunk_id instead of perpetually re-announcing the stale one). Confirm a
+        // batch spanning multiple chunks of the *same* file updates both, grouped into one
+        // file read-modify-write rather than one per chunk.
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+
+        let file_id = dfs_common::FileId::new();
+        let nodes = vec![NodeId::new(), NodeId::new(), NodeId::new()];
+
+        // Seed the file with two OLD chunk_ids at chunk_idx 0 and 1 (offsets a full
+        // CHUNK_SIZE apart — chunk_map_update_location_for_file's fallback match groups
+        // by file_offset/CHUNK_SIZE, so offsets within the same 4MB chunk would
+        // legitimately collide as "the same logical chunk slot" instead of two
+        // distinct chunks).
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let old_hashes: Vec<_> = (0..2u8).map(|i| compute_chunk_hash(format!("old-chunk-{}", i).as_bytes())).collect();
+        let old_chunk_ids: Vec<_> = old_hashes.iter().map(|h| ChunkId::from_hash(*h)).collect();
+        let old_locations: Vec<_> = old_chunk_ids.iter().zip(&old_hashes).enumerate().map(|(i, (cid, h))| ChunkLocation {
+            chunk_id: *cid, nodes: nodes.clone(), size: 4096, checksum: *h,
+            file_offset: Some(i as u64 * CHUNK_SIZE), written_at: None, client_write_seq: Some(1), file_id: Some(file_id),
+        }).collect();
+        let file_meta = dfs_common::FileMetadata {
+            id: file_id,
+            path: "/test-chunk-map-parity".to_string(),
+            size: 2 * CHUNK_SIZE,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            file_type: dfs_common::FileType::RegularFile,
+            created_at: 0,
+            modified_at: 0,
+            write_seq: 1,
+            chunk_locations: old_locations,
+        };
+        server.metadata.put_file(&file_meta).unwrap();
+
+        // Now batch-replicate NEW chunk_ids at the same two offsets (simulating a patch
+        // that rewrote both chunks), with a higher client_write_seq than the seeded data.
+        let new_hashes: Vec<_> = (0..2u8).map(|i| compute_chunk_hash(format!("new-chunk-{}", i).as_bytes())).collect();
+        let new_chunk_ids: Vec<_> = new_hashes.iter().map(|h| ChunkId::from_hash(*h)).collect();
+        let new_locations: Vec<_> = new_chunk_ids.iter().zip(&new_hashes).enumerate().map(|(i, (cid, h))| ChunkLocation {
+            chunk_id: *cid, nodes: nodes.clone(), size: 4096, checksum: *h,
+            file_offset: Some(i as u64 * CHUNK_SIZE), written_at: None, client_write_seq: Some(2), file_id: Some(file_id),
+        }).collect();
+
+        let response = server.handle_replicate_chunk_locations(new_locations.clone()).await;
+        assert!(matches!(response, Response::Ok { .. }), "expected Ok, got {:?}", response);
+
+        // The file-record patch goes through sled_write_tx's background worker
+        // asynchronously (same as the singular handler) — drain it before checking
+        // get_file() below, or this races the worker and reads a stale record.
+        server.drain_sled_writes().await;
+
+        // chunk_map must reflect the new chunk_ids.
+        let (chunk_map_locs, _) = server.chunk_map.get(&file_id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default();
+        for new_loc in &new_locations {
+            assert!(
+                chunk_map_locs.iter().any(|l| l.chunk_id == new_loc.chunk_id && l.file_offset == new_loc.file_offset),
+                "chunk_map missing updated location for offset {:?} (chunk_map not updated by batch handler)",
+                new_loc.file_offset
+            );
+        }
+
+        // The file's own metadata record must also reflect the new chunk_ids — this is
+        // the sled-patch parity check (DisseminateMetadata reads from here).
+        let updated_file = server.metadata.get_file(&file_id).unwrap().unwrap();
+        for new_loc in &new_locations {
+            let matching = updated_file.chunk_locations.iter()
+                .find(|l| l.file_offset == new_loc.file_offset);
+            assert_eq!(
+                matching.map(|l| l.chunk_id), Some(new_loc.chunk_id),
+                "file record not patched with new chunk_id at offset {:?} (sled-patch step skipped by batch handler)",
+                new_loc.file_offset
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replicate_chunk_locations_batch_merges_duplicate_chunk_id_within_batch() {
+        // If the same chunk_id appears more than once in one batch (plausible once the
+        // client starts sending batched updates), a later occurrence must merge against
+        // the earlier occurrence's result *within this same batch*, not stale on-disk
+        // data — the old per-item-commit design got this for free since every iteration
+        // committed before the next ran; the batched-commit design needs the in-memory
+        // `pending` map in handle_replicate_chunk_locations to preserve it.
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+
+        let file_id = dfs_common::FileId::new();
+        let hash = compute_chunk_hash(b"duplicate-in-one-batch");
+        let chunk_id = ChunkId::from_hash(hash);
+        let node_a = NodeId::new();
+        let node_b = NodeId::new();
+
+        let file_meta = dfs_common::FileMetadata {
+            id: file_id,
+            path: "/test-dup-in-batch".to_string(),
+            size: 4096,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            file_type: dfs_common::FileType::RegularFile,
+            created_at: 0,
+            modified_at: 0,
+            write_seq: 1,
+            chunk_locations: vec![ChunkLocation {
+                chunk_id, nodes: vec![node_a], size: 4096, checksum: hash,
+                file_offset: Some(0), written_at: None, client_write_seq: None, file_id: None,
+            }],
+        };
+        server.metadata.put_file(&file_meta).unwrap();
+        // No existing CHUNK_TABLE record — both occurrences below start under RF=3.
+
+        let first = ChunkLocation {
+            chunk_id, nodes: vec![node_a], size: 4096, checksum: hash,
+            file_offset: Some(0), written_at: Some(1_000), client_write_seq: None, file_id: Some(file_id),
+        };
+        let second = ChunkLocation {
+            chunk_id, nodes: vec![node_b], size: 4096, checksum: hash,
+            file_offset: Some(0), written_at: Some(1_001), client_write_seq: None, file_id: Some(file_id),
+        };
+
+        let response = server.handle_replicate_chunk_locations(vec![first, second]).await;
+        assert!(matches!(response, Response::Ok { .. }), "expected Ok, got {:?}", response);
+
+        let resolved = server.metadata.get_chunk_location(&chunk_id).unwrap().unwrap();
+        assert_eq!(resolved.nodes, vec![node_a, node_b],
+            "second occurrence in the same batch must union against the first \
+             occurrence's in-batch result, not stale (absent) on-disk data");
     }
 
     #[tokio::test]

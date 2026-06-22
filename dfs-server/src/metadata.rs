@@ -718,6 +718,35 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Store multiple chunk locations in a single write transaction.
+    ///
+    /// Callers that already have several locations to persist at once (e.g. the
+    /// ReplicateChunkLocations batch RPC handler) should use this instead of looping
+    /// put_chunk_location — committing N locations as N separate transactions costs N
+    /// separate B-tree page allocations and pending_non_durable_commits entries, the
+    /// same per-transaction overhead this function exists to amortize across the whole
+    /// batch in one commit.
+    pub fn put_chunk_locations_batch(&self, locations: &[ChunkLocation]) -> Result<()> {
+        if locations.is_empty() {
+            return Ok(());
+        }
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(CHUNK_TABLE)?;
+            for location in locations {
+                let key = format!("{}", location.chunk_id);
+                let value = bincode::serialize(location)
+                    .context("Failed to serialize chunk location")?;
+                table.insert(key.as_str(), value.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        debug!("Stored {} chunk locations in one batch transaction", locations.len());
+        Ok(())
+    }
+
     /// Get chunk location information.
     pub fn get_chunk_location(&self, chunk_id: &ChunkId) -> Result<Option<ChunkLocation>> {
         let key = format!("{}", chunk_id);
@@ -758,6 +787,16 @@ impl MetadataStore {
         tokio::task::spawn_blocking(move || store.put_chunk_location(&location))
             .await
             .context("spawn_blocking panicked in put_chunk_location_async")?
+    }
+
+    /// Async wrapper for put_chunk_locations_batch — see put_chunk_location_async for
+    /// why this must go through spawn_blocking rather than calling the sync method
+    /// directly from request-handling code.
+    pub async fn put_chunk_locations_batch_async(self: &Arc<Self>, locations: Vec<ChunkLocation>) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_chunk_locations_batch(&locations))
+            .await
+            .context("spawn_blocking panicked in put_chunk_locations_batch_async")?
     }
 
     /// Async wrapper for delete_chunk_location — see put_chunk_location_async.
@@ -1056,6 +1095,24 @@ impl MetadataStore {
                     live.insert(loc.chunk_id);
                 }
             }
+        }
+        Ok(live)
+    }
+
+    /// Set of file_id strings (FILE_TABLE's keys) for files that currently exist.
+    /// Cheaper than live_chunk_ids() — just the key set, no value deserialization —
+    /// and answers a different question: "does this file still exist" rather than
+    /// "is this exact chunk_id already known," which matters for a chunk freshly
+    /// written but not yet reflected in this file's chunk_locations (see
+    /// handle_replicate_chunk_locations's orphan-rejection gate).
+    pub fn live_file_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let table = txn.open_table(FILE_TABLE)?;
+        let mut live = std::collections::HashSet::new();
+        for item in table.range::<&str>(..)? {
+            let (k, _) = item?;
+            live.insert(k.value().to_string());
         }
         Ok(live)
     }

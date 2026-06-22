@@ -136,6 +136,15 @@ impl MetadataStore {
 
         let db_path = metadata_dir.join("metadata.redb");
 
+        // Discard any leftover shadow file from a compact_db() that crashed mid-flight
+        // (see compact_db()). Always safe: the live db_path file is never touched until
+        // the final atomic rename, so a stale shadow file never holds anything live.
+        let shadow_path = db_path.with_extension("redb.shadow");
+        if shadow_path.exists() {
+            warn!("Discarding stale compaction shadow file from prior crash: {:?}", shadow_path);
+            let _ = std::fs::remove_file(&shadow_path);
+        }
+
         // Cap redb's page cache to prevent OOM on low-RAM nodes (default is 1GB).
         // 256MB is plenty for our working set; the rest stays on disk.
         //
@@ -1544,13 +1553,295 @@ impl MetadataStore {
     // Misc
     // -------------------------------------------------------------------------
 
-    /// Compact the database, reclaiming dead pages from MultiPatch chunk-ID rotations.
-    /// Returns (before_bytes, after_bytes). Runs in the caller's thread — use spawn_blocking
-    /// from async code. Takes the Mutex exclusively, blocking all metadata I/O for the
-    /// duration; compact time scales with live data size (not file size), so after the first
-    /// run it is typically fast (seconds, not minutes).
+    /// Bytes-valued tables copied/diffed as a unit by compact_db()'s shadow-copy pass.
+    const BYTES_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 7] = [
+        FILE_TABLE, PATH_TABLE, CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX,
+        DELETE_QUEUE_TABLE, CHUNK_PATCH_JOURNAL_TABLE,
+    ];
+
+    /// u64-valued tables copied/diffed as a unit by compact_db()'s shadow-copy pass.
+    const U64_TABLES: [TableDefinition<'static, &'static str, u64>; 3] =
+        [COUNTERS_TABLE, PENDING_HEALING_TABLE, CHUNK_REFCOUNT_TABLE];
+
+    /// Copy every row of `def` from `src` into `dst`, overwriting whatever's there.
+    /// Used for compact_db()'s initial full snapshot copy.
+    fn copy_bytes_table(
+        src: &redb::ReadTransaction,
+        dst: &redb::WriteTransaction,
+        def: TableDefinition<&str, &[u8]>,
+    ) -> Result<()> {
+        // Some tables (e.g. chunk_refcount) aren't pre-created at startup and only come
+        // into existence on their first real write — a fresh/lightly-used store may
+        // never have touched one. redb's read-side open_table errors on a table that
+        // was never created (unlike the write side, which auto-creates); treat that as
+        // "nothing to copy" rather than a real failure.
+        let src_table = match src.open_table(def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut dst_table = dst.open_table(def)?;
+        for item in src_table.range::<&str>(..)? {
+            let (k, v) = item?;
+            dst_table.insert(k.value(), v.value())?;
+        }
+        Ok(())
+    }
+
+    fn copy_u64_table(
+        src: &redb::ReadTransaction,
+        dst: &redb::WriteTransaction,
+        def: TableDefinition<&str, u64>,
+    ) -> Result<()> {
+        let src_table = match src.open_table(def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut dst_table = dst.open_table(def)?;
+        for item in src_table.range::<&str>(..)? {
+            let (k, v) = item?;
+            dst_table.insert(k.value(), v.value())?;
+        }
+        Ok(())
+    }
+
+    /// Reconcile `dst`'s copy of `def` against `src`'s current contents: update any key
+    /// whose value differs, insert any key missing from `dst`, and remove any key in
+    /// `dst` that's no longer present in `src` (covers updates, inserts, and deletes in
+    /// one pass). Returns the number of rows changed. Used by compact_db()'s catch-up
+    /// passes to bring the shadow copy current with writes that landed during/after the
+    /// initial snapshot copy — schema-agnostic by design (compares raw bytes, never
+    /// needs to know what a table's values mean), so a future table needs no special
+    /// handling here beyond being added to BYTES_TABLES/U64_TABLES.
+    fn diff_bytes_table(
+        src: &redb::ReadTransaction,
+        dst: &redb::WriteTransaction,
+        def: TableDefinition<&str, &[u8]>,
+    ) -> Result<usize> {
+        let src_table = match src.open_table(def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut dst_table = dst.open_table(def)?;
+        let mut changed = 0usize;
+        let mut live_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in src_table.range::<&str>(..)? {
+            let (k, v) = item?;
+            let key = k.value().to_string();
+            live_keys.insert(key.clone());
+            let needs_update = match dst_table.get(key.as_str())? {
+                Some(existing) => existing.value() != v.value(),
+                None => true,
+            };
+            if needs_update {
+                dst_table.insert(key.as_str(), v.value())?;
+                changed += 1;
+            }
+        }
+        let stale_keys: Vec<String> = dst_table.range::<&str>(..)?
+            .map(|item| item.map(|(k, _)| k.value().to_string()))
+            .collect::<std::result::Result<_, _>>()?;
+        for key in stale_keys {
+            if !live_keys.contains(&key) {
+                dst_table.remove(key.as_str())?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn diff_u64_table(
+        src: &redb::ReadTransaction,
+        dst: &redb::WriteTransaction,
+        def: TableDefinition<&str, u64>,
+    ) -> Result<usize> {
+        let src_table = match src.open_table(def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut dst_table = dst.open_table(def)?;
+        let mut changed = 0usize;
+        let mut live_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in src_table.range::<&str>(..)? {
+            let (k, v) = item?;
+            let key = k.value().to_string();
+            live_keys.insert(key.clone());
+            let needs_update = match dst_table.get(key.as_str())? {
+                Some(existing) => existing.value() != v.value(),
+                None => true,
+            };
+            if needs_update {
+                dst_table.insert(key.as_str(), v.value())?;
+                changed += 1;
+            }
+        }
+        let stale_keys: Vec<String> = dst_table.range::<&str>(..)?
+            .map(|item| item.map(|(k, _)| k.value().to_string()))
+            .collect::<std::result::Result<_, _>>()?;
+        for key in stale_keys {
+            if !live_keys.contains(&key) {
+                dst_table.remove(key.as_str())?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn copy_all_tables(src: &redb::ReadTransaction, dst: &redb::WriteTransaction) -> Result<()> {
+        for def in Self::BYTES_TABLES { Self::copy_bytes_table(src, dst, def)?; }
+        for def in Self::U64_TABLES { Self::copy_u64_table(src, dst, def)?; }
+        Ok(())
+    }
+
+    fn diff_all_tables(src: &redb::ReadTransaction, dst: &redb::WriteTransaction) -> Result<usize> {
+        let mut changed = 0usize;
+        for def in Self::BYTES_TABLES { changed += Self::diff_bytes_table(src, dst, def)?; }
+        for def in Self::U64_TABLES { changed += Self::diff_u64_table(src, dst, def)?; }
+        Ok(changed)
+    }
+
+    /// Compact the database without blocking concurrent metadata I/O.
+    ///
+    /// redb's own `Database::compact()` requires exclusive `&mut Database` access with
+    /// no other open transactions — there's no "online compaction" mode in redb to turn
+    /// on. Calling it directly (the old approach) meant holding `self.db`'s exclusive
+    /// lock — which every other metadata operation takes the shared form of — for the
+    /// entire compaction, which is CPU/IO-bound and scales with live data size. Under
+    /// sustained write load that froze every other write on the node for the duration.
+    ///
+    /// Instead: build a fresh replacement file on the side (which starts out close to
+    /// optimal, since it's populated by a single insert pass rather than years of
+    /// update/delete churn — no further compact() of it is needed), and only take the
+    /// exclusive lock for the brief final handoff.
+    ///
+    ///  1. Copy every table into a new shadow db, holding only the same shared lock
+    ///     every ordinary read already uses — live reads and writes proceed normally
+    ///     throughout this (expensive, O(live data size)) pass.
+    ///  2. Iteratively diff the shadow copy against the live db's current contents and
+    ///     apply just the differences, still unlocked. Each pass should be cheaper than
+    ///     the last, since the window of "what changed since the last pass" shrinks as
+    ///     long as our diff throughput beats the live write rate.
+    ///  3. Take the exclusive lock once, for a final diff pass (bounded by whatever
+    ///     didn't converge away in step 2 — should be tiny) plus the atomic swap: close
+    ///     the shadow handle, rename it over the live file, and reopen a fresh handle on
+    ///     the renamed file. This is the only part that blocks other metadata ops, and
+    ///     it's now bounded by recent write volume instead of total live data size.
+    ///
+    /// Returns (before_bytes, after_bytes). Runs in the caller's thread — use
+    /// spawn_blocking from async code.
     pub fn compact_db(&self) -> Result<(u64, u64)> {
+        self.compact_db_with_budget(std::time::Duration::from_secs(5), 64)
+    }
+
+    /// Same as `compact_db()`, parameterized by the Phase 2 catch-up time budget and
+    /// convergence threshold (row-changes-per-pass below which we consider it settled).
+    /// Split out so tests can exercise the non-convergence/defer path deterministically
+    /// with a tiny budget/threshold, instead of needing a huge dataset and a multi-
+    /// second wait to reliably outrun the production defaults.
+    fn compact_db_with_budget(&self, catchup_budget: std::time::Duration, convergence_threshold: usize) -> Result<(u64, u64)> {
         let size_before = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
+        info!("redb compaction starting ({:.1}MB live)", size_before as f64 / 1_048_576.0);
+
+        let shadow_path = self.db_path.with_extension("redb.shadow");
+        let _ = std::fs::remove_file(&shadow_path);
+        let shadow_db = Database::builder()
+            .set_cache_size(256 * 1024 * 1024)
+            .create(&shadow_path)
+            .map_err(|e| anyhow::anyhow!("compact: failed to create shadow db: {}", e))?;
+
+        // Phase 1: full copy, holding only the shared lock.
+        {
+            let live = self.db.read().unwrap();
+            let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase1 begin_read: {}", e))?;
+            let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase1 begin_write: {}", e))?;
+            Self::copy_all_tables(&src_txn, &dst_txn)?;
+            dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase1 commit: {}", e))?;
+        }
+
+        // Phase 2: iterative catch-up, still unlocked. Bounded by a time budget, not a
+        // fixed pass count — under sustained heavy write churn (e.g. a bulk-delete
+        // storm), the live db can keep changing faster than we can scan it, so no fixed
+        // number of passes is guaranteed to converge. If we don't converge within the
+        // budget, abort cleanly rather than handing Phase 3 a large diff to apply while
+        // holding the exclusive lock — that would just relocate the original blocking
+        // problem instead of fixing it. The caller (server.rs's compaction loop) treats
+        // a plain Err here as "try again next cycle", which is exactly what we want:
+        // skip compacting while the node is busy, retry once things quiet down.
+        let catchup_deadline = std::time::Instant::now() + catchup_budget;
+        let mut converged = false;
+        loop {
+            let live = self.db.read().unwrap();
+            let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase2 begin_read: {}", e))?;
+            let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase2 begin_write: {}", e))?;
+            let changed = Self::diff_all_tables(&src_txn, &dst_txn)?;
+            dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase2 commit: {}", e))?;
+            if changed <= convergence_threshold {
+                converged = true;
+                break;
+            }
+            if std::time::Instant::now() >= catchup_deadline {
+                break;
+            }
+        }
+        if !converged {
+            drop(shadow_db);
+            let _ = std::fs::remove_file(&shadow_path);
+            anyhow::bail!(
+                "compaction deferred: live db is under sustained write churn and catch-up \
+                 didn't settle within budget — will retry on the next cycle"
+            );
+        }
+
+        // Phase 3: final catch-up + atomic swap, exclusively locked — the only part
+        // that blocks other metadata operations on this node. Logged separately from
+        // "compaction starting" so the actually-locked duration can be measured on its
+        // own — Phases 1-2 above can legitimately take a while in wall-clock terms
+        // without that being a problem, since they never hold this lock.
+        info!("redb compaction phase3 lock acquiring");
+        {
+            let mut live = self.db.write().unwrap();
+            {
+                let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase3 begin_read: {}", e))?;
+                let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase3 begin_write: {}", e))?;
+                Self::diff_all_tables(&src_txn, &dst_txn)?;
+                dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase3 commit: {}", e))?;
+            }
+            drop(shadow_db);
+            std::fs::rename(&shadow_path, &self.db_path)
+                .map_err(|e| anyhow::anyhow!("compact: failed to swap in shadow db: {}", e))?;
+            let new_db = Database::builder()
+                .set_cache_size(256 * 1024 * 1024)
+                .open(&self.db_path)
+                .map_err(|e| anyhow::anyhow!("compact: failed to reopen post-swap db: {}", e))?;
+            *live = new_db;
+        }
+
+        let size_after = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
+        // Unconditional completion marker, distinct from the caller's (server.rs)
+        // size-delta log — that one only fires when before != after, so it can't be
+        // relied on alone to always close a compaction window.
+        info!("redb compaction finished");
+        Ok((size_before, size_after))
+    }
+
+    /// Last-resort fallback: compact the live db directly, in place, blocking all other
+    /// metadata I/O on this node for the duration.
+    ///
+    /// compact_db() can defer indefinitely under sustained write churn — by design, it
+    /// never hands Phase 3 a large diff to apply while exclusively locked. That's the
+    /// right tradeoff for a transient burst (the next 60s cycle just tries again), but
+    /// under truly sustained churn (hours of continuous heavy writes) it could mean
+    /// fragmentation never gets reclaimed at all, and the file grows unboundedly. The
+    /// caller (server.rs's compaction loop) is responsible for escalating to this method
+    /// after compact_db() has deferred repeatedly for too long *and* fragmentation is
+    /// still bad enough to matter — accepting one bounded blocking hit is better than
+    /// unbounded disk growth.
+    pub fn compact_db_blocking(&self) -> Result<(u64, u64)> {
+        let size_before = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
+        info!("redb compaction starting (blocking fallback, {:.1}MB live)", size_before as f64 / 1_048_576.0);
         let mut db = self.db.write().unwrap();
 
         // redb's compact() fails if any pending_non_durable_commits exist — it counts
@@ -1567,6 +1858,7 @@ impl MetadataStore {
 
         db.compact().map_err(|e| anyhow::anyhow!("redb compact: {}", e))?;
         let size_after = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
+        info!("redb compaction finished (blocking fallback)");
         Ok((size_before, size_after))
     }
 
@@ -1832,5 +2124,152 @@ mod tests {
         let (leader, since) = store.get_leader_state().unwrap();
         assert_eq!(leader, Some(node_id2));
         assert_eq!(since, Some(67_890));
+    }
+
+    #[test]
+    fn test_compact_db_preserves_existing_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        for i in 0..200 {
+            let mut m = FileMetadata::new(format!("/seed_{}", i), FileType::RegularFile);
+            m.size = i as u64;
+            store.put_file(&m).unwrap();
+        }
+        let chunk_id = ChunkId::from_hash([7u8; 32]);
+        let location = ChunkLocation {
+            chunk_id,
+            nodes: vec![NodeId::new(), NodeId::new()],
+            size: 4096,
+            checksum: [9u8; 32],
+            file_offset: None,
+            written_at: None,
+            client_write_seq: None,
+            file_id: None,
+        };
+        store.put_chunk_location(&location).unwrap();
+
+        let (before, after) = store.compact_db().unwrap();
+        assert!(before > 0, "size_before should reflect the live file before compaction");
+        assert!(after > 0, "size_after should reflect the new file after compaction");
+
+        for i in 0..200 {
+            let path = format!("/seed_{}", i);
+            let retrieved = store.get_file_by_path(&path).unwrap()
+                .unwrap_or_else(|| panic!("lost file {} across compact_db()", path));
+            assert_eq!(retrieved.size, i as u64);
+        }
+        let retrieved = store.get_chunk_location(&chunk_id).unwrap().unwrap();
+        assert_eq!(retrieved.nodes.len(), 2);
+        assert_eq!(retrieved.size, 4096);
+    }
+
+    #[test]
+    fn test_compact_db_preserves_concurrent_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+
+        // Seed enough rows that Phase 1's full-table copy takes measurable time,
+        // giving the concurrent writer thread below a real chance to land writes
+        // while compact_db() is in its unlocked copy/catch-up phases rather than
+        // only before or after.
+        for i in 0..3000 {
+            let mut m = FileMetadata::new(format!("/seed_{}", i), FileType::RegularFile);
+            m.size = i as u64;
+            store.put_file(&m).unwrap();
+        }
+
+        let store2 = std::sync::Arc::clone(&store);
+        let writer = std::thread::spawn(move || {
+            for i in 0..500 {
+                let mut m = FileMetadata::new(format!("/concurrent_{}", i), FileType::RegularFile);
+                m.size = 100_000 + i as u64;
+                store2.put_file(&m).unwrap();
+            }
+        });
+
+        store.compact_db().unwrap();
+        writer.join().unwrap();
+
+        // Every concurrent write must have survived, regardless of whether it landed
+        // before, during, or after any particular compaction phase — this is the
+        // correctness property the catch-up passes (diff_all_tables) exist to provide.
+        for i in 0..500 {
+            let path = format!("/concurrent_{}", i);
+            assert!(
+                store.get_file_by_path(&path).unwrap().is_some(),
+                "lost concurrent write to {} during compact_db()", path
+            );
+        }
+        for i in 0..3000 {
+            let path = format!("/seed_{}", i);
+            assert!(
+                store.get_file_by_path(&path).unwrap().is_some(),
+                "lost seeded file {} during compact_db()", path
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_db_defers_under_sustained_churn() {
+        // Repro for a real bug found via the local suite's T44 check: a "storm" test
+        // (T21, thousands of rapid-fire deletes) kept the live db churning continuously
+        // through Phase 1/2, so the catch-up passes never dropped below the convergence
+        // threshold — Phase 3 inherited a large diff and held the exclusive lock for
+        // ~458ms, relocating the original blocking problem instead of fixing it.
+        // compact_db() must detect non-convergence and abort cleanly (Err) rather than
+        // ever handing Phase 3 a large diff.
+        //
+        // Uses compact_db_with_budget() with a tiny budget/threshold rather than the
+        // production defaults (5s / 64 rows) — reproducing non-convergence against the
+        // real defaults needs a huge dataset and several seconds of sustained writes to
+        // reliably outrun them, which is correct for production but far too slow for a
+        // unit test. A 5ms budget and a threshold of 1 row exercises the exact same
+        // code path deterministically and fast.
+        let temp_dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+
+        const SEED_COUNT: usize = 200;
+        for i in 0..SEED_COUNT {
+            let mut m = FileMetadata::new(format!("/seed_{}", i), FileType::RegularFile);
+            m.size = i as u64;
+            store.put_file(&m).unwrap();
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store2 = std::sync::Arc::clone(&store);
+        let stop2 = std::sync::Arc::clone(&stop);
+        let storm = std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut m = FileMetadata::new(format!("/storm_{}", i), FileType::RegularFile);
+                m.size = i;
+                store2.put_file(&m).unwrap();
+                i += 1;
+            }
+        });
+
+        let result = store.compact_db_with_budget(std::time::Duration::from_millis(5), 1);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        storm.join().unwrap();
+
+        assert!(result.is_err(), "compact_db() should defer (Err) under sustained churn, not block on a large Phase 3 diff");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("deferred"), "unexpected error: {}", msg);
+
+        // Nothing should have been lost or corrupted by the aborted attempt — the live
+        // db must be untouched (no swap happened).
+        for i in 0..SEED_COUNT {
+            let path = format!("/seed_{}", i);
+            assert!(store.get_file_by_path(&path).unwrap().is_some(), "lost seeded file {} after deferred compaction", path);
+        }
+
+        // A subsequent compaction, once churn has stopped, must succeed normally.
+        let (before, after) = store.compact_db().unwrap();
+        assert!(before > 0 && after > 0);
+        for i in 0..SEED_COUNT {
+            let path = format!("/seed_{}", i);
+            assert!(store.get_file_by_path(&path).unwrap().is_some(), "lost seeded file {} after successful follow-up compaction", path);
+        }
     }
 }

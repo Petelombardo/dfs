@@ -3484,6 +3484,11 @@ impl Server {
             // Zero means no baseline yet — compact unconditionally on first run.
             let mut last_compact_size: u64 = 0;
             let mut last_compact_time: Option<std::time::Instant> = None;
+            // When compact_db() first started deferring (returning Err rather than risk
+            // a long Phase 3 lock) while fragmentation was still bad. None means either
+            // we're not currently in a deferred streak, or the last compaction (by
+            // either method) succeeded. See the escalation check after the retry loop.
+            let mut first_deferred_at: Option<std::time::Instant> = None;
             loop {
                 // The fragmentation gate makes this interval cheap (just a stat()
                 // call on most iterations). Keep it at 60s so compaction triggers
@@ -3551,6 +3556,7 @@ impl Server {
                             }
                             last_compact_size = after; // update baseline only on success
                             last_compact_time = Some(std::time::Instant::now());
+                            first_deferred_at = None; // churn subsided — clear any deferred streak
                             last_err = None;
                             break;
                         }
@@ -3559,6 +3565,16 @@ impl Server {
                             if msg.contains("transaction") || msg.contains("in progress") {
                                 last_err = Some(msg);
                                 // transient — retry after brief delay
+                            } else if msg.contains("deferred") {
+                                // compact_db() chose not to converge rather than risk a
+                                // long Phase 3 lock — expected and fine under a brief
+                                // burst. Track how long this has been going on; the
+                                // escalation check right after this loop decides whether
+                                // it's gone on long enough to fall back to blocking.
+                                first_deferred_at.get_or_insert_with(std::time::Instant::now);
+                                warn!("redb compact deferred (live db busy): {}", e);
+                                last_err = None;
+                                break;
                             } else {
                                 warn!("redb periodic compact failed: {}", e);
                                 last_err = None;
@@ -3574,6 +3590,50 @@ impl Server {
                 }
                 if let Some(e) = last_err {
                     warn!("redb periodic compact failed after retries: {}", e);
+                }
+
+                // Escalate to the old blocking in-place compact() if compact_db() has
+                // been deferring for too long (5 minutes) *and* fragmentation is still
+                // bad enough to matter. A single deferral is normal and not a problem on
+                // its own — the safe path is designed to defer rather than ever hand
+                // Phase 3 a large diff — but sustained churn (hours, not a brief burst)
+                // could otherwise mean fragmentation never gets reclaimed and the file
+                // grows unboundedly. One bounded blocking hit is better than that.
+                if let Some(first) = first_deferred_at {
+                    if first.elapsed() >= std::time::Duration::from_secs(5 * 60) && frag_ratio >= 1.20 {
+                        warn!("redb compact has deferred for {:?} with fragmentation still high \
+                               ({:.1}MB vs {:.1}MB baseline) — falling back to blocking compact",
+                            first.elapsed(),
+                            current_size as f64 / 1_048_576.0,
+                            last_compact_size as f64 / 1_048_576.0);
+                        let m = metadata.clone();
+                        let task = tokio::task::spawn_blocking(move || m.compact_db_blocking());
+                        match tokio::time::timeout(std::time::Duration::from_secs(60), task).await {
+                            Ok(Ok(Ok((before, after)))) => {
+                                if before != after {
+                                    info!("redb compacted (blocking fallback): {:.1}MB → {:.1}MB",
+                                        before as f64 / 1_048_576.0, after as f64 / 1_048_576.0);
+                                }
+                                last_compact_size = after;
+                                last_compact_time = Some(std::time::Instant::now());
+                                first_deferred_at = None;
+                            }
+                            Ok(Ok(Err(e))) => warn!("redb blocking compact fallback failed: {}", e),
+                            Ok(Err(e)) => warn!("redb blocking compact fallback panicked: {}", e),
+                            Err(_) => {
+                                // Same reasoning as the main compact_db() timeout above:
+                                // this is the same in-place compact() that used to run
+                                // unconditionally, so the same "permanently wedged, just
+                                // restart" handling applies.
+                                error!(
+                                    "redb compact_db_blocking() exceeded 60s — exclusive metadata \
+                                     write lock is permanently wedged on this node. Restarting so \
+                                     HA replicas can continue serving."
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    }
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;

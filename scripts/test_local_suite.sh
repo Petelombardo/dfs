@@ -3006,6 +3006,88 @@ fi
 rm -f "$T43_FILE"
 fi # should_run T43
 
+if should_run T44; then
+echo ""
+echo "=== T44: metadata compaction must not visibly stall request handling ==="
+
+# Opportunistic, not a dedicated load test: compaction already fires naturally several
+# times per full suite run (confirmed in real logs — every server hits the fragmentation
+# threshold within the first couple minutes of T1-T43's combined write volume). server*.log
+# files aren't truncated per-test (unlike the client log), so they cover the whole run —
+# scan them for "redb compaction phase3 lock acquiring" -> "redb compaction finished"
+# windows (the only part of compact_db() that actually holds the exclusive lock — see
+# dfs-server/src/metadata.rs) and check whether that server's own log went suspiciously
+# quiet during one (a self-contained signal: if metadata I/O were blocked,
+# concurrently-handled requests on that same node couldn't log anything either, so the
+# gap shows up in the same file). The unlocked copy/catch-up phases before this window
+# can legitimately take a while in wall-clock terms without that being a problem.
+#
+# Local DBs are tens of MB, so even the actually-locked phase finishes in well under
+# 500ms — too fast for this to be a strong signal at this scale (that's exactly why the
+# bug only surfaced on staging's much larger live dataset). Treat this as a sanity
+# check, not proof; zero windows found (e.g. a filtered RUN_TESTS subset) is not a
+# failure.
+T44_REPORT=$(python3 -c "
+import re, sys, glob
+from datetime import datetime
+
+THRESHOLD_MS = 500
+TS_RE = re.compile(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z')
+
+def parse_ts(line):
+    m = TS_RE.search(line)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), '%Y-%m-%dT%H:%M:%S.%f')
+
+windows_checked = 0
+max_gap_ms = 0.0
+worst = None
+
+# Only the span between 'phase3 lock acquiring' and 'compaction finished' is actually
+# exclusively locked — Phase 1-2 (full copy + catch-up) run before this and can
+# legitimately take a while in wall-clock terms without blocking anyone, since they
+# never hold the lock. Measuring from 'compaction starting' instead would conflate
+# that unlocked work with real blocking.
+for path in sorted(glob.glob('$LOG/server*.log')):
+    with open(path, errors='replace') as f:
+        lines = f.readlines()
+    timestamps = [parse_ts(l) for l in lines]
+
+    start_idx = None
+    for i, line in enumerate(lines):
+        if 'redb compaction phase3 lock acquiring' in line:
+            start_idx = i
+            continue
+        if start_idx is not None and 'redb compaction finished' in line:
+            end_idx = i
+            window_ts = [t for t in timestamps[start_idx:end_idx+1] if t is not None]
+            if len(window_ts) >= 2:
+                windows_checked += 1
+                gaps = [(b - a).total_seconds() * 1000 for a, b in zip(window_ts, window_ts[1:])]
+                gap = max(gaps)
+                if gap > max_gap_ms:
+                    max_gap_ms = gap
+                    worst = (path, gap)
+            start_idx = None
+
+print(f'{windows_checked}|{max_gap_ms:.1f}|{worst[0] if worst else \"\"}')
+")
+T44_WINDOWS=$(echo "$T44_REPORT" | cut -d'|' -f1)
+T44_MAX_GAP=$(echo "$T44_REPORT" | cut -d'|' -f2)
+T44_WORST_LOG=$(echo "$T44_REPORT" | cut -d'|' -f3)
+
+echo "  T44: $T44_WINDOWS compaction window(s) observed across server logs, max internal gap ${T44_MAX_GAP}ms${T44_WORST_LOG:+ (in $T44_WORST_LOG)}"
+
+if [ "$T44_WINDOWS" -eq 0 ]; then
+    echo "  T44: no compaction windows observed this run (e.g. filtered RUN_TESTS subset) — not a failure"
+elif awk "BEGIN { exit !($T44_MAX_GAP > 500) }"; then
+    check "T44 request handling stalled ${T44_MAX_GAP}ms during a metadata compaction window (>500ms threshold)" FAIL
+else
+    check "T44 no significant stall observed during metadata compaction windows" PASS
+fi
+fi # should_run T44
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

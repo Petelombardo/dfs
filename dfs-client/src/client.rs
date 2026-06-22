@@ -6239,19 +6239,16 @@ leader_addr: Arc::new(RwLock::new(None)),
             mine
         };
         if !batch.is_empty() {
-            let chunk_ids: Vec<_> = batch.iter().map(|l| l.chunk_id).collect();
             let leader_addr = *self.leader_addr.read().await;
             match leader_addr {
                 Some(leader) => {
-                    info!("[RCL-QUEUE] flush_metadata_sync draining {} locations to leader {}: {:?}", chunk_ids.len(), leader, chunk_ids);
+                    let count = batch.len();
                     if let Err(e) = self.send_chunk_locations_batched(leader, batch).await {
-                        warn!("flush_metadata_sync: draining pending chunk locations failed: {}", e);
-                    } else {
-                        info!("[RCL-QUEUE] flush_metadata_sync drain succeeded: {:?}", chunk_ids);
+                        warn!("flush_metadata_sync: draining {} pending chunk locations failed: {}", count, e);
                     }
                 }
                 None => {
-                    warn!("[RCL-QUEUE] flush_metadata_sync dropped {} locations — no known leader: {:?}", chunk_ids.len(), chunk_ids);
+                    warn!("flush_metadata_sync: dropped {} pending chunk locations — no known leader", batch.len());
                 }
             }
         }
@@ -6280,21 +6277,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                     std::mem::take(&mut *pending)
                 };
-                let chunk_ids: Vec<_> = batch.iter().map(|l| l.chunk_id).collect();
                 // Resolved fresh here, not at enqueue time — uses the most current
                 // leader knowledge for whatever accumulated since the last tick.
                 let leader_addr = *client.leader_addr.read().await;
                 match leader_addr {
                     Some(leader) => {
-                        info!("[RCL-QUEUE] worker draining {} locations to leader {}: {:?}", chunk_ids.len(), leader, chunk_ids);
+                        let count = batch.len();
                         if let Err(e) = client.send_chunk_locations_batched(leader, batch).await {
-                            warn!("chunk_location_batch_worker: batched send to leader {} failed: {}", leader, e);
-                        } else {
-                            info!("[RCL-QUEUE] worker drain succeeded: {:?}", chunk_ids);
+                            warn!("chunk_location_batch_worker: batched send of {} locations to leader {} failed: {}", count, leader, e);
                         }
                     }
                     None => {
-                        warn!("[RCL-QUEUE] worker dropped {} locations — no known leader: {:?}", chunk_ids.len(), chunk_ids);
+                        warn!("chunk_location_batch_worker: dropped {} locations — no known leader", batch.len());
                     }
                 }
             }
@@ -6305,8 +6299,6 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// instead of sending it immediately inline. See pending_chunk_locations's doc
     /// comment for why this is safe for every current caller.
     async fn enqueue_chunk_location(&self, location: dfs_common::ChunkLocation) {
-        info!("[RCL-QUEUE] enqueue chunk={} offset={:?} file_id={:?}",
-            location.chunk_id, location.file_offset, location.file_id);
         self.pending_chunk_locations.lock().await.push(location);
     }
 

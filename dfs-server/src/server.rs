@@ -2405,21 +2405,34 @@ impl Server {
         // rejoin — causing the healer to replicate them cluster-wide and inflating disk
         // usage on every node. A deleted file has no FILE_TABLE record at all, so check
         // (b) still correctly rejects it.
-        let (live_chunks, live_files): (std::collections::HashSet<dfs_common::ChunkId>, std::collections::HashSet<String>) = {
+        // Orphan check, scoped to this batch's actual cost instead of total cluster
+        // size. The original implementation unconditionally built a live_chunks/
+        // live_files set via two full FILE_TABLE scans (one deserializing every file's
+        // FileMetadata) on every single call — fine for the original callers
+        // (chunk_location_sync, healer batch push, both infrequent bulk operations),
+        // but this handler is now also the destination for every live client write's
+        // chunk-location notification (see send_chunk_locations_batched), including
+        // single-chunk "batches". After enough files/chunks accumulate, that full scan
+        // on every write becomes the dominant cost — confirmed via benchmarking, not
+        // assumed. Replace with per-location targeted get_file() lookups (O(1) each,
+        // same primitive the old single-item handler always used), deduped within the
+        // batch by file_id. Only fall back to the original full-scan behavior for the
+        // rare legacy locations with no file_id at all.
+        let needs_legacy_scan = locations.iter().any(|l| l.file_id.is_none());
+        let live_chunks: std::collections::HashSet<dfs_common::ChunkId> = if needs_legacy_scan {
             let metadata = self.metadata.clone();
-            match tokio::task::spawn_blocking(move || -> Result<_, anyhow::Error> {
-                Ok((metadata.live_chunk_ids()?, metadata.live_file_ids()?))
-            }).await {
-                Ok(Ok(sets)) => sets,
+            match tokio::task::spawn_blocking(move || metadata.live_chunk_ids()).await {
+                Ok(Ok(ids)) => ids,
                 _ => {
-                    // Can't load live sets — accept everything to avoid silently dropping
-                    // valid locations (safe fallback: healer will orphan-purge stale ones).
-                    warn!("handle_replicate_chunk_locations: failed to load live sets, accepting all {} locations",
-                          locations.len());
-                    (locations.iter().map(|l| l.chunk_id).collect(), locations.iter().filter_map(|l| l.file_id).map(|f| f.to_string()).collect())
+                    warn!("handle_replicate_chunk_locations: failed to load live chunk IDs, accepting all {} no-file_id locations",
+                          locations.iter().filter(|l| l.file_id.is_none()).count());
+                    locations.iter().filter(|l| l.file_id.is_none()).map(|l| l.chunk_id).collect()
                 }
             }
+        } else {
+            std::collections::HashSet::new()
         };
+        let mut file_exists_cache: std::collections::HashMap<dfs_common::FileId, bool> = std::collections::HashMap::new();
 
         let mut rejected = 0usize;
         let mut under_replicated: Vec<ChunkId> = Vec::new();
@@ -2431,9 +2444,10 @@ impl Server {
         // this, since every iteration committed before the next one ran).
         let mut pending: std::collections::HashMap<ChunkId, ChunkLocation> = std::collections::HashMap::new();
         for location in &locations {
-            // Reject orphans: see the live_chunks/live_files comment above.
+            // Reject orphans: see the comment above this loop.
             let is_live = match location.file_id {
-                Some(fid) => live_files.contains(&fid.to_string()),
+                Some(fid) => *file_exists_cache.entry(fid)
+                    .or_insert_with(|| self.metadata.get_file(&fid).ok().flatten().is_some()),
                 None => live_chunks.contains(&location.chunk_id),
             };
             if !is_live {

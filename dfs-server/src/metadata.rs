@@ -1099,24 +1099,6 @@ impl MetadataStore {
         Ok(live)
     }
 
-    /// Set of file_id strings (FILE_TABLE's keys) for files that currently exist.
-    /// Cheaper than live_chunk_ids() — just the key set, no value deserialization —
-    /// and answers a different question: "does this file still exist" rather than
-    /// "is this exact chunk_id already known," which matters for a chunk freshly
-    /// written but not yet reflected in this file's chunk_locations (see
-    /// handle_replicate_chunk_locations's orphan-rejection gate).
-    pub fn live_file_ids(&self) -> Result<std::collections::HashSet<String>> {
-        let _db = self.db.read().unwrap();
-        let txn = _db.begin_read()?;
-        let table = txn.open_table(FILE_TABLE)?;
-        let mut live = std::collections::HashSet::new();
-        for item in table.range::<&str>(..)? {
-            let (k, _) = item?;
-            live.insert(k.value().to_string());
-        }
-        Ok(live)
-    }
-
     /// Rebuild missing chunk: routing table entries from file metadata.
     pub fn rebuild_chunk_locations_from_files(&self) -> Result<(usize, usize)> {
         // Collect missing chunk records (read phase).

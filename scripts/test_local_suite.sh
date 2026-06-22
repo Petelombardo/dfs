@@ -2952,6 +2952,60 @@ fi
 for i in $(seq 0 $((T42_NUM_PROCS-1))); do rm -f "$MOUNT/t42_flood_${i}.bin" 2>/dev/null || true; done
 fi # should_run T42
 
+if should_run T43; then
+snapshot_log T43
+echo ""
+echo "=== T43: single patch write should not trigger redundant ReplicateChunkLocation broadcasts ==="
+
+# Established staging-cluster observation: a single small in-place overwrite
+# (MultiPatch, 2 replicas under RF=2) produces THREE separate "Handling
+# replicate chunk location" log lines on the leader instead of one — each
+# patched replica self-reports its own node_id (server.rs ~5044-5070), and
+# the client then sends a third broadcast with the merged node set
+# (client.rs ~5926-5942). This test reproduces that count directly so a
+# future fix can be validated against it.
+
+T43_FILE="$MOUNT/t43_patch.bin"
+
+# Fresh 4MB write establishes chunk0 with an existing_loc on the server, so
+# the next write below takes the in-place overwrite (PatchChunk/MultiPatch)
+# path rather than the fresh-chunk path.
+dd if=/dev/zero of="$T43_FILE" bs=1M count=4 2>/dev/null
+dfs_sync
+
+# Exactly one small in-place overwrite -> exactly one MultiPatch, one patch.
+python3 -c "
+import os
+fd = os.open('$T43_FILE', os.O_RDWR)
+os.pwrite(fd, bytes([0xAB]) * 4096, 1000)
+os.fsync(fd)
+os.close(fd)
+"
+dfs_sync
+sleep 1   # let the replicas' fire-and-forget self-report RPCs land
+
+# Pull the resulting chunk id out of the server logs — each patched replica
+# logs its own "MultiPatch: old -> new (... final size=...)" line synchronously
+# as part of applying the patch, so this is available immediately (unlike the
+# client's own MultiPatch summary line, which can lag behind a buffered log
+# flush after dfs_sync returns).
+T43_CHUNK_ID=$(grep -hoE "MultiPatch: [0-9a-f]+ -> [0-9a-f]+" "$LOG"/server*.log 2>/dev/null \
+    | tail -1 | awk '{print $4}')
+echo "  T43: patched chunk = ${T43_CHUNK_ID:-<not found>}"
+
+if [ -z "$T43_CHUNK_ID" ]; then
+    check "T43 could not find patched chunk id in client log" FAIL
+else
+    T43_RCL_COUNT=$(grep -h "Handling replicate chunk location: $T43_CHUNK_ID " "$LOG"/server*.log 2>/dev/null | wc -l)
+    echo "  T43: $T43_RCL_COUNT ReplicateChunkLocation broadcasts handled by the leader for 1 patch write (ideal: 1)"
+    [ "$T43_RCL_COUNT" -le 1 ] \
+        && check "T43 no redundant RCL broadcasts for single patch" PASS \
+        || check "T43 redundant RCL broadcasts: $T43_RCL_COUNT calls for 1 patch write (expect 1)" FAIL
+fi
+
+rm -f "$T43_FILE"
+fi # should_run T43
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

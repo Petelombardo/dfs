@@ -4752,7 +4752,7 @@ impl Server {
         chunk_file_offset: u64,
         patches: Vec<(usize, Vec<u8>)>,
         _expected_new_chunk_id: Option<dfs_common::ChunkId>,
-        client_write_seq: Option<u64>,
+        _client_write_seq: Option<u64>,
     ) -> Response {
         // Serialize all patches to the same (file_id, chunk_idx). Without this lock,
         // two concurrent patches against the same base (e.g. duplicate flush retries)
@@ -5030,44 +5030,22 @@ impl Server {
                     // there is no second copy left behind to clean up.
                 }
 
-                // Notify the leader of the actual computed hash before returning to the
-                // client. Each replica sends its own node_id; the leader's merge logic
-                // unions under-RF sets, so two replicas sending {A} and {B} accumulate
-                // correctly to {A, B}. Fire-and-forget: if the leader is down the
-                // chunk_location_sync loop and healer will reconcile.
-                //
-                // When this node IS the leader, update the chunk_map directly instead of
-                // sending an RCL over the network. Without this, the chunk_map retains the
-                // old chunk_id forever (no self-RCL), and handle_put_file_metadata's
-                // "prefer chunk_map" merge logic later writes the stale id to sled —
-                // causing EIO on cold reads after a client restart.
-                if new_chunk_id != chunk_id {
-                    let location = ChunkLocation {
-                        chunk_id: new_chunk_id,
-                        nodes: vec![self.cluster.local_node_id()],
-                        size: final_size,
-                        checksum: new_chunk_id.hash,
-                        file_offset: Some(chunk_file_offset),
-                        written_at: Some(patch_ts),
-                        client_write_seq,
-                        file_id: Some(file_id),
-                    };
-                    if let Some(leader_addr) = self.cluster.get_leader_addr().await {
-                        if leader_addr != self.cluster.local_addr() {
-                            let req = Request::ReplicateChunkLocation { location, file_id: Some(file_id) };
-                            let client = self.client.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = client.send_message(leader_addr, Message::Request(req)).await {
-                                    warn!("MultiPatch: failed to notify leader {} of new chunk {}: {}", leader_addr, new_chunk_id, e);
-                                }
-                            });
-                        } else {
-                            // We ARE the leader — update chunk_map directly, then sled.
-                            // Reuse handle_replicate_chunk_location's merge + sled logic.
-                            self.handle_replicate_chunk_location(location, Some(file_id)).await;
-                        }
-                    }
-                }
+                // Replicas (including this one, if it happens to be the leader) do NOT
+                // self-report the new chunk location here. Request::MultiPatch is only ever
+                // sent by the client's do_multi_patch (dfs-client), which — regardless of
+                // whether the leader is itself one of the patched replicas — always sends
+                // its own single ReplicateChunkLocation to the leader with the full merged
+                // node set once every replica has acked. A per-replica self-report here
+                // (network RPC for non-leader replicas, in-process call when this node IS
+                // the leader) used to run in addition to that broadcast, turning one logical
+                // update into up to 3 separate hits on handle_replicate_chunk_location, each
+                // doing a full sled read+write — and a lone self-report always lands below
+                // RF, so it would also spuriously queue an immediate heal for a chunk the
+                // very next self-report was about to fully replicate anyway. Durability
+                // isn't at risk either way — the chunk is already safely on `rf` disks — so
+                // if the client crashes before its broadcast lands, the periodic
+                // chunk_location_sync / reconciliation pass (not this fast path) closes the
+                // gap.
 
                 Response::MultiPatchResult {
                     new_chunk_id,

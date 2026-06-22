@@ -207,11 +207,6 @@ struct InodeWriteState {
     /// logic to detect append-extend: if a slot was partially flushed, flushed_sizes[idx]
     /// tells us how many bytes the server already has for that chunk.
     flushed_sizes: HashMap<u64, usize>,
-    /// Chunk IDs that were current when this write session opened the file.
-    /// Used by PatchChunk to detect a stale-write race: if another session already
-    /// patched chunk N between our open() and flush, chunk_ids_at_open[N] will no
-    /// longer match metadata_cache — discard this flush rather than reverting.
-    chunk_ids_at_open: HashMap<u64, dfs_common::ChunkId>,
     /// If true, every fsync() must flush immediately (O_SYNC / O_DSYNC was set on open).
     /// If false, fsyncs within the coalescing window are absorbed (DVR / streaming mode).
     sync_on_fsync: bool,
@@ -244,7 +239,6 @@ impl InodeWriteState {
         Self {
             slots: HashMap::new(),
             flushed_sizes: HashMap::new(),
-            chunk_ids_at_open: HashMap::new(),
             canonical_write_nodes: HashMap::new(),
             sync_on_fsync,
             is_truncated_session: false,
@@ -379,12 +373,6 @@ impl InodeWriteState {
             // Advance sequential tracking regardless of whether this write was sequential.
             // The next write will compare its start against this end position.
             slot.last_sequential_end = Some(write_end);
-            // A real write() supersedes the open-time snapshot for this chunk.
-            // The stale-write guard uses chunk_ids_at_open to detect sessions that
-            // buffered content at open time and would revert a competing write — but
-            // once an actual write() has landed here, the slot has newer data than
-            // anything on the server and must not be discarded.
-            self.chunk_ids_at_open.remove(&idx);
 
             debug!("write_at: chunk={} file_offset={} intra={} write_end={} len={} | slot_len={} gap_prefix={} real_end={} dirty_ranges={:?}",
                    idx, write_start_offset, intra, write_end, n, slot.data.len(), slot.gap_filled_prefix, slot.real_data_end,
@@ -851,16 +839,14 @@ impl FlushHandle {
                         loc
                     });
                     if let Some(old_location) = old_location_opt {
-                        // Stale-write guard: discard if another session patched this chunk after our open().
-                        let id_at_open = self.write_buffers.get(&ino)
-                            .and_then(|s| s.try_lock().ok()
-                                .and_then(|st| st.chunk_ids_at_open.get(chunk_idx).copied()));
-                        if let Some(open_id) = id_at_open {
-                            if open_id != old_location.chunk_id {
-                                info!("flush_buffer_async: ino={} chunk={} chunk_id changed since open — discarding stale write", ino, chunk_idx);
-                                continue;
-                            }
-                        }
+                        // Note: the "stale-write guard" that used to live here (discard if
+                        // chunk_id differed from an open()-time snapshot) is removed — see
+                        // flush_buffer_async_one's equivalent comment for why: patch_bytes
+                        // below is sliced purely from this session's own written bytes
+                        // (gap_filled_prefix..effective_write_end), never server-read
+                        // content, and old_location.chunk_id is already correctly resolved
+                        // above. Genuine staleness is handled by the server's ChunkStale
+                        // validation and the _verified retry path just below.
                         // Serialize this chunk's patch+metadata update with any concurrent
                         // write to the same (ino, chunk_idx) from any other path.
                         let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, *chunk_idx).await;
@@ -1787,38 +1773,20 @@ impl FlushHandle {
                 };
 
                 if let Some(old_location) = old_location {
-                    // Stale-write guard: if another session already patched this chunk
-                    // between our open() and now, the current chunk_id will differ from
-                    // what we snapshotted at open time. Our write buffer contains bytes
-                    // read at open time — applying them now would revert the newer write.
-                    let id_at_open = self.write_buffers.get(&ino)
-                        .and_then(|s| s.try_lock().ok()
-                            .and_then(|st| st.chunk_ids_at_open.get(&chunk_idx).copied()));
-                    info!("flush_buffer_async_one: ino={} chunk={} id_at_open={:?} current_id={} patches={} ranges={:?}",
-                        ino, chunk_idx, id_at_open, old_location.chunk_id, patches.len(),
-                        patches.iter().map(|(s, b)| (*s, s + b.len())).collect::<Vec<_>>());
-                    if let Some(open_id) = id_at_open {
-                        if open_id != old_location.chunk_id {
-                            info!("flush_buffer_async_one: ino={} chunk={} chunk_id changed since open ({} -> {}) — discarding stale write",
-                                ino, chunk_idx, open_id, old_location.chunk_id);
-                            if let Some(state_arc) = self.write_buffers.get(&ino) {
-                                let mut state = state_arc.lock().await;
-                                let discarded_len = state.slots.get(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
-                                state.slots.remove(&chunk_idx);
-                                if discarded_len > 0 {
-                                    self.global_buffered_bytes.fetch_sub(
-                                        discarded_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                }
-                            }
-                            // CRITICAL: Must notify waiters even when discarding stale write!
-                            // Without this, the waiter remains forever and all subsequent flushes
-                            // to this chunk will deadlock waiting for notification that never comes.
-                            self.notify_chunk_flush_complete(ino, chunk_idx).await;
-                            return Ok(());
-                        }
-                    }
+                    // Note: there used to be a "stale-write guard" here that discarded the
+                    // flush outright whenever the chunk's current id differed from a
+                    // snapshot taken at open() time. Removed — patches here are always
+                    // sliced from dirty_ranges (this session's own written bytes only,
+                    // never server-read content, see the patches construction above), and
+                    // old_location.chunk_id is already correctly resolved to the current
+                    // chunk via the priority chain above (slot_server_id > recent_chunk_writes
+                    // > canonical_write_nodes > metadata_cache). A mismatch against a stale
+                    // open-time snapshot was never a real hazard — it's the expected case
+                    // under concurrent writes to different byte ranges of the same chunk —
+                    // and the old guard was silently dropping valid writes because of it.
+                    // Genuine staleness is already handled correctly below: the server
+                    // validates the patch base and the *_verified retry path corrects it.
+                    //
                     // Acquire the per-chunk lock before the network call and hold it
                     // through the metadata_cache update at the end of this function.
                     let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, chunk_idx).await;
@@ -2923,6 +2891,9 @@ impl DfsFilesystem {
         // Start background metadata queue worker.
         client.start_metadata_queue_worker(&runtime);
 
+        // Start background chunk-location batch drain worker.
+        client.start_chunk_location_batch_worker(&runtime);
+
         let metadata_cache = Arc::new(DashMap::<u64, FileMetadata>::new());
         let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
@@ -3881,42 +3852,6 @@ impl Filesystem for DfsFilesystem {
                 }
                 if is_trunc {
                     if let Ok(mut st) = state_entry.try_lock() { st.is_truncated_session = true; }
-                }
-                // Snapshot chunk IDs at open time for stale-write detection.
-                // If another session patches chunk N between our open() and flush(),
-                // the chunk_id in metadata_cache will no longer match chunk_ids_at_open[N]
-                // and we skip the PatchChunk rather than reverting the newer write.
-                //
-                // On the first writer: clear any stale chunk_ids_at_open entirely rather
-                // than populating from metadata_cache. metadata_cache may hold chunk IDs
-                // from a previous session that were never committed to the server (e.g.
-                // from a detach/reattach read-open that cached a partial state). Seeding
-                // from stale cache would cause the guard to fire on the first real write
-                // (open_id != current_server_id) and silently discard valid data.
-                // With an empty map, id_at_open=None and the guard is bypassed — safe
-                // because is_first_writer guarantees no concurrent session exists to conflict.
-                //
-                // On subsequent concurrent writers: or_insert so we don't clobber the
-                // first writer's snapshot mid-flight.
-                let state_arc = state_entry.clone();
-                if is_first_writer {
-                    if let Ok(mut st) = state_arc.try_lock() {
-                        st.chunk_ids_at_open.clear();
-                        info!("open: ino={} is_first_writer — cleared chunk_ids_at_open", ino);
-                    }
-                } else {
-                    let meta_snap = self.metadata_cache.get(&ino).map(|m| m.clone());
-                    if let Some(meta) = meta_snap {
-                        if let Ok(mut st) = state_arc.try_lock() {
-                            for loc in &meta.chunk_locations {
-                                if let Some(offset) = loc.file_offset {
-                                    let idx = offset / CHUNK_SIZE as u64;
-                                    let prev = *st.chunk_ids_at_open.entry(idx).or_insert(loc.chunk_id);
-                                    info!("open: ino={} chunk_ids_at_open[{}] = {} (prev={})", ino, idx, loc.chunk_id, prev);
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }

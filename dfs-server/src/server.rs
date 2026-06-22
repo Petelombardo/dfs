@@ -372,6 +372,32 @@ impl Server {
         });
     }
 
+    /// Periodically refresh this node's own disk capacity into the cluster's capacity
+    /// map, independent of whether any client/admin tool happens to call
+    /// GetStorageStats. send_heartbeats (cluster.rs) reads this same map to populate
+    /// the outgoing heartbeat's available_bytes/total_bytes, which is how every other
+    /// node — including whoever is leader — learns this node's real free space.
+    /// Without this loop, get_nodes_with_capacity_awareness has no way to ever learn a
+    /// remote node's capacity unless a client happened to query it directly, and
+    /// silently assumes 1TB/2TB available for any node it hasn't heard from — letting
+    /// nodes fill unevenly with no actual capacity-based placement.
+    pub async fn start_capacity_refresh_loop(self: std::sync::Arc<Self>) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tokio::spawn(async move {
+            loop {
+                tick.tick().await;
+                match self.storage.get_filesystem_stats() {
+                    Ok((total, _free, available)) => {
+                        self.cluster.update_node_capacity(
+                            self.cluster.local_node_id(), available, total,
+                        ).await;
+                    }
+                    Err(e) => warn!("Capacity refresh: failed to get local filesystem stats: {}", e),
+                }
+            }
+        });
+    }
+
     /// Update the chunk map for a single file — called after every metadata write or heal.
     async fn chunk_map_update(&self, metadata: &FileMetadata) {
         if !metadata.chunk_locations.is_empty() {
@@ -7351,6 +7377,19 @@ impl MessageHandler for Server {
                 ClusterMessage::Heartbeat { node_info, cluster_view } => {
                     debug!("Received heartbeat from {} with {} gossip entries",
                            node_info.id, cluster_view.len());
+
+                    // Record the sender's self-reported disk capacity before add_node
+                    // consumes node_info. Guard on total_bytes > 0 — a peer that hasn't
+                    // completed its own first capacity refresh yet sends zeros, and
+                    // recording that would make get_nodes_with_capacity_awareness treat
+                    // it as 100% full (immediate veto) instead of falling through to the
+                    // "never seen" 1TB/2TB default it should keep getting until the peer
+                    // actually has a real number to report.
+                    if node_info.total_bytes > 0 {
+                        self.cluster.update_node_capacity(
+                            node_info.id, node_info.available_bytes, node_info.total_bytes,
+                        ).await;
+                    }
 
                     // Re-add the sender unconditionally. This handles nodes that were
                     // purged after a long failure — update_heartbeat silently no-ops when

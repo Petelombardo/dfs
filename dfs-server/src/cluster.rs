@@ -721,6 +721,20 @@ impl ClusterManager {
             })
             .collect();
 
+        // Piggyback our own disk capacity on the heartbeat so every peer — not just
+        // whoever happens to be leader when we self-report via GetStorageStats — learns
+        // it. Without this, get_nodes_with_capacity_awareness on the leader has no way
+        // to ever learn a remote node's real free space and silently assumes 1TB/2TB
+        // available for any node it hasn't personally heard from, regardless of how
+        // full that node actually is. Refreshed periodically by
+        // Server::start_capacity_refresh_loop, so this is at most that loop's interval
+        // stale — within the existing 300s freshness window used in
+        // get_nodes_with_capacity_awareness.
+        let (local_available, local_total) = self.node_capacities.read().await
+            .get(&local_node_id)
+            .map(|cap| (cap.available, cap.total))
+            .unwrap_or((0, 0));
+
         for (node_id, node_info) in nodes {
             // Skip self
             if node_id == local_node_id {
@@ -732,7 +746,9 @@ impl ClusterManager {
                 continue;
             }
 
-            let local_node_info = NodeInfo::new(local_node_id, local_addr, None);
+            let mut local_node_info = NodeInfo::new(local_node_id, local_addr, None);
+            local_node_info.available_bytes = local_available;
+            local_node_info.total_bytes = local_total;
             let heartbeat = ClusterMessage::Heartbeat {
                 node_info: local_node_info,
                 cluster_view: cluster_view.clone(),

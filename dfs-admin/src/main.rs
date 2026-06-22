@@ -360,8 +360,8 @@ async fn handle_cluster_command(
                         }
                         println!();
                         println!("Nodes:");
-                        println!("{:<10} {:<40} {:<20} {:<12} {:<8} {}", "Short ID", "ID", "Address", "Status", "Role", "Last Heartbeat");
-                        println!("{}", "-".repeat(115));
+                        println!("{:<10} {:<40} {:<20} {:<12} {:<8} {:<14} {}", "Short ID", "ID", "Address", "Status", "Role", "Free Space", "Last Heartbeat");
+                        println!("{}", "-".repeat(130));
 
                         for node in nodes {
                             let id_str = node.id.to_string();
@@ -381,13 +381,23 @@ async fn handle_cluster_command(
                                 let seconds_ago = now.saturating_sub(node.last_heartbeat);
                                 format!("{}s ago", seconds_ago)
                             };
+                            // total_bytes == 0 means this node's capacity hasn't been
+                            // gossiped to us yet (just joined, or we're its leader and
+                            // haven't seen a heartbeat back from it).
+                            let space_str = if node.total_bytes > 0 {
+                                format!("{:.1}/{:.1}GB", node.available_bytes as f64 / 1_073_741_824.0,
+                                    node.total_bytes as f64 / 1_073_741_824.0)
+                            } else {
+                                "?".to_string()
+                            };
                             println!(
-                                "{:<10} {:<40} {:<20} {:<12} {:<8} {}",
+                                "{:<10} {:<40} {:<20} {:<12} {:<8} {:<14} {}",
                                 short_id,
                                 id_str,
                                 node.addr,
                                 status_display,
                                 role,
+                                space_str,
                                 heartbeat_str
                             );
                         }

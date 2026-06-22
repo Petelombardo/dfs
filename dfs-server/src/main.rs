@@ -232,7 +232,65 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.cluster().start_heartbeat_sender().await;
     info!("✓ Heartbeat sender started");
 
-    // Start healing manager
+    // Start local disk-capacity refresh loop — keeps this node's entry in the cluster
+    // capacity map fresh so outgoing heartbeats always carry a real, recent number for
+    // peers (and the leader) to make capacity-aware placement decisions with.
+    server.clone().start_capacity_refresh_loop().await;
+    info!("✓ Capacity refresh loop started");
+
+    // Start healing manager on its own dedicated, lower-priority runtime — kept
+    // separate from the main multi-threaded runtime that serves live client RPCs
+    // (writes/reads/patches). Healing's PushChunkTo transfers move full 4MB chunks
+    // and used to compete on equal footing with live request handling for the same
+    // CPU cores AND the same disk I/O scheduling class; under a write-heavy workload
+    // that meant healing could visibly eat into client-facing throughput even though
+    // it's inherently best-effort/eventual work. A single worker thread is enough —
+    // healing is already bandwidth-budget limited by heal_semaphore — and
+    // on_thread_start lowers both that thread's CPU scheduling priority (higher nice
+    // value) and its disk I/O scheduling class (IOPRIO_CLASS_IDLE) so the kernel
+    // favors the main runtime's request-handling threads for both CPU and disk
+    // access whenever both have runnable/pending work on a contended resource. This
+    // only affects scheduling priority between dfs-server's own threads; it does not
+    // throttle healing's already-existing bandwidth/rate limits.
+    let healer_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("dfs-healer")
+        .on_thread_start(|| {
+            // SAFETY: nice() only ever adjusts the calling thread's own scheduling
+            // priority; it cannot affect other threads. -1 is both a valid returned
+            // niceness and the error sentinel, so errno must be cleared first and
+            // checked after — per nice(2).
+            unsafe {
+                *libc::__errno_location() = 0;
+                let prev = libc::nice(10);
+                if prev == -1 && *libc::__errno_location() != 0 {
+                    warn!("Failed to lower healer thread niceness (continuing at default priority)");
+                }
+            }
+
+            // Drop this thread's disk I/O scheduling class to IDLE — it only yields
+            // I/O bandwidth to other classes (RT/BE) on the SAME block device when
+            // they have pending I/O; it never blocks outright. ioprio_set has no
+            // libc wrapper, so it's issued as a raw syscall (SYS_ioprio_set, like
+            // SYS_gettid below, is resolved correctly per-target-arch by the libc
+            // crate — verified for x86_64 and aarch64). IOPRIO_CLASS_IDLE = 3,
+            // IOPRIO_CLASS_SHIFT = 13 — see ioprio_set(2).
+            unsafe {
+                const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+                const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
+                const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+                let tid = libc::syscall(libc::SYS_gettid) as libc::c_int;
+                let ioprio = IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT;
+                let ret = libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, tid, ioprio);
+                if ret != 0 {
+                    warn!("Failed to set IDLE I/O priority for healer thread: {}",
+                        std::io::Error::last_os_error());
+                }
+            }
+        })
+        .enable_all()
+        .build()?;
+
     let healing = std::sync::Arc::new(healing::HealingManager::new(
         storage,
         metadata,
@@ -244,7 +302,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config.replication.auto_heal,
         server.chunk_map_ref(),
     ));
-    healing.clone().start().await;
+    healer_runtime.spawn(healing.clone().start());
     server.set_healing_manager(healing.clone()).await;
     server.clone().start_compaction_loop();
     server.clone().start_ops_tracker_loop();

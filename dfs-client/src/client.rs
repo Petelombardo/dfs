@@ -6207,22 +6207,36 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// The FUSE thread is parked in block_on but tokio worker threads keep running,
     /// so the metadata queue worker proceeds without starvation.
     pub async fn flush_metadata_sync(&self, metadata: &FileMetadata) {
-        // Drain and synchronously send any pending chunk-location notifications first.
-        // Without this, fsync/release could return (metadata_queue's push_and_wait
-        // below confirmed) while some chunk-location updates from this same flush
-        // cycle are still sitting in pending_chunk_locations, not yet sent — the
-        // background batch worker only flushes on its own ~10ms tick. The underlying
-        // chunk data is already safely replicated regardless of this notification's
-        // timing, but a read shortly after this call returns can still race ahead of
-        // the background worker and see the leader's pre-patch chunk_map/CHUNK_TABLE
-        // state if that read needs to consult the leader rather than relying entirely
-        // on already-patched local state. This closes that window at the one point
-        // every flush path already calls to confirm metadata is fully committed,
-        // instead of needing a drain call at each of flush_metadata_sync's ~10 call
-        // sites individually.
+        // Drain and synchronously send this file's own pending chunk-location
+        // notifications first. Without this, fsync/release could return
+        // (metadata_queue's push_and_wait below confirmed) while some chunk-location
+        // updates from this same flush cycle are still sitting in
+        // pending_chunk_locations, not yet sent — the background batch worker only
+        // flushes on its own ~10ms tick. The underlying chunk data is already safely
+        // replicated regardless of this notification's timing, but a read shortly
+        // after this call returns can still race ahead of the background worker and
+        // see the leader's pre-patch chunk_map/CHUNK_TABLE state if that read needs to
+        // consult the leader rather than relying entirely on already-patched local
+        // state. This closes that window at the one point every flush path already
+        // calls to confirm metadata is fully committed, instead of needing a drain
+        // call at each of flush_metadata_sync's ~10 call sites individually.
+        //
+        // Scoped to this file_id specifically — NOT the whole queue. flush_all_pipelined
+        // (called just before this, at the end of every flush cycle) already waits for
+        // all of this file's own concurrent patches to land, so waiting on their
+        // location notifications too is bounded by work this caller is already doing.
+        // Draining indiscriminately would instead make a fast caller (e.g. closing a
+        // small file) wait on unrelated notifications queued by a completely different
+        // file's concurrent flush — real head-of-line blocking introduced by batching,
+        // not present in the old one-RPC-per-patch design. Anything left over (other
+        // files' pending locations) stays queued for the background worker's next tick.
         let batch = {
             let mut pending = self.pending_chunk_locations.lock().await;
-            std::mem::take(&mut *pending)
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+                .into_iter()
+                .partition(|loc| loc.file_id == Some(metadata.id));
+            *pending = rest;
+            mine
         };
         if !batch.is_empty() {
             let chunk_ids: Vec<_> = batch.iter().map(|l| l.chunk_id).collect();

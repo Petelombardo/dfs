@@ -421,11 +421,36 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     tokio::select! {
         sig = shutdown => {
             info!("Shutting down ({sig}) — broadcasting GracefulLeave to peers...");
+            // Capture this BEFORE announce_leaving(), which marks our own node Leaving —
+            // is_leader() would already read false afterward.
+            let was_leader = server.cluster().is_leader().await;
             server.cluster().announce_leaving(dfs_common::LeaveReason::Shutdown).await;
             // Brief pause so peers process the broadcast before we close connections.
             // 100ms is sufficient — announce_leaving() already awaits the TCP sends.
             // Keeping this short avoids racing with test-suite teardown (pkill + sleep 0.5).
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // If we were the leader, stay up a bit longer so the listener keeps answering
+            // requests instead of going dark. Every leader-affinity handler already checks
+            // is_leader() and returns NotLeader{leader_addr} — and since announce_leaving()
+            // above already flipped our own status to Leaving, get_leader_addr() already
+            // resolves to the successor (next-lowest-ID online peer) with no election
+            // round-trip needed. The client's send_to_leader_with_retry redirects on that
+            // response immediately with zero backoff — so the only thing standing between
+            // a client and the successor is whether our port is still open when it retries.
+            // Default is short to match the existing 100ms (test-suite teardown does
+            // `pkill` + `sleep 0.5` and assumes shutdown finishes well under that);
+            // staging/production should set DFS_LEADER_HANDOFF_GRACE_MS higher (e.g. 2000)
+            // via the systemd unit so real clients have time to land a retry.
+            if was_leader {
+                let grace_ms = std::env::var("DFS_LEADER_HANDOFF_GRACE_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                if grace_ms > 0 {
+                    info!("Was leader — staying up {}ms to redirect clients to the successor before exiting", grace_ms);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(grace_ms)).await;
+                }
+            }
             // Drain the sled-write worker: commits any queued PutFileMetadata writes
             // before the process exits. Without this, writes queued but not yet committed
             // are lost on restart (the worker std::thread is killed when main() returns).

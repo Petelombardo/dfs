@@ -3343,6 +3343,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             } else {
                 self.select_replica(&replicas).await.unwrap_or(nodes[0])
             };
+            self.node_inflight_inc(primary);
 
             // Determine partial-read flag.
             let use_partial_read = if pipeline_only {
@@ -3396,10 +3397,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                             }
                             match fallback_data {
                                 Some(d) => d,
-                                None => return Err(last_err.context(format!("pipeline read chunk {} (all replicas failed)", r.chunk_id))),
+                                None => {
+                                    client.node_inflight_dec(r.primary);
+                                    return Err(last_err.context(format!("pipeline read chunk {} (all replicas failed)", r.chunk_id)));
+                                }
                             }
                         }
                     };
+                    client.node_inflight_dec(r.primary);
                     info!("✓ Chunk {} via pipeline ({} bytes)", r.chunk_id, data.len());
                     Ok((r.idx, r.chunk_id, r.file_offset, Arc::new(data), false, r.pipeline_only))
                 }
@@ -3440,6 +3445,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             Err(e) => { last_error = Some(e); }
                         }
                     }
+                    client.node_inflight_dec(r.primary);
                     let chunk_data = data.ok_or_else(||
                         last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed")))?;
                     Ok::<_, anyhow::Error>((r.idx, r.chunk_id, r.file_offset,
@@ -3543,6 +3549,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
                     let selected_replica = self.select_replica(&replicas).await
                         .context("No replicas available for fallback fetch")?;
+                    self.node_inflight_inc(selected_replica);
 
                     // Try selected replica first, then fall back to others
                     let mut fetch_succeeded = false;
@@ -3571,6 +3578,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             }
                         }
                     }
+                    self.node_inflight_dec(selected_replica);
 
                     if !fetch_succeeded {
                         anyhow::bail!("Failed to fetch chunk {} from any replica after timeout", chunk_id);

@@ -2057,6 +2057,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // replica with fewer in-flight requests over a busier one, with chunk-hash
                 // rotation breaking ties so chunks still fan out across replicas.
                 let (primary, fallbacks) = self.pick_replica_by_load(loc, &nim, &nodes);
+                self.node_inflight_inc(primary);
 
                 range_fetches.push(RangeFetch { idx, chunk_start, offset_in_chunk, len_in_chunk, cid, primary, fallbacks });
             }
@@ -2091,6 +2092,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 Ok(data) => {
                                     info!("Range fetch: chunk {} off={} len={} → {} bytes",
                                           cid, offset_in_chunk, len_in_chunk, data.len());
+                                    client.node_inflight_dec(primary);
                                     return Ok((idx, chunk_start, offset_in_chunk, data));
                                 }
                                 Err(e) => {
@@ -2104,6 +2106,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 }
                             }
                         }
+                        client.node_inflight_dec(primary);
                         if all_not_found && last_err.is_some() {
                             Err(anyhow::anyhow!(
                                 "Range chunk {} missing on all replicas — metadata may be stale", cid

@@ -2894,6 +2894,12 @@ impl DfsFilesystem {
         // Start background chunk-location batch drain worker.
         client.start_chunk_location_batch_worker(&runtime);
 
+        // Start background sweeper evicting idle range_fetch_node_limit entries.
+        client.start_range_fetch_limit_sweeper(&runtime);
+
+        // Start background sweeper evicting stale read_write_seq_cache entries.
+        client.start_read_write_seq_cache_sweeper(&runtime);
+
         let metadata_cache = Arc::new(DashMap::<u64, FileMetadata>::new());
         let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
@@ -7129,6 +7135,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let release_in_flight = self.release_in_flight.clone();
+        let written_inodes = self.written_inodes.clone();
 
         let flush_handle = FlushHandle {
             client: client.clone(),
@@ -7197,13 +7204,25 @@ impl Filesystem for DfsFilesystem {
                 }
             }
 
-            // Commit metadata for all inodes with chunk locations.
+            // Commit metadata only for inodes actually written this session — not every
+            // file this client has ever cached metadata for. Without the written_inodes
+            // filter, this scanned and sequentially flushed the entire metadata_cache on
+            // every `sync`, which scales with total cached-file count rather than dirty
+            // files (the same shape as the shutdown-drain filter at line ~581). Spawn one
+            // task per inode like the buffer-flush loop above, instead of a sequential
+            // RPC-per-file loop.
             let to_commit: Vec<_> = metadata_cache.iter()
-                .filter(|e| !e.chunk_locations.is_empty())
+                .filter(|e| !e.chunk_locations.is_empty() && written_inodes.contains(e.key()))
                 .map(|e| e.clone())
                 .collect();
-            for meta in to_commit {
-                client.flush_metadata_sync(&meta).await;
+            if !to_commit.is_empty() {
+                let handles: Vec<_> = to_commit.into_iter().map(|meta| {
+                    let c = client.clone();
+                    tokio::spawn(async move {
+                        c.flush_metadata_sync(&meta).await;
+                    })
+                }).collect();
+                for h in handles { let _ = h.await; }
             }
 
             info!("fsyncdir: all buffers flushed and metadata committed");

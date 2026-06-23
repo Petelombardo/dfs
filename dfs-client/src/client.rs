@@ -212,6 +212,52 @@ impl ZeroGap {
     }
 }
 
+/// Number of shards for byte_range_cache and zero_gap_table. Both are keyed by
+/// (inode, ...), so sharding on inode gives perfect isolation between files —
+/// concurrent random reads on different files no longer contend on one global
+/// Mutex, and per-inode full scans (invalidation) only need to lock one shard
+/// instead of the whole cache.
+const CACHE_SHARD_COUNT: usize = 16;
+
+fn shard_index(inode: u64) -> usize {
+    (inode as usize) % CACHE_SHARD_COUNT
+}
+
+/// Sharded byte-range cache: each shard is an independently-locked LruCache.
+struct ShardedByteRangeCache {
+    shards: Vec<Mutex<LruCache<ByteRangeCacheKey, CachedChunk>>>,
+}
+
+impl ShardedByteRangeCache {
+    fn new(total_capacity: NonZeroUsize) -> Self {
+        let per_shard = NonZeroUsize::new((total_capacity.get() / CACHE_SHARD_COUNT).max(1)).unwrap();
+        Self {
+            shards: (0..CACHE_SHARD_COUNT).map(|_| Mutex::new(LruCache::new(per_shard))).collect(),
+        }
+    }
+
+    fn shard(&self, inode: u64) -> &Mutex<LruCache<ByteRangeCacheKey, CachedChunk>> {
+        &self.shards[shard_index(inode)]
+    }
+}
+
+/// Sharded zero-gap table: each shard is an independently-locked HashMap.
+struct ShardedZeroGapTable {
+    shards: Vec<Mutex<HashMap<ZeroGapKey, Vec<ZeroGap>>>>,
+}
+
+impl ShardedZeroGapTable {
+    fn new() -> Self {
+        Self {
+            shards: (0..CACHE_SHARD_COUNT).map(|_| Mutex::new(HashMap::new())).collect(),
+        }
+    }
+
+    fn shard(&self, inode: u64) -> &Mutex<HashMap<ZeroGapKey, Vec<ZeroGap>>> {
+        &self.shards[shard_index(inode)]
+    }
+}
+
 /// Hint for how to read a chunk - full or partial
 /// Used to optimize seeks by only fetching needed portions of chunks
 #[derive(Debug, Clone)]
@@ -514,13 +560,13 @@ pub struct DfsClient {
     /// Byte-range cache for recently-accessed chunks (inode, offset) -> chunk data
     /// This solves the problem of content-addressed chunks changing during live DVR recording
     /// Even if chunk hashes change, we can still cache by file position
-    byte_range_cache: Arc<Mutex<LruCache<ByteRangeCacheKey, CachedChunk>>>,
+    byte_range_cache: Arc<ShardedByteRangeCache>,
 
     /// Zero-filled gap table: tracks ranges that contain zeros in sparse files.
     /// Key: (inode, chunk_offset), Value: Vec of gap ranges within that chunk.
     /// This avoids caching megabytes of zeros for qcow2 sparse writes.
     /// Gaps expire with same TTL as byte_range_cache (30s).
-    zero_gap_table: Arc<Mutex<HashMap<ZeroGapKey, Vec<ZeroGap>>>>,
+    zero_gap_table: Arc<ShardedZeroGapTable>,
 
     /// TCP connection pool - maintains up to N idle connections per server
     /// VecDeque allows concurrent callers to each get their own connection.
@@ -629,10 +675,12 @@ pub struct DfsClient {
     /// Seeded from the server's stored write_seq on first open-for-write.
     write_seq: Arc<DashMap<FileId, u64>>,
 
-    /// Cache of chunk_id -> write_seq for read operations.
+    /// Cache of chunk_id -> (write_seq, inserted_at) for read operations.
     /// Populated in read_file() from the file's metadata and looked up by read_chunk_from_server()
-    /// to enable client-driven metadata staleness detection.
-    read_write_seq_cache: Arc<DashMap<ChunkId, u64>>,
+    /// to enable client-driven metadata staleness detection. Entries are content-addressed
+    /// (a rewrite mints a new ChunkId) so they're never overwritten — swept on a timer by
+    /// start_read_write_seq_cache_sweeper() instead, to bound long-mount-lifetime growth.
+    read_write_seq_cache: Arc<DashMap<ChunkId, (u64, Instant)>>,
 
     /// Per-inode read engines.  Each open file gets one engine that holds the chunk map
     /// snapshot and pipeline state.  Writers never touch this; engines refresh lazily.
@@ -728,8 +776,6 @@ impl DfsClient {
             NonZeroUsize::new(4).unwrap()
         });
 
-        let byte_range_cache = LruCache::new(byte_cache_capacity);
-
         // Replica location cache: MUST be large to avoid metadata query storms!
         // Each entry is just Arc<Vec<SocketAddr>> (~40-80 bytes), so even 2000 entries = ~160KB
         // CRITICAL: Should be much larger than chunk cache to cache replica locations
@@ -764,8 +810,8 @@ impl DfsClient {
             seed_nodes: cluster_nodes,
             current_node: Arc::new(RwLock::new(0)),
             chunk_cache: cache,
-            byte_range_cache: Arc::new(Mutex::new(byte_range_cache)),
-            zero_gap_table: Arc::new(Mutex::new(HashMap::new())),
+            byte_range_cache: Arc::new(ShardedByteRangeCache::new(byte_cache_capacity)),
+            zero_gap_table: Arc::new(ShardedZeroGapTable::new()),
             connection_pool: Arc::new(DashMap::new()),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(tokio::sync::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
@@ -1896,14 +1942,6 @@ leader_addr: Arc::new(RwLock::new(None)),
             return Ok(vec![0u8; len]);
         }
 
-        // Populate write_seq cache for all chunks in this file so read_chunk_from_server
-        // can include it in read requests for client-driven staleness detection
-        if let Some(ws) = write_seq {
-            for loc in chunk_map.iter() {
-                self.read_write_seq_cache.insert(loc.chunk_id, ws);
-            }
-        }
-
         // Chunks are content-addressed (ChunkId = hash of data), so there is no
         // staleness risk from caching: a modified page gets a new ChunkId and the
         // old cache entry is simply never requested again.  SQLite files previously
@@ -1914,6 +1952,22 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let end = offset + size;
         let needed = InodeReadEngine::chunks_for_range(&chunk_offsets, offset, size);
+
+        // Populate write_seq cache for only the chunks this read actually touches, so
+        // read_chunk_from_server can include it in read requests for client-driven
+        // staleness detection. Previously this inserted every chunk in the file's
+        // chunk_map on every read — O(file's chunk count) per read instead of O(chunks
+        // touched), and since chunk_ids are content-addressed (a new id per rewrite),
+        // entries for old chunk_ids were never evicted — an unbounded leak over a long
+        // mount lifetime. start_read_write_seq_cache_sweeper() (background sweeper)
+        // bounds the leak from the other end.
+        if let Some(ws) = write_seq {
+            for (idx, _, _) in &needed {
+                if let Some(loc) = chunk_map.get(*idx) {
+                    self.read_write_seq_cache.insert(loc.chunk_id, (ws, Instant::now()));
+                }
+            }
+        }
 
         if needed.is_empty() {
             // Hole (sparse file) — return zeros.
@@ -1985,7 +2039,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // of the fetched data) so the lookup and store use the same coordinate.
                 let cache_key = ByteRangeCacheKey { inode, file_offset: read_start as u64 };
                 let cached = {
-                    let mut byte_cache = self.byte_range_cache.lock().await;
+                    let mut byte_cache = self.byte_range_cache.shard(inode).lock().await;
                     if let Some(entry) = byte_cache.get(&cache_key) {
                         if entry.is_expired() {
                             byte_cache.pop(&cache_key);
@@ -2017,7 +2071,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         inode,
                         chunk_offset: chunk_start as u64,
                     };
-                    let mut gap_table = self.zero_gap_table.lock().await;
+                    let mut gap_table = self.zero_gap_table.shard(inode).lock().await;
                     if let Some(gaps) = gap_table.get_mut(&gap_key) {
                         // Check if requested range overlaps any gap
                         let mut found_gap = false;
@@ -2153,7 +2207,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     chunk_size: arc.len(),
                                     cached_at: std::time::Instant::now(),
                                 };
-                                self.byte_range_cache.lock().await.put(cache_key, cached_entry);
+                                self.byte_range_cache.shard(inode).lock().await.put(cache_key, cached_entry);
                             }
                             result_chunks.push((idx, arc));
                         }
@@ -2213,7 +2267,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 inode,
                                 file_offset: (chunk_start + offset_in_chunk) as u64,
                             };
-                            self.byte_range_cache.lock().await.put(cache_key, CachedChunk {
+                            self.byte_range_cache.shard(inode).lock().await.put(cache_key, CachedChunk {
                                 data: Arc::clone(&arc),
                                 chunk_size: arc.len(),
                                 cached_at: std::time::Instant::now(),
@@ -2829,6 +2883,48 @@ leader_addr: Arc::new(RwLock::new(None)),
             .clone()
     }
 
+    /// Spawn the background sweeper that evicts idle `range_fetch_node_limit` entries.
+    /// Must be called once after construction. Without this, every distinct (inode, node)
+    /// pair that has ever done a range fetch keeps a permanent semaphore entry — an
+    /// unbounded leak that grows with total files-ever-opened, not concurrent files
+    /// (e.g. a DVR cycling through thousands of recordings over weeks, or QEMU
+    /// repeatedly reopening images). An entry is idle when nothing holds a permit
+    /// (`available_permits() == max`) and no other Arc clone is outstanding
+    /// (`strong_count == 1`, i.e. only this map's own reference remains) — an
+    /// in-flight `acquire_owned()` guard holds its own Arc clone, so it can't be
+    /// evicted out from under an active fetch.
+    pub fn start_range_fetch_limit_sweeper(&self, runtime: &tokio::runtime::Handle) {
+        let client = self.clone();
+        let max_permits = range_fetch_max_per_file_node();
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                client.range_fetch_node_limit.retain(|_, sem| {
+                    !(Arc::strong_count(sem) == 1 && sem.available_permits() == max_permits)
+                });
+            }
+        });
+    }
+
+    /// Spawn the background sweeper that evicts stale `read_write_seq_cache` entries.
+    /// Must be called once after construction. Chunk ids are content-addressed (a rewrite
+    /// mints a new id), so entries are never overwritten — without this sweeper the map
+    /// only grows for the life of the mount. A 5-minute TTL is generous: this cache only
+    /// serves an optional staleness-detection hint on reads, so an evicted-too-early entry
+    /// just means that one read omits client_write_seq, not a correctness issue.
+    pub fn start_read_write_seq_cache_sweeper(&self, runtime: &tokio::runtime::Handle) {
+        let client = self.clone();
+        const TTL: Duration = Duration::from_secs(300);
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                client.read_write_seq_cache.retain(|_, (_, inserted_at)| inserted_at.elapsed() < TTL);
+            }
+        });
+    }
+
     /// Fetch with primary then fallbacks sequentially.
     /// Connect timeout is 1s so a dead node fails fast without wasting bandwidth.
     async fn fetch_chunk_with_fallback(
@@ -3169,7 +3265,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             if !found && inode > 0 && idx < chunk_offsets.len() {
                 let requested_offset = chunk_offsets[idx];
                 let byte_hit = {
-                    let mut byte_cache = self.byte_range_cache.lock().await;
+                    let mut byte_cache = self.byte_range_cache.shard(inode).lock().await;
                     let key = ByteRangeCacheKey {
                         inode,
                         file_offset: requested_offset,
@@ -3480,7 +3576,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Add to byte-range cache if we have inode (skip pipeline-only — no valid file_offset).
             // Note: file_offset == 0 is valid (first chunk of file) and should be cached.
             if inode > 0 && !is_pipeline_only {
-                let mut byte_cache = self.byte_range_cache.lock().await;
+                let mut byte_cache = self.byte_range_cache.shard(inode).lock().await;
                 let key = ByteRangeCacheKey {
                     inode,
                     file_offset,
@@ -3767,7 +3863,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         if inode == 0 || dirty_ranges.is_empty() {
             return;
         }
-        let mut byte_cache = self.byte_range_cache.lock().await;
+        let mut byte_cache = self.byte_range_cache.shard(inode).lock().await;
         for &(range_start, range_end) in dirty_ranges {
             if range_end > range_start && range_end <= slot_data.len() {
                 let key = ByteRangeCacheKey {
@@ -3829,7 +3925,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 inode,
                 chunk_offset: chunk_file_offset,
             };
-            let mut gap_table = self.zero_gap_table.lock().await;
+            let mut gap_table = self.zero_gap_table.shard(inode).lock().await;
             let gap_entries: Vec<ZeroGap> = gaps
                 .into_iter()
                 .map(|(start, end)| ZeroGap {
@@ -3860,7 +3956,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         if inode == 0 || chunk_len == 0 {
             return;
         }
-        let mut byte_cache = self.byte_range_cache.lock().await;
+        let mut byte_cache = self.byte_range_cache.shard(inode).lock().await;
         // Invalidate all keys in the range [chunk_file_offset, chunk_file_offset + chunk_len).
         // LruCache doesn't have range removal, so we scan all entries. This is acceptable
         // because byte_range_cache is small (~100 entries) and invalidation is rare (patches).
@@ -3887,7 +3983,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             inode,
             chunk_offset: chunk_file_offset,
         };
-        let mut gap_table = self.zero_gap_table.lock().await;
+        let mut gap_table = self.zero_gap_table.shard(inode).lock().await;
         gap_table.remove(&gap_key);
     }
 
@@ -3895,7 +3991,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Called on every write so that gap entries never shadow real in-flight data.
     pub async fn invalidate_zero_gap_for_chunk(&self, inode: u64, chunk_file_offset: u64) {
         let gap_key = ZeroGapKey { inode, chunk_offset: chunk_file_offset };
-        let mut gap_table = self.zero_gap_table.lock().await;
+        let mut gap_table = self.zero_gap_table.shard(inode).lock().await;
         gap_table.remove(&gap_key);
     }
 
@@ -4033,7 +4129,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Read a single chunk from a specific server using connection pooling
     async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId, client_write_seq: Option<u64>) -> Result<Vec<u8>> {
         // Look up write_seq from cache if not explicitly provided
-        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| *e));
+        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| e.0));
 
         let request = Request::ReadChunk {
             chunk_id,
@@ -4214,7 +4310,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         client_write_seq: Option<u64>,
     ) -> Result<(TcpStream, usize)> {
         // Look up write_seq from cache if not explicitly provided
-        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| *e));
+        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| e.0));
 
         let request = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: ws };
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
@@ -4415,7 +4511,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         client_write_seq: Option<u64>,
     ) -> Result<Vec<u8>> {
         // Look up write_seq from cache if not explicitly provided
-        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| *e));
+        let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| e.0));
 
         let request = Request::ReadChunkRange { chunk_id, offset, length, client_write_seq: ws };
         let response = tokio::time::timeout(
@@ -4754,7 +4850,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // chunk_cache (keyed by ChunkId) enables full-chunk reads to hit cache.
         // byte_range_cache (keyed by inode+offset) enables sub-chunk range reads to hit cache.
         {
-            let mut byte_cache = if inode > 0 { Some(self.byte_range_cache.lock().await) } else { None };
+            let mut byte_cache = if inode > 0 { Some(self.byte_range_cache.shard(inode).lock().await) } else { None };
             let mut current_offset = file_offset;
             let mut any_inserted = false;
 
@@ -5007,7 +5103,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // chunk_cache (keyed by ChunkId) enables full-chunk reads to hit cache.
         // byte_range_cache (keyed by inode+offset) enables sub-chunk range reads to hit cache.
         {
-            let mut byte_cache = if inode > 0 { Some(self.byte_range_cache.lock().await) } else { None };
+            let mut byte_cache = if inode > 0 { Some(self.byte_range_cache.shard(inode).lock().await) } else { None };
             let mut current_offset = file_offset;
             let mut any_inserted = false;
 

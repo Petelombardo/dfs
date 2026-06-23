@@ -5249,17 +5249,23 @@ impl Server {
                             }
                         }
                     } else {
-                        // No file_id: fall back to scanning all files for the old chunk_id.
-                        // Slower but correct — ensures chunk_map is updated even when the
-                        // client didn't send file_id (e.g. legacy or fallback patch path).
-                        for mut entry in self.chunk_map.iter_mut() {
+                        // No chunk_idx: file_id is still always present on this request
+                        // (it's not Option), so this is still an O(1) lookup by file_id —
+                        // just without the offset filter to pick the exact location among
+                        // that file's own (small) chunk list. This used to scan every file
+                        // in the cluster (self.chunk_map.iter_mut()) — the same O(cluster-
+                        // size)-in-a-hot-path shape as the already-fixed find_file_by_chunk
+                        // bug. It's live: dfs-client's multi_patch_chunk_on_replicas (the
+                        // unverified variant used when file_id isn't yet confirmed at flush
+                        // start) always omits chunk_idx, so this path is exercised on real
+                        // writes, not just a legacy fallback.
+                        if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
                             let (locations, _) = entry.value_mut();
                             if let Some(loc) = locations.iter_mut().find(|l| l.chunk_id == chunk_id) {
                                 loc.chunk_id = new_chunk_id;
                                 loc.checksum = new_chunk_id.hash;
                                 loc.size = final_size;
                                 loc.written_at = Some(patch_ts);
-                                break;
                             }
                         }
                     }

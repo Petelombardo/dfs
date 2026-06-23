@@ -1650,7 +1650,15 @@ impl Server {
         // the client's fallback logic will retry a different replica. Proxying
         // causes cascading timeouts: a node under load holds up all its request
         // handlers waiting for remote fetches, starving heartbeats.
-        match self.storage.read_chunk_arc(&chunk_id) {
+        //
+        // Run on the blocking-task pool: on a cache miss this does a synchronous
+        // open+read syscall. Running it inline on a tokio worker thread would tie
+        // that thread up for the full disk seek/read latency, capping concurrent
+        // reads at the worker-thread count regardless of how many requests the
+        // client has in flight (the bottleneck behind the RND4K Q32T1 gap).
+        let storage = self.storage.clone();
+        let read_result = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&chunk_id)).await;
+        match read_result.unwrap_or_else(|e| Err(anyhow::anyhow!("read_chunk_arc panicked: {e}"))) {
             Ok(arc) => {
                 let (capacity, size) = self.storage.get_cache_stats();
                 let cache_stats = Some((0, capacity, size));
@@ -1691,7 +1699,16 @@ impl Server {
         // Use a seeked partial read — avoids loading the full 4MB chunk from disk
         // on a cache miss when the caller only needs a small byte range.
         // On a cache hit the slice is still copied from the warm Arc (negligible cost).
-        match self.storage.read_chunk_range_partial(&chunk_id, offset as usize, length as usize) {
+        //
+        // Run on the blocking-task pool: see handle_read_chunk for why a cache-miss
+        // open+seek+read must not run inline on a tokio worker thread. This is the
+        // path KDiskMark's RND4K random reads take, so it's the direct fix for the
+        // Q32T1 concurrency ceiling.
+        let storage = self.storage.clone();
+        let range_result = tokio::task::spawn_blocking(move || {
+            storage.read_chunk_range_partial(&chunk_id, offset as usize, length as usize)
+        }).await;
+        match range_result.unwrap_or_else(|e| Err(anyhow::anyhow!("read_chunk_range_partial panicked: {e}"))) {
             Ok(data) => {
                 debug!("Returning {} bytes from chunk {} (requested {}, offset {})",
                        data.len(), chunk_id, length, offset);

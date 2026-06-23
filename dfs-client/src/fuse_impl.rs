@@ -81,13 +81,77 @@ fn is_sqlite_direct_io(path: &str) -> bool {
 
 const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB chunks
 
-/// RAII guard that decrements a per-inode write-task counter on drop.
-/// Used by write() spawned tasks so release() can wait for all pending writes
-/// to land in the slot before flushing.
-struct WriteTaskGuard(Arc<std::sync::atomic::AtomicUsize>);
+/// RAII guard that decrements per-(inode, chunk) write-task counters on drop.
+/// Used by write() spawned tasks so release()/fsync() can wait for all pending
+/// writes to land before flushing, and flush_one_chunk can wait for just the
+/// one chunk it's about to snapshot rather than every write anywhere in the file.
+struct WriteTaskGuard(Vec<Arc<std::sync::atomic::AtomicUsize>>);
 impl Drop for WriteTaskGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        for c in &self.0 {
+            c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Chunk indices touched by a write of `len` bytes starting at `offset`.
+/// Mirrors InodeWriteState::write_at's own chunk-boundary walk so the two stay
+/// consistent about which chunks a given write spans.
+fn chunk_indices_for_write(offset: u64, len: usize) -> Vec<u64> {
+    if len == 0 {
+        return vec![offset / CHUNK_SIZE as u64];
+    }
+    let start_idx = offset / CHUNK_SIZE as u64;
+    let end_idx = (offset + len as u64 - 1) / CHUNK_SIZE as u64;
+    (start_idx..=end_idx).collect()
+}
+
+/// Increment the per-(inode, chunk) in-flight counters for every chunk a write
+/// touches, returning the Arc handles so the caller (typically a WriteTaskGuard)
+/// can decrement the exact same set later.
+fn inc_write_tasks_for_chunks(
+    map: &dashmap::DashMap<(u64, u64), Arc<std::sync::atomic::AtomicUsize>>,
+    ino: u64,
+    chunk_indices: &[u64],
+) -> Vec<Arc<std::sync::atomic::AtomicUsize>> {
+    chunk_indices.iter().map(|&idx| {
+        let counter = map.entry((ino, idx))
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .clone();
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        counter
+    }).collect()
+}
+
+/// Sum of in-flight write tasks across every chunk of a given inode. Used by
+/// release()/fsync()/open() which need to know about writes anywhere in the
+/// file, not just one chunk.
+fn write_tasks_in_flight_for_inode(
+    map: &dashmap::DashMap<(u64, u64), Arc<std::sync::atomic::AtomicUsize>>,
+    ino: u64,
+) -> usize {
+    map.iter()
+        .filter(|e| e.key().0 == ino)
+        .map(|e| e.value().load(std::sync::atomic::Ordering::Relaxed))
+        .sum()
+}
+
+/// Poll (with timeout) until all in-flight write tasks across every chunk of
+/// this inode finish. Returns false on timeout (caller logs/handles as before).
+async fn wait_for_inode_writes_done(
+    map: &dashmap::DashMap<(u64, u64), Arc<std::sync::atomic::AtomicUsize>>,
+    ino: u64,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if write_tasks_in_flight_for_inode(map, ino) == 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 
@@ -477,7 +541,7 @@ struct FlushHandle {
     flush_notify: Arc<tokio::sync::Notify>,
     /// Per-inode count of in-flight FUSE write() tasks. Used by flush_one_chunk to wait
     /// for all writes to land before snapshotting a full slot.
-    write_tasks_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
+    write_tasks_in_flight: Arc<DashMap<(u64, u64), Arc<std::sync::atomic::AtomicUsize>>>,
     /// Per-inode mutex that serialises concurrent flush_all_pipelined calls for the same
     /// inode. Without this, two sync_release handlers closing in quick succession can both
     /// enter flush_all_pipelined concurrently, race on slot ownership, and produce
@@ -1396,12 +1460,20 @@ impl FlushHandle {
         // and the flusher fires after the slot is complete. No wait needed, and waiting
         // would stall on write_tasks_in_flight>0 (continuous incoming writes), breaking
         // throughput completely.
+        //
+        // Keyed by (ino, chunk_idx), not just ino: this only needs to wait for writers
+        // touching THIS chunk. Waiting on a per-inode counter (any write anywhere in the
+        // file) collapsed concurrent random-write throughput once writes were made to
+        // actually run concurrently (KDiskMark RND4K write went from ~900-1200 ops/sec to
+        // ~30-45 ops/sec) — at QD32 scattered across many chunks, the per-inode counter
+        // almost never reached 0 during a sustained burst, so this wait kept timing out
+        // at its full 5s deadline for nearly every flush attempt.
         if gap_filled_prefix > 0 {
-        if let Some(counter) = self.write_tasks_in_flight.get(&ino) {
+        if let Some(counter) = self.write_tasks_in_flight.get(&(ino, chunk_idx)) {
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
             while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 if tokio::time::Instant::now() > deadline {
-                    warn!("flush_one_chunk: timed out waiting for write tasks for ino={}", ino);
+                    warn!("flush_one_chunk: timed out waiting for write tasks for ino={} chunk={}", ino, chunk_idx);
                     break;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
@@ -2798,7 +2870,7 @@ pub struct DfsFilesystem {
 
     /// Per-inode count of write() tasks still running (spawned but not yet written into the slot).
     /// release() waits for this to reach zero before flush so we don't flush an incomplete slot.
-    write_tasks_in_flight: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>>,
+    write_tasks_in_flight: Arc<DashMap<(u64, u64), Arc<std::sync::atomic::AtomicUsize>>>,
 
 
     /// Total bytes currently held across all per-inode write buffers.
@@ -2950,7 +3022,7 @@ impl DfsFilesystem {
 
         // Shared write_tasks_in_flight — used by flush_one_chunk to wait for in-flight
         // write() tasks before snapshotting a full slot.
-        let write_tasks_in_flight_shared: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>> = Arc::new(DashMap::new());
+        let write_tasks_in_flight_shared: Arc<DashMap<(u64, u64), Arc<std::sync::atomic::AtomicUsize>>> = Arc::new(DashMap::new());
         let chunk_write_locks_shared: Arc<DashMap<u64, Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>>> = Arc::new(DashMap::new());
         let flush_pipeline_locks_shared: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>> = Arc::new(DashMap::new());
         let release_in_flight_shared: Arc<DashMap<u64, Arc<std::sync::atomic::AtomicUsize>>> = Arc::new(DashMap::new());
@@ -3701,9 +3773,9 @@ impl Filesystem for DfsFilesystem {
     fn open(&mut self, _req: &FuseRequest, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
         let release_count = self.release_in_flight.get(&ino)
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
-        info!("open: ino={} flags=0x{:x} release_in_flight={} write_tasks_in_flight={:?}",
+        info!("open: ino={} flags=0x{:x} release_in_flight={} write_tasks_in_flight={}",
               ino, flags, release_count,
-              self.write_tasks_in_flight.get(&ino).map(|c| c.load(std::sync::atomic::Ordering::Relaxed)));
+              write_tasks_in_flight_for_inode(&self.write_tasks_in_flight, ino));
 
         // NOTE: We intentionally do NOT block here waiting for write_tasks_in_flight or
         // release_in_flight. Both used block_on() on main-runtime workers, which deadlocks
@@ -4902,14 +4974,17 @@ impl Filesystem for DfsFilesystem {
         let chunk_write_locks = self.chunk_write_locks.clone();
         let written_inodes = self.written_inodes.clone();
 
-        let write_task_counter = self.write_tasks_in_flight
-            .entry(ino)
-            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
-            .clone();
-        // NOTE: write_task_counter is incremented AFTER the back-pressure wait,
-        // just before write_at(). Incrementing here (before back-pressure) would
-        // cause a deadlock: flush_one_chunk waits for write_tasks_in_flight=0 before
-        // snapshotting gap-prefix slots, but the write stalled on back-pressure can't
+        let write_tasks_in_flight = self.write_tasks_in_flight.clone();
+        // Chunk(s) this write touches — almost always one for a sub-4MB write,
+        // two if it straddles a chunk boundary. Computed once up front so the
+        // fast and slow paths key their in-flight counters identically to how
+        // flush_one_chunk will look them up (per (ino, chunk_idx), not per ino —
+        // see chunk_indices_for_write's doc comment for why).
+        let write_chunk_indices = chunk_indices_for_write(offset as u64, data.len());
+        // NOTE: counters are incremented AFTER the back-pressure wait, just before
+        // write_at(). Incrementing here (before back-pressure) would cause a
+        // deadlock: flush_one_chunk waits for its chunk's counter to hit 0 before
+        // snapshotting a gap-prefix slot, but a write stalled on back-pressure can't
         // call write_at() until the flush frees buffer space — neither can proceed.
         // After a 5-second timeout flush_one_chunk would snapshot incomplete data and
         // flush zeros to the server (silent data corruption).
@@ -4951,10 +5026,25 @@ impl Filesystem for DfsFilesystem {
                         }
                         let state_arc = write_buffers.get(&ino).map(|e| e.clone());
                         if let Some(state_arc) = state_arc {
-                        // Use blocking_lock() — if the flush thread holds the mutex we wait
-                        // on the FUSE dispatch thread rather than falling through to spawn an
-                        // async task. Blocking the FUSE thread here is correct and desirable:
-                        // it throttles the writer naturally without consuming a runtime slot.
+                        // Spawn immediately instead of running inline: fuser's session
+                        // loop reads exactly one kernel request at a time and dispatches
+                        // synchronously (see fuser session.rs — "this read-dispatch-loop
+                        // is non-concurrent"). Anything done inline here blocks that one
+                        // thread from picking up the NEXT request, regardless of how many
+                        // the kernel has queued — which silently collapsed concurrent
+                        // writes to effectively QD1 (confirmed: KDiskMark RND4K write
+                        // throughput was flat from Q1 to Q32). Matches the shape read()
+                        // already uses (read_runtime.spawn, fuse_impl.rs ~4171).
+                        //
+                        // Back-pressure semantics are unchanged — the same graduated
+                        // sleep loop runs here, just inside the spawned task instead of
+                        // on the dispatch thread. This still bounds memory: FUSE's own
+                        // max_background cap limits how many writes the kernel will
+                        // dispatch to us without a reply, so the number of these tasks
+                        // that can exist at once is already bounded independent of this
+                        // change — moving the sleep off the dispatch thread doesn't admit
+                        // more outstanding writes than the kernel was already allowed to
+                        // queue.
                         //
                         // CRITICAL: apply back-pressure BEFORE acquiring the lock.
                         // Holding the slot mutex while spinning would prevent the flush task
@@ -4963,93 +5053,100 @@ impl Filesystem for DfsFilesystem {
                         // Graduated back-pressure reading global_buffered_bytes directly.
                         // This avoids try_lock on the slot (which fails under high concurrency
                         // and falls back to cap, causing false pressure) without introducing
-                        // CAS loops that cause spurious sleeps on the FUSE dispatch thread.
+                        // CAS loops that cause spurious sleeps.
                         // The cap is soft: concurrent writers can overshoot by at most
                         // N×write_size before the next check catches it — acceptable given
                         // write_size ≤ 1MB and the flusher drains continuously.
-                        {
-                            let t_bp = std::time::Instant::now();
-                            const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-                            // Scale cap with concurrent write sessions: each active inode needs
-                            // BUFFER_CHUNKS slots, but cap total at PIPELINE_MAX_ITEMS × CHUNK_SIZE
-                            // to bound memory under many concurrent writers.
-                            let effective_cap = (write_buffers.len().max(1) * global_write_buffer_cap)
-                                .min(PIPELINE_MAX_ITEMS * CHUNK_SIZE);
-                            loop {
-                                let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
-                                let fill_pct = current * 100 / effective_cap.max(1);
-                                let delay_ms: u64 = if fill_pct < 75 { 0 }
-                                    else if fill_pct < 90 { 1 }
-                                    else if fill_pct < 100 { 5 }
-                                    else {
-                                        if t_bp.elapsed() >= BP_TIMEOUT {
-                                            error!("write fast-path: ino={} bp timeout — EIO (global_buffered={}  cap={} active_inodes={})", ino, current, effective_cap, write_buffers.len());
-                                            // counter was never incremented (moved to after back-pressure)
-                                            reply.error(libc::EIO);
-                                            return;
+                        self.runtime.spawn(async move {
+                            {
+                                let t_bp = std::time::Instant::now();
+                                const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+                                // Scale cap with concurrent write sessions: each active inode needs
+                                // BUFFER_CHUNKS slots, but cap total at PIPELINE_MAX_ITEMS × CHUNK_SIZE
+                                // to bound memory under many concurrent writers.
+                                let effective_cap = (write_buffers.len().max(1) * global_write_buffer_cap)
+                                    .min(PIPELINE_MAX_ITEMS * CHUNK_SIZE);
+                                loop {
+                                    let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                                    let fill_pct = current * 100 / effective_cap.max(1);
+                                    let delay_ms: u64 = if fill_pct < 75 { 0 }
+                                        else if fill_pct < 90 { 1 }
+                                        else if fill_pct < 100 { 5 }
+                                        else {
+                                            if t_bp.elapsed() >= BP_TIMEOUT {
+                                                error!("write fast-path: ino={} bp timeout — EIO (global_buffered={}  cap={} active_inodes={})", ino, current, effective_cap, write_buffers.len());
+                                                // counter was never incremented (moved to after back-pressure)
+                                                reply.error(libc::EIO);
+                                                return;
+                                            }
+                                            10
+                                        };
+                                    if delay_ms == 0 { break; }
+                                    // Under back-pressure, urgently wake the flush worker so it
+                                    // drains stale partial slots (e.g. VM disk patches that never
+                                    // fill a full 4MB chunk) instead of waiting for the 50ms tick.
+                                    flush_handle.flush_notify.notify_one();
+                                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                    if fill_pct < 100 { break; }
+                                }
+                            }
+                            // Increment AFTER back-pressure wait: counters now only reflect
+                            // write_at() calls in progress, not writes stalled on buffer-full.
+                            let _write_guard = WriteTaskGuard(
+                                inc_write_tasks_for_chunks(&write_tasks_in_flight, ino, &write_chunk_indices)
+                            );
+                            let mut state = state_arc.lock().await;
+                            {
+                                let bytes_before = state.buffered_bytes();
+                                let pattern_changed = state.write_at(offset as u64, &data_vec);
+                                let bytes_after = state.buffered_bytes();
+                                let has_full = !state.full_slot_indices().is_empty();
+                                drop(state);
+                                let new_end = (offset as u64) + data_vec.len() as u64;
+                                {
+                                    let mut hwm = size_high_water.entry(ino).or_insert(0);
+                                    if new_end > *hwm { *hwm = new_end; }
+                                }
+                                // Invalidate zero_gap_table for chunks touched by this write.
+                                // Same rationale as the slow path: gap entries must not shadow
+                                // in-flight writes before the 50ms flush fires.
+                                {
+                                    const GAP_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                                    let write_start = offset as u64;
+                                    let write_end_gap = write_start + data_vec.len() as u64;
+                                    let first_chunk_off = (write_start / GAP_CHUNK_SIZE) * GAP_CHUNK_SIZE;
+                                    let client_gap = client.clone();
+                                    flush_handle.flush_runtime.spawn(async move {
+                                        let mut chunk_off = first_chunk_off;
+                                        while chunk_off < write_end_gap {
+                                            client_gap.invalidate_zero_gap_for_chunk(ino, chunk_off).await;
+                                            chunk_off += GAP_CHUNK_SIZE;
                                         }
-                                        10
-                                    };
-                                if delay_ms == 0 { break; }
-                                // Under back-pressure, urgently wake the flush worker so it
-                                // drains stale partial slots (e.g. VM disk patches that never
-                                // fill a full 4MB chunk) instead of waiting for the 50ms tick.
-                                flush_handle.flush_notify.notify_one();
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                                if fill_pct < 100 { break; }
+                                    });
+                                }
+                                // Only count bytes actually added to the buffer, not the write
+                                // size. Overlapping writes don't grow the slot, so adding
+                                // data_vec.len() unconditionally causes the counter to drift up.
+                                let added = bytes_after.saturating_sub(bytes_before);
+                                if added > 0 {
+                                    global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                {
+                                    let mut counters = write_counters.write().unwrap();
+                                    *counters.entry(ino).or_insert(0) += 1;
+                                }
+                                if has_full || pattern_changed {
+                                    flush_handle.flush_notify.notify_one();
+                                }
+                                // Explicit drop (not end-of-scope) so the per-chunk counters
+                                // decrement BEFORE the reply, same ordering as the explicit
+                                // fetch_sub this replaces.
+                                drop(_write_guard);
+                                debug!("write fast-path: ino={} off={} len={}", ino, offset, data_vec.len());
+                                reply.written(data_vec.len() as u32);
                             }
-                        }
-                        // Increment AFTER back-pressure wait: counter now only reflects
-                        // write_at() calls in progress, not writes stalled on buffer-full.
-                        write_task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let mut state = state_arc.blocking_lock();
-                        {
-                            let bytes_before = state.buffered_bytes();
-                            let pattern_changed = state.write_at(offset as u64, &data_vec);
-                            let bytes_after = state.buffered_bytes();
-                            let has_full = !state.full_slot_indices().is_empty();
-                            drop(state);
-                            let new_end = (offset as u64) + data_vec.len() as u64;
-                            {
-                                let mut hwm = size_high_water.entry(ino).or_insert(0);
-                                if new_end > *hwm { *hwm = new_end; }
-                            }
-                            // Invalidate zero_gap_table for chunks touched by this write.
-                            // Same rationale as the slow path: gap entries must not shadow
-                            // in-flight writes before the 50ms flush fires.
-                            {
-                                const GAP_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-                                let write_start = offset as u64;
-                                let write_end_gap = write_start + data_vec.len() as u64;
-                                let first_chunk_off = (write_start / GAP_CHUNK_SIZE) * GAP_CHUNK_SIZE;
-                                let client_gap = client.clone();
-                                flush_handle.flush_runtime.spawn(async move {
-                                    let mut chunk_off = first_chunk_off;
-                                    while chunk_off < write_end_gap {
-                                        client_gap.invalidate_zero_gap_for_chunk(ino, chunk_off).await;
-                                        chunk_off += GAP_CHUNK_SIZE;
-                                    }
-                                });
-                            }
-                            // Only count bytes actually added to the buffer, not the write
-                            // size. Overlapping writes don't grow the slot, so adding
-                            // data_vec.len() unconditionally causes the counter to drift up.
-                            let added = bytes_after.saturating_sub(bytes_before);
-                            if added > 0 {
-                                global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            {
-                                let mut counters = write_counters.write().unwrap();
-                                *counters.entry(ino).or_insert(0) += 1;
-                            }
-                            if has_full || pattern_changed {
-                                flush_handle.flush_notify.notify_one();
-                            }
-                            write_task_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                            debug!("write fast-path: ino={} off={} len={}", ino, offset, data_vec.len());
-                            reply.written(data_vec.len() as u32);
-                            return;
-                        } // blocking_lock scope
+                        });
+                        return;
                         } // if let Some(state_arc)
                     }
                 } else {
@@ -5058,11 +5155,12 @@ impl Filesystem for DfsFilesystem {
             }
         }
 
-        // Slow path: increment here (before spawn) since there is no back-pressure
-        // wait in the outer thread for this path. WriteTaskGuard decrements on drop.
-        write_task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Slow path: unlike the fast path, this can write at an offset other than
+        // the original `offset` parameter (e.g. the sparse-gap branch below pads
+        // from current_size, not from `offset`) — so each write_at call site below
+        // computes and holds its own chunk-indexed guard from its actual
+        // (offset, data) rather than reusing one computed up front.
         self.runtime.spawn(async move {
-            let _write_guard = WriteTaskGuard(write_task_counter);
             let start = std::time::Instant::now();
             debug!("write: ino={}, offset={}, size={}", ino, offset, data_vec.len());
 
@@ -5177,6 +5275,14 @@ impl Filesystem for DfsFilesystem {
                         padded.extend_from_slice(&data_vec);
                         let gap_write_offset = current_size as u64;
                         let padded_len = padded.len();
+
+                        // This writes at gap_write_offset (current_size), not the original
+                        // `offset` — the chunk(s) touched can differ from write_chunk_indices
+                        // computed up front from `offset`, so compute fresh here.
+                        let gap_chunk_indices = chunk_indices_for_write(gap_write_offset, padded_len);
+                        let _write_guard = WriteTaskGuard(
+                            inc_write_tasks_for_chunks(&write_tasks_in_flight, ino, &gap_chunk_indices)
+                        );
 
                         let state_arc = write_buffers
                             .entry(ino)
@@ -5370,6 +5476,12 @@ impl Filesystem for DfsFilesystem {
                         if fill_pct < 100 { break; }
                     }
                     let t_bp = t_bp_start.elapsed();
+
+                    // write_offset == offset here, so write_chunk_indices (computed up
+                    // front from the original offset/data) is still the right set.
+                    let _write_guard = WriteTaskGuard(
+                        inc_write_tasks_for_chunks(&write_tasks_in_flight, ino, &write_chunk_indices)
+                    );
 
                     // t_buf: time to acquire the slot lock and copy bytes into the buffer.
                     let t_buf_start = std::time::Instant::now();
@@ -5920,15 +6032,8 @@ impl Filesystem for DfsFilesystem {
                     // Wait for any concurrent write() tasks for this inode to finish writing
                     // into the slot before we flush. Without this, a close() that arrives
                     // while write() tasks are still queued flushes an incomplete slot.
-                    if let Some(counter) = write_tasks_in_flight.get(&ino) {
-                        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-                        while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                            if tokio::time::Instant::now() > deadline {
-                                warn!("release: timed out waiting for write tasks for ino={}", ino);
-                                break;
-                            }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                        }
+                    if !wait_for_inode_writes_done(&write_tasks_in_flight, ino, std::time::Duration::from_secs(5)).await {
+                        warn!("release: timed out waiting for write tasks for ino={}", ino);
                     }
                     // If the file was unlinked while this release task was queued, skip the
                     // flush — sending PutFileMetadata for a deleted file resurrects it on
@@ -6078,15 +6183,8 @@ impl Filesystem for DfsFilesystem {
                     // Wait for any concurrent write() tasks for this inode to finish writing
                     // into the slot before we flush. Without this, a close() that arrives
                     // while write() tasks are still queued flushes an incomplete slot.
-                    if let Some(counter) = write_tasks_in_flight.get(&ino) {
-                        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-                        while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                            if tokio::time::Instant::now() > deadline {
-                                warn!("release: timed out waiting for write tasks for ino={}", ino);
-                                break;
-                            }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                        }
+                    if !wait_for_inode_writes_done(&write_tasks_in_flight, ino, std::time::Duration::from_secs(5)).await {
+                        warn!("release: timed out waiting for write tasks for ino={}", ino);
                     }
                     // If the file was unlinked while this release task was queued, skip the
                     // flush — sending PutFileMetadata for a deleted file resurrects it on
@@ -6992,8 +7090,7 @@ impl Filesystem for DfsFilesystem {
 
         let path = self.metadata_cache.get(&ino).map(|m| m.path.clone()).unwrap_or_default();
         let active_writers = self.write_open_counts.get(&ino).map(|c| *c).unwrap_or(0);
-        let tasks_in_flight = self.write_tasks_in_flight.get(&ino)
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+        let tasks_in_flight = write_tasks_in_flight_for_inode(&self.write_tasks_in_flight, ino);
         let buffered_slots = self.write_buffers.get(&ino)
             .and_then(|s| s.try_lock().ok().map(|st| st.slots.len()))
             .unwrap_or(0);
@@ -7004,25 +7101,18 @@ impl Filesystem for DfsFilesystem {
         // Their writes are async tasks — fsync must wait for all of them to land
         // before replying, otherwise reads after fdatasync see stale/zero data.
         if self.direct_write_inodes.contains(&ino) {
-            if let Some(counter) = self.write_tasks_in_flight.get(&ino) {
-                let counter = counter.clone();
-                self.runtime.spawn(async move {
-                    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
-                    while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                        if tokio::time::Instant::now() > deadline {
-                            error!("fsync: timed out waiting for direct write tasks for ino={}", ino);
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                    }
-                    info!("fsync: ino={} → direct-write path, done", ino);
-                    reply.ok();
-                });
-            } else {
-                info!("fsync: ino={} path={:?} → direct-write path, done", ino, path);
+            let write_tasks_in_flight = self.write_tasks_in_flight.clone();
+            self.runtime.spawn(async move {
+                // Returns immediately if nothing is in flight for this inode, same
+                // as the old else-branch's fast path when no counter entry existed.
+                if !wait_for_inode_writes_done(&write_tasks_in_flight, ino, std::time::Duration::from_secs(10)).await {
+                    error!("fsync: timed out waiting for direct write tasks for ino={}", ino);
+                    reply.error(libc::EIO);
+                    return;
+                }
+                info!("fsync: ino={} → direct-write path, done", ino);
                 reply.ok();
-            }
+            });
             return;
         }
 

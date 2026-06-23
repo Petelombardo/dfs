@@ -75,6 +75,13 @@ pub struct Server {
     /// Updated on every write, heal, and chunk-location replication.
     chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
 
+    /// Reverse index of chunk_map: ChunkId -> FileId. Kept in lockstep with chunk_map
+    /// so find_file_by_chunk is O(1) instead of scanning every file's location list —
+    /// that scan used to run on every ReadChunk/ReadChunkRange carrying a
+    /// client_write_seq (i.e. most reads of a file the client has written this session),
+    /// scaling with total cluster chunks rather than the single chunk being read.
+    chunk_to_file: Arc<DashMap<ChunkId, FileId>>,
+
     /// Permanently-missing chunk blocklist.
     /// Chunks that recently failed reads from all online nodes. Prevents connection
     /// storms on repeated retries. TTL-based: entries expire after 5 minutes so chunks
@@ -235,6 +242,7 @@ impl Server {
             broadcast_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
             delete_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             chunk_map: Arc::new(DashMap::new()),
+            chunk_to_file: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashMap::new())),
             healing: Arc::new(RwLock::new(None)),
             leader_forward_queue: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -341,6 +349,7 @@ impl Server {
     /// materialising a 2 GB Vec<FileMetadata> and triggering OOM-like behaviour.
     pub fn rebuild_chunk_map_from_metadata(&self) {
         let chunk_map = self.chunk_map.clone();
+        let chunk_to_file = self.chunk_to_file.clone();
         let file_write_seqs = self.file_write_seqs.clone();
         let metadata = self.metadata.clone();
 
@@ -353,7 +362,12 @@ impl Server {
                 if !file.chunk_locations.is_empty() {
                     // or_insert_with: don't overwrite entries already added by incoming RCLs
                     // while the scan is running — the RCL is always newer than redb state.
-                    chunk_map.entry(file.id).or_insert_with(|| (file.chunk_locations.clone(), file.write_seq));
+                    let inserted = chunk_map.entry(file.id)
+                        .or_insert_with(|| (file.chunk_locations.clone(), file.write_seq));
+                    let (locs, _) = inserted.value();
+                    for loc in locs {
+                        chunk_to_file.insert(loc.chunk_id, file.id);
+                    }
                     built += 1;
                 }
                 // Seed file_write_seqs so the bypass guard has a correct baseline
@@ -461,13 +475,19 @@ impl Server {
             } else {
                 metadata.chunk_locations.clone()
             };
+            for loc in new_locs.iter() {
+                self.chunk_to_file.insert(loc.chunk_id, metadata.id);
+            }
             self.chunk_map.insert(metadata.id, (new_locs, metadata.write_seq));
-        } else if self.chunk_map.contains_key(&metadata.id) {
+        } else if let Some((old_locs, _)) = self.chunk_map.get(&metadata.id).map(|e| e.value().clone()) {
             // Empty chunk_locations on a file that already has a chunk_map entry means
             // truncate-to-zero. Reset the entry instead of leaving it untouched —
             // otherwise the stale pre-truncate chunks would linger in chunk_map and
             // get resurrected by handle_put_file_metadata's chunk_map union (below)
             // on the next write to this file.
+            for loc in old_locs.iter() {
+                self.chunk_to_file.remove(&loc.chunk_id);
+            }
             self.chunk_map.insert(metadata.id, (vec![], metadata.write_seq));
         }
         // If the file has no chunks yet (new empty file) and no map entry exists,
@@ -479,11 +499,13 @@ impl Server {
     /// Finds all files that reference this chunk and patches the location in place.
     async fn chunk_map_update_location(&self, location: &ChunkLocation) {
         for mut entry in self.chunk_map.iter_mut() {
+            let file_id = *entry.key();
             let (locs, _) = entry.value_mut();
             for loc in locs.iter_mut() {
                 if loc.chunk_id == location.chunk_id {
                     // Exact match — update in place.
                     *loc = location.clone();
+                    self.chunk_to_file.insert(location.chunk_id, file_id);
                     return;
                 }
             }
@@ -524,6 +546,7 @@ impl Server {
         for loc in locs.iter_mut() {
             if loc.chunk_id == location.chunk_id {
                 *loc = location.clone();
+                self.chunk_to_file.insert(location.chunk_id, file_id);
                 return;
             }
         }
@@ -549,7 +572,9 @@ impl Server {
                         }
                     };
                     if should_update {
+                        self.chunk_to_file.remove(&loc.chunk_id);
                         *loc = location.clone();
+                        self.chunk_to_file.insert(location.chunk_id, file_id);
                     } else {
                         // Stale RCL rejected: log so we can confirm the guard is working.
                         debug!("[RCL-stale-rejected] file={:?} chunk_idx={} kept={} (seq={:?}) dropped={} (seq={:?})",
@@ -564,24 +589,22 @@ impl Server {
         // Push so chunk_map grows incrementally as chunks are written rather than waiting
         // until file close (PutFileMetadata) to learn about the file's chunks.
         locs.push(location.clone());
+        self.chunk_to_file.insert(location.chunk_id, file_id);
     }
 
     /// Remove a file from the chunk map (on deletion).
     async fn chunk_map_remove(&self, file_id: &FileId) {
-        self.chunk_map.remove(file_id);
-    }
-
-    /// Find which file a chunk belongs to by scanning the chunk_map.
-    /// Returns None if chunk not found in any file.
-    fn find_file_by_chunk(&self, chunk_id: &ChunkId) -> Option<FileId> {
-        for entry in self.chunk_map.iter() {
-            let file_id = *entry.key();
-            let (locations, _) = entry.value();
-            if locations.iter().any(|loc| &loc.chunk_id == chunk_id) {
-                return Some(file_id);
+        if let Some((_, (locs, _))) = self.chunk_map.remove(file_id) {
+            for loc in locs.iter() {
+                self.chunk_to_file.remove(&loc.chunk_id);
             }
         }
-        None
+    }
+
+    /// Find which file a chunk belongs to via the chunk_to_file reverse index — O(1).
+    /// Returns None if chunk not found in any file.
+    fn find_file_by_chunk(&self, chunk_id: &ChunkId) -> Option<FileId> {
+        self.chunk_to_file.get(chunk_id).map(|e| *e.value())
     }
 
     /// Pull fresh metadata from the leader and store it locally.

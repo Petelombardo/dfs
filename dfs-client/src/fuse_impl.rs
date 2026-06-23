@@ -692,7 +692,10 @@ impl FlushHandle {
         // the full combined chunk. Without this, a DVR-style header write (small write to offset 0
         // at recording start, followed by the full stream body) produces a 12032-byte stub chunk
         // that replaces the correct 4MB first chunk when the file is closed.
-        let mut slots_to_write: Vec<(u64, Vec<u8>, u64)> = Vec::new(); // (chunk_idx, data, file_offset)
+        // Arc<Vec<u8>>, not Vec<u8>: each slot is up to CHUNK_SIZE (4MB) and gets cloned
+        // again below to move into its tokio::spawn task — Arc makes that a refcount
+        // bump instead of a second full-buffer copy.
+        let mut slots_to_write: Vec<(u64, Arc<Vec<u8>>, u64)> = Vec::new(); // (chunk_idx, data, file_offset)
         let mut patch_metadata_dirty = false; // true if any PatchChunk succeeded (needs metadata flush)
         for chunk_idx in &indices_to_flush {
             let Some(state_lock) = self.write_buffers.get(&ino) else { continue };
@@ -776,7 +779,7 @@ impl FlushHandle {
                 if is_overwrite && dirty_ranges_snap.len() > 1 {
                     info!("flush_buffer_async: slot {} is_overwrite with {} sparse dirty ranges — deferring to MultiPatch path",
                           chunk_idx, dirty_ranges_snap.len());
-                    slots_to_write.push((*chunk_idx, slot_data, file_offset));
+                    slots_to_write.push((*chunk_idx, Arc::new(slot_data), file_offset));
                     continue;
                 }
 
@@ -1021,10 +1024,10 @@ impl FlushHandle {
                 };
 
                 if !patched {
-                    slots_to_write.push((*chunk_idx, slot_data, file_offset));
+                    slots_to_write.push((*chunk_idx, Arc::new(slot_data), file_offset));
                 }
             } else {
-                slots_to_write.push((*chunk_idx, slot_data, file_offset));
+                slots_to_write.push((*chunk_idx, Arc::new(slot_data), file_offset));
             }
         }
 
@@ -1053,12 +1056,12 @@ impl FlushHandle {
         let file_id = self.metadata_cache.get(&ino).map(|m| m.id).unwrap_or_else(dfs_common::FileId::new);
         let handles: Vec<_> = slots_to_write.iter().map(|(chunk_idx, slot_data, file_offset)| {
             let client = self.client.clone();
-            let data = slot_data.clone();
+            let data = Arc::clone(slot_data);
             let offset = *file_offset;
             let idx = *chunk_idx;
             tokio::spawn(async move {
                 info!("flush_buffer_async: writing chunk {} ({} bytes at offset {})", idx, data.len(), offset);
-                let result = client.write_data_with_cache(&data, ino, offset, file_id, None).await;
+                let result = client.write_data_with_cache(data.as_slice(), ino, offset, file_id, None).await;
                 result.map(|(_, _, locs)| (idx, locs))
             })
         }).collect();
@@ -2255,14 +2258,9 @@ impl FlushHandle {
             Ok((_, _, Some(locations))) => {
                 let flushed_len = slot_data.len();
 
-                // Seed chunk_cache with the written data so subsequent reads (and the
-                // release() pre-seeding for partial overwrites) can find this chunk
-                // without a network round-trip. The server is authoritative, but we
-                // know the content is correct — we just wrote it.
-                let slot_arc = std::sync::Arc::new(slot_data.clone());
-                for loc in &locations {
-                    self.client.chunk_cache.insert(loc.chunk_id, Arc::clone(&slot_arc));
-                }
+                // chunk_cache is already seeded by write_data_with_cache (both the
+                // dual-replica and single-node-fallback paths populate it from the same
+                // bytes) — no need to clone slot_data again here just to re-insert it.
 
                 // Evict byte_range_cache and zero_gap_table entries for this chunk.
                 // chunk_cache was just seeded with the full content above; invalidating

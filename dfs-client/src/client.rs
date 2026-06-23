@@ -5274,6 +5274,17 @@ leader_addr: Arc::new(RwLock::new(None)),
             let (chunk_ids, chunk_sizes, replica_nodes_per_chunk) = self.write_data_single_chunk_tracked(data, file_id).await?;
             let cws = self.write_seq.get(&file_id).map(|e| *e);
             let locations = Self::build_chunk_locations_from_ids(&chunk_ids, &chunk_sizes, file_offset, replica_nodes_per_chunk, cws, file_id);
+
+            // Seed chunk_cache here so callers never need to re-clone `data` themselves
+            // to do it — mirrors write_data_dual_replica's seeding below for the
+            // multi-node case, which is the dominant path in production.
+            let mut chunk_start = 0usize;
+            for loc in &locations {
+                let chunk_end = chunk_start + loc.size;
+                self.chunk_cache.insert(loc.chunk_id, Arc::new(data[chunk_start..chunk_end].to_vec()));
+                chunk_start = chunk_end;
+            }
+
             return Ok((chunk_ids, chunk_sizes, Some(locations)));
         }
 

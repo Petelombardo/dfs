@@ -303,13 +303,14 @@ const MAX_BACKGROUND_PER_NODE: usize = 1;
 /// workload (e.g. a benchmark with a high queue depth) can open unbounded
 /// connections to a node and starve other files reading from the same node.
 /// Can be overridden via DFS_RANGE_FETCH_MAX_PER_FILE_NODE for cap-tuning trials.
-/// Default: 2.
+/// Default: 6 (raised from 2 after staging RND4K benchmarking showed 6 as the sweet
+/// spot between per-file concurrency and starving other files on the same node).
 fn range_fetch_max_per_file_node() -> usize {
     std::env::var("DFS_RANGE_FETCH_MAX_PER_FILE_NODE")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&v: &usize| v > 0)
-        .unwrap_or(2)
+        .unwrap_or(6)
 }
 
 /// Get the SQLite consistency window duration in milliseconds

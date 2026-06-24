@@ -482,10 +482,12 @@ impl InodeWriteState {
 
 
 /// Maximum number of chunk-flush tasks that may run concurrently per inode.
-/// Allows small patches to pipeline efficiently (16 × 1KB = 16KB in flight) while
+/// Allows small patches to pipeline efficiently (24 × 1KB = 24KB in flight) while
 /// large chunks hit the byte limit instead (4 × 4MB = 16MB).
 /// Background ticker: gentle limit to avoid overwhelming servers during steady-state writes.
-const PIPELINE_MAX_ITEMS: usize = 16;
+/// Raised from 16 to 24 after RND4K Q32T1 write benchmarking showed it as the binding
+/// constraint on the background flush drain, not per-chunk durability latency.
+const PIPELINE_MAX_ITEMS: usize = 24;
 /// fsync/release flush: higher limit so small-patch storms (e.g. VM disk installs) don't
 /// take ceil(N/16) rounds, but still bounded to prevent saturating XFS journal on servers.
 const FLUSH_ALL_MAX_ITEMS: usize = 64;

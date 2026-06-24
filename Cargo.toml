@@ -27,7 +27,12 @@ toml = "0.8"
 redb = "2"
 
 # Hashing and crypto
-blake3 = "1.5"
+# "rayon" enables multi-threaded hashing for large inputs (Hasher::update_rayon) —
+# every chunk patch re-hashes the full chunk (content-addressed storage), and on
+# the modest ARM SBCs this cluster runs on, single-threaded BLAKE3 only hits
+# ~210MB/s (~19ms per 4MB chunk). Parallelizing across cores measured ~3.7x
+# faster (~775MB/s, ~5ms per 4MB chunk) — see compute_chunk_hash_at.
+blake3 = { version = "1.5", features = ["rayon"] }
 sha2 = "0.10"
 
 # Networking

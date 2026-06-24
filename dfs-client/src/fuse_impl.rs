@@ -482,19 +482,30 @@ impl InodeWriteState {
 
 
 /// Maximum number of chunk-flush tasks that may run concurrently per inode.
-/// Allows small patches to pipeline efficiently (24 × 1KB = 24KB in flight) while
-/// large chunks hit the byte limit instead (4 × 4MB = 16MB).
+/// Allows small patches to pipeline efficiently (32 × 1KB = 32KB in flight) while
+/// large/zero-padded slots (e.g. a random write into a chunk that hasn't been
+/// touched yet this session — write_at zero-fills up to the write's offset, so a
+/// single 4KB write near the end of a chunk can balloon the slot to nearly 4MB)
+/// hit the byte limit (PIPELINE_MAX_BYTES) instead, regardless of item count.
 /// Background ticker: gentle limit to avoid overwhelming servers during steady-state writes.
-/// Raised from 16 to 24 after RND4K Q32T1 write benchmarking showed it as the binding
-/// constraint on the background flush drain, not per-chunk durability latency.
-const PIPELINE_MAX_ITEMS: usize = 24;
+/// Raised 16 -> 24 -> 32 after RND4K Q32T1 write benchmarking showed item count was the
+/// binding constraint on the background flush drain, not per-chunk durability latency.
+/// The byte cap below was previously enforced only by flush_all_pipelined (fsync/release);
+/// the ticker now enforces both, so raising this no longer raises worst-case memory —
+/// only PIPELINE_MAX_BYTES does that.
+const PIPELINE_MAX_ITEMS: usize = 32;
 /// fsync/release flush: higher limit so small-patch storms (e.g. VM disk installs) don't
 /// take ceil(N/16) rounds, but still bounded to prevent saturating XFS journal on servers.
 const FLUSH_ALL_MAX_ITEMS: usize = 64;
 
 /// Maximum total bytes in-flight across concurrent flush tasks per inode.
-/// Set to 4 × CHUNK_SIZE (16MB). Used by both the background ticker and flush_all_pipelined.
-const PIPELINE_MAX_BYTES: usize = 4 * CHUNK_SIZE;
+/// Set to 8 × CHUNK_SIZE (32MB) — matches the typical in-flight footprint the old
+/// PIPELINE_MAX_ITEMS=16 item-only cap produced for random-write workloads (each
+/// flushed slot averages ~2MB for a single random touch into an untouched chunk,
+/// so 16 × ~2MB ≈ 32MB). Used by both the background ticker and flush_all_pipelined,
+/// so raising PIPELINE_MAX_ITEMS buys more concurrency for small patches without
+/// raising the worst-case memory ceiling for large/zero-padded slots.
+const PIPELINE_MAX_BYTES: usize = 8 * CHUNK_SIZE;
 
 /// Number of full chunk slots the writer may buffer ahead of the pipeline.
 /// With up to 16 items or 16MB flushing and BUFFER_CHUNKS=4 in the buffer, the
@@ -2631,13 +2642,18 @@ impl FlushHandle {
             if pending == 0 { break; }
 
             // Count currently in-flight slots for this inode (claimed, flushing=true).
-            // Also sum their byte sizes to enforce the byte limit.
+            // Also sum their DIRTY byte sizes (not slot.data.len()) to enforce the byte
+            // limit. slot.data.len() is the nominal zero-padded buffer length — a single
+            // random write near the end of an untouched chunk can balloon that to ~4MB
+            // while only a few KB is real dirty data. Counting padded length as if it were
+            // real cost makes the byte budget bind far earlier than intended (same trap
+            // buffered_bytes() already avoids for write back-pressure, see its doc comment).
             let (in_flight_count, in_flight_bytes) = self.write_buffers.get(&ino).map(|s| {
                 s.try_lock().map(|st| {
                     let count = st.slots.values().filter(|sl| sl.flushing).count();
                     let bytes: usize = st.slots.values()
                         .filter(|sl| sl.flushing)
-                        .map(|sl| sl.data.len())
+                        .map(|sl| sl.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>())
                         .sum();
                     (count, bytes)
                 }).unwrap_or((0, 0))
@@ -2651,12 +2667,13 @@ impl FlushHandle {
             let bytes_available = PIPELINE_MAX_BYTES.saturating_sub(in_flight_bytes);
 
             // Estimate how many more items we can dispatch based on both budgets.
-            // Peek at pending slot sizes to make a reasonable guess.
+            // Peek at pending slots' DIRTY byte sizes (not slot.data.len() — see the
+            // in_flight_bytes comment above) to make a reasonable guess.
             let pending_slot_sizes: Vec<usize> = self.write_buffers.get(&ino)
                 .and_then(|s| s.try_lock().ok().map(|st| {
                     let mut sizes: Vec<usize> = st.slots.values()
                         .filter(|sl| !sl.data.is_empty() && !sl.flushing)
-                        .map(|sl| sl.data.len())
+                        .map(|sl| sl.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>())
                         .collect();
                     sizes.sort_unstable();
                     sizes
@@ -3100,6 +3117,21 @@ impl DfsFilesystem {
                             None => continue,
                         };
                         let state = state_arc.lock().await;
+                        // Dual cap: item count (PIPELINE_MAX_ITEMS) lets many small patches
+                        // pipeline freely; the byte cap bounds the rarer case of a chunk that
+                        // genuinely needs to send a lot of real data (e.g. is_full_replacement).
+                        // Must count DIRTY bytes, not slot.data.len() — a slot touched for the
+                        // first time this session can be zero-padded up to its write offset
+                        // (see write_at), so a single random write near the end of a chunk
+                        // makes data.len() ~4MB while real dirty content is a few KB. Counting
+                        // padded length here made this gate bind far earlier than intended —
+                        // worse than having no byte cap at all (regression caught by re-testing
+                        // RND4K Q32T1 write after first adding this check).
+                        let in_flight_bytes: usize = state.slots.values()
+                            .filter(|s| s.flushing)
+                            .map(|s| s.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>())
+                            .sum();
+                        if in_flight_bytes >= PIPELINE_MAX_BYTES { drop(state); continue; }
                         let has_full = !state.full_slot_indices().is_empty();
                         let no_active_writers = write_open_counts_for_bg
                             .get(&ino).map(|c| *c == 0).unwrap_or(true);
@@ -3176,6 +3208,18 @@ impl DfsFilesystem {
                                 // exit so we don't over-subscribe.
                                 let current = in_flight_task.get(&ino).map(|v| *v).unwrap_or(0);
                                 if current > PIPELINE_MAX_ITEMS { break; }
+                                // Same dual cap as the dispatch site: stop refilling if other
+                                // concurrent flushes for this inode are already holding
+                                // PIPELINE_MAX_BYTES worth of real dirty data. Counts dirty_ranges,
+                                // not slot.data.len() — see the dispatch-site comment above for why.
+                                let bytes_now: usize = handle.write_buffers.get(&ino)
+                                    .and_then(|s| s.try_lock().ok().map(|st| {
+                                        st.slots.values().filter(|sl| sl.flushing)
+                                            .map(|sl| sl.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>())
+                                            .sum()
+                                    }))
+                                    .unwrap_or(0);
+                                if bytes_now >= PIPELINE_MAX_BYTES { break; }
                             }
                             // Decrement; remove entry when it reaches zero.
                             let mut entry = in_flight_task.entry(ino).or_insert(0);

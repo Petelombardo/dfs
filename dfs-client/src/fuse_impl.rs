@@ -686,26 +686,27 @@ fn splice_chunk_location(
     loc: dfs_common::ChunkLocation,
     client: &Arc<DfsClient>,
 ) {
-    let chunk_idx = loc.file_offset.map(|o| o / CHUNK_SIZE as u64);
-    if let Some(pos) = chunk_locations.iter().position(|l| {
-        chunk_idx.is_some() && l.file_offset.map(|o| o / CHUNK_SIZE as u64) == chunk_idx
-    }) {
-        let old_cid = chunk_locations[pos].chunk_id;
-        if old_cid != loc.chunk_id {
-            let client = client.clone();
-            tokio::spawn(async move {
-                let _ = client.chunk_cache.remove(&old_cid);
-            });
-        }
-        chunk_locations[pos] = loc;
-        return;
-    }
+    // chunk_locations is sorted by file_offset (None entries are legacy and pushed to the
+    // end). Use binary search instead of linear scan — O(log n) vs O(n) per flush.
     match loc.file_offset {
         Some(offset) => {
-            let insert_pos = chunk_locations.iter()
-                .position(|l| l.file_offset.map(|o| o > offset).unwrap_or(false))
-                .unwrap_or(chunk_locations.len());
-            chunk_locations.insert(insert_pos, loc);
+            match chunk_locations.binary_search_by(|l| {
+                l.file_offset.unwrap_or(u64::MAX).cmp(&offset)
+            }) {
+                Ok(pos) => {
+                    let old_cid = chunk_locations[pos].chunk_id;
+                    if old_cid != loc.chunk_id {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            let _ = client.chunk_cache.remove(&old_cid);
+                        });
+                    }
+                    chunk_locations[pos] = loc;
+                }
+                Err(insert_pos) => {
+                    chunk_locations.insert(insert_pos, loc);
+                }
+            }
         }
         None => chunk_locations.push(loc),
     }
@@ -1232,17 +1233,16 @@ impl FlushHandle {
                     info!("flush_buffer_async: ino={} was truncated to zero during flush — discarding stale chunk locations", ino);
                     return Ok(());
                 }
-                for loc in &all_locations {
-                    splice_chunk_location(&mut meta.chunk_locations, loc.clone(), &self.client);
-                }
                 // File size = max of logical size (set by truncate) and physical chunk end.
                 // A sparse file grown via truncate has a logical size larger than its written
                 // chunks; clobbering with the physical end would shrink the reported size.
-                if let Some(last) = meta.chunk_locations.iter()
-                    .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
-                    .reduce(u64::max)
-                {
-                    meta.size = meta.size.max(last);
+                // meta.size already tracks all prior chunk ends — we only need to extend it for
+                // the chunks we're splicing in now, avoiding an O(n) scan over all chunks.
+                for loc in &all_locations {
+                    splice_chunk_location(&mut meta.chunk_locations, loc.clone(), &self.client);
+                    if let Some(end) = loc.file_offset.map(|o| o + loc.size as u64) {
+                        meta.size = meta.size.max(end);
+                    }
                 }
                 // Don't clobber an mtime the user explicitly just set via setattr
                 // (utimes/utimensat) — e.g. rsync -a's temp-file restore can land
@@ -2433,12 +2433,9 @@ impl FlushHandle {
                     }
                     for loc in &locations {
                         splice_chunk_location(&mut meta.chunk_locations, loc.clone(), &self.client);
-                    }
-                    if let Some(last) = meta.chunk_locations.iter()
-                        .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
-                        .reduce(u64::max)
-                    {
-                        meta.size = meta.size.max(last);
+                        if let Some(end) = loc.file_offset.map(|o| o + loc.size as u64) {
+                            meta.size = meta.size.max(end);
+                        }
                     }
                     // Don't clobber an mtime the user explicitly just set via setattr
                     // (utimes/utimensat) — e.g. rsync -a's temp-file restore can land

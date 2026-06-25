@@ -294,14 +294,21 @@ impl FileMetadata {
     pub fn chunk_location_for_idx(&self, chunk_idx: u64) -> Option<&ChunkLocation> {
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let target_offset = chunk_idx * CHUNK_SIZE;
-        self.chunk_locations.iter().find(|l| l.file_offset == Some(target_offset))
+        // chunk_locations is sorted by file_offset (None entries treated as u64::MAX, at end).
+        let pos = self.chunk_locations
+            .binary_search_by(|l| l.file_offset.unwrap_or(u64::MAX).cmp(&target_offset))
+            .ok()?;
+        Some(&self.chunk_locations[pos])
     }
 
     /// Mutable version of chunk_location_for_idx.
     pub fn chunk_location_for_idx_mut(&mut self, chunk_idx: u64) -> Option<&mut ChunkLocation> {
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let target_offset = chunk_idx * CHUNK_SIZE;
-        self.chunk_locations.iter_mut().find(|l| l.file_offset == Some(target_offset))
+        let pos = self.chunk_locations
+            .binary_search_by(|l| l.file_offset.unwrap_or(u64::MAX).cmp(&target_offset))
+            .ok()?;
+        Some(&mut self.chunk_locations[pos])
     }
 }
 

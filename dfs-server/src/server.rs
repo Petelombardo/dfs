@@ -169,6 +169,14 @@ pub struct Server {
     /// chunk_id changes every patch and would otherwise grow unboundedly.
     chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>>,
 
+    /// In-flight chunk prefetches for the MultiPatch hot path. When the network
+    /// layer decodes a split-frame MultiPatch envelope it knows chunk_id before
+    /// the patch bytes have arrived, so it kicks off the disk read immediately
+    /// via start_prefetch_for_patch(). handle_multi_patch() awaits this channel
+    /// instead of starting a fresh disk read, overlapping disk I/O with the
+    /// remaining network receive time for the patch payload.
+    chunk_prefetch: Arc<DashMap<ChunkId, tokio::sync::watch::Receiver<Option<std::sync::Arc<Vec<u8>>>>>>,
+
     /// Per-node ops/sec tracker — read, write, and metadata op counts in a
     /// 3600-bucket ring (one bucket per second). Near-zero overhead: atomic
     /// fetch_add per op, single mutex acquire per second for the ring write.
@@ -255,6 +263,7 @@ impl Server {
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             chunk_patch_locks: Arc::new(DashMap::new()),
             chunk_io_locks: Arc::new(DashMap::new()),
+            chunk_prefetch: Arc::new(DashMap::new()),
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
             sled_write_done,
@@ -5074,6 +5083,20 @@ impl Server {
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
 
+        // Collect any prefetch result that the network layer started when it decoded
+        // the split-frame envelope. We wait briefly — the disk read started when the
+        // envelope arrived, and most of the patch bytes have been arriving in parallel,
+        // so by now the prefetch is either done or very close to done.
+        let prefetched: Option<std::sync::Arc<Vec<u8>>> = if let Some((_, mut rx)) = self.chunk_prefetch.remove(&chunk_id) {
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_millis(50),
+                rx.wait_for(|v| v.is_some()),
+            ).await;
+            rx.borrow().clone()
+        } else {
+            None
+        };
+
         // See handle_patch_chunk for why this is acquired up front and moved
         // into the blocking closure: it excludes concurrent ReadChunk/
         // ReadChunkRange for this exact chunk_id during the in-place mutation.
@@ -5091,22 +5114,32 @@ impl Server {
             let _io_guard = io_guard;
             let t_start = Instant::now();
 
-            // If the chunk file doesn't exist on disk, refuse the patch.
-            // A ghost chunk_map entry (chunk_id in metadata but no file on disk)
-            // can arise when ReplicateChunkLocation updated this node's map but the
-            // actual data was written elsewhere. Creating an empty file and patching
-            // it would produce corrupt data — return NotFound so the client excludes
-            // this node and the healer can copy the real chunk here.
-            if !old_path.exists() {
-                return Err((format!("Failed to read chunk range: Failed to open chunk file: {:?}", old_path), ErrorCode::NotFound));
-            }
-
-            // Still need the full buffer in memory: compute_chunk_hash_at hashes the
-            // whole chunk, not just the patched ranges. Chunks are capped at 4MB, so
-            // this read is cheap; only the *write* below is now scoped to the actual
-            // patch bytes instead of rewriting the whole buffer to a new file.
-            let mut buf = fs::read(&old_path)
-                .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?;
+            // Use the prefetched chunk data if available; otherwise read from disk.
+            // The prefetch was started in the network layer as soon as the split-frame
+            // envelope was decoded, overlapping the disk read with the network receive
+            // of the patch payload. On cache miss the behavior is identical to before.
+            let mut buf = if let Some(arc_data) = prefetched {
+                match std::sync::Arc::try_unwrap(arc_data) {
+                    Ok(v) => v,
+                    Err(arc) => (*arc).clone(),
+                }
+            } else {
+                // If the chunk file doesn't exist on disk, refuse the patch.
+                // A ghost chunk_map entry (chunk_id in metadata but no file on disk)
+                // can arise when ReplicateChunkLocation updated this node's map but the
+                // actual data was written elsewhere. Creating an empty file and patching
+                // it would produce corrupt data — return NotFound so the client excludes
+                // this node and the healer can copy the real chunk here.
+                if !old_path.exists() {
+                    return Err((format!("Failed to read chunk range: Failed to open chunk file: {:?}", old_path), ErrorCode::NotFound));
+                }
+                // Still need the full buffer in memory: compute_chunk_hash_at hashes the
+                // whole chunk, not just the patched ranges. Chunks are capped at 4MB, so
+                // this read is cheap; only the *write* below is now scoped to the actual
+                // patch bytes instead of rewriting the whole buffer to a new file.
+                fs::read(&old_path)
+                    .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?
+            };
             let t_read = t_start.elapsed();
 
             let needed_len = patches.iter()
@@ -7813,6 +7846,31 @@ impl MessageHandler for Server {
         request: Request,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
         Box::pin(async move { self.handle_request(request).await })
+    }
+
+    fn start_prefetch_for_patch(&self, chunk_id: ChunkId) {
+        // Only prefetch if not already in progress for this chunk.
+        if self.chunk_prefetch.contains_key(&chunk_id) {
+            return;
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None::<std::sync::Arc<Vec<u8>>>);
+        self.chunk_prefetch.insert(chunk_id, rx);
+
+        let storage = self.storage.clone();
+        let prefetch_map = self.chunk_prefetch.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let path = storage.get_chunk_path(&chunk_id);
+                std::fs::read(&path).ok().map(std::sync::Arc::new)
+            }).await;
+            match result {
+                Ok(Some(data)) => { let _ = tx.send(Some(data)); }
+                // On read failure or task panic: sender drops, channel closes.
+                // handle_multi_patch detects the closed channel and falls back
+                // to its own disk read — no data is lost.
+                _ => { prefetch_map.remove(&chunk_id); }
+            }
+        });
     }
 
     fn handle_cluster_message(

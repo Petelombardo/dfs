@@ -23,6 +23,12 @@ pub trait MessageHandler: Send + Sync {
         &self,
         message: ClusterMessage,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>>;
+
+    /// Called by the network layer as soon as a split-frame MultiPatch envelope
+    /// is decoded — before the patch bytes have been read off the wire. Implementations
+    /// should kick off the chunk disk read immediately so it overlaps with the remaining
+    /// network receive time. Default is a no-op; only the storage server overrides it.
+    fn start_prefetch_for_patch(&self, _chunk_id: dfs_common::types::ChunkId) {}
 }
 
 // A connection counts against this for its entire open lifetime, including time
@@ -198,10 +204,13 @@ async fn handle_connection<H: MessageHandler>(
     const IDLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(300);
 
     loop {
-        // Read message from stream, with idle timeout
+        // Read message from stream, with idle timeout.
+        // Pass a prefetch callback so the network layer can kick off the chunk
+        // disk read as soon as a split-frame MultiPatch envelope is decoded —
+        // before the patch bytes have arrived — overlapping disk I/O with network receive.
         let read_result = tokio::time::timeout(
             IDLE_TIMEOUT,
-            read_message(&mut stream, &mut read_buf),
+            read_message(&mut stream, &mut read_buf, |cid| handler.start_prefetch_for_patch(cid)),
         ).await;
 
         match read_result {
@@ -242,10 +251,14 @@ async fn handle_connection<H: MessageHandler>(
 
 /// Read a framed message from the stream
 /// Format: [4 bytes length][message bytes]
-async fn read_message(
+async fn read_message<F>(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
-) -> Result<Option<MessageEnvelope>> {
+    on_multi_patch_envelope: F,
+) -> Result<Option<MessageEnvelope>>
+where
+    F: Fn(dfs_common::types::ChunkId) + Send,
+{
     // Per-read-operation timeout. Applied to every read_buf call so a client that
     // dies mid-transfer (e.g. after sending the length prefix but before the payload)
     // doesn't hold the connection open forever and leak the fd / task slot.
@@ -316,8 +329,14 @@ async fn read_message(
 
                 // Split-frame MultiPatch: all patch Vec<u8> are empty as a signal.
                 // Raw payload: [4B len0][data0][4B len1][data1]... for each patch.
-                if let dfs_common::Message::Request(dfs_common::Request::MultiPatch { ref mut patches, .. }) = envelope.message {
+                if let dfs_common::Message::Request(dfs_common::Request::MultiPatch { chunk_id, ref mut patches, .. }) = envelope.message {
                     if !patches.is_empty() && patches.iter().all(|(_, d)| d.is_empty()) {
+                        // We have chunk_id before the patch bytes arrive — kick off the
+                        // disk read immediately so it overlaps with the remaining network
+                        // receive. handle_multi_patch() will await the result instead of
+                        // starting a fresh disk read.
+                        on_multi_patch_envelope(chunk_id);
+
                         while buf.len() < 4 {
                             let n = tokio::time::timeout(READ_TIMEOUT, stream.read_buf(buf)).await
                                 .map_err(|_| anyhow::anyhow!("Timeout reading MultiPatch payload length"))?
@@ -545,7 +564,7 @@ impl NetworkClient {
         let mut read_buf = BytesMut::with_capacity(8192);
         let response = tokio::time::timeout(
             tokio::time::Duration::from_secs(30),
-            read_message(&mut stream, &mut read_buf),
+            read_message(&mut stream, &mut read_buf, |_| {}),
         )
         .await
         .map_err(|_| anyhow::anyhow!("Read timeout from {}", target))?  // Elapsed → Err

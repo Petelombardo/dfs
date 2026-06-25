@@ -5084,14 +5084,13 @@ impl Server {
         let metadata = self.metadata.clone();
 
         // Collect any prefetch result that the network layer started when it decoded
-        // the split-frame envelope. We wait briefly — the disk read started when the
-        // envelope arrived, and most of the patch bytes have been arriving in parallel,
-        // so by now the prefetch is either done or very close to done.
+        // the split-frame envelope. Wait for it without a timeout — we'd be blocking
+        // on a disk read either way, and a timeout causes the prefetch task and the
+        // fallback spawn_blocking to race on the same file, doubling I/O and
+        // introducing high variance. If the sender drops (prefetch panicked), wait_for
+        // returns Err and borrow() yields None, falling back to a fresh disk read.
         let prefetched: Option<std::sync::Arc<Vec<u8>>> = if let Some((_, mut rx)) = self.chunk_prefetch.remove(&chunk_id) {
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_millis(50),
-                rx.wait_for(|v| v.is_some()),
-            ).await;
+            let _ = rx.wait_for(|v| v.is_some()).await;
             rx.borrow().clone()
         } else {
             None

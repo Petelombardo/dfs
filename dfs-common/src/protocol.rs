@@ -17,17 +17,19 @@ where
     let frame_len = frame.len() as u32;
     let data_len = raw_data.len() as u32;
 
-    // Coalesce all four pieces into one buffer so the response goes out as a single
-    // packet instead of four — this is on the hot path for every chunk read response,
-    // including RTT-bound random-read range fetches where the extra packets/ACKs
-    // dominate latency.
-    let mut framed = Vec::with_capacity(4 + frame.len() + 4 + raw_data.len());
-    framed.extend_from_slice(&frame_len.to_be_bytes());
-    framed.extend_from_slice(&frame);
-    framed.extend_from_slice(&data_len.to_be_bytes());
-    framed.extend_from_slice(raw_data);
+    // Write header (envelope length + envelope + data length) as one small buffer,
+    // then write raw_data directly — avoids copying the full chunk payload (~4MB)
+    // into a Vec just to hand it to write_all. Works regardless of NIC scatter-gather
+    // support; TCP is a byte stream so the receiver sees no boundary between the two
+    // writes. The original single-buffer approach was added to avoid four separate tiny
+    // writes; this preserves that for the header while skipping the payload copy.
+    let mut header = Vec::with_capacity(4 + frame.len() + 4);
+    header.extend_from_slice(&frame_len.to_be_bytes());
+    header.extend_from_slice(&frame);
+    header.extend_from_slice(&data_len.to_be_bytes());
 
-    stream.write_all(&framed).await?;
+    stream.write_all(&header).await?;
+    stream.write_all(raw_data).await?;
     stream.flush().await
 }
 
@@ -58,16 +60,15 @@ where
     let envelope_len = encoded_envelope.len() as u32;
     let data_len = raw_data.len() as u32;
 
-    // Coalesce all four pieces into one buffer so the request goes out as a single
-    // packet instead of four — mirrors the write_chunk_response fix above. This path
-    // is hit on every dual-replica chunk write and repair/multi-patch flow.
-    let mut framed = Vec::with_capacity(4 + encoded_envelope.len() + 4 + raw_data.len());
-    framed.extend_from_slice(&envelope_len.to_be_bytes());
-    framed.extend_from_slice(encoded_envelope);
-    framed.extend_from_slice(&data_len.to_be_bytes());
-    framed.extend_from_slice(raw_data);
+    // Same two-write approach as write_chunk_response: header in one small buffer,
+    // raw_data written directly to avoid a ~4MB copy. See that function's comment.
+    let mut header = Vec::with_capacity(4 + encoded_envelope.len() + 4);
+    header.extend_from_slice(&envelope_len.to_be_bytes());
+    header.extend_from_slice(encoded_envelope);
+    header.extend_from_slice(&data_len.to_be_bytes());
 
-    stream.write_all(&framed).await?;
+    stream.write_all(&header).await?;
+    stream.write_all(raw_data).await?;
     stream.flush().await
 }
 

@@ -450,7 +450,7 @@ async fn process_message<H: MessageHandler>(
 pub struct NetworkClient {
     /// Request ID counter
     next_request_id: Arc<AtomicU64>,
-    /// Idle connection pool: per-peer queue of reusable TcpStreams (cap 4 per peer)
+    /// Idle connection pool: per-peer queue of reusable TcpStreams (cap 8 per peer)
     pool: Arc<DashMap<SocketAddr, Mutex<VecDeque<TcpStream>>>>,
 }
 
@@ -554,7 +554,7 @@ impl NetworkClient {
 
         debug!("Received response from {}", target);
 
-        // Return connection to pool (cap 4 idle per peer).
+        // Return connection to pool (cap 8 idle per peer).
         // If the pool is full, set SO_LINGER(0) before dropping so the kernel sends
         // RST instead of going through TIME_WAIT — prevents orphaned socket accumulation
         // under heavy healing load where many short-lived connections are created.
@@ -563,7 +563,7 @@ impl NetworkClient {
                 .entry(target)
                 .or_insert_with(|| Mutex::new(VecDeque::new()));
             let mut queue = entry.lock().await;
-            if queue.len() < 4 {
+            if queue.len() < 8 {
                 queue.push_back(stream);
             } else {
                 // Pool full — explicitly shut down before dropping so the kernel

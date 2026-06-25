@@ -225,8 +225,20 @@ async fn handle_connection<H: MessageHandler>(
                     peer_addr, envelope.request_id.0
                 );
 
-                // Process message and send response
-                let response = process_message(envelope, handler.clone()).await;
+                // Process message and send response — bounded so a hung handler
+                // (e.g. a blocking disk read that was never moved to spawn_blocking)
+                // can't hold a semaphore permit indefinitely.
+                const HANDLER_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(120);
+                let response = match tokio::time::timeout(
+                    HANDLER_TIMEOUT,
+                    process_message(envelope, handler.clone()),
+                ).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!("Handler timed out (>120s) for request from {}, closing connection", peer_addr);
+                        break;
+                    }
+                };
 
                 // Send response
                 if let Err(e) = write_message(&mut stream, &response).await {

@@ -1784,7 +1784,10 @@ impl Server {
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)))
         } else {
-            self.storage.write_chunk(&chunk_id, &data)
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)))
         };
 
         if let Err(e) = write_result {
@@ -1874,7 +1877,11 @@ impl Server {
             healing.heal_bandwidth_limiter().acquire(size_estimate).await;
         }
 
-        let data = match self.storage.read_chunk(&chunk_id) {
+        let storage = self.storage.clone();
+        let data = match tokio::task::spawn_blocking(move || storage.read_chunk(&chunk_id))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)))
+        {
             Ok(d) => d,
             Err(e) => {
                 warn!("PushChunkTo: chunk {} not found locally: {}", chunk_id, e);

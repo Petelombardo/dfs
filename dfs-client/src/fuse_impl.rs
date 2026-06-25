@@ -1017,11 +1017,8 @@ impl FlushHandle {
                                     if let Some(loc) = meta_entry.chunk_location_for_idx_mut(*chunk_idx) {
                                         *loc = new_location.clone();
                                     }
-                                    if let Some(new_size) = meta_entry.chunk_locations.iter()
-                                        .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
-                                        .reduce(u64::max)
-                                    {
-                                        meta_entry.size = meta_entry.size.max(new_size);
+                                    if let Some(end) = new_location.file_offset.map(|o| o + new_location.size as u64) {
+                                        meta_entry.size = meta_entry.size.max(end);
                                     }
                                 }
                                 patch_metadata_dirty = true;
@@ -2188,11 +2185,8 @@ impl FlushHandle {
                         if let Some(loc) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
                             *loc = new_location.clone();
                         }
-                        if let Some(new_size) = meta_entry.chunk_locations.iter()
-                            .filter_map(|l| l.file_offset.map(|o| o + l.size as u64))
-                            .reduce(u64::max)
-                        {
-                            meta_entry.size = meta_entry.size.max(new_size);
+                        if let Some(end) = new_location.file_offset.map(|o| o + new_location.size as u64) {
+                            meta_entry.size = meta_entry.size.max(end);
                         }
                     }
                     // Update read engine, THEN remove slot.

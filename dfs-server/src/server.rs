@@ -1826,6 +1826,19 @@ impl Server {
         }
         info!("PushChunkTo: pushing chunk {} to {}", chunk_id, target_addr);
 
+        // Fetch location metadata for written_at, file_offset, and a size estimate.
+        let loc = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
+        let written_at = loc.as_ref().and_then(|l| l.written_at);
+
+        // Pace this transfer against the configured heal bandwidth (DFS_HEAL_BANDWIDTH_MB)
+        // before doing the disk read — a real bytes/sec limiter, not just a cap on how
+        // many transfers can be in flight at once. Lives on the source node, since that's
+        // where the read+send actually happens (the leader only orchestrates).
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            let size_estimate = loc.as_ref().map(|l| l.size).unwrap_or(4 * 1024 * 1024);
+            healing.heal_bandwidth_limiter().acquire(size_estimate).await;
+        }
+
         let data = match self.storage.read_chunk(&chunk_id) {
             Ok(d) => d,
             Err(e) => {
@@ -1836,10 +1849,6 @@ impl Server {
                 };
             }
         };
-
-        // Fetch location metadata for written_at and file_offset.
-        let loc = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
-        let written_at = loc.as_ref().and_then(|l| l.written_at);
 
         // Verify chunk content before propagating — catches disk corruption at the
         // source so we don't spread bad data to the rest of the cluster.
@@ -5877,6 +5886,7 @@ impl Server {
         let cluster = self.cluster.clone();
         let client = self.network_client();
         let local_id = self.cluster.local_node_id();
+        let healing = self.healing.clone();
         tokio::spawn(async move {
             // Step 1: local repair on this node (runs in blocking thread — sled scans).
             let (live_file_ids, files_to_check): (Vec<dfs_common::FileId>, Vec<dfs_common::FileMetadata>) =
@@ -6120,33 +6130,18 @@ impl Server {
             }
 
             // Queue corrupt chunks for re-healing (bypasses the normal delay).
-            if !chunks_to_heal.is_empty() {
-                info!("Metadata repair: queuing {} corrupt chunks for immediate re-healing", chunks_to_heal.len());
-                if let Some(healing) = {
-                    // Can't hold the healing RwLock across await; just clone the Arc.
-                    // The healing manager is available via a shared reference on the server,
-                    // but here we're in a spawned task without self. Re-heal via HealFile
-                    // admin message to the local node instead.
-                    None::<()>
-                } {
-                    let _: () = healing; // unreachable, just for type inference
-                }
-                // Send HealFile for each affected file via local loopback.
-                let local_addr = cluster.local_addr();
-                let affected_files: std::collections::HashSet<dfs_common::FileId> = files_to_check.iter()
-                    .filter(|f| f.chunk_locations.iter().any(|l| chunks_to_heal.contains(&l.chunk_id)))
-                    .map(|f| f.id)
-                    .collect();
-                for fid in affected_files {
-                    let req = dfs_common::Request::HealFile { path: fid.to_string() };
-                    if let Err(e) = client.send_message(local_addr, dfs_common::Message::Request(req)).await {
-                        warn!("Metadata repair: failed to trigger HealFile for {}: {}", fid, e);
-                    }
+            let chunks_to_heal_count = chunks_to_heal.len();
+            if chunks_to_heal_count > 0 {
+                info!("Metadata repair: queuing {} corrupt chunks for immediate re-healing", chunks_to_heal_count);
+                if let Some(healing_mgr) = healing.read().await.as_ref().map(|h| h.clone()) {
+                    healing_mgr.queue_chunks_immediate(chunks_to_heal).await;
+                } else {
+                    warn!("Metadata repair: healing manager unavailable, corrupt chunks not queued");
                 }
             }
 
             info!("Metadata repair: size repair complete ({} files corrected, {} corrupt chunks queued)",
-                  repaired_files.len(), chunks_to_heal.len());
+                  repaired_files.len(), chunks_to_heal_count);
 
             // Step 3: send ReconcileMetadata to every online follower.
             for node in &nodes {

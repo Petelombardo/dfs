@@ -482,6 +482,13 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     // Clean up addr file so dfs-admin auto-discovery doesn't see a stale entry
     let _ = std::fs::remove_file(&addr_file);
 
+    // healer_runtime's Drop blocks joining its worker thread, which Tokio forbids
+    // from within an async task — letting it drop here when main() returns would
+    // panic ("Cannot drop a runtime in a context where blocking is not allowed").
+    // shutdown_background() consumes it without blocking, which is safe here since
+    // the process is exiting right after anyway.
+    healer_runtime.shutdown_background();
+
     Ok(())
 }
 

@@ -1435,7 +1435,7 @@ impl Server {
                 checksum,
             } => {
                 self.ops_tracker.inc_write();
-                self.handle_write_chunk(chunk_id, data, checksum).await
+                self.handle_write_chunk(chunk_id, data, checksum, false).await
             }
             Request::TombstoneChunk { chunk_id } => {
                 self.chunk_tombstones.insert(chunk_id);
@@ -1456,7 +1456,8 @@ impl Server {
                 data,
                 checksum,
                 written_at,
-            } => self.handle_replicate_chunk(chunk_id, data, checksum, written_at).await,
+                background,
+            } => self.handle_replicate_chunk(chunk_id, data, checksum, written_at, background).await,
             Request::PushChunkTo { chunk_id, target_addr, leader_id } => {
                 self.handle_push_chunk_to(chunk_id, target_addr, leader_id).await
             }
@@ -1750,6 +1751,7 @@ impl Server {
         chunk_id: ChunkId,
         data: Vec<u8>,
         checksum: [u8; 32],
+        background: bool,
     ) -> Response {
         debug!("Handling write chunk: {} ({} bytes)", chunk_id, data.len());
 
@@ -1761,8 +1763,31 @@ impl Server {
             };
         }
 
-        // Write locally
-        if let Err(e) = self.storage.write_chunk(&chunk_id, &data) {
+        // Write locally. Background (healing) writes run in spawn_blocking with idle
+        // I/O priority so their fsyncs don't compete with active client write fsyncs.
+        let data_len = data.len();
+        let write_result = if background {
+            let storage = self.storage.clone();
+            tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "linux")]
+                let old_prio = unsafe { libc::syscall(libc::SYS_ioprio_get, 1i64, 0i64) };
+                #[cfg(target_os = "linux")]
+                unsafe { libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, 3i64 << 13); }
+
+                let result = storage.write_chunk(&chunk_id, &data);
+
+                #[cfg(target_os = "linux")]
+                unsafe { libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, old_prio); }
+
+                result
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)))
+        } else {
+            self.storage.write_chunk(&chunk_id, &data)
+        };
+
+        if let Err(e) = write_result {
             warn!("Failed to write chunk {}: {}", chunk_id, e);
             return Response::Error {
                 message: format!("Failed to write chunk: {}", e),
@@ -1776,7 +1801,7 @@ impl Server {
         // location after it gets our Ok. Adding ourselves here before that broadcast
         // would leave a stale 4th-node record that the merge logic then perpetuates.
         let local_node_id = self.cluster.local_node_id();
-        if let Ok(mut location) = self.get_or_create_chunk_location(&chunk_id, data.len()).await {
+        if let Ok(mut location) = self.get_or_create_chunk_location(&chunk_id, data_len).await {
             if !location.nodes.contains(&local_node_id) && location.nodes.len() < self.replication_factor {
                 location.nodes.push(local_node_id);
                 let _ = self.metadata.put_chunk_location_async(location).await;
@@ -1793,10 +1818,11 @@ impl Server {
         data: Vec<u8>,
         checksum: [u8; 32],
         written_at: Option<u64>,
+        background: bool,
     ) -> Response {
         debug!("Handling replicate chunk: {} ({} bytes)", chunk_id, data.len());
 
-        let response = self.handle_write_chunk(chunk_id, data, checksum).await;
+        let response = self.handle_write_chunk(chunk_id, data, checksum, background).await;
 
         // Preserve the original write timestamp so scrub can detect corruption
         // by comparing chunk mtime against ChunkLocation.written_at.
@@ -1883,6 +1909,7 @@ impl Server {
             data,
             checksum: chunk_id.hash,
             written_at,
+            background: true,
         };
 
         match self.client.send_message(target_addr, Message::Request(request)).await {
@@ -2986,6 +3013,7 @@ impl Server {
                                     data: chunk_data,
                                     checksum: chunk_id.hash,
                                     written_at: None,
+                                    background: false,
                                 };
 
                                 match client
@@ -4597,6 +4625,7 @@ impl Server {
                                     data: chunk_data,
                                     checksum: chunk_id.hash,
                                     written_at: None,
+                                    background: false,
                                 };
                                 matches!(
                                     client.send_message(node_info.addr, Message::Request(request)).await,
@@ -7029,7 +7058,7 @@ mod tests {
         let chunk_id = ChunkId::from_hash(hash);
 
         let response = server
-            .handle_write_chunk(chunk_id, data.to_vec(), hash)
+            .handle_write_chunk(chunk_id, data.to_vec(), hash, false)
             .await;
 
         match response {
@@ -7076,7 +7105,7 @@ mod tests {
 
         // Write chunk
         server
-            .handle_write_chunk(chunk_id, data.to_vec(), hash)
+            .handle_write_chunk(chunk_id, data.to_vec(), hash, false)
             .await;
 
         // Should exist now

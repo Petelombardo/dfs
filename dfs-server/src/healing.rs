@@ -1745,7 +1745,7 @@ impl HealingManager {
             // Sort oldest-first, cap to max_heal_per_cycle.
             {
                 let pending = self.pending_healing.read().await;
-                v.sort_by_key(|(chunk_id, _, _)| {
+                v.sort_by_cached_key(|(chunk_id, _, _)| {
                     pending.get(chunk_id)
                         .map(|t| std::cmp::Reverse(t.elapsed()))
                         .unwrap_or(std::cmp::Reverse(Duration::ZERO))

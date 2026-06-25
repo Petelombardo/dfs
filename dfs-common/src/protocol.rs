@@ -252,6 +252,10 @@ pub enum Request {
         /// the same mtime, enabling scrub-time corruption detection via mtime comparison.
         #[serde(default)]
         written_at: Option<u64>,
+        /// When true this is a background healing transfer. The receiver uses idle
+        /// I/O priority for its fsync so healing doesn't compete with client writes.
+        #[serde(default)]
+        background: bool,
     },
 
     /// Instruct this node to push a chunk it holds to a target node.

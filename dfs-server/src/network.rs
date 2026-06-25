@@ -25,7 +25,15 @@ pub trait MessageHandler: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>>;
 }
 
-pub const MAX_CONNECTIONS: usize = 128;
+// A connection counts against this for its entire open lifetime, including time
+// spent idle in a client's reuse pool — not just while actively serving a request.
+// 128 was undersized against concurrency caps we've since raised for QD32 tuning
+// (PIPELINE_MAX_ITEMS=32 dual-written to 2 replicas, range-fetch up to 6/file/node,
+// client POOL_SIZE=20 idle per peer) plus healing fan-out and gossip/heartbeat
+// traffic, all drawing from the same budget on every node at once. 384 gives real
+// headroom while remaining tiny next to the 65536 NOFILE ulimit the systemd unit
+// already grants.
+pub const MAX_CONNECTIONS: usize = 384;
 
 /// Network server for handling node-to-node communication
 /// Optimized for SBC environments (connection reuse, async I/O)

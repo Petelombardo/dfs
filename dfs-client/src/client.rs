@@ -3150,14 +3150,21 @@ leader_addr: Arc::new(RwLock::new(None)),
             let addr_map = self.addr_to_node_id.read().await;
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
         };
-        engine.update_chunk_map_window(
-            locations.to_vec(),
-            from_chunk,
-            total_chunks,
-            Arc::new(nim),
-            file_size,
-            true,
-        );
+        let node_map = Arc::new(nim);
+
+        if locations.len() == 1 {
+            // Single-chunk write-path: update in-place with Arc::make_mut — O(1) vs O(n) clone.
+            engine.update_single_chunk(locations[0].clone(), file_size, node_map);
+        } else {
+            engine.update_chunk_map_window(
+                locations.to_vec(),
+                from_chunk,
+                total_chunks,
+                node_map,
+                file_size,
+                true,
+            );
+        }
         engine.clear_failed_refresh();
 
         // Evict stale chunk IDs from the cache. Any reader that already holds an Arc to

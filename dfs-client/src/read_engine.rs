@@ -176,6 +176,59 @@ impl InodeReadEngine {
         info!("Engine inode={}: chunk map updated ({} chunks, {} bytes)", self.inode, loc_len, file_size);
     }
 
+    /// Single-chunk write-path update — O(1) per call instead of O(n).
+    ///
+    /// Uses Arc::make_mut to update map and offsets in-place under the write lock.
+    /// When the write path is the sole Arc holder (common during sequential writes with
+    /// no concurrent reads), make_mut skips the clone entirely. If a concurrent reader
+    /// holds a snapshot Arc, make_mut clones — but that reader continues from its own
+    /// Arc unaffected. Either way, correctness is maintained.
+    pub fn update_single_chunk(
+        &self,
+        loc: ChunkLocation,
+        file_size: u64,
+        node_map: Arc<HashMap<dfs_common::NodeId, SocketAddr>>,
+    ) {
+        const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
+        let idx = loc.file_offset
+            .map(|o| (o / CHUNK_SIZE_U64) as usize)
+            .unwrap_or(0);
+        let offset_entry = (loc.file_offset.unwrap_or(0) as usize, loc.size);
+        let nil_loc = ChunkLocation {
+            chunk_id: dfs_common::ChunkId::from_hash([0u8; 32]),
+            nodes: Vec::new(), size: 0, checksum: [0u8; 32],
+            file_offset: None, written_at: None, client_write_seq: None, file_id: None,
+        };
+
+        let map_len = {
+            let mut s = self.chunk_state.write().unwrap();
+            let map = Arc::make_mut(&mut s.map);
+            if idx >= map.len() {
+                map.resize(idx + 1, nil_loc);
+            }
+            map[idx] = loc;
+            // Trim trailing nil entries (sequential writes never leave nils at the end)
+            while map.last().map(|l| l.chunk_id.hash == [0u8; 32]).unwrap_or(false) {
+                map.pop();
+            }
+            let map_len = map.len();
+            let offsets = Arc::make_mut(&mut s.offsets);
+            if offsets.len() < map_len {
+                offsets.resize(map_len, (0, 0));
+            }
+            if idx < offsets.len() {
+                offsets[idx] = offset_entry;
+            }
+            offsets.truncate(map_len);
+            map_len
+        };
+
+        *self.node_id_to_addr.write().unwrap() = node_map;
+        self.last_map_refresh_ms.store(now_ms(), Ordering::Relaxed);
+        self.known_size.store(file_size as usize, Ordering::Relaxed);
+        self.last_window_end.store(map_len as u32, Ordering::Relaxed);
+    }
+
     /// Merge a windowed chunk map response into the engine's full map.
     ///
     /// `from_write_path`: when true, write-path updates always win regardless of seq

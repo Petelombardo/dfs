@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crate::network::NetworkClient;
 use dfs_common::{ConsistentHashRing, NodeId, NodeInfo, NodeStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,6 +49,10 @@ pub struct ClusterManager {
 
     /// Node failure timeout in seconds
     failure_timeout: u64,
+
+    /// Shared connection pool for heartbeat messages — reuses persistent
+    /// inter-node TCP connections instead of opening a new one per heartbeat.
+    client: Arc<NetworkClient>,
 
     /// Fired whenever any peer node transitions to Online (recovered or newly joined).
     /// Listeners use this to trigger proactive sync without polling.
@@ -106,6 +111,7 @@ impl ClusterManager {
             failure_timeout,
             node_recovered_notify: Arc::new(Notify::new()),
             became_leader_at: Arc::new(RwLock::new(None)),
+            client: Arc::new(NetworkClient::new()),
         }
     }
 
@@ -697,10 +703,8 @@ impl ClusterManager {
     /// When `probe_failed` is true, also sends to Failed nodes so they can
     /// recover after a reboot or network partition without manual intervention.
     async fn send_heartbeats(&self, probe_failed: bool) -> Result<()> {
-        use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
+        use dfs_common::protocol::{ClusterMessage, Message};
         use dfs_common::{NodeHealthGossip, NodeInfo};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
 
         let nodes = self.nodes.read().await.clone();
         let local_node_id = self.local_node_id;
@@ -744,20 +748,34 @@ impl ClusterManager {
             let mut local_node_info = NodeInfo::new(local_node_id, local_addr, None);
             local_node_info.available_bytes = local_available;
             local_node_info.total_bytes = local_total;
-            let heartbeat = ClusterMessage::Heartbeat {
+            let heartbeat = Message::Cluster(ClusterMessage::Heartbeat {
                 node_info: local_node_info,
                 cluster_view: cluster_view.clone(),
-            };
+            });
 
-            // Send heartbeat asynchronously (don't wait for response)
+            // Send via the shared connection pool, fire-and-forget in a spawned task.
+            // Using the pool avoids a new TCP handshake per heartbeat cycle — the old
+            // raw-TcpStream approach created 4 new connections every 10 seconds and
+            // RST'd them on drop, producing steady churn visible in packet captures.
             let target_addr = node_info.addr;
             let is_probe = node_info.status == NodeStatus::Failed;
+            let client = self.client.clone();
             tokio::spawn(async move {
-                if let Err(e) = send_heartbeat_message(target_addr, heartbeat).await {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.send_message(target_addr, heartbeat),
+                ).await;
+                let failed = matches!(result, Err(_) | Ok(Err(_)));
+                if failed {
+                    let reason = match &result {
+                        Err(_) => "timeout".to_string(),
+                        Ok(Err(e)) => e.to_string(),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
                     if is_probe {
-                        debug!("Recovery probe to failed node {} unreachable: {}", target_addr, e);
+                        debug!("Recovery probe to failed node {} unreachable: {}", target_addr, reason);
                     } else {
-                        debug!("Failed to send heartbeat to {}: {}", target_addr, e);
+                        debug!("Failed to send heartbeat to {}: {}", target_addr, reason);
                     }
                 } else if is_probe {
                     debug!("Recovery probe sent to failed node {}", target_addr);
@@ -1019,39 +1037,6 @@ pub struct ClusterStats {
     pub failed_nodes: usize,
 }
 
-/// Helper function to send heartbeat message to a node
-async fn send_heartbeat_message(
-    target_addr: SocketAddr,
-    heartbeat: dfs_common::protocol::ClusterMessage,
-) -> Result<()> {
-    use dfs_common::protocol::{Message, MessageEnvelope, RequestId};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
-    // Connect to target node (5s timeout to prevent fd leaks when peers are overloaded)
-    let mut stream = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
-        TcpStream::connect(target_addr),
-    ).await
-        .map_err(|_| anyhow::anyhow!("Heartbeat connect timeout to {}", target_addr))??;
-
-    // Create message envelope
-    let request_id = RequestId::new(0); // Heartbeats don't need tracking
-    let envelope = MessageEnvelope::new(request_id, Message::Cluster(heartbeat));
-    let encoded = envelope.to_bytes()?;
-
-    // Send length prefix + message
-    stream.write_u32(encoded.len() as u32).await?;
-    stream.write_all(&encoded).await?;
-    stream.flush().await?;
-
-    // Shut down the write half so the server sees EOF immediately and exits
-    // handle_connection without waiting for the idle timeout. We don't need
-    // the response — heartbeats are fire-and-forget.
-    let _ = stream.shutdown().await;
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

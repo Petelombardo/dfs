@@ -2069,15 +2069,17 @@ impl HealingManager {
             .take(needed)
             .collect();
 
+        if targets.is_empty() {
+            warn!(
+                "No suitable target nodes for healing chunk {} (alive={:?} replica_count={} needed={})",
+                chunk_id, alive_ids, replica_count, needed
+            );
+            return Ok(());
+        }
         debug!(
             "Healing chunk {}: alive={:?} replica_count={} needed={} targets={:?}",
             chunk_id, alive_ids, replica_count, needed, targets
         );
-
-        if targets.is_empty() {
-            warn!("No suitable target nodes for healing chunk {}", chunk_id);
-            return Ok(());
-        }
 
         // Prefer a remote source to avoid loopback TCP (leader→leader PushChunkTo hangs
         // under Tokio scheduling pressure). Fall back to local only when no remote has it.

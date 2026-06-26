@@ -131,18 +131,30 @@ impl ClusterManager {
         let mut ring = self.hash_ring.write().await;
 
         let is_new = !nodes.contains_key(&node_info.id);
+        // Check if node was absent from the ring (e.g. removed by failure detection).
+        // We must check BEFORE calling ring.add_node so we can detect re-admission.
+        let was_in_ring = ring.nodes().contains(&node_info.id);
+
         if is_new {
             info!("Adding new node {} to cluster", node_info.id);
-            ring.add_node(node_info.id);
+        } else if !was_in_ring {
+            // Node was removed from the ring (failure) but is still in the registry.
+            // Re-admitting it now because we received a heartbeat — it is alive.
+            // Without this, nodes.insert() below overwrites the Failed status with
+            // Online, preventing check_failed_nodes from ever re-adding to the ring.
+            info!("Re-admitting recovered node {} to hash ring", node_info.id);
         } else {
             debug!("Node {} already exists, updating info", node_info.id);
         }
 
+        // Always add to ring — ConsistentHashRing::add_node is idempotent (no-ops for
+        // nodes already present). This re-admits nodes removed by failure detection.
+        ring.add_node(node_info.id);
         nodes.insert(node_info.id, node_info);
         drop(nodes);
         drop(ring);
 
-        if is_new {
+        if is_new || !was_in_ring {
             self.node_recovered_notify.notify_waiters();
         }
 

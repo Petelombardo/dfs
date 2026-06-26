@@ -557,8 +557,13 @@ impl NetworkClient {
             }
         };
 
-        // Send message
-        if let Err(e) = write_message(&mut stream, &envelope).await {
+        // Send message — bounded so a backed-up peer (TCP window closed) can't hold
+        // a handler indefinitely. Mirrors the 30s read timeout below.
+        const WRITE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+        if let Err(e) = tokio::time::timeout(WRITE_TIMEOUT, write_message(&mut stream, &envelope))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Write timeout to {}", target)))
+        {
             // Stale pooled connection — open a fresh one and retry once
             debug!("Pooled connection to {} failed ({}), retrying with new connection", target, e);
             let mut fresh = tokio::time::timeout(
@@ -568,7 +573,9 @@ impl NetworkClient {
                 .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
                 .with_context(|| format!("Failed to reconnect to {}", target))?;
             let _ = fresh.set_nodelay(true);
-            write_message(&mut fresh, &envelope).await?;
+            tokio::time::timeout(WRITE_TIMEOUT, write_message(&mut fresh, &envelope))
+                .await
+                .map_err(|_| anyhow::anyhow!("Write timeout to {}", target))??;
             stream = fresh;
         }
 

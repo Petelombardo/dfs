@@ -3401,7 +3401,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             fallbacks: Vec<SocketAddr>, // other replicas, excluding primary
         }
 
-        let node_id_map = self.addr_to_node_id.read().await.clone();
+        let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
+            let m = self.addr_to_node_id.read().await;
+            m.iter().map(|(&addr, &id)| (id, addr)).collect()
+        };
         let mut resolved: Vec<ResolvedFetch> = Vec::with_capacity(chunks_to_fetch.len());
 
         for (idx, chunk_id, file_offset, pipeline_only) in &chunks_to_fetch {
@@ -3413,9 +3416,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             // Resolve replica list from chunk_locations (fast, no network).
             let mut replicas = if let Some(loc) = chunk_loc_map.get(&chunk_id) {
                 let addrs: Vec<SocketAddr> = loc.nodes.iter()
-                    .filter_map(|nid| node_id_map.iter()
-                        .find(|(_, &id)| id == *nid)
-                        .map(|(&addr, _)| addr))
+                    .filter_map(|nid| node_id_to_addr.get(nid).copied())
                     .collect();
                 if !addrs.is_empty() { addrs } else { Vec::new() }
             } else {
@@ -4550,15 +4551,14 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // Map ALL replica NodeIds to SocketAddrs (not just first 2) so we have
         // real fallback candidates if either striped half-fetch fails.
-        let node_id_map = self.addr_to_node_id.read().await;
-        let all_replica_addrs: Vec<SocketAddr> = location.nodes.iter()
-            .filter_map(|node_id| {
-                node_id_map.iter()
-                    .find(|(_, &id)| id == *node_id)
-                    .map(|(&addr, _)| addr)
-            })
-            .collect();
-        drop(node_id_map);
+        let all_replica_addrs: Vec<SocketAddr> = {
+            let addr_map = self.addr_to_node_id.read().await;
+            let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> =
+                addr_map.iter().map(|(&addr, &id)| (id, addr)).collect();
+            location.nodes.iter()
+                .filter_map(|node_id| node_id_to_addr.get(node_id).copied())
+                .collect()
+        };
 
         // Helper: full-chunk read trying every available replica in order, then
         // any other cluster node as a last resort (covers ghost-record / drift).
@@ -4652,15 +4652,14 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Used to re-read the partial last chunk when re-aligning a write buffer after an interrupted append.
     pub async fn read_chunk_by_id(&self, chunk_id: ChunkId, node_ids: &[dfs_common::NodeId]) -> Result<Vec<u8>> {
         // Resolve NodeIds to SocketAddrs
-        let node_id_map = self.addr_to_node_id.read().await;
-        let mut node_addrs: Vec<SocketAddr> = node_ids.iter()
-            .filter_map(|node_id| {
-                node_id_map.iter()
-                    .find(|(_, &id)| id == *node_id)
-                    .map(|(&addr, _)| addr)
-            })
-            .collect();
-        drop(node_id_map);
+        let mut node_addrs: Vec<SocketAddr> = {
+            let addr_map = self.addr_to_node_id.read().await;
+            let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> =
+                addr_map.iter().map(|(&addr, &id)| (id, addr)).collect();
+            node_ids.iter()
+                .filter_map(|node_id| node_id_to_addr.get(node_id).copied())
+                .collect()
+        };
 
         if node_addrs.is_empty() {
             node_addrs = self.cluster_nodes.read().await.clone();

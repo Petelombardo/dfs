@@ -213,8 +213,12 @@ impl InodeReadEngine {
             }
             let map_len = map.len();
             let offsets = Arc::make_mut(&mut s.offsets);
-            if offsets.len() < map_len {
-                offsets.resize(map_len, (0, 0));
+            let old_len = offsets.len();
+            if old_len < map_len {
+                // Fill new nil slots with logical positions to keep the array
+                // non-decreasing for partition_point in chunks_for_range.
+                const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                offsets.extend((old_len..map_len).map(|i| (i * CHUNK_SIZE, 0usize)));
             }
             if idx < offsets.len() {
                 offsets[idx] = offset_entry;
@@ -340,14 +344,19 @@ impl InodeReadEngine {
         size: usize,
     ) -> Vec<(usize, usize, usize)> {
         let end = offset + size;
+        // Binary-search for the first entry whose chunk end is after `offset`.
+        // build_offsets assigns nil/gap entries their logical position (idx*CHUNK_SIZE, 0),
+        // keeping cs+cz non-decreasing across the whole array so partition_point is valid.
+        // The `chunk_size > 0` guard in the scan loop excludes nil entries (size=0) that
+        // fall inside the scan window but represent unwritten holes, not real data.
+        let start_idx = offsets.partition_point(|&(chunk_start, chunk_size)| chunk_start + chunk_size <= offset);
         let mut result = Vec::new();
-        for (idx, &(chunk_start, chunk_size)) in offsets.iter().enumerate() {
-            let chunk_end = chunk_start + chunk_size;
-            if chunk_end > offset && chunk_start < end {
-                result.push((idx, chunk_start, chunk_size));
-            }
+        for (idx, &(chunk_start, chunk_size)) in offsets[start_idx..].iter().enumerate() {
             if chunk_start >= end {
                 break;
+            }
+            if chunk_size > 0 && chunk_start + chunk_size > offset {
+                result.push((start_idx + idx, chunk_start, chunk_size));
             }
         }
         result
@@ -442,10 +451,15 @@ impl ReadEngineMap {
 }
 
 fn build_offsets(locations: &[ChunkLocation]) -> Vec<(usize, usize)> {
-    locations.iter().map(|loc| {
-        let start = loc.file_offset.unwrap_or(0) as usize;
-        let size = loc.size as usize;
-        (start, size)
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    locations.iter().enumerate().map(|(idx, loc)| {
+        match loc.file_offset {
+            Some(offset) => (offset as usize, loc.size as usize),
+            // Nil/gap placeholder: use logical position so the array stays
+            // non-decreasing and partition_point in chunks_for_range stays valid.
+            // chunk_size=0 ensures these entries are excluded by the scan guard.
+            None => (idx * CHUNK_SIZE, 0),
+        }
     }).collect()
 }
 
@@ -531,6 +545,49 @@ mod tests {
             seen.insert(primary);
         }
         assert_eq!(seen.len(), 3, "all 3 replicas should be used as primary across different chunks");
+    }
+
+    /// chunks_for_range must correctly find real chunks when nil/gap placeholders
+    /// sit between them (sparse file with interior holes).  The bug: nil entries
+    /// stored as (0, 0) make the predicate non-monotone and partition_point returns
+    /// a wrong start_idx that skips all real entries before the gap.
+    #[test]
+    fn test_chunks_for_range_with_interior_nil_gaps() {
+        const MB4: usize = 4 * 1024 * 1024;
+        // Mimics T29: chunks 0-2 at offsets 0/4M/8M, gap at 3-4, chunk 5 at 20M.
+        // build_offsets maps nil entries (file_offset=None) to (idx*4M, 0).
+        let offsets: Vec<(usize, usize)> = vec![
+            (0,    MB4),   // chunk 0
+            (MB4,  MB4),   // chunk 1
+            (2*MB4,MB4),   // chunk 2
+            (3*MB4,  0),   // nil gap chunk 3
+            (4*MB4,  0),   // nil gap chunk 4
+            (5*MB4,MB4),   // chunk 5
+        ];
+
+        // Reading at start of chunk 0 must find chunk 0.
+        let r = InodeReadEngine::chunks_for_range(&offsets, 0, 4096);
+        assert_eq!(r, vec![(0, 0, MB4)], "chunk 0 start");
+
+        // Reading inside chunk 1 must find chunk 1.
+        let r = InodeReadEngine::chunks_for_range(&offsets, MB4 + 1024, 4096);
+        assert_eq!(r, vec![(1, MB4, MB4)], "inside chunk 1");
+
+        // Reading at start of gap must return empty (zeros for sparse hole).
+        let r = InodeReadEngine::chunks_for_range(&offsets, 3*MB4, 4096);
+        assert!(r.is_empty(), "gap start should be empty");
+
+        // Reading in middle of gap must also be empty.
+        let r = InodeReadEngine::chunks_for_range(&offsets, 4*MB4 - 4096, 4096);
+        assert!(r.is_empty(), "gap middle should be empty");
+
+        // Reading at chunk 5 must find it.
+        let r = InodeReadEngine::chunks_for_range(&offsets, 5*MB4, 4096);
+        assert_eq!(r, vec![(5, 5*MB4, MB4)], "chunk 5");
+
+        // Reading spanning chunk 2 into the gap must only include chunk 2.
+        let r = InodeReadEngine::chunks_for_range(&offsets, 3*MB4 - 1024, 4096);
+        assert_eq!(r, vec![(2, 2*MB4, MB4)], "spanning chunk2→gap should not include nil");
     }
 
     /// resolve_primary must never invent a node outside loc.nodes ∩ nim — e.g.

@@ -6679,9 +6679,10 @@ impl Server {
             // The client window tracking uses this to know when it has fetched
             // the complete map — returning locations.len() would cause constant
             // re-fetches for sparse files where reads land beyond the last chunk.
-            let max_chunk_idx = locations.iter()
-                .filter_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE) as u32))
-                .max()
+            // locations is sorted by file_offset (None entries sort last via unwrap_or(u64::MAX)).
+            // Scan from the end to find the highest real offset in O(1).
+            let max_chunk_idx = locations.iter().rev()
+                .find_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE) as u32))
                 .unwrap_or(locations.len().saturating_sub(1) as u32);
             let total_chunks = max_chunk_idx + 1;
 

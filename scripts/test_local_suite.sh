@@ -2765,14 +2765,30 @@ T38_UNDER_BEFORE=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 2))")
 echo "  Under-replicated chunks immediately after restart: ${T38_UNDER_BEFORE:-?}"
 
-# Give the healer time to converge (local healing_delay_secs=10).
-echo "  Waiting for healer to converge replicas..."
-sleep 15
+# Trigger an immediate heal scan, then poll until the queue drains (or 2 min).
+echo "  Triggering healer and polling for convergence..."
 "$BIN/dfs-admin" --cluster "$CLUSTER" healing file /t38_slow.bin 2>/dev/null || true
-# Run healing trigger
 "$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
+sleep 5   # let the triggered scan populate the queue before polling
+
+T38_DEADLINE=$(( $(date +%s) + 120 ))
+while true; do
+    T38_STATUS=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json healing status 2>/dev/null || echo '{}')
+    T38_QUEUE=$(echo "$T38_STATUS" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d.get('pending_count', 0) + d.get('in_flight_count', 0))
+" 2>/dev/null || echo "?")
+    echo "  Heal queue: ${T38_QUEUE} (pending + in-flight)"
+    [ "$T38_QUEUE" = "0" ] && break
+    if [ "$(date +%s)" -ge "$T38_DEADLINE" ]; then
+        echo "  WARN: heal queue did not drain within 2 minutes"
+        break
+    fi
+    sleep 3
+done
+
 "$BIN/dfs-admin" --cluster "$CLUSTER" file info /t38_slow.bin
-sleep 8
 
 T38_UNDER_AFTER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t38_slow.bin 2>/dev/null \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 2))")

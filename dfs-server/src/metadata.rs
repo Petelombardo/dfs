@@ -468,6 +468,15 @@ impl MetadataStore {
     }
 
     /// Get file metadata by ID.
+    /// Cheap existence check — avoids deserializing the full FileMetadata.
+    pub fn file_exists_by_id(&self, file_id: FileId) -> Result<bool> {
+        let key = format!("{}", file_id);
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let table = txn.open_table(FILE_TABLE)?;
+        Ok(table.get(key.as_str())?.is_some())
+    }
+
     pub fn get_file(&self, file_id: &FileId) -> Result<Option<FileMetadata>> {
         let key = format!("{}", file_id);
         let _db = self.db.read().unwrap();

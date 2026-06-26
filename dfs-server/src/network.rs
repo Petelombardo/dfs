@@ -495,10 +495,31 @@ impl NetworkClient {
     }
 
     /// Send a message to a remote node and wait for response
+    /// Like `send_message` but with a caller-specified response read timeout.
+    /// Use for operations where the remote handler itself does slow work (e.g.
+    /// PushChunkTo, which must read a chunk from disk and forward it before replying).
+    pub async fn send_message_timeout(
+        &self,
+        target: SocketAddr,
+        message: Message,
+        response_timeout: std::time::Duration,
+    ) -> Result<MessageEnvelope> {
+        self.send_message_inner(target, message, response_timeout).await
+    }
+
     pub async fn send_message(
         &self,
         target: SocketAddr,
         message: Message,
+    ) -> Result<MessageEnvelope> {
+        self.send_message_inner(target, message, std::time::Duration::from_secs(30)).await
+    }
+
+    async fn send_message_inner(
+        &self,
+        target: SocketAddr,
+        message: Message,
+        response_timeout: std::time::Duration,
     ) -> Result<MessageEnvelope> {
         let request_id = self.next_request_id();
         let envelope = MessageEnvelope::new(request_id, message);
@@ -560,29 +581,37 @@ impl NetworkClient {
         // Send message — bounded so a backed-up peer (TCP window closed) can't hold
         // a handler indefinitely. Mirrors the 30s read timeout below.
         const WRITE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
-        if let Err(e) = tokio::time::timeout(WRITE_TIMEOUT, write_message(&mut stream, &envelope))
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("Write timeout to {}", target)))
-        {
-            // Stale pooled connection — open a fresh one and retry once
-            debug!("Pooled connection to {} failed ({}), retrying with new connection", target, e);
-            let mut fresh = tokio::time::timeout(
-                tokio::time::Duration::from_secs(5),
-                TcpStream::connect(target),
-            ).await
-                .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
-                .with_context(|| format!("Failed to reconnect to {}", target))?;
-            let _ = fresh.set_nodelay(true);
-            tokio::time::timeout(WRITE_TIMEOUT, write_message(&mut fresh, &envelope))
-                .await
-                .map_err(|_| anyhow::anyhow!("Write timeout to {}", target))??;
-            stream = fresh;
+        let write_result = tokio::time::timeout(WRITE_TIMEOUT, write_message(&mut stream, &envelope)).await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // Connection error (e.g. stale pooled connection) — retry with fresh one.
+                debug!("Pooled connection to {} failed ({}), retrying with new connection", target, e);
+                let mut fresh = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(target),
+                ).await
+                    .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
+                    .with_context(|| format!("Failed to reconnect to {}", target))?;
+                let _ = fresh.set_nodelay(true);
+                tokio::time::timeout(WRITE_TIMEOUT, write_message(&mut fresh, &envelope))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Write timeout to {}", target))??;
+                stream = fresh;
+            }
+            Err(_) => {
+                // Write timed out — target's TCP window is closed/backed up.
+                // Do NOT retry: a fresh connection won't help if the target is slow to
+                // receive, and retrying doubles the worst-case latency from 30s to 95s,
+                // pushing it past the 90s PushChunkTo leader timeout.
+                return Err(anyhow::anyhow!("Write timeout to {}", target));
+            }
         }
 
         // Read response — bounded so a hung peer never holds a semaphore permit forever.
         let mut read_buf = BytesMut::with_capacity(8192);
         let response = tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
+            response_timeout,
             read_message(&mut stream, &mut read_buf, |_| {}),
         )
         .await

@@ -1771,8 +1771,10 @@ impl Server {
             tokio::task::spawn_blocking(move || {
                 #[cfg(target_os = "linux")]
                 let old_prio = unsafe { libc::syscall(libc::SYS_ioprio_get, 1i64, 0i64) };
+                // Best-effort class (2) at priority 7 (lowest) — lower than foreground I/O
+                // but not starved like idle class (3) which never runs under continuous DVR load.
                 #[cfg(target_os = "linux")]
-                unsafe { libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, 3i64 << 13); }
+                unsafe { libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, (2i64 << 13) | 7i64); }
 
                 let result = storage.write_chunk(&chunk_id, &data);
 
@@ -5655,6 +5657,13 @@ impl Server {
             }
         }
         self.chunk_map_remove(&entry.file_id).await;
+
+        // Prune deleted chunks from the healing queue so they don't inflate
+        // the pending count indefinitely (routing table entry is already gone,
+        // so the discovery pass would never clear them on its own).
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            healing.clear_pending_for_deleted_chunks(&entry.chunk_ids).await;
+        }
 
         // Send DeleteChunksBatch to every online peer (not just chunk holders).
         let mut all_acked = true;

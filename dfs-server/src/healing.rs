@@ -41,38 +41,44 @@ struct BandwidthLimiterState {
 impl BandwidthLimiter {
     pub fn new(mb_per_sec: usize) -> Self {
         let rate_bytes_per_sec = (mb_per_sec * 1024 * 1024) as f64;
+        // Burst cap = 2× the per-second rate so all heal_max_concurrent tasks
+        // (default 8 × 4MB = 32MB) can start immediately at rates up to 16MB/s
+        // without queuing. At higher rates the burst is even larger, so no task
+        // ever has to wait on the first pass.
+        let burst_cap = rate_bytes_per_sec * 2.0;
         Self {
             rate_bytes_per_sec,
-            // Start with a full second's worth of burst allowance so a single
-            // small heal doesn't stall waiting for tokens from a cold start.
             state: tokio::sync::Mutex::new(BandwidthLimiterState {
-                tokens: rate_bytes_per_sec,
+                tokens: burst_cap,
                 last_refill: Instant::now(),
             }),
         }
     }
 
     /// Block until `bytes` worth of bandwidth budget is available, refilling at
-    /// the configured rate. Burst is capped to one second's worth of tokens so
-    /// sustained throughput tracks the configured MB/s instead of just being
-    /// bounded in aggregate.
+    /// the configured rate. Burst is capped to 2× the per-second rate so all
+    /// concurrent heal tasks can start immediately and sustained throughput
+    /// tracks the configured MB/s.
     pub async fn acquire(&self, bytes: usize) {
         let bytes = bytes as f64;
+        let burst_cap = self.rate_bytes_per_sec * 2.0;
         loop {
             let wait = {
                 let mut state = self.state.lock().await;
                 let now = Instant::now();
                 let elapsed = now.duration_since(state.last_refill).as_secs_f64();
                 state.tokens = (state.tokens + elapsed * self.rate_bytes_per_sec)
-                    .min(self.rate_bytes_per_sec);
+                    .min(burst_cap);
                 state.last_refill = now;
 
                 if state.tokens >= bytes {
                     state.tokens -= bytes;
                     None
                 } else {
+                    // Don't consume partial tokens on failure — leave them for the
+                    // next attempt so the refill computed from elapsed time is not
+                    // reset to zero, which would starve concurrent waiters.
                     let deficit = bytes - state.tokens;
-                    state.tokens = 0.0;
                     Some(Duration::from_secs_f64(deficit / self.rate_bytes_per_sec))
                 }
             };
@@ -428,6 +434,22 @@ impl HealingManager {
     /// longer relevant) and clear its persisted detection time.
     async fn clear_pending(&self, chunk_id: &ChunkId) {
         Self::clear_pending_static(&self.pending_healing, &self.metadata, chunk_id).await;
+    }
+
+    /// Remove a batch of chunks from pending_healing — called when files are deleted
+    /// so their chunks don't inflate the pending count indefinitely.
+    pub async fn clear_pending_for_deleted_chunks(&self, chunk_ids: &[ChunkId]) {
+        let mut pending = self.pending_healing.write().await;
+        let mut to_delete = Vec::new();
+        for chunk_id in chunk_ids {
+            if pending.remove(chunk_id).is_some() {
+                to_delete.push(*chunk_id);
+            }
+        }
+        drop(pending);
+        for chunk_id in to_delete {
+            let _ = self.metadata.delete_pending_healing_async(chunk_id).await;
+        }
     }
 
     /// Free-function equivalent of `clear_pending` for static/spawned contexts
@@ -1193,8 +1215,28 @@ impl HealingManager {
             // Fast: look up only pending chunks by ID.
             let mut chunks_to_check = Vec::with_capacity(pending_snapshot.len());
             for chunk_id in &pending_snapshot {
-                if let Ok(Some(loc)) = self.metadata.get_chunk_location(chunk_id) {
-                    chunks_to_check.push(loc);
+                match self.metadata.get_chunk_location(chunk_id) {
+                    Ok(Some(loc)) => {
+                        // If the chunk carries a file_id, verify the file still exists.
+                        // Orphan routing table entries (file deleted but RCL entry
+                        // re-added later) would otherwise cause the fast scan to keep
+                        // trying to heal chunks that belong to deleted files.
+                        let is_orphan = if let Some(file_id) = loc.file_id {
+                            !self.metadata.file_exists_by_id(file_id).unwrap_or(true)
+                        } else {
+                            false // can't tell without file_id; defer to deep scan
+                        };
+                        if is_orphan {
+                            let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
+                            self.clear_pending(chunk_id).await;
+                        } else {
+                            chunks_to_check.push(loc);
+                        }
+                    }
+                    // Chunk was deleted from routing table (file deleted) but its
+                    // pending_healing entry was never cleaned up. Prune it now.
+                    Ok(None) => { self.clear_pending(chunk_id).await; }
+                    Err(_) => {}
                 }
             }
             ScanResult { chunks_to_check }
@@ -1790,6 +1832,7 @@ impl HealingManager {
                 let heal_semaphore = self.heal_semaphore.clone();
                 let replication_factor = self.replication_factor;
                 let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs);
+                let bandwidth_limiter = self.heal_bandwidth_limiter.clone();
 
                 set.spawn(async move {
                     let _permit = heal_semaphore.acquire().await;
@@ -1799,7 +1842,7 @@ impl HealingManager {
                             ReplicationStatus::UnderReplicated => {
                                 HealingManager::do_heal_chunk_shared(
                                     &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
-                                    &pending_healing, &in_flight_healing, replication_factor,
+                                    &pending_healing, &in_flight_healing, replication_factor, &bandwidth_limiter,
                                 ).await
                             }
                             ReplicationStatus::OverReplicated => {
@@ -1886,6 +1929,7 @@ impl HealingManager {
         pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
         in_flight_healing: &Arc<RwLock<HashSet<ChunkId>>>,
         replication_factor: usize,
+        bandwidth_limiter: &Arc<BandwidthLimiter>,
     ) -> Result<()> {
         // In-flight guard: prevents two concurrent tasks healing the same chunk.
         {
@@ -1898,7 +1942,7 @@ impl HealingManager {
         }
 
         let result = Self::do_heal_chunk_inner(
-            chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, pending_healing, replication_factor,
+            chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, pending_healing, replication_factor, bandwidth_limiter,
         ).await;
         in_flight_healing.write().await.remove(chunk_id);
         result
@@ -1913,12 +1957,33 @@ impl HealingManager {
         client: &Arc<NetworkClient>,
         pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
         replication_factor: usize,
+        bandwidth_limiter: &Arc<BandwidthLimiter>,
     ) -> Result<()> {
         info!("Leader healing under-replicated chunk: {}", chunk_id);
 
         let location = metadata
             .get_chunk_location(chunk_id)?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
+
+        // Fast orphan guard: if no file claims this chunk, don't waste a heal slot on
+        // it. The deep-scan orphan sweep runs every ~6 min and will delete the routing
+        // table entry; we just don't want to block a 120s heal transfer on a ghost chunk.
+        let is_orphan = match location.file_id {
+            Some(file_id) => !metadata.file_exists_by_id(file_id).unwrap_or(true),
+            None => {
+                // No file_id recorded — we can't verify quickly. Stall for now and let
+                // the deep scan handle it rather than burning 120s on a speculative heal.
+                warn!("Chunk {} has no file_id in routing table — deferring to orphan sweep", chunk_id);
+                Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
+                return Ok(());
+            }
+        };
+        if is_orphan {
+            warn!("Chunk {}: file {:?} no longer exists — removing orphan chunk from routing table", chunk_id, location.file_id);
+            let _ = metadata.delete_chunk_location_async(*chunk_id).await;
+            Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
+            return Ok(());
+        }
 
         // Build alive list from confirmed_alive_nodes passed in from the bulk scan.
         // These were verified by the HasChunks bulk RPC in the classification phase —
@@ -2014,10 +2079,10 @@ impl HealingManager {
             return Ok(());
         }
 
-        // Pick the source node: prefer local node (no network hop for the read),
-        // otherwise use the first alive node.
-        let source = if alive_ids.contains(&local_id) {
-            alive.iter().find(|(id, _)| *id == local_id).copied()
+        // Prefer a remote source to avoid loopback TCP (leader→leader PushChunkTo hangs
+        // under Tokio scheduling pressure). Fall back to local only when no remote has it.
+        let source = if alive.len() > 1 {
+            alive.iter().find(|(id, _)| *id != local_id).copied()
         } else {
             alive.first().copied()
         };
@@ -2025,33 +2090,48 @@ impl HealingManager {
 
         let mut replicated = Vec::new();
 
-        for target_id in &targets {
-            if let Some(target_info) = cluster.get_node(target_id).await {
-                info!(
-                    "Healing chunk {}: instructing node {} to push to node {} ({})",
-                    chunk_id, source_id, target_id, target_info.addr
-                );
+        {
+            for target_id in &targets {
+                if let Some(target_info) = cluster.get_node(target_id).await {
+                    info!(
+                        "Healing chunk {}: instructing node {} to push to node {} ({})",
+                        chunk_id, source_id, target_id, target_info.addr
+                    );
 
-                let request = Request::PushChunkTo {
-                    chunk_id: *chunk_id,
-                    target_addr: target_info.addr,
-                    leader_id: local_id,
-                };
+                    let request = Request::PushChunkTo {
+                        chunk_id: *chunk_id,
+                        target_addr: target_info.addr,
+                        leader_id: local_id,
+                    };
 
-                match client.send_message(source_addr, Message::Request(request)).await {
-                    Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
-                        info!("Chunk {} successfully pushed from {} to {}", chunk_id, source_id, target_id);
-                        replicated.push(*target_id);
+                    // PushChunkTo response time = source disk read + ReplicateChunk RTT
+                    // to target (5s connect + 30s write + 30s read). Use 90s so the
+                    // leader doesn't time out before the source handler finishes.
+                    match client.send_message_timeout(
+                        source_addr,
+                        Message::Request(request),
+                        std::time::Duration::from_secs(90),
+                    ).await {
+                        Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
+                            info!("Chunk {} successfully pushed from {} to {}", chunk_id, source_id, target_id);
+                            replicated.push(*target_id);
+                        }
+                        Ok(envelope) if matches!(envelope.message, Message::Response(Response::Error { code: dfs_common::ErrorCode::NotFound, .. })) => {
+                            warn!("Chunk {} not found on source {} — removing from heal queue", chunk_id, source_id);
+                            let _ = metadata.delete_chunk_location_async(*chunk_id).await;
+                            Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
+                            return Ok(());
+                        }
+                        Ok(envelope) => {
+                            warn!("Chunk {} push from {} to {} failed: {:?}", chunk_id, source_id, target_id, envelope.message);
+                        }
+                        Err(e) => {
+                            warn!("Chunk {} push from {} to {} error: {}", chunk_id, source_id, target_id, e);
+                        }
                     }
-                    Ok(envelope) => {
-                        warn!("Chunk {} push from {} to {} failed: {:?}", chunk_id, source_id, target_id, envelope.message);
-                    }
-                    Err(e) => {
-                        warn!("Chunk {} push from {} to {} error: {}", chunk_id, source_id, target_id, e);
-                    }
+                } else {
+                    warn!("Chunk {}: target node {} not found in cluster registry — skipping", chunk_id, target_id);
                 }
-            } else {
-                warn!("Chunk {}: target node {} not found in cluster registry — skipping", chunk_id, target_id);
             }
         }
 
@@ -2067,22 +2147,20 @@ impl HealingManager {
             // and the healer will heal the correct (newer) chunk_id on the next cycle.
             // This keeps the chunk map free of stale replicas and prevents the client's
             // sorted-first-2 algorithm from targeting a node with an old base chunk.
-            let source_still_valid = {
-                let req = dfs_common::Request::HasChunks { chunk_ids: vec![*chunk_id] };
-                match client.send_message(source_addr, dfs_common::Message::Request(req)).await {
-                    Ok(env) => match env.message {
-                        dfs_common::Message::Response(dfs_common::Response::BoolVec { ref values }) => {
-                            values.first().copied().unwrap_or(false)
-                        }
-                        _ => {
-                            warn!("Healer: unexpected response verifying chunk {} on source {}", chunk_id, source_addr);
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Healer: could not verify chunk {} on source {}: {}", chunk_id, source_addr, e);
+            let req = dfs_common::Request::HasChunks { chunk_ids: vec![*chunk_id] };
+            let source_still_valid = match client.send_message(source_addr, dfs_common::Message::Request(req)).await {
+                Ok(env) => match env.message {
+                    dfs_common::Message::Response(dfs_common::Response::BoolVec { ref values }) => {
+                        values.first().copied().unwrap_or(false)
+                    }
+                    _ => {
+                        warn!("Healer: unexpected response verifying chunk {} on source {}", chunk_id, source_addr);
                         false
                     }
+                },
+                Err(e) => {
+                    warn!("Healer: could not verify chunk {} on source {}: {}", chunk_id, source_addr, e);
+                    false
                 }
             };
 

@@ -1845,10 +1845,31 @@ impl FlushHandle {
                         Some(loc) => {
                             match self.client.get_single_chunk_location(meta.id, chunk_idx).await {
                                 Ok(Some(fresh)) if fresh.chunk_id == loc.chunk_id && fresh.nodes != loc.nodes => {
+                                    // Reconcile: keep pruned-ghost removal (nodes no longer in
+                                    // fresh are gone from the ring and should be excluded), but
+                                    // do NOT promote healer-added nodes (nodes in fresh but not
+                                    // in loc) into the patch window. A healer-added node is
+                                    // registered in the leader's metadata before the copy
+                                    // completes; including it as a patch target displaces a
+                                    // confirmed holder into the dual-RF skip slot, which then
+                                    // loses its copy via tombstone — leaving only 1 replica.
+                                    // Use the intersection: nodes confirmed by both the leader
+                                    // (still live) and our last write (known to hold the chunk).
+                                    // If the intersection is empty the chunk migrated entirely
+                                    // and we fall back to the leader's full list.
+                                    let intersection: Vec<dfs_common::NodeId> = loc.nodes.iter()
+                                        .filter(|n| fresh.nodes.contains(n))
+                                        .copied()
+                                        .collect();
+                                    let reconciled_nodes = if intersection.is_empty() {
+                                        fresh.nodes.clone()
+                                    } else {
+                                        intersection
+                                    };
                                     info!("flush_buffer_async_one: ino={} chunk={} no session override yet — \
-                                           refreshing node list from leader before first patch this session ({:?} -> {:?})",
-                                        ino, chunk_idx, loc.nodes, fresh.nodes);
-                                    Some(ChunkLocation { nodes: fresh.nodes, ..loc })
+                                           refreshing node list from leader before first patch this session ({:?} -> {:?}, reconciled={:?})",
+                                        ino, chunk_idx, loc.nodes, fresh.nodes, reconciled_nodes);
+                                    Some(ChunkLocation { nodes: reconciled_nodes, ..loc })
                                 }
                                 _ => Some(loc),
                             }

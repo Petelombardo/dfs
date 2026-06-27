@@ -1531,10 +1531,41 @@ impl HealingManager {
                             chunk_id, nodes_down
                         );
                     } else {
-                        warn!(
-                            "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
-                            chunk_id, location.nodes.len()
-                        );
+                        // Before declaring DATA LOSS, check whether this chunk_id was
+                        // superseded by a newer write. PatchChunk renames old→new on disk,
+                        // so the old chunk_id's file is gone from every node — but the data
+                        // still exists under the new chunk_id. A superseded chunk appearing
+                        // to have 0 replicas is expected cleanup, not data loss.
+                        let is_superseded = if let (Some(file_id), Some(file_offset)) = (location.file_id, location.file_offset) {
+                            match self.metadata.get_file(&file_id) {
+                                Ok(Some(file_meta)) => {
+                                    // If the active chunk at this file position is a different
+                                    // chunk_id, we were patched away — this is not data loss.
+                                    let current = file_meta.chunk_locations.iter()
+                                        .find(|loc| loc.file_offset == Some(file_offset));
+                                    match current {
+                                        Some(cur) => cur.chunk_id != chunk_id,
+                                        None => true, // position removed — chunk is orphaned
+                                    }
+                                }
+                                Ok(None) => true, // file deleted — chunk is orphaned
+                                Err(_) => false,  // metadata error — be conservative
+                            }
+                        } else {
+                            false
+                        };
+
+                        if is_superseded {
+                            debug!(
+                                "Chunk {} has 0 replicas but was superseded by a newer write at the same file position — purging stale metadata (not DATA LOSS)",
+                                chunk_id
+                            );
+                        } else {
+                            warn!(
+                                "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
+                                chunk_id, location.nodes.len()
+                            );
+                        }
                         db_deletes.push(chunk_id);
                         self.clear_pending(&chunk_id).await;
                         continue;
@@ -2109,14 +2140,39 @@ impl HealingManager {
                     // PushChunkTo response time = source disk read + ReplicateChunk RTT
                     // to target (5s connect + 30s write + 30s read). Use 90s so the
                     // leader doesn't time out before the source handler finishes.
+                    let target_addr = target_info.addr;
                     match client.send_message_timeout(
                         source_addr,
                         Message::Request(request),
                         std::time::Duration::from_secs(90),
                     ).await {
                         Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
-                            info!("Chunk {} successfully pushed from {} to {}", chunk_id, source_id, target_id);
-                            replicated.push(*target_id);
+                            // Verify the target actually received and can confirm the chunk.
+                            // PushChunkTo's Ok only means the source completed the send —
+                            // a target with a corrupted filesystem may write OK but fail
+                            // reads immediately after. A quick HasChunks round-trip to the
+                            // target catches this before we commit it to routing metadata.
+                            let verify_req = dfs_common::Request::HasChunks { chunk_ids: vec![*chunk_id] };
+                            let target_confirmed = match client.send_message(
+                                target_addr,
+                                dfs_common::Message::Request(verify_req),
+                            ).await {
+                                Ok(env) => matches!(
+                                    env.message,
+                                    dfs_common::Message::Response(dfs_common::Response::BoolVec { ref values })
+                                    if values.first().copied().unwrap_or(false)
+                                ),
+                                Err(e) => {
+                                    warn!("Chunk {} post-push verification on target {} failed: {}", chunk_id, target_addr, e);
+                                    false
+                                }
+                            };
+                            if target_confirmed {
+                                info!("Chunk {} successfully pushed from {} to {} (target confirmed)", chunk_id, source_id, target_id);
+                                replicated.push(*target_id);
+                            } else {
+                                warn!("Chunk {} push to {} reported success but target {} does not confirm having it — not recording replica", chunk_id, source_id, target_id);
+                            }
                         }
                         Ok(envelope) if matches!(envelope.message, Message::Response(Response::Error { code: dfs_common::ErrorCode::NotFound, .. })) => {
                             warn!("Chunk {} not found on source {} — removing from heal queue", chunk_id, source_id);

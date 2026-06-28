@@ -5928,6 +5928,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // then only retry if no replica succeeded (i.e. our base is wrong for everyone).
         // Replicas that did succeed are handled via the re-push mechanism below.
         let mut stale_retry: Option<(ChunkId, dfs_common::ChunkLocation)> = None;
+        // Replicas that returned ChunkStale, keyed by addr → chunk_id they reported.
+        // We defer their verdict: if their reported chunk_id matches the authoritative
+        // patch result, the healer already brought them current and they count as patched.
+        let mut stale_ahead: Vec<(SocketAddr, ChunkId)> = Vec::new();
         for (addr, result) in results {
             match result {
                 Ok(Response::MultiPatchResult { new_chunk_id: ncid, size, patch_ts }) => {
@@ -5940,6 +5944,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
                     warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",
                         addr, old_chunk_id, current_chunk_id);
+                    stale_ahead.push((addr, current_chunk_id));
                     if attempt == 0 {
                         // Save corrected location; retry only if no replica succeeded.
                         stale_retry = Some((current_chunk_id, dfs_common::ChunkLocation {
@@ -6032,8 +6037,20 @@ leader_addr: Arc::new(RwLock::new(None)),
                         addr, ncid, authoritative_chunk_id);
                 }
                 Err(e) if e.to_string().contains("chunk stale") => {
-                    warn!("MultiPatch replica {}: stale base — excluding from location, healer will bring current",
-                        addr);
+                    // Check if this replica already had the target chunk (healer beat us to it).
+                    // If so it holds the correct data and should be counted as patched.
+                    let already_current = stale_ahead.iter()
+                        .any(|(a, cid)| a == addr && *cid == authoritative_chunk_id);
+                    if already_current {
+                        info!("MultiPatch replica {}: already at target {} (healer concurrent) — counting as patched",
+                            addr, authoritative_chunk_id);
+                        if let Some(&nid) = addr_to_node_id_snap.get(addr) {
+                            patched_node_ids.push(nid);
+                        }
+                    } else {
+                        warn!("MultiPatch replica {}: stale base — excluding from location, healer will bring current",
+                            addr);
+                    }
                 }
                 Err(_) => {} // connection/other failure — already logged
             }

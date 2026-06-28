@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+# find-block: trace a DFS chunk hash backwards through MultiPatch lineage.
+# Handles cycles and one-to-many predecessor relationships.
+# Does a single pass through the log to build the graph, then BFS backwards.
+#
+# Usage: find-block <block-hash> [log-file]
+# Env:   DFS_LOG=/path/to/dfs-client.log (default: /var/log/dfs-client.log)
+
+import sys
+import os
+import re
+from collections import defaultdict, deque
+
+LOG = os.environ.get("DFS_LOG", "/var/log/dfs-client.log")
+
+if len(sys.argv) < 2:
+    print("Usage: find-block <block-hash> [log-file]", file=sys.stderr)
+    sys.exit(1)
+
+target = sys.argv[1]
+if len(sys.argv) >= 3:
+    LOG = sys.argv[2]
+
+if not os.path.isfile(LOG):
+    print(f"Log file not found: {LOG}", file=sys.stderr)
+    sys.exit(1)
+
+pattern = re.compile(r'MultiPatch: ([0-9a-f]{16,}) -> ([0-9a-f]{16,})')
+
+# Single pass: build dst -> [(lineno, line, src)] index
+print(f"=== Scanning {LOG} ...", file=sys.stderr)
+dst_to_entries = defaultdict(list)
+with open(LOG, errors="replace") as f:
+    for lineno, line in enumerate(f, 1):
+        m = pattern.search(line)
+        if m:
+            src, dst = m.group(1), m.group(2)
+            dst_to_entries[dst].append((lineno, line.rstrip(), src))
+
+# BFS backwards from target
+visited = set()
+collected = {}   # lineno -> line
+cycles = []
+queue = deque([target])
+
+while queue:
+    h = queue.popleft()
+    if h in visited:
+        cycles.append(f"  [CYCLE: {h}]")
+        continue
+    visited.add(h)
+    for lineno, line, src in dst_to_entries.get(h, []):
+        collected[lineno] = line
+        queue.append(src)
+
+print(f"=== Block lineage for: {target}", file=sys.stderr)
+print(f"=== {len(visited)} unique hash(es) in lineage\n", file=sys.stderr)
+
+if not collected:
+    print(f"No MultiPatch entries found for {target}", file=sys.stderr)
+    sys.exit(0)
+
+for lnum in sorted(collected):
+    line = collected[lnum]
+    if f' -> {target}' in line:
+        tag = '-->'   # target was created here
+    elif f'{target} ->' in line:
+        tag = '<--'   # target was patched away here
+    else:
+        tag = '   '
+    print(f"L{lnum:<7} {tag} {line}")
+
+if cycles:
+    print()
+    print("=== Cycle(s) detected in patch graph ===")
+    for c in cycles:
+        print(c)
+
+print(f"\n=== {len(collected)} log line(s) collected ===", file=sys.stderr)

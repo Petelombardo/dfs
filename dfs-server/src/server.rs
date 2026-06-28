@@ -1879,6 +1879,16 @@ impl Server {
             healing.heal_bandwidth_limiter().acquire(size_estimate).await;
         }
 
+        // Serialize against any concurrent in-place MultiPatch on this same chunk.
+        // MultiPatch holds a write lock while it pwrites+renames the chunk file;
+        // reading mid-pwrite would give partially-overwritten bytes.  The hash
+        // verification below would catch the mismatch when file_offset and file_id
+        // are present, but a node that received this chunk via a prior ReplicateChunk
+        // may have neither field in its local sled record, skipping verification.
+        // Holding the read lock here ensures we always see either the pre-patch or
+        // the post-rename state — never the in-between partial write.
+        let _io_guard = self.chunk_io_read_guard(&chunk_id).await;
+
         let storage = self.storage.clone();
         let data = match tokio::task::spawn_blocking(move || storage.read_chunk(&chunk_id))
             .await

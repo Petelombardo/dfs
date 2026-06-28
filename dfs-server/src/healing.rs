@@ -2275,7 +2275,11 @@ impl HealingManager {
             if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
                 continue;
             }
-            let request = Request::ReplicateChunkLocation { location: location.clone(), file_id: None };
+            // Include file_id so the leader routes through chunk_map_update_location_for_file
+            // (with write_seq guard) instead of the scan-all fallback that only does an
+            // exact chunk_id match and can't enforce ordering between a stale heal RCL
+            // and a newer client patch RCL that already updated the same chunk slot.
+            let request = Request::ReplicateChunkLocation { location: location.clone(), file_id: location.file_id };
             if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
                 warn!("Failed to broadcast chunk location {} to node {}: {}", location.chunk_id, node.id, e);
             }

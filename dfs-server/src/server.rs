@@ -5951,6 +5951,7 @@ impl Server {
                     in_flight_count: stats.in_flight_healing,
                     stalled_count: stats.stalled_healing,
                     last_check: 0,
+                    bandwidth_mb: stats.current_bandwidth_mb,
                 }
             }
             None => Response::HealingStatus {
@@ -5959,6 +5960,7 @@ impl Server {
                 in_flight_count: 0,
                 stalled_count: 0,
                 last_check: 0,
+                bandwidth_mb: 0,
             },
         }
     }

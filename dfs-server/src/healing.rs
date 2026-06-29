@@ -57,6 +57,12 @@ impl BandwidthLimiter {
         }
     }
 
+    /// Current rate in MB/s (reads the live value from locked state).
+    pub async fn current_rate_mb(&self) -> usize {
+        let state = self.state.lock().await;
+        (state.rate_bytes_per_sec / (1024.0 * 1024.0)) as usize
+    }
+
     /// Update the token-bucket rate at runtime. Takes effect on the next acquire() call.
     /// Burst cap is always 2× the new rate. Existing token balance is clamped to the
     /// new burst cap to prevent a burst of accumulated tokens at the old rate.
@@ -2635,6 +2641,7 @@ impl HealingManager {
             stalled_healing: stalled_count,
             auto_heal_enabled: self.auto_heal,
             healing_delay_secs: self.healing_delay_secs,
+            current_bandwidth_mb: self.heal_bandwidth_limiter.current_rate_mb().await,
         }
     }
 
@@ -2677,6 +2684,7 @@ pub struct HealingStats {
     pub stalled_healing: usize,
     pub auto_heal_enabled: bool,
     pub healing_delay_secs: u64,
+    pub current_bandwidth_mb: usize,
 }
 
 #[cfg(test)]

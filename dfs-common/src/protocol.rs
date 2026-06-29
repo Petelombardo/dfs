@@ -699,6 +699,8 @@ pub enum Response {
         in_flight_count: usize,
         stalled_count: usize,
         last_check: u64,
+        #[serde(default)]
+        bandwidth_mb: usize,
     },
 
     /// File info with chunk locations

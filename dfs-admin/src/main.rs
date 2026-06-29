@@ -570,6 +570,7 @@ async fn handle_healing_command(
                     in_flight_count,
                     stalled_count,
                     last_check,
+                    bandwidth_mb,
                 } => {
                     if json_output {
                         let output = serde_json::json!({
@@ -578,6 +579,7 @@ async fn handle_healing_command(
                             "in_flight_count": in_flight_count,
                             "stalled_count": stalled_count,
                             "last_check": last_check,
+                            "bandwidth_mb": bandwidth_mb,
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
@@ -587,6 +589,7 @@ async fn handle_healing_command(
                         println!("Pending:       {}", pending_count);
                         println!("In-flight:     {}", in_flight_count);
                         println!("Stalled:       {}", stalled_count);
+                        println!("Bandwidth:     {}MB/s", bandwidth_mb);
                         println!("Last Check:    {} seconds ago", last_check);
                     }
                 }

@@ -29,11 +29,12 @@ pub const LEADER_CHANGE_GRACE_SECS: u64 = 1200;
 /// where the bytes actually move — the leader only orchestrates which node pushes
 /// to which.
 pub struct BandwidthLimiter {
-    rate_bytes_per_sec: f64,
     state: tokio::sync::Mutex<BandwidthLimiterState>,
 }
 
 struct BandwidthLimiterState {
+    rate_bytes_per_sec: f64,
+    burst_cap: f64,
     tokens: f64,
     last_refill: Instant,
 }
@@ -47,12 +48,25 @@ impl BandwidthLimiter {
         // ever has to wait on the first pass.
         let burst_cap = rate_bytes_per_sec * 2.0;
         Self {
-            rate_bytes_per_sec,
             state: tokio::sync::Mutex::new(BandwidthLimiterState {
+                rate_bytes_per_sec,
+                burst_cap,
                 tokens: burst_cap,
                 last_refill: Instant::now(),
             }),
         }
+    }
+
+    /// Update the token-bucket rate at runtime. Takes effect on the next acquire() call.
+    /// Burst cap is always 2× the new rate. Existing token balance is clamped to the
+    /// new burst cap to prevent a burst of accumulated tokens at the old rate.
+    pub async fn set_rate_mb(&self, mb_per_sec: usize) {
+        let rate = (mb_per_sec * 1024 * 1024) as f64;
+        let burst = rate * 2.0;
+        let mut state = self.state.lock().await;
+        state.rate_bytes_per_sec = rate;
+        state.burst_cap = burst;
+        state.tokens = state.tokens.min(burst);
     }
 
     /// Block until `bytes` worth of bandwidth budget is available, refilling at
@@ -61,14 +75,13 @@ impl BandwidthLimiter {
     /// tracks the configured MB/s.
     pub async fn acquire(&self, bytes: usize) {
         let bytes = bytes as f64;
-        let burst_cap = self.rate_bytes_per_sec * 2.0;
         loop {
             let wait = {
                 let mut state = self.state.lock().await;
                 let now = Instant::now();
                 let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-                state.tokens = (state.tokens + elapsed * self.rate_bytes_per_sec)
-                    .min(burst_cap);
+                state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec)
+                    .min(state.burst_cap);
                 state.last_refill = now;
 
                 if state.tokens >= bytes {
@@ -79,7 +92,7 @@ impl BandwidthLimiter {
                     // next attempt so the refill computed from elapsed time is not
                     // reset to zero, which would starve concurrent waiters.
                     let deficit = bytes - state.tokens;
-                    Some(Duration::from_secs_f64(deficit / self.rate_bytes_per_sec))
+                    Some(Duration::from_secs_f64(deficit / state.rate_bytes_per_sec))
                 }
             };
             match wait {
@@ -145,6 +158,15 @@ pub struct HealingManager {
     /// The configured heal bandwidth rate (MB/s), kept for logging.
     heal_bandwidth_mb: usize,
 
+    /// Unix-epoch ms of the most recent client write seen on any node (updated via
+    /// ReplicateChunkLocation broadcasts). Used by the adaptive bandwidth controller
+    /// to detect active-write vs idle periods.
+    last_cluster_write_ms: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Assumed node-to-node link bandwidth in MB/s. Used as the 100% baseline for
+    /// the adaptive rate formula. Defaults to 100 (1Gbps). Future: auto-measured on startup.
+    link_bandwidth_mb: usize,
+
     /// Chunks ready to heal: under-replicated, has ≥1 confirmed alive source node,
     /// and healing delay has passed. Maps chunk_id → first_detected_at so oldest-
     /// first scheduling works correctly.
@@ -197,6 +219,7 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
         chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
+        last_cluster_write_ms: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let max_heal_per_cycle = 200;
 
@@ -261,6 +284,11 @@ impl HealingManager {
             heal_max_concurrent,
             heal_bandwidth_limiter,
             heal_bandwidth_mb: heal_bw_mb,
+            last_cluster_write_ms,
+            link_bandwidth_mb: std::env::var("DFS_LINK_BANDWIDTH_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(100),
             pending_healing: Arc::new(RwLock::new(pending_healing_map)),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -312,6 +340,75 @@ impl HealingManager {
         tokio::spawn(async move {
             reconciler.run_phantom_reconciliation_loop().await;
         });
+
+        // Adaptive bandwidth controller: re-evaluates heal rate every 2s based on
+        // write activity and queue depth. Backs off to 10% during active writes,
+        // ramps to 80% when idle. Overrides toward 80% as queue debt grows.
+        let bw_controller = self.clone();
+        tokio::spawn(async move {
+            bw_controller.run_bandwidth_controller().await;
+        });
+    }
+
+    async fn run_bandwidth_controller(&self) {
+        // Tier boundaries (heal queue depth in chunks):
+        //   < TIER1  → floor rate (trivially small, don't compete)
+        //   TIER1..TIER2 → proportional scale, boosted by growth rate
+        //   ≥ TIER2  → ceiling rate (queue is dangerously deep, must keep up)
+        const TIER1: usize = 100;
+        const TIER2: usize = 1_000;
+        const LOW_PCT:  f64 = 0.10;
+        const HIGH_PCT: f64 = 0.60; // logical ceiling: healer > writer → can never fall behind
+        // A sustained growth rate of GROWTH_BOOST_RATE items/sec in the middle tier
+        // contributes up to GROWTH_BOOST_SHARE of the remaining headroom, letting the
+        // system react to a fast-growing queue before depth alone would force the rate up.
+        const GROWTH_BOOST_RATE:  f64 = 10.0;  // items/sec = "growing fast"
+        const GROWTH_BOOST_SHARE: f64 = 0.50;  // max extra fraction of headroom from growth
+        const INTERVAL_SECS: f64 = 2.0;
+
+        let mut prev_depth: usize = 0;
+
+        loop {
+            tokio::time::sleep(Duration::from_secs_f64(INTERVAL_SECS)).await;
+
+            let queue_depth = self.pending_healing.read().await.len();
+
+            // items/sec — positive means queue is growing (falling behind), negative means draining
+            let growth_rate = (queue_depth as f64 - prev_depth as f64) / INTERVAL_SECS;
+            prev_depth = queue_depth;
+
+            let factor: f64 = if queue_depth < TIER1 {
+                // Trivially small queue — stay at floor regardless of growth rate.
+                // Even 0→100 in 2 s doesn't warrant going above the floor: depth
+                // must be meaningful before we ramp up.
+                0.0
+            } else if queue_depth >= TIER2 {
+                // Deep queue — use ceiling rate to match or exceed incoming rate.
+                1.0
+            } else {
+                // Middle tier: linear depth scale, plus a growth-rate boost so a
+                // fast-growing queue in this range pushes the rate up earlier.
+                let depth_scale = (queue_depth - TIER1) as f64 / (TIER2 - TIER1) as f64;
+                let growth_boost = if growth_rate > 0.0 {
+                    (growth_rate / GROWTH_BOOST_RATE).clamp(0.0, 1.0) * GROWTH_BOOST_SHARE
+                } else {
+                    0.0
+                };
+                (depth_scale + growth_boost).clamp(0.0, 1.0)
+            };
+
+            let target_pct = LOW_PCT + (HIGH_PCT - LOW_PCT) * factor;
+            let target_mb = ((self.link_bandwidth_mb as f64 * target_pct) as usize).max(1);
+
+            self.heal_bandwidth_limiter.set_rate_mb(target_mb).await;
+
+            if queue_depth > 0 || growth_rate.abs() > 0.5 {
+                debug!(
+                    "heal-bw: depth={} growth={:+.1}/s factor={:.2} rate={}MB/s",
+                    queue_depth, growth_rate, factor, target_mb
+                );
+            }
+        }
     }
 
     /// Discovery loop — runs every 60s on the cluster leader.

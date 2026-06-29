@@ -301,6 +301,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config.replication.scrub_interval_hours,
         config.replication.auto_heal,
         server.chunk_map_ref(),
+        server.last_cluster_write_ms(),
     ));
     healer_runtime.spawn(healing.clone().start());
     server.set_healing_manager(healing.clone()).await;

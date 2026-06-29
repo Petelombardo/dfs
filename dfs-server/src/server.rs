@@ -177,6 +177,12 @@ pub struct Server {
     /// remaining network receive time for the patch payload.
     chunk_prefetch: Arc<DashMap<ChunkId, tokio::sync::watch::Receiver<Option<std::sync::Arc<Vec<u8>>>>>>,
 
+    /// Unix-epoch ms of the most recent client write (WriteChunk, PatchChunk, MultiPatch,
+    /// or ReplicateChunkLocation) processed by any node in the cluster. Updated locally
+    /// on every direct write and on every RCL broadcast received from peers. Shared with
+    /// HealingManager for adaptive bandwidth control.
+    last_cluster_write_ms: Arc<std::sync::atomic::AtomicU64>,
+
     /// Per-node ops/sec tracker — read, write, and metadata op counts in a
     /// 3600-bucket ring (one bucket per second). Near-zero overhead: atomic
     /// fetch_add per op, single mutex acquire per second for the ring write.
@@ -264,6 +270,7 @@ impl Server {
             chunk_patch_locks: Arc::new(DashMap::new()),
             chunk_io_locks: Arc::new(DashMap::new()),
             chunk_prefetch: Arc::new(DashMap::new()),
+            last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
             sled_write_done,
@@ -686,6 +693,11 @@ impl Server {
     /// live-file orphan sweep can use it as an always-fresh liveness source.
     pub fn chunk_map_ref(&self) -> Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>> {
         self.chunk_map.clone()
+    }
+
+    /// Shared write-activity timestamp — passed to HealingManager for adaptive bandwidth control.
+    pub fn last_cluster_write_ms(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.last_cluster_write_ms.clone()
     }
 
     /// Wire in the healing manager after construction.
@@ -1767,6 +1779,15 @@ impl Server {
     ) -> Response {
         debug!("Handling write chunk: {} ({} bytes)", chunk_id, data.len());
 
+        // Signal write activity for adaptive heal-bandwidth control (client writes only).
+        if !background {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.last_cluster_write_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Verify checksum matches chunk_id
         if checksum != chunk_id.hash {
             return Response::Error {
@@ -2170,6 +2191,17 @@ impl Server {
     async fn handle_replicate_chunk_location(&self, location: ChunkLocation, file_id: Option<FileId>) -> Response {
         info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
 
+        // A ReplicateChunkLocation from a peer means a client write just completed somewhere
+        // in the cluster — update the shared write-activity timestamp so the adaptive
+        // bandwidth controller on this node knows to throttle healing.
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.last_cluster_write_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Assign server-side timestamp to fresh-write locations (written_at=None).
         // Same reason as in handle_put_file_metadata: T_now on the leader is always
         // greater than any previous patch timestamp, so fresh writes win the guard.
@@ -2506,6 +2538,14 @@ impl Server {
 
     async fn handle_replicate_chunk_locations(&self, locations: Vec<ChunkLocation>) -> Response {
         debug!("Handling batch replicate of {} chunk locations", locations.len());
+
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.last_cluster_write_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Build the live sets once. Only accept locations that are either (a) for a
         // chunk_id already referenced by some active file, or (b) carrying a file_id
@@ -4855,6 +4895,14 @@ impl Server {
         intra_offset: usize,
         patch_data: Vec<u8>,
     ) -> Response {
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.last_cluster_write_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Serialize all patches to the same (file_id, chunk_idx) — same lock
         // handle_multi_patch uses and for the same reason: two concurrent patches
         // against the same base could otherwise both read it, both succeed
@@ -5087,6 +5135,14 @@ impl Server {
         _expected_new_chunk_id: Option<dfs_common::ChunkId>,
         _client_write_seq: Option<u64>,
     ) -> Response {
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.last_cluster_write_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Serialize all patches to the same (file_id, chunk_idx). Without this lock,
         // two concurrent patches against the same base (e.g. duplicate flush retries)
         // could both succeed independently and then race on the final chunk_map

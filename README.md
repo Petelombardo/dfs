@@ -184,6 +184,28 @@ dfs-admin --cluster 10.25.1.58:8900 file info '/podman/dvr/recordings/show.mpg'
 dfs-admin --cluster 10.25.1.58:8900 healing file '/podman/dvr/recordings/show.mpg'
 ```
 
+## Environment Variables
+
+All env vars are read at server startup. Restart `dfs-server` after changing them.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DFS_HEAL_BANDWIDTH_MB` | `32` | Initial token-bucket rate for healer chunk transfers (MB/s). The adaptive controller adjusts this at runtime — this value is used only for the initial rate before the controller's first evaluation. |
+| `DFS_HEAL_MAX_CONCURRENT` | `8` | Maximum number of simultaneous outbound heal chunk transfers. Caps concurrency independently of bandwidth pacing. |
+| `DFS_HEAL_TRANSFER_TIMEOUT_SECS` | `120` | Per-chunk heal transfer timeout in seconds. Timed-out chunks remain in the pending queue and are retried on the next drain cycle. |
+| `DFS_LINK_BANDWIDTH_MB` | `100` | Assumed node-to-node link capacity in MB/s (1 Gbps ≈ 100 MB/s). Used as the 100% baseline for the adaptive bandwidth formula. |
+| `DFS_HEAL_MAX_PCT` | `60` | Maximum percentage of link bandwidth the healer may use. The default of 60% is the logical ceiling when client and heal traffic share a single interface — at 60% the healer consumes more bandwidth than writes can ever produce, so the queue cannot grow unboundedly. Set higher (e.g. `90`) when storage nodes have a dedicated server-to-server interface that is separate from the client-facing interface. Accepts integer values 10–100. |
+
+### Adaptive Heal Bandwidth
+
+The healer automatically scales its bandwidth between 10% and `DFS_HEAL_MAX_PCT` based on queue depth and growth rate:
+
+- **< 100 chunks pending**: floor rate (10%) — trivially small queue, don't compete with writes
+- **100–1000 chunks**: proportional scale 10% → max%, boosted if the queue is growing fast
+- **≥ 1000 chunks**: maximum rate — queue is deep enough that durability takes priority
+
+The current rate is visible in `dfs-admin healing status` as `Bandwidth: NMB/s`.
+
 ## Performance
 
 5-node ARM64 cluster (OrangePi 5), spinning HDD backend, GbE network:

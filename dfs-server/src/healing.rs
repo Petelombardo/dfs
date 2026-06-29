@@ -173,6 +173,12 @@ pub struct HealingManager {
     /// the adaptive rate formula. Defaults to 100 (1Gbps). Future: auto-measured on startup.
     link_bandwidth_mb: usize,
 
+    /// Maximum fraction of link bandwidth the healer may use (0.0–1.0).
+    /// Default 0.60 — logical ceiling when client and heal traffic share one interface
+    /// (healer > writer → can never fall behind). Override via DFS_HEAL_MAX_PCT for
+    /// deployments with a dedicated server-to-server interface where higher rates are safe.
+    heal_max_pct: f64,
+
     /// Chunks ready to heal: under-replicated, has ≥1 confirmed alive source node,
     /// and healing delay has passed. Maps chunk_id → first_detected_at so oldest-
     /// first scheduling works correctly.
@@ -295,6 +301,11 @@ impl HealingManager {
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(100),
+            heal_max_pct: std::env::var("DFS_HEAL_MAX_PCT")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|pct| (pct / 100.0).clamp(0.10, 1.00))
+                .unwrap_or(0.60),
             pending_healing: Arc::new(RwLock::new(pending_healing_map)),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -363,8 +374,8 @@ impl HealingManager {
         //   ≥ TIER2  → ceiling rate (queue is dangerously deep, must keep up)
         const TIER1: usize = 100;
         const TIER2: usize = 1_000;
-        const LOW_PCT:  f64 = 0.10;
-        const HIGH_PCT: f64 = 0.60; // logical ceiling: healer > writer → can never fall behind
+        const LOW_PCT: f64 = 0.10;
+        let high_pct = self.heal_max_pct;
         // A sustained growth rate of GROWTH_BOOST_RATE items/sec in the middle tier
         // contributes up to GROWTH_BOOST_SHARE of the remaining headroom, letting the
         // system react to a fast-growing queue before depth alone would force the rate up.
@@ -403,7 +414,7 @@ impl HealingManager {
                 (depth_scale + growth_boost).clamp(0.0, 1.0)
             };
 
-            let target_pct = LOW_PCT + (HIGH_PCT - LOW_PCT) * factor;
+            let target_pct = LOW_PCT + (high_pct - LOW_PCT) * factor;
             let target_mb = ((self.link_bandwidth_mb as f64 * target_pct) as usize).max(1);
 
             self.heal_bandwidth_limiter.set_rate_mb(target_mb).await;

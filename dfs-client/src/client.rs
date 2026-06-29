@@ -3213,6 +3213,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         let chunk_ids: Vec<ChunkId> = read_hints.iter().map(|h| h.chunk_id).collect();
         let chunk_offsets: Vec<u64> = read_hints.iter().map(|h| h.file_offset).collect();
         let start_chunk_idx = read_hints.first().map(|h| h.chunk_idx).unwrap_or(0);
+        let hints_map: std::collections::HashMap<ChunkId, &ChunkReadHint> =
+            read_hints.iter().map(|h| (h.chunk_id, h)).collect();
 
         // Log the read request with byte offsets and chunk IDs for debugging
         if !chunk_offsets.is_empty() && chunk_offsets[0] > 0 {
@@ -3454,7 +3456,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let use_partial_read = if pipeline_only {
                 false
             } else {
-                read_hints.iter().find(|h| h.chunk_id == chunk_id)
+                hints_map.get(&chunk_id).copied()
                     .map(|h| !h.full_chunk && !is_sequential)
                     .unwrap_or(false)
             };
@@ -3519,7 +3521,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let tasks: Vec<_> = resolved.into_iter().map(|r| {
                 let client = self.clone();
                 let semaphore = max_concurrent_fetches.clone();
-                let read_hint = read_hints.iter().find(|h| h.chunk_id == r.chunk_id).cloned();
+                let read_hint = hints_map.get(&r.chunk_id).copied().cloned();
 
                 tokio::spawn(async move {
                     let _permit = semaphore.acquire().await.unwrap();

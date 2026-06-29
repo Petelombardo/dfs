@@ -421,6 +421,15 @@ impl Server {
         });
     }
 
+    /// Binary search the chunk_map Vec (sorted by chunk_idx) for a given chunk_idx.
+    /// Returns the slice index of the matching entry, or None.
+    fn chunk_map_find_by_idx(locs: &[ChunkLocation], chunk_idx: u64) -> Option<usize> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let cidx_of = |l: &ChunkLocation| l.file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE);
+        let pos = locs.partition_point(|l| cidx_of(l) < chunk_idx);
+        if pos < locs.len() && cidx_of(&locs[pos]) == chunk_idx { Some(pos) } else { None }
+    }
+
     /// Update the chunk map for a single file — called after every metadata write or heal.
     async fn chunk_map_update(&self, metadata: &FileMetadata) {
         if !metadata.chunk_locations.is_empty() {
@@ -445,8 +454,8 @@ impl Server {
                     // but the same chunk_idx. Exact matching misses the guard, letting stale
                     // metadata revert a freshly-updated chunk_map entry.
                     let incoming_cidx = loc.file_offset.map(|o| o / CHUNK_SIZE_4M);
-                    if let Some(old_loc) = existing_locs.iter().find(|l| {
-                        incoming_cidx.is_some() && l.file_offset.map(|o| o / CHUNK_SIZE_4M) == incoming_cidx
+                    if let Some(old_loc) = incoming_cidx.and_then(|cidx| {
+                        Self::chunk_map_find_by_idx(existing_locs, cidx).map(|i| &existing_locs[i])
                     }) {
                         if old_loc.chunk_id == loc.chunk_id { continue; }
                         // Staleness guard: prefer client_write_seq (monotone, clock-agnostic)
@@ -569,34 +578,37 @@ impl Server {
         if let Some(file_offset) = location.file_offset {
             const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             let incoming_chunk_idx = file_offset / CHUNK_SIZE;
-            for loc in locs.iter_mut() {
-                if loc.file_offset.map(|o| o / CHUNK_SIZE) == Some(incoming_chunk_idx) {
-                    let should_update = match (location.client_write_seq, loc.client_write_seq) {
-                        (Some(inc), Some(ext)) => inc >= ext,
-                        (Some(_), None)        => true,  // incoming has seq, existing is legacy → accept
-                        (None, Some(_))        => false, // existing has seq, incoming is legacy → keep
-                        (None, None)           => {
-                            // Legacy path: both records predate client_write_seq → use written_at
-                            location.written_at.unwrap_or(0) >= loc.written_at.unwrap_or(0)
-                        }
-                    };
-                    if should_update {
-                        self.chunk_to_file.remove(&loc.chunk_id);
-                        *loc = location.clone();
-                        self.chunk_to_file.insert(location.chunk_id, file_id);
-                    } else {
-                        // Stale RCL rejected: log so we can confirm the guard is working.
-                        debug!("[RCL-stale-rejected] file={:?} chunk_idx={} kept={} (seq={:?}) dropped={} (seq={:?})",
-                            file_id, incoming_chunk_idx, loc.chunk_id, loc.client_write_seq,
-                            location.chunk_id, location.client_write_seq);
+            // Binary search: Vec is sorted by chunk_idx (maintained by sorted-insert below).
+            let pos = locs.partition_point(|l| l.file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE) < incoming_chunk_idx);
+            if pos < locs.len() && locs[pos].file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE) == incoming_chunk_idx {
+                let loc = &mut locs[pos];
+                let should_update = match (location.client_write_seq, loc.client_write_seq) {
+                    (Some(inc), Some(ext)) => inc >= ext,
+                    (Some(_), None)        => true,  // incoming has seq, existing is legacy → accept
+                    (None, Some(_))        => false, // existing has seq, incoming is legacy → keep
+                    (None, None)           => {
+                        // Legacy path: both records predate client_write_seq → use written_at
+                        location.written_at.unwrap_or(0) >= loc.written_at.unwrap_or(0)
                     }
-                    return;
+                };
+                if should_update {
+                    self.chunk_to_file.remove(&loc.chunk_id);
+                    *loc = location.clone();
+                    self.chunk_to_file.insert(location.chunk_id, file_id);
+                } else {
+                    // Stale RCL rejected: log so we can confirm the guard is working.
+                    debug!("[RCL-stale-rejected] file={:?} chunk_idx={} kept={} (seq={:?}) dropped={} (seq={:?})",
+                        file_id, incoming_chunk_idx, loc.chunk_id, loc.client_write_seq,
+                        location.chunk_id, location.client_write_seq);
                 }
+                return;
             }
+            // No entry for this chunk_idx — insert at sorted position so Vec stays ordered.
+            locs.insert(pos, location.clone());
+            self.chunk_to_file.insert(location.chunk_id, file_id);
+            return;
         }
-        // No existing entry matched by chunk_id or chunk_idx — new chunk for this file.
-        // Push so chunk_map grows incrementally as chunks are written rather than waiting
-        // until file close (PutFileMetadata) to learn about the file's chunks.
+        // No file_offset — can't determine position; append.
         locs.push(location.clone());
         self.chunk_to_file.insert(location.chunk_id, file_id);
     }
@@ -4863,8 +4875,8 @@ impl Server {
         if let Some(cidx) = chunk_idx {
             if let Some(entry) = self.chunk_map.get(&file_id) {
                 let (locations, _) = entry.value();
-                const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-                if let Some(loc) = locations.iter().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)) {
+                if let Some(pos) = Self::chunk_map_find_by_idx(locations, cidx) {
+                    let loc = &locations[pos];
                     if loc.chunk_id != chunk_id {
                         info!("PatchChunk: stale chunk_id from client — file {} chunk {} client={} server={}",
                             file_id, cidx, chunk_id, loc.chunk_id);
@@ -5094,9 +5106,9 @@ impl Server {
 
         if let Some(cidx) = chunk_idx {
             if let Some(entry) = self.chunk_map.get(&file_id) {
-                const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
                 let (locations, _) = entry.value();
-                if let Some(loc) = locations.iter().find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)) {
+                if let Some(pos) = Self::chunk_map_find_by_idx(locations, cidx) {
+                    let loc = &locations[pos];
                     if loc.chunk_id != chunk_id {
                         // Before returning ChunkStale, verify the "current" chunk exists on disk.
                         // A stale broadcast can revert chunk_map to an old hash whose file was

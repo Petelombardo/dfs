@@ -533,6 +533,7 @@ struct FlushHandle {
     /// from being cached after a concurrent create() cleared the entry.
     dir_cache_invalidated_at: Arc<DashMap<String, std::time::Instant>>,
     path_to_inode: Arc<RwLock<HashMap<String, u64>>>,
+    inode_to_path: Arc<RwLock<HashMap<u64, String>>>,
     /// Inodes that received a setattr(size=0) truncate while a flush was in progress.
     /// Prevents a racing flush from re-populating metadata with stale chunk locations.
     /// Cleared once fresh write data lands (first successful chunk update).
@@ -1196,8 +1197,7 @@ impl FlushHandle {
         // If the entry isn't cached yet (create()'s async task may still be in flight),
         // fetch from server so we have a valid base to merge chunk locations into.
         if !self.metadata_cache.contains_key(&ino) {
-            let path_opt = self.path_to_inode.read().unwrap()
-                .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+            let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
             match path_opt {
                 None => {
                     // No path → file was deleted; skip metadata commit.
@@ -2414,8 +2414,7 @@ impl FlushHandle {
 
                 // Fetch metadata if not cached
                 if !self.metadata_cache.contains_key(&ino) {
-                    let path_opt = self.path_to_inode.read().unwrap()
-                        .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                    let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
                     if let Some(path) = path_opt {
                         if let Ok(Some(fetched)) = self.client.get_file_metadata(&path).await {
                             self.client.seed_write_seq(fetched.id, fetched.write_seq);
@@ -2768,8 +2767,9 @@ pub struct DfsFilesystem {
     /// Metadata cache: inode -> FileMetadata
     metadata_cache: Arc<DashMap<u64, FileMetadata>>,
 
-    /// Path to inode mapping
+    /// Path to inode mapping (forward and reverse)
     path_to_inode: Arc<RwLock<HashMap<String, u64>>>,
+    inode_to_path: Arc<RwLock<HashMap<u64, String>>>,
 
     /// Next available inode number
     next_inode: Arc<RwLock<u64>>,
@@ -3003,6 +3003,7 @@ impl DfsFilesystem {
 
         let metadata_cache = Arc::new(DashMap::<u64, FileMetadata>::new());
         let path_to_inode = Arc::new(RwLock::new(HashMap::<String, u64>::new()));
+        let inode_to_path = Arc::new(RwLock::new(HashMap::<u64, String>::new()));
         let next_inode = Arc::new(RwLock::new(2)); // Start at 2, root is 1
         let write_buffers_for_cleanup = Arc::new(DashMap::<u64, Arc<Mutex<InodeWriteState>>>::new());
         let flush_in_flight_shared: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>> =
@@ -3065,6 +3066,7 @@ impl DfsFilesystem {
             let metadata_cache_for_cleanup = metadata_cache.clone();
             let write_open_counts_for_bg = write_open_counts.clone();
             let path_to_inode_for_bg = path_to_inode.clone();
+            let inode_to_path_for_bg = inode_to_path.clone();
             let chunk_write_locks_for_bg = chunk_write_locks_shared.clone();
             let release_in_flight_for_bg = release_in_flight_shared.clone();
             // in_flight: per-inode count of chunk-flush tasks currently running.
@@ -3083,6 +3085,7 @@ impl DfsFilesystem {
                 dir_cache: dir_cache_shared.clone(),
                 dir_cache_invalidated_at: dir_cache_invalidated_at_shared.clone(),
                 path_to_inode: path_to_inode_for_bg.clone(),
+                inode_to_path: inode_to_path_for_bg.clone(),
                 truncated_inodes: truncated_inodes_shared.clone(),
                 explicit_mtime_pending: explicit_mtime_pending_shared.clone(),
                 flush_runtime: flush_runtime.clone(),
@@ -3266,6 +3269,7 @@ impl DfsFilesystem {
 
         metadata_cache.insert(1, root_metadata);
         path_to_inode.write().unwrap().insert("/".to_string(), 1);
+        inode_to_path.write().unwrap().insert(1, "/".to_string());
 
         // Build FlushHandle before moving fields into the struct
         let flush_handle = FlushHandle {
@@ -3277,6 +3281,7 @@ impl DfsFilesystem {
             dir_cache: dir_cache_shared.clone(),
             dir_cache_invalidated_at: dir_cache_invalidated_at_shared.clone(),
             path_to_inode: path_to_inode.clone(),
+            inode_to_path: inode_to_path.clone(),
             truncated_inodes: truncated_inodes_shared.clone(),
             explicit_mtime_pending: explicit_mtime_pending_shared.clone(),
             flush_runtime: flush_runtime.clone(),
@@ -3293,6 +3298,7 @@ impl DfsFilesystem {
             client,
             metadata_cache,
             path_to_inode,
+            inode_to_path,
             next_inode,
             root_inode: 1,
             runtime,
@@ -3526,12 +3532,11 @@ impl DfsFilesystem {
         // Fast path: parent is in metadata_cache (normal case after lookup/readdir).
         let parent_path_opt = self.metadata_cache.get(&parent).map(|m| m.path.clone());
 
-        // Fallback: scan path_to_inode for the parent inode. This covers the case
+        // Fallback: check inode_to_path for the parent inode. This covers the case
         // where the kernel holds a directory inode from before a client restart but
         // the metadata_cache is empty (in-memory only, lost on restart).
         let parent_path = parent_path_opt.or_else(|| {
-            let map = self.path_to_inode.read().unwrap();
-            map.iter().find(|(_, &v)| v == parent).map(|(k, _)| k.clone())
+            self.inode_to_path.read().unwrap().get(&parent).cloned()
         })?;
 
         let full_path = if parent_path == "/" {
@@ -3575,6 +3580,7 @@ impl Filesystem for DfsFilesystem {
             let client = self.client.clone();
             let metadata_cache = self.metadata_cache.clone();
             let path_to_inode = self.path_to_inode.clone();
+            let inode_to_path = self.inode_to_path.clone();
             let next_inode = self.next_inode.clone();
             let last_metadata_update = self.last_metadata_update.clone();
             let dir_cache = self.dir_cache.clone();
@@ -3611,6 +3617,7 @@ impl Filesystem for DfsFilesystem {
                                 *next += 1;
                                 drop(next);
                                 path_map.insert(file.path.clone(), v);
+                                inode_to_path.write().unwrap().insert(v, file.path.clone());
                                 v
                             }
                         }
@@ -3734,6 +3741,7 @@ impl Filesystem for DfsFilesystem {
         let client = self.client.clone();
         let metadata_cache = self.metadata_cache.clone();
         let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
         let next_inode = self.next_inode.clone();
         let last_metadata_update = self.last_metadata_update.clone();
         let write_open_counts = self.write_open_counts.clone();
@@ -3756,6 +3764,7 @@ impl Filesystem for DfsFilesystem {
                             *next += 1;
                             drop(next);
                             path_to_inode.write().unwrap().insert(path.clone(), ino);
+                            inode_to_path.write().unwrap().insert(ino, path.clone());
                             ino
                         }
                     };
@@ -3803,6 +3812,7 @@ impl Filesystem for DfsFilesystem {
                                     *next += 1;
                                     drop(next);
                                     path_to_inode.write().unwrap().insert(path.clone(), ino);
+                                    inode_to_path.write().unwrap().insert(ino, path.clone());
                                     ino
                                 }
                             };
@@ -3876,8 +3886,7 @@ impl Filesystem for DfsFilesystem {
 
             let is_first_writer = self.write_open_counts.get(&ino).map(|c| *c == 1).unwrap_or(true);
             if !is_first_writer {
-                let path_opt = self.path_to_inode.read().unwrap()
-                    .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
                 if let Some(path) = path_opt {
                     let client = self.client.clone();
                     let metadata_cache = self.metadata_cache.clone();
@@ -4621,6 +4630,7 @@ impl Filesystem for DfsFilesystem {
         let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let metadata_cache = self.metadata_cache.clone();
         let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
         let next_inode = self.next_inode.clone();
         let last_metadata_update = self.last_metadata_update.clone();
         let write_buffers = self.write_buffers.clone();
@@ -4754,6 +4764,7 @@ impl Filesystem for DfsFilesystem {
                 let dir_cache = dir_cache.clone();
                 let metadata_cache = metadata_cache.clone();
                 let path_to_inode = path_to_inode.clone();
+                let inode_to_path = inode_to_path.clone();
                 let next_inode = next_inode.clone();
                 let last_metadata_update = last_metadata_update.clone();
                 tokio::spawn(async move {
@@ -4784,6 +4795,7 @@ impl Filesystem for DfsFilesystem {
                                         *next += 1;
                                         drop(next);
                                         path_map.insert(entry.path.clone(), v);
+                                        inode_to_path.write().unwrap().insert(v, entry.path.clone());
                                         v
                                     }
                                 }
@@ -4872,6 +4884,7 @@ impl Filesystem for DfsFilesystem {
         let metadata_cache = self.metadata_cache.clone();
         let dir_cache = self.dir_cache.clone();
         let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
         let next_inode = self.next_inode.clone();
         let write_open_counts = self.write_open_counts.clone();
         let write_buffers = self.write_buffers.clone();
@@ -4900,6 +4913,7 @@ impl Filesystem for DfsFilesystem {
                             let mut next = next_inode.write().unwrap();
                             let v = *next; *next += 1; drop(next);
                             path_to_inode.write().unwrap().insert(path.clone(), v);
+                            inode_to_path.write().unwrap().insert(v, path.clone());
                             v
                         }
                     };
@@ -5021,6 +5035,7 @@ impl Filesystem for DfsFilesystem {
         let buffer_flush_threshold = self.buffer_flush_threshold;
         let last_metadata_update = self.last_metadata_update.clone();
         let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
         let flush_handle = self.flush_handle.clone();
         let size_high_water = self.size_high_water.clone();
         let global_buffered_bytes = self.global_buffered_bytes.clone();
@@ -5060,8 +5075,7 @@ impl Filesystem for DfsFilesystem {
         // Fall back to path-based check for files not in direct_write_inodes.
         let path_for_sqlite_check = if force_direct { None } else {
             metadata_cache.get(&ino).map(|m| m.path.clone())
-                .or_else(|| path_to_inode.read().unwrap()
-                    .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone()))
+                .or_else(|| inode_to_path.read().unwrap().get(&ino).cloned())
         };
         let use_buffer = !force_direct && path_for_sqlite_check.as_deref()
             .map(|p| !is_sqlite_path(p) || is_sqlite_buffered(p))
@@ -5226,10 +5240,7 @@ impl Filesystem for DfsFilesystem {
                 Some(m) => m.clone(),
                 None => {
                     // Metadata cache miss — fetch from server and populate.
-                    let path_opt = {
-                        let map = path_to_inode.read().unwrap();
-                        map.iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone())
-                    };
+                    let path_opt = inode_to_path.read().unwrap().get(&ino).cloned();
                     if let Some(path) = path_opt {
                         match client.get_file_metadata(&path).await {
                             Ok(Some(fetched)) => {
@@ -5980,6 +5991,7 @@ impl Filesystem for DfsFilesystem {
                 info!("release: ino={} was unlinked while open — triggering deferred server delete for {}", ino, unlinked_path);
                 let def_client = self.client.clone();
                 let def_path_to_inode = self.path_to_inode.clone();
+                let def_inode_to_path = self.inode_to_path.clone();
                 let def_pending_deletes = self.pending_deletes.clone();
                 let def_metadata_cache = self.metadata_cache.clone();
                 let def_write_counters = self.write_counters.clone();
@@ -6015,6 +6027,7 @@ impl Filesystem for DfsFilesystem {
                     if path_is_ours {
                         def_path_to_inode.write().unwrap()
                             .remove_entry(&unlinked_path);
+                        def_inode_to_path.write().unwrap().remove(&ino);
                         match def_client.delete_file(&unlinked_path).await {
                             Ok(_) => info!("deferred unlink: deleted {} (ino={})", unlinked_path, ino),
                             Err(e) => error!("deferred unlink: delete_file failed for {}: {}", unlinked_path, e),
@@ -6043,7 +6056,7 @@ impl Filesystem for DfsFilesystem {
                 let release_in_flight = self.release_in_flight.clone();
                 let write_tasks_in_flight = self.write_tasks_in_flight.clone();
                 let pending_deletes_for_release = self.pending_deletes.clone();
-                let path_to_inode_for_release = self.path_to_inode.clone();
+                let inode_to_path_for_release = self.inode_to_path.clone();
                 let size_high_water_for_release = self.size_high_water.clone();
                 let read_engines_for_release = self.client.read_engines.map.clone();
                 let open_counts_for_release = self.open_counts.clone();
@@ -6096,8 +6109,7 @@ impl Filesystem for DfsFilesystem {
                     // If the file was unlinked while this release task was queued, skip the
                     // flush — sending PutFileMetadata for a deleted file resurrects it on
                     // the server.
-                    let release_path = path_to_inode_for_release.read().unwrap()
-                        .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                    let release_path = inode_to_path_for_release.read().unwrap().get(&ino).cloned();
                     let is_pending_delete = release_path.as_deref()
                         .map_or(false, |p| pending_deletes_for_release.contains(p));
                     let path_gone = release_path.is_none();
@@ -6144,8 +6156,7 @@ impl Filesystem for DfsFilesystem {
                         // any stale entries, so this is safe even if a new session has started.
                         // Re-check pending_delete: a delete can arrive while FAP was running.
                         {
-                            let path_now = path_to_inode_for_release.read().unwrap()
-                                .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                            let path_now = inode_to_path_for_release.read().unwrap().get(&ino).cloned();
                             let still_live = path_now.as_deref()
                                 .map_or(false, |p| !pending_deletes_for_release.contains(p));
                             if still_live {
@@ -6160,8 +6171,7 @@ impl Filesystem for DfsFilesystem {
                         // the leader has current metadata before release_in_flight drops to
                         // zero — preventing a concurrent read open from getting stale chunk IDs.
                         // Re-check pending_delete: a delete can arrive while we waited above.
-                        let path_now = path_to_inode_for_release.read().unwrap()
-                            .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                        let path_now = inode_to_path_for_release.read().unwrap().get(&ino).cloned();
                         let still_live = path_now.as_deref()
                             .map_or(false, |p| !pending_deletes_for_release.contains(p));
                         if still_live {
@@ -6247,8 +6257,7 @@ impl Filesystem for DfsFilesystem {
                     // If the file was unlinked while this release task was queued, skip the
                     // flush — sending PutFileMetadata for a deleted file resurrects it on
                     // the server.
-                    let release_path = path_to_inode_for_release.read().unwrap()
-                        .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                    let release_path = inode_to_path_for_release.read().unwrap().get(&ino).cloned();
                     let is_pending_delete = release_path.as_deref()
                         .map_or(false, |p| pending_deletes_for_release.contains(p));
                     let path_gone = release_path.is_none();
@@ -6295,8 +6304,7 @@ impl Filesystem for DfsFilesystem {
                         // any stale entries, so this is safe even if a new session has started.
                         // Re-check pending_delete: a delete can arrive while FAP was running.
                         {
-                            let path_now = path_to_inode_for_release.read().unwrap()
-                                .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                            let path_now = inode_to_path_for_release.read().unwrap().get(&ino).cloned();
                             let still_live = path_now.as_deref()
                                 .map_or(false, |p| !pending_deletes_for_release.contains(p));
                             if still_live {
@@ -6311,8 +6319,7 @@ impl Filesystem for DfsFilesystem {
                         // the leader has current metadata before release_in_flight drops to
                         // zero — preventing a concurrent read open from getting stale chunk IDs.
                         // Re-check pending_delete: a delete can arrive while we waited above.
-                        let path_now = path_to_inode_for_release.read().unwrap()
-                            .iter().find(|(_, &v)| v == ino).map(|(k, _)| k.clone());
+                        let path_now = inode_to_path_for_release.read().unwrap().get(&ino).cloned();
                         let still_live = path_now.as_deref()
                             .map_or(false, |p| !pending_deletes_for_release.contains(p));
                         if still_live {
@@ -6490,6 +6497,7 @@ impl Filesystem for DfsFilesystem {
         let dir_cache = self.dir_cache.clone();
         let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
         let next_inode = self.next_inode.clone();
 
         self.runtime.spawn(async move {
@@ -6504,6 +6512,7 @@ impl Filesystem for DfsFilesystem {
                             let mut next = next_inode.write().unwrap();
                             let v = *next; *next += 1; drop(next);
                             path_to_inode.write().unwrap().insert(path.clone(), v);
+                            inode_to_path.write().unwrap().insert(v, path.clone());
                             v
                         }
                     };
@@ -6541,6 +6550,7 @@ impl Filesystem for DfsFilesystem {
         let dir_cache = self.dir_cache.clone();
         let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
         let write_buffers = self.write_buffers.clone();
         let write_counters = self.write_counters.clone();
         let last_metadata_update = self.last_metadata_update.clone();
@@ -6588,6 +6598,7 @@ impl Filesystem for DfsFilesystem {
                 last_metadata_update.remove(&ino);
                 last_warm_offset.remove(&ino);
                 chunk_offset_cache.remove(&ino);
+                inode_to_path.write().unwrap().remove(&ino);
             }
             path_to_inode.write().unwrap().remove(&path);
             DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, parent_path);
@@ -6629,6 +6640,7 @@ impl Filesystem for DfsFilesystem {
         let dir_cache = self.dir_cache.clone();
         let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
 
         self.runtime.spawn(async move {
             match client.list_directory(&path).await {
@@ -6641,6 +6653,7 @@ impl Filesystem for DfsFilesystem {
                         Ok(_) => {
                             if let Some(&ino) = path_to_inode.read().unwrap().get(&path) {
                                 metadata_cache.remove(&ino);
+                                inode_to_path.write().unwrap().remove(&ino);
                             }
                             path_to_inode.write().unwrap().remove(&path);
 
@@ -6700,6 +6713,7 @@ impl Filesystem for DfsFilesystem {
         let dir_cache = self.dir_cache.clone();
         let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
         let flush_handle = self.flush_handle.clone();
         let write_buffers = self.write_buffers.clone();
         let release_in_flight = self.release_in_flight.clone();
@@ -6779,9 +6793,10 @@ impl Filesystem for DfsFilesystem {
 
             match client.rename_file(&old_path, &new_path).await {
                 Ok(_) => {
-                    // Update local path→inode mapping.
+                    // Update local path→inode mapping (forward and reverse).
                     path_to_inode.write().unwrap().remove(&old_path);
                     path_to_inode.write().unwrap().insert(new_path.clone(), old_ino);
+                    inode_to_path.write().unwrap().insert(old_ino, new_path.clone());
 
                     // Update local metadata cache with new path. Per POSIX, rename()
                     // does not change mtime (only ctime) — don't stamp modified_at=now()
@@ -7292,6 +7307,7 @@ impl Filesystem for DfsFilesystem {
             dir_cache: self.dir_cache.clone(),
             dir_cache_invalidated_at: self.dir_cache_invalidated_at.clone(),
             path_to_inode: self.path_to_inode.clone(),
+            inode_to_path: self.inode_to_path.clone(),
             truncated_inodes: self.truncated_inodes.clone(),
             explicit_mtime_pending: self.explicit_mtime_pending.clone(),
             flush_runtime: self.flush_runtime.clone(),

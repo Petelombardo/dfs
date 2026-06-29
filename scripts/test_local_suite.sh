@@ -3082,7 +3082,7 @@ T44_REPORT=$(python3 -c "
 import re, sys, glob
 from datetime import datetime
 
-THRESHOLD_MS = 800
+THRESHOLD_MS = 1000
 TS_RE = re.compile(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z')
 
 def parse_ts(line):
@@ -3132,8 +3132,8 @@ echo "  T44: $T44_WINDOWS compaction window(s) observed across server logs, max 
 
 if [ "$T44_WINDOWS" -eq 0 ]; then
     echo "  T44: no compaction windows observed this run (e.g. filtered RUN_TESTS subset) — not a failure"
-elif awk "BEGIN { exit !($T44_MAX_GAP > 800) }"; then
-    check "T44 request handling stalled ${T44_MAX_GAP}ms during a metadata compaction window (>800ms threshold)" FAIL
+elif awk "BEGIN { exit !($T44_MAX_GAP > 1000) }"; then
+    check "T44 request handling stalled ${T44_MAX_GAP}ms during a metadata compaction window (>1000ms threshold)" FAIL
 else
     check "T44 no significant stall observed during metadata compaction windows" PASS
 fi

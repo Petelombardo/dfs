@@ -190,7 +190,6 @@ All env vars are read at server startup. Restart `dfs-server` after changing the
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DFS_HEAL_BANDWIDTH_MB` | `32` | Initial token-bucket rate for healer chunk transfers (MB/s). The adaptive controller adjusts this at runtime — this value is used only for the initial rate before the controller's first evaluation. |
 | `DFS_HEAL_MAX_CONCURRENT` | `8` | Maximum number of simultaneous outbound heal chunk transfers. Caps concurrency independently of bandwidth pacing. |
 | `DFS_HEAL_TRANSFER_TIMEOUT_SECS` | `120` | Per-chunk heal transfer timeout in seconds. Timed-out chunks remain in the pending queue and are retried on the next drain cycle. |
 | `DFS_LINK_BANDWIDTH_MB` | `100` | Assumed node-to-node link capacity in MB/s (1 Gbps ≈ 100 MB/s). Used as the 100% baseline for the adaptive bandwidth formula. |

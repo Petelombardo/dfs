@@ -158,11 +158,8 @@ pub struct HealingManager {
     heal_max_concurrent: usize,
 
     /// Real bytes/sec pacing for this node's outbound heal-chunk reads+sends.
-    /// Configured via DFS_HEAL_BANDWIDTH_MB.
+    /// Rate is managed entirely by the adaptive bandwidth controller.
     heal_bandwidth_limiter: Arc<BandwidthLimiter>,
-
-    /// The configured heal bandwidth rate (MB/s), kept for logging.
-    heal_bandwidth_mb: usize,
 
     /// Unix-epoch ms of the most recent client write seen on any node (updated via
     /// ReplicateChunkLocation broadcasts). Used by the adaptive bandwidth controller
@@ -235,14 +232,15 @@ impl HealingManager {
     ) -> Self {
         let max_heal_per_cycle = 200;
 
-        // Real bytes/sec pacing for heal traffic, sized via DFS_HEAL_BANDWIDTH_MB
-        // (default 32MB/s). This actually paces throughput over time instead of
-        // just bounding how many bytes can be in flight at once.
-        let heal_bw_mb = std::env::var("DFS_HEAL_BANDWIDTH_MB")
+        // Initialize the limiter at the floor rate (10% of assumed link bandwidth).
+        // The adaptive bandwidth controller takes over within 2 seconds of startup
+        // and adjusts the rate based on queue depth and growth rate.
+        let link_bw_mb = std::env::var("DFS_LINK_BANDWIDTH_MB")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(32);
-        let heal_bandwidth_limiter = Arc::new(BandwidthLimiter::new(heal_bw_mb));
+            .unwrap_or(100);
+        let initial_bw_mb = ((link_bw_mb as f64 * 0.10) as usize).max(1);
+        let heal_bandwidth_limiter = Arc::new(BandwidthLimiter::new(initial_bw_mb));
 
         // Separate, independent concurrency cap on outstanding heal transfers
         // (FD/task safety) — no longer derived from the bandwidth number.
@@ -295,12 +293,8 @@ impl HealingManager {
             heal_semaphore,
             heal_max_concurrent,
             heal_bandwidth_limiter,
-            heal_bandwidth_mb: heal_bw_mb,
             last_cluster_write_ms,
-            link_bandwidth_mb: std::env::var("DFS_LINK_BANDWIDTH_MB")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(100),
+            link_bandwidth_mb: link_bw_mb,
             heal_max_pct: std::env::var("DFS_HEAL_MAX_PCT")
                 .ok()
                 .and_then(|s| s.parse::<f64>().ok())
@@ -324,9 +318,10 @@ impl HealingManager {
         }
 
         info!(
-            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, bandwidth: {}MB/s, max_concurrent: {}, transfer_timeout: {}s)",
+            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, max_concurrent: {}, transfer_timeout: {}s, link: {}MB/s, max_pct: {}%)",
             self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle,
-            self.heal_bandwidth_mb, self.heal_max_concurrent, self.heal_transfer_timeout_secs
+            self.heal_max_concurrent, self.heal_transfer_timeout_secs,
+            self.link_bandwidth_mb, (self.heal_max_pct * 100.0) as u32
         );
 
         // Discovery loop: scans all chunks, bulk-queries nodes, classifies under/over

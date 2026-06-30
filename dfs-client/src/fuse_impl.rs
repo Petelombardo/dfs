@@ -571,10 +571,10 @@ struct FlushHandle {
     /// session (e.g., mid-way through a 300MB write, only some chunks updated).
     write_open_counts: Arc<DashMap<u64, usize>>,
     /// Per-server prefetch hints for the current flush wave, populated ONCE per wave
-    /// by flush_all_pipelined before tasks are spawned. Tasks read synchronously
-    /// (std::sync::Mutex, no .await) so there is zero async overhead in the hot path.
+    /// by flush_all_pipelined before tasks are spawned. Tasks read by cloning the inner
+    /// Arc — one atomic increment, no HashMap clone, no Mutex contention under load.
     /// Always empty for background-ticker flushes (single chunk, nothing to hint about).
-    patch_prefetch_hints: Arc<std::sync::Mutex<HashMap<SocketAddr, Vec<dfs_common::ChunkId>>>>,
+    patch_prefetch_hints: Arc<std::sync::Mutex<Arc<HashMap<SocketAddr, Vec<dfs_common::ChunkId>>>>>,
 }
 
 /// Cheaply-cloneable handle for graceful-shutdown buffer draining. Built from a
@@ -1960,9 +1960,10 @@ impl FlushHandle {
                     // Pass file_id + chunk_idx so the server validates chunk_id and returns
                     // ChunkStale if stale; client retries automatically with corrected id.
                     // Hints were computed once for the whole wave by flush_all_pipelined and
-                    // written into patch_prefetch_hints before tasks were spawned. Read
-                    // synchronously — no .await, no metadata clone, no scheduling overhead.
-                    let hints: HashMap<SocketAddr, Vec<dfs_common::ChunkId>> = {
+                    // written into patch_prefetch_hints before tasks were spawned. Read by
+                    // cloning the inner Arc — one atomic increment, no HashMap copy, no
+                    // Mutex contention under concurrent flush tasks.
+                    let hints: Arc<HashMap<SocketAddr, Vec<dfs_common::ChunkId>>> = {
                         self.patch_prefetch_hints.lock().unwrap().clone()
                     };
                     let patch_result = if let Some(fid) = file_id_at_flush_start {
@@ -2610,6 +2611,9 @@ impl FlushHandle {
         &self,
         ino: u64,
     ) -> HashMap<SocketAddr, Vec<dfs_common::ChunkId>> {
+        if std::env::var("DFS_DISABLE_PATCH_PREFETCH").is_ok() {
+            return HashMap::new();
+        }
         // try_lock: a concurrent write() may hold this; skip hints rather than stall.
         let pending: Vec<u64> = {
             let Some(state_arc) = self.write_buffers.get(&ino) else { return HashMap::new() };
@@ -2676,7 +2680,7 @@ impl FlushHandle {
             use_dual_rf: true,
             // Fresh Arc per flush_all_pipelined call so concurrent calls for different
             // inodes don't share a hint map and overwrite each other's wave snapshots.
-            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
             ..self.clone()
         };
 
@@ -2800,7 +2804,7 @@ impl FlushHandle {
             // so there is zero async overhead inside the per-task flush hot path.
             {
                 let wave_hints = self.compute_wave_prefetch_hints(ino).await;
-                *sync_handle.patch_prefetch_hints.lock().unwrap() = wave_hints;
+                *sync_handle.patch_prefetch_hints.lock().unwrap() = Arc::new(wave_hints);
             }
 
             let mut handles = Vec::new();
@@ -3187,7 +3191,7 @@ impl DfsFilesystem {
                 flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
                 use_dual_rf: false,
                 write_open_counts: write_open_counts_for_bg.clone(),
-                patch_prefetch_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
@@ -3384,7 +3388,7 @@ impl DfsFilesystem {
             flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
             use_dual_rf: false,
             write_open_counts: write_open_counts.clone(),
-            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
         };
 
         Ok(Self {
@@ -7411,7 +7415,7 @@ impl Filesystem for DfsFilesystem {
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
             use_dual_rf: false,
             write_open_counts: self.write_open_counts.clone(),
-            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
         };
 
         // Spawn so the FUSE dispatch thread is freed immediately — same pattern as fsync().

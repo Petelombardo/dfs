@@ -5742,7 +5742,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
         dual_rf: bool,
-        per_server_hints: HashMap<SocketAddr, Vec<ChunkId>>,
+        per_server_hints: Arc<HashMap<SocketAddr, Vec<ChunkId>>>,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
         self.multi_patch_chunk_on_replicas_inner(old_chunk_id, file_id, None, chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf, per_server_hints).await
     }
@@ -5757,7 +5757,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
         dual_rf: bool,
-        per_server_hints: HashMap<SocketAddr, Vec<ChunkId>>,
+        per_server_hints: Arc<HashMap<SocketAddr, Vec<ChunkId>>>,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
         self.multi_patch_chunk_on_replicas_inner(old_chunk_id, file_id, Some(chunk_idx), chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf, per_server_hints).await
     }
@@ -5772,7 +5772,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
         dual_rf: bool,
-        per_server_hints: HashMap<SocketAddr, Vec<ChunkId>>,
+        per_server_hints: Arc<HashMap<SocketAddr, Vec<ChunkId>>>,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
         let original_old_chunk_id = old_chunk_id;
         let mut current_location = old_location.clone();

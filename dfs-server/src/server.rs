@@ -177,6 +177,12 @@ pub struct Server {
     /// remaining network receive time for the patch payload.
     chunk_prefetch: Arc<DashMap<ChunkId, tokio::sync::watch::Receiver<Option<std::sync::Arc<Vec<u8>>>>>>,
 
+    /// Ring buffer of the last 64 chunk_ids that completed a MultiPatch on this node.
+    /// start_prefetch_for_patch skips any chunk_id found here — it was just read/written
+    /// and is almost certainly hot in the OS page cache, so prefetching it again wastes
+    /// a semaphore slot and a spawn_blocking call.
+    recently_patched: Arc<std::sync::Mutex<std::collections::VecDeque<ChunkId>>>,
+
     /// Unix-epoch ms of the most recent client write (WriteChunk, PatchChunk, MultiPatch,
     /// or ReplicateChunkLocation) processed by any node in the cluster. Updated locally
     /// on every direct write and on every RCL broadcast received from peers. Shared with
@@ -273,6 +279,7 @@ impl Server {
             chunk_patch_locks: Arc::new(DashMap::new()),
             chunk_io_locks: Arc::new(DashMap::new()),
             chunk_prefetch: Arc::new(DashMap::new()),
+            recently_patched: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))),
             last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
@@ -5480,6 +5487,18 @@ impl Server {
                 // chunk_location_sync / reconciliation pass (not this fast path) closes the
                 // gap.
 
+                // Record both old and new chunk_ids as recently patched so subsequent
+                // prefetch hints for either are skipped (data is hot in the OS page cache).
+                {
+                    let mut rp = self.recently_patched.lock().unwrap();
+                    if rp.len() >= 64 { rp.pop_front(); }
+                    rp.push_back(chunk_id);
+                    if new_chunk_id != chunk_id {
+                        if rp.len() >= 64 { rp.pop_front(); }
+                        rp.push_back(new_chunk_id);
+                    }
+                }
+
                 Response::MultiPatchResult {
                     new_chunk_id,
                     size: final_size,
@@ -7998,6 +8017,18 @@ impl MessageHandler for Server {
 
     fn start_prefetch_for_patch(&self, chunk_id: ChunkId) {
         if self.chunk_prefetch.contains_key(&chunk_id) {
+            return;
+        }
+        // Skip if this chunk is currently being read/written by its own MultiPatch —
+        // a concurrent disk I/O is already in progress and a prefetch would race it.
+        if let Some(io_lock) = self.chunk_io_locks.get(&chunk_id) {
+            if io_lock.try_read().is_err() {
+                return;
+            }
+        }
+        // Skip if this chunk was recently patched on this node — old and new chunk_ids
+        // are hot in the OS page cache and don't need a disk read to warm them.
+        if self.recently_patched.lock().unwrap().contains(&chunk_id) {
             return;
         }
         // Best-effort: if the semaphore is full, skip rather than queue.

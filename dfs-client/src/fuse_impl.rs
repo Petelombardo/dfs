@@ -570,6 +570,11 @@ struct FlushHandle {
     /// the file open — metadata_cache may only partially reflect the current
     /// session (e.g., mid-way through a 300MB write, only some chunks updated).
     write_open_counts: Arc<DashMap<u64, usize>>,
+    /// Per-server prefetch hints for the current flush wave, populated ONCE per wave
+    /// by flush_all_pipelined before tasks are spawned. Tasks read synchronously
+    /// (std::sync::Mutex, no .await) so there is zero async overhead in the hot path.
+    /// Always empty for background-ticker flushes (single chunk, nothing to hint about).
+    patch_prefetch_hints: Arc<std::sync::Mutex<HashMap<SocketAddr, Vec<dfs_common::ChunkId>>>>,
 }
 
 /// Cheaply-cloneable handle for graceful-shutdown buffer draining. Built from a
@@ -1954,17 +1959,23 @@ impl FlushHandle {
                     // atomic server-side write+rename.
                     // Pass file_id + chunk_idx so the server validates chunk_id and returns
                     // ChunkStale if stale; client retries automatically with corrected id.
+                    // Hints were computed once for the whole wave by flush_all_pipelined and
+                    // written into patch_prefetch_hints before tasks were spawned. Read
+                    // synchronously — no .await, no metadata clone, no scheduling overhead.
+                    let hints: HashMap<SocketAddr, Vec<dfs_common::ChunkId>> = {
+                        self.patch_prefetch_hints.lock().unwrap().clone()
+                    };
                     let patch_result = if let Some(fid) = file_id_at_flush_start {
                         self.client.multi_patch_chunk_on_replicas_verified(
                             old_location.chunk_id, fid, chunk_idx,
                             file_offset, patches.clone(), &old_location, None,
-                            self.use_dual_rf,
+                            self.use_dual_rf, hints.clone(),
                         ).await
                     } else {
                         self.client.multi_patch_chunk_on_replicas(
                             old_location.chunk_id, effective_file_id, file_offset, patches.clone(),
                             &old_location, None,
-                            self.use_dual_rf,
+                            self.use_dual_rf, hints.clone(),
                         ).await
                     };
                     let (mut new_location, _skip_pairs) = match patch_result {
@@ -2016,15 +2027,17 @@ impl FlushHandle {
                             match fresh_loc {
                                 Some(loc) => {
                                     // Retry the patch with the authoritative location.
+                                    // Reuse hints from the initial attempt — any already-prefetched
+                                    // chunks are no-ops on the server (contains_key guard).
                                     let retry_result = if let Some(fid) = file_id_at_flush_start {
                                         self.client.multi_patch_chunk_on_replicas_verified(
                                             loc.chunk_id, fid, chunk_idx, file_offset,
-                                            patches.clone(), &loc, None, self.use_dual_rf,
+                                            patches.clone(), &loc, None, self.use_dual_rf, hints.clone(),
                                         ).await
                                     } else {
                                         self.client.multi_patch_chunk_on_replicas(
                                             loc.chunk_id, effective_file_id, file_offset, patches.clone(), &loc, None,
-                                            self.use_dual_rf,
+                                            self.use_dual_rf, hints.clone(),
                                         ).await
                                     };
                                     match retry_result {
@@ -2579,6 +2592,53 @@ impl FlushHandle {
         }
     }
 
+    /// Compute per-server prefetch hints for a MultiPatch about to be dispatched.
+    ///
+    /// Snapshots all OTHER pending (non-flushing) chunk slots for this inode, resolves
+    /// their existing locations, and groups their chunk_ids by server address. The caller
+    /// includes the per-addr slice in each MultiPatch request so the server can start
+    /// disk reads for those chunks while their patch payloads are still in transit.
+    ///
+    /// Called fresh at every MultiPatch dispatch point so each successive RPC carries
+    /// only the chunks still outstanding — already-dispatched slots are marked flushing=true
+    /// and naturally drop out of the snapshot.
+    /// Build the per-server prefetch hint map for the upcoming flush wave.
+    /// Called once per wave in flush_all_pipelined (not per task) and the result is
+    /// written into the shared patch_prefetch_hints Mutex so spawned tasks can read
+    /// it synchronously with no .await and no per-task metadata clone.
+    async fn compute_wave_prefetch_hints(
+        &self,
+        ino: u64,
+    ) -> HashMap<SocketAddr, Vec<dfs_common::ChunkId>> {
+        // try_lock: a concurrent write() may hold this; skip hints rather than stall.
+        let pending: Vec<u64> = {
+            let Some(state_arc) = self.write_buffers.get(&ino) else { return HashMap::new() };
+            let Ok(state) = state_arc.try_lock() else { return HashMap::new() };
+            state.slots.iter()
+                .filter(|(_, s)| !s.data.is_empty() && !s.flushing)
+                .map(|(idx, _)| *idx)
+                .collect()
+        };
+        if pending.is_empty() { return HashMap::new(); }
+        let meta = match self.metadata_cache.get(&ino) {
+            Some(m) => m.clone(),
+            None => return HashMap::new(),
+        };
+        let node_id_to_addr = self.client.node_id_to_addr_snapshot().await;
+        if node_id_to_addr.is_empty() { return HashMap::new(); }
+        let mut by_server: HashMap<SocketAddr, Vec<dfs_common::ChunkId>> = HashMap::new();
+        for idx in pending {
+            if let Some(loc) = meta.chunk_location_for_idx(idx) {
+                for &node_id in &loc.nodes {
+                    if let Some(&addr) = node_id_to_addr.get(&node_id) {
+                        by_server.entry(addr).or_default().push(loc.chunk_id);
+                    }
+                }
+            }
+        }
+        by_server
+    }
+
     /// Drain ALL dirty slots for `ino` (including partial tail) through a pipeline
     /// capped at FLUSH_ALL_MAX_ITEMS (64) and PIPELINE_MAX_BYTES (16MB).
     /// Used by release() and fsync(). 64 items >> background ticker's 16, so small
@@ -2614,6 +2674,9 @@ impl FlushHandle {
         // deletes from this flush session don't bleed into the background ticker's handle.
         let sync_handle = FlushHandle {
             use_dual_rf: true,
+            // Fresh Arc per flush_all_pipelined call so concurrent calls for different
+            // inodes don't share a hint map and overwrite each other's wave snapshots.
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ..self.clone()
         };
 
@@ -2710,6 +2773,34 @@ impl FlushHandle {
                 // Item or byte budget exhausted — wait for in-flight slots to complete.
                 tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 continue;
+            }
+
+            // Back-pressure: if the metadata queue is stalling, pause before hammering
+            // the server with another wave of MultiPatch RPCs. The server needs breathing
+            // room to process PutFileMetadata — adding more chunk writes while it's already
+            // saturated only makes the stall worse. Slow down rather than send EIO.
+            {
+                const META_STALL_THRESHOLD_SECS: u64 = 8;
+                const META_BACKOFF_MS: u64 = 200;
+                const META_BACKOFF_MAX_MS: u64 = 2000;
+                let mut backoff_ms = META_BACKOFF_MS;
+                while let Some(age) = self.client.metadata_queue.front_age().await {
+                    if age.as_secs() < META_STALL_THRESHOLD_SECS { break; }
+                    debug!(
+                        "flush_all_pipelined: metadata queue stalled ({}s), throttling wave dispatch for {}ms",
+                        age.as_secs(), backoff_ms
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(META_BACKOFF_MAX_MS);
+                }
+            }
+
+            // Compute per-server prefetch hints once for this wave and publish to the
+            // shared Mutex before spawning tasks. Tasks read it synchronously (no .await),
+            // so there is zero async overhead inside the per-task flush hot path.
+            {
+                let wave_hints = self.compute_wave_prefetch_hints(ino).await;
+                *sync_handle.patch_prefetch_hints.lock().unwrap() = wave_hints;
             }
 
             let mut handles = Vec::new();
@@ -3096,6 +3187,7 @@ impl DfsFilesystem {
                 flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
                 use_dual_rf: false,
                 write_open_counts: write_open_counts_for_bg.clone(),
+                patch_prefetch_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             };
             runtime.spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
@@ -3292,6 +3384,7 @@ impl DfsFilesystem {
             flush_pipeline_locks: flush_pipeline_locks_shared.clone(),
             use_dual_rf: false,
             write_open_counts: write_open_counts.clone(),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         Ok(Self {
@@ -7318,6 +7411,7 @@ impl Filesystem for DfsFilesystem {
             flush_pipeline_locks: self.flush_handle.flush_pipeline_locks.clone(),
             use_dual_rf: false,
             write_open_counts: self.write_open_counts.clone(),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         // Spawn so the FUSE dispatch thread is freed immediately — same pattern as fsync().

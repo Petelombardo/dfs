@@ -603,37 +603,63 @@ async fn handle_healing_command(
             }
         }
         HealingCommands::Enable => {
-            let leader = find_leader_addr(cluster_addrs).await;
-            let response = send_request(leader, Request::EnableHealing).await?;
-
-            match response {
-                Response::Ok { .. } => {
-                    println!("Healing enabled successfully");
+            let all_addrs: Vec<SocketAddr> =
+                if let Ok(Response::ClusterStatus { nodes, .. }) =
+                    send_request(cluster_addrs[0], Request::GetClusterStatus).await
+                {
+                    nodes.iter().map(|n| n.addr).collect()
+                } else {
+                    cluster_addrs.to_vec()
+                };
+            let mut failed = 0usize;
+            for addr in &all_addrs {
+                match send_request(*addr, Request::EnableHealing).await {
+                    Ok(Response::Ok { .. }) => {}
+                    Ok(Response::Error { message, .. }) => {
+                        error!("Enable healing failed on {}: {}", addr, message);
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        error!("Enable healing error on {}: {}", addr, e);
+                        failed += 1;
+                    }
+                    _ => { failed += 1; }
                 }
-                Response::Error { message, .. } => {
-                    error!("Error: {}", message);
-                    anyhow::bail!("Command failed: {}", message);
-                }
-                _ => {
-                    anyhow::bail!("Unexpected response type");
-                }
+            }
+            if failed == 0 {
+                println!("Healing enabled on all {} node(s)", all_addrs.len());
+            } else {
+                anyhow::bail!("Healing enable failed on {}/{} node(s)", failed, all_addrs.len());
             }
         }
         HealingCommands::Disable => {
-            let leader = find_leader_addr(cluster_addrs).await;
-            let response = send_request(leader, Request::DisableHealing).await?;
-
-            match response {
-                Response::Ok { .. } => {
-                    println!("Healing disabled successfully");
+            let all_addrs: Vec<SocketAddr> =
+                if let Ok(Response::ClusterStatus { nodes, .. }) =
+                    send_request(cluster_addrs[0], Request::GetClusterStatus).await
+                {
+                    nodes.iter().map(|n| n.addr).collect()
+                } else {
+                    cluster_addrs.to_vec()
+                };
+            let mut failed = 0usize;
+            for addr in &all_addrs {
+                match send_request(*addr, Request::DisableHealing).await {
+                    Ok(Response::Ok { .. }) => {}
+                    Ok(Response::Error { message, .. }) => {
+                        error!("Disable healing failed on {}: {}", addr, message);
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        error!("Disable healing error on {}: {}", addr, e);
+                        failed += 1;
+                    }
+                    _ => { failed += 1; }
                 }
-                Response::Error { message, .. } => {
-                    error!("Error: {}", message);
-                    anyhow::bail!("Command failed: {}", message);
-                }
-                _ => {
-                    anyhow::bail!("Unexpected response type");
-                }
+            }
+            if failed == 0 {
+                println!("Healing disabled on all {} node(s)", all_addrs.len());
+            } else {
+                anyhow::bail!("Healing disable failed on {}/{} node(s)", failed, all_addrs.len());
             }
         }
         HealingCommands::Trigger => {

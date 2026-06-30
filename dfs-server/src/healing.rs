@@ -214,6 +214,12 @@ pub struct HealingManager {
     /// the leader freeze on 2026-06-20. A second pass now logs and exits instead
     /// of running alongside the first.
     phantom_reconcile_in_progress: std::sync::atomic::AtomicBool,
+
+    /// Runtime healing kill-switch. Toggled by `dfs-admin healing disable/enable`
+    /// without a service restart. Initialised from `auto_heal` at construction.
+    /// All loop iterations check this flag; when false, they skip their work and
+    /// sleep until re-enabled.
+    pub healing_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HealingManager {
@@ -307,6 +313,7 @@ impl HealingManager {
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
             heal_transfer_timeout_secs,
             phantom_reconcile_in_progress: std::sync::atomic::AtomicBool::new(false),
+            healing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(auto_heal)),
         }
     }
 
@@ -443,6 +450,10 @@ impl HealingManager {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
 
+            if !self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+
             let is_leader = self.cluster.is_leader().await;
 
             if is_leader != was_leader {
@@ -506,6 +517,10 @@ impl HealingManager {
 
         loop {
             tokio::time::sleep(Duration::from_secs(15)).await;
+
+            if !self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
 
             let is_leader = self.cluster.is_leader().await;
 
@@ -939,7 +954,9 @@ impl HealingManager {
         timer.tick().await; // skip immediate first tick — let the cluster settle on startup
         loop {
             timer.tick().await;
-            self.run_phantom_reconciliation_pass().await;
+            if self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                self.run_phantom_reconciliation_pass().await;
+            }
         }
     }
 
@@ -2645,7 +2662,7 @@ impl HealingManager {
             pending_healing: pending_count,
             in_flight_healing: in_flight.len(),
             stalled_healing: stalled_count,
-            auto_heal_enabled: self.auto_heal,
+            auto_heal_enabled: self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed),
             healing_delay_secs: self.healing_delay_secs,
             current_bandwidth_mb: self.heal_bandwidth_limiter.current_rate_mb().await,
         }

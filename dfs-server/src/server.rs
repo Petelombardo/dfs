@@ -1560,9 +1560,9 @@ impl Server {
                 self.ops_tracker.inc_write();
                 self.handle_patch_chunk(chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data).await
             }
-            Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq } => {
+            Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints } => {
                 self.ops_tracker.inc_write();
-                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq).await
+                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints).await
             }
             Request::DeleteFile { path } => {
                 self.ops_tracker.inc_meta();
@@ -2932,6 +2932,7 @@ impl Server {
             accepted: chunk_ids.len(),
         }
     }
+
 
     /// Handle delete chunk request
     async fn handle_delete_chunk(&self, chunk_id: ChunkId) -> Response {
@@ -5134,6 +5135,7 @@ impl Server {
         patches: Vec<(usize, Vec<u8>)>,
         _expected_new_chunk_id: Option<dfs_common::ChunkId>,
         _client_write_seq: Option<u64>,
+        prefetch_hints: Option<Vec<ChunkId>>,
     ) -> Response {
         {
             let now_ms = std::time::SystemTime::now()
@@ -5193,6 +5195,16 @@ impl Server {
 
         if let Some(healing) = self.healing.read().await.as_ref() {
             healing.evict_from_pending(&chunk_id).await;
+        }
+
+        // Kick off disk reads for the next 2 chunks the client flagged as incoming.
+        // Capped at 2 to avoid stacking too many concurrent prefetch reads on top of
+        // the active MultiPatch disk I/O, which saturates the blocking thread pool.
+        // start_prefetch_for_patch is idempotent — already-in-flight chunks are skipped.
+        if let Some(hints) = prefetch_hints {
+            for hint_cid in hints.into_iter().take(2) {
+                self.start_prefetch_for_patch(hint_cid);
+            }
         }
 
         let old_path = self.storage.get_chunk_path(&chunk_id);
@@ -5980,15 +5992,23 @@ impl Server {
         Response::Ok { data: None }
     }
 
-    /// Handle enable healing request
+    /// Handle enable healing request — sets the in-memory flag on this node.
+    /// dfs-admin fans out to every node so the cluster transitions together.
     async fn handle_enable_healing(&self) -> Response {
-        // Auto-heal flag is set at startup from config; runtime toggling not yet supported.
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            healing.healing_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+            info!("Healing enabled via admin command");
+        }
         Response::Ok { data: None }
     }
 
-    /// Handle disable healing request
+    /// Handle disable healing request — sets the in-memory flag on this node.
+    /// dfs-admin fans out to every node so the cluster transitions together.
     async fn handle_disable_healing(&self) -> Response {
-        // Auto-heal flag is set at startup from config; runtime toggling not yet supported.
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            healing.healing_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+            info!("Healing disabled via admin command");
+        }
         Response::Ok { data: None }
     }
 

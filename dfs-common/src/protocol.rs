@@ -323,6 +323,7 @@ pub enum Request {
         chunk_ids: Vec<ChunkId>,
     },
 
+
     /// Apply a small patch to an existing chunk without transferring the full chunk.
     /// Server reads the chunk locally, splices in the patch bytes, recomputes the
     /// position-aware Blake3 hash, and writes the result as a new chunk file.
@@ -374,6 +375,13 @@ pub enum Request {
         /// counter instead of wall-clock timestamps (which are unreliable across nodes).
         #[serde(default)]
         client_write_seq: Option<u64>,
+        /// Other chunk_ids the client is about to MultiPatch to this same server in the
+        /// current flush cycle. Server calls start_prefetch_for_patch for each, overlapping
+        /// their disk reads with the time their patch payloads spend in transit.
+        /// Computed fresh at dispatch time so later RPCs reflect the shrinking pending set.
+        /// Server skips any chunk already being prefetched (contains_key guard).
+        #[serde(default)]
+        prefetch_hints: Option<Vec<ChunkId>>,
     },
 
     // Admin requests

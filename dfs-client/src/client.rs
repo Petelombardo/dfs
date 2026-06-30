@@ -404,11 +404,24 @@ impl MetadataQueue {
     /// Enqueue a metadata update and wait for the worker to confirm delivery.
     /// Retries indefinitely — returns only when the leader acks. Used by release().
     pub async fn push_and_wait(&self, metadata: FileMetadata) {
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let path = metadata.path.clone();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
         self.push_inner(metadata, Some(tx)).await;
-        // Await confirmation from the worker. If the sender is dropped (shouldn't
-        // happen — worker never drops without sending), treat as delivered.
-        let _ = rx.await;
+        // Await confirmation from the worker. Log every 5s so stalls are visible;
+        // never give up — the data is safely replicated, we just need metadata to land.
+        let start = std::time::Instant::now();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), &mut rx).await {
+                Ok(_) => break,
+                Err(_) => {
+                    warn!(
+                        "flush_metadata_sync: waiting {}s for metadata delivery of {} — \
+                         leader may be saturated, throttling writes",
+                        start.elapsed().as_secs(), path
+                    );
+                }
+            }
+        }
     }
 
     async fn push_inner(
@@ -4920,6 +4933,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         anyhow::bail!("ReplicateChunkLocations to leader {} failed after 4 attempts", leader)
     }
 
+    /// Return a snapshot of the NodeId→SocketAddr reverse map for use by callers that
+    /// need to resolve chunk location node-ids to addresses (e.g. prefetch hint building).
+    pub async fn node_id_to_addr_snapshot(&self) -> HashMap<NodeId, SocketAddr> {
+        self.addr_to_node_id.read().await
+            .iter().map(|(&addr, &id)| (id, addr)).collect()
+    }
+
     /// Write a single chunk to 2 replica nodes, with fallback to other nodes if either fails.
     /// The server healer is responsible for lazily replicating to additional nodes up to RF.
     async fn write_chunk_to_replicas(
@@ -5722,8 +5742,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
         dual_rf: bool,
+        per_server_hints: HashMap<SocketAddr, Vec<ChunkId>>,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
-        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, file_id, None, chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf).await
+        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, file_id, None, chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf, per_server_hints).await
     }
 
     pub async fn multi_patch_chunk_on_replicas_verified(
@@ -5736,8 +5757,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
         dual_rf: bool,
+        per_server_hints: HashMap<SocketAddr, Vec<ChunkId>>,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
-        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, file_id, Some(chunk_idx), chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf).await
+        self.multi_patch_chunk_on_replicas_inner(old_chunk_id, file_id, Some(chunk_idx), chunk_file_offset, patches, old_location, expected_new_chunk_id, dual_rf, per_server_hints).await
     }
 
     async fn multi_patch_chunk_on_replicas_inner(
@@ -5750,6 +5772,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         old_location: &dfs_common::ChunkLocation,
         expected_new_chunk_id: Option<ChunkId>,
         dual_rf: bool,
+        per_server_hints: HashMap<SocketAddr, Vec<ChunkId>>,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
         let original_old_chunk_id = old_chunk_id;
         let mut current_location = old_location.clone();
@@ -5864,24 +5887,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let total_patch_data: usize = patches.iter().map(|(_, d)| d.len()).sum();
 
         let results = if total_patch_data >= SPLIT_FRAME_THRESHOLD {
-            // Build envelope with empty patch data as split-frame signal.
-            let empty_patches: Vec<(usize, Vec<u8>)> = patches.iter()
-                .map(|(off, _)| (*off, Vec::new()))
-                .collect();
-            let patch_req_split = Request::MultiPatch {
-                chunk_id: old_chunk_id,
-                file_id,
-                chunk_idx,
-                chunk_file_offset,
-                patches: empty_patches,
-                expected_new_chunk_id,
-                client_write_seq: patch_client_write_seq,
-            };
-            let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
-            let envelope = MessageEnvelope::new(request_id, Message::Request(patch_req_split));
-            let encoded = Arc::new(envelope.to_bytes().context("Failed to serialize MultiPatch envelope")?);
-
-            // Raw payload: [4B len0][data0][4B len1][data1]...
+            // Raw payload shared across all replicas: [4B len0][data0][4B len1][data1]...
             let mut raw_payload = Vec::with_capacity(
                 patches.iter().map(|(_, d)| 4 + d.len()).sum::<usize>()
             );
@@ -5891,28 +5897,50 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
             let raw_payload = Arc::new(raw_payload);
 
+            // Each addr gets its own envelope: hints differ per server and the envelope
+            // is tiny (metadata only — patch data travels in the shared raw_payload arc).
             let futures: Vec<_> = patch_addrs.iter().map(|&addr| {
                 let client = self.clone();
-                let enc = Arc::clone(&encoded);
                 let raw = Arc::clone(&raw_payload);
+                let empty_patches: Vec<(usize, Vec<u8>)> = patches.iter()
+                    .map(|(off, _)| (*off, Vec::new()))
+                    .collect();
+                let hints = per_server_hints.get(&addr).cloned();
+                let patch_req_split = Request::MultiPatch {
+                    chunk_id: old_chunk_id,
+                    file_id,
+                    chunk_idx,
+                    chunk_file_offset,
+                    patches: empty_patches,
+                    expected_new_chunk_id,
+                    client_write_seq: patch_client_write_seq,
+                    prefetch_hints: hints,
+                };
                 async move {
-                    (addr, client.send_split_frame_write_request(addr, &enc, &raw).await)
+                    let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+                    let envelope = MessageEnvelope::new(request_id, Message::Request(patch_req_split));
+                    let encoded = match envelope.to_bytes().context("Failed to serialize MultiPatch envelope") {
+                        Ok(b) => b,
+                        Err(e) => return (addr, Err(e)),
+                    };
+                    (addr, client.send_split_frame_write_request(addr, &encoded, &raw).await)
                 }
             }).collect();
             futures::future::join_all(futures).await
         } else {
-            let patch_req = Request::MultiPatch {
-                chunk_id: old_chunk_id,
-                file_id,
-                chunk_idx,
-                chunk_file_offset,
-                patches: patches.clone(),
-                expected_new_chunk_id,
-                client_write_seq: patch_client_write_seq,
-            };
             let futures: Vec<_> = patch_addrs.iter().map(|&addr| {
                 let client = self.clone();
-                let req = patch_req.clone();
+                let hints = per_server_hints.get(&addr).cloned();
+                let req = Request::MultiPatch {
+                    chunk_id: old_chunk_id,
+                    file_id,
+                    chunk_idx,
+                    chunk_file_offset,
+                    patches: patches.clone(),
+                    expected_new_chunk_id,
+                    client_write_seq: patch_client_write_seq,
+                    prefetch_hints: hints,
+                };
                 async move { (addr, client.send_request(addr, req).await) }
             }).collect();
             futures::future::join_all(futures).await

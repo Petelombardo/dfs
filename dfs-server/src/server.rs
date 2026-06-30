@@ -249,7 +249,10 @@ impl Server {
             // Allow 8 concurrent prefetch operations for faster cache warming
             // With modern HDDs and read-ahead, parallel reads are efficient
             // Real client reads bypass this limit (high priority)
-            prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            // Cap at 2: prefetch is best-effort and must not compete with actual
+            // MultiPatch I/O or PutFileMetadata sled writes for blocking thread pool
+            // slots. try_acquire() in start_prefetch_for_patch skips silently when full.
+            prefetch_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             // Cap total outbound broadcast RPCs to 20 at a time across all operations.
             // 5 nodes × 4 concurrent fan-outs = 20 max simultaneous cluster connections,
             // well within the 65536 fd limit even under heavy delete/heal load.
@@ -7994,10 +7997,16 @@ impl MessageHandler for Server {
     }
 
     fn start_prefetch_for_patch(&self, chunk_id: ChunkId) {
-        // Only prefetch if not already in progress for this chunk.
         if self.chunk_prefetch.contains_key(&chunk_id) {
             return;
         }
+        // Best-effort: if the semaphore is full, skip rather than queue.
+        // Prefetch must not compete with actual MultiPatch disk reads or
+        // PutFileMetadata sled writes for blocking thread pool slots.
+        let permit = match self.prefetch_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
         let (tx, rx) = tokio::sync::watch::channel(None::<std::sync::Arc<Vec<u8>>>);
         self.chunk_prefetch.insert(chunk_id, rx);
 
@@ -8008,6 +8017,7 @@ impl MessageHandler for Server {
                 let path = storage.get_chunk_path(&chunk_id);
                 std::fs::read(&path).ok().map(std::sync::Arc::new)
             }).await;
+            drop(permit); // release before sending so the slot opens for the next hint
             match result {
                 Ok(Some(data)) => { let _ = tx.send(Some(data)); }
                 // On read failure or task panic: sender drops, channel closes.

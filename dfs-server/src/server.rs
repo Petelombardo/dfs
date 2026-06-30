@@ -183,6 +183,13 @@ pub struct Server {
     /// a semaphore slot and a spawn_blocking call.
     recently_patched: Arc<std::sync::Mutex<std::collections::VecDeque<ChunkId>>>,
 
+    /// In-memory ring cache of recently read/patched chunk content, keyed by chunk_id.
+    /// Populated by start_prefetch_for_patch (on prefetch completion) and re-keyed
+    /// old→new by handle_multi_patch after each successful patch. Allows consecutive
+    /// patches to skip the disk read entirely — only pwrite(patch bytes) + rename touch
+    /// disk, eliminating the full 4MB read that would otherwise precede every patch.
+    chunk_ring: Arc<std::sync::Mutex<lru::LruCache<ChunkId, Arc<Vec<u8>>>>>,
+
     /// Unix-epoch ms of the most recent client write (WriteChunk, PatchChunk, MultiPatch,
     /// or ReplicateChunkLocation) processed by any node in the cluster. Updated locally
     /// on every direct write and on every RCL broadcast received from peers. Shared with
@@ -280,6 +287,9 @@ impl Server {
             chunk_io_locks: Arc::new(DashMap::new()),
             chunk_prefetch: Arc::new(DashMap::new()),
             recently_patched: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))),
+            chunk_ring: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(32).unwrap()
+            ))),
             last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
@@ -5221,17 +5231,27 @@ impl Server {
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
 
-        // Collect any prefetch result that the network layer started when it decoded
-        // the split-frame envelope. Wait for it without a timeout — we'd be blocking
-        // on a disk read either way, and a timeout causes the prefetch task and the
-        // fallback spawn_blocking to race on the same file, doubling I/O and
-        // introducing high variance. If the sender drops (prefetch panicked), wait_for
-        // returns Err and borrow() yields None, falling back to a fresh disk read.
-        let prefetched: Option<std::sync::Arc<Vec<u8>>> = if let Some((_, mut rx)) = self.chunk_prefetch.remove(&chunk_id) {
-            let _ = rx.wait_for(|v| v.is_some()).await;
-            rx.borrow().clone()
+        // Ring hit: chunk content is already in memory from a previous prefetch or patch.
+        // Consume any pending prefetch entry (let it drop — we don't need it) and use
+        // the ring data directly, skipping the disk read entirely.
+        let ring_data = self.chunk_ring.lock().unwrap().get(&chunk_id).cloned();
+        let prefetched: Option<std::sync::Arc<Vec<u8>>> = if let Some(data) = ring_data {
+            // Drop any in-flight prefetch for this chunk — ring data is already current.
+            self.chunk_prefetch.remove(&chunk_id);
+            Some(data)
         } else {
-            None
+            // Collect any prefetch result that the network layer started when it decoded
+            // the split-frame envelope. Wait for it without a timeout — we'd be blocking
+            // on a disk read either way, and a timeout causes the prefetch task and the
+            // fallback spawn_blocking to race on the same file, doubling I/O and
+            // introducing high variance. If the sender drops (prefetch panicked), wait_for
+            // returns Err and borrow() yields None, falling back to a fresh disk read.
+            if let Some((_, mut rx)) = self.chunk_prefetch.remove(&chunk_id) {
+                let _ = rx.wait_for(|v| v.is_some()).await;
+                rx.borrow().clone()
+            } else {
+                None
+            }
         };
 
         // See handle_patch_chunk for why this is acquired up front and moved
@@ -5396,18 +5416,29 @@ impl Server {
                 );
             }
 
-            Ok::<_, (String, ErrorCode)>((new_chunk_id, final_size, patches))
+            Ok::<_, (String, ErrorCode)>((new_chunk_id, final_size, patches, Arc::new(buf)))
         }).await;
 
         self.chunk_io_locks.remove(&chunk_id);
 
         match result {
-            Ok(Ok((new_chunk_id, final_size, patches))) => {
+            Ok(Ok((new_chunk_id, final_size, patches, final_buf))) => {
                 let patch_summary: Vec<(usize, usize)> = patches.iter()
                     .map(|(off, d)| (*off, off + d.len()))
                     .collect();
                 info!("MultiPatch: {} -> {} ({} patches, final size={}): {:?}",
                     chunk_id, new_chunk_id, patches.len(), final_size, patch_summary);
+
+                // Re-key ring: the patched content is now the new chunk. Remove old
+                // entry and insert under new_chunk_id so the next patch finds it
+                // immediately without a disk read.
+                {
+                    let mut ring = self.chunk_ring.lock().unwrap();
+                    ring.pop(&chunk_id);
+                    if new_chunk_id != chunk_id {
+                        ring.put(new_chunk_id, final_buf);
+                    }
+                }
 
                 // Update this node's local chunk_map and sled metadata to reflect the
                 // new chunk_id atomically with the patch — before returning the response.
@@ -8031,6 +8062,11 @@ impl MessageHandler for Server {
         if self.recently_patched.lock().unwrap().contains(&chunk_id) {
             return;
         }
+        // Skip if content is already in the ring — handle_multi_patch will use it
+        // directly without needing a prefetch disk read.
+        if self.chunk_ring.lock().unwrap().contains(&chunk_id) {
+            return;
+        }
         // Best-effort: if the semaphore is full, skip rather than queue.
         // Prefetch must not compete with actual MultiPatch disk reads or
         // PutFileMetadata sled writes for blocking thread pool slots.
@@ -8043,6 +8079,7 @@ impl MessageHandler for Server {
 
         let storage = self.storage.clone();
         let prefetch_map = self.chunk_prefetch.clone();
+        let ring = self.chunk_ring.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let path = storage.get_chunk_path(&chunk_id);
@@ -8050,7 +8087,10 @@ impl MessageHandler for Server {
             }).await;
             drop(permit); // release before sending so the slot opens for the next hint
             match result {
-                Ok(Some(data)) => { let _ = tx.send(Some(data)); }
+                Ok(Some(data)) => {
+                    ring.lock().unwrap().put(chunk_id, Arc::clone(&data));
+                    let _ = tx.send(Some(data));
+                }
                 // On read failure or task panic: sender drops, channel closes.
                 // handle_multi_patch detects the closed channel and falls back
                 // to its own disk read — no data is lost.

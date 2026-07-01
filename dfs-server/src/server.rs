@@ -1680,16 +1680,24 @@ impl Server {
 
         // Client-driven staleness detection: if client has newer metadata than us,
         // self-heal by pulling fresh metadata from leader before serving the read.
+        // Uses the in-memory file_write_seqs map (kept current on every metadata
+        // write/replicate and seeded from redb at startup — see
+        // rebuild_chunk_map_from_metadata) instead of metadata.get_file(), which
+        // takes a std::sync::RwLock and opens a redb read transaction synchronously
+        // inside this async fn. That blocking I/O ran on every single read
+        // (client_write_seq is populated from open() onward, so this branch was
+        // effectively unconditional) and, unlike the chunk data read below, was
+        // never moved to spawn_blocking — silently capping read concurrency the
+        // same way the disk read did before it got the spawn_blocking fix.
         if let Some(client_seq) = client_write_seq {
             if let Some(file_id) = self.find_file_by_chunk(&chunk_id) {
-                if let Ok(Some(our_meta)) = self.metadata.get_file(&file_id) {
-                    if client_seq > our_meta.write_seq {
-                        info!("Stale metadata detected: client has seq={}, we have seq={} for file_id={}, pulling from leader",
-                              client_seq, our_meta.write_seq, file_id);
-                        if let Err(e) = self.pull_metadata_from_leader(file_id).await {
-                            warn!("Failed to pull fresh metadata from leader: {}", e);
-                            // Continue anyway - serve what we have
-                        }
+                let our_seq = self.file_write_seqs.get(&file_id).map(|v| *v).unwrap_or(0);
+                if client_seq > our_seq {
+                    info!("Stale metadata detected: client has seq={}, we have seq={} for file_id={}, pulling from leader",
+                          client_seq, our_seq, file_id);
+                    if let Err(e) = self.pull_metadata_from_leader(file_id).await {
+                        warn!("Failed to pull fresh metadata from leader: {}", e);
+                        // Continue anyway - serve what we have
                     }
                 }
             }
@@ -1731,16 +1739,16 @@ impl Server {
     async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64, client_write_seq: Option<u64>) -> Response {
         debug!("Handling read chunk range: {} offset={} length={}", chunk_id, offset, length);
 
-        // Client-driven staleness detection (same as handle_read_chunk)
+        // Client-driven staleness detection (same as handle_read_chunk — see the
+        // comment there for why this uses file_write_seqs instead of metadata.get_file()).
         if let Some(client_seq) = client_write_seq {
             if let Some(file_id) = self.find_file_by_chunk(&chunk_id) {
-                if let Ok(Some(our_meta)) = self.metadata.get_file(&file_id) {
-                    if client_seq > our_meta.write_seq {
-                        info!("Stale metadata detected in range read: client seq={}, our seq={} for file_id={}, pulling from leader",
-                              client_seq, our_meta.write_seq, file_id);
-                        if let Err(e) = self.pull_metadata_from_leader(file_id).await {
-                            warn!("Failed to pull fresh metadata from leader: {}", e);
-                        }
+                let our_seq = self.file_write_seqs.get(&file_id).map(|v| *v).unwrap_or(0);
+                if client_seq > our_seq {
+                    info!("Stale metadata detected in range read: client seq={}, our seq={} for file_id={}, pulling from leader",
+                          client_seq, our_seq, file_id);
+                    if let Err(e) = self.pull_metadata_from_leader(file_id).await {
+                        warn!("Failed to pull fresh metadata from leader: {}", e);
                     }
                 }
             }

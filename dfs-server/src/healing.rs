@@ -154,7 +154,7 @@ pub struct HealingManager {
     /// Bounds how many heal transfers the leader has concurrently outstanding
     /// (one permit per task), to avoid FD/task exhaustion from fanning out too many
     /// PushChunkTo RPCs at once. This is a concurrency cap only — actual byte
-    /// throughput is paced separately by heal_bandwidth_limiter on the source node.
+    /// throughput is paced separately by heal_bandwidth_limiter_out on the source node.
     heal_semaphore: Arc<Semaphore>,
 
     /// Max concurrent heal transfers (heal_semaphore's target capacity), stored for the
@@ -164,8 +164,19 @@ pub struct HealingManager {
     heal_max_concurrent: Arc<AtomicUsize>,
 
     /// Real bytes/sec pacing for this node's outbound heal-chunk reads+sends.
-    /// Rate is managed entirely by the adaptive bandwidth controller.
-    heal_bandwidth_limiter: Arc<BandwidthLimiter>,
+    /// Rate is managed entirely by the adaptive bandwidth controller. Separate from
+    /// heal_bandwidth_limiter_in because TX/RX are independent full-duplex capacity —
+    /// a node simultaneously pushing to one peer and receiving from another isn't
+    /// competing with itself, so sharing one bucket would wrongly halve its throughput.
+    heal_bandwidth_limiter_out: Arc<BandwidthLimiter>,
+
+    /// Real bytes/sec pacing for this node's inbound heal-chunk receives+writes.
+    /// Same configured rate as heal_bandwidth_limiter_out (both driven by the same
+    /// adaptive controller tick), but a distinct token bucket so RX pacing never
+    /// contends with TX pacing. Without this, several source nodes could each stay
+    /// under their own egress cap while collectively swamping one recovering target's
+    /// ingress, since nothing previously paced the receiving side at all.
+    heal_bandwidth_limiter_in: Arc<BandwidthLimiter>,
 
     /// Unix-epoch ms of the most recent client write seen on any node (updated via
     /// ReplicateChunkLocation broadcasts). Used by the adaptive bandwidth controller
@@ -256,7 +267,8 @@ impl HealingManager {
         // The adaptive bandwidth controller takes over within 2 seconds of startup
         // and adjusts the rate based on queue depth and growth rate.
         let initial_bw_mb = ((link_bandwidth_mb as f64 * 0.10) as usize).max(1);
-        let heal_bandwidth_limiter = Arc::new(BandwidthLimiter::new(initial_bw_mb));
+        let heal_bandwidth_limiter_out = Arc::new(BandwidthLimiter::new(initial_bw_mb));
+        let heal_bandwidth_limiter_in = Arc::new(BandwidthLimiter::new(initial_bw_mb));
         let link_bandwidth_mb = Arc::new(AtomicUsize::new(link_bandwidth_mb));
 
         // Separate, independent concurrency cap on outstanding heal transfers
@@ -305,7 +317,8 @@ impl HealingManager {
             max_heal_per_cycle,
             heal_semaphore,
             heal_max_concurrent,
-            heal_bandwidth_limiter,
+            heal_bandwidth_limiter_out,
+            heal_bandwidth_limiter_in,
             last_cluster_write_ms,
             link_bandwidth_mb,
             heal_max_pct,
@@ -424,7 +437,8 @@ impl HealingManager {
             let target_pct = LOW_PCT + (high_pct - LOW_PCT) * factor;
             let target_mb = ((self.link_bandwidth_mb.load(Ordering::Relaxed) as f64 * target_pct) as usize).max(1);
 
-            self.heal_bandwidth_limiter.set_rate_mb(target_mb).await;
+            self.heal_bandwidth_limiter_out.set_rate_mb(target_mb).await;
+            self.heal_bandwidth_limiter_in.set_rate_mb(target_mb).await;
 
             if queue_depth > 0 || growth_rate.abs() > 0.5 {
                 debug!(
@@ -1974,8 +1988,9 @@ impl HealingManager {
         // Without this cap, all `work` tasks would be spawned at once, each holding OS
         // resources (stack, file descriptors from pending connects) while blocked on
         // acquire — causing "too many orphaned sockets" kernel warnings under load.
-        // Actual byte throughput is paced separately by heal_bandwidth_limiter on
-        // whichever node ends up being the transfer's source.
+        // Actual byte throughput is paced separately by heal_bandwidth_limiter_out on
+        // whichever node ends up being the transfer's source (and heal_bandwidth_limiter_in
+        // on whichever node ends up being the target).
         let max_live = self.heal_max_concurrent.load(Ordering::Relaxed).max(1);
         let mut set: JoinSet<()> = JoinSet::new();
         let mut iter = work.into_iter();
@@ -1995,7 +2010,7 @@ impl HealingManager {
                 let heal_semaphore = self.heal_semaphore.clone();
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
                 let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs.load(Ordering::Relaxed));
-                let bandwidth_limiter = self.heal_bandwidth_limiter.clone();
+                let bandwidth_limiter = self.heal_bandwidth_limiter_out.clone();
 
                 set.spawn(async move {
                     let _permit = heal_semaphore.acquire().await;
@@ -2628,10 +2643,20 @@ impl HealingManager {
         self.stalled_healing.write().await.remove(chunk_id);
     }
 
-    /// This node's outbound heal-bandwidth limiter — used by Server::handle_push_chunk_to
-    /// to pace the actual disk-read+network-send of healed chunk data.
-    pub fn heal_bandwidth_limiter(&self) -> &Arc<BandwidthLimiter> {
-        &self.heal_bandwidth_limiter
+    /// This node's outbound heal-bandwidth limiter — Server::handle_push_chunk_to
+    /// acquires against it when this node is the *source* (disk-read+network-send).
+    /// Independent of heal_bandwidth_limiter_in since TX/RX are separate full-duplex
+    /// capacity on the same link.
+    pub fn heal_bandwidth_limiter_out(&self) -> &Arc<BandwidthLimiter> {
+        &self.heal_bandwidth_limiter_out
+    }
+
+    /// This node's inbound heal-bandwidth limiter — Server::handle_write_chunk
+    /// acquires against it when this node is the *target* (network-recv+disk-write).
+    /// Without this, several source nodes could each stay under their own egress cap
+    /// while collectively swamping this node's ingress when it's the recovery target.
+    pub fn heal_bandwidth_limiter_in(&self) -> &Arc<BandwidthLimiter> {
+        &self.heal_bandwidth_limiter_in
     }
 
     /// Apply a partial set of live tuning updates (`None` fields left unchanged) and
@@ -2739,7 +2764,7 @@ impl HealingManager {
             stalled_healing: stalled_count,
             auto_heal_enabled: self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed),
             healing_delay_secs: self.healing_delay_secs,
-            current_bandwidth_mb: self.heal_bandwidth_limiter.current_rate_mb().await,
+            current_bandwidth_mb: self.heal_bandwidth_limiter_out.current_rate_mb().await,
             tuning: self.tuning_snapshot().await,
         }
     }

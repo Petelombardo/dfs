@@ -1862,6 +1862,17 @@ impl Server {
             };
         }
 
+        // Pace inbound heal writes against this node's own heal-bandwidth budget before
+        // touching disk. Mirrors the outbound pacing in handle_push_chunk_to — without
+        // this, several source nodes could each stay under their own egress cap while
+        // collectively saturating this node's NIC/disk, since nothing previously paced
+        // the receiving side. Client-driven writes (background=false) are never paced.
+        if background {
+            if let Some(healing) = self.healing.read().await.as_ref() {
+                healing.heal_bandwidth_limiter_in().acquire(data.len()).await;
+            }
+        }
+
         // Write locally. Background (healing) writes run in spawn_blocking with idle
         // I/O priority so their fsyncs don't compete with active client write fsyncs.
         let data_len = data.len();
@@ -1975,7 +1986,7 @@ impl Server {
         // where the read+send actually happens (the leader only orchestrates).
         if let Some(healing) = self.healing.read().await.as_ref() {
             let size_estimate = loc.as_ref().map(|l| l.size).unwrap_or(4 * 1024 * 1024);
-            healing.heal_bandwidth_limiter().acquire(size_estimate).await;
+            healing.heal_bandwidth_limiter_out().acquire(size_estimate).await;
         }
 
         // Serialize against any concurrent in-place MultiPatch on this same chunk.

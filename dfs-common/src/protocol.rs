@@ -580,6 +580,26 @@ pub enum Request {
     DebugGetRawChunkLocation {
         chunk_id: ChunkId,
     },
+
+    /// Live-update one or more healing tuning knobs (bandwidth ceiling, concurrency,
+    /// transfer timeout). `None` fields are left unchanged — this is a partial patch,
+    /// not a full replace. Applied immediately in-memory and persisted to config.toml
+    /// so it survives a restart. Handled by `Server::handle_set_healing_tuning`.
+    /// Appended at the end of the enum, not inserted mid-list — see
+    /// TriggerPhantomReconciliation's doc comment above for why.
+    SetHealingTuning {
+        link_bandwidth_mb: Option<usize>,
+        heal_max_pct: Option<f64>,
+        heal_max_concurrent: Option<usize>,
+        heal_transfer_timeout_secs: Option<u64>,
+    },
+
+    /// Live-update the cluster's replication factor. Applied immediately in-memory
+    /// (shared Arc<AtomicUsize> between Server and HealingManager) and persisted to
+    /// config.toml. Handled by `Server::handle_set_replication_factor`.
+    SetReplicationFactor {
+        replication_factor: usize,
+    },
 }
 
 /// Response types
@@ -709,6 +729,18 @@ pub enum Response {
         last_check: u64,
         #[serde(default)]
         bandwidth_mb: usize,
+        /// Configured link-bandwidth baseline (MB/s) — the adaptive controller's 100% mark.
+        #[serde(default)]
+        link_bandwidth_mb: usize,
+        /// Configured healing bandwidth ceiling, percent of link_bandwidth_mb (10-100).
+        #[serde(default)]
+        heal_max_pct: f64,
+        /// Configured max concurrent outstanding heal transfers.
+        #[serde(default)]
+        heal_max_concurrent: usize,
+        /// Configured per-transfer timeout in seconds.
+        #[serde(default)]
+        heal_transfer_timeout_secs: u64,
     },
 
     /// File info with chunk locations

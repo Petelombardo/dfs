@@ -101,6 +101,8 @@ NodeIds are stable UUIDs persisted to disk. On every heartbeat, each node re-add
 
 The leader runs a healing check every 60 seconds, processing up to 1000 chunks per cycle with 2 ops concurrently and a 50ms cooldown between each. On gigabit, a 4MB chunk transfers in ~33ms; a 20GB file heals in ~2 minutes. Ghost-node references (chunks whose known replicas all report "not found") are moved to the stalled set after 300s and removed from the active healing queue so they don't spin the loop.
 
+Bandwidth ceiling, concurrency, transfer timeout, and replication factor are all live-tunable via `dfs-admin` (see [Config File](#config-file) and [Administration](#administration)) — changes apply immediately and persist across restarts, no env var or config-edit-plus-restart required.
+
 ### Chunk Storage
 
 - Files split into 4MB chunks, each identified by a BLAKE3 hash seeded with the chunk's file offset (position-aware — the same data at different offsets produces different IDs)
@@ -182,18 +184,43 @@ dfs-admin --cluster 10.25.1.58:8900 file info '/podman/dvr/recordings/show.mpg'
 
 # Trigger healing for a specific file
 dfs-admin --cluster 10.25.1.58:8900 healing file '/podman/dvr/recordings/show.mpg'
+
+# Live-update one or more healing tuning knobs cluster-wide — no restart needed
+dfs-admin --cluster 10.25.1.58:8900 healing set --link-bandwidth-mb 200 --max-pct 80
+
+# Show current healing tuning values
+dfs-admin --cluster 10.25.1.58:8900 healing get
+
+# Live-update replication factor cluster-wide — no restart needed
+dfs-admin --cluster 10.25.1.58:8900 cluster set --replication-factor 2
+
+# Show current cluster-wide settings (replication factor)
+dfs-admin --cluster 10.25.1.58:8900 cluster get
 ```
 
-## Environment Variables
+## Config File
 
-All env vars are read at server startup. Restart `dfs-server` after changing them.
+Healing tuning and replication factor live in `config.toml`'s `[replication]` section
+and are changeable **without a restart** via `dfs-admin healing set` / `cluster set`
+(see Administration above) — the running server updates in-memory state immediately and
+persists the change back to `config.toml` so it survives a restart too.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DFS_HEAL_MAX_CONCURRENT` | `8` | Maximum number of simultaneous outbound heal chunk transfers. Caps concurrency independently of bandwidth pacing. |
-| `DFS_HEAL_TRANSFER_TIMEOUT_SECS` | `120` | Per-chunk heal transfer timeout in seconds. Timed-out chunks remain in the pending queue and are retried on the next drain cycle. |
-| `DFS_LINK_BANDWIDTH_MB` | `100` | Assumed node-to-node link capacity in MB/s (1 Gbps ≈ 100 MB/s). Used as the 100% baseline for the adaptive bandwidth formula. |
-| `DFS_HEAL_MAX_PCT` | `60` | Maximum percentage of link bandwidth the healer may use. The default of 60% is the logical ceiling when client and heal traffic share a single interface — at 60% the healer consumes more bandwidth than writes can ever produce, so the queue cannot grow unboundedly. Set higher (e.g. `90`) when storage nodes have a dedicated server-to-server interface that is separate from the client-facing interface. Accepts integer values 10–100. |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `replication_factor` | `3` | Number of replicas to maintain per chunk. Live-settable via `dfs-admin cluster set --replication-factor`. A node that's unreachable during a change adopts the leader's value automatically when it rejoins the cluster. |
+| `heal_max_concurrent` | `8` | Maximum number of simultaneous outbound heal chunk transfers. Caps concurrency independently of bandwidth pacing. |
+| `heal_transfer_timeout_secs` | `120` | Per-chunk heal transfer timeout in seconds. Timed-out chunks remain in the pending queue and are retried on the next drain cycle. |
+| `link_bandwidth_mb` | `100` | Assumed node-to-node link capacity in MB/s (1 Gbps ≈ 100 MB/s). Used as the 100% baseline for the adaptive bandwidth formula. |
+| `heal_max_pct` | `60` | Maximum percentage of link bandwidth the healer may use. The default of 60% is the logical ceiling when client and heal traffic share a single interface — at 60% the healer consumes more bandwidth than writes can ever produce, so the queue cannot grow unboundedly. Set higher (e.g. `90`) when storage nodes have a dedicated server-to-server interface that is separate from the client-facing interface. Accepts values 10–100. |
+
+All four healing-tuning fields (not `replication_factor`, which has no env-var
+equivalent) also accept a legacy `DFS_HEAL_MAX_CONCURRENT` / `DFS_HEAL_TRANSFER_TIMEOUT_SECS`
+/ `DFS_LINK_BANDWIDTH_MB` / `DFS_HEAL_MAX_PCT` env var on **first startup only**, for
+deployments upgrading from before these were config fields — the resolved value is
+migrated into `config.toml` and persisted, exactly like `node_id`'s legacy-file
+migration. Once a field is present in `config.toml` it is never read from the env var
+again, so a stale env var left in a systemd unit can never override a value you've
+since changed live via `dfs-admin`.
 
 ### Adaptive Heal Bandwidth
 

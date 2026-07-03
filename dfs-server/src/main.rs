@@ -187,6 +187,10 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     let node_id = config.load_or_create_node_id(Some(&config_path))?;
     info!("Node ID: {}", node_id);
 
+    // Resolve the healing-tuning knobs: config wins if already set, otherwise migrate
+    // from the legacy DFS_* env vars (once) and persist — same pattern as node_id above.
+    config.load_or_migrate_healing_tuning(Some(&config_path))?;
+
     // The address we register in the cluster and advertise to peers.
     // Prefer advertise_addr; fall back to listen_addr. Either way the client
     // now gets the real address from ClusterStatus and can map it to node_id.
@@ -210,6 +214,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         cluster.clone(),
         config.replication.replication_factor,
         config.storage.metadata_dir.clone(),
+        config_path.clone(),
     ));
     info!("✓ Server instance created");
 
@@ -296,12 +301,16 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         metadata,
         cluster,
         server.network_client(),
-        config.replication.replication_factor,
+        server.replication_factor_handle(),
         config.replication.healing_delay_secs,
         config.replication.scrub_interval_hours,
         config.replication.auto_heal,
         server.chunk_map_ref(),
         server.last_cluster_write_ms(),
+        config.replication.link_bandwidth_mb.expect("resolved by load_or_migrate_healing_tuning"),
+        config.replication.heal_max_pct.expect("resolved by load_or_migrate_healing_tuning"),
+        config.replication.heal_max_concurrent.expect("resolved by load_or_migrate_healing_tuning"),
+        config.replication.heal_transfer_timeout_secs.expect("resolved by load_or_migrate_healing_tuning"),
     ));
     healer_runtime.spawn(healing.clone().start());
     server.set_healing_manager(healing.clone()).await;
@@ -394,12 +403,13 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                 // Wake the chunk-location sync loop — now that we have a leader, push
                 // our local locations immediately rather than waiting for the 30s poll.
                 server.cluster().node_recovered_notify.notify_waiters();
+                reconcile_replication_factor_with_leader(&server, &config_path).await;
             }
             Err(e) => warn!("Failed to join cluster: {}", e),
         }
 
         // Start periodic rejoin attempts in background
-        start_periodic_rejoin(server.clone(), all_join_targets.clone(), metadata_dir.clone(), local_addr).await;
+        start_periodic_rejoin(server.clone(), all_join_targets.clone(), metadata_dir.clone(), local_addr, config_path.clone()).await;
     } else {
         info!("No seed nodes or peers configured - running as standalone node");
     }
@@ -550,6 +560,89 @@ async fn join_cluster(
     anyhow::bail!("Failed to join cluster - all {} seed/peer nodes unreachable", unique_seeds.len())
 }
 
+/// Closes the RF cross-node divergence gap: `replication_factor` is otherwise read
+/// independently from each node's own local config.toml with no consistency check
+/// (unlike healing-tuning knobs, RF also drives the write-path immediate-replica count,
+/// so a node that silently kept a stale value could disagree with the rest of the
+/// cluster about write durability, not just healing classification). Called after every
+/// successful join/rejoin — including periodic rejoin after a partition — so a node
+/// that was unreachable during a `dfs-admin cluster set --replication-factor` change
+/// self-heals to the cluster's value instead of requiring the operator to notice and
+/// re-run the command.
+///
+/// Deliberately does NOT special-case "am I the leader" and trust my own value in that
+/// case — leadership is purely "online node with the lowest NodeId" (see README's
+/// Leader Election section), which has no relationship to whether this node's own
+/// config is fresh. A node that was down during an RF change can easily reclaim
+/// leadership within seconds of rejoining if its NodeId happens to be the lowest
+/// online — an earlier version of this function skipped reconciliation whenever
+/// `is_leader()` was true and consequently never adopted the cluster's actual value in
+/// exactly that case (caught by test T45g/h/i in test_local_suite.sh). Querying every
+/// reachable peer and taking a majority vote works regardless of this node's own
+/// leadership status.
+async fn reconcile_replication_factor_with_leader(
+    server: &std::sync::Arc<server::Server>,
+    config_path: &std::path::Path,
+) {
+    let local_rf = server.replication_factor_handle().load(std::sync::atomic::Ordering::Relaxed);
+
+    let local_id = server.cluster().local_node_id();
+    let peers: Vec<_> = server.cluster().get_all_nodes().await
+        .into_iter()
+        .filter(|n| n.id != local_id)
+        .collect();
+
+    if peers.is_empty() {
+        debug!("RF reconciliation: no peers known yet, skipping");
+        return;
+    }
+
+    let mut votes: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut reached = 0usize;
+    for peer in &peers {
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.network_client().send_message(peer.addr, dfs_common::Message::Request(dfs_common::Request::GetClusterStatus)),
+        ).await;
+        if let Ok(Ok(envelope)) = resp {
+            if let dfs_common::Message::Response(dfs_common::Response::ClusterStatus { replication_factor, .. }) = envelope.message {
+                *votes.entry(replication_factor).or_insert(0) += 1;
+                reached += 1;
+            }
+        }
+    }
+
+    if reached == 0 {
+        debug!("RF reconciliation: could not reach any peer, skipping");
+        return;
+    }
+
+    // Majority among reached peers. A tie (or no value held by >50%) isn't enough
+    // signal to override our own value, so leave it alone rather than guess.
+    let Some((&majority_rf, &majority_count)) = votes.iter().max_by_key(|(_, c)| **c) else {
+        return;
+    };
+    if majority_count * 2 <= reached || majority_rf == local_rf {
+        return;
+    }
+
+    warn!(
+        "Local replication_factor ({}) is stale vs. cluster majority ({}/{} reachable peers report {}) — adopting and persisting to config",
+        local_rf, majority_count, reached, majority_rf
+    );
+    server.replication_factor_handle().store(majority_rf, std::sync::atomic::Ordering::Relaxed);
+
+    match Config::from_file(config_path) {
+        Ok(mut config) => {
+            config.replication.replication_factor = majority_rf;
+            if let Err(e) = config.to_file(config_path) {
+                warn!("RF reconciliation: failed to persist adopted replication_factor to config {:?}: {}", config_path, e);
+            }
+        }
+        Err(e) => warn!("RF reconciliation: failed to reload config {:?} to persist adopted replication_factor: {}", config_path, e),
+    }
+}
+
 /// Send join request to a seed node
 async fn send_join_request(
     seed_addr: std::net::SocketAddr,
@@ -640,6 +733,7 @@ async fn start_periodic_rejoin(
     join_targets: Vec<std::net::SocketAddr>,
     metadata_dir: std::path::PathBuf,
     local_addr: std::net::SocketAddr,
+    config_path: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -658,6 +752,7 @@ async fn start_periodic_rejoin(
                     Ok(_) => {
                         info!("✓ Successfully rejoined cluster via periodic retry");
                         server.cluster().node_recovered_notify.notify_waiters();
+                        reconcile_replication_factor_with_leader(&server, &config_path).await;
                     }
                     Err(e) => {
                         debug!("Periodic rejoin attempt failed: {}", e);

@@ -14,6 +14,7 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -46,11 +47,18 @@ pub struct Server {
     /// Network client for talking to other nodes
     client: Arc<NetworkClient>,
 
-    /// Replication factor
-    replication_factor: usize,
+    /// Replication factor. `Arc<AtomicUsize>` — the same instance is handed to
+    /// `HealingManager` at construction (see `replication_factor_handle()`), so a live
+    /// `dfs-admin cluster set --replication-factor` change or rejoin reconciliation is
+    /// visible to both the write path and healing decisions without a restart.
+    replication_factor: Arc<AtomicUsize>,
 
     /// Metadata directory path for persisting peer list
     metadata_dir: PathBuf,
+
+    /// Path to this node's config.toml — used to persist live admin changes
+    /// (healing tuning, replication factor) so they survive a restart.
+    config_path: PathBuf,
 
     /// Storage stats cache with 10-second TTL
     storage_stats_cache: Arc<RwLock<Option<StorageStatsCache>>>,
@@ -215,7 +223,9 @@ impl Server {
         cluster: Arc<ClusterManager>,
         replication_factor: usize,
         metadata_dir: PathBuf,
+        config_path: PathBuf,
     ) -> Self {
+        let replication_factor = Arc::new(AtomicUsize::new(replication_factor));
         // Create tombstones before the struct so the sled_write_tx worker can
         // capture a clone and guard against writing metadata for deleted files.
         let delete_tombstones: Arc<DashMap<FileId, std::time::Instant>> = Arc::new(DashMap::new());
@@ -258,6 +268,7 @@ impl Server {
             client: Arc::new(NetworkClient::new()),
             replication_factor,
             metadata_dir,
+            config_path,
             storage_stats_cache: Arc::new(RwLock::new(None)),
             // Allow 8 concurrent prefetch operations for faster cache warming
             // With modern HDDs and read-ahead, parallel reads are efficient
@@ -524,16 +535,30 @@ impl Server {
                 self.chunk_to_file.insert(loc.chunk_id, metadata.id);
             }
             self.chunk_map.insert(metadata.id, (new_locs, metadata.write_seq));
-        } else if let Some((old_locs, _)) = self.chunk_map.get(&metadata.id).map(|e| e.value().clone()) {
-            // Empty chunk_locations on a file that already has a chunk_map entry means
-            // truncate-to-zero. Reset the entry instead of leaving it untouched —
-            // otherwise the stale pre-truncate chunks would linger in chunk_map and
-            // get resurrected by handle_put_file_metadata's chunk_map union (below)
-            // on the next write to this file.
-            for loc in old_locs.iter() {
-                self.chunk_to_file.remove(&loc.chunk_id);
+        } else if metadata.size == 0 {
+            if let Some((old_locs, _)) = self.chunk_map.get(&metadata.id).map(|e| e.value().clone()) {
+                // Empty chunk_locations AND size==0 on a file that already has a chunk_map
+                // entry means truncate-to-zero. Reset the entry instead of leaving it
+                // untouched — otherwise the stale pre-truncate chunks would linger in
+                // chunk_map and get resurrected by handle_put_file_metadata's chunk_map
+                // union (below) on the next write to this file.
+                //
+                // Requiring size==0 (not just chunk_locations being empty) is deliberate:
+                // real incident, 2026-07-03 (staging nanopir3) — a stale/incomplete
+                // metadata snapshot (chunk_locations never populated this session, e.g.
+                // from ListAllFiles's scalar-only startup warm-up) arrived with a real,
+                // non-zero size but empty chunk_locations, and this branch wiped a
+                // perfectly good chunk_map entry out from under it, corrupting the file
+                // (subsequent read/write both saw "no chunks" and a fresh write zeroed
+                // the real content). A genuine truncate-to-zero always carries size==0;
+                // "empty chunks, non-zero size" is a contradiction that should never be
+                // trusted enough to destroy existing data — leaving chunk_map untouched
+                // in that case is the safe default (worst case: briefly stale, not wrong).
+                for loc in old_locs.iter() {
+                    self.chunk_to_file.remove(&loc.chunk_id);
+                }
+                self.chunk_map.insert(metadata.id, (vec![], metadata.write_seq));
             }
-            self.chunk_map.insert(metadata.id, (vec![], metadata.write_seq));
         }
         // If the file has no chunks yet (new empty file) and no map entry exists,
         // no map entry is needed — chunk_map_update_location_for_file will create
@@ -718,6 +743,13 @@ impl Server {
     /// Shared write-activity timestamp — passed to HealingManager for adaptive bandwidth control.
     pub fn last_cluster_write_ms(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.last_cluster_write_ms.clone()
+    }
+
+    /// Shared replication-factor handle — passed to HealingManager at construction so
+    /// both share the exact same `Arc<AtomicUsize>` (a live change is visible to both
+    /// without a restart, no separate sync path needed).
+    pub fn replication_factor_handle(&self) -> Arc<AtomicUsize> {
+        self.replication_factor.clone()
     }
 
     /// Wire in the healing manager after construction.
@@ -1600,6 +1632,12 @@ impl Server {
             Request::TriggerScrub => self.handle_trigger_scrub().await,
             Request::EnableHealing => self.handle_enable_healing().await,
             Request::DisableHealing => self.handle_disable_healing().await,
+            Request::SetHealingTuning { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs } => {
+                self.handle_set_healing_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs).await
+            }
+            Request::SetReplicationFactor { replication_factor } => {
+                self.handle_set_replication_factor(replication_factor).await
+            }
             Request::TriggerHealing => self.handle_trigger_healing().await,
             Request::TriggerPhantomReconciliation => self.handle_trigger_phantom_reconciliation().await,
             Request::DebugGetRawChunkLocation { chunk_id } => {
@@ -1868,7 +1906,7 @@ impl Server {
         // would leave a stale 4th-node record that the merge logic then perpetuates.
         let local_node_id = self.cluster.local_node_id();
         if let Ok(mut location) = self.get_or_create_chunk_location(&chunk_id, data_len).await {
-            if !location.nodes.contains(&local_node_id) && location.nodes.len() < self.replication_factor {
+            if !location.nodes.contains(&local_node_id) && location.nodes.len() < self.replication_factor.load(Ordering::Relaxed) {
                 location.nodes.push(local_node_id);
                 let _ = self.metadata.put_chunk_location_async(location).await;
             }
@@ -2261,7 +2299,7 @@ impl Server {
         // This prevents the cycle: write broadcasts {A,B} → healer heals to {A,B,C} →
         // stale write broadcast arrives, replaces with {A,B} → healer heals to {A,B,D}
         // → accumulate nodes D,E,... = over-replication.
-        let rf = self.replication_factor;
+        let rf = self.replication_factor.load(Ordering::Relaxed);
         let merged_location = match self.metadata.get_chunk_location(&location.chunk_id) {
             Ok(Some(existing)) => {
                 let incoming_count = location.nodes.len();
@@ -2413,7 +2451,7 @@ impl Server {
                 // case), don't wait for the next discovery pass (up to 60s) to notice
                 // — the leader already knows right now. Queue it for the next heal
                 // loop tick (~15s) instead, skipping the discovery debounce.
-                if merged_location.nodes.len() < self.replication_factor {
+                if merged_location.nodes.len() < self.replication_factor.load(Ordering::Relaxed) {
                     if let Some(healing) = self.healing.read().await.as_ref() {
                         healing.queue_chunks_immediate(vec![merged_location.chunk_id]).await;
                     }
@@ -2656,7 +2694,7 @@ impl Server {
             };
             let incoming_count = location.nodes.len();
             let existing_count = existing.as_ref().map_or(0, |e| e.nodes.len());
-            let rf = self.replication_factor;
+            let rf = self.replication_factor.load(Ordering::Relaxed);
             let nodes = if incoming_count < rf && existing_count < rf {
                 // Both sides are under-RF — union the node sets.
                 let mut merged: Vec<_> = existing.as_ref().map_or_else(Vec::new, |e| e.nodes.clone());
@@ -3042,7 +3080,7 @@ impl Server {
             let storage = self.storage.clone();
             let metadata = self.metadata.clone();
             let client = self.client.clone();
-            let replication_factor = self.replication_factor;
+            let replication_factor = self.replication_factor.load(Ordering::Relaxed);
 
             // Spawn a task for each chunk
             let task = tokio::spawn(async move {
@@ -3537,15 +3575,26 @@ impl Server {
                 // hit sled before the worker commits, returning stale chunk IDs (T7/T20).
                 // The chunk_map is updated synchronously in handle_put_file_metadata
                 // before the client gets its Ok response, so it's always current.
-                if let Some(entry) = self.chunk_map.get(&metadata.id) {
+                let sled_size = metadata.size;
+                let sled_chunk0_size = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
+                let (chunk_map_present, chunk_map_chunks, chunk_map_chunk0_size) = if let Some(entry) = self.chunk_map.get(&metadata.id) {
                     let (map_locs, map_write_seq) = entry.value();
                     if !map_locs.is_empty() {
+                        let chunk0_size = map_locs.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
                         metadata.chunk_locations = map_locs.clone();
                         if *map_write_seq > metadata.write_seq {
                             metadata.write_seq = *map_write_seq;
                         }
+                        (true, map_locs.len(), chunk0_size)
+                    } else {
+                        (true, 0, None)
                     }
-                }
+                } else {
+                    (false, 0, None)
+                };
+                let returned_chunk0_size = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
+                info!("[SIZE TRACE] get path={} id={} sled_size={} sled_chunk0_size={:?} chunk_map_present={} chunk_map_chunks={} chunk_map_chunk0_size={:?} returned_chunk0_size={:?}",
+                    path, metadata.id, sled_size, sled_chunk0_size, chunk_map_present, chunk_map_chunks, chunk_map_chunk0_size, returned_chunk0_size);
 
                 // Check if client has provided a cached write_seq (clock-agnostic —
                 // modified_at is user-settable via setattr and not safe for this check).
@@ -4238,6 +4287,13 @@ impl Server {
             metadata.path, metadata.id, metadata.write_seq, metadata.size,
             self.cluster.is_leader().await
         );
+        {
+            let incoming_chunk0 = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
+            let chunk_map_before = self.chunk_map.get(&metadata.id)
+                .map(|e| e.value().0.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size));
+            info!("[SIZE TRACE] put-incoming path={} id={} incoming_chunks={} incoming_chunk0_size={:?} chunk_map_before_chunk0_size={:?}",
+                metadata.path, metadata.id, metadata.chunk_locations.len(), incoming_chunk0, chunk_map_before.flatten());
+        }
 
         let is_leader = self.cluster.is_leader().await;
 
@@ -4382,6 +4438,14 @@ impl Server {
             m
         };
         self.chunk_map_update(&metadata).await;
+        {
+            let chunk_map_after = self.chunk_map.get(&metadata.id)
+                .map(|e| e.value().0.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size));
+            info!("[SIZE TRACE] put-after-chunk_map_update path={} id={} reconciled_chunks={} reconciled_chunk0_size={:?} chunk_map_after_chunk0_size={:?}",
+                metadata.path, metadata.id, metadata.chunk_locations.len(),
+                metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size),
+                chunk_map_after.flatten());
+        }
         self.record_recent_write(metadata.clone());
         // Mark file dirty for the metadata healer (drains every 5s).
         // DashMap deduplicates by FileId — write storms produce one healer push per file.
@@ -4683,7 +4747,7 @@ impl Server {
 
         for (chunk_id, chunk_data) in &chunks {
             let target_nodes = self.cluster
-                .get_nodes_with_capacity_awareness(chunk_id, self.replication_factor)
+                .get_nodes_with_capacity_awareness(chunk_id, self.replication_factor.load(Ordering::Relaxed))
                 .await;
 
             if target_nodes.is_empty() {
@@ -4693,7 +4757,7 @@ impl Server {
                 };
             }
 
-            let immediate_replicas = if self.replication_factor >= 3 { 2 } else { self.replication_factor };
+            let immediate_replicas = if self.replication_factor.load(Ordering::Relaxed) >= 3 { 2 } else { self.replication_factor.load(Ordering::Relaxed) };
 
             // Fire all replica writes in parallel — same approach as the original client-side
             // dual-write. Both the local write and the remote ReplicateChunk are spawned
@@ -5904,7 +5968,7 @@ impl Server {
             healthy_nodes,
             chunk_size_mb,
             leader_node_id,
-            replication_factor: self.replication_factor,
+            replication_factor: self.replication_factor.load(Ordering::Relaxed),
             local_node_id: Some(self.cluster.local_node_id()),
         }
     }
@@ -5927,7 +5991,7 @@ impl Server {
                     return Response::StorageStats {
                         total_chunks: cached.total_chunks,
                         total_size,
-                        replication_factor: self.replication_factor,
+                        replication_factor: self.replication_factor.load(Ordering::Relaxed),
                         nodes_count,
                         total_space: cached.total_space,
                         free_space: cached.free_space,
@@ -6004,7 +6068,7 @@ impl Server {
         Response::StorageStats {
             total_chunks,
             total_size,
-            replication_factor: self.replication_factor,
+            replication_factor: self.replication_factor.load(Ordering::Relaxed),
             nodes_count,
             total_space,
             free_space,
@@ -6014,6 +6078,14 @@ impl Server {
 
     /// Handle get healing status request
     async fn handle_get_healing_status(&self) -> Response {
+        self.healing_status_response().await
+    }
+
+    /// Builds a `Response::HealingStatus` from the current live `HealingStats` snapshot.
+    /// Shared by `handle_get_healing_status` and `handle_set_healing_tuning` (which
+    /// returns the post-update snapshot so `dfs-admin healing set` can print what was
+    /// actually applied without a second round trip).
+    async fn healing_status_response(&self) -> Response {
         let healing_guard = self.healing.read().await;
         match healing_guard.as_ref() {
             Some(healing) => {
@@ -6025,6 +6097,10 @@ impl Server {
                     stalled_count: stats.stalled_healing,
                     last_check: 0,
                     bandwidth_mb: stats.current_bandwidth_mb,
+                    link_bandwidth_mb: stats.tuning.link_bandwidth_mb,
+                    heal_max_pct: stats.tuning.heal_max_pct,
+                    heal_max_concurrent: stats.tuning.heal_max_concurrent,
+                    heal_transfer_timeout_secs: stats.tuning.heal_transfer_timeout_secs,
                 }
             }
             None => Response::HealingStatus {
@@ -6034,8 +6110,86 @@ impl Server {
                 stalled_count: 0,
                 last_check: 0,
                 bandwidth_mb: 0,
+                link_bandwidth_mb: 0,
+                heal_max_pct: 0.0,
+                heal_max_concurrent: 0,
+                heal_transfer_timeout_secs: 0,
             },
         }
+    }
+
+    /// Handle a live, partial healing-tuning update. Applies in-memory immediately,
+    /// then persists the resulting values to config.toml so a restart doesn't revert
+    /// them — closing the gap `healing_enabled`'s runtime toggle has (comment on that
+    /// field notes restarts re-read `auto_heal` from config; tuning values now do the
+    /// same, but land in config instead of reverting to a hardcoded/env default).
+    async fn handle_set_healing_tuning(
+        &self,
+        link_bandwidth_mb: Option<usize>,
+        heal_max_pct: Option<f64>,
+        heal_max_concurrent: Option<usize>,
+        heal_transfer_timeout_secs: Option<u64>,
+    ) -> Response {
+        let healing_guard = self.healing.read().await;
+        let Some(healing) = healing_guard.as_ref() else {
+            return Response::Error {
+                message: "Healing manager not available".to_string(),
+                code: ErrorCode::InternalError,
+            };
+        };
+        let healing = healing.clone();
+        drop(healing_guard);
+
+        // Clamp to sane bounds — same range HealingManager::new already clamps
+        // heal_max_pct to, plus a generous upper bound on concurrency to avoid
+        // accidentally exhausting FDs/tasks via a fat-fingered admin command.
+        let heal_max_pct = heal_max_pct.map(|p| p.clamp(10.0, 100.0));
+        let heal_max_concurrent = heal_max_concurrent.map(|c| c.clamp(1, 64));
+
+        healing.apply_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs).await;
+        info!(
+            "Healing tuning updated via admin command (link_bandwidth_mb={:?}, heal_max_pct={:?}, heal_max_concurrent={:?}, heal_transfer_timeout_secs={:?})",
+            link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs
+        );
+
+        let snapshot = healing.tuning_snapshot().await;
+        match dfs_common::Config::from_file(&self.config_path) {
+            Ok(mut config) => {
+                config.replication.link_bandwidth_mb = Some(snapshot.link_bandwidth_mb);
+                config.replication.heal_max_pct = Some(snapshot.heal_max_pct);
+                config.replication.heal_max_concurrent = Some(snapshot.heal_max_concurrent);
+                config.replication.heal_transfer_timeout_secs = Some(snapshot.heal_transfer_timeout_secs);
+                if let Err(e) = config.to_file(&self.config_path) {
+                    warn!("Failed to persist healing tuning to config {:?}: {}", self.config_path, e);
+                }
+            }
+            Err(e) => warn!("Failed to reload config {:?} for healing tuning persistence: {}", self.config_path, e),
+        }
+
+        self.healing_status_response().await
+    }
+
+    /// Handle a live replication-factor change. Applies in-memory immediately (shared
+    /// `Arc<AtomicUsize>` with HealingManager — see `replication_factor_handle`), then
+    /// persists to config.toml. dfs-admin fans this out to every reachable node; a node
+    /// that's unreachable during the change reconciles to the leader's value on rejoin
+    /// (see `reconcile_replication_factor_with_leader` in main.rs).
+    async fn handle_set_replication_factor(&self, replication_factor: usize) -> Response {
+        let rf = replication_factor.clamp(1, 10);
+        self.replication_factor.store(rf, Ordering::Relaxed);
+        info!("Replication factor set to {} via admin command", rf);
+
+        match dfs_common::Config::from_file(&self.config_path) {
+            Ok(mut config) => {
+                config.replication.replication_factor = rf;
+                if let Err(e) = config.to_file(&self.config_path) {
+                    warn!("Failed to persist replication_factor to config {:?}: {}", self.config_path, e);
+                }
+            }
+            Err(e) => warn!("Failed to reload config {:?} for replication_factor persistence: {}", self.config_path, e),
+        }
+
+        Response::Ok { data: None }
     }
 
     /// Return the physical on-disk size of each requested chunk.
@@ -6549,7 +6703,7 @@ impl Server {
         let client = self.client.clone();
         let metadata = self.metadata.clone();
         let local_id = self.cluster.local_node_id();
-        let rf = self.replication_factor;
+        let rf = self.replication_factor.load(Ordering::Relaxed);
 
         // Spawn the per-chunk work in the background. Process one chunk at a time so
         // we don't flood all replica nodes with hundreds of concurrent verify RPCs.
@@ -7201,7 +7355,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         // Write data
         let data = b"Hello, distributed filesystem!";
@@ -7228,7 +7382,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         // Test write
         let data = b"Test chunk data";
@@ -7268,7 +7422,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let data = b"Test";
         let hash = compute_chunk_hash(data);
@@ -7325,7 +7479,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let file_id = dfs_common::FileId::new();
         let file_offset = 2 * 1024 * 1024u64; // chunk 512's file_offset
@@ -7388,7 +7542,7 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let file_id = dfs_common::FileId::new();
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
@@ -7464,7 +7618,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let file_id = dfs_common::FileId::new();
         let hash = compute_chunk_hash(b"chunk-data");
@@ -7525,7 +7679,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let file_id = dfs_common::FileId::new();
         let hash = compute_chunk_hash(b"chunk-data-ghost-pruned-batch");
@@ -7611,7 +7765,7 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let file_id = dfs_common::FileId::new();
         let nodes = vec![NodeId::new(), NodeId::new(), NodeId::new()];
@@ -7677,7 +7831,7 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let file_id = dfs_common::FileId::new();
         let nodes = vec![NodeId::new(), NodeId::new(), NodeId::new()];
@@ -7769,7 +7923,7 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let file_id = dfs_common::FileId::new();
         let hash = compute_chunk_hash(b"duplicate-in-one-batch");
@@ -7827,7 +7981,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf());
+        let server = Server::new(storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
 
         let file_id = dfs_common::FileId::new();
         let chunk_file_offset = 0u64;

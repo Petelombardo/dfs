@@ -3139,12 +3139,211 @@ else
 fi
 fi # should_run T44
 
+# ── Test 45: live healing tuning + replication-factor set/get, rejoin reconciliation ──
+#
+# Verifies the `dfs-admin healing set/get` and `cluster set/get` commands: healing
+# bandwidth ceiling, concurrency, and transfer timeout, plus replication_factor, are
+# live-tunable cluster-wide without a restart, and persist to config.toml so a restart
+# doesn't revert them. Also verifies the rejoin-reconciliation gap-closer: a node that's
+# down during a `cluster set --replication-factor` change silently keeps its stale
+# config — by design, each node reads replication_factor independently with no
+# cross-node consistency check — and must self-heal to the leader's value when it
+# rejoins, without the operator needing to notice and re-run the command (see
+# reconcile_replication_factor_with_leader in dfs-server/src/main.rs).
+if should_run T45; then
+snapshot_log T45
+echo ""
+echo "=== T45: live healing tuning + replication-factor set/get + rejoin reconciliation ==="
+
+# --- Part A: healing set/get — live effect + config persistence across a restart ---
+T45_BASELINE=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json healing get 2>/dev/null)
+echo "  T45: baseline healing tuning: $T45_BASELINE"
+
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing set \
+    --link-bandwidth-mb 55 --max-pct 42 --max-concurrent 6 --transfer-timeout-secs 77
+T45_AFTER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json healing get 2>/dev/null)
+echo "  T45: after set: $T45_AFTER"
+
+T45_LIVE_OK=$(echo "$T45_AFTER" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+ok = (d.get('link_bandwidth_mb') == 55 and abs(d.get('heal_max_pct', 0) - 42.0) < 0.01
+      and d.get('heal_max_concurrent') == 6 and d.get('heal_transfer_timeout_secs') == 77)
+print('PASS' if ok else 'FAIL')
+" 2>/dev/null || echo FAIL)
+check "T45a healing set applied live (link=55 pct=42 concurrent=6 timeout=77)" "$T45_LIVE_OK"
+
+T45_CONFIG_OK=PASS
+for i in 1 2 3 4 5; do
+    grep -q "link_bandwidth_mb = 55" "$BASE/node${i}/config.toml" || T45_CONFIG_OK=FAIL
+    grep -q "heal_max_concurrent = 6" "$BASE/node${i}/config.toml" || T45_CONFIG_OK=FAIL
+done
+check "T45b healing set persisted to config.toml on all 5 nodes" "$T45_CONFIG_OK"
+
+echo "  T45: restarting node1 to confirm tuned values survive (not reverted to defaults)..."
+pkill -f "dfs-server start --config $BASE/node1/config.toml" 2>/dev/null || true
+sleep 0.5
+RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node1/config.toml" \
+    >> "$LOG/server1.log" 2>&1 &
+
+# Poll for a full 5-node rejoin, not just node1's RPC listener being up — Part B below
+# uses node1 (cluster_addrs[0]) for cluster-wide node discovery via GetClusterStatus,
+# which needs join_cluster to have actually completed (repopulating node1's member
+# list), not merely an accepting socket. Bounded poll instead of a fixed sleep: fast
+# on the happy path (typically ~1-2s locally), safe if it's ever slower.
+T45_DEADLINE=$(( $(date +%s) + 15 ))
+while [ "$(date +%s)" -lt "$T45_DEADLINE" ]; do
+    T45_N=$("$BIN/dfs-admin" --cluster "127.0.0.1:8900" --format json cluster status 2>/dev/null \
+        | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_nodes', 0))" 2>/dev/null || echo 0)
+    [ "$T45_N" = "5" ] && break
+    sleep 1
+done
+
+T45_NODE1_STATUS=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json healing get 2>/dev/null || echo '{}')
+T45_SURVIVES_RESTART=$(echo "$T45_NODE1_STATUS" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('PASS' if d.get('link_bandwidth_mb') == 55 else 'FAIL')
+" 2>/dev/null || echo FAIL)
+check "T45c tuned healing values survive a node restart (persisted, not reverted)" "$T45_SURVIVES_RESTART"
+
+# --- Part B: replication-factor INCREASE — verify healing adds a real replica ---
+#
+# Deliberately tests an RF *increase* (3→4), not a decrease. Over-replication trims
+# (what a decrease would eventually trigger) require destructive_allowed =
+# grace_elapsed && nodes_down <= 1, where grace_elapsed needs LEADER_CHANGE_GRACE_SECS
+# (1200s = 20min) since the last leader election — and every test run boots a brand new
+# cluster (fresh leader election at startup), so that grace period cannot have elapsed
+# within this test's lifetime. Under-replication healing (an increase) has no such
+# gate — it's unconditional ("always safe") — so it's both the more meaningful check
+# (does healing actually push a real 4th replica onto existing data, not just accept a
+# new config number?) and the only RF direction that's fast enough to assert on here.
+
+# min_replica_count <path>: smallest nodes-per-chunk count across a file's chunks, via
+# dfs-admin's JSON file info. Used to poll for convergence after an RF change.
+min_replica_count() {
+    "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info "$1" 2>/dev/null \
+        | python3 -c "import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(min(len(c['nodes']) for c in d['chunk_locations']))
+except Exception:
+    print('?')" 2>/dev/null || echo "?"
+}
+
+T45_RF_FILE="$MOUNT/t45_rf.bin"
+dd if=/dev/urandom of="$T/t45_rf_src.bin" bs=1M count=1 2>/dev/null
+cp "$T/t45_rf_src.bin" "$T45_RF_FILE"
+dfs_sync
+
+T45_RF_BEFORE=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster get 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['replication_factor'])" 2>/dev/null || echo "?")
+echo "  T45: baseline replication_factor: $T45_RF_BEFORE"
+
+# Not waiting for full RF=3 convergence here — that would cost a full
+# healing_delay_secs+heal-loop-tick cycle for something T45i already checks below.
+# But dfs_sync only guarantees the client-facing write+metadata commit, not that
+# dfs-admin's separately-routed query (via cluster_addrs[0]) sees it on the very next
+# request — a brief metadata-propagation lag is real, so retry briefly rather than
+# taking a single immediate sample.
+T45_REPLICAS_BEFORE="?"
+for _ in 1 2 3 4 5; do
+    T45_REPLICAS_BEFORE=$(min_replica_count /t45_rf.bin)
+    [ "$T45_REPLICAS_BEFORE" != "?" ] && break
+    sleep 1
+done
+echo "  T45: replicas per chunk shortly after write (sync-only, no heal wait): $T45_REPLICAS_BEFORE"
+check "T45d write lands at least 2 sync replicas before any healing" \
+    "$( [ "${T45_REPLICAS_BEFORE:-0}" -ge 2 ] 2>/dev/null && echo PASS || echo FAIL )"
+
+echo "  T45: stopping node5 to simulate it being unreachable during the RF change..."
+pkill -f "dfs-server start --config $BASE/node5/config.toml" 2>/dev/null || true
+sleep 0.5
+
+# node5 is down, so this fans out to the other 4 and reports a failure (and non-zero
+# exit) for node5 — that's expected and is exactly the scenario rejoin reconciliation
+# exists to heal, so it's tolerated here.
+"$BIN/dfs-admin" --cluster "$CLUSTER" cluster set --replication-factor 4 2>&1 | tail -5 || true
+
+T45_RF_LIVE_NODES_OK=PASS
+for i in 1 2 3 4; do
+    grep -q "replication_factor = 4" "$BASE/node${i}/config.toml" || T45_RF_LIVE_NODES_OK=FAIL
+done
+check "T45e replication_factor updated + persisted on 4 reachable nodes while node5 was down" "$T45_RF_LIVE_NODES_OK"
+
+T45_NODE5_STALE_OK=PASS
+grep -q "replication_factor = 3" "$BASE/node5/config.toml" || T45_NODE5_STALE_OK=FAIL
+check "T45f node5 config still stale (=3) while down — confirms no silent cross-node update" "$T45_NODE5_STALE_OK"
+
+echo "  T45: restarting node5 — expect it to self-reconcile replication_factor to 4 on rejoin..."
+RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
+    >> "$LOG/server5.log" 2>&1 &
+
+T45_DEADLINE=$(( $(date +%s) + 30 ))
+T45_RECONCILED=FAIL
+while [ "$(date +%s)" -lt "$T45_DEADLINE" ]; do
+    if grep -q "replication_factor = 4" "$BASE/node5/config.toml" 2>/dev/null; then
+        T45_RECONCILED=PASS
+        break
+    fi
+    sleep 2
+done
+check "T45g node5 self-reconciled replication_factor to 4 after rejoining (no manual re-run needed)" "$T45_RECONCILED"
+
+T45_RECONCILE_LOG_OK=FAIL
+grep -q "stale vs. cluster majority" "$LOG/server5.log" 2>/dev/null && T45_RECONCILE_LOG_OK=PASS
+check "T45h reconciliation warning logged on node5" "$T45_RECONCILE_LOG_OK"
+
+# The real proof: does healing actually push a physical 4th replica of *existing* data,
+# not just accept the new config number?
+#
+# `healing trigger` is a one-shot RPC that only does anything if it lands on the
+# *current* leader — a non-leader just logs "ignoring" and still returns Ok, so the
+# caller can't tell it was a no-op. Node5 just restarted and reconciled RF moments
+# ago, so leadership may still be mid-transition — a single upfront trigger can race
+# that and land on a node that (correctly) ignores it, leaving convergence to the slow
+# passive 60s discovery cycle instead. Re-issue the trigger each iteration so a
+# transient "wrong node" miss just gets retried instead of dooming the whole check to
+# that passive cycle.
+echo "  T45: triggering healing (retried) and polling for the 4th replica to land on real data..."
+T45_DEADLINE=$(( $(date +%s) + 60 ))
+T45_HEALED_TO_4=FAIL
+while [ "$(date +%s)" -lt "$T45_DEADLINE" ]; do
+    "$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger >/dev/null 2>&1 || true
+    [ "$(min_replica_count /t45_rf.bin)" = "4" ] && { T45_HEALED_TO_4=PASS; break; }
+    sleep 3
+done
+check "T45i healing added a real 4th replica of existing data after RF 3→4 (was $T45_REPLICAS_BEFORE)" "$T45_HEALED_TO_4"
+
+"$BIN/dfs-admin" --cluster "$CLUSTER" file info /t45_rf.bin || true
+rm -f "$T45_RF_FILE" "$T/t45_rf_src.bin"
+
+# Restore defaults so any tests appended after this one start from a clean baseline.
+# This is a *decrease* (4→3) — deliberately not asserted on: the over-replication trim
+# it would eventually trigger is gated behind the 20-minute post-leader-election grace
+# period explained above, which this freshly-started test cluster can't have cleared
+# yet. The config value still updates immediately; only the physical trim-down lags,
+# and that's harmless (an extra replica, not a missing one) in the meantime.
+"$BIN/dfs-admin" --cluster "$CLUSTER" cluster set --replication-factor 3 >/dev/null 2>&1 || true
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing set \
+    --link-bandwidth-mb 100 --max-pct 60 --max-concurrent 8 --transfer-timeout-secs 120 >/dev/null 2>&1 || true
+
+fi # should_run T45
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="
 fusermount -u "$MOUNT" 2>/dev/null || true
 sleep 0.3
-kill $CLIENT_PID2 2>/dev/null || true
+# Don't assume CLIENT_PID2 is set — it's only assigned by remount tests (T8/T23/T24/
+# etc.), so running a later-numbered test standalone (e.g. `test_local_suite.sh T45`)
+# leaves it empty and `kill $CLIENT_PID2` a silent no-op, orphaning the mount's
+# dfs-client process. Use pkill (kills every match), not `kill $(pgrep | head -1)` —
+# if more than one dfs-client happens to be running at cleanup time (e.g. a prior
+# orphan that predates this fix, or a race with a concurrent invocation), head -1
+# only kills whichever one pgrep lists first, silently leaving the rest running
+# indefinitely. Same all-matches approach the top-of-script preamble already uses.
+pkill -f "dfs-client mount $MOUNT" 2>/dev/null || true
 pkill -f "dfs-server" 2>/dev/null || true
 rm -rf "$T"
 

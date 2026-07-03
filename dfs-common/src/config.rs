@@ -153,6 +153,29 @@ pub struct ReplicationConfig {
     /// Scrubbing interval in hours (background verification)
     #[serde(default = "default_scrub_interval")]
     pub scrub_interval_hours: u64,
+
+    /// Assumed node-to-node link bandwidth in MB/s, used as the 100% baseline for the
+    /// adaptive healing bandwidth controller (default: 100). `None` until resolved by
+    /// `Config::load_or_migrate_healing_tuning` — same Option-until-migrated shape as
+    /// `node.node_id`, so config always wins over a leftover `DFS_LINK_BANDWIDTH_MB` env
+    /// var once this has been set once (by migration or by `dfs-admin healing set`).
+    #[serde(default)]
+    pub link_bandwidth_mb: Option<usize>,
+
+    /// Maximum percentage of link bandwidth the healer may use, 10-100 (default: 60).
+    /// See `link_bandwidth_mb` doc for the Option/migration rationale.
+    #[serde(default)]
+    pub heal_max_pct: Option<f64>,
+
+    /// Maximum concurrent outstanding PushChunkTo heal transfers (default: 8).
+    /// See `link_bandwidth_mb` doc for the Option/migration rationale.
+    #[serde(default)]
+    pub heal_max_concurrent: Option<usize>,
+
+    /// Per-transfer timeout for a single heal push, in seconds (default: 120).
+    /// See `link_bandwidth_mb` doc for the Option/migration rationale.
+    #[serde(default)]
+    pub heal_transfer_timeout_secs: Option<u64>,
 }
 
 fn default_replication_factor() -> usize {
@@ -171,6 +194,26 @@ fn default_scrub_interval() -> u64 {
     24
 }
 
+/// Hardcoded final-fallback defaults for the healing-tuning knobs, used only when
+/// neither config nor the legacy env var provides a value. Kept as plain fns (not
+/// `#[serde(default = ...)]`) since the fields are now `Option<T>` — see
+/// `load_or_migrate_healing_tuning`.
+pub fn default_link_bandwidth_mb() -> usize {
+    100
+}
+
+pub fn default_heal_max_pct() -> f64 {
+    60.0
+}
+
+pub fn default_heal_max_concurrent() -> usize {
+    8
+}
+
+pub fn default_heal_transfer_timeout_secs() -> u64 {
+    120
+}
+
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
@@ -178,6 +221,10 @@ impl Default for ReplicationConfig {
             healing_delay_secs: default_healing_delay(),
             auto_heal: default_auto_heal(),
             scrub_interval_hours: default_scrub_interval(),
+            link_bandwidth_mb: None,
+            heal_max_pct: None,
+            heal_max_concurrent: None,
+            heal_transfer_timeout_secs: None,
         }
     }
 }
@@ -257,6 +304,67 @@ impl Config {
 
         Ok(node_id)
     }
+
+    /// Resolve the four healing-tuning knobs, mirroring `load_or_create_node_id`'s
+    /// resolution order and write-back behavior:
+    ///
+    ///   1. `replication.<field>` in config (canonical, once written — set either by a
+    ///      prior migration below, or live via `dfs-admin healing set`)
+    ///   2. The field's legacy `DFS_*` env var, migrated into config on first read
+    ///   3. A hardcoded default
+    ///
+    /// Once a field is `Some` in config it is never re-read from the env var again —
+    /// this is deliberate: `dfs-admin healing set` persists to config, and a stale env
+    /// var left in a systemd unit must never silently override a value the operator
+    /// already changed live. Call once at startup, before constructing `HealingManager`.
+    pub fn load_or_migrate_healing_tuning(&mut self, config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+        let mut changed = false;
+
+        if self.replication.link_bandwidth_mb.is_none() {
+            let v = std::env::var("DFS_LINK_BANDWIDTH_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(default_link_bandwidth_mb);
+            self.replication.link_bandwidth_mb = Some(v);
+            changed = true;
+        }
+        if self.replication.heal_max_pct.is_none() {
+            let v = std::env::var("DFS_HEAL_MAX_PCT")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or_else(default_heal_max_pct);
+            self.replication.heal_max_pct = Some(v);
+            changed = true;
+        }
+        if self.replication.heal_max_concurrent.is_none() {
+            let v = std::env::var("DFS_HEAL_MAX_CONCURRENT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(default_heal_max_concurrent);
+            self.replication.heal_max_concurrent = Some(v);
+            changed = true;
+        }
+        if self.replication.heal_transfer_timeout_secs.is_none() {
+            let v = std::env::var("DFS_HEAL_TRANSFER_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or_else(default_heal_transfer_timeout_secs);
+            self.replication.heal_transfer_timeout_secs = Some(v);
+            changed = true;
+        }
+
+        if changed {
+            if let Some(path) = config_path {
+                if let Err(e) = self.to_file(path) {
+                    // Non-fatal: node still works at the resolved values, just won't be
+                    // cached in config for next start (will re-migrate from env/defaults).
+                    tracing::warn!("Could not write migrated healing tuning back to config {:?}: {}", path, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -275,5 +383,35 @@ mod tests {
     fn test_chunk_size_bytes() {
         let config = Config::default();
         assert_eq!(config.chunk_size_bytes(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_healing_tuning_migration_uses_defaults_when_no_env() {
+        std::env::remove_var("DFS_LINK_BANDWIDTH_MB");
+        std::env::remove_var("DFS_HEAL_MAX_PCT");
+        std::env::remove_var("DFS_HEAL_MAX_CONCURRENT");
+        std::env::remove_var("DFS_HEAL_TRANSFER_TIMEOUT_SECS");
+
+        let mut config = Config::default();
+        config.load_or_migrate_healing_tuning(None).unwrap();
+
+        assert_eq!(config.replication.link_bandwidth_mb, Some(100));
+        assert_eq!(config.replication.heal_max_pct, Some(60.0));
+        assert_eq!(config.replication.heal_max_concurrent, Some(8));
+        assert_eq!(config.replication.heal_transfer_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn test_healing_tuning_config_wins_over_env_once_set() {
+        std::env::set_var("DFS_LINK_BANDWIDTH_MB", "999");
+
+        let mut config = Config::default();
+        config.replication.link_bandwidth_mb = Some(50); // already-migrated / admin-set value
+        config.load_or_migrate_healing_tuning(None).unwrap();
+
+        // Config value wins — the env var is never consulted once the field is Some.
+        assert_eq!(config.replication.link_bandwidth_mb, Some(50));
+
+        std::env::remove_var("DFS_LINK_BANDWIDTH_MB");
     }
 }

@@ -6379,6 +6379,12 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// The FUSE thread is parked in block_on but tokio worker threads keep running,
     /// so the metadata queue worker proceeds without starvation.
     pub async fn flush_metadata_sync(&self, metadata: &FileMetadata) {
+        {
+            let chunk0_size = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
+            info!("[SIZE TRACE] flush_metadata_sync path={} id={} seq={} chunks={} chunk0_size={:?} pending_chunk_locations_for_this_file={}",
+                metadata.path, metadata.id, metadata.write_seq, metadata.chunk_locations.len(), chunk0_size,
+                self.pending_chunk_locations.lock().await.iter().filter(|l| l.file_id == Some(metadata.id)).count());
+        }
         // Drain and synchronously send this file's own pending chunk-location
         // notifications first. Without this, fsync/release could return
         // (metadata_queue's push_and_wait below confirmed) while some chunk-location

@@ -202,6 +202,21 @@ struct ChunkSlot {
     /// recent_chunk_writes. This is the authoritative base for the next patch: if set,
     /// it takes priority over all other sources so we never use a stale chunk_id.
     server_chunk_id: Option<ChunkId>,
+    /// Total flush attempts that ended in the terminal "cannot safely fresh-write"
+    /// failure (see reconstruct_or_abort_for_fresh_write), across ticks — unlike
+    /// consecutive_patch_failures, this is NOT reset when that failure fires, since its
+    /// only purpose is pacing retries of a chunk that's failed this specific way before.
+    /// Used to compute `retry_backoff_until`.
+    terminal_failure_count: u32,
+    /// Set on a terminal flush failure to a short-in-the-future deadline; the periodic
+    /// ticker skips this slot until it passes. Without this, a chunk that fails this way
+    /// (e.g. its data no longer exists anywhere in the cluster) gets retried on every
+    /// 50ms tick forever — see the 2026-07-03 staging incident, where a permanently
+    /// under-replicated chunk's sole replica was wiped mid-repave: every retry failed
+    /// identically, at ~20/sec, until the client was manually restarted. Backing off
+    /// doesn't fix an unrecoverable chunk, but it stops the client from hammering the
+    /// leader and spamming logs over something that isn't going to change on its own.
+    retry_backoff_until: Option<std::time::Instant>,
 }
 
 impl ChunkSlot {
@@ -216,7 +231,21 @@ impl ChunkSlot {
             flushing: false,
             last_sequential_end: None,
             server_chunk_id: None,
+            terminal_failure_count: 0,
+            retry_backoff_until: None,
         }
+    }
+
+    /// Backoff after a terminal flush failure: 1s, 2s, 4s, ... capped at 30s.
+    fn record_terminal_failure(&mut self) {
+        self.terminal_failure_count = self.terminal_failure_count.saturating_add(1);
+        let secs = 1u64 << self.terminal_failure_count.saturating_sub(1).min(5);
+        self.retry_backoff_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs.min(30)));
+    }
+
+    /// True if a prior terminal failure's backoff hasn't elapsed yet.
+    fn in_backoff(&self) -> bool {
+        self.retry_backoff_until.is_some_and(|t| std::time::Instant::now() < t)
     }
 
     /// Record a write at [start, end) into dirty_ranges, merging with adjacent ranges.
@@ -1355,9 +1384,13 @@ impl FlushHandle {
             let Some(state_arc) = self.write_buffers.get(&ino) else { return Ok(()); };
             let mut state = state_arc.lock().await;
 
-            // Full slots first (lowest index, not already claimed, not already on server)
+            // Full slots first (lowest index, not already claimed, not already on server).
+            // Backoff only applies when !urgent — the ticker's opportunistic path should
+            // skip a slot that just failed terminally rather than hammer it every tick,
+            // but fsync/release (urgent=true) must still see and flush it: the caller is
+            // waiting synchronously and needs the real outcome, not a silent no-op.
             let mut full: Vec<u64> = state.slots.iter()
-                .filter(|(_, s)| s.is_full() && !s.flushing)
+                .filter(|(_, s)| s.is_full() && !s.flushing && (urgent || !s.in_backoff()))
                 .map(|(idx, _)| *idx)
                 .collect();
             full.sort_unstable();
@@ -1367,7 +1400,7 @@ impl FlushHandle {
             } else {
                 // No full unclaimed slot — try the oldest idle partial slot.
                 let mut idle: Vec<(u64, SystemTime)> = state.slots.iter()
-                    .filter(|(_, s)| s.is_idle() && !s.data.is_empty() && !s.flushing)
+                    .filter(|(_, s)| s.is_idle() && !s.data.is_empty() && !s.flushing && (urgent || !s.in_backoff()))
                     .map(|(idx, s)| (*idx, s.last_modified))
                     .collect();
                 idle.sort_by_key(|&(_, t)| t);
@@ -1594,15 +1627,21 @@ impl FlushHandle {
             *slot_data = reconstructed;
             Ok(())
         } else {
-            warn!("flush_buffer_async_one: ino={} chunk={} cache miss — aborting to prevent zeroing untouched chunk regions (returning EIO)",
-                ino, chunk_idx);
+            let mut backoff_secs = 0u64;
             if let Some(state_arc) = self.write_buffers.get(&ino) {
                 let mut state = state_arc.lock().await;
                 if let Some(slot) = state.slots.get_mut(&chunk_idx) {
                     slot.flushing = false;
                     slot.consecutive_patch_failures = 0;
+                    slot.record_terminal_failure();
+                    backoff_secs = slot.retry_backoff_until
+                        .map(|t| t.saturating_duration_since(std::time::Instant::now()).as_secs())
+                        .unwrap_or(0);
                 }
             }
+            warn!("flush_buffer_async_one: ino={} chunk={} cache miss — aborting to prevent zeroing untouched chunk regions \
+                   (returning EIO, backing off retries for this chunk {}s)",
+                ino, chunk_idx, backoff_secs);
             self.notify_chunk_flush_complete(ino, chunk_idx).await;
             Err(anyhow::anyhow!(
                 "chunk {} cache miss: cannot safely fresh-write without zeroing untouched real data", chunk_idx
@@ -1624,6 +1663,11 @@ impl FlushHandle {
             .and_then(|s| s.try_lock().ok().and_then(|st| st.expected_file_id));
 
         // Check whether this slot needs PatchChunk or a fresh write.
+        // Set inside the block below: true when flushed_sizes had no entry for this
+        // chunk, i.e. this is the first flush of it in the current write session — the
+        // only window where existing_chunk_size depends on (possibly stale/incomplete)
+        // metadata_cache rather than this session's own authoritative flush history.
+        let mut is_first_flush_this_session = true;
         let existing_chunk_size = {
             // Check if the buffer has a file_id expectation. If metadata_cache now refers
             // to a different file (inode reuse after delete+create), any chunk size from
@@ -1637,6 +1681,7 @@ impl FlushHandle {
             let from_flushed = self.write_buffers.get(&ino)
                 .and_then(|s| s.try_lock().ok()
                     .and_then(|st| st.flushed_sizes.get(&chunk_idx).copied()));
+            is_first_flush_this_session = from_flushed.is_none();
             if let Some(flushed) = from_flushed {
                 flushed // flushed_sizes is always authoritative (same session)
             } else if meta_id_matches {
@@ -1850,31 +1895,43 @@ impl FlushHandle {
                         Some(loc) => {
                             match self.client.get_single_chunk_location(meta.id, chunk_idx).await {
                                 Ok(Some(fresh)) if fresh.chunk_id == loc.chunk_id && fresh.nodes != loc.nodes => {
-                                    // Reconcile: keep pruned-ghost removal (nodes no longer in
-                                    // fresh are gone from the ring and should be excluded), but
-                                    // do NOT promote healer-added nodes (nodes in fresh but not
-                                    // in loc) into the patch window. A healer-added node is
-                                    // registered in the leader's metadata before the copy
-                                    // completes; including it as a patch target displaces a
-                                    // confirmed holder into the dual-RF skip slot, which then
-                                    // loses its copy via tombstone — leaving only 1 replica.
-                                    // Use the intersection: nodes confirmed by both the leader
-                                    // (still live) and our last write (known to hold the chunk).
-                                    // If the intersection is empty the chunk migrated entirely
-                                    // and we fall back to the leader's full list.
-                                    let intersection: Vec<dfs_common::NodeId> = loc.nodes.iter()
-                                        .filter(|n| fresh.nodes.contains(n))
-                                        .copied()
-                                        .collect();
-                                    let reconciled_nodes = if intersection.is_empty() {
-                                        fresh.nodes.clone()
-                                    } else {
-                                        intersection
-                                    };
+                                    // Trust the leader's fresh node list wholesale — it both
+                                    // prunes ghosts (nodes no longer in fresh are gone from the
+                                    // ring) and picks up nodes added since our session cache was
+                                    // last refreshed.
+                                    //
+                                    // This used to intersect loc.nodes with fresh.nodes instead,
+                                    // on the theory that a healer-added node might be registered
+                                    // in the leader's metadata before its copy actually completes
+                                    // — trusting it as a patch target could displace a confirmed
+                                    // holder into the dual-RF skip slot, which then loses its
+                                    // copy via tombstone, leaving too few replicas. Audited every
+                                    // live path that writes a chunk's node list into the leader's
+                                    // metadata (do_heal_chunk_shared verifies via HasChunks before
+                                    // recording; the FUSE write path relies entirely on the healer
+                                    // for the 3rd replica and never writes it speculatively itself;
+                                    // MultiPatch reports only patched_node_ids — nodes the client
+                                    // itself directly confirmed via RPC response) and found none
+                                    // that registers an unconfirmed node — so "in fresh" already
+                                    // means confirmed, and intersecting against a merely-stale
+                                    // client-side cache only threw away good replicas.
+                                    //
+                                    // Real incident, 2026-07-03 (staging gluster3 repave): a
+                                    // chunk's confirmed holders were healer-migrated out from
+                                    // under a session whose cache still pointed at 2 old nodes.
+                                    // Old nodes ∩ fresh nodes coincidentally overlapped in exactly
+                                    // one node — the one being repaved — so intersection collapsed
+                                    // the target set to that single, about-to-disappear node
+                                    // instead of the 2 actually-good replicas fresh reported.
+                                    // Every subsequent patch attempt failed identically until the
+                                    // client was restarted, since the stale cache never healed
+                                    // itself: this exact reconciliation is the only place a stale
+                                    // session cache gets corrected before the intersection could
+                                    // discard the correction.
                                     info!("flush_buffer_async_one: ino={} chunk={} no session override yet — \
-                                           refreshing node list from leader before first patch this session ({:?} -> {:?}, reconciled={:?})",
-                                        ino, chunk_idx, loc.nodes, fresh.nodes, reconciled_nodes);
-                                    Some(ChunkLocation { nodes: reconciled_nodes, ..loc })
+                                           refreshing node list from leader before first patch this session ({:?} -> {:?})",
+                                        ino, chunk_idx, loc.nodes, fresh.nodes);
+                                    Some(ChunkLocation { nodes: fresh.nodes.clone(), ..loc })
                                 }
                                 _ => Some(loc),
                             }
@@ -2335,6 +2392,63 @@ impl FlushHandle {
             // Fall through to normal fresh write path which sends the full slot_data
         }
 
+        // Last-line-of-defense safety check: about to fabricate gap_filled_prefix bytes
+        // of zeros on the belief this chunk doesn't exist yet (chunk_exists=false). That
+        // belief comes from existing_chunk_size, sourced from metadata_cache — which can
+        // be stale specifically on a chunk's first flush in a session (see the open()
+        // synchronous-refresh fix above). Real incident, 2026-07-03 (staging nanopir3):
+        // dvr.conf's real 111 bytes were zeroed exactly this way, and reproduced even
+        // after that fix — the precise staleness cause wasn't fully pinned down, so
+        // rather than requiring perfect cache freshness everywhere, treat this as a
+        // final, authoritative check instead. Scoped to first-flush-this-session only
+        // (is_first_flush_this_session) so it doesn't add an RPC to every legitimate
+        // sparse write to a genuinely-new chunk (e.g. VM disk image creation) — only the
+        // narrow window where existing_chunk_size hasn't yet been confirmed by this
+        // session's own flush history.
+        if !chunk_exists && gap_filled_prefix > 0 && is_first_flush_this_session {
+            let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
+            let fresh_has_chunk = if let Some(path) = path_opt.clone() {
+                match self.client.get_file_metadata(&path).await {
+                    Ok(Some(fresh)) => {
+                        let fresh_chunk0 = fresh.chunk_location_for_idx(chunk_idx).map(|l| l.size);
+                        let has_chunk = fresh_chunk0.map(|s| s > 0).unwrap_or(false);
+                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} fresh_chunks={} fresh_chunk0_size={:?} has_chunk={}",
+                            ino, chunk_idx, path, fresh.chunk_locations.len(), fresh_chunk0, has_chunk);
+                        if has_chunk {
+                            self.metadata_cache.insert(ino, fresh);
+                        }
+                        has_chunk
+                    }
+                    Ok(None) => {
+                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} server_says_not_found", ino, chunk_idx, path);
+                        false
+                    }
+                    Err(e) => {
+                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} lookup_error={}", ino, chunk_idx, path, e);
+                        false
+                    }
+                }
+            } else {
+                info!("[SIZE TRACE] flush-safety-check ino={} chunk={} no_path_known", ino, chunk_idx);
+                false
+            };
+            if fresh_has_chunk {
+                warn!("flush_buffer_async_one: ino={} chunk={} fresh-write safety check: server says this chunk actually has real data (metadata_cache was stale) — refusing to send gap-fill zeros over it; will retry with corrected metadata",
+                    ino, chunk_idx);
+                if let Some(state_arc) = self.write_buffers.get(&ino) {
+                    if let Ok(mut state) = state_arc.try_lock() {
+                        if let Some(slot) = state.slots.get_mut(&chunk_idx) {
+                            slot.flushing = false;
+                        }
+                    }
+                }
+                self.notify_chunk_flush_complete(ino, chunk_idx).await;
+                anyhow::bail!(
+                    "chunk {} fresh-write safety check found real existing data — aborting this attempt to avoid corruption", chunk_idx
+                );
+            }
+        }
+
         // Normal fresh write path (contiguous data, no gaps)
         // Acquire the per-chunk write lock for the fresh-write path too.
         let _chunk_guard = DfsFilesystem::lock_chunk(&self.chunk_write_locks, ino, chunk_idx).await;
@@ -2465,6 +2579,9 @@ impl FlushHandle {
                             meta.size = meta.size.max(end);
                         }
                     }
+                    info!("[SIZE TRACE] splice ino={} chunk={} spliced_locations={} meta_chunks_after={} meta_chunk0_size_after={:?}",
+                        ino, chunk_idx, locations.len(), meta.chunk_locations.len(),
+                        meta.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size));
                     // Don't clobber an mtime the user explicitly just set via setattr
                     // (utimes/utimensat) — e.g. rsync -a's temp-file restore can land
                     // before this flush completes (T37).
@@ -3243,7 +3360,13 @@ impl DfsFilesystem {
                             .map(|s| s.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>())
                             .sum();
                         if in_flight_bytes >= PIPELINE_MAX_BYTES { drop(state); continue; }
-                        let has_full = !state.full_slot_indices().is_empty();
+                        // Backoff only gates this opportunistic background dispatch, not
+                        // full_slot_indices() itself — fsync/release/flush_all_pipelined
+                        // callers elsewhere need an accurate answer immediately, not one
+                        // silently suppressed by a terminal-failure backoff the caller
+                        // doesn't know about.
+                        let has_full = state.slots.iter()
+                            .any(|(_, s)| s.is_full() && !s.flushing && !s.in_backoff());
                         let no_active_writers = write_open_counts_for_bg
                             .get(&ino).map(|c| *c == 0).unwrap_or(true);
                         // Flush idle slots with no new writes for >500ms, even with active
@@ -3268,11 +3391,11 @@ impl DfsFilesystem {
                             .unwrap_or(false);
                         if pipeline_busy { drop(state); continue; }
                         let has_stale = release_inflight == 0 && state.slots.iter().any(|(_, s)| {
-                            !s.data.is_empty() && !s.flushing && s.is_idle() &&
+                            !s.data.is_empty() && !s.flushing && !s.in_backoff() && s.is_idle() &&
                             s.last_modified.elapsed().map(|e| e.as_millis()).unwrap_or(0) >= STALE_FLUSH_MS
                         });
                         let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
-                            s.is_idle() && !s.data.is_empty() && !s.flushing
+                            s.is_idle() && !s.data.is_empty() && !s.flushing && !s.in_backoff()
                         });
                         drop(state);
                         if !has_full && !has_idle && !has_stale { continue; }
@@ -3970,19 +4093,71 @@ impl Filesystem for DfsFilesystem {
             // rebalancing since the last fetch. Without this, a write open on a long-lived
             // file (e.g. a multi-hour DVR recording) uses chunk locations from hours ago,
             // causing PatchChunk to target nodes that no longer hold the chunk.
-            // Skip for first-writer opens: the writer is about to replace file content, so
-            // stale chunk locations are irrelevant.  A background refresh that completes
-            // after the write session flushes will overwrite the freshly-committed metadata
-            // with old server data, causing the file to revert to its pre-write size.
-            // For subsequent writers on the same inode (write_open_count > 1), the metadata
-            // is already fresh from the first writer's open, so skip there too.
             // Mark inode as write-open so reads bypass the chunk cache for this session.
             // Synchronous — happens before open() returns, so the app's first read
             // after open always fetches fresh data from the server.
             self.client.write_open_inodes.insert(ino);
 
             let is_first_writer = self.write_open_counts.get(&ino).map(|c| *c == 1).unwrap_or(true);
-            if !is_first_writer {
+            if is_first_writer {
+                // O_TRUNC: skip — the writer is about to replace file content wholesale, so
+                // stale chunk locations are irrelevant, and the O_TRUNC branch below removes
+                // the metadata_cache entry outright to force a clean slate anyway.
+                //
+                // Non-O_TRUNC: MUST refresh synchronously (not backgrounded) before returning
+                // from open(). Without this, a write session that partially rewrites an
+                // existing file (not a full O_TRUNC replace) can find a stale or entirely
+                // missing metadata_cache entry — most likely right after a client restart,
+                // before this file has been touched again — and flush_buffer_async_one's
+                // existing_chunk_size computation falls back to 0, misclassifying the write
+                // as "chunk doesn't exist yet" (fresh-write path) instead of an append/patch.
+                // The fresh-write path then sends the *whole* buffer, including synthetic
+                // gap-fill zeros for any byte range the app didn't touch this session —
+                // silently overwriting real existing content with zeros.
+                //
+                // Real incident, 2026-07-03 (staging nanopir3): dvr.conf's first 111 bytes
+                // were zeroed exactly this way when the DVR container appended one line
+                // (O_RDWR, no O_TRUNC) moments after a dfs-client restart.
+                //
+                // Only pay the RPC when the in-memory cache actually looks like it might be
+                // missing real chunk data (absent entirely, or present with zero chunks) —
+                // a cheap, no-network check. A hot-reopen workload (e.g. QEMU cycling a VM
+                // disk's fd every few seconds via BLKFLSBUF) already has a populated,
+                // non-empty entry from its own prior open in the same long-lived session,
+                // so it never pays this cost; only a genuinely cold cache does.
+                let cached_chunk0_size = self.metadata_cache.get(&ino)
+                    .and_then(|m| m.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size));
+                let cache_looks_empty = self.metadata_cache.get(&ino)
+                    .map(|m| m.chunk_locations.is_empty())
+                    .unwrap_or(true);
+                info!("[SIZE TRACE] open-write-check ino={} is_trunc={} cache_present={} cache_looks_empty={} cached_chunk0_size={:?}",
+                    ino, is_trunc, self.metadata_cache.get(&ino).is_some(), cache_looks_empty, cached_chunk0_size);
+                if !is_trunc && cache_looks_empty {
+                    let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
+                    if let Some(path) = path_opt {
+                        let client = self.client.clone();
+                        match self.runtime.block_on(client.get_file_metadata(&path)) {
+                            Ok(Some(fresh)) => {
+                                let fresh_chunk0_size = fresh.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
+                                info!("[SIZE TRACE] open-write-refresh ino={} path={} fresh_chunks={} fresh_chunk0_size={:?}",
+                                    ino, path, fresh.chunk_locations.len(), fresh_chunk0_size);
+                                self.client.seed_write_seq(fresh.id, fresh.write_seq);
+                                self.metadata_cache.insert(ino, fresh);
+                            }
+                            Ok(None) => {
+                                info!("[SIZE TRACE] open-write-refresh ino={} path={} server_says_not_found", ino, path);
+                            }
+                            Err(e) => {
+                                info!("[SIZE TRACE] open-write-refresh ino={} path={} lookup_error={}", ino, path, e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Subsequent writers on an already-open inode: the first writer's open
+                // (above) already made metadata fresh for this session, so refresh in the
+                // background rather than blocking this open() — the staleness window left
+                // over is negligible.
                 let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
                 if let Some(path) = path_opt {
                     let client = self.client.clone();
@@ -6274,8 +6449,29 @@ impl Filesystem for DfsFilesystem {
                         if still_live {
                             let meta_to_persist = flush_handle.metadata_cache.get(&ino).map(|m| m.clone());
                             if let Some(meta) = meta_to_persist {
-                                flush_handle.client.flush_metadata_sync(&meta).await;
-                                flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                                // Don't blindly re-send whatever metadata_cache currently holds —
+                                // nothing was buffered this session (has_unflushed=false), so this
+                                // cache entry's chunk_locations may never have been populated with
+                                // real data (e.g. a scalar-only startup warm-up entry, right after a
+                                // client restart). Sending it while empty on a file that isn't
+                                // genuinely empty (size>0) claims "this file has no chunks" — a real
+                                // incident, 2026-07-03 (staging nanopir3): the server trusted exactly
+                                // this shape of commit as an intentional truncate and wiped its own
+                                // correct chunk_map entry, and the next write zeroed real content
+                                // over the gap. The server now refuses that specific case too
+                                // (chunk_map_update requires size==0 to treat empty chunk_locations
+                                // as a genuine truncate), but the client shouldn't construct and
+                                // send a claim about file state it doesn't actually know in the
+                                // first place — skip the redundant commit when there's nothing
+                                // trustworthy to report.
+                                let trustworthy = !meta.chunk_locations.is_empty() || meta.size == 0;
+                                if trustworthy {
+                                    flush_handle.client.flush_metadata_sync(&meta).await;
+                                    flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                                } else {
+                                    warn!("release: ino={} skipping metadata re-commit — cached chunk_locations empty but size={} (untrustworthy snapshot, nothing changed this session)",
+                                        ino, meta.size);
+                                }
                             }
                         }
                     }
@@ -6422,8 +6618,29 @@ impl Filesystem for DfsFilesystem {
                         if still_live {
                             let meta_to_persist = flush_handle.metadata_cache.get(&ino).map(|m| m.clone());
                             if let Some(meta) = meta_to_persist {
-                                flush_handle.client.flush_metadata_sync(&meta).await;
-                                flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                                // Don't blindly re-send whatever metadata_cache currently holds —
+                                // nothing was buffered this session (has_unflushed=false), so this
+                                // cache entry's chunk_locations may never have been populated with
+                                // real data (e.g. a scalar-only startup warm-up entry, right after a
+                                // client restart). Sending it while empty on a file that isn't
+                                // genuinely empty (size>0) claims "this file has no chunks" — a real
+                                // incident, 2026-07-03 (staging nanopir3): the server trusted exactly
+                                // this shape of commit as an intentional truncate and wiped its own
+                                // correct chunk_map entry, and the next write zeroed real content
+                                // over the gap. The server now refuses that specific case too
+                                // (chunk_map_update requires size==0 to treat empty chunk_locations
+                                // as a genuine truncate), but the client shouldn't construct and
+                                // send a claim about file state it doesn't actually know in the
+                                // first place — skip the redundant commit when there's nothing
+                                // trustworthy to report.
+                                let trustworthy = !meta.chunk_locations.is_empty() || meta.size == 0;
+                                if trustworthy {
+                                    flush_handle.client.flush_metadata_sync(&meta).await;
+                                    flush_handle.last_metadata_update.insert(ino, std::time::Instant::now());
+                                } else {
+                                    warn!("release: ino={} skipping metadata re-commit — cached chunk_locations empty but size={} (untrustworthy snapshot, nothing changed this session)",
+                                        ino, meta.size);
+                                }
                             }
                         }
                     }
@@ -7336,7 +7553,12 @@ impl Filesystem for DfsFilesystem {
                                 .get(&ino)
                                 .map(|t| t.elapsed().as_millis() >= METADATA_SYNC_DEBOUNCE_MS)
                                 .unwrap_or(true);
-                            if needs_sync {
+                            // Same untrustworthy-snapshot guard as release() — fsync() can fire
+                            // on a session that hasn't written this file's chunk data (e.g. a
+                            // defensive/periodic fsync right after open), so metadata_cache may
+                            // still hold a scalar-only entry with no real chunk_locations.
+                            let trustworthy = !meta.chunk_locations.is_empty() || meta.size == 0;
+                            if needs_sync && trustworthy {
                                 handle.client.flush_metadata_sync(&meta).await;
                                 handle.last_metadata_update.insert(ino, std::time::Instant::now());
                             }
@@ -7713,7 +7935,11 @@ impl Filesystem for DfsFilesystem {
                         return;
                     }
                     if let Some(meta) = metadata_cache.get(&ino).map(|m| m.clone()) {
-                        client.flush_metadata_sync(&meta).await;
+                        // Same untrustworthy-snapshot guard as release()/fsync() — see the
+                        // 2026-07-03 dvr.conf incident comment there for why this matters.
+                        if !meta.chunk_locations.is_empty() || meta.size == 0 {
+                            client.flush_metadata_sync(&meta).await;
+                        }
                     }
 
                     reply.ioctl(0, &[]);

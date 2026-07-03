@@ -74,6 +74,16 @@ enum ClusterCommands {
         /// Node ID to remove
         node_id: String,
     },
+    /// Live-update cluster-wide settings (currently: replication factor). Fans out to
+    /// every reachable node and persists to config.toml on each. A node that's
+    /// unreachable during the change reconciles to the leader's value on rejoin.
+    Set {
+        /// New replication factor (number of copies to maintain per chunk)
+        #[arg(long)]
+        replication_factor: usize,
+    },
+    /// Show current cluster-wide settings (currently: replication factor)
+    Get,
 }
 
 #[derive(Subcommand)]
@@ -92,6 +102,26 @@ enum HealingCommands {
     Enable,
     /// Disable auto-healing
     Disable,
+    /// Live-update one or more healing tuning knobs cluster-wide. Omitted flags are
+    /// left unchanged. Applied immediately (no restart) and persisted to config.toml
+    /// on every node, so a restart doesn't revert it — a stale env var left in a
+    /// systemd unit can never override this once set.
+    Set {
+        /// Assumed node-to-node link bandwidth in MB/s (the adaptive controller's 100% mark)
+        #[arg(long)]
+        link_bandwidth_mb: Option<usize>,
+        /// Max percentage of link bandwidth the healer may use, 10-100
+        #[arg(long)]
+        max_pct: Option<f64>,
+        /// Max concurrent outstanding heal transfers
+        #[arg(long)]
+        max_concurrent: Option<usize>,
+        /// Per-transfer timeout in seconds
+        #[arg(long)]
+        transfer_timeout_secs: Option<u64>,
+    },
+    /// Show current healing tuning values (bandwidth ceiling, concurrency, timeout)
+    Get,
     /// Trigger immediate healing check
     Trigger,
     /// Rebuild path index and chunk map from file records (non-blocking, runs in background)
@@ -412,6 +442,56 @@ async fn handle_cluster_command(
                 }
             }
         }
+        ClusterCommands::Set { replication_factor } => {
+            let all_addrs = discover_all_addrs(cluster_addrs).await;
+            let mut failed = 0usize;
+            for addr in &all_addrs {
+                match send_request(*addr, Request::SetReplicationFactor { replication_factor }).await {
+                    Ok(Response::Ok { .. }) => {}
+                    Ok(Response::Error { message, .. }) => {
+                        error!("Set replication factor failed on {}: {}", addr, message);
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        error!("Set replication factor error on {}: {}", addr, e);
+                        failed += 1;
+                    }
+                    _ => { failed += 1; }
+                }
+            }
+            if failed == 0 {
+                println!("Replication factor set to {} on all {} node(s)", replication_factor, all_addrs.len());
+                println!();
+                println!("Note: writes only durably sync 2 replicas even at RF>=3 (3rd is async) —");
+                println!("this does not change write-path durability unless RF crosses the 3 boundary.");
+                println!("Over-replication trim is throttled (~200 chunks/15s tick) and gated by");
+                println!("cluster-health checks — a decrease will drain gradually, not instantly.");
+            } else {
+                anyhow::bail!("Set replication factor failed on {}/{} node(s)", failed, all_addrs.len());
+            }
+        }
+        ClusterCommands::Get => {
+            let response = send_request(cluster_addrs[0], Request::GetClusterStatus).await?;
+            match response {
+                Response::ClusterStatus { replication_factor, .. } => {
+                    if json_output {
+                        let output = serde_json::json!({ "replication_factor": replication_factor });
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else {
+                        println!("DFS Cluster Settings");
+                        println!("=====================");
+                        println!("Replication factor: {}", replication_factor);
+                    }
+                }
+                Response::Error { message, .. } => {
+                    error!("Error: {}", message);
+                    anyhow::bail!("Command failed: {}", message);
+                }
+                _ => {
+                    anyhow::bail!("Unexpected response type");
+                }
+            }
+        }
     }
 
     Ok(())
@@ -540,6 +620,20 @@ async fn handle_storage_command(
     Ok(())
 }
 
+/// Discover every node's address via GetClusterStatus, for commands that fan out to
+/// the whole cluster (e.g. `healing enable/disable/set`, `cluster set`). Falls back to
+/// the caller-supplied addresses if the query fails, so the command still does
+/// *something* useful rather than erroring out entirely.
+async fn discover_all_addrs(cluster_addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    if let Ok(Response::ClusterStatus { nodes, .. }) =
+        send_request(cluster_addrs[0], Request::GetClusterStatus).await
+    {
+        nodes.iter().map(|n| n.addr).collect()
+    } else {
+        cluster_addrs.to_vec()
+    }
+}
+
 /// Resolve the leader's socket address by querying GetClusterStatus.
 /// Falls back to cluster_addrs[0] if the leader can't be determined.
 async fn find_leader_addr(cluster_addrs: &[SocketAddr]) -> SocketAddr {
@@ -571,6 +665,10 @@ async fn handle_healing_command(
                     stalled_count,
                     last_check,
                     bandwidth_mb,
+                    link_bandwidth_mb,
+                    heal_max_pct,
+                    heal_max_concurrent,
+                    heal_transfer_timeout_secs,
                 } => {
                     if json_output {
                         let output = serde_json::json!({
@@ -580,6 +678,10 @@ async fn handle_healing_command(
                             "stalled_count": stalled_count,
                             "last_check": last_check,
                             "bandwidth_mb": bandwidth_mb,
+                            "link_bandwidth_mb": link_bandwidth_mb,
+                            "heal_max_pct": heal_max_pct,
+                            "heal_max_concurrent": heal_max_concurrent,
+                            "heal_transfer_timeout_secs": heal_transfer_timeout_secs,
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
@@ -589,7 +691,9 @@ async fn handle_healing_command(
                         println!("Pending:       {}", pending_count);
                         println!("In-flight:     {}", in_flight_count);
                         println!("Stalled:       {}", stalled_count);
-                        println!("Bandwidth:     {}MB/s", bandwidth_mb);
+                        println!("Bandwidth:     {}MB/s (ceiling: {}% of {}MB/s link)", bandwidth_mb, heal_max_pct, link_bandwidth_mb);
+                        println!("Max Concurrent: {}", heal_max_concurrent);
+                        println!("Transfer Timeout: {}s", heal_transfer_timeout_secs);
                         println!("Last Check:    {} seconds ago", last_check);
                     }
                 }
@@ -603,14 +707,7 @@ async fn handle_healing_command(
             }
         }
         HealingCommands::Enable => {
-            let all_addrs: Vec<SocketAddr> =
-                if let Ok(Response::ClusterStatus { nodes, .. }) =
-                    send_request(cluster_addrs[0], Request::GetClusterStatus).await
-                {
-                    nodes.iter().map(|n| n.addr).collect()
-                } else {
-                    cluster_addrs.to_vec()
-                };
+            let all_addrs = discover_all_addrs(cluster_addrs).await;
             let mut failed = 0usize;
             for addr in &all_addrs {
                 match send_request(*addr, Request::EnableHealing).await {
@@ -633,14 +730,7 @@ async fn handle_healing_command(
             }
         }
         HealingCommands::Disable => {
-            let all_addrs: Vec<SocketAddr> =
-                if let Ok(Response::ClusterStatus { nodes, .. }) =
-                    send_request(cluster_addrs[0], Request::GetClusterStatus).await
-                {
-                    nodes.iter().map(|n| n.addr).collect()
-                } else {
-                    cluster_addrs.to_vec()
-                };
+            let all_addrs = discover_all_addrs(cluster_addrs).await;
             let mut failed = 0usize;
             for addr in &all_addrs {
                 match send_request(*addr, Request::DisableHealing).await {
@@ -735,6 +825,81 @@ async fn handle_healing_command(
             match response {
                 Response::Ok { .. } => {
                     println!("Phantom reconciliation triggered on leader ({})", leader);
+                }
+                Response::Error { message, .. } => {
+                    error!("Error: {}", message);
+                    anyhow::bail!("Command failed: {}", message);
+                }
+                _ => {
+                    anyhow::bail!("Unexpected response type");
+                }
+            }
+        }
+        HealingCommands::Set { link_bandwidth_mb, max_pct, max_concurrent, transfer_timeout_secs } => {
+            if link_bandwidth_mb.is_none() && max_pct.is_none() && max_concurrent.is_none() && transfer_timeout_secs.is_none() {
+                anyhow::bail!(
+                    "healing set requires at least one of --link-bandwidth-mb, --max-pct, --max-concurrent, --transfer-timeout-secs"
+                );
+            }
+
+            let all_addrs = discover_all_addrs(cluster_addrs).await;
+            let mut failed = 0usize;
+            let mut applied: Option<(usize, f64, usize, u64)> = None;
+            for addr in &all_addrs {
+                match send_request(*addr, Request::SetHealingTuning {
+                    link_bandwidth_mb,
+                    heal_max_pct: max_pct,
+                    heal_max_concurrent: max_concurrent,
+                    heal_transfer_timeout_secs: transfer_timeout_secs,
+                }).await {
+                    Ok(Response::HealingStatus { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs, .. }) => {
+                        applied = Some((link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs));
+                    }
+                    Ok(Response::Error { message, .. }) => {
+                        error!("Healing set failed on {}: {}", addr, message);
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        error!("Healing set error on {}: {}", addr, e);
+                        failed += 1;
+                    }
+                    _ => { failed += 1; }
+                }
+            }
+            if failed == 0 {
+                println!("Healing tuning updated on all {} node(s)", all_addrs.len());
+                if let Some((bw, pct, conc, timeout)) = applied {
+                    println!("  link_bandwidth_mb:          {}", bw);
+                    println!("  heal_max_pct:               {}", pct);
+                    println!("  heal_max_concurrent:        {}", conc);
+                    println!("  heal_transfer_timeout_secs: {}", timeout);
+                }
+            } else {
+                anyhow::bail!("Healing set failed on {}/{} node(s)", failed, all_addrs.len());
+            }
+        }
+        HealingCommands::Get => {
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, Request::GetHealingStatus).await?;
+
+            match response {
+                Response::HealingStatus { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs, .. } => {
+                    if json_output {
+                        let output = serde_json::json!({
+                            "link_bandwidth_mb": link_bandwidth_mb,
+                            "heal_max_pct": heal_max_pct,
+                            "heal_max_concurrent": heal_max_concurrent,
+                            "heal_transfer_timeout_secs": heal_transfer_timeout_secs,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else {
+                        println!("DFS Healing Tuning (leader: {})", leader);
+                        println!("====================");
+                        println!("link_bandwidth_mb:          {}", link_bandwidth_mb);
+                        println!("heal_max_pct:               {}", heal_max_pct);
+                        println!("heal_max_concurrent:        {}", heal_max_concurrent);
+                        println!("heal_transfer_timeout_secs: {}", heal_transfer_timeout_secs);
+                    }
                 }
                 Response::Error { message, .. } => {
                     error!("Error: {}", message);

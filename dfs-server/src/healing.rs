@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use dfs_common::{ChunkId, ChunkLocation, FileId, Message, NodeId, Request, Response};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
@@ -132,8 +133,11 @@ pub struct HealingManager {
     /// Network client for inter-node communication
     client: Arc<NetworkClient>,
 
-    /// Target replication factor
-    replication_factor: usize,
+    /// Target replication factor. Shared `Arc<AtomicUsize>` with `Server::replication_factor`
+    /// (same instance, constructed once in main.rs) so a live `dfs-admin cluster set
+    /// --replication-factor` change — or rejoin reconciliation adopting the leader's
+    /// value — is visible to both the write path and healing decisions without a restart.
+    replication_factor: Arc<AtomicUsize>,
 
     /// Delay before starting healing after node failure (seconds)
     healing_delay_secs: u64,
@@ -153,9 +157,11 @@ pub struct HealingManager {
     /// throughput is paced separately by heal_bandwidth_limiter on the source node.
     heal_semaphore: Arc<Semaphore>,
 
-    /// Max concurrent heal transfers (heal_semaphore's capacity), stored for the
-    /// drain loop's task-fill bound.
-    heal_max_concurrent: usize,
+    /// Max concurrent heal transfers (heal_semaphore's target capacity), stored for the
+    /// drain loop's task-fill bound. Live-settable via `dfs-admin healing set
+    /// --max-concurrent` — see `resize_heal_concurrency`, which reconciles the actual
+    /// `heal_semaphore` permit count to this target.
+    heal_max_concurrent: Arc<AtomicUsize>,
 
     /// Real bytes/sec pacing for this node's outbound heal-chunk reads+sends.
     /// Rate is managed entirely by the adaptive bandwidth controller.
@@ -167,14 +173,16 @@ pub struct HealingManager {
     last_cluster_write_ms: Arc<std::sync::atomic::AtomicU64>,
 
     /// Assumed node-to-node link bandwidth in MB/s. Used as the 100% baseline for
-    /// the adaptive rate formula. Defaults to 100 (1Gbps). Future: auto-measured on startup.
-    link_bandwidth_mb: usize,
+    /// the adaptive rate formula. Defaults to 100 (1Gbps). Live-settable via
+    /// `dfs-admin healing set --link-bandwidth-mb`.
+    link_bandwidth_mb: Arc<AtomicUsize>,
 
-    /// Maximum fraction of link bandwidth the healer may use (0.0–1.0).
+    /// Maximum fraction of link bandwidth the healer may use (0.10–1.00).
     /// Default 0.60 — logical ceiling when client and heal traffic share one interface
-    /// (healer > writer → can never fall behind). Override via DFS_HEAL_MAX_PCT for
-    /// deployments with a dedicated server-to-server interface where higher rates are safe.
-    heal_max_pct: f64,
+    /// (healer > writer → can never fall behind). `RwLock` rather than an atomic since
+    /// it's a float; read fresh each `run_bandwidth_controller` tick (every 2s) so a
+    /// live `dfs-admin healing set --max-pct` change takes effect within one tick.
+    heal_max_pct: Arc<RwLock<f64>>,
 
     /// Chunks ready to heal: under-replicated, has ≥1 confirmed alive source node,
     /// and healing delay has passed. Maps chunk_id → first_detected_at so oldest-
@@ -204,7 +212,8 @@ pub struct HealingManager {
 
     /// Per-transfer timeout for a single PushChunkTo (seconds). On expiry the chunk
     /// stays in pending (retried next drain tick) and the semaphore slot is released.
-    heal_transfer_timeout_secs: u64,
+    /// Live-settable via `dfs-admin healing set --transfer-timeout-secs`.
+    heal_transfer_timeout_secs: Arc<AtomicU64>,
 
     /// Guards run_phantom_reconciliation_pass against overlapping itself — the
     /// periodic loop and a manual `dfs-admin healing reconcile` trigger can land
@@ -224,42 +233,40 @@ pub struct HealingManager {
 
 impl HealingManager {
     /// Create a new healing manager
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<ChunkStorage>,
         metadata: Arc<MetadataStore>,
         cluster: Arc<ClusterManager>,
         client: Arc<NetworkClient>,
-        replication_factor: usize,
+        replication_factor: Arc<AtomicUsize>,
         healing_delay_secs: u64,
         scrub_interval_hours: u64,
         auto_heal: bool,
         chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
         last_cluster_write_ms: Arc<std::sync::atomic::AtomicU64>,
+        link_bandwidth_mb: usize,
+        heal_max_pct_config: f64,
+        heal_max_concurrent: usize,
+        heal_transfer_timeout_secs: u64,
     ) -> Self {
         let max_heal_per_cycle = 200;
 
         // Initialize the limiter at the floor rate (10% of assumed link bandwidth).
         // The adaptive bandwidth controller takes over within 2 seconds of startup
         // and adjusts the rate based on queue depth and growth rate.
-        let link_bw_mb = std::env::var("DFS_LINK_BANDWIDTH_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(100);
-        let initial_bw_mb = ((link_bw_mb as f64 * 0.10) as usize).max(1);
+        let initial_bw_mb = ((link_bandwidth_mb as f64 * 0.10) as usize).max(1);
         let heal_bandwidth_limiter = Arc::new(BandwidthLimiter::new(initial_bw_mb));
+        let link_bandwidth_mb = Arc::new(AtomicUsize::new(link_bandwidth_mb));
 
         // Separate, independent concurrency cap on outstanding heal transfers
         // (FD/task safety) — no longer derived from the bandwidth number.
-        let heal_max_concurrent = std::env::var("DFS_HEAL_MAX_CONCURRENT")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8);
         let heal_semaphore = Arc::new(Semaphore::new(heal_max_concurrent));
+        let heal_max_concurrent = Arc::new(AtomicUsize::new(heal_max_concurrent));
 
-        let heal_transfer_timeout_secs = std::env::var("DFS_HEAL_TRANSFER_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120); // 2 minutes per transfer before timing out
+        let heal_max_pct = Arc::new(RwLock::new((heal_max_pct_config / 100.0).clamp(0.10, 1.00)));
+
+        let heal_transfer_timeout_secs = Arc::new(AtomicU64::new(heal_transfer_timeout_secs));
 
         // Restore pending_healing first-detection times across process restarts.
         // Without this, every restart resets the whole backlog's debounce timer to
@@ -300,12 +307,8 @@ impl HealingManager {
             heal_max_concurrent,
             heal_bandwidth_limiter,
             last_cluster_write_ms,
-            link_bandwidth_mb: link_bw_mb,
-            heal_max_pct: std::env::var("DFS_HEAL_MAX_PCT")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|pct| (pct / 100.0).clamp(0.10, 1.00))
-                .unwrap_or(0.60),
+            link_bandwidth_mb,
+            heal_max_pct,
             pending_healing: Arc::new(RwLock::new(pending_healing_map)),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -327,8 +330,8 @@ impl HealingManager {
         info!(
             "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, max_concurrent: {}, transfer_timeout: {}s, link: {}MB/s, max_pct: {}%)",
             self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle,
-            self.heal_max_concurrent, self.heal_transfer_timeout_secs,
-            self.link_bandwidth_mb, (self.heal_max_pct * 100.0) as u32
+            self.heal_max_concurrent.load(Ordering::Relaxed), self.heal_transfer_timeout_secs.load(Ordering::Relaxed),
+            self.link_bandwidth_mb.load(Ordering::Relaxed), (*self.heal_max_pct.read().await * 100.0) as u32
         );
 
         // Discovery loop: scans all chunks, bulk-queries nodes, classifies under/over
@@ -377,7 +380,6 @@ impl HealingManager {
         const TIER1: usize = 100;
         const TIER2: usize = 1_000;
         const LOW_PCT: f64 = 0.10;
-        let high_pct = self.heal_max_pct;
         // A sustained growth rate of GROWTH_BOOST_RATE items/sec in the middle tier
         // contributes up to GROWTH_BOOST_SHARE of the remaining headroom, letting the
         // system react to a fast-growing queue before depth alone would force the rate up.
@@ -390,6 +392,9 @@ impl HealingManager {
         loop {
             tokio::time::sleep(Duration::from_secs_f64(INTERVAL_SECS)).await;
 
+            // Read fresh each tick so a live `dfs-admin healing set --max-pct` change
+            // takes effect within one 2s cycle instead of only at the next restart.
+            let high_pct = *self.heal_max_pct.read().await;
             let queue_depth = self.pending_healing.read().await.len();
 
             // items/sec — positive means queue is growing (falling behind), negative means draining
@@ -417,7 +422,7 @@ impl HealingManager {
             };
 
             let target_pct = LOW_PCT + (high_pct - LOW_PCT) * factor;
-            let target_mb = ((self.link_bandwidth_mb as f64 * target_pct) as usize).max(1);
+            let target_mb = ((self.link_bandwidth_mb.load(Ordering::Relaxed) as f64 * target_pct) as usize).max(1);
 
             self.heal_bandwidth_limiter.set_rate_mb(target_mb).await;
 
@@ -903,7 +908,7 @@ impl HealingManager {
                 file_id: loc.file_id,
             };
 
-            if confirmed_present.len() < self.replication_factor {
+            if confirmed_present.len() < self.replication_factor.load(Ordering::Relaxed) {
                 to_heal.push(loc.chunk_id);
             }
 
@@ -1613,7 +1618,7 @@ impl HealingManager {
                 }
             }
 
-            let replication_factor = self.replication_factor;
+            let replication_factor = self.replication_factor.load(Ordering::Relaxed);
 
             // Detect unrecoverable chunks: actual_replicas == 0 and all metadata nodes
             // were reachable and confirmed they don't have it (or node list is empty).
@@ -1906,6 +1911,7 @@ impl HealingManager {
             let cache     = self.alive_nodes_cache.read().await;
             let in_flight = self.in_flight_healing.read().await;
             let stalled   = self.stalled_healing.read().await;
+            let replication_factor = self.replication_factor.load(Ordering::Relaxed);
 
             let mut v = Vec::new();
             for (chunk_id, detected_at) in pending.iter() {
@@ -1926,9 +1932,9 @@ impl HealingManager {
                     None => continue, // discovery hasn't run yet for this chunk
                 };
 
-                let status = if confirmed_alive.len() < self.replication_factor {
+                let status = if confirmed_alive.len() < replication_factor {
                     ReplicationStatus::UnderReplicated
-                } else if confirmed_alive.len() > self.replication_factor {
+                } else if confirmed_alive.len() > replication_factor {
                     if destructive_allowed { ReplicationStatus::OverReplicated } else { continue }
                 } else {
                     continue; // at RF, discovery will clean up pending entry
@@ -1970,7 +1976,7 @@ impl HealingManager {
         // acquire — causing "too many orphaned sockets" kernel warnings under load.
         // Actual byte throughput is paced separately by heal_bandwidth_limiter on
         // whichever node ends up being the transfer's source.
-        let max_live = self.heal_max_concurrent.max(1);
+        let max_live = self.heal_max_concurrent.load(Ordering::Relaxed).max(1);
         let mut set: JoinSet<()> = JoinSet::new();
         let mut iter = work.into_iter();
 
@@ -1987,8 +1993,8 @@ impl HealingManager {
                 let in_flight_healing = self.in_flight_healing.clone();
                 let stalled_healing = self.stalled_healing.clone();
                 let heal_semaphore = self.heal_semaphore.clone();
-                let replication_factor = self.replication_factor;
-                let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs);
+                let replication_factor = self.replication_factor.load(Ordering::Relaxed);
+                let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs.load(Ordering::Relaxed));
                 let bandwidth_limiter = self.heal_bandwidth_limiter.clone();
 
                 set.spawn(async move {
@@ -2628,6 +2634,75 @@ impl HealingManager {
         &self.heal_bandwidth_limiter
     }
 
+    /// Apply a partial set of live tuning updates (`None` fields left unchanged) and
+    /// return the resulting snapshot. Caller (`Server::handle_set_healing_tuning`) is
+    /// responsible for persisting the applied values to config.toml.
+    pub async fn apply_tuning(
+        &self,
+        link_bandwidth_mb: Option<usize>,
+        heal_max_pct: Option<f64>,
+        heal_max_concurrent: Option<usize>,
+        heal_transfer_timeout_secs: Option<u64>,
+    ) -> HealingTuningSnapshot {
+        if let Some(v) = link_bandwidth_mb {
+            self.link_bandwidth_mb.store(v.max(1), Ordering::Relaxed);
+        }
+        if let Some(pct) = heal_max_pct {
+            *self.heal_max_pct.write().await = (pct / 100.0).clamp(0.10, 1.00);
+        }
+        if let Some(secs) = heal_transfer_timeout_secs {
+            self.heal_transfer_timeout_secs.store(secs.max(1), Ordering::Relaxed);
+        }
+        if let Some(target) = heal_max_concurrent {
+            self.resize_heal_concurrency(target.max(1)).await;
+        }
+        self.tuning_snapshot().await
+    }
+
+    /// Reconciles `heal_semaphore`'s actual permit count to a new target. Growing is
+    /// immediate (`add_permits`). Shrinking calls `forget_permits`, which only reduces
+    /// *available* permits — if all are currently checked out by in-flight transfers,
+    /// forget_permits forgets 0 and returns the shortfall. Rather than force-cancel
+    /// in-flight heal transfers just to hit the new number faster, a background retry
+    /// keeps trying every 500ms until the full reduction has been applied, so the
+    /// semaphore converges to the target as transfers naturally complete and release
+    /// their permits.
+    async fn resize_heal_concurrency(&self, target: usize) {
+        let previous = self.heal_max_concurrent.swap(target, Ordering::Relaxed);
+        if target > previous {
+            self.heal_semaphore.add_permits(target - previous);
+        } else if target < previous {
+            let mut remaining = previous - target;
+            remaining -= self.heal_semaphore.forget_permits(remaining);
+            if remaining > 0 {
+                let semaphore = self.heal_semaphore.clone();
+                let heal_max_concurrent = self.heal_max_concurrent.clone();
+                tokio::spawn(async move {
+                    while remaining > 0 {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        // Bail out if a newer resize has since superseded this one —
+                        // otherwise a rapid shrink-then-grow could over-forget permits
+                        // that the newer, larger target still needs.
+                        if heal_max_concurrent.load(Ordering::Relaxed) != target {
+                            return;
+                        }
+                        remaining -= semaphore.forget_permits(remaining);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Current live values of all four tuning knobs, for `dfs-admin healing get`/`status`.
+    pub async fn tuning_snapshot(&self) -> HealingTuningSnapshot {
+        HealingTuningSnapshot {
+            link_bandwidth_mb: self.link_bandwidth_mb.load(Ordering::Relaxed),
+            heal_max_pct: *self.heal_max_pct.read().await * 100.0,
+            heal_max_concurrent: self.heal_max_concurrent.load(Ordering::Relaxed),
+            heal_transfer_timeout_secs: self.heal_transfer_timeout_secs.load(Ordering::Relaxed),
+        }
+    }
+
     pub async fn queue_chunks_immediate(&self, chunk_ids: Vec<ChunkId>) {
         let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs + 1);
         let backdated_secs = dfs_common::types::current_timestamp()
@@ -2665,6 +2740,7 @@ impl HealingManager {
             auto_heal_enabled: self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed),
             healing_delay_secs: self.healing_delay_secs,
             current_bandwidth_mb: self.heal_bandwidth_limiter.current_rate_mb().await,
+            tuning: self.tuning_snapshot().await,
         }
     }
 
@@ -2708,6 +2784,18 @@ pub struct HealingStats {
     pub auto_heal_enabled: bool,
     pub healing_delay_secs: u64,
     pub current_bandwidth_mb: usize,
+    pub tuning: HealingTuningSnapshot,
+}
+
+/// Snapshot of the four live-settable healing tuning knobs — the configured ceilings,
+/// not the adaptive controller's current instantaneous rate (that's `current_bandwidth_mb`
+/// on `HealingStats`).
+#[derive(Debug, Clone, Copy)]
+pub struct HealingTuningSnapshot {
+    pub link_bandwidth_mb: usize,
+    pub heal_max_pct: f64,
+    pub heal_max_concurrent: usize,
+    pub heal_transfer_timeout_secs: u64,
 }
 
 #[cfg(test)]
@@ -2733,7 +2821,10 @@ mod tests {
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
         let client = Arc::new(NetworkClient::new());
 
-        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 300, 24, true, Arc::new(DashMap::new()));
+        let healing = HealingManager::new(
+            storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
+            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 120,
+        );
 
         let stats = healing.get_stats().await;
         assert_eq!(stats.pending_healing, 0);
@@ -2754,7 +2845,10 @@ mod tests {
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
         let client = Arc::new(NetworkClient::new());
 
-        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 2, 24, true, Arc::new(DashMap::new())); // 2s delay
+        let healing = HealingManager::new(
+            storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 2, 24, true,
+            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 120,
+        ); // 2s delay
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"test"));
 
@@ -2797,7 +2891,10 @@ mod tests {
         // Construct a fresh HealingManager against the same MetadataStore —
         // simulates a process restart. healing_delay_secs = 10, so the 8s that
         // already elapsed before restart must carry over.
-        let healing = HealingManager::new(storage, metadata, cluster, client, 3, 10, 24, true, Arc::new(DashMap::new()));
+        let healing = HealingManager::new(
+            storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 10, 24, true,
+            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 120,
+        );
 
         // 8s < 10s — not ready yet, but the persisted age must have been restored
         // (not reset to 0s on restart).
@@ -2815,7 +2912,10 @@ mod tests {
         let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
         let client = Arc::new(NetworkClient::new());
-        let healing = HealingManager::new(storage.clone(), metadata.clone(), cluster, client, 3, 300, 24, true, Arc::new(DashMap::new()));
+        let healing = HealingManager::new(
+            storage.clone(), metadata.clone(), cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
+            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 120,
+        );
         (storage, metadata, healing, temp_storage, temp_metadata)
     }
 

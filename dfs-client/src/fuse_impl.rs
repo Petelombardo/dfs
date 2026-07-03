@@ -5159,6 +5159,7 @@ impl Filesystem for DfsFilesystem {
         let inode_to_path = self.inode_to_path.clone();
         let next_inode = self.next_inode.clone();
         let write_open_counts = self.write_open_counts.clone();
+        let open_counts = self.open_counts.clone();
         let write_buffers = self.write_buffers.clone();
         let write_buffer_enabled = self.write_buffer_enabled;
         let direct_write_inodes = self.direct_write_inodes.clone();
@@ -5166,6 +5167,7 @@ impl Filesystem for DfsFilesystem {
         let pending_creates = self.pending_creates.clone();
         let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let written_inodes_for_create = self.written_inodes.clone();
+        let is_write_open = (_flags & libc::O_ACCMODE) != libc::O_RDONLY;
 
         // Block lookups from overwriting metadata_cache for this path until the create
         // async task inserts the fresh metadata. Set on the FUSE dispatch thread (before
@@ -5173,6 +5175,49 @@ impl Filesystem for DfsFilesystem {
         pending_creates.insert(path.clone());
 
         self.runtime.spawn(async move {
+            // O_CREAT without O_EXCL, local cache miss: the file may still genuinely exist
+            // on the server — e.g. this client just restarted and hasn't warmed/looked up
+            // this specific path yet, or the leader changed and this session never learned
+            // about it. The check above only ever consulted our own in-memory path_to_inode,
+            // never the server, so a cold cache here used to silently mint a brand new FileId
+            // over a path that already had real content, orphaning it (staging incident,
+            // 2026-07-03: hdhomerun dvr's dvr.conf got replaced with a near-empty file after
+            // a full cluster + client redeploy — see create()'s local-cache-only comment
+            // above for the full trace). Ask the server before assuming "new".
+            if !o_excl {
+                if let Ok(Some(existing_metadata)) = client.get_file_metadata_conditional(&path, None).await {
+                    let ino = {
+                        let path_map = path_to_inode.read().unwrap();
+                        if let Some(&existing) = path_map.get(&path) {
+                            existing
+                        } else {
+                            drop(path_map);
+                            let mut next = next_inode.write().unwrap();
+                            let v = *next; *next += 1; drop(next);
+                            path_to_inode.write().unwrap().insert(path.clone(), v);
+                            inode_to_path.write().unwrap().insert(v, path.clone());
+                            v
+                        }
+                    };
+                    client.seed_write_seq(existing_metadata.id, existing_metadata.write_seq);
+                    if is_write_open {
+                        *write_open_counts.entry(ino).or_insert(0) += 1;
+                        client.write_open_inodes.insert(ino);
+                    }
+                    *open_counts.entry(ino).or_insert(0) += 1;
+                    metadata_cache.insert(ino, existing_metadata.clone());
+                    last_metadata_update.insert(ino, std::time::Instant::now());
+                    pending_creates.remove(&path);
+                    let attr = DfsFilesystem::metadata_to_attr_static(ino, &existing_metadata);
+                    let is_sqlite = is_sqlite_direct_io(&existing_metadata.path);
+                    let open_flags = if is_sqlite { fuser::consts::FOPEN_DIRECT_IO } else { 0 };
+                    info!("create: path={} found on server (ino={}, id={}) despite cold local cache — opening existing file instead of minting a new identity",
+                        path, ino, existing_metadata.id);
+                    reply.created(&Duration::ZERO, &attr, 0, 0, open_flags);
+                    return;
+                }
+            }
+
             match client.put_file_metadata(&metadata_clone).await {
                 Ok(_) => {
                     // Allocate inode

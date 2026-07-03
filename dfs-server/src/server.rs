@@ -2318,7 +2318,7 @@ impl Server {
         // stale write broadcast arrives, replaces with {A,B} → healer heals to {A,B,D}
         // → accumulate nodes D,E,... = over-replication.
         let rf = self.replication_factor.load(Ordering::Relaxed);
-        let merged_location = match self.metadata.get_chunk_location(&location.chunk_id) {
+        let merged_location = match self.metadata.get_chunk_location_async(location.chunk_id).await {
             Ok(Some(existing)) => {
                 let incoming_count = location.nodes.len();
                 let existing_count = existing.nodes.len();
@@ -2686,8 +2686,15 @@ impl Server {
         for location in &locations {
             // Reject orphans: see the comment above this loop.
             let is_live = match location.file_id {
-                Some(fid) => *file_exists_cache.entry(fid)
-                    .or_insert_with(|| self.metadata.get_file(&fid).ok().flatten().is_some()),
+                Some(fid) => {
+                    if let Some(exists) = file_exists_cache.get(&fid) {
+                        *exists
+                    } else {
+                        let exists = self.metadata.get_file_async(fid).await.ok().flatten().is_some();
+                        file_exists_cache.insert(fid, exists);
+                        exists
+                    }
+                }
                 None => live_chunks.contains(&location.chunk_id),
             };
             if !is_live {
@@ -2708,7 +2715,7 @@ impl Server {
             // the healer's deep scan eventually corrects it.
             let existing = match pending.get(&location.chunk_id) {
                 Some(p) => Some(p.clone()),
-                None => self.metadata.get_chunk_location(&location.chunk_id).ok().flatten(),
+                None => self.metadata.get_chunk_location_async(location.chunk_id).await.ok().flatten(),
             };
             let incoming_count = location.nodes.len();
             let existing_count = existing.as_ref().map_or(0, |e| e.nodes.len());
@@ -3549,7 +3556,7 @@ impl Server {
         chunk_id: &ChunkId,
         size: usize,
     ) -> Result<ChunkLocation> {
-        if let Ok(Some(location)) = self.metadata.get_chunk_location(chunk_id) {
+        if let Ok(Some(location)) = self.metadata.get_chunk_location_async(*chunk_id).await {
             Ok(location)
         } else {
             let now_ms = std::time::SystemTime::now()

@@ -32,6 +32,36 @@ get_dfs_containers() {
 	"
 }
 
+# resolve_ip <host>
+# dfs-admin needs a numeric address, not a hostname.
+resolve_ip() {
+	getent hosts "$1" | awk '{print $1; exit}'
+}
+
+# wait_for_convergence <ip> <baseline_count> <label>
+# Polls the given node's own file list until it reports at least baseline_count
+# files, or gives up after ~90s. A node that just restarted may not yet have
+# caught up on metadata written to the rest of the cluster while it was down —
+# see the staging incident this replaces a fixed `sleep` for: dvr.conf's create()
+# asks the server before minting a new file identity, but that check is only as
+# good as whichever node answers it. A fixed sleep here was a guess about how
+# long that catch-up takes; this checks the actual condition instead.
+wait_for_convergence() {
+	local ip="$1" baseline="$2" label="$3"
+	local count=0
+	for _ in $(seq 1 45); do
+		count=$(target/release/dfs-admin --cluster "${ip}:8900" --format json file list 2>/dev/null \
+			| python3 -c "import json,sys; print(json.load(sys.stdin).get('total_count', 0))" 2>/dev/null || echo 0)
+		if [ "$count" -ge "$baseline" ] 2>/dev/null; then
+			echo "  [$label] Converged: $count files (baseline $baseline)"
+			return 0
+		fi
+		sleep 2
+	done
+	echo "  [$label] WARNING: only $count/$baseline files after ~90s — this node may still be catching up on metadata. Proceeding anyway, but watch for it."
+	return 1
+}
+
 # stop_dfs_client <host> <containers_space_separated>
 # Stops given containers then stops dfs-client.
 stop_dfs_client() {
@@ -86,19 +116,26 @@ fi
 
 # ─── server rolling update ────────────────────────────────────────────────────
 if [ "$1" == "all" ] || [ "$1" == "server" ]; then
+	# Baseline file count from whichever node answers first — every node we
+	# restart below must catch back up to at least this before we move on to the
+	# next one (or, after the last one, to restarting clients). Query before
+	# touching anything so a mid-restart node can't be the one we ask.
+	baseline_ip=$(resolve_ip gluster1)
+	baseline_count=$(target/release/dfs-admin --cluster "${baseline_ip}:8900" --format json file list 2>/dev/null \
+		| python3 -c "import json,sys; print(json.load(sys.stdin).get('total_count', 0))" 2>/dev/null || echo 0)
+	echo "Baseline file count before server deploy: $baseline_count"
+	echo ""
+
 	for i in gluster2 gluster3 gluster4 gluster5 gluster1; do
 		echo "Deploying to $i"
 		ssh root@$i systemctl stop dfs-server
 		sleep 1
 		scp target/release/dfs-server target/release/dfs-admin target/release/dfs-client root@$i:/usr/bin/
 		ssh root@$i systemctl start dfs-server
-		sleep 3
+		wait_for_convergence "$(resolve_ip $i)" "$baseline_count" "$i"
 		echo ""
 	done
 fi
-
-echo "Waiting a few seconds for the servers to settle"
-sleep 3
 
 # ─── client update ────────────────────────────────────────────────────────────
 if [ "$1" == "all" ] || [ "$1" == "client" ]; then

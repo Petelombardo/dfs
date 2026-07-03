@@ -489,6 +489,15 @@ impl MetadataStore {
         }
     }
 
+    /// Async wrapper for get_file — see get_chunk_location_async for why the sync
+    /// version must never be called directly from async request-handling code.
+    pub async fn get_file_async(self: &Arc<Self>, file_id: FileId) -> Result<Option<FileMetadata>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_file(&file_id))
+            .await
+            .context("spawn_blocking panicked in get_file_async")?
+    }
+
     /// Get file metadata by path.
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
         let _db = self.db.read().unwrap();
@@ -767,6 +776,19 @@ impl MetadataStore {
                 .with_context(|| format!("Failed to deserialize chunk location {}", chunk_id))?)),
             None => Ok(None),
         }
+    }
+
+    /// Async wrapper for get_chunk_location. Calling the sync version directly from
+    /// request-handling code runs a redb read transaction (real disk/mmap I/O) inline
+    /// on the tokio executor thread — see put_chunk_location_async for why that's
+    /// dangerous under load. This is on the hottest per-write path there is
+    /// (handle_replicate_chunk_location fires once per confirmed chunk write
+    /// cluster-wide), so always call this instead from async handlers.
+    pub async fn get_chunk_location_async(self: &Arc<Self>, chunk_id: ChunkId) -> Result<Option<ChunkLocation>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_chunk_location(&chunk_id))
+            .await
+            .context("spawn_blocking panicked in get_chunk_location_async")?
     }
 
     /// Delete chunk location.

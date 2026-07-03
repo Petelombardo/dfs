@@ -3593,7 +3593,7 @@ impl Server {
                     (false, 0, None)
                 };
                 let returned_chunk0_size = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
-                info!("[SIZE TRACE] get path={} id={} sled_size={} sled_chunk0_size={:?} chunk_map_present={} chunk_map_chunks={} chunk_map_chunk0_size={:?} returned_chunk0_size={:?}",
+                debug!("[SIZE TRACE] get path={} id={} sled_size={} sled_chunk0_size={:?} chunk_map_present={} chunk_map_chunks={} chunk_map_chunk0_size={:?} returned_chunk0_size={:?}",
                     path, metadata.id, sled_size, sled_chunk0_size, chunk_map_present, chunk_map_chunks, chunk_map_chunk0_size, returned_chunk0_size);
 
                 // Check if client has provided a cached write_seq (clock-agnostic —
@@ -4291,7 +4291,7 @@ impl Server {
             let incoming_chunk0 = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
             let chunk_map_before = self.chunk_map.get(&metadata.id)
                 .map(|e| e.value().0.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size));
-            info!("[SIZE TRACE] put-incoming path={} id={} incoming_chunks={} incoming_chunk0_size={:?} chunk_map_before_chunk0_size={:?}",
+            debug!("[SIZE TRACE] put-incoming path={} id={} incoming_chunks={} incoming_chunk0_size={:?} chunk_map_before_chunk0_size={:?}",
                 metadata.path, metadata.id, metadata.chunk_locations.len(), incoming_chunk0, chunk_map_before.flatten());
         }
 
@@ -4441,7 +4441,7 @@ impl Server {
         {
             let chunk_map_after = self.chunk_map.get(&metadata.id)
                 .map(|e| e.value().0.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size));
-            info!("[SIZE TRACE] put-after-chunk_map_update path={} id={} reconciled_chunks={} reconciled_chunk0_size={:?} chunk_map_after_chunk0_size={:?}",
+            debug!("[SIZE TRACE] put-after-chunk_map_update path={} id={} reconciled_chunks={} reconciled_chunk0_size={:?} chunk_map_after_chunk0_size={:?}",
                 metadata.path, metadata.id, metadata.chunk_locations.len(),
                 metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size),
                 chunk_map_after.flatten());

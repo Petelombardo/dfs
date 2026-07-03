@@ -6381,7 +6381,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     pub async fn flush_metadata_sync(&self, metadata: &FileMetadata) {
         {
             let chunk0_size = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
-            info!("[SIZE TRACE] flush_metadata_sync path={} id={} seq={} chunks={} chunk0_size={:?} pending_chunk_locations_for_this_file={}",
+            debug!("[SIZE TRACE] flush_metadata_sync path={} id={} seq={} chunks={} chunk0_size={:?} pending_chunk_locations_for_this_file={}",
                 metadata.path, metadata.id, metadata.write_seq, metadata.chunk_locations.len(), chunk0_size,
                 self.pending_chunk_locations.lock().await.iter().filter(|l| l.file_id == Some(metadata.id)).count());
         }

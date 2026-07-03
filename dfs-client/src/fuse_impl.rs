@@ -2412,7 +2412,7 @@ impl FlushHandle {
                     Ok(Some(fresh)) => {
                         let fresh_chunk0 = fresh.chunk_location_for_idx(chunk_idx).map(|l| l.size);
                         let has_chunk = fresh_chunk0.map(|s| s > 0).unwrap_or(false);
-                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} fresh_chunks={} fresh_chunk0_size={:?} has_chunk={}",
+                        debug!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} fresh_chunks={} fresh_chunk0_size={:?} has_chunk={}",
                             ino, chunk_idx, path, fresh.chunk_locations.len(), fresh_chunk0, has_chunk);
                         if has_chunk {
                             self.metadata_cache.insert(ino, fresh);
@@ -2420,16 +2420,16 @@ impl FlushHandle {
                         has_chunk
                     }
                     Ok(None) => {
-                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} server_says_not_found", ino, chunk_idx, path);
+                        debug!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} server_says_not_found", ino, chunk_idx, path);
                         false
                     }
                     Err(e) => {
-                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} lookup_error={}", ino, chunk_idx, path, e);
+                        debug!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} lookup_error={}", ino, chunk_idx, path, e);
                         false
                     }
                 }
             } else {
-                info!("[SIZE TRACE] flush-safety-check ino={} chunk={} no_path_known", ino, chunk_idx);
+                debug!("[SIZE TRACE] flush-safety-check ino={} chunk={} no_path_known", ino, chunk_idx);
                 false
             };
             if fresh_has_chunk {
@@ -2579,7 +2579,7 @@ impl FlushHandle {
                             meta.size = meta.size.max(end);
                         }
                     }
-                    info!("[SIZE TRACE] splice ino={} chunk={} spliced_locations={} meta_chunks_after={} meta_chunk0_size_after={:?}",
+                    debug!("[SIZE TRACE] splice ino={} chunk={} spliced_locations={} meta_chunks_after={} meta_chunk0_size_after={:?}",
                         ino, chunk_idx, locations.len(), meta.chunk_locations.len(),
                         meta.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size));
                     // Don't clobber an mtime the user explicitly just set via setattr
@@ -4130,7 +4130,7 @@ impl Filesystem for DfsFilesystem {
                 let cache_looks_empty = self.metadata_cache.get(&ino)
                     .map(|m| m.chunk_locations.is_empty())
                     .unwrap_or(true);
-                info!("[SIZE TRACE] open-write-check ino={} is_trunc={} cache_present={} cache_looks_empty={} cached_chunk0_size={:?}",
+                debug!("[SIZE TRACE] open-write-check ino={} is_trunc={} cache_present={} cache_looks_empty={} cached_chunk0_size={:?}",
                     ino, is_trunc, self.metadata_cache.get(&ino).is_some(), cache_looks_empty, cached_chunk0_size);
                 if !is_trunc && cache_looks_empty {
                     let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
@@ -4139,16 +4139,16 @@ impl Filesystem for DfsFilesystem {
                         match self.runtime.block_on(client.get_file_metadata(&path)) {
                             Ok(Some(fresh)) => {
                                 let fresh_chunk0_size = fresh.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
-                                info!("[SIZE TRACE] open-write-refresh ino={} path={} fresh_chunks={} fresh_chunk0_size={:?}",
+                                debug!("[SIZE TRACE] open-write-refresh ino={} path={} fresh_chunks={} fresh_chunk0_size={:?}",
                                     ino, path, fresh.chunk_locations.len(), fresh_chunk0_size);
                                 self.client.seed_write_seq(fresh.id, fresh.write_seq);
                                 self.metadata_cache.insert(ino, fresh);
                             }
                             Ok(None) => {
-                                info!("[SIZE TRACE] open-write-refresh ino={} path={} server_says_not_found", ino, path);
+                                debug!("[SIZE TRACE] open-write-refresh ino={} path={} server_says_not_found", ino, path);
                             }
                             Err(e) => {
-                                info!("[SIZE TRACE] open-write-refresh ino={} path={} lookup_error={}", ino, path, e);
+                                debug!("[SIZE TRACE] open-write-refresh ino={} path={} lookup_error={}", ino, path, e);
                             }
                         }
                     }

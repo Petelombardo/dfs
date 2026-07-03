@@ -1997,7 +1997,7 @@ impl Server {
         // may have neither field in its local sled record, skipping verification.
         // Holding the read lock here ensures we always see either the pre-patch or
         // the post-rename state — never the in-between partial write.
-        let _io_guard = self.chunk_io_read_guard(&chunk_id).await;
+        let io_guard = self.chunk_io_read_guard(&chunk_id).await;
 
         let storage = self.storage.clone();
         let data = match tokio::task::spawn_blocking(move || storage.read_chunk(&chunk_id))
@@ -2013,6 +2013,13 @@ impl Server {
                 };
             }
         };
+
+        // The guard only needs to span the disk read above — that's the sole window
+        // where a concurrent MultiPatch's pwrite could produce a torn read. Once `data`
+        // is in hand it's an immutable in-memory snapshot; hashing it and sending it
+        // over the network don't touch the file, so hold the write-lock's opponent for
+        // the shortest possible time instead of the whole RTT to target_addr (up to 90s).
+        drop(io_guard);
 
         // Verify chunk content before propagating — catches disk corruption at the
         // source so we don't spread bad data to the rest of the cluster.
@@ -5142,6 +5149,14 @@ impl Server {
                     .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
                 let t_rename = t_start.elapsed();
 
+                // The write-lock's job — excluding a concurrent read from seeing a
+                // torn/partial write — is done as of the rename above: old_path is gone
+                // (any reader now gets a clean NotFound) and new_path is a complete,
+                // already-fsynced file (any reader gets a clean, whole read). Everything
+                // below is metadata/cache bookkeeping that doesn't touch chunk bytes, so
+                // drop early instead of blocking readers (esp. the healer) through it.
+                drop(_io_guard);
+
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -5452,6 +5467,14 @@ impl Server {
                 fs::rename(&old_path, &new_path)
                     .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
                 let t_rename = t_start.elapsed();
+
+                // The write-lock's job — excluding a concurrent read from seeing a
+                // torn/partial write — is done as of the rename above: old_path is gone
+                // (any reader now gets a clean NotFound) and new_path is a complete,
+                // already-fsynced file (any reader gets a clean, whole read). Everything
+                // below is metadata/cache bookkeeping that doesn't touch chunk bytes, so
+                // drop early instead of blocking readers (esp. the healer) through it.
+                drop(_io_guard);
 
                 // Register new_chunk_id in metadata, reusing the old location's node
                 // list. Unlike before, there is no separate old file left behind to

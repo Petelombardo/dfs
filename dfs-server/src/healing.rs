@@ -2026,6 +2026,7 @@ impl HealingManager {
                             ReplicationStatus::OverReplicated => {
                                 HealingManager::do_cleanup_excess_shared(
                                     &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client, replication_factor,
+                                    &in_flight_healing,
                                 ).await
                             }
                             ReplicationStatus::Ok => Ok(()),
@@ -2442,7 +2443,38 @@ impl HealingManager {
     /// Hash integrity verification is NOT done here — that is too expensive for
     /// background bulk trimming (reads 4MB from every node per chunk, floods I/O).
     /// Use `dfs-admin file repair` for explicit integrity checking.
+    ///
+    /// Registers the chunk in `in_flight_healing` for the duration of the cleanup so
+    /// it shows up in `dfs-admin healing status`'s in-flight count — it holds a
+    /// `heal_semaphore` permit the same as an under-replicated heal, and previously
+    /// wasn't tracked, making the reported in-flight count undercount true concurrency.
     async fn do_cleanup_excess_shared(
+        chunk_id: &ChunkId,
+        confirmed_alive_nodes: Vec<NodeId>,
+        storage: &Arc<ChunkStorage>,
+        metadata: &Arc<MetadataStore>,
+        cluster: &Arc<ClusterManager>,
+        client: &Arc<NetworkClient>,
+        replication_factor: usize,
+        in_flight_healing: &Arc<RwLock<HashSet<ChunkId>>>,
+    ) -> Result<()> {
+        {
+            let mut in_flight = in_flight_healing.write().await;
+            if in_flight.contains(chunk_id) {
+                debug!("Chunk {} cleanup already in-flight, skipping", chunk_id);
+                return Ok(());
+            }
+            in_flight.insert(*chunk_id);
+        }
+
+        let result = Self::do_cleanup_excess_inner(
+            chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, replication_factor,
+        ).await;
+        in_flight_healing.write().await.remove(chunk_id);
+        result
+    }
+
+    async fn do_cleanup_excess_inner(
         chunk_id: &ChunkId,
         confirmed_alive_nodes: Vec<NodeId>,
         storage: &Arc<ChunkStorage>,

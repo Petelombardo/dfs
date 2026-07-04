@@ -15,6 +15,9 @@ Do not run the test suite, let the user run it and report issues.
 While it is important to make our code robust, it's imperative that we prioritize resolving the root cause of any problems.  When we identify a new problem that is difficult to resolve, we should attempt to create a local test to reproduce it so that we can easily validate when our solution works.
 
 
+## Build Process
+Always redirect the output of a build into a log file so that you can grep for errors if any occur.  This way you don't need to re-run a failed build just to get the errors.
+
 ## Local test suite
 
 Run with: `bash scripts/test_local_suite.sh`

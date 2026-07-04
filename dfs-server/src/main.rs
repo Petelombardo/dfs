@@ -369,14 +369,18 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 
     // Try to join cluster using both seed nodes AND persisted peers
     // This ensures any node can rejoin even if the seed node is down
-    let metadata_dir = std::path::PathBuf::from(&config.storage.metadata_dir);
+    // peers.json lives next to config.toml (not under metadata_dir), so a data/metadata
+    // format/reset doesn't also wipe the node's memory of the cluster it belongs to.
+    let config_dir = config_path.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let local_addr = peer_addr; // Use peer_addr (our advertised address) for self-filtering
 
     // Start with configured seed nodes
     let mut all_join_targets = config.cluster.seed_nodes.clone();
 
     // Load persisted peers (excluding our own address)
-    match cluster::ClusterManager::load_persisted_peers(&metadata_dir).await {
+    match cluster::ClusterManager::load_persisted_peers(&config_dir).await {
         Ok(persisted_peers) => {
             // Filter out our own address before adding to join targets
             let filtered_peers: Vec<_> = persisted_peers
@@ -397,7 +401,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         info!("Attempting to join cluster via {} total nodes (seeds + peers)...", all_join_targets.len());
         tokio::time::sleep(std::time::Duration::from_millis(500)).await; // Let server start
 
-        match join_cluster(server.clone(), &all_join_targets, &metadata_dir, local_addr).await {
+        match join_cluster(server.clone(), &all_join_targets, &config_dir, local_addr).await {
             Ok(_) => {
                 info!("✓ Successfully joined cluster");
                 // Wake the chunk-location sync loop — now that we have a leader, push
@@ -409,7 +413,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         }
 
         // Start periodic rejoin attempts in background
-        start_periodic_rejoin(server.clone(), all_join_targets.clone(), metadata_dir.clone(), local_addr, config_path.clone()).await;
+        start_periodic_rejoin(server.clone(), all_join_targets.clone(), config_dir.clone(), local_addr, config_path.clone()).await;
     } else {
         info!("No seed nodes or peers configured - running as standalone node");
     }
@@ -507,10 +511,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
 async fn join_cluster(
     server: std::sync::Arc<server::Server>,
     seed_nodes: &[std::net::SocketAddr],
-    metadata_dir: &std::path::Path,
+    config_dir: &std::path::Path,
     local_addr: std::net::SocketAddr,
 ) -> Result<()> {
-    use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
     use tracing::warn;
 
     info!("Attempting to join cluster via {} seed/peer nodes", seed_nodes.len());
@@ -526,38 +529,60 @@ async fn join_cluster(
         anyhow::bail!("No valid join targets after filtering self");
     }
 
+    // Try every seed/peer rather than stopping at the first that answers. Each one
+    // may hold a different, incomplete view of the cluster (e.g. it hasn't heard
+    // about a node that's mid-restart yet) — stopping early meant we'd persist
+    // whichever partial view we got first, silently and permanently dropping any
+    // node absent from it: it never ends up in the saved peer list to retry, and
+    // the failure detector only probes nodes it already knows about, not ones it
+    // never learned of at all.
+    let mut all_learned_nodes: std::collections::HashMap<dfs_common::types::NodeId, dfs_common::types::NodeInfo> =
+        std::collections::HashMap::new();
+    let mut joined_via: std::collections::HashSet<std::net::SocketAddr> = std::collections::HashSet::new();
+    let mut last_err = None;
+
     for seed_addr in &unique_seeds {
         match send_join_request(*seed_addr, &server).await {
             Ok(cluster_nodes) => {
                 info!("✓ Successfully joined cluster via {} - learned about {} total nodes",
                     seed_addr, cluster_nodes.len());
-
-                // Save discovered peers to disk (excluding self) for future recovery
-                let peer_addrs: Vec<std::net::SocketAddr> = cluster_nodes
-                    .iter()
-                    .map(|n| n.addr)
-                    .filter(|addr| *addr != local_addr)
-                    .collect();
-
-                if !peer_addrs.is_empty() {
-                    if let Err(e) = cluster::ClusterManager::save_persisted_peers(&peer_addrs, metadata_dir).await {
-                        warn!("Failed to save persisted peers: {}", e);
-                    }
+                for node in cluster_nodes {
+                    all_learned_nodes.entry(node.id).or_insert(node);
                 }
-
-                // Announce ourselves to all peers we learned about (except the one we joined through)
-                announce_to_peers(&server, &cluster_nodes, *seed_addr).await;
-
-                return Ok(());
+                joined_via.insert(*seed_addr);
             }
             Err(e) => {
                 debug!("Failed to join via {}: {}", seed_addr, e);
-                continue;
+                last_err = Some(e);
             }
         }
     }
 
-    anyhow::bail!("Failed to join cluster - all {} seed/peer nodes unreachable", unique_seeds.len())
+    if joined_via.is_empty() {
+        return Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("Failed to join cluster - all {} seed/peer nodes unreachable", unique_seeds.len())
+        }));
+    }
+
+    // Save the union of peers learned across all successful joins (excluding self)
+    let peer_addrs: Vec<std::net::SocketAddr> = all_learned_nodes
+        .values()
+        .map(|n| n.addr)
+        .filter(|addr| *addr != local_addr)
+        .collect();
+
+    if !peer_addrs.is_empty() {
+        if let Err(e) = cluster::ClusterManager::save_persisted_peers(&peer_addrs, config_dir).await {
+            warn!("Failed to save persisted peers: {}", e);
+        }
+    }
+
+    // Announce ourselves to every peer we learned about, except the ones we joined
+    // through directly (they already know about us from the join request itself).
+    let all_nodes: Vec<_> = all_learned_nodes.into_values().collect();
+    announce_to_peers(&server, &all_nodes, &joined_via).await;
+
+    Ok(())
 }
 
 /// Closes the RF cross-node divergence gap: `replication_factor` is otherwise read
@@ -731,7 +756,7 @@ async fn send_join_request(
 async fn start_periodic_rejoin(
     server: std::sync::Arc<server::Server>,
     join_targets: Vec<std::net::SocketAddr>,
-    metadata_dir: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
     local_addr: std::net::SocketAddr,
     config_path: std::path::PathBuf,
 ) {
@@ -748,7 +773,7 @@ async fn start_periodic_rejoin(
             if node_count <= 1 {
                 debug!("Isolated node detected ({} nodes), attempting to rejoin cluster...", node_count);
 
-                match join_cluster(server.clone(), &join_targets, &metadata_dir, local_addr).await {
+                match join_cluster(server.clone(), &join_targets, &config_dir, local_addr).await {
                     Ok(_) => {
                         info!("✓ Successfully rejoined cluster via periodic retry");
                         server.cluster().node_recovered_notify.notify_waiters();
@@ -767,7 +792,7 @@ async fn start_periodic_rejoin(
 async fn announce_to_peers(
     server: &std::sync::Arc<server::Server>,
     cluster_nodes: &[dfs_common::types::NodeInfo],
-    joined_via: std::net::SocketAddr,
+    joined_via: &std::collections::HashSet<std::net::SocketAddr>,
 ) {
     use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
     use tokio::io::AsyncWriteExt;
@@ -781,9 +806,9 @@ async fn announce_to_peers(
         node_info: node_info.clone(),
     };
 
-    // Announce to all peers except ourselves and the one we joined through
+    // Announce to all peers except ourselves and the ones we joined through directly
     for peer in cluster_nodes {
-        if peer.id == local_node_id || peer.addr == joined_via {
+        if peer.id == local_node_id || joined_via.contains(&peer.addr) {
             continue;
         }
 

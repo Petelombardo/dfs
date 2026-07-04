@@ -1023,9 +1023,12 @@ impl ClusterManager {
         true
     }
 
-    /// Load persisted peer list from disk
-    pub async fn load_persisted_peers(metadata_dir: &Path) -> Result<Vec<SocketAddr>> {
-        let peers_file = metadata_dir.join("peers.json");
+    /// Load persisted peer list from disk. Deliberately lives under the config
+    /// directory, not metadata_dir: metadata_dir gets wiped by a data/metadata
+    /// format/reset, which should not also erase a node's memory of the cluster
+    /// it belongs to.
+    pub async fn load_persisted_peers(config_dir: &Path) -> Result<Vec<SocketAddr>> {
+        let peers_file = config_dir.join("peers.json");
 
         if !peers_file.exists() {
             debug!("No persisted peers file found at {}", peers_file.display());
@@ -1039,8 +1042,9 @@ impl ClusterManager {
         Ok(persisted.peers)
     }
 
-    /// Save peer list to disk for cluster recovery
-    pub async fn save_persisted_peers(peers: &[SocketAddr], metadata_dir: &Path) -> Result<()> {
+    /// Save peer list to disk for cluster recovery. See `load_persisted_peers` for why
+    /// this lives under config_dir rather than metadata_dir.
+    pub async fn save_persisted_peers(peers: &[SocketAddr], config_dir: &Path) -> Result<()> {
         let persisted = PersistedPeers {
             peers: peers.to_vec(),
             last_updated: SystemTime::now()
@@ -1049,7 +1053,7 @@ impl ClusterManager {
                 .as_secs(),
         };
 
-        let peers_file = metadata_dir.join("peers.json");
+        let peers_file = config_dir.join("peers.json");
         let data = serde_json::to_string_pretty(&persisted)?;
         tokio::fs::write(&peers_file, data).await?;
 

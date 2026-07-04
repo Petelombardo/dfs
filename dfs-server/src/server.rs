@@ -53,7 +53,7 @@ pub struct Server {
     /// visible to both the write path and healing decisions without a restart.
     replication_factor: Arc<AtomicUsize>,
 
-    /// Metadata directory path for persisting peer list
+    /// Metadata directory path (chunk map, redb store — data that a format/reset wipes)
     metadata_dir: PathBuf,
 
     /// Path to this node's config.toml — used to persist live admin changes
@@ -8331,9 +8331,30 @@ impl MessageHandler for Server {
                     // purged after a long failure — update_heartbeat silently no-ops when
                     // the node isn't in the map, causing permanent split-brain.
                     // add_node is idempotent: it updates existing entries and inserts new ones.
+                    let already_known = self.cluster.get_node(&sender_id).await.is_some();
                     if let Err(e) = self.cluster.add_node(node_info).await {
                         warn!("Failed to add/update heartbeat node: {}", e);
                     }
+                    // A restarted node (empty peer memory, e.g. no seed_nodes/peers.json)
+                    // is often first re-discovered through a peer just resuming its normal
+                    // Heartbeat broadcast, not a fresh Join/JoinRequest — the sender never
+                    // stopped considering us known, so it never re-announces. Without this,
+                    // that first-contact-via-heartbeat case never gets persisted, and a node
+                    // that keeps losing its peers.json on every restart keeps starting from
+                    // zero every time even though its peers are right there heartbeating at it.
+                    if !already_known {
+                        self.persist_peer_list().await;
+                    }
+                    // add_node just wrote whatever last_heartbeat the sender's NodeInfo
+                    // carried, stamped by the sender's own clock — not ours. A heartbeat
+                    // literally just arrived, so re-stamp with our own clock: trusting a
+                    // remote clock for local liveness bookkeeping means a node with a
+                    // skewed clock (NTP broken, wrong hardware clock, etc.) looks
+                    // perpetually stale to everyone else no matter how often it actually
+                    // sends heartbeats — it oscillates Online/Suspected forever instead of
+                    // settling, and each false "recovery" fires node_recovered_notify,
+                    // triggering full inventory re-pushes and reconciliation cluster-wide.
+                    let _ = self.cluster.update_heartbeat(&sender_id).await;
 
                     // Merge cluster view gossip if present
                     if !cluster_view.is_empty() {
@@ -8362,6 +8383,8 @@ impl MessageHandler for Server {
                 }
                 ClusterMessage::Join { node_info } => {
                     info!("Node {} joining cluster", node_info.id);
+                    let node_id = node_info.id;
+                    let already_known = self.cluster.get_node(&node_id).await.is_some();
                     if let Err(e) = self.cluster.add_node(node_info).await {
                         warn!("Failed to add node: {}", e);
                         Response::Error {
@@ -8369,6 +8392,17 @@ impl MessageHandler for Server {
                             code: ErrorCode::InternalError,
                         }
                     } else {
+                        // A Join is direct proof the sender is reachable right now, but
+                        // add_node just wrote whatever last_heartbeat the sender's own NodeInfo
+                        // carried — which was stamped with the sender's clock, not ours. Trusting
+                        // a remote clock for local liveness bookkeeping breaks the failure
+                        // detector the moment that clock is wrong (a skewed node's heartbeats
+                        // look perpetually stale no matter how often they actually arrive).
+                        // update_heartbeat re-stamps with our own clock and marks it Online.
+                        let _ = self.cluster.update_heartbeat(&node_id).await;
+                        if !already_known {
+                            self.persist_peer_list().await;
+                        }
                         Response::Ok { data: None }
                     }
                 }
@@ -8383,6 +8417,7 @@ impl MessageHandler for Server {
                     info!("Received join request from node {}", node_info.id);
 
                     // Add node to cluster
+                    let already_known = self.cluster.get_node(&node_info.id).await.is_some();
                     if let Err(e) = self.cluster.add_node(node_info.clone()).await {
                         warn!("Failed to add node: {}", e);
                         let response = ClusterMessage::JoinResponse {
@@ -8392,6 +8427,12 @@ impl MessageHandler for Server {
                         return Response::Ok {
                             data: Some(bincode::serialize(&response).unwrap()),
                         };
+                    }
+                    // Re-stamp with our own clock — see the Join handler comment for why we
+                    // don't trust the sender's self-reported last_heartbeat.
+                    let _ = self.cluster.update_heartbeat(&node_info.id).await;
+                    if !already_known {
+                        self.persist_peer_list().await;
                     }
 
                     // Get all cluster nodes
@@ -8424,12 +8465,7 @@ impl MessageHandler for Server {
                         if let Err(e) = self.cluster.add_node(node_info).await {
                             warn!("Failed to add node from broadcast: {}", e);
                         }
-
-                        // Save updated peer list to disk
-                        let peer_addrs = self.cluster.get_all_peer_addrs().await;
-                        if let Err(e) = ClusterManager::save_persisted_peers(&peer_addrs, &self.metadata_dir).await {
-                            warn!("Failed to save persisted peers after NodeJoined: {}", e);
-                        }
+                        self.persist_peer_list().await;
                     } else {
                         debug!("Node {} already known, ignoring duplicate join", node_info.id);
                     }
@@ -8504,6 +8540,24 @@ fn count_close_wait_connections(port: u16) -> usize {
 }
 
 impl Server {
+    /// Persist the current peer set to disk. Lives next to config.toml, not under
+    /// metadata_dir, so a data/metadata format/reset doesn't also erase this node's
+    /// memory of the cluster it belongs to.
+    ///
+    /// Called from every path that adds a node to the cluster (`Join`, `JoinRequest`,
+    /// `NodeJoined`) — not just `NodeJoined` as before. A node that only ever learns
+    /// about peers by being dialed into (e.g. a bootstrap seed with an empty
+    /// `seed_nodes` of its own, which never calls `join_cluster` itself) previously
+    /// never wrote a peers.json at all, so a later restart had nothing to reconnect
+    /// with beyond passively waiting to be dialed again.
+    async fn persist_peer_list(&self) {
+        let peer_addrs = self.cluster.get_all_peer_addrs().await;
+        let config_dir = self.config_path.parent().unwrap_or(std::path::Path::new("."));
+        if let Err(e) = ClusterManager::save_persisted_peers(&peer_addrs, config_dir).await {
+            warn!("Failed to save persisted peers: {}", e);
+        }
+    }
+
     /// Periodically remove tombstones for chunks that are no longer on disk.
     /// Handles the case where the fire-and-forget DeleteChunk from the client failed —
     /// the tombstone guard is no longer needed once the data is gone.

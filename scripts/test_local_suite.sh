@@ -3330,6 +3330,76 @@ rm -f "$T45_RF_FILE" "$T/t45_rf_src.bin"
 
 fi # should_run T45
 
+# ── T46: chunk-0 header loss after delete+recreate at the same path ───────────
+#
+# Reproduces the staging corruption seen in HDHomeRun DVR recordings and dvr.conf:
+# both write a small header/content first, and when a file is deleted and
+# immediately recreated at the identical path (inode reused via path_to_inode),
+# InodeWriteState's `expected_file_id` guard — which exists specifically to detect
+# "metadata_cache now refers to a different file" (fuse_impl.rs:309-312) — is only
+# ever set on the SQLite pre-create path (fuse_impl.rs:5297-5306), never on the
+# general lazy write-buffer path (fuse_impl.rs:5411-5413) that DVR recordings and
+# dvr.conf go through. A stale, larger existing_chunk_size left over from the
+# deleted predecessor then causes the new file's small first write to be routed
+# as a patch against the old (wrong) chunk instead of a fresh write, and the real
+# header never lands in chunk 0.
+if should_run T46; then
+snapshot_log T46
+echo ""
+echo "=== T46: chunk-0 header loss after delete+recreate at same path ==="
+
+T46_FILE="$MOUNT/t46_header.bin"
+
+# Step 1: write a large "old" file with a distinctive marker as its first bytes,
+# and commit it for real (dfs_sync) so the server has a genuine, sized chunk 0.
+DFS_MOUNT="$MOUNT" python3 - <<'PYEOF'
+import os
+mount = os.environ['DFS_MOUNT']
+path = mount + '/t46_header.bin'
+with open(path, 'wb') as f:
+    f.write(b'OLDFILE_MARKER_DO_NOT_KEEP\n')
+    f.write(os.urandom(3 * 1024 * 1024))
+    f.flush()
+    os.fsync(f.fileno())
+PYEOF
+dfs_sync
+
+T46_OLD_LANDED=FAIL
+dd if="$T46_FILE" bs=1k count=12 2>/dev/null | strings | grep -q "OLDFILE_MARKER_DO_NOT_KEEP" && T46_OLD_LANDED=PASS
+check "T46a old file's marker landed before delete (sanity check)" "$T46_OLD_LANDED"
+
+# Step 2: delete it, then immediately recreate the SAME path with a distinctive
+# "new" header as the very first write, fsync'ing right after just that header
+# (before writing the bulk data) to force the first flush of chunk 0 while the
+# slot is still tiny — no sleep, to land inside the inode-reuse window while the
+# client's own metadata_cache/write_buffers state for this inode is still stale.
+rm -f "$T46_FILE"
+
+DFS_MOUNT="$MOUNT" python3 - <<'PYEOF'
+import os
+mount = os.environ['DFS_MOUNT']
+path = mount + '/t46_header.bin'
+with open(path, 'wb') as f:
+    f.write(b'NEWFILE_HEADER_MARKER_XYZ\n')
+    f.flush()
+    os.fsync(f.fileno())
+    f.write(os.urandom(1 * 1024 * 1024))
+    f.flush()
+    os.fsync(f.fileno())
+PYEOF
+dfs_sync
+
+T46_NEW_HEADER_OK=FAIL
+dd if="$T46_FILE" bs=1k count=12 2>/dev/null | strings | grep -q "NEWFILE_HEADER_MARKER_XYZ" && T46_NEW_HEADER_OK=PASS
+check "T46b new file's chunk-0 header survives delete+recreate at same path" "$T46_NEW_HEADER_OK"
+
+T46_OLD_LEAKED=PASS
+dd if="$T46_FILE" bs=1k count=12 2>/dev/null | strings | grep -q "OLDFILE_MARKER_DO_NOT_KEEP" && T46_OLD_LEAKED=FAIL
+check "T46c new file's chunk-0 is not contaminated with the old file's content" "$T46_OLD_LEAKED"
+
+rm -f "$T46_FILE"
+fi # should_run T46
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

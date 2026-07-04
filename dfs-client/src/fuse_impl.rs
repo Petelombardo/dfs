@@ -5107,8 +5107,18 @@ impl Filesystem for DfsFilesystem {
         // thread, or a race between lookup and create), behave like open() rather than
         // creating a second inode. Without this check, two threads racing on the same path
         // both succeed at creating the file and write independent schemas — corrupting the db.
+        //
+        // Must NOT take this shortcut if the path is pending-delete: unlink() on a still-open
+        // file defers clearing path_to_inode/metadata_cache/write_buffers until the old fd's
+        // release() (see unlink()'s "still_open" branch) so in-flight writes on that fd can
+        // still resolve — but that means this path's cached ino/metadata can be for a file
+        // that's logically already gone. Reopening it here as "the same file" would hand a
+        // brand new create() the old file's stale write_buffers/flushed_sizes, which
+        // flush_buffer_async_one can misread as real existing chunk content belonging to the
+        // new file (root cause of the chunk-0 header-loss corruption traced 2026-07-03).
         let o_excl = (_flags & libc::O_EXCL) != 0;
-        if !o_excl {
+        let path_pending_delete = self.pending_deletes.contains(&path);
+        if !o_excl && !path_pending_delete {
             let existing_ino = self.path_to_inode.read().unwrap().get(&path).copied();
             if let Some(ino) = existing_ino {
                 if let Some(meta) = self.metadata_cache.get(&ino) {
@@ -5168,6 +5178,7 @@ impl Filesystem for DfsFilesystem {
         let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
         let written_inodes_for_create = self.written_inodes.clone();
         let is_write_open = (_flags & libc::O_ACCMODE) != libc::O_RDONLY;
+        let pending_deletes = self.pending_deletes.clone();
 
         // Block lookups from overwriting metadata_cache for this path until the create
         // async task inserts the fresh metadata. Set on the FUSE dispatch thread (before
@@ -5184,7 +5195,13 @@ impl Filesystem for DfsFilesystem {
             // 2026-07-03: hdhomerun dvr's dvr.conf got replaced with a near-empty file after
             // a full cluster + client redeploy — see create()'s local-cache-only comment
             // above for the full trace). Ask the server before assuming "new".
-            if !o_excl {
+            //
+            // Skip this reuse entirely if the path is pending-delete: the server hasn't
+            // processed the delete yet either (unlink() defers it until the old fd's
+            // release(), see the "still_open" branch), so it would answer with the SAME
+            // stale, logically-superseded file we must not reuse — see the sync fast-path
+            // guard above for the full explanation.
+            if !o_excl && !pending_deletes.contains(&path) {
                 if let Ok(Some(existing_metadata)) = client.get_file_metadata_conditional(&path, None).await {
                     let ino = {
                         let path_map = path_to_inode.read().unwrap();
@@ -5220,18 +5237,27 @@ impl Filesystem for DfsFilesystem {
 
             match client.put_file_metadata(&metadata_clone).await {
                 Ok(_) => {
-                    // Allocate inode
+                    // Allocate inode. Don't reuse path_to_inode's existing entry if the path
+                    // is pending-delete — that entry belongs to a file this same path is in
+                    // the process of superseding (deferred cleanup, see the sync fast-path
+                    // guard above), and handing its ino to this genuinely-new file would let
+                    // it inherit that file's stale write_buffers/flushed_sizes. Always mint a
+                    // fresh ino in that case; this naturally "steals" the path mapping away
+                    // from the old, soon-to-be-cleaned-up inode, which is fine since it's
+                    // already logically gone.
                     let ino = {
                         let path_map = path_to_inode.read().unwrap();
-                        if let Some(&existing) = path_map.get(&path) {
-                            existing
-                        } else {
-                            drop(path_map);
-                            let mut next = next_inode.write().unwrap();
-                            let v = *next; *next += 1; drop(next);
-                            path_to_inode.write().unwrap().insert(path.clone(), v);
-                            inode_to_path.write().unwrap().insert(v, path.clone());
-                            v
+                        let reusable = path_map.get(&path).copied();
+                        drop(path_map);
+                        match reusable {
+                            Some(existing) if !pending_deletes.contains(&path) => existing,
+                            _ => {
+                                let mut next = next_inode.write().unwrap();
+                                let v = *next; *next += 1; drop(next);
+                                path_to_inode.write().unwrap().insert(path.clone(), v);
+                                inode_to_path.write().unwrap().insert(v, path.clone());
+                                v
+                            }
                         }
                     };
 
@@ -5242,15 +5268,19 @@ impl Filesystem for DfsFilesystem {
                     *write_open_counts.entry(ino).or_insert(0) += 1;
 
                     // Cache metadata and stamp it as fresh.
-                    // BUT: Only insert if the cache doesn't already have data from writes.
-                    // Sparse writes (qcow2 creation) may have already updated the cache
-                    // with the correct size while this async CREATE task was in flight.
-                    // Without this check, we'd overwrite the sparse write's metadata
-                    // (size=1GB) with stale creation metadata (size=0).
+                    // BUT: Only skip inserting if the cache already has data from THIS same
+                    // file's own in-flight writes. Sparse writes (qcow2 creation) may have
+                    // already updated the cache with the correct size while this async
+                    // CREATE task was in flight. Without this check, we'd overwrite the
+                    // sparse write's metadata (size=1GB) with stale creation metadata (size=0).
                     // We can't rely on modified_at because it only has 1-second granularity
                     // and the sparse write happens within the same second as create.
+                    //
+                    // Also always insert if the cached entry belongs to a DIFFERENT file id —
+                    // a stale leftover at this ino from a logically-superseded predecessor
+                    // must never be mistaken for "this session's own write already landed".
                     let should_insert = metadata_cache.get(&ino)
-                        .map(|cached| cached.size == 0 && cached.chunk_locations.is_empty())
+                        .map(|cached| cached.id != metadata.id || (cached.size == 0 && cached.chunk_locations.is_empty()))
                         .unwrap_or(true);
                     if should_insert {
                         metadata_cache.insert(ino, metadata.clone());
@@ -5403,14 +5433,32 @@ impl Filesystem for DfsFilesystem {
                 if meta.file_type == FileType::RegularFile {
                     let offset_usize = offset as usize;
                     let cache_size = meta.size as usize;
+                    let current_file_id = meta.id;
                     drop(meta);
                     let hwm = size_high_water.get(&ino).map(|v| *v as usize).unwrap_or(0);
                     let current_size = hwm.max(cache_size);
                     let is_sequential = offset_usize <= current_size;
                     if is_sequential {
-                        if !write_buffers.contains_key(&ino) {
+                        // Create a fresh buffer if none exists yet, or if the existing one was
+                        // stamped for a different file identity — the same "Always replace"
+                        // handling create()'s SQLite pre-create path already does, extended to
+                        // this general lazy-creation path used by every other regular file
+                        // (DVR recordings included). Without this, a write_buffers entry left
+                        // over from a deleted-but-still-open predecessor at this inode carries
+                        // stale flushed_sizes that flush_buffer_async_one can misread as real
+                        // existing chunk content belonging to the new file — see
+                        // expected_file_id's doc comment for the full mechanism.
+                        let needs_fresh_buffer = match write_buffers.get(&ino) {
+                            None => true,
+                            Some(existing) => existing.try_lock().ok()
+                                .map(|st| st.expected_file_id.is_some_and(|id| id != current_file_id))
+                                .unwrap_or(false),
+                        };
+                        if needs_fresh_buffer {
                             let sync = path_for_sqlite_check.as_deref().map(is_sqlite_buffered).unwrap_or(false);
-                            write_buffers.insert(ino, Arc::new(Mutex::new(InodeWriteState::new(sync))));
+                            let mut state = InodeWriteState::new(sync);
+                            state.expected_file_id = Some(current_file_id);
+                            write_buffers.insert(ino, Arc::new(Mutex::new(state)));
                             written_inodes.insert(ino);
                         }
                         let state_arc = write_buffers.get(&ino).map(|e| e.clone());

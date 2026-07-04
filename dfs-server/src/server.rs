@@ -8309,7 +8309,8 @@ impl MessageHandler for Server {
         Box::pin(async move {
             // Handle cluster messages (heartbeat, join, leave, etc.)
             match message {
-                ClusterMessage::Heartbeat { node_info, cluster_view } => {
+                ClusterMessage::Heartbeat { node_info, cluster_view, heal_bandwidth_target_mb } => {
+                    let sender_id = node_info.id;
                     debug!("Received heartbeat from {} with {} gossip entries",
                            node_info.id, cluster_view.len());
 
@@ -8338,6 +8339,22 @@ impl MessageHandler for Server {
                     if !cluster_view.is_empty() {
                         if let Err(e) = self.cluster.merge_cluster_gossip(cluster_view).await {
                             warn!("Failed to merge cluster gossip: {}", e);
+                        }
+                    }
+
+                    // Apply the sender's heal bandwidth target if they're the leader —
+                    // our own pending_healing is always empty unless we're leader, so
+                    // this is the only accurate queue-depth-driven signal we can get.
+                    if let Some(target_mb) = heal_bandwidth_target_mb {
+                        let sender_is_leader = self.cluster.is_leader_id(sender_id).await;
+                        debug!(
+                            "heartbeat from {} carried heal_bandwidth_target_mb={} sender_is_leader={}",
+                            sender_id, target_mb, sender_is_leader
+                        );
+                        if sender_is_leader {
+                            if let Some(healing) = self.healing.read().await.as_ref() {
+                                healing.apply_external_bandwidth_target(target_mb).await;
+                            }
                         }
                     }
 

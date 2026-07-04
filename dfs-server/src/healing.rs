@@ -405,6 +405,17 @@ impl HealingManager {
         loop {
             tokio::time::sleep(Duration::from_secs_f64(INTERVAL_SECS)).await;
 
+            // pending_healing is only ever populated on the leader (discovery and
+            // drain are both leader-gated), so a follower always sees depth 0 here
+            // and would otherwise wrongly pin itself at the LOW_PCT floor regardless
+            // of the real cluster-wide backlog. Followers instead receive the
+            // leader's computed target via heartbeat — see
+            // Server::handle_cluster_message's ClusterMessage::Heartbeat arm and
+            // apply_external_bandwidth_target below.
+            if !self.cluster.is_leader().await {
+                continue;
+            }
+
             // Read fresh each tick so a live `dfs-admin healing set --max-pct` change
             // takes effect within one 2s cycle instead of only at the next restart.
             let high_pct = *self.heal_max_pct.read().await;
@@ -439,6 +450,7 @@ impl HealingManager {
 
             self.heal_bandwidth_limiter_out.set_rate_mb(target_mb).await;
             self.heal_bandwidth_limiter_in.set_rate_mb(target_mb).await;
+            self.cluster.set_local_heal_bandwidth_target(target_mb);
 
             if queue_depth > 0 || growth_rate.abs() > 0.5 {
                 debug!(
@@ -447,6 +459,17 @@ impl HealingManager {
                 );
             }
         }
+    }
+
+    /// Apply a heal bandwidth target (MB/s) received from the leader via heartbeat.
+    /// Used by followers, whose own `run_bandwidth_controller` tick is a no-op
+    /// (see the leader gate above) because their local `pending_healing` is always
+    /// empty. Bypasses the tiered depth calculation entirely — the leader already
+    /// did it — and just applies the rate directly to both local limiters.
+    pub async fn apply_external_bandwidth_target(&self, target_mb: usize) {
+        debug!("heal-bw (follower): applying leader-pushed target {}MB/s", target_mb);
+        self.heal_bandwidth_limiter_out.set_rate_mb(target_mb).await;
+        self.heal_bandwidth_limiter_in.set_rate_mb(target_mb).await;
     }
 
     /// Discovery loop — runs every 60s on the cluster leader.

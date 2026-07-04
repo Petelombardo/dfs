@@ -63,6 +63,14 @@ pub struct ClusterManager {
     /// Used by the healer to enforce a post-election grace period before
     /// allowing destructive operations (orphan purge, DATA LOSS declarations).
     became_leader_at: Arc<RwLock<Option<std::time::Instant>>>,
+
+    /// This node's most recently computed heal bandwidth target (MB/s), set by
+    /// HealingManager::run_bandwidth_controller only when this node is leader.
+    /// Piggybacked on outgoing heartbeats so followers — whose own pending_healing
+    /// map is always empty (only the leader drains/discovers) — can throttle heal
+    /// transfers off the cluster's real queue depth instead of always seeing an
+    /// empty local queue and pinning themselves at the 10% floor rate.
+    local_heal_bandwidth_mb: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Decide the epoch (unix secs) this leadership episode "started" at.
@@ -112,7 +120,15 @@ impl ClusterManager {
             node_recovered_notify: Arc::new(Notify::new()),
             became_leader_at: Arc::new(RwLock::new(None)),
             client: Arc::new(NetworkClient::new()),
+            local_heal_bandwidth_mb: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Record this node's just-computed heal bandwidth target (MB/s) so the next
+    /// outgoing heartbeat can carry it to followers. Only meaningful when called
+    /// by the leader — see `local_heal_bandwidth_mb` doc comment.
+    pub fn set_local_heal_bandwidth_target(&self, target_mb: usize) {
+        self.local_heal_bandwidth_mb.store(target_mb, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get this node's ID
@@ -746,6 +762,16 @@ impl ClusterManager {
             .map(|cap| (cap.available, cap.total))
             .unwrap_or((0, 0));
 
+        // Only the leader's queue-depth signal is meaningful (pending_healing is
+        // only ever populated on the leader — see local_heal_bandwidth_mb doc
+        // comment), so only advertise it when we currently believe we're leader.
+        // Receivers additionally verify the sender is the leader before trusting it.
+        let heal_bandwidth_target_mb = if self.is_leader().await {
+            Some(self.local_heal_bandwidth_mb.load(std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        };
+
         for (node_id, node_info) in nodes {
             // Skip self
             if node_id == local_node_id {
@@ -763,6 +789,7 @@ impl ClusterManager {
             let heartbeat = Message::Cluster(ClusterMessage::Heartbeat {
                 node_info: local_node_info,
                 cluster_view: cluster_view.clone(),
+                heal_bandwidth_target_mb,
             });
 
             // Send via the shared connection pool, fire-and-forget in a spawned task.

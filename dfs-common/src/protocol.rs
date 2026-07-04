@@ -925,6 +925,12 @@ pub enum ClusterMessage {
         node_info: NodeInfo,
         #[serde(default)]
         cluster_view: Vec<crate::NodeHealthGossip>,
+        /// Sender's current heal bandwidth target (MB/s), Some only when the sender
+        /// believes itself to be leader (the only node with an accurate heal queue
+        /// depth). Lets followers throttle heal transfers off the cluster-wide
+        /// signal instead of their own always-empty local queue.
+        #[serde(default)]
+        heal_bandwidth_target_mb: Option<usize>,
     },
 
     /// Join cluster request

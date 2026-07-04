@@ -815,6 +815,12 @@ impl FlushHandle {
         // bump instead of a second full-buffer copy.
         let mut slots_to_write: Vec<(u64, Arc<Vec<u8>>, u64)> = Vec::new(); // (chunk_idx, data, file_offset)
         let mut patch_metadata_dirty = false; // true if any PatchChunk succeeded (needs metadata flush)
+        // Every chunk location that changed in this flush cycle — populated both by
+        // successful PatchChunks below (which mutate metadata_cache in place, so their new
+        // location is pushed here explicitly) and by fresh-write results further down (via
+        // .extend(locations)). This is the single list fed to the read engine and spliced
+        // into metadata_cache, so both patched and freshly-written chunks are reflected.
+        let mut all_locations: Vec<dfs_common::ChunkLocation> = Vec::new();
         for chunk_idx in &indices_to_flush {
             let Some(state_lock) = self.write_buffers.get(&ino) else { continue };
             // Snapshot slot data and drop the mutex before any network I/O.
@@ -1061,6 +1067,7 @@ impl FlushHandle {
                                         meta_entry.size = meta_entry.size.max(end);
                                     }
                                 }
+                                all_locations.push(new_location.clone());
                                 patch_metadata_dirty = true;
                                 true
                             }
@@ -1117,6 +1124,7 @@ impl FlushHandle {
                                                 *loc = new_location.clone();
                                             }
                                         }
+                                        all_locations.push(new_location.clone());
                                         patch_metadata_dirty = true;
                                         refreshed = true;
                                     }
@@ -1187,7 +1195,8 @@ impl FlushHandle {
 
         // Process results: track flushed sizes and collect locations.
         // DO NOT remove slots yet - wait until read engine is updated to avoid race.
-        let mut all_locations: Vec<dfs_common::ChunkLocation> = Vec::new();
+        // (all_locations itself is declared earlier, alongside patch_metadata_dirty, so
+        // successful PatchChunks above can push their new location into the same list.)
         let mut first_err: Option<anyhow::Error> = None;
         let mut failed_chunk_indices: Vec<usize> = Vec::new();
         let mut flushed_chunks: Vec<(u64, usize)> = Vec::new(); // (chunk_idx, flushed_len)
@@ -1328,9 +1337,15 @@ impl FlushHandle {
                 self.client.flush_metadata_sync(&meta).await;
                 self.last_metadata_update.insert(ino, std::time::Instant::now());
                 // Now the leader has the metadata — safe to populate the read engine.
+                // Feed only the locations just flushed (all_locations), not the whole
+                // (ever-growing) meta.chunk_locations — the read engine is incremental by
+                // design (see feed_chunk_locations_to_read_engine's doc comment: callers
+                // pass one location at a time), and passing the full list here made every
+                // flush clone and rebuild a window over the entire file's chunk history:
+                // O(n) work per flush, O(n^2) over a large sequential write.
                 let current_size = meta.size;
                 self.client.feed_chunk_locations_to_read_engine(
-                    ino, &meta.chunk_locations, current_size,
+                    ino, &all_locations, current_size,
                 ).await;
             } else {
                 // Background tick: push directly into the queue (no back-pressure wait).
@@ -1364,10 +1379,12 @@ impl FlushHandle {
                 // For background flushes, update read engine immediately (not queued)
                 // so reads see fresh chunk_map before slots are removed below. Always runs,
                 // even when the metadata push above is throttled — this only updates this
-                // client's own local read cache, not the network.
+                // client's own local read cache, not the network. Feed only all_locations
+                // (this cycle's newly flushed chunks) — see the force branch's comment above
+                // for why passing the full meta.chunk_locations here was an O(n) per flush.
                 let current_size = meta.size;
                 self.client.feed_chunk_locations_to_read_engine(
-                    ino, &meta.chunk_locations, current_size,
+                    ino, &all_locations, current_size,
                 ).await;
             }
         }

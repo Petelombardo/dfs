@@ -555,6 +555,11 @@ struct FlushHandle {
     /// flush_all_pipelined (fsync/release) uses byte limit only — no item cap.
     flush_in_flight: Arc<RwLock<Option<Arc<DashMap<u64, usize>>>>>,
     last_metadata_update: Arc<DashMap<u64, std::time::Instant>>,
+    /// Per-inode timestamp of the last full-metadata push made by a *background* (non-force)
+    /// flush tick. Gates how often flush_buffer_async's background branch sends the complete
+    /// FileMetadata (whole chunk_locations Vec) to the leader — see its use in
+    /// flush_buffer_async for why this must be time-throttled rather than per-chunk.
+    last_bg_metadata_push: Arc<DashMap<u64, std::time::Instant>>,
     dir_cache: Arc<DashMap<String, (Vec<FileMetadata>, std::time::Instant)>>,
     /// Tracks when each directory was last invalidated (create/mkdir/unlink/rename).
     /// readdir only inserts into dir_cache if the directory wasn't invalidated
@@ -1333,11 +1338,33 @@ impl FlushHandle {
                 // which would hold the in_flight slot and prevent new background flushes
                 // from starting — starving the write pipeline. We stamp the seq and push
                 // directly; the queue worker handles delivery and retries independently.
-                self.last_metadata_update.insert(ino, std::time::Instant::now());
-                let stamped = self.client.stamp_write_seq_pub(&meta);
-                self.client.metadata_queue.push(stamped).await;
+                //
+                // Throttled to at most once per BG_METADATA_PUSH_INTERVAL: this carries the
+                // *entire* chunk_locations Vec (every chunk written so far), and
+                // handle_put_file_metadata reconciles it against the leader's chunk_map with
+                // two nested O(n) scans. The leader's chunk_map is already kept current
+                // per-chunk by the cheap ReplicateChunkLocation(s) sent during the chunk write
+                // itself (write_data_dual_replica) — this full-metadata push only exists to
+                // make size/mtime/chunk_locations visible to other clients and durable before
+                // release(). Sending it on every single completed chunk made a large sequential
+                // write's per-chunk cost grow with the file's total chunk count (O(n) client-side
+                // clone/serialize plus O(n^2) server-side reconcile, repeated ~n times), collapsing
+                // throughput over a multi-GB transfer. force=true (fsync/release, above) always
+                // pushes unthrottled so the file is fully authoritative at close.
+                const BG_METADATA_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+                let should_push = self.last_bg_metadata_push.get(&ino)
+                    .map(|last| last.elapsed() >= BG_METADATA_PUSH_INTERVAL)
+                    .unwrap_or(true);
+                if should_push {
+                    self.last_bg_metadata_push.insert(ino, std::time::Instant::now());
+                    self.last_metadata_update.insert(ino, std::time::Instant::now());
+                    let stamped = self.client.stamp_write_seq_pub(&meta);
+                    self.client.metadata_queue.push(stamped).await;
+                }
                 // For background flushes, update read engine immediately (not queued)
-                // so reads see fresh chunk_map before slots are removed below.
+                // so reads see fresh chunk_map before slots are removed below. Always runs,
+                // even when the metadata push above is throttled — this only updates this
+                // client's own local read cache, not the network.
                 let current_size = meta.size;
                 self.client.feed_chunk_locations_to_read_engine(
                     ino, &meta.chunk_locations, current_size,
@@ -3224,6 +3251,8 @@ impl DfsFilesystem {
         let explicit_mtime_pending_shared: Arc<dashmap::DashSet<u64>> = Arc::new(dashmap::DashSet::new());
         let last_metadata_update_shared: Arc<DashMap<u64, std::time::Instant>> =
             Arc::new(DashMap::new());
+        let last_bg_metadata_push_shared: Arc<DashMap<u64, std::time::Instant>> =
+            Arc::new(DashMap::new());
 
         let write_open_counts: Arc<DashMap<u64, usize>> = Arc::new(DashMap::new());
         let open_counts: Arc<DashMap<u64, usize>> = Arc::new(DashMap::new());
@@ -3294,6 +3323,7 @@ impl DfsFilesystem {
                 metadata_cache: metadata_cache_for_cleanup.clone(),
                 flush_in_flight: flush_in_flight_shared.clone(),
                 last_metadata_update: last_metadata_update_shared.clone(),
+                last_bg_metadata_push: last_bg_metadata_push_shared.clone(),
                 dir_cache: dir_cache_shared.clone(),
                 dir_cache_invalidated_at: dir_cache_invalidated_at_shared.clone(),
                 path_to_inode: path_to_inode_for_bg.clone(),
@@ -3497,6 +3527,7 @@ impl DfsFilesystem {
             metadata_cache: metadata_cache.clone(),
             flush_in_flight: flush_in_flight_shared.clone(),
             last_metadata_update: last_metadata_update_shared.clone(),
+            last_bg_metadata_push: last_bg_metadata_push_shared.clone(),
             dir_cache: dir_cache_shared.clone(),
             dir_cache_invalidated_at: dir_cache_invalidated_at_shared.clone(),
             path_to_inode: path_to_inode.clone(),
@@ -6968,6 +6999,7 @@ impl Filesystem for DfsFilesystem {
         let write_buffers = self.write_buffers.clone();
         let write_counters = self.write_counters.clone();
         let last_metadata_update = self.last_metadata_update.clone();
+        let last_bg_metadata_push = self.flush_handle.last_bg_metadata_push.clone();
         let last_warm_offset = self.last_warm_offset.clone();
         let chunk_offset_cache = self.chunk_offset_cache.clone();
         let pending_deletes = self.pending_deletes.clone();
@@ -7010,6 +7042,7 @@ impl Filesystem for DfsFilesystem {
                 client.evict_recent_chunk_writes(ino);
                 write_counters.write().unwrap().remove(&ino);
                 last_metadata_update.remove(&ino);
+                last_bg_metadata_push.remove(&ino);
                 last_warm_offset.remove(&ino);
                 chunk_offset_cache.remove(&ino);
                 inode_to_path.write().unwrap().remove(&ino);
@@ -7723,6 +7756,7 @@ impl Filesystem for DfsFilesystem {
             metadata_cache: metadata_cache.clone(),
             flush_in_flight: flush_in_flight.clone(),
             last_metadata_update: self.last_metadata_update.clone(),
+            last_bg_metadata_push: self.flush_handle.last_bg_metadata_push.clone(),
             dir_cache: self.dir_cache.clone(),
             dir_cache_invalidated_at: self.dir_cache_invalidated_at.clone(),
             path_to_inode: self.path_to_inode.clone(),

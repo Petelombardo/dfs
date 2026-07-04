@@ -5546,20 +5546,27 @@ impl Filesystem for DfsFilesystem {
                                 }
                                 // Invalidate zero_gap_table for chunks touched by this write.
                                 // Same rationale as the slow path: gap entries must not shadow
-                                // in-flight writes before the 50ms flush fires.
+                                // in-flight writes before the 50ms flush fires. Must be awaited
+                                // inline here (not spawned onto flush_runtime) — spawning it
+                                // detached meant flush_notify.notify_one() below could wake the
+                                // background ticker, which could run flush_buffer_async_one and
+                                // re-seed a gap over this chunk, before the spawned invalidation
+                                // task ever ran. That stale gap then shadowed the real data this
+                                // write just landed: a fresh reader with no live write-buffer
+                                // slot (e.g. a new open() after the writer closed) would read
+                                // through zero_gap_table and get zeros instead of the actual
+                                // bytes. Root cause of the DVR-stream last-chunk stale-zero-read
+                                // regression (chunk 7, page 0, in test_dvr_stream.sh).
                                 {
                                     const GAP_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
                                     let write_start = offset as u64;
                                     let write_end_gap = write_start + data_vec.len() as u64;
                                     let first_chunk_off = (write_start / GAP_CHUNK_SIZE) * GAP_CHUNK_SIZE;
-                                    let client_gap = client.clone();
-                                    flush_handle.flush_runtime.spawn(async move {
-                                        let mut chunk_off = first_chunk_off;
-                                        while chunk_off < write_end_gap {
-                                            client_gap.invalidate_zero_gap_for_chunk(ino, chunk_off).await;
-                                            chunk_off += GAP_CHUNK_SIZE;
-                                        }
-                                    });
+                                    let mut chunk_off = first_chunk_off;
+                                    while chunk_off < write_end_gap {
+                                        client.invalidate_zero_gap_for_chunk(ino, chunk_off).await;
+                                        chunk_off += GAP_CHUNK_SIZE;
+                                    }
                                 }
                                 // Only count bytes actually added to the buffer, not the write
                                 // size. Overlapping writes don't grow the slot, so adding

@@ -612,21 +612,13 @@ impl Server {
         let mut entry = self.chunk_map.entry(file_id)
             .or_insert_with(|| (vec![], location.client_write_seq.unwrap_or(0)));
         let (locs, _) = entry.value_mut();
-        // First try exact chunk_id match.
-        for loc in locs.iter_mut() {
-            if loc.chunk_id == location.chunk_id {
-                *loc = location.clone();
-                self.chunk_to_file.insert(location.chunk_id, file_id);
-                return;
-            }
-        }
-        // Fallback: match by chunk_idx (file_offset / CHUNK_SIZE), NOT exact file_offset.
-        // Two writes to the same chunk_idx can arrive with different file_offsets: the first
-        // may use the actual intra-chunk write position (e.g., 2148007936 for a 65536-byte
-        // write at byte 524288 of chunk 512), while the second uses the chunk boundary
-        // (2147483648). Exact-offset matching would push both as separate entries; the stale
-        // first entry then causes handle_multi_patch to return ChunkStale for the newer chunk.
-        // Matching by chunk_idx ensures the newer entry always replaces the older one.
+        // Match by chunk_idx (file_offset / CHUNK_SIZE), NOT exact file_offset. Two writes
+        // to the same chunk_idx can arrive with different file_offsets: the first may use
+        // the actual intra-chunk write position (e.g., 2148007936 for a 65536-byte write at
+        // byte 524288 of chunk 512), while the second uses the chunk boundary (2147483648).
+        // Exact-offset matching would push both as separate entries; the stale first entry
+        // then causes handle_multi_patch to return ChunkStale for the newer chunk. Matching
+        // by chunk_idx ensures the newer entry always replaces the older one.
         if let Some(file_offset) = location.file_offset {
             const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             let incoming_chunk_idx = file_offset / CHUNK_SIZE;
@@ -634,13 +626,32 @@ impl Server {
             let pos = locs.partition_point(|l| l.file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE) < incoming_chunk_idx);
             if pos < locs.len() && locs[pos].file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE) == incoming_chunk_idx {
                 let loc = &mut locs[pos];
-                let should_update = match (location.client_write_seq, loc.client_write_seq) {
-                    (Some(inc), Some(ext)) => inc >= ext,
-                    (Some(_), None)        => true,  // incoming has seq, existing is legacy → accept
-                    (None, Some(_))        => false, // existing has seq, incoming is legacy → keep
-                    (None, None)           => {
-                        // Legacy path: both records predate client_write_seq → use written_at
-                        location.written_at.unwrap_or(0) >= loc.written_at.unwrap_or(0)
+                // Same chunk_id at this position: an identity match, not a content change
+                // (chunk_id is a hash over content+offset+file — see compute_chunk_hash_at —
+                // so an unchanged chunk_id here means only `nodes` differs, e.g. the healer
+                // added/removed a replica, or two write-replicas each self-reported). The
+                // caller (handle_replicate_chunk_location(s)) already resolved the correct
+                // node set with its own RF-aware merge before calling this — there's no
+                // content-freshness question left to ask, so accept unconditionally. This
+                // used to be found via a separate O(n) linear scan for an exact chunk_id
+                // match tried before the chunk_idx lookup below; doing the identity check
+                // at the chunk_idx position instead finds the same answer in O(log n) since
+                // an exact chunk_id match can only exist at the position its own hash
+                // encodes. A *different* chunk_id at this same position means the content
+                // genuinely changed (e.g. a patch produced a new hash), which is the one
+                // case that legitimately needs the client_write_seq ordering guard below to
+                // arbitrate between two competing versions.
+                let should_update = if loc.chunk_id == location.chunk_id {
+                    true
+                } else {
+                    match (location.client_write_seq, loc.client_write_seq) {
+                        (Some(inc), Some(ext)) => inc >= ext,
+                        (Some(_), None)        => true,  // incoming has seq, existing is legacy → accept
+                        (None, Some(_))        => false, // existing has seq, incoming is legacy → keep
+                        (None, None)           => {
+                            // Legacy path: both records predate client_write_seq → use written_at
+                            location.written_at.unwrap_or(0) >= loc.written_at.unwrap_or(0)
+                        }
                     }
                 };
                 if should_update {
@@ -660,7 +671,16 @@ impl Server {
             self.chunk_to_file.insert(location.chunk_id, file_id);
             return;
         }
-        // No file_offset — can't determine position; append.
+        // No file_offset (legacy path only — every real write carries one, so this is
+        // never the hot path): chunk_idx position can't be determined, so fall back to
+        // matching by exact chunk_id before giving up and appending a new entry.
+        for loc in locs.iter_mut() {
+            if loc.chunk_id == location.chunk_id {
+                *loc = location.clone();
+                self.chunk_to_file.insert(location.chunk_id, file_id);
+                return;
+            }
+        }
         locs.push(location.clone());
         self.chunk_to_file.insert(location.chunk_id, file_id);
     }
@@ -2409,59 +2429,21 @@ impl Server {
                     self.chunk_map_update_location(&merged_location).await;
                 }
 
-                // Also update the file metadata record in sled so DisseminateMetadata
-                // broadcasts the correct chunk_id to followers. Without this, the file
-                // record retains the old chunk_id and periodic dissemination overwrites
-                // the in-memory fix, causing perpetual ChunkStale on followers.
-                let sled_file_id = file_id.or_else(|| {
-                    // Legacy fallback: find the file by chunk_id in the chunk_map.
-                    merged_location.file_offset.and_then(|file_offset| {
-                        for entry in self.chunk_map.iter() {
-                            let fid = *entry.key();
-                            let (locs, _) = entry.value();
-                            if locs.iter().any(|l| l.file_offset == Some(file_offset) && l.chunk_id == merged_location.chunk_id) {
-                                return Some(fid);
-                            }
-                        }
-                        None
-                    })
-                });
-                if let Some(fid) = sled_file_id {
-                    if let Ok(Some(mut file_meta)) = self.metadata.get_file(&fid) {
-                        let mut updated = false;
-                        for loc in file_meta.chunk_locations.iter_mut() {
-                            if loc.chunk_id == merged_location.chunk_id {
-                                // Same chunk_id: pure node-list merge — ordering doesn't apply.
-                                *loc = merged_location.clone();
-                                updated = true;
-                                break;
-                            } else if loc.file_offset == merged_location.file_offset {
-                                // Different chunk_id at same offset: guard against stale RCL
-                                // arriving after a newer patch already updated the sled.
-                                let should_update = match (merged_location.client_write_seq, loc.client_write_seq) {
-                                    (Some(inc), Some(ext)) => inc >= ext,
-                                    (Some(_), None)        => true,
-                                    (None, Some(_))        => false,
-                                    (None, None)           => true, // no ordering info — accept (existing behavior)
-                                };
-                                if should_update {
-                                    *loc = merged_location.clone();
-                                    updated = true;
-                                } else {
-                                    debug!("RCL sled update skipped: stale client_write_seq {:?} < existing {:?} for file {:?} offset {:?}",
-                                        merged_location.client_write_seq, loc.client_write_seq, fid, loc.file_offset);
-                                }
-                                break;
-                            }
-                        }
-                        if updated && !self.delete_tombstones.contains_key(&fid) {
-                            if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
-                                let _ = tx.send(file_meta);
-                            }
-                        }
-                    }
-                }
-
+                // Deliberately not eagerly patching the file's persisted sled record here
+                // (this used to re-fetch, linear-scan, and rewrite the *entire*, ever-growing
+                // FileMetadata blob on every single chunk write — O(n) disk I/O repeated n
+                // times per file). It isn't needed for correctness: neither dissemination path
+                // depends on it — the durable per-follower queue (enqueue_metadata_for_followers,
+                // fed only from handle_put_file_metadata/handle_append_file) sends whatever was
+                // captured at enqueue time, and the metadata healer loop rebuilds
+                // chunk_locations straight from this same in-memory chunk_map before broadcasting
+                // (see start_metadata_healer_loop) — so chunk_map (updated above, unconditionally
+                // and cheaply) is already the authoritative source both paths need. The only
+                // consumers that read the persisted chunk_locations field directly are
+                // dfs-admin's `file info`/`file list` (GetFileInfo(ById), never used by the
+                // actual client read path), which can lag until the next PutFileMetadata for
+                // this file — an admin-visibility staleness window, not a filesystem-correctness
+                // one.
                 info!("Successfully replicated chunk location for {} (total nodes: {})",
                       merged_location.chunk_id, merged_location.nodes.len());
 
@@ -2814,63 +2796,11 @@ impl Server {
                 }
             }
 
-            // 2. Patch each affected file's record in the metadata store so
-            //    DisseminateMetadata broadcasts the correct chunk_id — grouped by
-            //    resolved file_id so a batch touching multiple chunks of the same file
-            //    does one read-modify-write per file, not per chunk.
-            let mut by_file: std::collections::HashMap<FileId, Vec<&ChunkLocation>> = std::collections::HashMap::new();
-            for location in &to_commit {
-                let sled_file_id = location.file_id.or_else(|| {
-                    // Legacy fallback: find the file by chunk_id in the chunk_map.
-                    location.file_offset.and_then(|file_offset| {
-                        for entry in self.chunk_map.iter() {
-                            let fid = *entry.key();
-                            let (locs, _) = entry.value();
-                            if locs.iter().any(|l| l.file_offset == Some(file_offset) && l.chunk_id == location.chunk_id) {
-                                return Some(fid);
-                            }
-                        }
-                        None
-                    })
-                });
-                if let Some(fid) = sled_file_id {
-                    by_file.entry(fid).or_default().push(location);
-                }
-            }
-            for (fid, file_locations) in by_file {
-                if let Ok(Some(mut file_meta)) = self.metadata.get_file(&fid) {
-                    let mut updated = false;
-                    for merged_location in file_locations {
-                        for loc in file_meta.chunk_locations.iter_mut() {
-                            if loc.chunk_id == merged_location.chunk_id {
-                                *loc = merged_location.clone();
-                                updated = true;
-                                break;
-                            } else if loc.file_offset == merged_location.file_offset {
-                                let should_update = match (merged_location.client_write_seq, loc.client_write_seq) {
-                                    (Some(inc), Some(ext)) => inc >= ext,
-                                    (Some(_), None)        => true,
-                                    (None, Some(_))        => false,
-                                    (None, None)           => true,
-                                };
-                                if should_update {
-                                    *loc = merged_location.clone();
-                                    updated = true;
-                                } else {
-                                    debug!("RCL batch sled update skipped: stale client_write_seq {:?} < existing {:?} for file {:?} offset {:?}",
-                                        merged_location.client_write_seq, loc.client_write_seq, fid, loc.file_offset);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if updated && !self.delete_tombstones.contains_key(&fid) {
-                        if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
-                            let _ = tx.send(file_meta);
-                        }
-                    }
-                }
-            }
+            // Deliberately not eagerly patching each affected file's persisted sled record
+            // here — see the matching comment in handle_replicate_chunk_location for why
+            // this per-chunk read-modify-write of the entire (ever-growing) FileMetadata
+            // blob isn't needed for dissemination correctness, only for dfs-admin
+            // `file info`/`file list` freshness during an in-progress write.
 
             for location in &to_commit {
                 info!("Successfully replicated chunk location for {} (total nodes: {})",

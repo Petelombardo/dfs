@@ -576,6 +576,14 @@ pub struct DfsClient {
     /// Even if chunk hashes change, we can still cache by file position
     byte_range_cache: Arc<ShardedByteRangeCache>,
 
+    /// Combined worst-case byte size of chunk_cache + byte_range_cache, as actually
+    /// computed at startup (not re-derived independently elsewhere). Callers sizing
+    /// their own memory budget off the same `available_mb` snapshot (e.g.
+    /// fuse_impl.rs's write-buffer cap) must subtract this first — each cache being
+    /// sized as an independent percentage of the same "available" figure would let
+    /// their worst cases silently compound past what's actually safe.
+    pub reserved_cache_bytes: usize,
+
     /// Zero-filled gap table: tracks ranges that contain zeros in sparse files.
     /// Key: (inode, chunk_offset), Value: Vec of gap ranges within that chunk.
     /// This avoids caching megabytes of zeros for qcow2 sparse writes.
@@ -819,12 +827,16 @@ impl DfsClient {
             .expect("warm_cache_capacity must be > 0");
         let warm_cache_map = LruCache::new(warm_cache_capacity);
 
+        let reserved_cache_bytes =
+            (cache_capacity.get() + byte_cache_capacity.get()) * 4 * 1024 * 1024;
+
         Ok(Self {
             cluster_nodes: Arc::new(RwLock::new(cluster_nodes.clone())),
             seed_nodes: cluster_nodes,
             current_node: Arc::new(RwLock::new(0)),
             chunk_cache: cache,
             byte_range_cache: Arc::new(ShardedByteRangeCache::new(byte_cache_capacity)),
+            reserved_cache_bytes,
             zero_gap_table: Arc::new(ShardedZeroGapTable::new()),
             connection_pool: Arc::new(DashMap::new()),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),

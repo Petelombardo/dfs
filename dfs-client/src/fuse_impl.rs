@@ -217,6 +217,22 @@ struct ChunkSlot {
     /// doesn't fix an unrecoverable chunk, but it stops the client from hammering the
     /// leader and spamming logs over something that isn't going to change on its own.
     retry_backoff_until: Option<std::time::Instant>,
+    /// Set by write_at() when a write lands in a *different* chunk than the last one —
+    /// an unambiguous, event-driven signal that this slot won't receive more data soon
+    /// (as opposed to merely being idle for some duration, which can misfire for a
+    /// continuous sequential stream — see STALE_FLUSH_MS's history: a blind 50ms idle
+    /// timer once flushed a live DVR recording mid-write and corrupted it, commit
+    /// 0bc3b09). Cleared the next time this slot is written to. The background ticker
+    /// treats abandoned slots as immediately flush-eligible regardless of
+    /// no_active_writers, since the file having other active writers elsewhere is
+    /// irrelevant to whether *this specific* chunk is done — the DVR case that
+    /// motivated no_active_writers is about a chunk still being actively appended to,
+    /// which this flag structurally cannot signal for (only a real cross-chunk move
+    /// sets it). Root cause of the 2026-07-05 kdiskmark RND4K throughput collapse:
+    /// without this, abandoned chunks from random-write patterns fell through to the
+    /// 2000ms STALE_FLUSH_MS fallback, forcing a multi-GB write-buffer cap just to
+    /// avoid back-pressure on the resulting backlog.
+    abandoned: bool,
 }
 
 impl ChunkSlot {
@@ -233,6 +249,7 @@ impl ChunkSlot {
             server_chunk_id: None,
             terminal_failure_count: 0,
             retry_backoff_until: None,
+            abandoned: false,
         }
     }
 
@@ -365,13 +382,18 @@ impl InodeWriteState {
             // Cross-chunk pattern change: if this write lands in a different chunk than
             // the last one, the previous chunk's slot has been abandoned mid-fill.
             // Signal an immediate flush so its buffered data doesn't wait for the timer.
+            // Also mark the slot `abandoned` — a stronger, event-driven signal than
+            // pattern_changed's notify_one() wake-up alone, which only wakes the ticker
+            // without giving it a way to treat this slot as eligible regardless of
+            // no_active_writers. See `abandoned`'s doc comment.
             if let Some(prev_idx) = self.last_written_chunk {
                 if prev_idx != idx {
-                    if let Some(prev_slot) = self.slots.get(&prev_idx) {
+                    if let Some(prev_slot) = self.slots.get_mut(&prev_idx) {
                         if (prev_slot.real_data_end > 0 || prev_slot.gap_filled_prefix > 0)
                             && !prev_slot.flushing
                         {
                             pattern_changed = true;
+                            prev_slot.abandoned = true;
                         }
                     }
                 }
@@ -395,6 +417,10 @@ impl InodeWriteState {
                 }
                 s
             });
+            // This slot is receiving data again — if it was previously marked abandoned
+            // (a write moved away from it, then came back before the ticker flushed it),
+            // that's no longer true.
+            slot.abandoned = false;
 
             // Detect write-pattern change: if this write doesn't start exactly where
             // the last one ended, the caller has switched from sequential to random
@@ -514,6 +540,27 @@ impl InodeWriteState {
             .collect()
     }
 
+    /// True if any slot is ready for flush_one_chunk to pick up right now — full,
+    /// abandoned, idle, or over the per-chunk dirty threshold. Used by the
+    /// self-refilling ticker loop to decide whether to keep dispatching immediately
+    /// rather than falling back to the next periodic tick; MUST exactly mirror
+    /// flush_one_chunk's own (non-urgent) selection criteria, including
+    /// !in_backoff() — omitting it caused a real self-refilling-loop hang (this
+    /// method said "more work" forever for a backed-off slot while
+    /// flush_one_chunk(ino, false) correctly skipped it and returned Ok(()) doing
+    /// nothing, spinning forever and permanently pinning one of the
+    /// PIPELINE_MAX_ITEMS concurrency slots) — caught during 2026-07-05 kdiskmark
+    /// testing of the `abandoned` fix.
+    fn has_flushable_slot(&self) -> bool {
+        const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 4;
+        self.slots.values().any(|s| {
+            !s.flushing && !s.data.is_empty() && !s.in_backoff() && (
+                s.is_full() || s.is_idle() || s.abandoned ||
+                s.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES
+            )
+        })
+    }
+
     /// All slot indices sorted ascending. Used by fsync/release.
     fn all_slot_indices(&self) -> Vec<u64> {
         let mut indices: Vec<u64> = self.slots.iter()
@@ -552,20 +599,20 @@ const FLUSH_ALL_MAX_ITEMS: usize = 64;
 /// raising the worst-case memory ceiling for large/zero-padded slots.
 const PIPELINE_MAX_BYTES: usize = 8 * CHUNK_SIZE;
 
-/// Hard ceiling on total write-buffer memory across ALL inodes combined, regardless
-/// of how many files are concurrently open for writing. This is the actual
-/// OOM-safety bound. It used to be computed per-inode (BUFFER_CHUNKS × CHUNK_SIZE)
-/// and then scaled up by the number of open write buffers — meaning more
-/// concurrently-open files meant a higher ceiling, making worst-case RSS depend on
-/// workload shape instead of being a flat, easy-to-reason-about number. Now flat.
-/// 256MB is well below any real memory budget (production dfs-client sits around
-/// ~800MB RSS total under sustained load — see the server5/VM100 incident,
-/// 2026-07-05) while still generous enough for VM-disk/sparse-write patterns now
-/// that resident_bytes() correctly counts gap-fill memory against this cap (see its
-/// doc comment) — raised after that fix measurably slowed VM-disk-pattern tests
-/// (T22/T26/T27/T29, ~45-60s across the local suite) by triggering back-pressure
-/// where it previously (incorrectly) didn't.
-const GLOBAL_WRITE_BUFFER_CAP_BYTES: usize = 256 * 1024 * 1024;
+/// Historical note on the write-buffer cap (now computed at runtime in
+/// new_with_runtime as global_write_buffer_cap_bytes, scaled to available
+/// memory — see its computation for the full rationale): this was originally a
+/// flat 256MB constant, which real-world kdiskmark testing on server5 showed
+/// collapsed RND4K Q32T1/Q1T1 random-write throughput ~40x (3MB/s -> 0.07MB/s)
+/// while sequential writes and reads improved. Root cause: resident_bytes() now
+/// correctly charges the FULL gap-fill preload (up to CHUNK_SIZE) against this
+/// cap for every distinct chunk touched (see its doc comment) — sequential
+/// writes reuse the same/adjacent chunk many times before it needs to flush,
+/// amortizing that cost, but *random* 4K writes across a multi-GB disk touch a
+/// new chunk almost every write, each paying the full preload cost. At 256MB
+/// (64 chunks) that exhausted almost immediately for kdiskmark's ~1GiB
+/// random-write test region (256 chunks), collapsing concurrency to roughly one
+/// admitted write per completed flush.
 
 /// Cheaply-cloneable handle to the fields needed by flush_buffer_async.
 /// Extracted so fsync() can clone it and spawn a background flush task without
@@ -1494,9 +1541,20 @@ impl FlushHandle {
             let idx = if let Some(i) = full.into_iter().next() {
                 i
             } else {
-                // No full unclaimed slot — try the oldest idle partial slot.
+                // No full unclaimed slot — try the oldest eligible partial slot. Eligible
+                // means idle (quiet for a while), OR abandoned (a write moved to a
+                // different chunk — an unambiguous "done with this one" event, safe
+                // regardless of is_idle()'s timing — see `abandoned`'s doc comment), OR
+                // over the per-chunk dirty-byte threshold (a slot that keeps getting
+                // revisited so never goes idle or gets abandoned, but has accumulated
+                // enough real dirty data to be worth flushing on its own).
+                const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 4;
                 let mut idle: Vec<(u64, SystemTime)> = state.slots.iter()
-                    .filter(|(_, s)| s.is_idle() && !s.data.is_empty() && !s.flushing && (urgent || !s.in_backoff()))
+                    .filter(|(_, s)| {
+                        (s.is_idle() || s.abandoned
+                            || s.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES)
+                        && !s.data.is_empty() && !s.flushing && (urgent || !s.in_backoff())
+                    })
                     .map(|(idx, s)| (*idx, s.last_modified))
                     .collect();
                 idle.sort_by_key(|&(_, t)| t);
@@ -1613,7 +1671,18 @@ impl FlushHandle {
         // almost never reached 0 during a sustained burst, so this wait kept timing out
         // at its full 5s deadline for nearly every flush attempt.
         if gap_filled_prefix > 0 {
-        if let Some(counter) = self.write_tasks_in_flight.get(&(ino, chunk_idx)) {
+        // Clone the Arc and drop the DashMap Ref guard immediately — holding a
+        // DashMap shard's lock across the .await points below (up to 5 real
+        // seconds via the sleep loop) blocks any other thread that needs the same
+        // shard for an unrelated (ino, chunk_idx) key (e.g. inc_write_tasks_for_chunks
+        // incrementing a different chunk's counter), with no timeout of its own
+        // since that's a plain std lock, not tokio-aware. Root cause of a real
+        // deadlock hit during 2026-07-05 testing (dramatically more likely to
+        // trigger once the `abandoned` fix raised flush frequency/concurrency) —
+        // quite possibly the same mechanism behind the still-unexplained
+        // server5/VM100 production deadlock, which showed an identical
+        // all-threads-parked-on-futex_wait_queue signature.
+        if let Some(counter) = self.write_tasks_in_flight.get(&(ino, chunk_idx)).map(|r| r.clone()) {
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
             while counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 if tokio::time::Instant::now() > deadline {
@@ -3109,6 +3178,12 @@ pub struct DfsFilesystem {
     /// Enable write-behind buffering
     write_buffer_enabled: bool,
 
+    /// Hard ceiling on total write-buffer resident memory across all inodes,
+    /// scaled to available system memory at startup. See its computation in
+    /// new() for the full rationale (nanopir3-safe, hypervisor-considerate,
+    /// still large enough to avoid the RND4K throughput collapse).
+    global_write_buffer_cap_bytes: usize,
+
     /// Per-inode write state: chunk slots keyed by chunk index, plus sync policy flag.
     /// DashMap provides lock-free reads and fine-grained locking per inode.
     write_buffers: Arc<DashMap<u64, Arc<Mutex<InodeWriteState>>>>,
@@ -3270,8 +3345,67 @@ impl DfsFilesystem {
               buffer_flush_threshold / chunk_size_bytes,
               chunk_size_mb);
 
-        info!("Global write buffer cap: {}MB (flat, across all inodes)",
-              GLOBAL_WRITE_BUFFER_CAP_BYTES / (1024 * 1024));
+        // Scale the write-buffer cap to available memory, the same way chunk_cache
+        // and byte_range_cache already do — a flat cap sized for a 16GB server would
+        // be dangerous on a low-memory client like nanopir3 (2GB total, ~900MB
+        // available). Kept deliberately conservative even on large boxes: dfs-client
+        // often runs alongside the actual workload it exists to serve (e.g. server5
+        // is a Proxmox hypervisor — its RAM is for VMs, not for us to help ourselves
+        // to a quarter of it just because it happens to be free at startup). The max
+        // tier is sized to comfortably cover kdiskmark's typical ~1GiB random-write
+        // test region (256 chunks) — real-world testing on server5 showed the
+        // previous 256MB cap collapsed RND4K random-write throughput ~40x (see
+        // GLOBAL_WRITE_BUFFER_CAP_BYTES's history) because random access across a
+        // multi-GB disk touches a new chunk almost every write, each paying the full
+        // gap-fill cost (resident_bytes()) against the cap — but there's no reason
+        // to go further than that working set just because more RAM is technically free.
+        //
+        // Also computed as target_pct of available memory MINUS what chunk_cache +
+        // byte_range_cache already reserved from that same "available" snapshot
+        // (client.reserved_cache_bytes) — sizing each cache as an independent
+        // percentage of the same figure would let their worst cases silently compound.
+        let available_bytes = dfs_common::get_available_memory().unwrap_or(1024 * 1024 * 1024);
+        let available_mb = available_bytes / (1024 * 1024);
+        let (wb_target_pct, wb_min_bytes, wb_max_bytes): (u8, usize, usize) =
+            if available_mb < 256 {
+                (4, 16 * 1024 * 1024, 32 * 1024 * 1024)
+            } else if available_mb < 512 {
+                (8, 32 * 1024 * 1024, 64 * 1024 * 1024)
+            } else if available_mb < 1024 {
+                (15, 64 * 1024 * 1024, 128 * 1024 * 1024)
+            } else if available_mb < 2048 {
+                (18, 96 * 1024 * 1024, 256 * 1024 * 1024)
+            } else if available_mb < 4096 {
+                (20, 128 * 1024 * 1024, 512 * 1024 * 1024)
+            } else {
+                (15, 256 * 1024 * 1024, 1024 * 1024 * 1024)
+            };
+        let target_bytes = (available_bytes as f64 * (wb_target_pct as f64 / 100.0)) as usize;
+        let computed_cap_bytes = target_bytes
+            .saturating_sub(client.reserved_cache_bytes)
+            .max(wb_min_bytes)
+            .min(wb_max_bytes);
+        // DFS_WRITE_BUFFER_CAP_MB overrides the computed value entirely (no min/max
+        // clamping applied to an explicit override) — for A/B testing cap sizing
+        // against real workloads (e.g. kdiskmark RND4K) without a rebuild. Unset in
+        // normal operation; the memory-scaled computation above is what actually ships.
+        let env_override_mb = std::env::var("DFS_WRITE_BUFFER_CAP_MB").ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let global_write_buffer_cap_bytes = match env_override_mb {
+            Some(mb) => {
+                let bytes = mb * 1024 * 1024;
+                info!("Write buffer cap sizing: OVERRIDDEN via DFS_WRITE_BUFFER_CAP_MB={} MB (computed value would have been {} MB: {} MB available, {}% target, {} MB reserved)",
+                      mb, computed_cap_bytes / (1024 * 1024), available_mb, wb_target_pct,
+                      client.reserved_cache_bytes / (1024 * 1024));
+                bytes
+            }
+            None => {
+                info!("Write buffer cap sizing: {} MB available, {}% target, {} MB reserved by other caches -> {} MB",
+                      available_mb, wb_target_pct, client.reserved_cache_bytes / (1024 * 1024),
+                      computed_cap_bytes / (1024 * 1024));
+                computed_cap_bytes
+            }
+        };
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
         if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {
@@ -3497,8 +3631,22 @@ impl DfsFilesystem {
                         let has_idle = no_active_writers && state.slots.iter().any(|(_, s)| {
                             s.is_idle() && !s.data.is_empty() && !s.flushing && !s.in_backoff()
                         });
+                        // Event-driven, no time delay and no no_active_writers requirement —
+                        // an abandoned slot (write moved to a different chunk) is definitively
+                        // done regardless of what else the file's writers are doing elsewhere.
+                        // See `abandoned`'s doc comment for why this is safe for DVR too.
+                        let has_abandoned = state.slots.iter()
+                            .any(|(_, s)| s.abandoned && !s.data.is_empty() && !s.flushing && !s.in_backoff());
+                        // Safety net for slots that keep getting revisited (so never go idle,
+                        // never get abandoned via cross-chunk move, and never hit is_full())
+                        // — flush once meaningfully dirty regardless of activity elsewhere.
+                        const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 4;
+                        let has_dirty_threshold = state.slots.iter().any(|(_, s)| {
+                            !s.flushing && !s.in_backoff() &&
+                            s.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES
+                        });
                         drop(state);
-                        if !has_full && !has_idle && !has_stale { continue; }
+                        if !has_full && !has_idle && !has_stale && !has_abandoned && !has_dirty_threshold { continue; }
 
                         // Increment before spawning to prevent a second dispatch racing
                         // in the same tick before the task starts.
@@ -3516,7 +3664,29 @@ impl DfsFilesystem {
                             // This self-refilling loop is what keeps the pipeline truly full:
                             // each task fills its own pipeline slot back-to-back without
                             // waiting up to 100ms for the ticker to notice the vacancy.
+                            //
+                            // Safety valve: has_flushable_slot() must exactly mirror
+                            // flush_one_chunk's own selection criteria, or this loop can spin
+                            // forever finding "more work" that flush_one_chunk(ino, false)
+                            // itself declines to touch (returns Ok(()) without flushing),
+                            // permanently pinning one of the PIPELINE_MAX_ITEMS concurrency
+                            // slots — exactly what happened during 2026-07-05 kdiskmark
+                            // testing (has_flushable_slot was missing !in_backoff()). If this
+                            // ever recurs for some other reason, cap the spin and surface it
+                            // loudly rather than hanging silently forever.
+                            let mut spin_count: u32 = 0;
+                            const SPIN_WARN_THRESHOLD: u32 = 200;
                             loop {
+                                spin_count += 1;
+                                if spin_count == SPIN_WARN_THRESHOLD {
+                                    tracing::error!(
+                                        "Background flush self-refill loop for inode {} has spun {} times without exiting — \
+                                         possible has_flushable_slot()/flush_one_chunk mismatch (see comment). Breaking to avoid \
+                                         permanently pinning a pipeline slot; next tick will retry.",
+                                        ino, spin_count
+                                    );
+                                    break;
+                                }
                                 if let Err(e) = handle.flush_one_chunk(ino, false).await {
                                     tracing::error!("Background flush failed for inode {}: {}", ino, e);
                                     break;
@@ -3532,9 +3702,10 @@ impl DfsFilesystem {
                                         handle.client.enqueue_metadata(&meta).await;
                                     }
                                 }
-                                // Check whether more full slots remain.
+                                // Check whether more flushable slots remain (full, abandoned,
+                                // idle, or over the dirty threshold — not just full).
                                 let has_more = handle.write_buffers.get(&ino).map(|s| {
-                                    s.try_lock().map(|st| !st.full_slot_indices().is_empty()).unwrap_or(false)
+                                    s.try_lock().map(|st| st.has_flushable_slot()).unwrap_or(false)
                                 }).unwrap_or(false);
                                 if !has_more { break; }
                                 // Only continue if there's a spare pipeline slot for us.
@@ -3625,6 +3796,7 @@ impl DfsFilesystem {
             runtime,
             write_counters: Arc::new(RwLock::new(HashMap::new())),
             write_buffer_enabled,
+            global_write_buffer_cap_bytes,
             write_buffers: write_buffers_for_cleanup,
             last_metadata_update: last_metadata_update_shared,
             last_chunk_cache: Arc::new(RwLock::new(None)),
@@ -5486,6 +5658,7 @@ impl Filesystem for DfsFilesystem {
         let flush_handle = self.flush_handle.clone();
         let size_high_water = self.size_high_water.clone();
         let global_buffered_bytes = self.global_buffered_bytes.clone();
+        let global_write_buffer_cap_bytes = self.global_write_buffer_cap_bytes;
         let data_vec = data.to_vec();
         let req_uid = _req.uid();
         let req_gid = _req.gid();
@@ -5597,7 +5770,7 @@ impl Filesystem for DfsFilesystem {
                             {
                                 let t_bp = std::time::Instant::now();
                                 const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-                                let effective_cap = GLOBAL_WRITE_BUFFER_CAP_BYTES;
+                                let effective_cap = global_write_buffer_cap_bytes;
                                 loop {
                                     let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
                                     let fill_pct = current * 100 / effective_cap.max(1);
@@ -5986,7 +6159,7 @@ impl Filesystem for DfsFilesystem {
                     // flush tasks needed to drain the buffer.
                     let t_bp_start = std::time::Instant::now();
                     const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-                    let effective_cap = GLOBAL_WRITE_BUFFER_CAP_BYTES;
+                    let effective_cap = global_write_buffer_cap_bytes;
                     loop {
                         let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
                         let fill_pct = current * 100 / effective_cap.max(1);

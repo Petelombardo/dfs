@@ -401,7 +401,7 @@ impl MetadataStore {
                     .collect();
 
             let mut cloned = metadata.clone();
-            for loc in &mut cloned.chunk_locations {
+            for loc in Arc::make_mut(&mut cloned.chunk_locations).iter_mut() {
                 if let Some(existing_loc) = existing_by_id.get(&loc.chunk_id) {
                     // Rule 1: same chunk_id — merge node lists.
                     for node in &existing_loc.nodes {
@@ -1122,7 +1122,7 @@ impl MetadataStore {
         for item in table.range::<&str>(..)? {
             let (_, v) = item?;
             if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
-                for loc in &m.chunk_locations {
+                for loc in m.chunk_locations.iter() {
                     live.insert(loc.chunk_id);
                 }
             }
@@ -1145,7 +1145,7 @@ impl MetadataStore {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
-                for loc in &m.chunk_locations {
+                for loc in m.chunk_locations.iter() {
                     let key = format!("{}", loc.chunk_id);
                     if chunk_table.get(key.as_str())?.is_none() {
                         let bytes = bincode::serialize(loc)

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use dfs_common::{ChunkId, ChunkLocation, FileId, FileMetadata, FileType, NodeId};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 /// SQL-based metadata store for files and chunks
@@ -107,7 +108,7 @@ impl SqlMetadataStore {
                    params![metadata.id.as_bytes()])?;
 
         // Insert chunk locations
-        for location in &metadata.chunk_locations {
+        for location in metadata.chunk_locations.iter() {
             // Insert chunk
             tx.execute(
                 "INSERT INTO chunks (file_id, chunk_id, file_offset, size, checksum)
@@ -223,7 +224,7 @@ impl SqlMetadataStore {
             uid: uid as u32,
             gid: gid as u32,
             file_type,
-            chunk_locations,
+            chunk_locations: Arc::new(chunk_locations),
             write_seq: 0,
         }))
     }
@@ -340,7 +341,7 @@ impl SqlMetadataStore {
                         id: dfs_common::FileId::new(),
                         path: child_dir_path,
                         size: 0,
-                        chunk_locations: Vec::new(),
+                        chunk_locations: Arc::new(Vec::new()),
                         created_at: 0,
                         modified_at: 0,
                         mode: 0o755,

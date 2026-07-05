@@ -1391,7 +1391,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
 
     // Build updated metadata
     let mut new_metadata = metadata.clone();
-    new_metadata.chunk_locations = new_chunk_locations;
+    new_metadata.chunk_locations = std::sync::Arc::new(new_chunk_locations);
     new_metadata.modified_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

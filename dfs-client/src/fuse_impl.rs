@@ -1284,7 +1284,7 @@ impl FlushHandle {
                 // meta.size already tracks all prior chunk ends — we only need to extend it for
                 // the chunks we're splicing in now, avoiding an O(n) scan over all chunks.
                 for loc in &all_locations {
-                    splice_chunk_location(&mut meta.chunk_locations, loc.clone(), &self.client);
+                    splice_chunk_location(Arc::make_mut(&mut meta.chunk_locations), loc.clone(), &self.client);
                     if let Some(end) = loc.file_offset.map(|o| o + loc.size as u64) {
                         meta.size = meta.size.max(end);
                     }
@@ -1334,7 +1334,28 @@ impl FlushHandle {
                 // Ordering matters: readers must not see chunk IDs before the leader
                 // has them — otherwise a leader refresh overwrites our engine update
                 // with stale data and readers get the wrong chunks.
-                self.client.flush_metadata_sync(&meta).await;
+                //
+                // Send a network-lightweight clone: same scalar fields (path/size/mtime/
+                // etc), but chunk_locations replaced with just this cycle's newly-flushed
+                // locations (all_locations) instead of the full, ever-growing history.
+                // handle_put_file_metadata's existing chunk_map-union reconcile already
+                // treats the incoming list as potentially non-cumulative and fills in
+                // every other chunk from its authoritative chunk_map (see its own comment:
+                // "concurrent per-chunk flushes ... race to send their own non-cumulative
+                // chunk_locations snapshot") — the full-history send here was pure
+                // unnecessary cost: full clone, full bincode serialize, full network
+                // transfer, and a full O(n) reconcile pass, repeated on every single
+                // fsync/release regardless of how many chunks actually changed. Patching
+                // a large file and fsyncing after each patch (confirmed via a dedicated
+                // patch-timing test) showed this cost scaling directly with total file
+                // size, uniformly regardless of where the patch landed.
+                let mut meta_for_network = meta.clone();
+                meta_for_network.chunk_locations = Arc::new(all_locations.clone());
+                let t_meta_sync = std::time::Instant::now();
+                debug!("[STATE-DIAG] ino={} metadata_cache_len={} write_buffers_len={} dir_cache_dirs={}",
+                    ino, self.metadata_cache.len(), self.write_buffers.len(), self.dir_cache.len());
+                self.client.flush_metadata_sync(&meta_for_network).await;
+                debug!("[STATE-DIAG] ino={} flush_metadata_sync took {:?}", ino, t_meta_sync.elapsed());
                 self.last_metadata_update.insert(ino, std::time::Instant::now());
                 // Now the leader has the metadata — safe to populate the read engine.
                 // Feed only the locations just flushed (all_locations), not the whole
@@ -2618,7 +2639,7 @@ impl FlushHandle {
                         return Ok(());
                     }
                     for loc in &locations {
-                        splice_chunk_location(&mut meta.chunk_locations, loc.clone(), &self.client);
+                        splice_chunk_location(Arc::make_mut(&mut meta.chunk_locations), loc.clone(), &self.client);
                         if let Some(end) = loc.file_offset.map(|o| o + loc.size as u64) {
                             meta.size = meta.size.max(end);
                         }
@@ -3529,7 +3550,7 @@ impl DfsFilesystem {
             uid: 0,
             gid: 0,
             file_type: FileType::Directory,
-            chunk_locations: Vec::new(),
+            chunk_locations: Arc::new(Vec::new()),
             write_seq: 0,
         };
 
@@ -5204,7 +5225,7 @@ impl Filesystem for DfsFilesystem {
             uid: _req.uid(),
             gid: _req.gid(),
             file_type: FileType::RegularFile,
-            chunk_locations: Vec::new(),
+            chunk_locations: Arc::new(Vec::new()),
             write_seq: 0,
         };
 
@@ -5674,7 +5695,7 @@ impl Filesystem for DfsFilesystem {
                                     id: dfs_common::FileId::new(),
                                     path: path.clone(),
                                     size: 0,
-                                    chunk_locations: Vec::new(),
+                                    chunk_locations: Arc::new(Vec::new()),
                                     created_at: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default().as_secs(),
@@ -5888,7 +5909,7 @@ impl Filesystem for DfsFilesystem {
                                 let mut metadata = meta_snap.unwrap_or_else(|| metadata.clone());
                                 let new_size = (offset_usize + data_vec.len()).max(current_size).max(metadata.size as usize);
                                 if let Some(chunk_locations) = chunk_locations_opt {
-                                    metadata.chunk_locations.extend(chunk_locations);
+                                    Arc::make_mut(&mut metadata.chunk_locations).extend(chunk_locations);
                                 }
                                 metadata.size = new_size as u64;
                                 metadata.modified_at = SystemTime::now()
@@ -6167,7 +6188,7 @@ impl Filesystem for DfsFilesystem {
                 Ok((_, _, chunk_locations_opt)) => {
                     if is_append {
                         if let Some(chunk_locations) = chunk_locations_opt {
-                            metadata.chunk_locations.extend(chunk_locations);
+                            Arc::make_mut(&mut metadata.chunk_locations).extend(chunk_locations);
                         }
                         // For gap writes, the actual end is offset + len, not current_size + len.
                         let write_end = write_file_offset_override
@@ -6183,7 +6204,7 @@ impl Filesystem for DfsFilesystem {
                         if last_idx + 1 < metadata.chunk_locations.len() {
                             updated_locations.extend_from_slice(&metadata.chunk_locations[last_idx + 1..]);
                         }
-                        metadata.chunk_locations = updated_locations;
+                        metadata.chunk_locations = Arc::new(updated_locations);
                         let physical_size = metadata.chunk_locations.iter().map(|l| l.size as u64).sum();
                         metadata.size = metadata.size.max(physical_size);
                         info!("After splice: {} total chunks, {} total bytes",
@@ -6204,7 +6225,7 @@ impl Filesystem for DfsFilesystem {
                         }
                     } else {
                         warn!("Full file rewrite with {} bytes", new_data.len());
-                        metadata.chunk_locations = chunk_locations_opt.unwrap_or_default();
+                        metadata.chunk_locations = Arc::new(chunk_locations_opt.unwrap_or_default());
                         metadata.size = metadata.size.max(new_data.len() as u64);
                     }
                     metadata.modified_at = SystemTime::now()
@@ -6948,7 +6969,7 @@ impl Filesystem for DfsFilesystem {
             uid: _req.uid(),
             gid: _req.gid(),
             file_type: FileType::Directory,
-            chunk_locations: Vec::new(),
+            chunk_locations: Arc::new(Vec::new()),
             write_seq: 0,
         };
 
@@ -7341,7 +7362,7 @@ impl Filesystem for DfsFilesystem {
                 // may be unavailable due to garbage collection or incomplete replication
                 if new_size == 0 {
                     // Truncate to zero: clear metadata and discard any buffered write data.
-                    metadata.chunk_locations = Vec::new();
+                    metadata.chunk_locations = Arc::new(Vec::new());
                     metadata.size = 0;
                     self.write_buffers.remove(&ino);
                     self.client.evict_recent_chunk_writes(ino);
@@ -7430,7 +7451,7 @@ impl Filesystem for DfsFilesystem {
                                     if let Some(new_chunk_locs) = chunk_locations_opt {
                                         new_locs.extend(new_chunk_locs);
                                     }
-                                    metadata.chunk_locations = new_locs;
+                                    metadata.chunk_locations = Arc::new(new_locs);
                                     metadata.size = new_size;
                                 }
                                 Err(e) => {
@@ -7442,7 +7463,7 @@ impl Filesystem for DfsFilesystem {
                         } else {
                             // All chunks are complete, just drop the ones after
                             info!("Truncate: keeping {} full chunks, dropping rest", last_chunk_idx + 1);
-                            metadata.chunk_locations.truncate(last_chunk_idx + 1);
+                            Arc::make_mut(&mut metadata.chunk_locations).truncate(last_chunk_idx + 1);
                             metadata.size = new_size;
                         }
                     }
@@ -7844,15 +7865,33 @@ impl Filesystem for DfsFilesystem {
             // files (the same shape as the shutdown-drain filter at line ~581). Spawn one
             // task per inode like the buffer-flush loop above, instead of a sequential
             // RPC-per-file loop.
-            let to_commit: Vec<_> = metadata_cache.iter()
+            let to_commit: Vec<(u64, FileMetadata)> = metadata_cache.iter()
                 .filter(|e| !e.chunk_locations.is_empty() && written_inodes.contains(e.key()))
-                .map(|e| e.clone())
+                .map(|e| (*e.key(), e.clone()))
                 .collect();
             if !to_commit.is_empty() {
-                let handles: Vec<_> = to_commit.into_iter().map(|meta| {
+                let handles: Vec<_> = to_commit.into_iter().map(|(commit_ino, meta)| {
                     let c = client.clone();
+                    let written_inodes = written_inodes.clone();
                     tokio::spawn(async move {
                         c.flush_metadata_sync(&meta).await;
+                        // Mark clean now that this snapshot is durably committed —
+                        // written_inodes was previously insert-only (populated at every
+                        // write/create, never removed), so every single `sync $MOUNT`
+                        // re-committed full metadata (the complete, ever-growing
+                        // chunk_locations list) for every file this client process had
+                        // EVER written to, not just what's dirty since the last sync.
+                        // A confirmed patch-timing test showed this scaling directly
+                        // with total historical write volume: a freshly-restarted client
+                        // (empty written_inodes) patched an 8GB file ~2.9x faster than
+                        // the same client after a long session of unrelated writes to
+                        // other files. flush_metadata_sync retries internally until the
+                        // leader acks (see its own doc comment), so reaching this point
+                        // means the commit genuinely succeeded. A write that races in
+                        // concurrently re-inserts (insert is idempotent) and is simply
+                        // picked up by the next sync — same best-effort semantics as
+                        // sync() racing any concurrent write elsewhere.
+                        written_inodes.remove(&commit_ino);
                     })
                 }).collect();
                 for h in handles { let _ = h.await; }

@@ -410,7 +410,7 @@ impl Server {
                     // or_insert_with: don't overwrite entries already added by incoming RCLs
                     // while the scan is running — the RCL is always newer than redb state.
                     let inserted = chunk_map.entry(file.id)
-                        .or_insert_with(|| (file.chunk_locations.clone(), file.write_seq));
+                        .or_insert_with(|| (file.chunk_locations.as_ref().clone(), file.write_seq));
                     let (locs, _) = inserted.value();
                     for loc in locs {
                         chunk_to_file.insert(loc.chunk_id, file.id);
@@ -484,7 +484,7 @@ impl Server {
             let new_locs: Vec<ChunkLocation> = if let Some(existing_entry) = self.chunk_map.get(&metadata.id) {
                 let (existing_locs, _) = existing_entry.value();
                 const CHUNK_SIZE_4M: u64 = 4 * 1024 * 1024;
-                let mut locs = metadata.chunk_locations.clone();
+                let mut locs = metadata.chunk_locations.as_ref().clone();
                 for loc in locs.iter_mut() {
                     if loc.file_offset.is_none() { continue; }
                     // Match by chunk_idx (not exact file_offset): a non-aligned write and a
@@ -529,7 +529,7 @@ impl Server {
                 }
                 locs
             } else {
-                metadata.chunk_locations.clone()
+                metadata.chunk_locations.as_ref().clone()
             };
             for loc in new_locs.iter() {
                 self.chunk_to_file.insert(loc.chunk_id, metadata.id);
@@ -2153,7 +2153,7 @@ impl Server {
             let mut m = metadata;
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
-                for loc in m.chunk_locations.iter_mut() {
+                for loc in Arc::make_mut(&mut m.chunk_locations).iter_mut() {
                     if let Some(file_offset) = loc.file_offset {
                         if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                             if map_loc.chunk_id != loc.chunk_id {
@@ -2855,7 +2855,7 @@ impl Server {
                 let mut m = metadata;
                 if let Some(map_entry) = self.chunk_map.get(&m.id) {
                     let (map_locs, _) = map_entry.value();
-                    for loc in m.chunk_locations.iter_mut() {
+                    for loc in Arc::make_mut(&mut m.chunk_locations).iter_mut() {
                         if let Some(file_offset) = loc.file_offset {
                             if let Some(map_loc) = map_locs.iter().find(|l| l.file_offset == Some(file_offset)) {
                                 if map_loc.chunk_id != loc.chunk_id {
@@ -3536,7 +3536,7 @@ impl Server {
                     let (map_locs, map_write_seq) = entry.value();
                     if !map_locs.is_empty() {
                         let chunk0_size = map_locs.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
-                        metadata.chunk_locations = map_locs.clone();
+                        metadata.chunk_locations = Arc::new(map_locs.clone());
                         if *map_write_seq > metadata.write_seq {
                             metadata.write_seq = *map_write_seq;
                         }
@@ -4008,7 +4008,7 @@ impl Server {
                             .into_iter()
                             .map(|(file_id, mut meta)| {
                                 if let Some(map_entry) = server.chunk_map.get(&file_id) {
-                                    meta.chunk_locations = map_entry.value().0.clone();
+                                    meta.chunk_locations = Arc::new(map_entry.value().0.clone());
                                 }
                                 meta
                             })
@@ -4123,7 +4123,7 @@ impl Server {
                 // Override chunk_locations with authoritative chunk_map entries.
                 for meta in batch.iter_mut() {
                     if let Some(map_entry) = self.chunk_map.get(&meta.id) {
-                        meta.chunk_locations = map_entry.value().0.clone();
+                        meta.chunk_locations = Arc::new(map_entry.value().0.clone());
                     }
                 }
 
@@ -4331,7 +4331,7 @@ impl Server {
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
                 const CHUNK_SIZE_RECONCILE: u64 = 4 * 1024 * 1024;
-                for loc in m.chunk_locations.iter_mut() {
+                for loc in Arc::make_mut(&mut m.chunk_locations).iter_mut() {
                     if let Some(file_offset) = loc.file_offset {
                         // Match by chunk_idx, not exact file_offset: a fresh write's explicit
                         // leader RCL and the client's own later metadata_cache splice are two
@@ -4383,11 +4383,11 @@ impl Server {
                             if !m.chunk_locations.iter().any(|l| {
                                 l.file_offset.map(|o| o / CHUNK_SIZE_RECONCILE) == Some(map_cidx)
                             }) {
-                                m.chunk_locations.push(map_loc.clone());
+                                Arc::make_mut(&mut m.chunk_locations).push(map_loc.clone());
                             }
                         }
                     }
-                    m.chunk_locations.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+                    Arc::make_mut(&mut m.chunk_locations).sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
                 }
             }
             m
@@ -4466,7 +4466,7 @@ impl Server {
         let live_items: Vec<FileMetadata> = live_items_raw.into_iter().map(|mut m| {
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
-                for loc in m.chunk_locations.iter_mut() {
+                for loc in Arc::make_mut(&mut m.chunk_locations).iter_mut() {
                     if let Some(file_offset) = loc.file_offset {
                         // Match by chunk_idx, not exact file_offset — same reasoning as the
                         // PutFileMetadata reconcile: a non-boundary-aligned chunk_map entry
@@ -4813,10 +4813,10 @@ impl Server {
 
         // --- Step 7: Splice metadata ---
         if drop_last_chunk {
-            metadata.chunk_locations.pop();
+            Arc::make_mut(&mut metadata.chunk_locations).pop();
         }
         for loc in &new_locations {
-            metadata.chunk_locations.push(loc.clone());
+            Arc::make_mut(&mut metadata.chunk_locations).push(loc.clone());
         }
 
         // --- Step 8: Update metadata size and timestamp ---
@@ -6270,7 +6270,7 @@ impl Server {
                         let _ = metadata.scan_files(|file| {
                             total += 1;
                             if !file.chunk_locations.is_empty() {
-                                chunk_map.insert(file.id, (file.chunk_locations.clone(), file.write_seq));
+                                chunk_map.insert(file.id, (file.chunk_locations.as_ref().clone(), file.write_seq));
                                 built += 1;
                             }
                             Ok(())
@@ -6354,7 +6354,7 @@ impl Server {
                 // Collect all unique node IDs referenced by this file's chunks.
                 let mut node_ids_for_file: std::collections::HashSet<dfs_common::NodeId> =
                     std::collections::HashSet::new();
-                for loc in &file.chunk_locations {
+                for loc in file.chunk_locations.iter() {
                     for &nid in &loc.nodes {
                         node_ids_for_file.insert(nid);
                     }
@@ -6684,7 +6684,7 @@ impl Server {
             let mut corrupt_removed = 0usize;
             let mut heal_queued = 0usize;
 
-            for chunk_loc in &file_meta.chunk_locations {
+            for chunk_loc in file_meta.chunk_locations.iter() {
                 let chunk_id = chunk_loc.chunk_id;
                 let file_offset = match chunk_loc.file_offset {
                     Some(o) => o,
@@ -7010,7 +7010,7 @@ impl Server {
         match result {
             Ok(Ok(Some(metadata))) if !metadata.chunk_locations.is_empty() => {
                 // Populate cache for future lookups.
-                self.chunk_map.insert(file_id, (metadata.chunk_locations.clone(), metadata.write_seq));
+                self.chunk_map.insert(file_id, (metadata.chunk_locations.as_ref().clone(), metadata.write_seq));
                 slice_response(&metadata.chunk_locations, metadata.write_seq)
             }
             _ => Response::Error {
@@ -7045,7 +7045,7 @@ impl Server {
                 // serializes gigabytes and blocks the leader's tokio workers.
                 // Chunk locations are fetched lazily on open() via GetFileChunkMap.
                 let files: Vec<_> = files.into_iter().map(|mut f| {
-                    f.chunk_locations.clear();
+                    f.chunk_locations = Arc::new(Vec::new());
                     f
                 }).collect();
                 Response::FileList { files, total_count }

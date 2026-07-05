@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Unique identifier for a node in the cluster
@@ -251,8 +252,19 @@ pub struct FileMetadata {
     /// File type
     pub file_type: FileType,
 
-    /// Chunk locations with replica node tracking
-    pub chunk_locations: Vec<ChunkLocation>,
+    /// Chunk locations with replica node tracking.
+    /// Arc-wrapped so cloning a FileMetadata (which happens very frequently — on every
+    /// cache snapshot, every flush's dir_cache update, every network send prep) is an
+    /// O(1) refcount bump instead of an O(n) deep copy of every ChunkLocation (each of
+    /// which itself owns a Vec<NodeId>, so a naive clone is one heap allocation per
+    /// chunk, twice — see the patch-timing test that caught this: patch latency scaled
+    /// ~4-7x for an 8x larger file, uniformly regardless of patch position, which only
+    /// makes sense for a cost proportional to total chunk count hit on every flush).
+    /// Mutators use Arc::make_mut (copy-on-write — cheap when this is the sole owner,
+    /// which is the common case). Serializes byte-identical to a plain Vec on the wire
+    /// (see the workspace Cargo.toml's serde "rc" feature) — this is an in-memory
+    /// representation change only, not a protocol change.
+    pub chunk_locations: Arc<Vec<ChunkLocation>>,
 
     /// Monotonically increasing sequence number assigned by the client before
     /// enqueueing each metadata write. The server uses this to reject out-of-order
@@ -275,7 +287,7 @@ impl FileMetadata {
             uid: 0,
             gid: 0,
             file_type,
-            chunk_locations: Vec::new(),
+            chunk_locations: Arc::new(Vec::new()),
             write_seq: 0,
         }
     }
@@ -308,7 +320,7 @@ impl FileMetadata {
         let pos = self.chunk_locations
             .binary_search_by(|l| l.file_offset.unwrap_or(u64::MAX).cmp(&target_offset))
             .ok()?;
-        Some(&mut self.chunk_locations[pos])
+        Some(&mut Arc::make_mut(&mut self.chunk_locations)[pos])
     }
 }
 

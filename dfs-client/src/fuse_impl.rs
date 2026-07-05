@@ -490,6 +490,22 @@ impl InodeWriteState {
             .sum()
     }
 
+    /// Real memory resident in slot buffers, including gap-fill padding — unlike
+    /// buffered_bytes(), which deliberately excludes gap-fill so sparse writes don't
+    /// trigger back-pressure prematurely. That exclusion is correct for scheduling
+    /// (deciding when a slot is "full" / how many chunks to flush concurrently), but
+    /// wrong for a memory-safety cap: a write to an existing chunk still allocates a
+    /// real, fully zero-filled buffer up to CHUNK_SIZE (see write_at's gap-fill), and
+    /// that allocation must count against the cap that's supposed to bound real RSS.
+    /// Without this, random-overwrite workloads against a large pre-existing file
+    /// (VM disk images under kdiskmark-style benchmarks) allocate up to one full
+    /// CHUNK_SIZE buffer per distinct chunk touched — invisible to buffered_bytes() —
+    /// which is exactly what drove dfs-client to multi-GB RSS and an OOM kill in the
+    /// 2026-07-05 local repro (scripts/repro_write_deadlock.sh).
+    fn resident_bytes(&self) -> usize {
+        self.slots.values().map(|s| s.data.len()).sum()
+    }
+
     /// Slots that are full and not yet claimed by a flush task.
     fn full_slot_indices(&self) -> Vec<u64> {
         self.slots.iter()
@@ -536,10 +552,20 @@ const FLUSH_ALL_MAX_ITEMS: usize = 64;
 /// raising the worst-case memory ceiling for large/zero-padded slots.
 const PIPELINE_MAX_BYTES: usize = 8 * CHUNK_SIZE;
 
-/// Number of full chunk slots the writer may buffer ahead of the pipeline.
-/// With up to 16 items or 16MB flushing and BUFFER_CHUNKS=4 in the buffer, the
-/// writer is always filling the next slots while the current ones are in-flight.
-const BUFFER_CHUNKS: usize = 4;
+/// Hard ceiling on total write-buffer memory across ALL inodes combined, regardless
+/// of how many files are concurrently open for writing. This is the actual
+/// OOM-safety bound. It used to be computed per-inode (BUFFER_CHUNKS × CHUNK_SIZE)
+/// and then scaled up by the number of open write buffers — meaning more
+/// concurrently-open files meant a higher ceiling, making worst-case RSS depend on
+/// workload shape instead of being a flat, easy-to-reason-about number. Now flat.
+/// 256MB is well below any real memory budget (production dfs-client sits around
+/// ~800MB RSS total under sustained load — see the server5/VM100 incident,
+/// 2026-07-05) while still generous enough for VM-disk/sparse-write patterns now
+/// that resident_bytes() correctly counts gap-fill memory against this cap (see its
+/// doc comment) — raised after that fix measurably slowed VM-disk-pattern tests
+/// (T22/T26/T27/T29, ~45-60s across the local suite) by triggering back-pressure
+/// where it previously (incorrectly) didn't.
+const GLOBAL_WRITE_BUFFER_CAP_BYTES: usize = 256 * 1024 * 1024;
 
 /// Cheaply-cloneable handle to the fields needed by flush_buffer_async.
 /// Extracted so fsync() can clone it and spawn a background flush task without
@@ -1415,10 +1441,15 @@ impl FlushHandle {
         if !flushed_chunks.is_empty() {
             if let Some(state_lock) = self.write_buffers.get(&ino) {
                 let mut state = state_lock.lock().await;
-                for (chunk_idx, flushed_len) in flushed_chunks {
-                    state.slots.remove(&chunk_idx);
+                for (chunk_idx, _flushed_len) in flushed_chunks {
+                    // Subtract the slot's actual resident size (including gap-fill padding),
+                    // not flushed_len (dirty bytes only) — the counter is now maintained in
+                    // resident-byte terms (see resident_bytes()' doc comment), so removing a
+                    // slot must free its full allocation from the tally or the counter drifts
+                    // upward forever and eventually wedges all writes under back-pressure.
+                    let removed_size = state.slots.remove(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
                     self.global_buffered_bytes.fetch_sub(
-                        flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                        removed_size.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                 }
@@ -2407,12 +2438,18 @@ impl FlushHandle {
                             } else {
                                 if patched_len > 0 {
                                     state.flushed_sizes.insert(chunk_idx, patched_len);
+                                }
+                                // Subtract the slot's actual resident size, not patched_len — the
+                                // slot is being removed here, freeing its full allocation
+                                // (including any gap-fill padding). See resident_bytes()'s doc
+                                // comment.
+                                let removed_size = state.slots.remove(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
+                                if removed_size > 0 {
                                     self.global_buffered_bytes.fetch_sub(
-                                        patched_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                        removed_size.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
                                 }
-                                state.slots.remove(&chunk_idx);
                             }
                         }
                     }
@@ -2725,9 +2762,13 @@ impl FlushHandle {
                             s.data.len() > flushed_len || s.last_modified > last_modified_snap
                         }).unwrap_or(false);
                         if !new_data_arrived {
-                            state.slots.remove(&chunk_idx);
+                            // Subtract the slot's actual resident size, not flushed_len — the
+                            // slot is being removed here, freeing its full allocation (including
+                            // any gap-fill padding), which can be far larger than flushed_len.
+                            // See resident_bytes()'s doc comment.
+                            let removed_size = state.slots.remove(&chunk_idx).map(|s| s.data.len()).unwrap_or(0);
                             self.global_buffered_bytes.fetch_sub(
-                                flushed_len.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                                removed_size.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         } else {
@@ -3191,10 +3232,6 @@ pub struct DfsFilesystem {
     /// Shared with FlushHandle so write operations can trigger immediate flushing.
     flush_notify: Arc<tokio::sync::Notify>,
 
-    /// Hard cap on total write buffer bytes (~30% of available RAM, min 64MB).
-    /// The write task delays reply.written() while this is exceeded, throttling the kernel.
-    global_write_buffer_cap: usize,
-
     /// Inodes for which a write buffer was created this session.
     /// destroy() uses this to skip flushing metadata for read-only files whose
     /// metadata_cache was populated only by warmup — flushing those with a
@@ -3233,13 +3270,8 @@ impl DfsFilesystem {
               buffer_flush_threshold / chunk_size_bytes,
               chunk_size_mb);
 
-        // Global write buffer cap: BUFFER_CHUNKS × CHUNK_SIZE.
-        // The writer may buffer up to BUFFER_CHUNKS full slots per inode before blocking.
-        // With up to 32 items or 16MB flushing concurrently, BUFFER_CHUNKS=4 slots buffered,
-        // the writer always has room to fill the next slot while prior ones are in-flight.
-        let global_write_buffer_cap = BUFFER_CHUNKS * CHUNK_SIZE;
-        info!("Global write buffer cap: {}MB ({} buffer chunks × {}MB)",
-              global_write_buffer_cap / (1024 * 1024), BUFFER_CHUNKS, CHUNK_SIZE / (1024 * 1024));
+        info!("Global write buffer cap: {}MB (flat, across all inodes)",
+              GLOBAL_WRITE_BUFFER_CAP_BYTES / (1024 * 1024));
 
         // Populate addr_to_node_id immediately so the very first write gets real node IDs.
         if let Err(e) = runtime.block_on(client.refresh_cluster_nodes()) {
@@ -3622,7 +3654,6 @@ impl DfsFilesystem {
             write_tasks_in_flight: write_tasks_in_flight_shared,
             global_buffered_bytes,
             flush_notify,
-            global_write_buffer_cap,
             written_inodes: Arc::new(dashmap::DashSet::new()),
         })
     }
@@ -5455,7 +5486,6 @@ impl Filesystem for DfsFilesystem {
         let flush_handle = self.flush_handle.clone();
         let size_high_water = self.size_high_water.clone();
         let global_buffered_bytes = self.global_buffered_bytes.clone();
-        let global_write_buffer_cap = self.global_write_buffer_cap;
         let data_vec = data.to_vec();
         let req_uid = _req.uid();
         let req_gid = _req.gid();
@@ -5567,11 +5597,7 @@ impl Filesystem for DfsFilesystem {
                             {
                                 let t_bp = std::time::Instant::now();
                                 const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-                                // Scale cap with concurrent write sessions: each active inode needs
-                                // BUFFER_CHUNKS slots, but cap total at PIPELINE_MAX_ITEMS × CHUNK_SIZE
-                                // to bound memory under many concurrent writers.
-                                let effective_cap = (write_buffers.len().max(1) * global_write_buffer_cap)
-                                    .min(PIPELINE_MAX_ITEMS * CHUNK_SIZE);
+                                let effective_cap = GLOBAL_WRITE_BUFFER_CAP_BYTES;
                                 loop {
                                     let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
                                     let fill_pct = current * 100 / effective_cap.max(1);
@@ -5603,9 +5629,9 @@ impl Filesystem for DfsFilesystem {
                             );
                             let mut state = state_arc.lock().await;
                             {
-                                let bytes_before = state.buffered_bytes();
+                                let bytes_before = state.resident_bytes();
                                 let pattern_changed = state.write_at(offset as u64, &data_vec);
-                                let bytes_after = state.buffered_bytes();
+                                let bytes_after = state.resident_bytes();
                                 let has_full = !state.full_slot_indices().is_empty();
                                 drop(state);
                                 let new_end = (offset as u64) + data_vec.len() as u64;
@@ -5799,7 +5825,7 @@ impl Filesystem for DfsFilesystem {
                             .or_insert_with(|| Arc::new(Mutex::new(InodeWriteState::new(is_sqlite_buf))))
                             .clone();
                         let mut state = state_arc.lock().await;
-                        let bytes_before = state.buffered_bytes();
+                        let bytes_before = state.resident_bytes();
                         let pattern_changed = state.write_at(gap_write_offset, &padded);
                         // Mark the gap bytes as synthetic so flush doesn't mistake them
                         // for real app data when deciding whether to PatchChunk.
@@ -5808,7 +5834,7 @@ impl Filesystem for DfsFilesystem {
                         if let Some(slot) = state.slots.get_mut(&gap_chunk_idx) {
                             slot.gap_filled_prefix = gap_intra + gap;
                         }
-                        let added = state.buffered_bytes().saturating_sub(bytes_before);
+                        let added = state.resident_bytes().saturating_sub(bytes_before);
 
                         // Notify flush worker if chunks are now full or write pattern changed.
                         let has_full_chunks = !state.full_slot_indices().is_empty();
@@ -5960,8 +5986,7 @@ impl Filesystem for DfsFilesystem {
                     // flush tasks needed to drain the buffer.
                     let t_bp_start = std::time::Instant::now();
                     const BP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-                    let effective_cap = (write_buffers.len().max(1) * global_write_buffer_cap)
-                        .min(PIPELINE_MAX_ITEMS * CHUNK_SIZE);
+                    let effective_cap = GLOBAL_WRITE_BUFFER_CAP_BYTES;
                     loop {
                         let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
                         let fill_pct = current * 100 / effective_cap.max(1);
@@ -5996,9 +6021,9 @@ impl Filesystem for DfsFilesystem {
                     // t_buf: time to acquire the slot lock and copy bytes into the buffer.
                     let t_buf_start = std::time::Instant::now();
                     let mut state = state_arc.lock().await;
-                    let bytes_before = state.buffered_bytes();
+                    let bytes_before = state.resident_bytes();
                     let pattern_changed = state.write_at(write_offset, &data_vec);
-                    let added = state.buffered_bytes().saturating_sub(bytes_before);
+                    let added = state.resident_bytes().saturating_sub(bytes_before);
 
                     // Notify the flush worker if a 4MB chunk is full or the write pattern
                     // changed from sequential to random (event-driven, no timer needed).

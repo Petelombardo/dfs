@@ -305,6 +305,23 @@ impl ChunkSlot {
     fn is_idle(&self) -> bool {
         self.last_modified.elapsed().unwrap_or_default() > std::time::Duration::from_millis(50)
     }
+
+    fn dirty_bytes(&self) -> usize {
+        self.dirty_ranges.iter().map(|&(s, e)| e - s).sum()
+    }
+
+    /// True if dirty_ranges has more than one distinct (non-adjacent) range — the
+    /// signature of scattered/random writes landing at different offsets within the
+    /// same chunk (e.g. repeated small patches to one chunk, never advancing past
+    /// it). A genuine sequential fill-in-progress (e.g. a DVR recording) keeps
+    /// merging each new write into a single contiguous range (mark_dirty() merges
+    /// overlapping/adjacent ranges), so this stays false for it throughout — used to
+    /// gate the dirty-byte flush threshold so it only fires for the scattered case
+    /// it's meant for, not for an ordinary sequential chunk that's about to complete
+    /// naturally via is_full() anyway. See SLOT_DIRTY_FLUSH_THRESHOLD_BYTES's history.
+    fn is_fragmented(&self) -> bool {
+        self.dirty_ranges.len() >= 2
+    }
 }
 
 /// Per-inode write state: a set of chunk slots keyed by chunk index (file_offset / CHUNK_SIZE).
@@ -552,11 +569,10 @@ impl InodeWriteState {
     /// PIPELINE_MAX_ITEMS concurrency slots) — caught during 2026-07-05 kdiskmark
     /// testing of the `abandoned` fix.
     fn has_flushable_slot(&self) -> bool {
-        const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 4;
         self.slots.values().any(|s| {
             !s.flushing && !s.data.is_empty() && !s.in_backoff() && (
                 s.is_full() || s.is_idle() || s.abandoned ||
-                s.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES
+                (s.is_fragmented() && s.dirty_bytes() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES)
             )
         })
     }
@@ -598,6 +614,38 @@ const FLUSH_ALL_MAX_ITEMS: usize = 64;
 /// so raising PIPELINE_MAX_ITEMS buys more concurrency for small patches without
 /// raising the worst-case memory ceiling for large/zero-padded slots.
 const PIPELINE_MAX_BYTES: usize = 8 * CHUNK_SIZE;
+
+/// Per-chunk dirty-byte safety net: a slot whose dirty coverage crosses this
+/// AND is fragmented (ChunkSlot::is_fragmented — dirty_ranges.len() >= 2) is
+/// flush-eligible regardless of idle/abandoned status — for slots that keep
+/// getting scattered/repeated touches at different offsets within the same
+/// chunk (so never go idle, never get abandoned via a cross-chunk move, and
+/// never hit is_full()), e.g. VM-disk-style repeated same-chunk patches
+/// (local suite T22/T26/T27).
+///
+/// The fragmentation gate matters: this was first tried WITHOUT it, checking
+/// dirty bytes alone. That worked for the scattered case but also fired on an
+/// ordinary sequentially-filling chunk (e.g. a DVR recording) well before it
+/// naturally reaches is_full() via a single contiguous dirty range — DVR's
+/// sequential appends always keep mark_dirty() merging into one range, so
+/// is_fragmented() reliably stays false for it throughout, while T22/T26's
+/// same-chunk-different-offset pattern always produces multiple ranges.
+/// Splitting single sequential chunk fills into extra round trips measurably
+/// added cluster load that starved other clients sharing the same 5-node
+/// cluster (rock5b's benchmark slowed down once nanopir3's DVR recording
+/// started sending several times as many small ops) — simply raising the
+/// byte threshold to avoid that (94% of a chunk) then regressed T22/T26/T27
+/// back to their pre-abandoned-fix durations, since those tests' slots are
+/// never abandoned (they never leave the chunk) and were relying on this
+/// threshold specifically. The fragmentation gate is what lets both cases be
+/// fixed at once: aggressive for genuinely scattered writes, hands-off for
+/// sequential fills in progress.
+///
+/// One shared constant, not three duplicated locals — the ticker gate,
+/// flush_one_chunk's selection, and has_flushable_slot() must all agree or
+/// they can disagree about what's eligible (see has_flushable_slot's doc
+/// comment for a real bug this already caused once).
+const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 4;
 
 /// Historical note on the write-buffer cap (now computed at runtime in
 /// new_with_runtime as global_write_buffer_cap_bytes, scaled to available
@@ -1548,11 +1596,10 @@ impl FlushHandle {
                 // over the per-chunk dirty-byte threshold (a slot that keeps getting
                 // revisited so never goes idle or gets abandoned, but has accumulated
                 // enough real dirty data to be worth flushing on its own).
-                const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 4;
                 let mut idle: Vec<(u64, SystemTime)> = state.slots.iter()
                     .filter(|(_, s)| {
                         (s.is_idle() || s.abandoned
-                            || s.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES)
+                            || (s.is_fragmented() && s.dirty_bytes() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES))
                         && !s.data.is_empty() && !s.flushing && (urgent || !s.in_backoff())
                     })
                     .map(|(idx, s)| (*idx, s.last_modified))
@@ -3640,10 +3687,9 @@ impl DfsFilesystem {
                         // Safety net for slots that keep getting revisited (so never go idle,
                         // never get abandoned via cross-chunk move, and never hit is_full())
                         // — flush once meaningfully dirty regardless of activity elsewhere.
-                        const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 4;
                         let has_dirty_threshold = state.slots.iter().any(|(_, s)| {
-                            !s.flushing && !s.in_backoff() &&
-                            s.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES
+                            !s.flushing && !s.in_backoff() && s.is_fragmented()
+                                && s.dirty_bytes() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES
                         });
                         drop(state);
                         if !has_full && !has_idle && !has_stale && !has_abandoned && !has_dirty_threshold { continue; }

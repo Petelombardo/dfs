@@ -56,6 +56,7 @@ sleep 3
 # script can be used to test the hypothesis that arena proliferation, not a real
 # data leak, drives the RSS growth (export MALLOC_ARENA_MAX=2 before invoking to test).
 env RUST_LOG=info ${MALLOC_ARENA_MAX:+MALLOC_ARENA_MAX="$MALLOC_ARENA_MAX"} \
+    ${DFS_WRITE_BUFFER_CAP_MB:+DFS_WRITE_BUFFER_CAP_MB="$DFS_WRITE_BUFFER_CAP_MB"} \
     "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
     --log-file "$LOG/client.log" --allow-other --log-level info &
 sleep 2

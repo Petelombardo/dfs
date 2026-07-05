@@ -3024,6 +3024,17 @@ T43_FILE="$MOUNT/t43_patch.bin"
 dd if=/dev/zero of="$T43_FILE" bs=1M count=4 2>/dev/null
 dfs_sync
 
+# Record each server log's line count *before* the write, so the extraction
+# below can look only at lines appended by this specific write — server logs
+# aren't per-test-truncated (unlike the client log snapshot), so a background
+# flush/heal cycle settling late from an earlier test (e.g. a slow/throttled
+# write test) can otherwise land its own "MultiPatch:" line after this test's
+# and get mistaken for it by a plain `tail -1` across the whole run's history.
+declare -A T43_LOG_MARKS
+for f in "$LOG"/server*.log; do
+    T43_LOG_MARKS["$f"]=$(wc -l < "$f" 2>/dev/null || echo 0)
+done
+
 # Exactly one small in-place overwrite -> exactly one MultiPatch, one patch.
 python3 -c "
 import os
@@ -3039,9 +3050,15 @@ sleep 1   # let the replicas' fire-and-forget self-report RPCs land
 # logs its own "MultiPatch: old -> new (... final size=...)" line synchronously
 # as part of applying the patch, so this is available immediately (unlike the
 # client's own MultiPatch summary line, which can lag behind a buffered log
-# flush after dfs_sync returns).
-T43_CHUNK_ID=$(grep -hoE "MultiPatch: [0-9a-f]+ -> [0-9a-f]+" "$LOG"/server*.log 2>/dev/null \
-    | tail -1 | awk '{print $4}')
+# flush after dfs_sync returns). Scoped to only lines appended since the marks
+# above, so unrelated background activity elsewhere can't be picked up instead.
+T43_CHUNK_ID=""
+for f in "$LOG"/server*.log; do
+    mark=${T43_LOG_MARKS["$f"]:-0}
+    found=$(tail -n "+$((mark+1))" "$f" 2>/dev/null \
+        | grep -oE "MultiPatch: [0-9a-f]+ -> [0-9a-f]+" | tail -1 | awk '{print $4}')
+    [ -n "$found" ] && T43_CHUNK_ID="$found"
+done
 echo "  T43: patched chunk = ${T43_CHUNK_ID:-<not found>}"
 
 if [ -z "$T43_CHUNK_ID" ]; then

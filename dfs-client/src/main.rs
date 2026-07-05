@@ -11,6 +11,21 @@ use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber;
 
+// glibc's malloc creates additional per-thread arenas under heavy multi-threaded
+// alloc/free contention, and those arenas are essentially never returned to the OS
+// even once everything inside them is freed. Under a heavy concurrent-write
+// workload (many threads repeatedly allocating/freeing chunk-sized ~4MB buffers)
+// this caused dfs-client's RSS to balloon to several GB and get OOM-killed, even
+// though the actual live/reachable data was properly bounded (confirmed via
+// smaps: dozens of ~64MB anonymous mappings, the classic arena-per-thread
+// signature, while the traditional heap region stayed flat). mimalloc doesn't
+// have this per-thread-arena growth pattern. See
+// project_writebuffer_gapfill_memory_bug memory / scripts/repro_write_deadlock.sh
+// for the repro and MALLOC_ARENA_MAX=2 A/B comparison that confirmed this,
+// 2026-07-05.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "dfs-client")]
 #[command(about = "DFS FUSE client - mount distributed filesystem", long_about = None)]

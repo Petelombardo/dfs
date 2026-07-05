@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
@@ -163,6 +163,21 @@ pub struct HealingManager {
     /// `heal_semaphore` permit count to this target.
     heal_max_concurrent: Arc<AtomicUsize>,
 
+    /// Per-node concurrency gate: one `Semaphore` per `NodeId`, created lazily
+    /// (on first use) with `heal_max_concurrent_per_node` permits. Combined in+out —
+    /// a node counts toward its own cap whether it's acting as heal source or target —
+    /// this bounds how many transfers any single node can be party to at once, so a
+    /// busy node can't consume the whole global `heal_max_concurrent` budget while
+    /// other nodes sit idle (e.g. B→A and D→C can each run their own quota in parallel).
+    node_inflight: Arc<DashMap<NodeId, Arc<Semaphore>>>,
+
+    /// Target capacity for each entry in `node_inflight` (heal_max_concurrent_per_node's
+    /// live value). Newly-created node semaphores start at this value; live-settable via
+    /// `dfs-admin healing set --max-concurrent-per-node` — see `resize_node_concurrency`.
+    /// Always kept <= `heal_max_concurrent`: a per-node cap above the global cap could
+    /// never bind, so both `apply_tuning` and `resize_heal_concurrency` clamp it down.
+    heal_max_concurrent_per_node: Arc<AtomicUsize>,
+
     /// Real bytes/sec pacing for this node's outbound heal-chunk reads+sends.
     /// Rate is managed entirely by the adaptive bandwidth controller. Separate from
     /// heal_bandwidth_limiter_in because TX/RX are independent full-duplex capacity —
@@ -259,6 +274,7 @@ impl HealingManager {
         link_bandwidth_mb: usize,
         heal_max_pct_config: f64,
         heal_max_concurrent: usize,
+        heal_max_concurrent_per_node: usize,
         heal_transfer_timeout_secs: u64,
     ) -> Self {
         let max_heal_per_cycle = 200;
@@ -275,6 +291,13 @@ impl HealingManager {
         // (FD/task safety) — no longer derived from the bandwidth number.
         let heal_semaphore = Arc::new(Semaphore::new(heal_max_concurrent));
         let heal_max_concurrent = Arc::new(AtomicUsize::new(heal_max_concurrent));
+
+        // A per-node cap above the global cap could never bind — clamp at construction
+        // the same way apply_tuning/resize_heal_concurrency clamp it on live updates.
+        let heal_max_concurrent_per_node = heal_max_concurrent_per_node
+            .clamp(1, heal_max_concurrent.load(Ordering::Relaxed));
+        let node_inflight: Arc<DashMap<NodeId, Arc<Semaphore>>> = Arc::new(DashMap::new());
+        let heal_max_concurrent_per_node = Arc::new(AtomicUsize::new(heal_max_concurrent_per_node));
 
         let heal_max_pct = Arc::new(RwLock::new((heal_max_pct_config / 100.0).clamp(0.10, 1.00)));
 
@@ -317,6 +340,8 @@ impl HealingManager {
             max_heal_per_cycle,
             heal_semaphore,
             heal_max_concurrent,
+            node_inflight,
+            heal_max_concurrent_per_node,
             heal_bandwidth_limiter_out,
             heal_bandwidth_limiter_in,
             last_cluster_write_ms,
@@ -341,9 +366,10 @@ impl HealingManager {
         }
 
         info!(
-            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, max_concurrent: {}, transfer_timeout: {}s, link: {}MB/s, max_pct: {}%)",
+            "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, max_concurrent: {}, max_concurrent_per_node: {}, transfer_timeout: {}s, link: {}MB/s, max_pct: {}%)",
             self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle,
-            self.heal_max_concurrent.load(Ordering::Relaxed), self.heal_transfer_timeout_secs.load(Ordering::Relaxed),
+            self.heal_max_concurrent.load(Ordering::Relaxed), self.heal_max_concurrent_per_node.load(Ordering::Relaxed),
+            self.heal_transfer_timeout_secs.load(Ordering::Relaxed),
             self.link_bandwidth_mb.load(Ordering::Relaxed), (*self.heal_max_pct.read().await * 100.0) as u32
         );
 
@@ -1926,6 +1952,46 @@ impl HealingManager {
         Ok(())
     }
 
+    /// Get-or-create `node`'s entry in `node_inflight`, sized to the current
+    /// `heal_max_concurrent_per_node` target. Free function (not `&self`) so it can be
+    /// called from the static/spawned task context in `drain_heal_queue`'s JoinSet, the
+    /// same way `do_heal_chunk_shared` already operates without a `&self` receiver.
+    fn node_semaphore(
+        node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
+        heal_max_concurrent_per_node: &Arc<AtomicUsize>,
+        node: NodeId,
+    ) -> Arc<Semaphore> {
+        node_inflight
+            .entry(node)
+            .or_insert_with(|| {
+                Arc::new(Semaphore::new(heal_max_concurrent_per_node.load(Ordering::Relaxed).max(1)))
+            })
+            .clone()
+    }
+
+    /// Block until a permit is free for `node`'s combined in+out concurrency budget.
+    async fn acquire_node_permit(
+        node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
+        heal_max_concurrent_per_node: &Arc<AtomicUsize>,
+        node: NodeId,
+    ) -> OwnedSemaphorePermit {
+        let sem = Self::node_semaphore(node_inflight, heal_max_concurrent_per_node, node);
+        // Semaphore is never closed, so acquire_owned() only errors if closed — unreachable here.
+        sem.acquire_owned().await.expect("node semaphore never closed")
+    }
+
+    /// Non-blocking variant — used to spread source selection across whichever
+    /// alive replica-holder has a free slot right now, instead of always queuing
+    /// behind the first candidate.
+    fn try_acquire_node_permit(
+        node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
+        heal_max_concurrent_per_node: &Arc<AtomicUsize>,
+        node: NodeId,
+    ) -> Option<OwnedSemaphorePermit> {
+        let sem = Self::node_semaphore(node_inflight, heal_max_concurrent_per_node, node);
+        sem.try_acquire_owned().ok()
+    }
+
     /// Drain the heal queue — dispatches PushChunkTo / DeleteChunkReplica for all
     /// chunks in pending_healing that are ready (delay passed, source known, not
     /// in-flight, not stalled). Tasks are spawned-and-forgotten; in_flight_healing
@@ -2034,6 +2100,8 @@ impl HealingManager {
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
                 let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs.load(Ordering::Relaxed));
                 let bandwidth_limiter = self.heal_bandwidth_limiter_out.clone();
+                let node_inflight = self.node_inflight.clone();
+                let heal_max_concurrent_per_node = self.heal_max_concurrent_per_node.clone();
 
                 set.spawn(async move {
                     let _permit = heal_semaphore.acquire().await;
@@ -2044,6 +2112,7 @@ impl HealingManager {
                                 HealingManager::do_heal_chunk_shared(
                                     &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
                                     &pending_healing, &in_flight_healing, replication_factor, &bandwidth_limiter,
+                                    &node_inflight, &heal_max_concurrent_per_node,
                                 ).await
                             }
                             ReplicationStatus::OverReplicated => {
@@ -2132,6 +2201,8 @@ impl HealingManager {
         in_flight_healing: &Arc<RwLock<HashSet<ChunkId>>>,
         replication_factor: usize,
         bandwidth_limiter: &Arc<BandwidthLimiter>,
+        node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
+        heal_max_concurrent_per_node: &Arc<AtomicUsize>,
     ) -> Result<()> {
         // In-flight guard: prevents two concurrent tasks healing the same chunk.
         {
@@ -2145,6 +2216,7 @@ impl HealingManager {
 
         let result = Self::do_heal_chunk_inner(
             chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, pending_healing, replication_factor, bandwidth_limiter,
+            node_inflight, heal_max_concurrent_per_node,
         ).await;
         in_flight_healing.write().await.remove(chunk_id);
         result
@@ -2160,6 +2232,8 @@ impl HealingManager {
         pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
         replication_factor: usize,
         bandwidth_limiter: &Arc<BandwidthLimiter>,
+        node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
+        heal_max_concurrent_per_node: &Arc<AtomicUsize>,
     ) -> Result<()> {
         info!("Leader healing under-replicated chunk: {}", chunk_id);
 
@@ -2285,18 +2359,46 @@ impl HealingManager {
 
         // Prefer a remote source to avoid loopback TCP (leader→leader PushChunkTo hangs
         // under Tokio scheduling pressure). Fall back to local only when no remote has it.
-        let source = if alive.len() > 1 {
-            alive.iter().find(|(id, _)| *id != local_id).copied()
-        } else {
-            alive.first().copied()
+        let mut preferred_sources: Vec<(NodeId, std::net::SocketAddr)> =
+            alive.iter().filter(|(id, _)| *id != local_id).copied().collect();
+        if preferred_sources.is_empty() {
+            preferred_sources = alive.clone();
+        }
+
+        // Try each candidate in preference order for an immediately-free per-node slot
+        // first — this is what lets independent node-pairs (e.g. B->A and D->C) proceed
+        // in parallel instead of every heal task queuing behind whichever node happens
+        // to be listed first. Only block (on the top-preference candidate, preserving
+        // the prior always-prefer-remote behavior) if every candidate is at capacity.
+        let mut source_pick: Option<(NodeId, std::net::SocketAddr)> = None;
+        let mut source_permit: Option<OwnedSemaphorePermit> = None;
+        for (id, addr) in &preferred_sources {
+            if let Some(permit) = Self::try_acquire_node_permit(node_inflight, heal_max_concurrent_per_node, *id) {
+                source_pick = Some((*id, *addr));
+                source_permit = Some(permit);
+                break;
+            }
+        }
+        let (source_id, source_addr) = match source_pick {
+            Some(s) => s,
+            None => {
+                let (id, addr) = *preferred_sources.first().ok_or_else(|| anyhow::anyhow!("No source node"))?;
+                source_permit = Some(Self::acquire_node_permit(node_inflight, heal_max_concurrent_per_node, id).await);
+                (id, addr)
+            }
         };
-        let (source_id, source_addr) = source.ok_or_else(|| anyhow::anyhow!("No source node"))?;
+        // Held for the whole task (all targets below) — the source node is busy with a
+        // disk read + send for each target in turn. Released when this function returns.
+        let _source_permit = source_permit;
 
         let mut replicated = Vec::new();
 
         {
             for target_id in &targets {
                 if let Some(target_info) = cluster.get_node(target_id).await {
+                    let _target_permit = Self::acquire_node_permit(
+                        node_inflight, heal_max_concurrent_per_node, *target_id,
+                    ).await;
                     info!(
                         "Healing chunk {}: instructing node {} to push to node {} ({})",
                         chunk_id, source_id, target_id, target_info.addr
@@ -2722,6 +2824,7 @@ impl HealingManager {
         link_bandwidth_mb: Option<usize>,
         heal_max_pct: Option<f64>,
         heal_max_concurrent: Option<usize>,
+        heal_max_concurrent_per_node: Option<usize>,
         heal_transfer_timeout_secs: Option<u64>,
     ) -> HealingTuningSnapshot {
         if let Some(v) = link_bandwidth_mb {
@@ -2733,8 +2836,21 @@ impl HealingManager {
         if let Some(secs) = heal_transfer_timeout_secs {
             self.heal_transfer_timeout_secs.store(secs.max(1), Ordering::Relaxed);
         }
+        // Apply the global cap first so a per-node value supplied in the same call is
+        // clamped against the *new* global ceiling, not the stale one.
         if let Some(target) = heal_max_concurrent {
             self.resize_heal_concurrency(target.max(1)).await;
+        }
+        if let Some(target) = heal_max_concurrent_per_node {
+            let global = self.heal_max_concurrent.load(Ordering::Relaxed);
+            let clamped = target.max(1).min(global);
+            if clamped != target {
+                warn!(
+                    "heal_max_concurrent_per_node={} exceeds heal_max_concurrent={}; clamping to {} — a per-node cap above the global cap can never take effect",
+                    target, global, clamped
+                );
+            }
+            self.resize_node_concurrency(clamped).await;
         }
         self.tuning_snapshot().await
     }
@@ -2771,14 +2887,58 @@ impl HealingManager {
                 });
             }
         }
+
+        // Keep the two knobs logically consistent: a per-node cap above the global cap
+        // could never bind, so if the global cap just dropped below it, clamp it down too.
+        let per_node = self.heal_max_concurrent_per_node.load(Ordering::Relaxed);
+        if per_node > target {
+            warn!(
+                "heal_max_concurrent lowered to {} below current heal_max_concurrent_per_node={}; clamping per-node cap down to match",
+                target, per_node
+            );
+            self.resize_node_concurrency(target).await;
+        }
     }
 
-    /// Current live values of all four tuning knobs, for `dfs-admin healing get`/`status`.
+    /// Reconciles every semaphore in `node_inflight` (plus the target used to size new,
+    /// lazily-created entries) to a new per-node concurrency target. Same grow-immediately
+    /// / shrink-via-forget_permits-with-retry semantics as `resize_heal_concurrency`,
+    /// just applied to each node's semaphore instead of a single global one.
+    async fn resize_node_concurrency(&self, target: usize) {
+        let previous = self.heal_max_concurrent_per_node.swap(target, Ordering::Relaxed);
+        if target == previous {
+            return;
+        }
+        for entry in self.node_inflight.iter() {
+            let semaphore = entry.value().clone();
+            if target > previous {
+                semaphore.add_permits(target - previous);
+            } else {
+                let mut remaining = previous - target;
+                remaining -= semaphore.forget_permits(remaining);
+                if remaining > 0 {
+                    let heal_max_concurrent_per_node = self.heal_max_concurrent_per_node.clone();
+                    tokio::spawn(async move {
+                        while remaining > 0 {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            if heal_max_concurrent_per_node.load(Ordering::Relaxed) != target {
+                                return;
+                            }
+                            remaining -= semaphore.forget_permits(remaining);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Current live values of all five tuning knobs, for `dfs-admin healing get`/`status`.
     pub async fn tuning_snapshot(&self) -> HealingTuningSnapshot {
         HealingTuningSnapshot {
             link_bandwidth_mb: self.link_bandwidth_mb.load(Ordering::Relaxed),
             heal_max_pct: *self.heal_max_pct.read().await * 100.0,
             heal_max_concurrent: self.heal_max_concurrent.load(Ordering::Relaxed),
+            heal_max_concurrent_per_node: self.heal_max_concurrent_per_node.load(Ordering::Relaxed),
             heal_transfer_timeout_secs: self.heal_transfer_timeout_secs.load(Ordering::Relaxed),
         }
     }
@@ -2875,6 +3035,7 @@ pub struct HealingTuningSnapshot {
     pub link_bandwidth_mb: usize,
     pub heal_max_pct: f64,
     pub heal_max_concurrent: usize,
+    pub heal_max_concurrent_per_node: usize,
     pub heal_transfer_timeout_secs: u64,
 }
 
@@ -2903,7 +3064,7 @@ mod tests {
 
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
-            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 120,
+            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
         );
 
         let stats = healing.get_stats().await;
@@ -2927,7 +3088,7 @@ mod tests {
 
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 2, 24, true,
-            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 120,
+            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
         ); // 2s delay
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"test"));
@@ -2973,7 +3134,7 @@ mod tests {
         // already elapsed before restart must carry over.
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 10, 24, true,
-            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 120,
+            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
         );
 
         // 8s < 10s — not ready yet, but the persisted age must have been restored
@@ -2994,7 +3155,7 @@ mod tests {
         let client = Arc::new(NetworkClient::new());
         let healing = HealingManager::new(
             storage.clone(), metadata.clone(), cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
-            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 120,
+            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
         );
         (storage, metadata, healing, temp_storage, temp_metadata)
     }

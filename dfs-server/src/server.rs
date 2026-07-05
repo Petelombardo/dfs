@@ -1652,8 +1652,8 @@ impl Server {
             Request::TriggerScrub => self.handle_trigger_scrub().await,
             Request::EnableHealing => self.handle_enable_healing().await,
             Request::DisableHealing => self.handle_disable_healing().await,
-            Request::SetHealingTuning { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs } => {
-                self.handle_set_healing_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs).await
+            Request::SetHealingTuning { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs } => {
+                self.handle_set_healing_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs).await
             }
             Request::SetReplicationFactor { replication_factor } => {
                 self.handle_set_replication_factor(replication_factor).await
@@ -6071,6 +6071,7 @@ impl Server {
                     link_bandwidth_mb: stats.tuning.link_bandwidth_mb,
                     heal_max_pct: stats.tuning.heal_max_pct,
                     heal_max_concurrent: stats.tuning.heal_max_concurrent,
+                    heal_max_concurrent_per_node: stats.tuning.heal_max_concurrent_per_node,
                     heal_transfer_timeout_secs: stats.tuning.heal_transfer_timeout_secs,
                 }
             }
@@ -6084,6 +6085,7 @@ impl Server {
                 link_bandwidth_mb: 0,
                 heal_max_pct: 0.0,
                 heal_max_concurrent: 0,
+                heal_max_concurrent_per_node: 0,
                 heal_transfer_timeout_secs: 0,
             },
         }
@@ -6099,6 +6101,7 @@ impl Server {
         link_bandwidth_mb: Option<usize>,
         heal_max_pct: Option<f64>,
         heal_max_concurrent: Option<usize>,
+        heal_max_concurrent_per_node: Option<usize>,
         heal_transfer_timeout_secs: Option<u64>,
     ) -> Response {
         let healing_guard = self.healing.read().await;
@@ -6114,13 +6117,17 @@ impl Server {
         // Clamp to sane bounds — same range HealingManager::new already clamps
         // heal_max_pct to, plus a generous upper bound on concurrency to avoid
         // accidentally exhausting FDs/tasks via a fat-fingered admin command.
+        // heal_max_concurrent_per_node's own upper bound (never above the current
+        // heal_max_concurrent) is enforced inside apply_tuning, since it depends on
+        // the (possibly-just-changed) global value.
         let heal_max_pct = heal_max_pct.map(|p| p.clamp(10.0, 100.0));
         let heal_max_concurrent = heal_max_concurrent.map(|c| c.clamp(1, 64));
+        let heal_max_concurrent_per_node = heal_max_concurrent_per_node.map(|c| c.clamp(1, 64));
 
-        healing.apply_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs).await;
+        healing.apply_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs).await;
         info!(
-            "Healing tuning updated via admin command (link_bandwidth_mb={:?}, heal_max_pct={:?}, heal_max_concurrent={:?}, heal_transfer_timeout_secs={:?})",
-            link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_transfer_timeout_secs
+            "Healing tuning updated via admin command (link_bandwidth_mb={:?}, heal_max_pct={:?}, heal_max_concurrent={:?}, heal_max_concurrent_per_node={:?}, heal_transfer_timeout_secs={:?})",
+            link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs
         );
 
         let snapshot = healing.tuning_snapshot().await;
@@ -6129,6 +6136,7 @@ impl Server {
                 config.replication.link_bandwidth_mb = Some(snapshot.link_bandwidth_mb);
                 config.replication.heal_max_pct = Some(snapshot.heal_max_pct);
                 config.replication.heal_max_concurrent = Some(snapshot.heal_max_concurrent);
+                config.replication.heal_max_concurrent_per_node = Some(snapshot.heal_max_concurrent_per_node);
                 config.replication.heal_transfer_timeout_secs = Some(snapshot.heal_transfer_timeout_secs);
                 if let Err(e) = config.to_file(&self.config_path) {
                     warn!("Failed to persist healing tuning to config {:?}: {}", self.config_path, e);

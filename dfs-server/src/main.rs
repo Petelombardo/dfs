@@ -310,6 +310,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config.replication.link_bandwidth_mb.expect("resolved by load_or_migrate_healing_tuning"),
         config.replication.heal_max_pct.expect("resolved by load_or_migrate_healing_tuning"),
         config.replication.heal_max_concurrent.expect("resolved by load_or_migrate_healing_tuning"),
+        config.replication.heal_max_concurrent_per_node.expect("resolved by load_or_migrate_healing_tuning"),
         config.replication.heal_transfer_timeout_secs.expect("resolved by load_or_migrate_healing_tuning"),
     ));
     healer_runtime.spawn(healing.clone().start());

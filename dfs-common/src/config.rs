@@ -172,6 +172,14 @@ pub struct ReplicationConfig {
     #[serde(default)]
     pub heal_max_concurrent: Option<usize>,
 
+    /// Maximum concurrent heal transfers any single node may be party to (as source or
+    /// target, combined) at once (default: 3). Bounds how many transfers pile onto one
+    /// busy node while `heal_max_concurrent` is the overall cluster-wide ceiling; kept
+    /// <= `heal_max_concurrent` since a larger per-node value could never bind. See
+    /// `link_bandwidth_mb` doc for the Option/migration rationale.
+    #[serde(default)]
+    pub heal_max_concurrent_per_node: Option<usize>,
+
     /// Per-transfer timeout for a single heal push, in seconds (default: 120).
     /// See `link_bandwidth_mb` doc for the Option/migration rationale.
     #[serde(default)]
@@ -210,6 +218,10 @@ pub fn default_heal_max_concurrent() -> usize {
     8
 }
 
+pub fn default_heal_max_concurrent_per_node() -> usize {
+    3
+}
+
 pub fn default_heal_transfer_timeout_secs() -> u64 {
     120
 }
@@ -224,6 +236,7 @@ impl Default for ReplicationConfig {
             link_bandwidth_mb: None,
             heal_max_pct: None,
             heal_max_concurrent: None,
+            heal_max_concurrent_per_node: None,
             heal_transfer_timeout_secs: None,
         }
     }
@@ -344,6 +357,14 @@ impl Config {
             self.replication.heal_max_concurrent = Some(v);
             changed = true;
         }
+        if self.replication.heal_max_concurrent_per_node.is_none() {
+            let v = std::env::var("DFS_HEAL_MAX_CONCURRENT_PER_NODE")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(default_heal_max_concurrent_per_node);
+            self.replication.heal_max_concurrent_per_node = Some(v);
+            changed = true;
+        }
         if self.replication.heal_transfer_timeout_secs.is_none() {
             let v = std::env::var("DFS_HEAL_TRANSFER_TIMEOUT_SECS")
                 .ok()
@@ -390,6 +411,7 @@ mod tests {
         std::env::remove_var("DFS_LINK_BANDWIDTH_MB");
         std::env::remove_var("DFS_HEAL_MAX_PCT");
         std::env::remove_var("DFS_HEAL_MAX_CONCURRENT");
+        std::env::remove_var("DFS_HEAL_MAX_CONCURRENT_PER_NODE");
         std::env::remove_var("DFS_HEAL_TRANSFER_TIMEOUT_SECS");
 
         let mut config = Config::default();
@@ -398,6 +420,7 @@ mod tests {
         assert_eq!(config.replication.link_bandwidth_mb, Some(100));
         assert_eq!(config.replication.heal_max_pct, Some(60.0));
         assert_eq!(config.replication.heal_max_concurrent, Some(8));
+        assert_eq!(config.replication.heal_max_concurrent_per_node, Some(3));
         assert_eq!(config.replication.heal_transfer_timeout_secs, Some(120));
     }
 

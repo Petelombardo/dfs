@@ -592,6 +592,10 @@ pub enum Request {
         heal_max_pct: Option<f64>,
         heal_max_concurrent: Option<usize>,
         heal_transfer_timeout_secs: Option<u64>,
+        /// Appended at the end, not inserted mid-list — bincode is positional, so a
+        /// mid-list insertion would misalign every field after it on wire-version skew.
+        #[serde(default)]
+        heal_max_concurrent_per_node: Option<usize>,
     },
 
     /// Live-update the cluster's replication factor. Applied immediately in-memory
@@ -741,6 +745,11 @@ pub enum Response {
         /// Configured per-transfer timeout in seconds.
         #[serde(default)]
         heal_transfer_timeout_secs: u64,
+        /// Configured max concurrent heal transfers any single node may be party to.
+        /// Appended at the end, not inserted mid-list — bincode is positional, so a
+        /// mid-list insertion would misalign every field after it on wire-version skew.
+        #[serde(default)]
+        heal_max_concurrent_per_node: usize,
     },
 
     /// File info with chunk locations

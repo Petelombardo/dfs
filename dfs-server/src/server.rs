@@ -4506,37 +4506,40 @@ impl Server {
             m
         }).collect();
 
-        // Run all sled writes in spawn_blocking so we never block the async runtime.
-        // Under a write storm the 5000-item batch would otherwise stall the follower.
+        // Run all redb writes in spawn_blocking so we never block the async runtime,
+        // and as ONE shared transaction via put_files_batch rather than one commit
+        // per item — under a write storm (or a follower rejoining after being down
+        // long enough to queue thousands of entries) individually-committed puts is
+        // what made a real deployment's rejoin catch-up take well over a minute.
         let meta_store = self.metadata.clone();
         let block_result = tokio::task::spawn_blocking(move || {
+            let put_results = meta_store.put_files_batch(&live_items)?;
             let mut stored: Vec<FileMetadata> = Vec::new();
             let mut corrections: Vec<FileMetadata> = Vec::new();
-            let mut failed = 0usize;
-            for metadata in &live_items {
-                match meta_store.put_file(metadata) {
-                    Ok(crate::metadata::PutFileResult::Stored) => {
-                        stored.push(metadata.clone());
-                    }
-                    Ok(crate::metadata::PutFileResult::Stale(newer)) => {
+            for (metadata, result) in live_items.iter().zip(put_results.into_iter()) {
+                match result {
+                    crate::metadata::PutFileResult::Stored => stored.push(metadata.clone()),
+                    crate::metadata::PutFileResult::Stale(newer) => {
                         debug!(
                             "disseminate: follower has newer write_seq={} for {}, will correct leader",
                             newer.write_seq, newer.path
                         );
                         corrections.push(newer);
                     }
-                    Err(e) => {
-                        warn!("disseminate: failed to store '{}': {}", metadata.path, e);
-                        failed += 1;
-                    }
                 }
             }
-            // Record follower sequence inside spawn_blocking to keep it off the async thread.
-            (stored, corrections, failed)
+            Ok::<_, anyhow::Error>((stored, corrections))
         }).await;
 
-        let (stored, corrections, failed) = match block_result {
-            Ok(v) => v,
+        let (stored, corrections) = match block_result {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                warn!("disseminate: batch store failed: {}", e);
+                return Response::Error {
+                    message: format!("disseminate: batch store failed: {}", e),
+                    code: ErrorCode::InternalError,
+                };
+            }
             Err(e) => {
                 warn!("disseminate: spawn_blocking panicked: {}", e);
                 return Response::Error {
@@ -4584,14 +4587,10 @@ impl Server {
             });
         }
 
-        if failed > 0 {
-            Response::Error {
-                message: format!("disseminate: {} items failed to store", failed),
-                code: ErrorCode::InternalError,
-            }
-        } else {
-            Response::Ok { data: None }
-        }
+        // A per-item failure can no longer happen here — put_files_batch fails the
+        // whole batch instead (handled above), so reaching this point means every
+        // item was either stored or correctly identified as stale.
+        Response::Ok { data: None }
     }
 
     /// Return a compact file inventory: Vec<(FileId, modified_at)>.

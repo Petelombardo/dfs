@@ -355,38 +355,29 @@ impl MetadataStore {
     // File metadata — core CRUD
     // -------------------------------------------------------------------------
 
-    /// Store file metadata.
-    pub fn put_file(&self, metadata: &FileMetadata) -> Result<PutFileResult> {
+    /// Core of put_file, parameterized over already-open table handles so callers
+    /// can share ONE transaction across many records (see put_files_batch) instead
+    /// of paying a full commit per record.
+    ///
+    /// The stale-write check is done BEFORE touching path_table/file_table for any
+    /// removal, not after (unlike a naive port of the old single-item code) — so a
+    /// rejected stale item contributes nothing at all to the transaction. That
+    /// matters for put_files_batch: a stale item earlier in a batch must never
+    /// leave a partial mutation (e.g. an old_id removal) sitting in a transaction
+    /// that other items in the same batch go on to share. It's a no-op change for
+    /// put_file's own single-item case, since nothing there ever committed on the
+    /// stale path either way.
+    ///
+    /// Returns the stored/stale result plus any old file_id removed due to a path
+    /// collision — the caller must mark both dirty after commit (see put_file's
+    /// dirty-marking comment).
+    fn put_file_in_txn(
+        file_table: &mut redb::Table<&str, &[u8]>,
+        path_table: &mut redb::Table<&str, &[u8]>,
+        metadata: &FileMetadata,
+    ) -> Result<(PutFileResult, Option<String>)> {
         let file_id_str = format!("{}", metadata.id);
         let path_str = metadata.path.as_str();
-
-        let _db = self.db.read().unwrap();
-        let mut txn = _db.begin_write()?;
-        txn.set_durability(self.next_write_durability());
-
-        // Read-before-write: open both tables once and keep them alive for the
-        // duration of the transaction so all reads and writes are atomic.
-        let mut file_table = txn.open_table(FILE_TABLE)?;
-        let mut path_table = txn.open_table(PATH_TABLE)?;
-
-        // If a different file ID already exists at this path, remove the stale file record.
-        // old_id_str is captured outside this block so it can be marked dirty after
-        // commit (see the dirty_files.insert calls below compact_db_with_budget's
-        // incremental catch-up passes rely on).
-        let old_id_str: Option<String> = match path_table.get(path_str)? {
-            Some(v) => dfs_common::deserialize_file_metadata(v.value())
-                .ok()
-                .filter(|m| m.id != metadata.id)
-                .map(|m| format!("{}", m.id)),
-            None => None,
-        };
-        if let Some(old_id) = &old_id_str {
-            if let Err(e) = file_table.remove(old_id.as_str()) {
-                warn!("Failed to remove stale file record {} for path {}: {}", old_id, metadata.path, e);
-            } else {
-                debug!("Removed stale file record {} superseded by {} at path {}", old_id, metadata.id, metadata.path);
-            }
-        }
 
         // Merge chunk_locations with any existing same-ID record.
         let existing_opt: Option<FileMetadata> = match file_table.get(file_id_str.as_str())? {
@@ -405,7 +396,7 @@ impl MetadataStore {
                     "Dropping stale metadata for {} (existing write_seq={} > incoming={})",
                     metadata.path, existing.write_seq, metadata.write_seq
                 );
-                return Ok(PutFileResult::Stale(existing));
+                return Ok((PutFileResult::Stale(existing), None));
             }
 
             // Merge chunk locations — Rule 1 (same chunk_id: merge node lists),
@@ -468,6 +459,24 @@ impl MetadataStore {
             metadata
         };
 
+        // If a different file ID already exists at this path, remove the stale file
+        // record. Done only now (after the stale-check above can no longer bail
+        // out) — see this function's doc comment for why the ordering matters.
+        let old_id_str: Option<String> = match path_table.get(path_str)? {
+            Some(v) => dfs_common::deserialize_file_metadata(v.value())
+                .ok()
+                .filter(|m| m.id != metadata.id)
+                .map(|m| format!("{}", m.id)),
+            None => None,
+        };
+        if let Some(old_id) = &old_id_str {
+            if let Err(e) = file_table.remove(old_id.as_str()) {
+                warn!("Failed to remove stale file record {} for path {}: {}", old_id, metadata.path, e);
+            } else {
+                debug!("Removed stale file record {} superseded by {} at path {}", old_id, metadata.id, metadata.path);
+            }
+        }
+
         let value = bincode::serialize(metadata_to_store)
             .context("Failed to serialize file metadata")?;
 
@@ -476,22 +485,93 @@ impl MetadataStore {
         path_table.insert(path_str, value.as_slice())
             .context("Failed to insert path index")?;
 
-        drop(file_table);
-        drop(path_table);
+        Ok((PutFileResult::Stored, old_id_str))
+    }
+
+    /// Store file metadata.
+    pub fn put_file(&self, metadata: &FileMetadata) -> Result<PutFileResult> {
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+
+        let (result, old_id_str) = {
+            let mut file_table = txn.open_table(FILE_TABLE)?;
+            let mut path_table = txn.open_table(PATH_TABLE)?;
+            Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?
+        };
+
+        if matches!(result, PutFileResult::Stale(_)) {
+            // Nothing was mutated — see put_file_in_txn's doc comment. Dropping txn
+            // here without committing is a no-op against the live db.
+            return Ok(result);
+        }
+
         txn.commit()?;
 
         // Mark touched keys dirty for compact_db_with_budget's incremental catch-up —
         // must happen while `_db` (the read guard) is still held, so Phase 3's
         // exclusive db.write() lock acts as a barrier: it cannot succeed until this
         // line has already run for every write that started before it.
-        self.dirty_files.lock().unwrap().insert(file_id_str.clone());
-        self.dirty_paths.lock().unwrap().insert(path_str.to_string());
+        self.dirty_files.lock().unwrap().insert(format!("{}", metadata.id));
+        self.dirty_paths.lock().unwrap().insert(metadata.path.clone());
         if let Some(old_id) = &old_id_str {
             self.dirty_files.lock().unwrap().insert(old_id.clone());
         }
 
-        debug!("Stored metadata for file: {} ({})", metadata_to_store.path, metadata_to_store.id);
-        Ok(PutFileResult::Stored)
+        debug!("Stored metadata for file: {} ({})", metadata.path, metadata.id);
+        Ok(result)
+    }
+
+    /// Batched version of put_file: applies every item within ONE shared
+    /// transaction (one commit for the whole batch) instead of one transaction per
+    /// item. This is the dissemination catch-up path's hot loop
+    /// (handle_disseminate_metadata in server.rs) — a follower that's been offline
+    /// accumulates one queued entry per write it missed, and applying thousands of
+    /// them via individual put_file calls (one redb commit each) is what made a
+    /// real deployment's rejoin catch-up take well over a minute for ~10,000 queued
+    /// records, even though almost all of that time was pure per-transaction
+    /// overhead rather than actual work. Batching cuts that to a single commit.
+    ///
+    /// Returns one PutFileResult per input item, in the same order. Unlike calling
+    /// put_file in a loop, a hard error (e.g. genuine I/O failure) aborts the whole
+    /// batch rather than skipping just the offending item — acceptable here since
+    /// such errors are effectively never caused by a single item's content, and the
+    /// caller (handle_disseminate_metadata) already retries the whole batch on any
+    /// failure (the leader won't ack_meta_queue_for_node until it succeeds).
+    pub fn put_files_batch(&self, items: &[FileMetadata]) -> Result<Vec<PutFileResult>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+
+        let mut results = Vec::with_capacity(items.len());
+        let mut touched_file_ids: Vec<String> = Vec::new();
+        let mut touched_paths: Vec<String> = Vec::new();
+        {
+            let mut file_table = txn.open_table(FILE_TABLE)?;
+            let mut path_table = txn.open_table(PATH_TABLE)?;
+            for metadata in items {
+                let (result, old_id_str) = Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?;
+                if !matches!(result, PutFileResult::Stale(_)) {
+                    touched_file_ids.push(format!("{}", metadata.id));
+                    touched_paths.push(metadata.path.clone());
+                    if let Some(old_id) = old_id_str {
+                        touched_file_ids.push(old_id);
+                    }
+                }
+                results.push(result);
+            }
+        }
+        txn.commit()?;
+
+        // See put_file's matching comment: must happen while `_db` is still held.
+        self.dirty_files.lock().unwrap().extend(touched_file_ids);
+        self.dirty_paths.lock().unwrap().extend(touched_paths);
+
+        Ok(results)
     }
 
     /// Get file metadata by ID.
@@ -2466,6 +2546,83 @@ mod tests {
             "diff_all_tables_tracked took {:?} for {} dirty keys against a {}-row table \
              — should be near-instant, not scale with table size",
             elapsed, NEW_COUNT, SEED_COUNT
+        );
+    }
+
+    /// Regression test for a real deployment finding: a rejoining follower (gluster2)
+    /// was still short 1 file after ~90s of catch-up out of ~10,638 queued records.
+    /// handle_disseminate_metadata applied each queued item via an individual
+    /// put_file call — one full redb transaction + commit per record — which is
+    /// almost entirely per-transaction overhead at that scale, not real work.
+    /// put_files_batch shares ONE transaction across the whole batch. Confirms both
+    /// that per-item semantics are unchanged (stale rejection inside a shared batch
+    /// transaction must not affect other items) and that it's meaningfully faster.
+    #[test]
+    fn test_put_files_batch_matches_individual_puts_and_is_faster() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        // --- Correctness: new record, updated record, and a stale resend, all in
+        // one shared-transaction batch. ---
+        let mut existing = FileMetadata::new("/existing.txt".to_string(), FileType::RegularFile);
+        existing.write_seq = 5;
+        store.put_file(&existing).unwrap();
+
+        let new_file = FileMetadata::new("/new.txt".to_string(), FileType::RegularFile);
+
+        let mut updated_existing = existing.clone();
+        updated_existing.write_seq = 6;
+        updated_existing.size = 4096;
+
+        let mut stale_resend = existing.clone();
+        stale_resend.write_seq = 1; // < stored write_seq=5 — must be rejected as Stale
+
+        let batch = vec![new_file.clone(), updated_existing.clone(), stale_resend.clone()];
+        let results = store.put_files_batch(&batch).unwrap();
+        assert!(matches!(results[0], PutFileResult::Stored), "brand-new file must store");
+        assert!(matches!(results[1], PutFileResult::Stored), "newer write_seq must store");
+        assert!(matches!(results[2], PutFileResult::Stale(_)), "older write_seq must be rejected as stale");
+
+        assert!(store.get_file(&new_file.id).unwrap().is_some(), "new file lost in batch");
+        let stored_existing = store.get_file(&existing.id).unwrap().unwrap();
+        assert_eq!(stored_existing.write_seq, 6, "stale resend must not have clobbered the real update");
+        assert_eq!(stored_existing.size, 4096, "update from the same batch must have been applied");
+
+        // --- Performance: individual put_file calls vs. one put_files_batch call
+        // over an equivalent number of brand-new records. ---
+        const COUNT: usize = 2000;
+        let individual_dir = TempDir::new().unwrap();
+        let individual_store = MetadataStore::new(individual_dir.path().to_path_buf()).unwrap();
+        let individual_items: Vec<FileMetadata> = (0..COUNT)
+            .map(|i| FileMetadata::new(format!("/individual_{}", i), FileType::RegularFile))
+            .collect();
+        let start_individual = std::time::Instant::now();
+        for m in &individual_items {
+            individual_store.put_file(m).unwrap();
+        }
+        let individual_elapsed = start_individual.elapsed();
+
+        let batch_dir = TempDir::new().unwrap();
+        let batch_store = MetadataStore::new(batch_dir.path().to_path_buf()).unwrap();
+        let batch_items: Vec<FileMetadata> = (0..COUNT)
+            .map(|i| FileMetadata::new(format!("/batched_{}", i), FileType::RegularFile))
+            .collect();
+        let start_batch = std::time::Instant::now();
+        let batch_results = batch_store.put_files_batch(&batch_items).unwrap();
+        let batch_elapsed = start_batch.elapsed();
+
+        assert_eq!(batch_results.len(), COUNT);
+        assert!(batch_results.iter().all(|r| matches!(r, PutFileResult::Stored)));
+        for m in &batch_items {
+            assert!(batch_store.get_file(&m.id).unwrap().is_some(), "lost {} in batched put", m.path);
+        }
+
+        assert!(
+            batch_elapsed * 3 < individual_elapsed,
+            "put_files_batch ({:?} for {} records) should be at least 3x faster than \
+             {} individual put_file calls ({:?}) — the whole point is amortizing the \
+             per-transaction commit cost across the batch",
+            batch_elapsed, COUNT, COUNT, individual_elapsed
         );
     }
 

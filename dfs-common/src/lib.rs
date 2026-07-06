@@ -8,8 +8,8 @@ pub mod storage_stats;
 // Re-export commonly used types
 pub use config::Config;
 pub use types::{
-    ChunkId, ChunkLocation, FileId, FileMetadata, FileType, LeaveReason, NodeHealthGossip, NodeId,
-    NodeInfo, NodeStatus,
+    deserialize_file_metadata, ChunkId, ChunkLocation, FileId, FileMetadata, FileType,
+    LeaveReason, NodeHealthGossip, NodeId, NodeInfo, NodeStatus,
 };
 pub use protocol::{
     ClusterMessage, DeleteQueueEntry, ErrorCode, Message, MessageEnvelope, MetadataOperation,

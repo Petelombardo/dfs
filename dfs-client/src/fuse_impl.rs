@@ -9,6 +9,7 @@ use fuser::{
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -3801,6 +3802,7 @@ impl DfsFilesystem {
             file_type: FileType::Directory,
             chunk_locations: Arc::new(Vec::new()),
             write_seq: 0,
+            symlink_target: None,
         };
 
         metadata_cache.insert(1, root_metadata);
@@ -5476,6 +5478,7 @@ impl Filesystem for DfsFilesystem {
             file_type: FileType::RegularFile,
             chunk_locations: Arc::new(Vec::new()),
             write_seq: 0,
+            symlink_target: None,
         };
 
         // Store metadata on cluster — spawn so we never block_on the FUSE dispatch thread.
@@ -5952,6 +5955,7 @@ impl Filesystem for DfsFilesystem {
                                     gid: req_gid,
                                     file_type: dfs_common::FileType::RegularFile,
                                     write_seq: 0,
+                                    symlink_target: None,
                                 };
                                 info!("write: inode {} has no server metadata, creating new record for {}", ino, path);
                                 metadata_cache.insert(ino, new_meta.clone());
@@ -7215,6 +7219,7 @@ impl Filesystem for DfsFilesystem {
             file_type: FileType::Directory,
             chunk_locations: Arc::new(Vec::new()),
             write_seq: 0,
+            symlink_target: None,
         };
 
         // Store metadata on cluster — spawn so we never block_on the FUSE dispatch thread.
@@ -7256,6 +7261,145 @@ impl Filesystem for DfsFilesystem {
                     error!("Failed to create directory {}: {}", path, e);
                     reply.error(libc::EIO);
                 }
+            }
+        });
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &FuseRequest,
+        parent: u64,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        debug!("symlink: parent={}, link_name={:?}, target={:?}", parent, link_name, target);
+
+        let path = match self.get_path_from_parent(parent, link_name) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let target_str = match target.to_str() {
+            Some(t) => t.to_string(),
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        // Symlink target is stored inline in metadata (see FileMetadata::symlink_target's
+        // doc comment) rather than as chunk data — no chunk allocation/replication needed.
+        // size mirrors the target string length, matching readlink()'s convention.
+        let metadata = FileMetadata {
+            id: dfs_common::FileId::new(),
+            path: path.clone(),
+            size: target_str.len() as u64,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            modified_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            mode: 0o777,
+            uid: _req.uid(),
+            gid: _req.gid(),
+            file_type: FileType::Symlink,
+            chunk_locations: Arc::new(Vec::new()),
+            write_seq: 0,
+            symlink_target: Some(target_str),
+        };
+
+        // Store metadata on cluster — spawn so we never block_on the FUSE dispatch thread.
+        let client = self.client.clone();
+        let metadata_clone = metadata.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let dir_cache = self.dir_cache.clone();
+        let dir_cache_invalidated_at = self.dir_cache_invalidated_at.clone();
+        let path_to_inode = self.path_to_inode.clone();
+        let inode_to_path = self.inode_to_path.clone();
+        let next_inode = self.next_inode.clone();
+
+        self.runtime.spawn(async move {
+            match client.put_file_metadata(&metadata_clone).await {
+                Ok(_) => {
+                    let ino = {
+                        let path_map = path_to_inode.read().unwrap();
+                        if let Some(&existing) = path_map.get(&path) {
+                            existing
+                        } else {
+                            drop(path_map);
+                            let mut next = next_inode.write().unwrap();
+                            let v = *next; *next += 1; drop(next);
+                            path_to_inode.write().unwrap().insert(path.clone(), v);
+                            inode_to_path.write().unwrap().insert(v, path.clone());
+                            v
+                        }
+                    };
+                    metadata_cache.insert(ino, metadata.clone());
+
+                    let raw_parent = path.rsplitn(2, '/').nth(1).unwrap_or("");
+                    let parent_path = if raw_parent.is_empty() { "/" } else { raw_parent };
+                    DfsFilesystem::invalidate_dir_cache(&dir_cache, &dir_cache_invalidated_at, parent_path);
+
+                    let attr = DfsFilesystem::metadata_to_attr_static(ino, &metadata);
+                    reply.entry(&Duration::ZERO, &attr, 0);
+                }
+                Err(e) => {
+                    error!("Failed to create symlink {}: {}", path, e);
+                    reply.error(libc::EIO);
+                }
+            }
+        });
+    }
+
+    fn readlink(&mut self, _req: &FuseRequest, ino: u64, reply: ReplyData) {
+        debug!("readlink: ino={}", ino);
+
+        let client = self.client.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let inode_to_path = self.inode_to_path.clone();
+        let last_metadata_update = self.last_metadata_update.clone();
+        let runtime = self.runtime.clone();
+
+        runtime.spawn(async move {
+            let cached = metadata_cache.get(&ino).map(|m| m.clone());
+
+            let metadata = match cached {
+                Some(m) => Some(m),
+                None => {
+                    let path_opt = inode_to_path.read().unwrap().get(&ino).cloned();
+                    match path_opt {
+                        Some(path) => match client.get_file_metadata(&path).await {
+                            Ok(Some(fetched)) => {
+                                metadata_cache.insert(ino, fetched.clone());
+                                last_metadata_update.insert(ino, std::time::Instant::now());
+                                Some(fetched)
+                            }
+                            _ => None,
+                        },
+                        None => None,
+                    }
+                }
+            };
+
+            match metadata {
+                Some(m) if m.file_type == FileType::Symlink => {
+                    match m.symlink_target {
+                        Some(target) => reply.data(target.as_bytes()),
+                        None => {
+                            error!("readlink: ino={} is a symlink with no stored target", ino);
+                            reply.error(libc::EIO);
+                        }
+                    }
+                }
+                Some(_) => reply.error(libc::EINVAL),
+                None => reply.error(libc::ENOENT),
             }
         });
     }

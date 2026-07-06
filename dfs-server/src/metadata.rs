@@ -266,7 +266,7 @@ impl MetadataStore {
             let mut repairs = Vec::new();
             for item in file_table.range::<&str>(..)? {
                 let (_, v) = item?;
-                let m = match bincode::deserialize::<FileMetadata>(v.value()) {
+                let m = match dfs_common::deserialize_file_metadata(v.value()) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -301,7 +301,7 @@ impl MetadataStore {
             let mut stale = Vec::new();
             for item in path_table.range::<&str>(..)? {
                 let (k, v) = item?;
-                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                     let fid_str = format!("{}", m.id);
                     if file_table.get(fid_str.as_str())?.is_none() {
                         stale.push(k.value().to_string());
@@ -356,7 +356,7 @@ impl MetadataStore {
         // If a different file ID already exists at this path, remove the stale file record.
         {
             let old_id_str: Option<String> = match path_table.get(path_str)? {
-                Some(v) => bincode::deserialize::<FileMetadata>(v.value())
+                Some(v) => dfs_common::deserialize_file_metadata(v.value())
                     .ok()
                     .filter(|m| m.id != metadata.id)
                     .map(|m| format!("{}", m.id)),
@@ -373,7 +373,7 @@ impl MetadataStore {
 
         // Merge chunk_locations with any existing same-ID record.
         let existing_opt: Option<FileMetadata> = match file_table.get(file_id_str.as_str())? {
-            Some(v) => bincode::deserialize::<FileMetadata>(v.value()).ok(),
+            Some(v) => dfs_common::deserialize_file_metadata(v.value()).ok(),
             None => None,
         };
 
@@ -483,7 +483,7 @@ impl MetadataStore {
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         match table.get(key.as_str())? {
-            Some(v) => Ok(Some(bincode::deserialize::<FileMetadata>(v.value())
+            Some(v) => Ok(Some(dfs_common::deserialize_file_metadata(v.value())
                 .with_context(|| format!("Failed to deserialize metadata for {}", file_id))?)),
             None => Ok(None),
         }
@@ -504,7 +504,7 @@ impl MetadataStore {
         let txn = _db.begin_read()?;
         let table = txn.open_table(PATH_TABLE)?;
         match table.get(path)? {
-            Some(v) => Ok(Some(bincode::deserialize::<FileMetadata>(v.value())
+            Some(v) => Ok(Some(dfs_common::deserialize_file_metadata(v.value())
                 .with_context(|| format!("Failed to deserialize metadata for path {}", path))?)),
             None => Ok(None),
         }
@@ -522,7 +522,7 @@ impl MetadataStore {
 
             // Get path from file record so we can remove the path index entry.
             if let Some(v) = file_table.get(file_id_str.as_str())? {
-                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                     path_table.remove(m.path.as_str())?;
                 }
             }
@@ -592,7 +592,7 @@ impl MetadataStore {
         let table = txn.open_table(FILE_TABLE)?;
         for item in table.range::<&str>(..)? {
             let (k, v) = item?;
-            match bincode::deserialize::<FileMetadata>(v.value()) {
+            match dfs_common::deserialize_file_metadata(v.value()) {
                 Ok(m) => f(m)?,
                 Err(_) => warn!("Skipping corrupt metadata entry (key={:?})", k.value()),
             }
@@ -615,7 +615,7 @@ impl MetadataStore {
             let mut paths = Vec::new();
             for item in table.range::<&str>(..)? {
                 let (k, v) = item?;
-                let m = match bincode::deserialize::<FileMetadata>(v.value()) {
+                let m = match dfs_common::deserialize_file_metadata(v.value()) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -654,7 +654,7 @@ impl MetadataStore {
             let mut stale = Vec::new();
             for item in table.range::<&str>(..)? {
                 let (k, v) = item?;
-                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                     if !live_ids.contains(&m.id) {
                         stale.push(k.value().to_string());
                     }
@@ -706,7 +706,7 @@ impl MetadataStore {
             let relative = &path[dir_path.len()..];
             // Direct child: no slash, or a lone trailing slash (directory entry).
             if !relative.is_empty() && (!relative.contains('/') || relative.ends_with('/')) {
-                match bincode::deserialize::<FileMetadata>(v.value()) {
+                match dfs_common::deserialize_file_metadata(v.value()) {
                     Ok(m) => files.push(m),
                     Err(_) => warn!("list_directory: could not deserialize path index for {}", path),
                 }
@@ -1121,7 +1121,7 @@ impl MetadataStore {
         let mut live = std::collections::HashSet::new();
         for item in table.range::<&str>(..)? {
             let (_, v) = item?;
-            if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+            if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                 for loc in m.chunk_locations.iter() {
                     live.insert(loc.chunk_id);
                 }
@@ -1141,7 +1141,7 @@ impl MetadataStore {
             let mut missing = Vec::new();
             for item in file_table.range::<&str>(..)? {
                 let (_, v) = item?;
-                let m = match bincode::deserialize::<FileMetadata>(v.value()) {
+                let m = match dfs_common::deserialize_file_metadata(v.value()) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -1347,7 +1347,7 @@ impl MetadataStore {
             let key_str = k.value();
             let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
             let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
-            match bincode::deserialize::<FileMetadata>(v.value()) {
+            match dfs_common::deserialize_file_metadata(v.value()) {
                 Ok(m) => items.push((seq, m)),
                 Err(e) => warn!("meta_queue: failed to deserialize entry {}: {}", key_str, e),
             }
@@ -1374,7 +1374,7 @@ impl MetadataStore {
                 if key_str > up_to_key.as_str() {
                     break;
                 }
-                let idx_key = bincode::deserialize::<FileMetadata>(v.value())
+                let idx_key = dfs_common::deserialize_file_metadata(v.value())
                     .ok()
                     .map(|m| format!("{}:{}", node_hex, m.id.0.as_simple()));
                 items.push((key_str.to_string(), idx_key));
@@ -1434,7 +1434,7 @@ impl MetadataStore {
                 let key_str = k.value();
                 let seq_hex = key_str.split(':').nth(1).unwrap_or("0");
                 let seq = u64::from_str_radix(seq_hex, 16).unwrap_or(0);
-                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                     result.push((key_str.to_string(), seq, m.id));
                 }
             }
@@ -1510,7 +1510,7 @@ impl MetadataStore {
         let mut out = Vec::new();
         for item in table.range::<&str>(..)? {
             let (_, v) = item?;
-            if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+            if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                 out.push((m.id, m.write_seq));
             }
         }
@@ -1526,7 +1526,7 @@ impl MetadataStore {
         for id in ids {
             let key = format!("{}", id);
             if let Some(v) = table.get(key.as_str())? {
-                if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                     out.push(m);
                 }
             }
@@ -1545,7 +1545,7 @@ impl MetadataStore {
         let mut count = 0usize;
         for item in table.range::<&str>(..)? {
             let (_, v) = item?;
-            if let Ok(m) = bincode::deserialize::<FileMetadata>(v.value()) {
+            if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                 f(m)?;
                 count += 1;
             }

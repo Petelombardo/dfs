@@ -272,6 +272,13 @@ pub struct FileMetadata {
     /// dropped. 0 means unsequenced (no ordering enforcement).
     #[serde(default)]
     pub write_seq: u64,
+
+    /// Target path for a symlink (only set when file_type == Symlink). Stored inline
+    /// in metadata rather than as chunk data — symlink targets are always short, so
+    /// this avoids allocating/replicating a chunk just to hold a few bytes of text.
+    /// None for non-symlinks and for records written before this field existed.
+    #[serde(default)]
+    pub symlink_target: Option<String>,
 }
 
 impl FileMetadata {
@@ -289,6 +296,7 @@ impl FileMetadata {
             file_type,
             chunk_locations: Arc::new(Vec::new()),
             write_seq: 0,
+            symlink_target: None,
         }
     }
 
@@ -321,6 +329,65 @@ impl FileMetadata {
             .binary_search_by(|l| l.file_offset.unwrap_or(u64::MAX).cmp(&target_offset))
             .ok()?;
         Some(&mut Arc::make_mut(&mut self.chunk_locations)[pos])
+    }
+}
+
+/// Pre-`symlink_target` on-disk shape of [`FileMetadata`]. bincode is a positional,
+/// non-self-describing format: unlike JSON, `#[serde(default)]` cannot rescue a
+/// struct deserialize when the trailing field's bytes simply aren't in the buffer —
+/// it errors with `UnexpectedEof` instead of substituting the default (confirmed by
+/// reproduction: staging's entire FILE_TABLE became undeserializable, reported as
+/// "Total Files: 0", the moment `symlink_target` was added without this fallback).
+/// Every FileMetadata record written before that field existed hits exactly this.
+/// This struct must never be changed to track FileMetadata — it's a frozen fixture
+/// that `deserialize_file_metadata` falls back to, not a schema to keep in sync.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct FileMetadataLegacyV0 {
+    id: FileId,
+    path: String,
+    size: u64,
+    created_at: u64,
+    modified_at: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    file_type: FileType,
+    chunk_locations: Arc<Vec<ChunkLocation>>,
+    write_seq: u64,
+}
+
+impl From<FileMetadataLegacyV0> for FileMetadata {
+    fn from(v: FileMetadataLegacyV0) -> Self {
+        FileMetadata {
+            id: v.id,
+            path: v.path,
+            size: v.size,
+            created_at: v.created_at,
+            modified_at: v.modified_at,
+            mode: v.mode,
+            uid: v.uid,
+            gid: v.gid,
+            file_type: v.file_type,
+            chunk_locations: v.chunk_locations,
+            write_seq: v.write_seq,
+            symlink_target: None,
+        }
+    }
+}
+
+/// Deserialize a bincode-encoded FileMetadata, tolerating records written before any
+/// field appended after `write_seq` existed (see `FileMetadataLegacyV0`). Every read
+/// of a stored FileMetadata blob (FILE_TABLE, PATH_TABLE, dissemination queue, etc.)
+/// must go through this rather than calling `bincode::deserialize` directly — that
+/// bypass is exactly what broke staging (see FileMetadataLegacyV0's doc comment).
+/// Any future field added to FileMetadata needs the same treatment: add it to this
+/// function's fallback chain (deserialize current shape, then try each prior legacy
+/// shape in turn) rather than assuming `#[serde(default)]` alone is enough.
+pub fn deserialize_file_metadata(bytes: &[u8]) -> bincode::Result<FileMetadata> {
+    match bincode::deserialize::<FileMetadata>(bytes) {
+        Ok(m) => Ok(m),
+        Err(_) => bincode::deserialize::<FileMetadataLegacyV0>(bytes).map(Into::into),
     }
 }
 
@@ -423,5 +490,48 @@ mod tests {
         assert_eq!(meta.path, "/test.txt");
         assert_eq!(meta.size, 0);
         assert_eq!(meta.file_type, FileType::RegularFile);
+    }
+
+    // Regression test for the 2026-07-06 staging incident: adding symlink_target with
+    // only #[serde(default)] silently broke every pre-existing FILE_TABLE record
+    // (bincode::deserialize::<FileMetadata> errored with UnexpectedEof instead of
+    // defaulting the field), which made the whole cluster report 0 files. This
+    // constructs bytes shaped like a record written before symlink_target existed
+    // (via FileMetadataLegacyV0 directly, not FileMetadata::new(), so this test still
+    // catches a regression even if a future field is added the same wrong way) and
+    // verifies deserialize_file_metadata() still reads it correctly.
+    #[test]
+    fn test_deserialize_file_metadata_reads_legacy_pre_symlink_target_records() {
+        let legacy = FileMetadataLegacyV0 {
+            id: FileId::new(),
+            path: "/podman".to_string(),
+            size: 4096,
+            created_at: 1_700_000_000,
+            modified_at: 1_700_000_001,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            file_type: FileType::Directory,
+            chunk_locations: Arc::new(Vec::new()),
+            write_seq: 3,
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+
+        // The raw bincode call this test guards against — must fail on legacy bytes,
+        // confirming this test would have caught the incident.
+        assert!(bincode::deserialize::<FileMetadata>(&bytes).is_err());
+
+        let recovered = deserialize_file_metadata(&bytes).expect("must recover legacy record");
+        assert_eq!(recovered.path, "/podman");
+        assert_eq!(recovered.size, 4096);
+        assert_eq!(recovered.write_seq, 3);
+        assert_eq!(recovered.symlink_target, None);
+
+        // Current-shape records must still round-trip normally.
+        let mut fresh = FileMetadata::new("/t47_link.txt".to_string(), FileType::Symlink);
+        fresh.symlink_target = Some("t47_target.txt".to_string());
+        let fresh_bytes = bincode::serialize(&fresh).unwrap();
+        let fresh_recovered = deserialize_file_metadata(&fresh_bytes).unwrap();
+        assert_eq!(fresh_recovered.symlink_target, Some("t47_target.txt".to_string()));
     }
 }

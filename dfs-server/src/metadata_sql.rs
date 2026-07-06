@@ -226,6 +226,7 @@ impl SqlMetadataStore {
             file_type,
             chunk_locations: Arc::new(chunk_locations),
             write_seq: 0,
+            symlink_target: None,
         }))
     }
 
@@ -349,6 +350,7 @@ impl SqlMetadataStore {
                         gid: 0,
                         file_type: dfs_common::FileType::Directory,
                         write_seq: 0,
+                        symlink_target: None,
                     });
                 }
             } else {

@@ -7711,6 +7711,7 @@ mod tests {
                 client_write_seq: None,
                 file_id: None,
             }]),
+            symlink_target: None,
         };
         server.metadata.put_file(&file_meta).unwrap();
 
@@ -7798,6 +7799,7 @@ mod tests {
             modified_at: 0,
             write_seq: 1,
             chunk_locations: Arc::new(locations.clone()),
+            symlink_target: None,
         };
         server.metadata.put_file(&file_meta).unwrap();
 
@@ -7858,6 +7860,7 @@ mod tests {
             modified_at: 0,
             write_seq: 1,
             chunk_locations: Arc::new(old_locations),
+            symlink_target: None,
         };
         server.metadata.put_file(&file_meta).unwrap();
 
@@ -7944,6 +7947,7 @@ mod tests {
                 chunk_id, nodes: vec![node_a], size: 4096, checksum: hash,
                 file_offset: Some(0), written_at: None, client_write_seq: None, file_id: None,
             }]),
+            symlink_target: None,
         };
         server.metadata.put_file(&file_meta).unwrap();
         // No existing CHUNK_TABLE record — both occurrences below start under RF=3.

@@ -130,6 +130,63 @@ GOT=$(cat "$MOUNT/t5.txt")
 [ "$GOT" = "v2" ] && check "T5 delete+recreate" PASS || check "T5 delete+recreate (got: $GOT)" FAIL
 fi # should_run T5
 
+# ── Test 47: symlink create/readlink/read-through + healer safety ────────────
+# Placed early (despite the T47 number, assigned in creation order like T19/T20's
+# out-of-order placement) so the symlink stays alive for every later healer-trigger
+# test in this file (T25c, T25d, T38, T45, ...) — each one becomes an incidental
+# regression check that the healer still leaves a chunk-less symlink alone.
+snapshot_log T47
+if should_run T47; then
+echo "=== T47: symlink create, readlink, read-through, and healer safety ==="
+echo "symlink target content" > "$MOUNT/t47_target.txt"
+
+T47_OK=PASS
+
+# Relative symlink, same shape as the original repro: ln -s test1.img test18.img
+ln -s t47_target.txt "$MOUNT/t47_link.txt" || T47_OK=FAIL
+dfs_sync
+
+T47_READLINK=$(readlink "$MOUNT/t47_link.txt" 2>/dev/null)
+[ "$T47_READLINK" = "t47_target.txt" ] || T47_OK=FAIL
+
+# Must report as a symlink, not a regular file, in both directory listing and stat.
+[ -L "$MOUNT/t47_link.txt" ] || T47_OK=FAIL
+
+T47_VIA_LINK=$(cat "$MOUNT/t47_link.txt" 2>/dev/null)
+[ "$T47_VIA_LINK" = "symlink target content" ] || T47_OK=FAIL
+
+check "T47a symlink create/readlink/read-through" "$T47_OK"
+
+# Trigger the healer twice (same pattern as T25c/T25d) — a symlink has zero chunks,
+# so a correct healer must leave it alone entirely: not delete it as an orphan (it
+# has nothing in chunk_map to confirm-live), and not try to repair/replicate chunks
+# that don't exist for it.
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
+sleep 5
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
+sleep 5
+
+T47_POST_HEAL_OK=PASS
+[ -L "$MOUNT/t47_link.txt" ] || T47_POST_HEAL_OK=FAIL
+T47_POST_READLINK=$(readlink "$MOUNT/t47_link.txt" 2>/dev/null)
+[ "$T47_POST_READLINK" = "t47_target.txt" ] || T47_POST_HEAL_OK=FAIL
+T47_POST_VIA_LINK=$(cat "$MOUNT/t47_link.txt" 2>/dev/null)
+[ "$T47_POST_VIA_LINK" = "symlink target content" ] || T47_POST_HEAL_OK=FAIL
+[ -f "$MOUNT/t47_target.txt" ] || T47_POST_HEAL_OK=FAIL
+
+check "T47b symlink and target survive healer cycles unmodified (not eaten, not falsely healed)" "$T47_POST_HEAL_OK"
+
+# unlink(symlink) must remove only the link, never the target it points to.
+rm "$MOUNT/t47_link.txt"
+sleep 0.3
+T47_UNLINK_OK=PASS
+[ ! -e "$MOUNT/t47_link.txt" ] || T47_UNLINK_OK=FAIL
+[ -f "$MOUNT/t47_target.txt" ] || T47_UNLINK_OK=FAIL
+T47_TARGET_STILL=$(cat "$MOUNT/t47_target.txt" 2>/dev/null)
+[ "$T47_TARGET_STILL" = "symlink target content" ] || T47_UNLINK_OK=FAIL
+check "T47c unlinking symlink leaves target intact" "$T47_UNLINK_OK"
+fi # should_run T47
+
 # ── Test 6: selective delete ──────────────────────────────────────────────────
 snapshot_log T6
 if should_run T6; then

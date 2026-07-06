@@ -489,6 +489,23 @@ impl MetadataStore {
         }
     }
 
+    /// Test-only: write unparseable bytes directly under a file_id key, bypassing
+    /// put_file's normal serialization. Used to reproduce a genuine get_file() Err
+    /// (as opposed to Ok(None)), which no amount of legitimate FileMetadata data can
+    /// trigger — see the 2026-07-06 healing.rs regression test this supports.
+    #[cfg(test)]
+    pub(crate) fn put_raw_file_bytes(&self, file_id: &FileId, bytes: &[u8]) -> Result<()> {
+        let key = format!("{}", file_id);
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_write()?;
+        {
+            let mut file_table = txn.open_table(FILE_TABLE)?;
+            file_table.insert(key.as_str(), bytes)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Async wrapper for get_file — see get_chunk_location_async for why the sync
     /// version must never be called directly from async request-handling code.
     pub async fn get_file_async(self: &Arc<Self>, file_id: FileId) -> Result<Option<FileMetadata>> {

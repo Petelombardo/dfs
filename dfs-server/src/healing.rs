@@ -628,6 +628,49 @@ impl HealingManager {
         Self::clear_pending_static(&self.pending_healing, &self.metadata, chunk_id).await;
     }
 
+    /// Classify a chunk_id that has 0 accessible replicas: is it safe to purge
+    /// (superseded by a newer write at the same file position, or its file no
+    /// longer exists) or is it a genuine, permanent loss? Returns:
+    ///   Some(true)  — superseded/orphaned, safe to purge (not DATA LOSS)
+    ///   Some(false) — still the live chunk for this file position, genuine DATA LOSS
+    ///   None        — metadata read failed, cannot confirm either way
+    ///
+    /// The None case must NOT be collapsed into Some(false) by the caller. A
+    /// metadata read error here (e.g. the 2026-07-06 bincode-deserialization
+    /// incident, where every FILE_TABLE read failed cluster-wide) previously fell
+    /// into an `Err(_) => false` arm that still purged the chunk and logged it as
+    /// DATA LOSS — the "be conservative" comment on that arm didn't actually change
+    /// the outcome, since both branches purged unconditionally. Callers must skip
+    /// the purge entirely on None and let the chunk be re-evaluated next cycle.
+    fn classify_zero_replica_chunk(&self, chunk_id: ChunkId, location: &ChunkLocation) -> Option<bool> {
+        let (file_id, file_offset) = match (location.file_id, location.file_offset) {
+            (Some(file_id), Some(file_offset)) => (file_id, file_offset),
+            // No file context to cross-check against — treat as not superseded,
+            // same as before this was extracted into its own method.
+            _ => return Some(false),
+        };
+        match self.metadata.get_file(&file_id) {
+            Ok(Some(file_meta)) => {
+                // If the active chunk at this file position is a different
+                // chunk_id, we were patched away — this is not data loss.
+                let current = file_meta.chunk_locations.iter()
+                    .find(|loc| loc.file_offset == Some(file_offset));
+                Some(match current {
+                    Some(cur) => cur.chunk_id != chunk_id,
+                    None => true, // position removed — chunk is orphaned
+                })
+            }
+            Ok(None) => Some(true), // file deleted — chunk is orphaned
+            Err(e) => {
+                warn!(
+                    "Chunk {} has 0 accessible replicas but reading metadata for file {} failed ({}) — cannot confirm superseded-vs-lost, deferring purge decision to next cycle",
+                    chunk_id, file_id, e
+                );
+                None
+            }
+        }
+    }
+
     /// Remove a batch of chunks from pending_healing — called when files are deleted
     /// so their chunks don't inflate the pending count indefinitely.
     pub async fn clear_pending_for_deleted_chunks(&self, chunk_ids: &[ChunkId]) {
@@ -1726,43 +1769,28 @@ impl HealingManager {
                         );
                     } else {
                         // Before declaring DATA LOSS, check whether this chunk_id was
-                        // superseded by a newer write. PatchChunk renames old→new on disk,
-                        // so the old chunk_id's file is gone from every node — but the data
-                        // still exists under the new chunk_id. A superseded chunk appearing
-                        // to have 0 replicas is expected cleanup, not data loss.
-                        let is_superseded = if let (Some(file_id), Some(file_offset)) = (location.file_id, location.file_offset) {
-                            match self.metadata.get_file(&file_id) {
-                                Ok(Some(file_meta)) => {
-                                    // If the active chunk at this file position is a different
-                                    // chunk_id, we were patched away — this is not data loss.
-                                    let current = file_meta.chunk_locations.iter()
-                                        .find(|loc| loc.file_offset == Some(file_offset));
-                                    match current {
-                                        Some(cur) => cur.chunk_id != chunk_id,
-                                        None => true, // position removed — chunk is orphaned
-                                    }
-                                }
-                                Ok(None) => true, // file deleted — chunk is orphaned
-                                Err(_) => false,  // metadata error — be conservative
+                        // superseded by a newer write, or genuinely unrecoverable, or
+                        // unknown (metadata read failed — must not purge, see
+                        // classify_zero_replica_chunk's doc comment).
+                        if let Some(is_superseded) = self.classify_zero_replica_chunk(chunk_id, &location) {
+                            if is_superseded {
+                                debug!(
+                                    "Chunk {} has 0 replicas but was superseded by a newer write at the same file position — purging stale metadata (not DATA LOSS)",
+                                    chunk_id
+                                );
+                            } else {
+                                warn!(
+                                    "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
+                                    chunk_id, location.nodes.len()
+                                );
                             }
-                        } else {
-                            false
-                        };
-
-                        if is_superseded {
-                            debug!(
-                                "Chunk {} has 0 replicas but was superseded by a newer write at the same file position — purging stale metadata (not DATA LOSS)",
-                                chunk_id
-                            );
-                        } else {
-                            warn!(
-                                "DATA LOSS: Chunk {} is permanently unrecoverable ({} metadata nodes, all confirmed empty) — purging stale metadata",
-                                chunk_id, location.nodes.len()
-                            );
+                            db_deletes.push(chunk_id);
+                            self.clear_pending(&chunk_id).await;
+                            continue;
                         }
-                        db_deletes.push(chunk_id);
-                        self.clear_pending(&chunk_id).await;
-                        continue;
+                        // None: metadata read failed, already logged inside
+                        // classify_zero_replica_chunk. Don't purge — fall through to
+                        // reconciliation below so this chunk is re-evaluated next cycle.
                     }
                 } else {
                     debug!(
@@ -3045,7 +3073,7 @@ mod tests {
     use crate::cluster::ClusterManager;
     use crate::metadata::MetadataStore;
     use crate::storage::ChunkStorage;
-    use dfs_common::compute_chunk_hash;
+    use dfs_common::{compute_chunk_hash, FileMetadata, FileType};
     use std::net::SocketAddr;
     use tempfile::TempDir;
 
@@ -3285,5 +3313,118 @@ mod tests {
             healing.run_disk_orphan_sweep().await;
         }
         assert!(storage.get_chunk_path(&chunk_id).exists(), "must never evict a candidate still inside the age grace");
+    }
+
+    /// Regression test for the 2026-07-06 incident: a metadata read error must defer
+    /// (None), never collapse into "not superseded" (Some(false)), which would still
+    /// purge the chunk and log it as DATA LOSS. This is exactly what happened when
+    /// FileMetadata::symlink_target was added without a bincode-compatible fallback —
+    /// every FILE_TABLE read failed cluster-wide, and the old `Err(_) => false` arm
+    /// caused this same function to purge live chunks' bookkeeping en masse.
+    #[tokio::test]
+    async fn test_classify_zero_replica_chunk_defers_on_metadata_read_error() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let file_id = FileId::new();
+        // Neither the current nor the legacy FileMetadata shape can deserialize this —
+        // forces a genuine get_file() Err, not Ok(None).
+        metadata.put_raw_file_bytes(&file_id, b"not a valid FileMetadata encoding").unwrap();
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"unreadable-metadata-chunk"));
+        let location = ChunkLocation {
+            chunk_id,
+            nodes: vec![],
+            size: 4096,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        };
+
+        assert_eq!(
+            healing.classify_zero_replica_chunk(chunk_id, &location),
+            None,
+            "a metadata read error must defer (None), never collapse into 'not superseded'"
+        );
+    }
+
+    /// A chunk_id whose file metadata now points at a *different* chunk_id at the
+    /// same file position was patched away — expected cleanup, not data loss.
+    #[tokio::test]
+    async fn test_classify_zero_replica_chunk_detects_superseded_chunk() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let old_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"old-content"));
+        let new_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"new-content"));
+
+        let mut file_meta = FileMetadata::new("/patched-file".to_string(), FileType::RegularFile);
+        let file_id = file_meta.id;
+        file_meta.chunk_locations = Arc::new(vec![ChunkLocation {
+            chunk_id: new_chunk_id,
+            nodes: vec![node_id],
+            size: 4096,
+            checksum: new_chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }]);
+        metadata.put_file(&file_meta).unwrap();
+
+        // location still points at the OLD (patched-away) chunk_id.
+        let old_location = ChunkLocation {
+            chunk_id: old_chunk_id,
+            nodes: vec![],
+            size: 4096,
+            checksum: old_chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        };
+
+        assert_eq!(
+            healing.classify_zero_replica_chunk(old_chunk_id, &old_location),
+            Some(true),
+            "file metadata now points at a different chunk at this offset — superseded, not data loss"
+        );
+    }
+
+    /// A chunk_id that is still exactly what the file's metadata references at this
+    /// offset, with 0 accessible replicas, is genuinely and permanently lost.
+    #[tokio::test]
+    async fn test_classify_zero_replica_chunk_detects_genuine_data_loss() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"still-the-live-chunk"));
+
+        let mut file_meta = FileMetadata::new("/lost-file".to_string(), FileType::RegularFile);
+        let file_id = file_meta.id;
+        file_meta.chunk_locations = Arc::new(vec![ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: 4096,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }]);
+        metadata.put_file(&file_meta).unwrap();
+
+        let location = file_meta.chunk_locations[0].clone();
+
+        assert_eq!(
+            healing.classify_zero_replica_chunk(chunk_id, &location),
+            Some(false),
+            "file metadata still points at this exact chunk_id — genuine, permanent data loss"
+        );
     }
 }

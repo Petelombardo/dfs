@@ -7,7 +7,7 @@ use redb::{Database, Durability, ReadableTable, TableDefinition};
 // only lost on kernel panic/power failure. Acceptable with 5-way replication.
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -126,6 +126,16 @@ pub struct MetadataStore {
     /// Counts Durability::None commits since the last Durability::Immediate one.
     /// See next_write_durability() for why this exists.
     non_durable_commits: AtomicU64,
+    /// FILE_TABLE keys (file_id strings) written or removed since the dirty set was
+    /// last drained. Populated by every FILE_TABLE mutator (put_file, delete_file,
+    /// remove_unlisted_files) immediately after a successful commit, while that
+    /// mutator still holds `db.read()` — see compact_db_with_budget's doc comment on
+    /// diff_all_tables_tracked for why that ordering makes this race-free against
+    /// Phase 3's exclusive lock. Drained (not just read) at the start of each
+    /// compaction catch-up pass so repeated passes only see genuinely new writes.
+    dirty_files: Mutex<std::collections::HashSet<String>>,
+    /// PATH_TABLE keys (path strings), same tracking discipline as dirty_files.
+    dirty_paths: Mutex<std::collections::HashSet<String>>,
 }
 
 impl MetadataStore {
@@ -223,7 +233,13 @@ impl MetadataStore {
 
         info!("Initialized redb metadata store at {:?}", db_path);
 
-        Ok(Self { db: RwLock::new(db), db_path, non_durable_commits: AtomicU64::new(0) })
+        Ok(Self {
+            db: RwLock::new(db),
+            db_path,
+            non_durable_commits: AtomicU64::new(0),
+            dirty_files: Mutex::new(std::collections::HashSet::new()),
+            dirty_paths: Mutex::new(std::collections::HashSet::new()),
+        })
     }
 
     /// Every Nth Durability::None write is instead committed with
@@ -354,20 +370,21 @@ impl MetadataStore {
         let mut path_table = txn.open_table(PATH_TABLE)?;
 
         // If a different file ID already exists at this path, remove the stale file record.
-        {
-            let old_id_str: Option<String> = match path_table.get(path_str)? {
-                Some(v) => dfs_common::deserialize_file_metadata(v.value())
-                    .ok()
-                    .filter(|m| m.id != metadata.id)
-                    .map(|m| format!("{}", m.id)),
-                None => None,
-            };
-            if let Some(old_id) = old_id_str {
-                if let Err(e) = file_table.remove(old_id.as_str()) {
-                    warn!("Failed to remove stale file record {} for path {}: {}", old_id, metadata.path, e);
-                } else {
-                    debug!("Removed stale file record {} superseded by {} at path {}", old_id, metadata.id, metadata.path);
-                }
+        // old_id_str is captured outside this block so it can be marked dirty after
+        // commit (see the dirty_files.insert calls below compact_db_with_budget's
+        // incremental catch-up passes rely on).
+        let old_id_str: Option<String> = match path_table.get(path_str)? {
+            Some(v) => dfs_common::deserialize_file_metadata(v.value())
+                .ok()
+                .filter(|m| m.id != metadata.id)
+                .map(|m| format!("{}", m.id)),
+            None => None,
+        };
+        if let Some(old_id) = &old_id_str {
+            if let Err(e) = file_table.remove(old_id.as_str()) {
+                warn!("Failed to remove stale file record {} for path {}: {}", old_id, metadata.path, e);
+            } else {
+                debug!("Removed stale file record {} superseded by {} at path {}", old_id, metadata.id, metadata.path);
             }
         }
 
@@ -463,6 +480,16 @@ impl MetadataStore {
         drop(path_table);
         txn.commit()?;
 
+        // Mark touched keys dirty for compact_db_with_budget's incremental catch-up —
+        // must happen while `_db` (the read guard) is still held, so Phase 3's
+        // exclusive db.write() lock acts as a barrier: it cannot succeed until this
+        // line has already run for every write that started before it.
+        self.dirty_files.lock().unwrap().insert(file_id_str.clone());
+        self.dirty_paths.lock().unwrap().insert(path_str.to_string());
+        if let Some(old_id) = &old_id_str {
+            self.dirty_files.lock().unwrap().insert(old_id.clone());
+        }
+
         debug!("Stored metadata for file: {} ({})", metadata_to_store.path, metadata_to_store.id);
         Ok(PutFileResult::Stored)
     }
@@ -530,6 +557,7 @@ impl MetadataStore {
     /// Delete file metadata (removes both file and path index entries).
     pub fn delete_file(&self, file_id: &FileId) -> Result<()> {
         let file_id_str = format!("{}", file_id);
+        let mut removed_path: Option<String> = None;
         let _db = self.db.read().unwrap();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
@@ -541,11 +569,19 @@ impl MetadataStore {
             if let Some(v) = file_table.get(file_id_str.as_str())? {
                 if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
                     path_table.remove(m.path.as_str())?;
+                    removed_path = Some(m.path);
                 }
             }
             file_table.remove(file_id_str.as_str())?;
         }
         txn.commit()?;
+
+        // See put_file's matching comment: must happen while `_db` is still held.
+        self.dirty_files.lock().unwrap().insert(file_id_str.clone());
+        if let Some(path) = &removed_path {
+            self.dirty_paths.lock().unwrap().insert(path.clone());
+        }
+
         debug!("Deleted metadata for file: {}", file_id);
         Ok(())
     }
@@ -560,6 +596,10 @@ impl MetadataStore {
             table.remove(path)?;
         }
         txn.commit()?;
+
+        // See put_file's matching comment: must happen while `_db` is still held.
+        self.dirty_paths.lock().unwrap().insert(path.to_string());
+
         debug!("Deleted path index for: {}", path);
         Ok(())
     }
@@ -660,6 +700,16 @@ impl MetadataStore {
                 }
             }
             txn.commit()?;
+
+            // See put_file's matching comment: must happen while `_db` is still held.
+            {
+                let mut dirty_files = self.dirty_files.lock().unwrap();
+                dirty_files.extend(stale_file_ids.iter().cloned());
+            }
+            {
+                let mut dirty_paths = self.dirty_paths.lock().unwrap();
+                dirty_paths.extend(stale_file_paths.iter().cloned());
+            }
         }
 
         // Also sweep path entries independently — a path entry can exist without
@@ -693,6 +743,10 @@ impl MetadataStore {
                 }
             }
             txn.commit()?;
+
+            // See put_file's matching comment: must happen while `_db` is still held.
+            let mut dirty_paths = self.dirty_paths.lock().unwrap();
+            dirty_paths.extend(stale_path_keys.iter().cloned());
         }
 
         if removed > 0 {
@@ -1650,6 +1704,14 @@ impl MetadataStore {
     const U64_TABLES: [TableDefinition<'static, &'static str, u64>; 3] =
         [COUNTERS_TABLE, PENDING_HEALING_TABLE, CHUNK_REFCOUNT_TABLE];
 
+    /// BYTES_TABLES minus FILE_TABLE/PATH_TABLE — the tables diff_all_tables_tracked
+    /// still diffs via a full scan, since only FILE_TABLE/PATH_TABLE have dirty-key
+    /// tracking (see dirty_files/dirty_paths). Individually much smaller per-row than
+    /// full serialized FileMetadata blobs, so their O(size) cost isn't the bottleneck.
+    const OTHER_BYTES_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 5] = [
+        CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX, DELETE_QUEUE_TABLE, CHUNK_PATCH_JOURNAL_TABLE,
+    ];
+
     /// Copy every row of `def` from `src` into `dst`, overwriting whatever's there.
     /// Used for compact_db()'s initial full snapshot copy.
     fn copy_bytes_table(
@@ -1783,9 +1845,82 @@ impl MetadataStore {
         Ok(())
     }
 
-    fn diff_all_tables(src: &redb::ReadTransaction, dst: &redb::WriteTransaction) -> Result<usize> {
+    /// Reconcile `dst`'s copy of `def` against `src`'s current contents, but only for
+    /// the given `keys` — the incremental counterpart to diff_bytes_table, used for
+    /// FILE_TABLE/PATH_TABLE whose dirty keys are tracked as writes happen (see
+    /// dirty_files/dirty_paths) instead of requiring a full-table scan to find what
+    /// changed. A key present in `keys` but missing from `src` means it was deleted
+    /// since the last pass — removed from `dst` too. Returns the number of rows
+    /// actually changed (not just checked).
+    fn diff_bytes_table_by_keys(
+        src: &redb::ReadTransaction,
+        dst: &redb::WriteTransaction,
+        def: TableDefinition<&str, &[u8]>,
+        keys: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let src_table = match src.open_table(def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut dst_table = dst.open_table(def)?;
         let mut changed = 0usize;
-        for def in Self::BYTES_TABLES { changed += Self::diff_bytes_table(src, dst, def)?; }
+        for key in keys {
+            match src_table.get(key.as_str())? {
+                Some(v) => {
+                    let needs_update = match dst_table.get(key.as_str())? {
+                        Some(existing) => existing.value() != v.value(),
+                        None => true,
+                    };
+                    if needs_update {
+                        dst_table.insert(key.as_str(), v.value())?;
+                        changed += 1;
+                    }
+                }
+                None => {
+                    // No longer in the live table (deleted) — remove from shadow too.
+                    if dst_table.get(key.as_str())?.is_some() {
+                        dst_table.remove(key.as_str())?;
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Same as the old diff_all_tables, but FILE_TABLE/PATH_TABLE go through the
+    /// dirty-key-tracked incremental path (O(recent writes), not O(table size)) while
+    /// every other table still uses the full-scan diff_bytes_table/diff_u64_table —
+    /// see OTHER_BYTES_TABLES's doc comment for why that's an acceptable tradeoff.
+    ///
+    /// Fixes the 2026-07-06 T44 finding: diff_bytes_table's full-table scan meant
+    /// Phase 3's exclusive lock was held for however long it took to re-scan the
+    /// *entire* live table on every compaction, regardless of how few rows had
+    /// actually changed — "convergence" tracked the change *count*, never the scan
+    /// *cost*, so a 50MB table cost ~1.1s under the exclusive lock even when nearly
+    /// nothing had changed since the last pass. FILE_TABLE/PATH_TABLE are the
+    /// dominant contributors to that size (full serialized FileMetadata blobs,
+    /// duplicated across both tables), so tracking just those two turns their part of
+    /// Phase 3's cost into O(writes since the last pass).
+    ///
+    /// Drains (not just reads) the dirty sets each call — see dirty_files's field doc
+    /// comment for why doing this while holding `db`'s exclusive lock (Phase 3) or a
+    /// shared lock started before this snapshot (Phase 2) is race-free against
+    /// concurrent writers: every writer marks its keys dirty before releasing its own
+    /// `db.read()` guard, so nothing committed-but-unmarked can exist by the time this
+    /// runs under Phase 3's exclusive `db.write()`.
+    fn diff_all_tables_tracked(&self, src: &redb::ReadTransaction, dst: &redb::WriteTransaction) -> Result<usize> {
+        let dirty_file_keys = std::mem::take(&mut *self.dirty_files.lock().unwrap());
+        let dirty_path_keys = std::mem::take(&mut *self.dirty_paths.lock().unwrap());
+
+        let mut changed = 0usize;
+        changed += Self::diff_bytes_table_by_keys(src, dst, FILE_TABLE, &dirty_file_keys)?;
+        changed += Self::diff_bytes_table_by_keys(src, dst, PATH_TABLE, &dirty_path_keys)?;
+        for def in Self::OTHER_BYTES_TABLES { changed += Self::diff_bytes_table(src, dst, def)?; }
         for def in Self::U64_TABLES { changed += Self::diff_u64_table(src, dst, def)?; }
         Ok(changed)
     }
@@ -1839,6 +1974,15 @@ impl MetadataStore {
             .create(&shadow_path)
             .map_err(|e| anyhow::anyhow!("compact: failed to create shadow db: {}", e))?;
 
+        // Establish the dirty-tracking baseline before Phase 1's snapshot: any write
+        // that commits after this point marks itself dirty (see dirty_files's field
+        // doc comment), so Phase 2/3's incremental catch-up will see it regardless of
+        // whether it landed before or after Phase 1's own read snapshot — being marked
+        // dirty for a key Phase 1 already copied is harmless (just a redundant re-copy
+        // next pass), it's only a miss in the other direction that would lose data.
+        self.dirty_files.lock().unwrap().clear();
+        self.dirty_paths.lock().unwrap().clear();
+
         // Phase 1: full copy, holding only the shared lock.
         {
             let live = self.db.read().unwrap();
@@ -1863,7 +2007,7 @@ impl MetadataStore {
             let live = self.db.read().unwrap();
             let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase2 begin_read: {}", e))?;
             let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase2 begin_write: {}", e))?;
-            let changed = Self::diff_all_tables(&src_txn, &dst_txn)?;
+            let changed = self.diff_all_tables_tracked(&src_txn, &dst_txn)?;
             dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase2 commit: {}", e))?;
             if changed <= convergence_threshold {
                 converged = true;
@@ -1893,7 +2037,7 @@ impl MetadataStore {
             {
                 let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase3 begin_read: {}", e))?;
                 let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase3 begin_write: {}", e))?;
-                Self::diff_all_tables(&src_txn, &dst_txn)?;
+                self.diff_all_tables_tracked(&src_txn, &dst_txn)?;
                 dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase3 commit: {}", e))?;
             }
             drop(shadow_db);
@@ -2249,6 +2393,80 @@ mod tests {
         let retrieved = store.get_chunk_location(&chunk_id).unwrap().unwrap();
         assert_eq!(retrieved.nodes.len(), 2);
         assert_eq!(retrieved.size, 4096);
+    }
+
+    /// Regression test for the 2026-07-06 T44 finding: diff_bytes_table's full-table
+    /// scan meant every compaction catch-up pass cost O(live table size), not O(what
+    /// actually changed) — "convergence" tracked the change count, never the scan
+    /// cost, so a real run's ~50MB table held Phase 3's exclusive lock for ~1.1s even
+    /// though almost nothing had changed since the prior pass. diff_all_tables_tracked
+    /// fixes this for FILE_TABLE/PATH_TABLE via dirty-key tracking: seed a table large
+    /// enough that a full scan would be measurably slow, mark only a handful of keys
+    /// dirty, and confirm the tracked diff pass stays fast and reports only those keys
+    /// as changed (not all seeded rows).
+    #[test]
+    fn test_diff_all_tables_tracked_is_fast_regardless_of_table_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        const SEED_COUNT: usize = 5_000;
+        for i in 0..SEED_COUNT {
+            let mut m = FileMetadata::new(format!("/seed_{}", i), FileType::RegularFile);
+            m.size = i as u64;
+            store.put_file(&m).unwrap();
+        }
+
+        let shadow_dir = TempDir::new().unwrap();
+        let shadow_db = Database::builder()
+            .create(shadow_dir.path().join("shadow.redb"))
+            .unwrap();
+
+        // Mirror Phase 1: a full copy so the shadow starts in sync with everything
+        // seeded above — otherwise a diff pass against an empty shadow reports every
+        // row as "changed" regardless of code path, which would hide the actual bug
+        // (full-table-scan *cost* even when the *count* of real changes is tiny).
+        {
+            let live = store.db.read().unwrap();
+            let src_txn = live.begin_read().unwrap();
+            let dst_txn = shadow_db.begin_write().unwrap();
+            MetadataStore::copy_all_tables(&src_txn, &dst_txn).unwrap();
+            dst_txn.commit().unwrap();
+        }
+
+        // Simulate "Phase 2 has already converged, this is one more catch-up pass" —
+        // only the writes below should register as dirty for it.
+        store.dirty_files.lock().unwrap().clear();
+        store.dirty_paths.lock().unwrap().clear();
+
+        const NEW_COUNT: usize = 5;
+        for i in 0..NEW_COUNT {
+            let mut m = FileMetadata::new(format!("/fresh_{}", i), FileType::RegularFile);
+            m.size = 999;
+            store.put_file(&m).unwrap();
+        }
+
+        let live = store.db.read().unwrap();
+        let src_txn = live.begin_read().unwrap();
+        let dst_txn = shadow_db.begin_write().unwrap();
+
+        let start = std::time::Instant::now();
+        let changed = store.diff_all_tables_tracked(&src_txn, &dst_txn).unwrap();
+        let elapsed = start.elapsed();
+
+        dst_txn.commit().unwrap();
+
+        // Each fresh file touches both FILE_TABLE and PATH_TABLE.
+        assert_eq!(
+            changed, NEW_COUNT * 2,
+            "only the {} fresh writes (x2 tables) should be reported as changed, not all {} seeded rows",
+            NEW_COUNT, SEED_COUNT
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "diff_all_tables_tracked took {:?} for {} dirty keys against a {}-row table \
+             — should be near-instant, not scale with table size",
+            elapsed, NEW_COUNT, SEED_COUNT
+        );
     }
 
     #[test]

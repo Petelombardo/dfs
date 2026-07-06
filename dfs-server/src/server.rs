@@ -2501,11 +2501,30 @@ impl Server {
     /// cluster-wide coordination. The caller decides whose answer to trust (normally
     /// the leader, as the most caught-up replica); this handler just reports the
     /// truth as this node currently sees it.
+    ///
+    /// Must union FILE_TABLE's live_chunk_ids() with chunk_map, same as
+    /// run_disk_orphan_sweep does for its own local candidate selection: FILE_TABLE
+    /// only refreshes on a full PutFileMetadata, so a long-lived, repeatedly
+    /// in-place-patched file (e.g. a mounted qcow2 disk) can have a current chunk_id
+    /// missing from it for an unbounded amount of time, while chunk_map is kept
+    /// synchronously fresh by every patch/replicate-location handler. A caller of
+    /// this RPC (HealingManager::authorize_live_file_orphan_deletes) trusts a "not
+    /// live" answer enough to physically delete its only copy of the chunk — so
+    /// checking FILE_TABLE alone here, while run_disk_orphan_sweep checks both, is a
+    /// real data-loss bug, not just an inconsistency (2026-07-06 staging incident:
+    /// this exact gap let two untouched nodes delete live VM-disk chunks within
+    /// seconds of an unrelated node rejoining the cluster).
     async fn handle_confirm_chunks_live(&self, chunk_ids: Vec<ChunkId>) -> Response {
         let metadata = self.metadata.clone();
         let result = tokio::task::spawn_blocking(move || metadata.live_chunk_ids()).await;
         match result {
-            Ok(Ok(live_set)) => {
+            Ok(Ok(mut live_set)) => {
+                for entry in self.chunk_map.iter() {
+                    let (locs, _) = entry.value();
+                    for loc in locs {
+                        live_set.insert(loc.chunk_id);
+                    }
+                }
                 let live: Vec<ChunkId> = chunk_ids.into_iter().filter(|id| live_set.contains(id)).collect();
                 Response::ChunkLiveness { live }
             }
@@ -7682,7 +7701,7 @@ mod tests {
             created_at: 0,
             modified_at: 0,
             write_seq: 1,
-            chunk_locations: vec![ChunkLocation {
+            chunk_locations: Arc::new(vec![ChunkLocation {
                 chunk_id,
                 nodes: vec![node_a, node_b, node_c],
                 size: 65536,
@@ -7691,7 +7710,7 @@ mod tests {
                 written_at: None,
                 client_write_seq: None,
                 file_id: None,
-            }],
+            }]),
         };
         server.metadata.put_file(&file_meta).unwrap();
 
@@ -7778,7 +7797,7 @@ mod tests {
             created_at: 0,
             modified_at: 0,
             write_seq: 1,
-            chunk_locations: locations.clone(),
+            chunk_locations: Arc::new(locations.clone()),
         };
         server.metadata.put_file(&file_meta).unwrap();
 
@@ -7838,7 +7857,7 @@ mod tests {
             created_at: 0,
             modified_at: 0,
             write_seq: 1,
-            chunk_locations: old_locations,
+            chunk_locations: Arc::new(old_locations),
         };
         server.metadata.put_file(&file_meta).unwrap();
 
@@ -7921,10 +7940,10 @@ mod tests {
             created_at: 0,
             modified_at: 0,
             write_seq: 1,
-            chunk_locations: vec![ChunkLocation {
+            chunk_locations: Arc::new(vec![ChunkLocation {
                 chunk_id, nodes: vec![node_a], size: 4096, checksum: hash,
                 file_offset: Some(0), written_at: None, client_write_seq: None, file_id: None,
-            }],
+            }]),
         };
         server.metadata.put_file(&file_meta).unwrap();
         // No existing CHUNK_TABLE record — both occurrences below start under RF=3.
@@ -7988,7 +8007,7 @@ mod tests {
         // First patch (simulates the VM's first COW write to this chunk): original -> gen1.
         let resp1 = server.handle_multi_patch(
             original_chunk_id, file_id, Some(0), chunk_file_offset,
-            vec![(0, vec![1u8; 100])], None, None,
+            vec![(0, vec![1u8; 100])], None, None, None,
         ).await;
         let gen1_id = match resp1 {
             Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
@@ -8004,7 +8023,7 @@ mod tests {
         // Second patch (the VM's next COW write to the same offset): gen1 -> gen2.
         let resp2 = server.handle_multi_patch(
             gen1_id, file_id, Some(0), chunk_file_offset,
-            vec![(0, vec![2u8; 100])], None, None,
+            vec![(0, vec![2u8; 100])], None, None, None,
         ).await;
         let gen2_id = match resp2 {
             Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
@@ -8175,6 +8194,67 @@ mod tests {
         assert_eq!(resolved.nodes, vec![node_a, node_b],
             "a fresher CHUNK_TABLE record with >1 nodes must win even when it has \
              fewer nodes than inline — that shrinkage is the whole point of pruning");
+    }
+
+    /// Repro for the 2026-07-06 staging incident: a chunk that is the CURRENT,
+    /// live content for an actively-patched file (e.g. a mounted qcow2 disk) but
+    /// hasn't been folded back into that file's persisted FILE_TABLE record yet
+    /// (deliberately deferred — see the comment on chunk_map_update_location_for_file's
+    /// caller in handle_replicate_chunk_location) must still be reported live by
+    /// ConfirmChunksLive. Followers trust this RPC's answer unconditionally before
+    /// physically deleting their only copy of a chunk (see
+    /// HealingManager::authorize_live_file_orphan_deletes), so a false "not live"
+    /// here is a direct data-loss bug, not a cosmetic one.
+    ///
+    /// run_disk_orphan_sweep's own local candidate selection already unions
+    /// live_chunk_ids() (FILE_TABLE) with live_chunk_ids_from_chunk_map() for exactly
+    /// this staleness gap. handle_confirm_chunks_live — the RPC a follower calls to
+    /// ask the leader the same question — never got that same union, so the leader
+    /// answers using only the stale FILE_TABLE view.
+    #[tokio::test]
+    async fn test_confirm_chunks_live_must_trust_chunk_map_not_just_file_table() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+
+        let file_id = dfs_common::FileId::new();
+        let hash = compute_chunk_hash(b"current post-patch chunk content");
+        let chunk_id = ChunkId::from_hash(hash);
+
+        // Simulate the state right after an in-place patch: chunk_map (the fresh
+        // source) knows this chunk is file_id's current content at offset 0, but
+        // FILE_TABLE was never rewritten to say so — no FileMetadata exists for
+        // file_id at all here, the extreme case of that staleness gap.
+        server.chunk_map.insert(file_id, (vec![ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: 33,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: Some(dfs_common::types::current_timestamp() * 1000),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        }], 1));
+
+        let response = server.handle_confirm_chunks_live(vec![chunk_id]).await;
+        let live = match response {
+            Response::ChunkLiveness { live } => live,
+            other => panic!("expected ChunkLiveness, got {:?}", other),
+        };
+
+        assert!(live.contains(&chunk_id),
+            "chunk_map says this chunk is file {}'s current live content — ConfirmChunksLive \
+             must not tell a follower it's safe to delete just because FILE_TABLE hasn't \
+             caught up yet", file_id);
     }
 }
 

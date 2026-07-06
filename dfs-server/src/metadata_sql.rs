@@ -381,7 +381,7 @@ mod tests {
         metadata.size = 8192;
 
         let chunk_id = ChunkId::from_hash([1u8; 32]);
-        metadata.chunk_locations.push(ChunkLocation {
+        metadata.chunk_locations = Arc::new(vec![ChunkLocation {
             chunk_id,
             nodes: vec![NodeId::new(), NodeId::new()],
             size: 4096,
@@ -390,7 +390,7 @@ mod tests {
             written_at: None,
             client_write_seq: None,
             file_id: Some(metadata.id),
-        });
+        }]);
 
         // Store and retrieve
         store.put_file_metadata(&metadata).unwrap();
@@ -412,29 +412,29 @@ mod tests {
 
         // Add chunks with gaps (sparse file)
         let node1 = NodeId::new();
-        metadata.chunk_locations.push(ChunkLocation {
-            chunk_id: ChunkId::from_hash([1u8; 32]),
-            nodes: vec![node1],
-            size: 4096,
-            checksum: [0u8; 32],
-            file_offset: Some(0),
-            written_at: None,
-            client_write_seq: None,
-            file_id: Some(metadata.id),
-        });
-
-        // Gap: bytes 4096-8191 (no chunk = hole)
-
-        metadata.chunk_locations.push(ChunkLocation {
-            chunk_id: ChunkId::from_hash([2u8; 32]),
-            nodes: vec![node1],
-            size: 4096,
-            checksum: [0u8; 32],
-            file_offset: Some(8192),
-            written_at: None,
-            client_write_seq: None,
-            file_id: Some(metadata.id),
-        });
+        metadata.chunk_locations = Arc::new(vec![
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash([1u8; 32]),
+                nodes: vec![node1],
+                size: 4096,
+                checksum: [0u8; 32],
+                file_offset: Some(0),
+                written_at: None,
+                client_write_seq: None,
+                file_id: Some(metadata.id),
+            },
+            // Gap: bytes 4096-8191 (no chunk = hole)
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash([2u8; 32]),
+                nodes: vec![node1],
+                size: 4096,
+                checksum: [0u8; 32],
+                file_offset: Some(8192),
+                written_at: None,
+                client_write_seq: None,
+                file_id: Some(metadata.id),
+            },
+        ]);
 
         store.put_file_metadata(&metadata).unwrap();
 

@@ -379,21 +379,21 @@ impl MetadataStore {
     /// pre-merge existing) plus any old file_id removed due to a path collision —
     /// the caller must mark both dirty after commit (see put_file's dirty-marking
     /// comment).
-    fn put_file_in_txn(
-        file_table: &mut redb::Table<&str, &[u8]>,
-        path_table: &mut redb::Table<&str, &[u8]>,
-        metadata: &FileMetadata,
-    ) -> Result<(PutFileResult, Option<String>)> {
-        let file_id_str = format!("{}", metadata.id);
-        let path_str = metadata.path.as_str();
-
-        // Merge chunk_locations with any existing same-ID record.
-        let existing_opt: Option<FileMetadata> = match file_table.get(file_id_str.as_str())? {
-            Some(v) => dfs_common::deserialize_file_metadata(v.value()).ok(),
-            None => None,
-        };
-
-        let merged_metadata: Option<FileMetadata>;
+    /// Pure per-write reconciliation: merges `incoming` against an optional
+    /// `existing` record with no I/O. Contains every rule `put_file_in_txn` used
+    /// to apply inline (staleness check, chunk_locations union, scalar-field
+    /// selection) — extracted so the batch-fold step in the sled_write_tx worker
+    /// (see server.rs) can fold several pending writes for the same file_id
+    /// in-memory, one call per fold step, using the exact same logic as the
+    /// redb-backed path instead of a second hand-written copy. Two independently
+    /// maintained copies of this merge is exactly how the historical four-layer
+    /// chunk_locations drop bug arose — do not duplicate this logic elsewhere.
+    ///
+    /// Returns (metadata_to_store, is_stale). is_stale means incoming's *scalar*
+    /// fields (size, mtime, write_seq, ...) lost to existing's — but
+    /// chunk_locations is always the union of both regardless; see below for why
+    /// (T48 background-tick chunk-drop history).
+    pub(crate) fn merge_file_metadata(existing: Option<&FileMetadata>, incoming: &FileMetadata) -> (FileMetadata, bool) {
         // If existing is strictly newer, incoming's *scalar* fields (size, mtime,
         // write_seq, ...) are stale and must not overwrite existing's — but incoming's
         // chunk_locations still need to be unioned in below. Under the per-cycle-delta
@@ -408,125 +408,158 @@ impl MetadataStore {
         // chunk (7/8 persisted) under full-suite timing pressure, even after the
         // dissemination/queue/put_file union fixes above — root-caused to this
         // early bail-out never running the merge at all.
-        let is_stale = existing_opt.as_ref().is_some_and(|existing| {
-            existing.write_seq > 0 && metadata.write_seq > 0 && existing.write_seq > metadata.write_seq
+        let is_stale = existing.is_some_and(|existing| {
+            existing.write_seq > 0 && incoming.write_seq > 0 && existing.write_seq > incoming.write_seq
         });
-        let metadata_to_store: &FileMetadata = if let Some(existing) = existing_opt {
-            if is_stale {
-                debug!(
-                    "Merging (not dropping) stale-scalar metadata for {} (existing write_seq={} > incoming={}) — chunk_locations still unioned",
-                    metadata.path, existing.write_seq, metadata.write_seq
-                );
+
+        let Some(existing) = existing else {
+            return (incoming.clone(), false);
+        };
+
+        if is_stale {
+            debug!(
+                "Merging (not dropping) stale-scalar metadata for {} (existing write_seq={} > incoming={}) — chunk_locations still unioned",
+                incoming.path, existing.write_seq, incoming.write_seq
+            );
+        }
+
+        // Merge chunk_locations as a TRUE UNION, starting from EXISTING (the
+        // persisted record) rather than the incoming payload. This matters
+        // because incoming may be only a partial, non-cumulative delta (routine
+        // writes now send just the chunks touched this cycle, not the full
+        // history — see fuse_impl.rs's flush_buffer_async). Starting from
+        // incoming (the old approach) silently dropped any chunk recorded in
+        // existing but absent from incoming — safe only as long as some upstream
+        // step (e.g. handle_put_file_metadata's chunk_map reconcile) had already
+        // expanded incoming to a full list, which isn't guaranteed under
+        // concurrent/rapid pushes where chunk_map itself can lag behind the
+        // delta currently arriving. Starting from existing means anything not
+        // mentioned by incoming simply survives untouched, regardless of how
+        // partial incoming is or how stale chunk_map was upstream.
+        //
+        // Per-entry reconciliation rules are unchanged from before: Rule 1
+        // (same chunk_id already present: union node lists, keep incoming's
+        // other fields) and Rule 2 (different chunk_id at the same offset: keep
+        // whichever is newer by client_write_seq/written_at, falling back to
+        // file-level write_seq). Matched by chunk_id first, then by offset —
+        // same priority as before, since a chunk_id is a content hash of
+        // (file_id, offset, data) and in practice never appears at two
+        // different offsets for the same file.
+        let mut merged_locs: Vec<ChunkLocation> = existing.chunk_locations.as_ref().clone();
+        let mut id_index: std::collections::HashMap<ChunkId, usize> = merged_locs.iter()
+            .enumerate().map(|(i, l)| (l.chunk_id, i)).collect();
+        let mut offset_index: std::collections::HashMap<u64, usize> = merged_locs.iter()
+            .enumerate().filter_map(|(i, l)| l.file_offset.map(|o| (o, i))).collect();
+
+        for incoming_loc in incoming.chunk_locations.iter() {
+            if let Some(&idx) = id_index.get(&incoming_loc.chunk_id) {
+                // Rule 1: same chunk_id already present — union node lists,
+                // otherwise take incoming's fields (mirrors the pre-union
+                // behavior of enriching a copy of incoming with existing's nodes).
+                let mut new_entry = incoming_loc.clone();
+                for node in &merged_locs[idx].nodes {
+                    if !new_entry.nodes.contains(node) {
+                        new_entry.nodes.push(*node);
+                    }
+                }
+                if let Some(old_offset) = merged_locs[idx].file_offset {
+                    if Some(old_offset) != new_entry.file_offset {
+                        offset_index.remove(&old_offset);
+                    }
+                }
+                if let Some(new_offset) = new_entry.file_offset {
+                    offset_index.insert(new_offset, idx);
+                }
+                merged_locs[idx] = new_entry;
+                continue;
             }
-
-            // Merge chunk_locations as a TRUE UNION, starting from EXISTING (the
-            // persisted record) rather than the incoming payload. This matters
-            // because incoming may be only a partial, non-cumulative delta (routine
-            // writes now send just the chunks touched this cycle, not the full
-            // history — see fuse_impl.rs's flush_buffer_async). Starting from
-            // incoming (the old approach) silently dropped any chunk recorded in
-            // existing but absent from incoming — safe only as long as some upstream
-            // step (e.g. handle_put_file_metadata's chunk_map reconcile) had already
-            // expanded incoming to a full list, which isn't guaranteed under
-            // concurrent/rapid pushes where chunk_map itself can lag behind the
-            // delta currently arriving. Starting from existing means anything not
-            // mentioned by incoming simply survives untouched, regardless of how
-            // partial incoming is or how stale chunk_map was upstream.
-            //
-            // Per-entry reconciliation rules are unchanged from before: Rule 1
-            // (same chunk_id already present: union node lists, keep incoming's
-            // other fields) and Rule 2 (different chunk_id at the same offset: keep
-            // whichever is newer by client_write_seq/written_at, falling back to
-            // file-level write_seq). Matched by chunk_id first, then by offset —
-            // same priority as before, since a chunk_id is a content hash of
-            // (file_id, offset, data) and in practice never appears at two
-            // different offsets for the same file.
-            let mut merged_locs: Vec<ChunkLocation> = existing.chunk_locations.as_ref().clone();
-            let mut id_index: std::collections::HashMap<ChunkId, usize> = merged_locs.iter()
-                .enumerate().map(|(i, l)| (l.chunk_id, i)).collect();
-            let mut offset_index: std::collections::HashMap<u64, usize> = merged_locs.iter()
-                .enumerate().filter_map(|(i, l)| l.file_offset.map(|o| (o, i))).collect();
-
-            for incoming_loc in metadata.chunk_locations.iter() {
-                if let Some(&idx) = id_index.get(&incoming_loc.chunk_id) {
-                    // Rule 1: same chunk_id already present — union node lists,
-                    // otherwise take incoming's fields (mirrors the pre-union
-                    // behavior of enriching a copy of incoming with existing's nodes).
-                    let mut new_entry = incoming_loc.clone();
-                    for node in &merged_locs[idx].nodes {
-                        if !new_entry.nodes.contains(node) {
-                            new_entry.nodes.push(*node);
+            if let Some(file_offset) = incoming_loc.file_offset {
+                if let Some(&idx) = offset_index.get(&file_offset) {
+                    // Rule 2: different chunk_id at the same offset — keep the newer one.
+                    let existing_loc = &merged_locs[idx];
+                    // If the incoming file-level write_seq is strictly higher, the incoming
+                    // chunk is definitively from a later write session and always wins,
+                    // regardless of per-chunk client_write_seq. This covers the case where
+                    // the incoming chunk has client_write_seq=None (e.g. fresh overwrite after
+                    // a patch that did carry a client_write_seq).
+                    let incoming_file_seq_wins = incoming.write_seq > 0
+                        && existing.write_seq > 0
+                        && incoming.write_seq > existing.write_seq;
+                    let keep_existing = if incoming_file_seq_wins {
+                        // File-level seq wins for fresh overwrites, but a chunk with a
+                        // higher existing client_write_seq is still authoritative —
+                        // prevents a stale broadcast (lower cws) from winning just
+                        // because the accompanying file write_seq happened to be higher.
+                        matches!(
+                            (incoming_loc.client_write_seq, existing_loc.client_write_seq),
+                            (Some(inc), Some(ext)) if ext > inc
+                        )
+                    } else {
+                        match (incoming_loc.client_write_seq, existing_loc.client_write_seq) {
+                            (Some(inc), Some(ext)) => ext > inc,
+                            (Some(_), None)        => false,
+                            (None, Some(_))        => true,
+                            (None, None)           => {
+                                existing_loc.written_at.unwrap_or(0) > incoming_loc.written_at.unwrap_or(0)
+                            }
                         }
+                    };
+                    if !keep_existing {
+                        id_index.remove(&merged_locs[idx].chunk_id);
+                        id_index.insert(incoming_loc.chunk_id, idx);
+                        merged_locs[idx] = incoming_loc.clone();
                     }
-                    if let Some(old_offset) = merged_locs[idx].file_offset {
-                        if Some(old_offset) != new_entry.file_offset {
-                            offset_index.remove(&old_offset);
-                        }
-                    }
-                    if let Some(new_offset) = new_entry.file_offset {
-                        offset_index.insert(new_offset, idx);
-                    }
-                    merged_locs[idx] = new_entry;
                     continue;
                 }
-                if let Some(file_offset) = incoming_loc.file_offset {
-                    if let Some(&idx) = offset_index.get(&file_offset) {
-                        // Rule 2: different chunk_id at the same offset — keep the newer one.
-                        let existing_loc = &merged_locs[idx];
-                        // If the incoming file-level write_seq is strictly higher, the incoming
-                        // chunk is definitively from a later write session and always wins,
-                        // regardless of per-chunk client_write_seq. This covers the case where
-                        // the incoming chunk has client_write_seq=None (e.g. fresh overwrite after
-                        // a patch that did carry a client_write_seq).
-                        let incoming_file_seq_wins = metadata.write_seq > 0
-                            && existing.write_seq > 0
-                            && metadata.write_seq > existing.write_seq;
-                        let keep_existing = if incoming_file_seq_wins {
-                            // File-level seq wins for fresh overwrites, but a chunk with a
-                            // higher existing client_write_seq is still authoritative —
-                            // prevents a stale broadcast (lower cws) from winning just
-                            // because the accompanying file write_seq happened to be higher.
-                            matches!(
-                                (incoming_loc.client_write_seq, existing_loc.client_write_seq),
-                                (Some(inc), Some(ext)) if ext > inc
-                            )
-                        } else {
-                            match (incoming_loc.client_write_seq, existing_loc.client_write_seq) {
-                                (Some(inc), Some(ext)) => ext > inc,
-                                (Some(_), None)        => false,
-                                (None, Some(_))        => true,
-                                (None, None)           => {
-                                    existing_loc.written_at.unwrap_or(0) > incoming_loc.written_at.unwrap_or(0)
-                                }
-                            }
-                        };
-                        if !keep_existing {
-                            id_index.remove(&merged_locs[idx].chunk_id);
-                            id_index.insert(incoming_loc.chunk_id, idx);
-                            merged_locs[idx] = incoming_loc.clone();
-                        }
-                        continue;
-                    }
-                }
-                // Genuinely new slot — append.
-                let new_idx = merged_locs.len();
-                id_index.insert(incoming_loc.chunk_id, new_idx);
-                if let Some(offset) = incoming_loc.file_offset {
-                    offset_index.insert(offset, new_idx);
-                }
-                merged_locs.push(incoming_loc.clone());
             }
+            // Genuinely new slot — append.
+            let new_idx = merged_locs.len();
+            id_index.insert(incoming_loc.chunk_id, new_idx);
+            if let Some(offset) = incoming_loc.file_offset {
+                offset_index.insert(offset, new_idx);
+            }
+            merged_locs.push(incoming_loc.clone());
+        }
 
-            // Scalar fields (size, mtime, write_seq, ...) come from whichever side is
-            // authoritative by write_seq — existing if incoming is stale, else incoming
-            // (unchanged from before this fix). chunk_locations is always the union.
-            let mut cloned = if is_stale { existing.clone() } else { metadata.clone() };
-            cloned.chunk_locations = Arc::new(merged_locs);
-            merged_metadata = Some(cloned);
-            merged_metadata.as_ref().unwrap()
-        } else {
-            metadata
+        // Scalar fields (size, mtime, write_seq, ...) come from whichever side is
+        // authoritative by write_seq — existing if incoming is stale, else incoming
+        // (unchanged from before this fix). chunk_locations is always the union.
+        let mut cloned = if is_stale { existing.clone() } else { incoming.clone() };
+        cloned.chunk_locations = Arc::new(merged_locs);
+        (cloned, is_stale)
+    }
+
+    fn put_file_in_txn(
+        file_table: &mut redb::Table<&str, &[u8]>,
+        path_table: &mut redb::Table<&str, &[u8]>,
+        metadata: &FileMetadata,
+    ) -> Result<(PutFileResult, Option<String>)> {
+        let file_id_str = format!("{}", metadata.id);
+        let path_str = metadata.path.as_str();
+
+        // TEMP PROFILING (2026-07-07): timing instrumentation to find the per-push
+        // server-side cost under sustained concurrent writes (32-way pipeline) — see
+        // project memory on the vm-111 install bottleneck investigation. Remove once
+        // the bottleneck is characterized.
+        let t_merge_start = std::time::Instant::now();
+
+        // Merge chunk_locations with any existing same-ID record.
+        let existing_opt: Option<FileMetadata> = match file_table.get(file_id_str.as_str())? {
+            Some(v) => dfs_common::deserialize_file_metadata(v.value()).ok(),
+            None => None,
         };
+        let existing_chunk_count = existing_opt.as_ref().map(|m| m.chunk_locations.len()).unwrap_or(0);
+        let incoming_chunk_count = metadata.chunk_locations.len();
+
+        let (metadata_to_store, is_stale) = Self::merge_file_metadata(existing_opt.as_ref(), metadata);
+
+        let merge_elapsed = t_merge_start.elapsed();
+        if merge_elapsed.as_millis() > 5 {
+            debug!(
+                "[TIMING] put_file_in_txn merge: path={} existing_chunks={} incoming_chunks={} took={:?}",
+                metadata.path, existing_chunk_count, incoming_chunk_count, merge_elapsed
+            );
+        }
 
         // If a different file ID already exists at this path, remove the stale file
         // record. Done only now (after the stale-check above can no longer bail
@@ -546,7 +579,7 @@ impl MetadataStore {
             }
         }
 
-        let value = bincode::serialize(metadata_to_store)
+        let value = bincode::serialize(&metadata_to_store)
             .context("Failed to serialize file metadata")?;
 
         file_table.insert(file_id_str.as_str(), value.as_slice())
@@ -558,7 +591,7 @@ impl MetadataStore {
             // Still report Stale so the caller knows incoming's scalar fields lost
             // and can converge whoever sent it — but the persisted record (returned
             // here) now includes the union, not just existing's original chunks.
-            Ok((PutFileResult::Stale(metadata_to_store.clone()), old_id_str))
+            Ok((PutFileResult::Stale(metadata_to_store), old_id_str))
         } else {
             Ok((PutFileResult::Stored, old_id_str))
         }
@@ -566,20 +599,33 @@ impl MetadataStore {
 
     /// Store file metadata.
     pub fn put_file(&self, metadata: &FileMetadata) -> Result<PutFileResult> {
+        // TEMP PROFILING (2026-07-07): see put_file_in_txn's matching comment.
+        let t_put_start = std::time::Instant::now();
         let _db = self.db.read().unwrap();
+        let t_lock_acquired = t_put_start.elapsed();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
+        let t_txn_begun = t_put_start.elapsed();
 
         let (result, old_id_str) = {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut path_table = txn.open_table(PATH_TABLE)?;
             Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?
         };
+        let t_txn_body_done = t_put_start.elapsed();
 
         // A Stale result no longer means "nothing was mutated" — put_file_in_txn still
         // unions incoming's chunk_locations into existing's before returning Stale, so
         // this transaction must always commit or that merge is silently rolled back.
         txn.commit()?;
+        let t_committed = t_put_start.elapsed();
+        if t_committed.as_millis() > 5 {
+            debug!(
+                "[TIMING] put_file: path={} lock={:?} begin_txn={:?} body={:?} commit={:?} total={:?}",
+                metadata.path, t_lock_acquired, t_txn_begun - t_lock_acquired,
+                t_txn_body_done - t_txn_begun, t_committed - t_txn_body_done, t_committed
+            );
+        }
 
         // Mark touched keys dirty for compact_db_with_budget's incremental catch-up —
         // must happen while `_db` (the read guard) is still held, so Phase 3's

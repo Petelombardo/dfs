@@ -215,6 +215,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config.replication.replication_factor,
         config.storage.metadata_dir.clone(),
         config_path.clone(),
+        config.storage.metadata_batch_drain_enabled,
     ));
     info!("✓ Server instance created");
 

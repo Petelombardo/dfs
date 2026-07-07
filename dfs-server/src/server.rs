@@ -153,6 +153,13 @@ pub struct Server {
     /// by dropping the sender, then wait for the worker thread to drain completely.
     sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>>,
 
+    /// TEMP PROFILING (2026-07-07): approximate backlog depth of the sled_write_tx
+    /// channel (incremented on send, decremented after put_file returns) — tests
+    /// whether the single-threaded worker can keep up under sustained concurrent
+    /// writes, or whether it silently falls behind (client is acked immediately on
+    /// send, so a growing backlog here would NOT show up as client-visible latency).
+    sled_write_backlog: Arc<std::sync::atomic::AtomicUsize>,
+
     /// Notified by the sled-write worker when it has drained all pending items
     /// and exited (after the sender is dropped). Used by drain_sled_writes().
     sled_write_done: Arc<tokio::sync::Notify>,
@@ -214,6 +221,37 @@ pub struct Server {
     conn_semaphore: Arc<RwLock<Option<Arc<tokio::sync::Semaphore>>>>,
 }
 
+/// Fold a batch of pending metadata writes down to one `FileMetadata` per
+/// file_id, in arrival order, before it ever touches redb. For a group of N
+/// items sharing a file_id, repeatedly applies `MetadataStore::merge_file_metadata`
+/// — the exact same rules `put_file_in_txn` uses against a redb-backed `existing`
+/// — against an in-memory accumulator seeded with the first item. This is NOT a
+/// second merge implementation: it reuses the one pure function both paths share,
+/// so the fold can never silently diverge from the single-item path's behavior
+/// (see merge_file_metadata's doc comment on why that divergence risk matters here).
+///
+/// Folding only resolves ordering/dedup *within* this batch — a late-arriving
+/// straggler from a different batch still goes through put_file_in_txn's normal
+/// staleness guard against whatever's already committed in redb, unchanged.
+fn fold_metadata_batch(items: Vec<FileMetadata>) -> Vec<FileMetadata> {
+    let mut order: Vec<FileId> = Vec::new();
+    let mut acc: std::collections::HashMap<FileId, FileMetadata> =
+        std::collections::HashMap::with_capacity(items.len());
+    for item in items {
+        match acc.get(&item.id) {
+            Some(existing) => {
+                let (merged, _is_stale) = MetadataStore::merge_file_metadata(Some(existing), &item);
+                acc.insert(item.id, merged);
+            }
+            None => {
+                order.push(item.id);
+                acc.insert(item.id, item);
+            }
+        }
+    }
+    order.into_iter().filter_map(|id| acc.remove(&id)).collect()
+}
+
 impl Server {
     /// Create a new server instance
     pub fn new(
@@ -224,6 +262,7 @@ impl Server {
         replication_factor: usize,
         metadata_dir: PathBuf,
         config_path: PathBuf,
+        metadata_batch_drain_enabled: bool,
     ) -> Self {
         let replication_factor = Arc::new(AtomicUsize::new(replication_factor));
         // Create tombstones before the struct so the sled_write_tx worker can
@@ -235,23 +274,94 @@ impl Server {
         // thread captures the correct Arc clones (struct fields can't cross-reference
         // each other within a single literal).
         let sled_write_done: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let sled_write_backlog: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>> = {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
             let meta_bg = metadata.clone();
             let done_notify = sled_write_done.clone();
+            let backlog_for_worker = sled_write_backlog.clone();
             std::thread::spawn(move || {
-                while let Some(m) = rx.blocking_recv() {
+                // Batch/fold pending writes into one redb transaction per drain cycle
+                // instead of one begin_write() per item — the measured bottleneck
+                // under sustained concurrent writes was time blocked acquiring redb's
+                // single process-wide write transaction (up to 826ms observed at
+                // 32-way concurrency), not the merge/commit cost itself (sub-ms).
+                // See the 2026-07 write-contention investigation.
+                const BATCH_MAX_ITEMS: usize = 256;
+                const BATCH_MAX_LINGER: std::time::Duration = std::time::Duration::from_millis(8);
+                const BATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(200);
+
+                let mut last_log = std::time::Instant::now();
+                'outer: loop {
+                    // Block for the first item of the next batch — no busy-waiting
+                    // while the channel is empty.
+                    let first = match rx.blocking_recv() {
+                        Some(m) => m,
+                        None => break 'outer, // sender dropped, nothing buffered
+                    };
+                    let mut buf = Vec::with_capacity(BATCH_MAX_ITEMS);
+                    buf.push(first);
+                    let mut channel_closed = false;
+
+                    if metadata_batch_drain_enabled {
+                        let deadline = std::time::Instant::now() + BATCH_MAX_LINGER;
+                        while buf.len() < BATCH_MAX_ITEMS {
+                            match rx.try_recv() {
+                                Ok(m) => buf.push(m),
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                    if std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    std::thread::sleep(BATCH_POLL_INTERVAL);
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    channel_closed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    let batch_len = buf.len();
+                    let backlog = backlog_for_worker.fetch_sub(batch_len, std::sync::atomic::Ordering::Relaxed) - batch_len;
+                    if last_log.elapsed().as_secs() >= 1 {
+                        debug!("[TIMING] sled_write_worker backlog={} last_batch={}", backlog, batch_len);
+                        last_log = std::time::Instant::now();
+                    }
+
                     // Guard: don't resurrect a file that was deleted after this
                     // write was queued (race between ReplicateChunkLocation and
                     // handle_delete_file). The tombstone is set by handle_delete_file
                     // before removing from sled, so if it's present here the delete
-                    // wins and we discard the stale metadata update.
-                    if tombstones_for_worker.contains_key(&m.id) {
-                        debug!("sled_write_worker: skipping tombstoned file {} ({})", m.path, m.id);
-                        continue;
+                    // wins and we discard the stale metadata update. Filtered before
+                    // folding, not after — folding a soon-to-be-discarded item into a
+                    // survivor would incorrectly union its chunk_locations in.
+                    buf.retain(|m| {
+                        if tombstones_for_worker.contains_key(&m.id) {
+                            debug!("sled_write_worker: skipping tombstoned file {} ({})", m.path, m.id);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                    if !buf.is_empty() {
+                        if metadata_batch_drain_enabled {
+                            let folded = fold_metadata_batch(buf);
+                            if let Err(e) = meta_bg.put_files_batch(&folded) {
+                                warn!("sled_write_worker: put_files_batch failed for {} files: {}", folded.len(), e);
+                            }
+                        } else {
+                            for m in &buf {
+                                if let Err(e) = meta_bg.put_file(m) {
+                                    warn!("sled_write_worker: put_file failed for {}: {}", m.path, e);
+                                }
+                            }
+                        }
                     }
-                    if let Err(e) = meta_bg.put_file(&m) {
-                        warn!("sled_write_worker: put_file failed for {}: {}", m.path, e);
+
+                    if channel_closed {
+                        break 'outer;
                     }
                 }
                 // All pending items have been committed — signal drain_sled_writes().
@@ -305,6 +415,7 @@ impl Server {
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
             sled_write_done,
+            sled_write_backlog,
             sled_write_tx,
         };
 
@@ -2182,6 +2293,7 @@ impl Server {
         };
         self.chunk_map_update(&metadata).await;
         if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
+            self.sled_write_backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = tx.send(metadata.clone());
         }
 
@@ -2905,6 +3017,7 @@ impl Server {
             };
             self.chunk_map_update(&metadata).await;
             if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
+                self.sled_write_backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = tx.send(metadata.clone());
             }
         }
@@ -4493,6 +4606,7 @@ impl Server {
             let _ = tokio::task::spawn_blocking(move || meta_store.put_file(&meta_clone)).await;
         } else {
             if let Some(tx) = self.sled_write_tx.lock().unwrap().as_ref() {
+                self.sled_write_backlog.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = tx.send(metadata);
             }
         }
@@ -7462,7 +7576,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         // Write data
         let data = b"Hello, distributed filesystem!";
@@ -7489,7 +7603,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         // Test write
         let data = b"Test chunk data";
@@ -7529,7 +7643,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let data = b"Test";
         let hash = compute_chunk_hash(data);
@@ -7586,7 +7700,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         let file_offset = 2 * 1024 * 1024u64; // chunk 512's file_offset
@@ -7628,6 +7742,95 @@ mod tests {
         assert_eq!(loc.client_write_seq, Some(8));
     }
 
+    /// Phase-2 batching correctness: folding several out-of-order, partially
+    /// overlapping pushes for the SAME file within one drain batch (fold_metadata_batch,
+    /// used by the sled_write_tx worker) must produce a byte-identical persisted result
+    /// to applying the same pushes one at a time, in the same arrival order, through
+    /// the pre-batching put_file path. This is the one genuinely new piece of logic
+    /// introduced by the write-contention fix — everything else just calls existing,
+    /// unmodified code (put_file_in_txn/put_files_batch) differently.
+    #[test]
+    fn test_fold_metadata_batch_matches_serial_put_file_application() {
+        let node = NodeId::new();
+        let file_id = FileId::new();
+        let path = "/fold_test.bin".to_string();
+
+        // Build 4 pushes for the same file, deliberately out of write_seq order and
+        // with a chunk-slot collision (C supersedes A's chunk at offset 0):
+        //   A (write_seq=2): chunk at offset 0
+        //   B (write_seq=1): chunk at offset 4MB — lower write_seq than A, e.g. a
+        //     background-tick straggler that arrives after a later push
+        //   C (write_seq=4): a DIFFERENT chunk_id at offset 0 — must win over A's
+        //   D (write_seq=3): a distinct chunk at offset 8MB
+        let mk = |write_seq: u64, offset: u64, tag: u8| {
+            let mut m = FileMetadata::new(path.clone(), dfs_common::FileType::RegularFile);
+            m.id = file_id;
+            m.write_seq = write_seq;
+            m.size = offset + 4 * 1024 * 1024;
+            let hash = [tag; 32];
+            m.chunk_locations = Arc::new(vec![ChunkLocation {
+                chunk_id: ChunkId::from_hash(hash),
+                nodes: vec![node],
+                size: 4 * 1024 * 1024,
+                checksum: hash,
+                file_offset: Some(offset),
+                written_at: Some(1000 + write_seq),
+                client_write_seq: Some(write_seq),
+                file_id: Some(file_id),
+            }]);
+            m
+        };
+
+        let item_a = mk(2, 0, 1);
+        let item_b = mk(1, 4 * 1024 * 1024, 2);
+        let item_c = mk(4, 0, 3);
+        let item_d = mk(3, 8 * 1024 * 1024, 4);
+
+        // Arrival order intentionally does not match write_seq order.
+        let batch: Vec<FileMetadata> = vec![item_c.clone(), item_a.clone(), item_d.clone(), item_b.clone()];
+
+        // Reference: apply the exact same items, in the exact same arrival order,
+        // one at a time via put_file — this is what the pre-batching worker did.
+        let reference_dir = TempDir::new().unwrap();
+        let reference_store = MetadataStore::new(reference_dir.path().to_path_buf()).unwrap();
+        for item in &batch {
+            reference_store.put_file(item).unwrap();
+        }
+        let reference_result = reference_store.get_file(&file_id).unwrap().unwrap();
+
+        // Under test: fold the batch in memory, then apply the single folded record
+        // via put_files_batch — this is what the batching worker does now.
+        let folded_dir = TempDir::new().unwrap();
+        let folded_store = MetadataStore::new(folded_dir.path().to_path_buf()).unwrap();
+        let folded = fold_metadata_batch(batch);
+        assert_eq!(folded.len(), 1, "all 4 items share one file_id — fold must produce exactly one record");
+        folded_store.put_files_batch(&folded).unwrap();
+        let folded_result = folded_store.get_file(&file_id).unwrap().unwrap();
+
+        assert_eq!(folded_result.write_seq, reference_result.write_seq,
+            "scalar fields must converge to the highest-write_seq item (C, seq=4), matching serial application");
+        assert_eq!(folded_result.size, reference_result.size);
+
+        let mut ref_locs: Vec<(Option<u64>, ChunkId)> = reference_result.chunk_locations.iter()
+            .map(|l| (l.file_offset, l.chunk_id)).collect();
+        let mut folded_locs: Vec<(Option<u64>, ChunkId)> = folded_result.chunk_locations.iter()
+            .map(|l| (l.file_offset, l.chunk_id)).collect();
+        ref_locs.sort_by_key(|(o, _)| *o);
+        folded_locs.sort_by_key(|(o, _)| *o);
+        assert_eq!(folded_locs, ref_locs,
+            "folding a batch in memory before one put_files_batch call must produce byte-identical \
+             chunk_locations to applying the same items serially through put_file, one at a time");
+
+        // Sanity-check the specific expected winner at the contended offset, not just
+        // that the two paths agree with each other (both could agree on a wrong answer).
+        let at_offset_0 = folded_result.chunk_locations.iter()
+            .find(|l| l.file_offset == Some(0)).expect("offset 0 must be present");
+        assert_eq!(at_offset_0.chunk_id, item_c.chunk_locations[0].chunk_id,
+            "higher client_write_seq (C) must win over A's chunk at the same offset");
+        assert_eq!(folded_result.chunk_locations.len(), 3,
+            "offset 0 (C wins over A), offset 4MB (B), offset 8MB (D) — 3 slots total");
+    }
+
     /// Non-aligned write followed by boundary-aligned write to the same chunk_idx must not
     /// produce duplicate chunk_map entries. The RCL for the boundary write (file_offset =
     /// chunk_idx * CHUNK_SIZE) must REPLACE the entry from the non-aligned write
@@ -7649,7 +7852,7 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
@@ -7725,7 +7928,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         let hash = compute_chunk_hash(b"chunk-data");
@@ -7786,7 +7989,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         let hash = compute_chunk_hash(b"chunk-data-ghost-pruned-batch");
@@ -7873,7 +8076,7 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         let nodes = vec![NodeId::new(), NodeId::new(), NodeId::new()];
@@ -7940,7 +8143,7 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         let nodes = vec![NodeId::new(), NodeId::new(), NodeId::new()];
@@ -8033,7 +8236,7 @@ mod tests {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         let hash = compute_chunk_hash(b"duplicate-in-one-batch");
@@ -8092,7 +8295,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         let chunk_file_offset = 0u64;
@@ -8337,7 +8540,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
         let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
 
-        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"));
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
 
         let file_id = dfs_common::FileId::new();
         let hash = compute_chunk_hash(b"current post-patch chunk content");

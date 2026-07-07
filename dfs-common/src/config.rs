@@ -77,6 +77,14 @@ pub struct StorageConfig {
     /// Chunk size in megabytes (default: 4MB)
     #[serde(default = "default_chunk_size_mb")]
     pub chunk_size_mb: usize,
+
+    /// Whether the sled_write_tx worker batches+folds pending metadata writes
+    /// into one redb transaction per drain cycle, instead of one begin_write()
+    /// per item. Default true. Kept as a config-flip fallback (not a hot-reload
+    /// toggle — requires a restart) so a regression can be mitigated without a
+    /// revert+redeploy; see the 2026-07 write-contention investigation.
+    #[serde(default = "default_metadata_batch_drain_enabled")]
+    pub metadata_batch_drain_enabled: bool,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -91,12 +99,17 @@ fn default_chunk_size_mb() -> usize {
     4
 }
 
+fn default_metadata_batch_drain_enabled() -> bool {
+    true
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
             metadata_dir: default_metadata_dir(),
             chunk_size_mb: default_chunk_size_mb(),
+            metadata_batch_drain_enabled: default_metadata_batch_drain_enabled(),
         }
     }
 }

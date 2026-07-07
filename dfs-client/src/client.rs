@@ -448,7 +448,40 @@ impl MetadataQueue {
                 // Dedup replace: only replace if incoming write_seq >= existing.
                 // This ensures newer metadata (higher sequence) always wins, even if
                 // a stale entry somehow arrives after a newer one was already queued.
-                if metadata.write_seq >= entry.metadata.write_seq {
+                //
+                // Union chunk_locations from BOTH sides first, regardless of which one
+                // wins the scalar-field comparison below. Since 2026-07-07,
+                // flush_buffer_async sends only each cycle's newly-flushed locations
+                // (all_locations), not the full cumulative history — two coalesced
+                // pushes for the same file describe two DIFFERENT, not overlapping-nor-
+                // superset, deltas. Blindly keeping only the "winning" side's
+                // chunk_locations (the old behavior, safe back when every push carried
+                // the complete history) silently drops whichever chunk(s) only the
+                // losing side described — caught by T48 as an intermittent off-by-one
+                // in the persisted chunk count under concurrent/rapid flush cycles.
+                // Dedup by file_offset: a genuine conflict (same offset, both sides
+                // recorded a write to it) prefers the scalar-comparison winner's version.
+                let winner_is_incoming = metadata.write_seq >= entry.metadata.write_seq;
+                let (base_locs, other_locs) = if winner_is_incoming {
+                    (&metadata.chunk_locations, &entry.metadata.chunk_locations)
+                } else {
+                    (&entry.metadata.chunk_locations, &metadata.chunk_locations)
+                };
+                let merged_locs: Vec<dfs_common::ChunkLocation> = if other_locs.is_empty() {
+                    base_locs.as_ref().clone()
+                } else {
+                    let mut merged = base_locs.as_ref().clone();
+                    let existing_offsets: std::collections::HashSet<Option<u64>> =
+                        merged.iter().map(|l| l.file_offset).collect();
+                    for loc in other_locs.iter() {
+                        if !existing_offsets.contains(&loc.file_offset) {
+                            merged.push(loc.clone());
+                        }
+                    }
+                    merged
+                };
+
+                if winner_is_incoming {
                     info!(
                         "[META QUEUE] enqueue op={} path={} id={} seq={} size={} (replacing seq={})",
                         op, metadata.path, metadata.id, metadata.write_seq,
@@ -460,10 +493,13 @@ impl MetadataQueue {
                     if done_tx.is_some() {
                         entry.done_tx = done_tx;
                     }
-                    entry.metadata = metadata;
+                    let mut merged_metadata = metadata;
+                    merged_metadata.chunk_locations = std::sync::Arc::new(merged_locs);
+                    entry.metadata = merged_metadata;
                 } else {
-                    // Incoming is older — drop it, but transfer done_tx if present so
-                    // a release() waiter still gets notified when the newer entry delivers.
+                    // Incoming is older — drop its scalar fields, but transfer done_tx if
+                    // present so a release() waiter still gets notified when the newer
+                    // entry delivers, and keep the union of chunk_locations either way.
                     info!(
                         "[META QUEUE] drop-stale op={} path={} id={} seq={} (queue has seq={})",
                         op, metadata.path, metadata.id, metadata.write_seq,
@@ -472,6 +508,7 @@ impl MetadataQueue {
                     if done_tx.is_some() && entry.done_tx.is_none() {
                         entry.done_tx = done_tx;
                     }
+                    entry.metadata.chunk_locations = std::sync::Arc::new(merged_locs);
                 }
                 drop(q);
                 drop(idx);
@@ -6992,6 +7029,54 @@ mod tests {
 
         let pending = client.pending_chunk_locations.lock().await;
         assert_eq!(pending.len(), 20, "all 20 concurrent enqueues should land in the shared queue");
+    }
+
+    /// Regression test for a real bug found via T48 (background-tick metadata push
+    /// under full-suite load, 2026-07-07): coalescing two queued pushes for the same
+    /// file must union their chunk_locations, not let the write_seq-winning side's
+    /// replace silently discard whatever only the losing side described.
+    ///
+    /// Since 2026-07-07, flush_buffer_async sends only each cycle's newly-flushed
+    /// locations (all_locations), not the full cumulative chunk history — so two
+    /// pushes for the same file describe two DIFFERENT, non-overlapping deltas, not
+    /// one being a superset of the other. If a background-tick push for chunk N is
+    /// still queued when a later push (e.g. from release()) arrives and doesn't
+    /// happen to describe chunk N, a naive replace loses chunk N forever — the
+    /// server never sees a delta that was discarded client-side before ever being
+    /// sent over the network.
+    #[tokio::test]
+    async fn test_metadata_queue_coalesce_unions_chunk_locations_not_replaces() {
+        let queue = MetadataQueue::new();
+        let file_id = FileId::new();
+
+        let mut first = FileMetadata::new("/coalesce_test.bin".to_string(), dfs_common::FileType::RegularFile);
+        first.id = file_id;
+        first.write_seq = 1;
+        first.size = 4 * 1024 * 1024;
+        let loc_a = loc_with_nodes(chunk_id_with_hash0(1), vec![]);
+        first.chunk_locations = Arc::new(vec![loc_a.clone()]);
+
+        let mut second = FileMetadata::new("/coalesce_test.bin".to_string(), dfs_common::FileType::RegularFile);
+        second.id = file_id;
+        second.write_seq = 2;
+        second.size = 8 * 1024 * 1024;
+        let mut loc_b = loc_with_nodes(chunk_id_with_hash0(2), vec![]);
+        loc_b.file_offset = Some(4 * 1024 * 1024); // a different offset than loc_a
+        second.chunk_locations = Arc::new(vec![loc_b.clone()]);
+
+        // Both pushed before anything drains — exactly the coalescing scenario: a
+        // background-tick push (first) still queued when a later push (second,
+        // e.g. release()) arrives for the same file.
+        queue.push(first).await;
+        queue.push(second).await;
+
+        let entry = queue.pop().await.expect("coalesced entry must still be present");
+        let offsets: std::collections::HashSet<Option<u64>> = entry.metadata.chunk_locations
+            .iter().map(|l| l.file_offset).collect();
+        assert!(offsets.contains(&loc_a.file_offset), "chunk from the coalesced-away first push must survive");
+        assert!(offsets.contains(&loc_b.file_offset), "chunk from the winning second push must be present");
+        assert_eq!(entry.metadata.chunk_locations.len(), 2, "must be a union, not just the winner's own locations");
+        assert_eq!(entry.metadata.size, 8 * 1024 * 1024, "scalar fields must come from the write_seq-winning push");
     }
 
     /// With equal load (the common case), different chunks on the same 2-replica

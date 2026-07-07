@@ -1497,18 +1497,27 @@ impl FlushHandle {
                 // from starting — starving the write pipeline. We stamp the seq and push
                 // directly; the queue worker handles delivery and retries independently.
                 //
-                // Throttled to at most once per BG_METADATA_PUSH_INTERVAL: this carries the
-                // *entire* chunk_locations Vec (every chunk written so far), and
-                // handle_put_file_metadata reconciles it against the leader's chunk_map with
-                // two nested O(n) scans. The leader's chunk_map is already kept current
-                // per-chunk by the cheap ReplicateChunkLocation(s) sent during the chunk write
-                // itself (write_data_dual_replica) — this full-metadata push only exists to
-                // make size/mtime/chunk_locations visible to other clients and durable before
-                // release(). Sending it on every single completed chunk made a large sequential
-                // write's per-chunk cost grow with the file's total chunk count (O(n) client-side
-                // clone/serialize plus O(n^2) server-side reconcile, repeated ~n times), collapsing
-                // throughput over a multi-GB transfer. force=true (fsync/release, above) always
-                // pushes unthrottled so the file is fully authoritative at close.
+                // Throttled to at most once per BG_METADATA_PUSH_INTERVAL, AND — like the
+                // force/fsync branch above — sends only this cycle's newly-flushed locations
+                // (all_locations), not the full, ever-growing meta.chunk_locations. This used
+                // to send the *entire* Vec (every chunk written so far): the leader's chunk_map
+                // is already kept current per-chunk by the cheap ReplicateChunkLocation(s) sent
+                // during the chunk write itself (write_data_dual_replica), and
+                // handle_put_file_metadata's reconcile step already unions a non-cumulative
+                // incoming list against chunk_map before storing — so sending the full history
+                // here was pure unnecessary cost (client-side clone/serialize, network transfer,
+                // and server-side incoming-deserialize all scaling with total file size), on top
+                // of the reconcile/chunk_map_update/put_file cost that scales with size
+                // regardless. A real large-file workload (VM disk install) showed this specific
+                // path's round-trip latency climbing from ~1.5ms to ~40-49ms as chunk_locations
+                // grew past ~1300 entries, collapsing write throughput to a fraction of its
+                // earlier rate for the rest of the session. all_locations is guaranteed
+                // non-empty here — patch_metadata_dirty is only ever set alongside a matching
+                // all_locations.push(), and this branch is unreachable unless the earlier
+                // `all_locations.is_empty() && !patch_metadata_dirty` check passed — so this
+                // can never be misread by the server as an intentional truncate-to-zero (empty
+                // chunk_locations skips its chunk_map union entirely; see
+                // handle_put_file_metadata's reconcile comment).
                 const BG_METADATA_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
                 let should_push = self.last_bg_metadata_push.get(&ino)
                     .map(|last| last.elapsed() >= BG_METADATA_PUSH_INTERVAL)
@@ -1516,7 +1525,9 @@ impl FlushHandle {
                 if should_push {
                     self.last_bg_metadata_push.insert(ino, std::time::Instant::now());
                     self.last_metadata_update.insert(ino, std::time::Instant::now());
-                    let stamped = self.client.stamp_write_seq_pub(&meta);
+                    let mut meta_for_network = meta.clone();
+                    meta_for_network.chunk_locations = Arc::new(all_locations.clone());
+                    let stamped = self.client.stamp_write_seq_pub(&meta_for_network);
                     self.client.metadata_queue.push(stamped).await;
                 }
                 // For background flushes, update read engine immediately (not queued)

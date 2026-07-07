@@ -359,18 +359,26 @@ impl MetadataStore {
     /// can share ONE transaction across many records (see put_files_batch) instead
     /// of paying a full commit per record.
     ///
-    /// The stale-write check is done BEFORE touching path_table/file_table for any
-    /// removal, not after (unlike a naive port of the old single-item code) — so a
-    /// rejected stale item contributes nothing at all to the transaction. That
-    /// matters for put_files_batch: a stale item earlier in a batch must never
-    /// leave a partial mutation (e.g. an old_id removal) sitting in a transaction
-    /// that other items in the same batch go on to share. It's a no-op change for
-    /// put_file's own single-item case, since nothing there ever committed on the
-    /// stale path either way.
+    /// A "stale" write (existing.write_seq > incoming.write_seq) does NOT mean
+    /// "ignore incoming entirely" — incoming's chunk_locations are still unioned
+    /// into existing's before storing, only incoming's scalar fields (size, mtime,
+    /// write_seq, ...) are discarded in favor of existing's. This always writes to
+    /// file_table/path_table, stale or not; the caller must always commit and mark
+    /// the result dirty (see put_file/put_files_batch). This is deliberate: under
+    /// the per-cycle-delta push model (background-tick sends only chunks touched
+    /// since the last push, not the full cumulative history — see fuse_impl.rs),
+    /// two pushes for the same file can arrive at the leader out of write_seq
+    /// order while each still carrying a genuinely new, disjoint chunk. Treating
+    /// "stale" as "discard the whole payload" (the old behavior) silently dropped
+    /// that chunk forever. Real repro: T48's background-tick sustained-write test
+    /// losing exactly one chunk under full-suite timing pressure, even after the
+    /// dissemination/queue-coalescing/existing-base-union fixes elsewhere in this
+    /// file — this was the fourth and deepest layer of the same underlying issue.
     ///
-    /// Returns the stored/stale result plus any old file_id removed due to a path
-    /// collision — the caller must mark both dirty after commit (see put_file's
-    /// dirty-marking comment).
+    /// Returns the stored/stale result (the persisted, merged record — not the raw
+    /// pre-merge existing) plus any old file_id removed due to a path collision —
+    /// the caller must mark both dirty after commit (see put_file's dirty-marking
+    /// comment).
     fn put_file_in_txn(
         file_table: &mut redb::Table<&str, &[u8]>,
         path_table: &mut redb::Table<&str, &[u8]>,
@@ -386,40 +394,85 @@ impl MetadataStore {
         };
 
         let merged_metadata: Option<FileMetadata>;
+        // If existing is strictly newer, incoming's *scalar* fields (size, mtime,
+        // write_seq, ...) are stale and must not overwrite existing's — but incoming's
+        // chunk_locations still need to be unioned in below. Under the per-cycle-delta
+        // push model (background-tick sends only chunks touched since the last push,
+        // not the full cumulative history), a push can arrive out of order with a
+        // LOWER write_seq while still carrying a chunk offset `existing` has never
+        // seen — e.g. two background-tick pushes for the same file racing on the
+        // network, or a queue-coalesce (MetadataQueue::push_inner) resolving in
+        // seq order but delivery completing out of order. Previously this branch
+        // returned immediately without merging, silently discarding that chunk —
+        // real repro: T48 background-tick sustained-write test losing exactly one
+        // chunk (7/8 persisted) under full-suite timing pressure, even after the
+        // dissemination/queue/put_file union fixes above — root-caused to this
+        // early bail-out never running the merge at all.
+        let is_stale = existing_opt.as_ref().is_some_and(|existing| {
+            existing.write_seq > 0 && metadata.write_seq > 0 && existing.write_seq > metadata.write_seq
+        });
         let metadata_to_store: &FileMetadata = if let Some(existing) = existing_opt {
-            // Drop stale incoming write if existing is strictly newer.
-            if existing.write_seq > 0
-                && metadata.write_seq > 0
-                && existing.write_seq > metadata.write_seq
-            {
+            if is_stale {
                 debug!(
-                    "Dropping stale metadata for {} (existing write_seq={} > incoming={})",
+                    "Merging (not dropping) stale-scalar metadata for {} (existing write_seq={} > incoming={}) — chunk_locations still unioned",
                     metadata.path, existing.write_seq, metadata.write_seq
                 );
-                return Ok((PutFileResult::Stale(existing), None));
             }
 
-            // Merge chunk locations — Rule 1 (same chunk_id: merge node lists),
-            // Rule 2 (same offset, different chunk_id: keep newer by client_write_seq).
-            let existing_by_id: std::collections::HashMap<ChunkId, &dfs_common::ChunkLocation> =
-                existing.chunk_locations.iter().map(|loc| (loc.chunk_id, loc)).collect();
-            let existing_by_offset: std::collections::HashMap<u64, &dfs_common::ChunkLocation> =
-                existing.chunk_locations.iter()
-                    .filter_map(|loc| loc.file_offset.map(|o| (o, loc)))
-                    .collect();
+            // Merge chunk_locations as a TRUE UNION, starting from EXISTING (the
+            // persisted record) rather than the incoming payload. This matters
+            // because incoming may be only a partial, non-cumulative delta (routine
+            // writes now send just the chunks touched this cycle, not the full
+            // history — see fuse_impl.rs's flush_buffer_async). Starting from
+            // incoming (the old approach) silently dropped any chunk recorded in
+            // existing but absent from incoming — safe only as long as some upstream
+            // step (e.g. handle_put_file_metadata's chunk_map reconcile) had already
+            // expanded incoming to a full list, which isn't guaranteed under
+            // concurrent/rapid pushes where chunk_map itself can lag behind the
+            // delta currently arriving. Starting from existing means anything not
+            // mentioned by incoming simply survives untouched, regardless of how
+            // partial incoming is or how stale chunk_map was upstream.
+            //
+            // Per-entry reconciliation rules are unchanged from before: Rule 1
+            // (same chunk_id already present: union node lists, keep incoming's
+            // other fields) and Rule 2 (different chunk_id at the same offset: keep
+            // whichever is newer by client_write_seq/written_at, falling back to
+            // file-level write_seq). Matched by chunk_id first, then by offset —
+            // same priority as before, since a chunk_id is a content hash of
+            // (file_id, offset, data) and in practice never appears at two
+            // different offsets for the same file.
+            let mut merged_locs: Vec<ChunkLocation> = existing.chunk_locations.as_ref().clone();
+            let mut id_index: std::collections::HashMap<ChunkId, usize> = merged_locs.iter()
+                .enumerate().map(|(i, l)| (l.chunk_id, i)).collect();
+            let mut offset_index: std::collections::HashMap<u64, usize> = merged_locs.iter()
+                .enumerate().filter_map(|(i, l)| l.file_offset.map(|o| (o, i))).collect();
 
-            let mut cloned = metadata.clone();
-            for loc in Arc::make_mut(&mut cloned.chunk_locations).iter_mut() {
-                if let Some(existing_loc) = existing_by_id.get(&loc.chunk_id) {
-                    // Rule 1: same chunk_id — merge node lists.
-                    for node in &existing_loc.nodes {
-                        if !loc.nodes.contains(node) {
-                            loc.nodes.push(*node);
+            for incoming_loc in metadata.chunk_locations.iter() {
+                if let Some(&idx) = id_index.get(&incoming_loc.chunk_id) {
+                    // Rule 1: same chunk_id already present — union node lists,
+                    // otherwise take incoming's fields (mirrors the pre-union
+                    // behavior of enriching a copy of incoming with existing's nodes).
+                    let mut new_entry = incoming_loc.clone();
+                    for node in &merged_locs[idx].nodes {
+                        if !new_entry.nodes.contains(node) {
+                            new_entry.nodes.push(*node);
                         }
                     }
-                } else if let Some(file_offset) = loc.file_offset {
-                    // Rule 2: different chunk_id at same offset — keep the newer one.
-                    if let Some(existing_loc) = existing_by_offset.get(&file_offset) {
+                    if let Some(old_offset) = merged_locs[idx].file_offset {
+                        if Some(old_offset) != new_entry.file_offset {
+                            offset_index.remove(&old_offset);
+                        }
+                    }
+                    if let Some(new_offset) = new_entry.file_offset {
+                        offset_index.insert(new_offset, idx);
+                    }
+                    merged_locs[idx] = new_entry;
+                    continue;
+                }
+                if let Some(file_offset) = incoming_loc.file_offset {
+                    if let Some(&idx) = offset_index.get(&file_offset) {
+                        // Rule 2: different chunk_id at the same offset — keep the newer one.
+                        let existing_loc = &merged_locs[idx];
                         // If the incoming file-level write_seq is strictly higher, the incoming
                         // chunk is definitively from a later write session and always wins,
                         // regardless of per-chunk client_write_seq. This covers the case where
@@ -434,25 +487,41 @@ impl MetadataStore {
                             // prevents a stale broadcast (lower cws) from winning just
                             // because the accompanying file write_seq happened to be higher.
                             matches!(
-                                (loc.client_write_seq, existing_loc.client_write_seq),
+                                (incoming_loc.client_write_seq, existing_loc.client_write_seq),
                                 (Some(inc), Some(ext)) if ext > inc
                             )
                         } else {
-                            match (loc.client_write_seq, existing_loc.client_write_seq) {
+                            match (incoming_loc.client_write_seq, existing_loc.client_write_seq) {
                                 (Some(inc), Some(ext)) => ext > inc,
                                 (Some(_), None)        => false,
                                 (None, Some(_))        => true,
                                 (None, None)           => {
-                                    existing_loc.written_at.unwrap_or(0) > loc.written_at.unwrap_or(0)
+                                    existing_loc.written_at.unwrap_or(0) > incoming_loc.written_at.unwrap_or(0)
                                 }
                             }
                         };
-                        if keep_existing {
-                            *loc = (*existing_loc).clone();
+                        if !keep_existing {
+                            id_index.remove(&merged_locs[idx].chunk_id);
+                            id_index.insert(incoming_loc.chunk_id, idx);
+                            merged_locs[idx] = incoming_loc.clone();
                         }
+                        continue;
                     }
                 }
+                // Genuinely new slot — append.
+                let new_idx = merged_locs.len();
+                id_index.insert(incoming_loc.chunk_id, new_idx);
+                if let Some(offset) = incoming_loc.file_offset {
+                    offset_index.insert(offset, new_idx);
+                }
+                merged_locs.push(incoming_loc.clone());
             }
+
+            // Scalar fields (size, mtime, write_seq, ...) come from whichever side is
+            // authoritative by write_seq — existing if incoming is stale, else incoming
+            // (unchanged from before this fix). chunk_locations is always the union.
+            let mut cloned = if is_stale { existing.clone() } else { metadata.clone() };
+            cloned.chunk_locations = Arc::new(merged_locs);
             merged_metadata = Some(cloned);
             merged_metadata.as_ref().unwrap()
         } else {
@@ -485,7 +554,14 @@ impl MetadataStore {
         path_table.insert(path_str, value.as_slice())
             .context("Failed to insert path index")?;
 
-        Ok((PutFileResult::Stored, old_id_str))
+        if is_stale {
+            // Still report Stale so the caller knows incoming's scalar fields lost
+            // and can converge whoever sent it — but the persisted record (returned
+            // here) now includes the union, not just existing's original chunks.
+            Ok((PutFileResult::Stale(metadata_to_store.clone()), old_id_str))
+        } else {
+            Ok((PutFileResult::Stored, old_id_str))
+        }
     }
 
     /// Store file metadata.
@@ -500,12 +576,9 @@ impl MetadataStore {
             Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?
         };
 
-        if matches!(result, PutFileResult::Stale(_)) {
-            // Nothing was mutated — see put_file_in_txn's doc comment. Dropping txn
-            // here without committing is a no-op against the live db.
-            return Ok(result);
-        }
-
+        // A Stale result no longer means "nothing was mutated" — put_file_in_txn still
+        // unions incoming's chunk_locations into existing's before returning Stale, so
+        // this transaction must always commit or that merge is silently rolled back.
         txn.commit()?;
 
         // Mark touched keys dirty for compact_db_with_budget's incremental catch-up —
@@ -555,12 +628,12 @@ impl MetadataStore {
             let mut path_table = txn.open_table(PATH_TABLE)?;
             for metadata in items {
                 let (result, old_id_str) = Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?;
-                if !matches!(result, PutFileResult::Stale(_)) {
-                    touched_file_ids.push(format!("{}", metadata.id));
-                    touched_paths.push(metadata.path.clone());
-                    if let Some(old_id) = old_id_str {
-                        touched_file_ids.push(old_id);
-                    }
+                // Stale results still mutate (chunk_locations union — see put_file_in_txn),
+                // so they must be marked dirty too, same as Stored.
+                touched_file_ids.push(format!("{}", metadata.id));
+                touched_paths.push(metadata.path.clone());
+                if let Some(old_id) = old_id_str {
+                    touched_file_ids.push(old_id);
                 }
                 results.push(result);
             }
@@ -2230,6 +2303,120 @@ mod tests {
         let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
         assert_eq!(retrieved.path, "/test.txt");
         assert_eq!(retrieved.size, 1024);
+    }
+
+    /// Regression test for a real bug found via T48 under full local-suite load
+    /// (2026-07-07): put_file's chunk_locations merge must be a true union starting
+    /// from the PERSISTED record, not from the incoming payload. Routine writes now
+    /// send only the chunks touched this cycle (a partial, non-cumulative delta —
+    /// see fuse_impl.rs's flush_buffer_async), relying on this merge to preserve
+    /// whatever the incoming update doesn't mention. Starting from incoming (the old
+    /// behavior) silently dropped any chunk recorded in the existing record but
+    /// absent from incoming — this was masked in most cases by handle_put_file_metadata's
+    /// upstream chunk_map reconcile pre-expanding incoming to a full list, but that
+    /// reconcile is only as fresh as chunk_map itself, which can lag behind concurrent
+    /// pushes — put_file must not depend on it.
+    #[test]
+    fn test_put_file_preserves_existing_chunks_when_incoming_is_partial() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let node = NodeId::new();
+
+        let mut metadata = FileMetadata::new("/partial_merge.bin".to_string(), FileType::RegularFile);
+        metadata.write_seq = 1;
+        let loc0 = dfs_common::ChunkLocation {
+            chunk_id: ChunkId::from_hash([1u8; 32]),
+            nodes: vec![node],
+            size: 4 * 1024 * 1024,
+            checksum: [1u8; 32],
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: Some(1),
+            file_id: Some(metadata.id),
+        };
+        metadata.chunk_locations = Arc::new(vec![loc0.clone()]);
+        store.put_file(&metadata).unwrap();
+
+        // Second push describes ONLY a new chunk at a different offset — a partial,
+        // non-cumulative delta, exactly what the routine background-tick/force-flush
+        // paths send since 2026-07-07. Must not lose loc0.
+        let mut update = metadata.clone();
+        update.write_seq = 2;
+        let loc1 = dfs_common::ChunkLocation {
+            chunk_id: ChunkId::from_hash([2u8; 32]),
+            nodes: vec![node],
+            size: 4 * 1024 * 1024,
+            checksum: [2u8; 32],
+            file_offset: Some(4 * 1024 * 1024),
+            written_at: None,
+            client_write_seq: Some(1),
+            file_id: Some(metadata.id),
+        };
+        update.chunk_locations = Arc::new(vec![loc1.clone()]);
+        store.put_file(&update).unwrap();
+
+        let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
+        let offsets: std::collections::HashSet<Option<u64>> = retrieved.chunk_locations
+            .iter().map(|l| l.file_offset).collect();
+        assert!(offsets.contains(&loc0.file_offset), "chunk from the earlier push must survive a later partial update");
+        assert!(offsets.contains(&loc1.file_offset), "chunk from the later partial update must be present");
+        assert_eq!(retrieved.chunk_locations.len(), 2, "must be a union, not just the incoming payload");
+    }
+
+    /// Regression test for the fourth and deepest layer of the T48 background-tick
+    /// chunk-loss bug (2026-07-07): a push that arrives OUT OF ORDER with a lower
+    /// write_seq than what's already persisted must still have its chunk_locations
+    /// unioned in, not be dropped wholesale as "stale". Under the per-cycle-delta
+    /// push model, an out-of-order push can carry a genuinely new chunk offset that
+    /// the newer-write_seq record never mentioned.
+    #[test]
+    fn test_put_file_unions_chunks_from_an_out_of_order_stale_push() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let node = NodeId::new();
+
+        let mut metadata = FileMetadata::new("/stale_union.bin".to_string(), FileType::RegularFile);
+        metadata.write_seq = 2;
+        let loc1 = dfs_common::ChunkLocation {
+            chunk_id: ChunkId::from_hash([4u8; 32]),
+            nodes: vec![node],
+            size: 4 * 1024 * 1024,
+            checksum: [4u8; 32],
+            file_offset: Some(4 * 1024 * 1024),
+            written_at: None,
+            client_write_seq: Some(2),
+            file_id: Some(metadata.id),
+        };
+        metadata.chunk_locations = Arc::new(vec![loc1.clone()]);
+        store.put_file(&metadata).unwrap();
+
+        // A delayed push for the SAME file arrives after, but describes an EARLIER
+        // write (write_seq=1 < stored 2) — e.g. two background-tick pushes raced on
+        // the network. It carries a chunk at a different offset that the stored
+        // record has never seen.
+        let mut stale_push = metadata.clone();
+        stale_push.write_seq = 1;
+        let loc0 = dfs_common::ChunkLocation {
+            chunk_id: ChunkId::from_hash([3u8; 32]),
+            nodes: vec![node],
+            size: 4 * 1024 * 1024,
+            checksum: [3u8; 32],
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: Some(1),
+            file_id: Some(metadata.id),
+        };
+        stale_push.chunk_locations = Arc::new(vec![loc0.clone()]);
+        let result = store.put_file(&stale_push).unwrap();
+        assert!(matches!(result, PutFileResult::Stale(_)), "lower write_seq than stored must still report Stale");
+
+        let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
+        assert_eq!(retrieved.write_seq, 2, "scalar fields must come from the newer (existing) side, not the stale push");
+        let offsets: std::collections::HashSet<Option<u64>> = retrieved.chunk_locations
+            .iter().map(|l| l.file_offset).collect();
+        assert!(offsets.contains(&loc0.file_offset), "chunk from the out-of-order stale push must survive, not be silently dropped");
+        assert!(offsets.contains(&loc1.file_offset), "chunk from the newer record must still be present");
+        assert_eq!(retrieved.chunk_locations.len(), 2, "must be a union, not a wholesale discard of the stale push");
     }
 
     #[test]

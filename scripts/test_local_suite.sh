@@ -3474,6 +3474,92 @@ check "T46c new file's chunk-0 is not contaminated with the old file's content" 
 rm -f "$T46_FILE"
 fi # should_run T46
 
+# ── Test 48: background-tick metadata push must not lose chunk_locations ─────
+#
+# Regression test for a real-world finding: a large qcow2 disk write's metadata
+# round-trip latency climbed from ~1.5ms to ~40-49ms as chunk_locations grew past
+# ~1300 entries, because flush_buffer_async's background-tick push (the non-force
+# branch, throttled to once per 2s but NOT payload-trimmed) sent the file's entire,
+# ever-growing chunk_locations Vec on every push. The force/fsync branch already
+# sent only the newly-flushed locations (all_locations) for this exact reason; the
+# background-tick branch was missed. Fixed by applying the same trim there.
+#
+# This test writes several separate 4MB-aligned chunks to the SAME open file
+# descriptor with pauses long enough for the background tick's own 2s throttle to
+# fire independently between writes (no explicit fsync in between — fsync takes
+# the already-fixed force branch, so avoiding it is what actually exercises the
+# code path this regression lives in). If the fix regressed — e.g. sending a
+# genuinely non-cumulative chunk_locations that the server misread as a
+# truncate-to-zero — chunk_locations would have been lost partway through, and
+# either the read-back content or the leader's persisted chunk count would show it.
+echo ""
+echo "=== T48: background-tick metadata push preserves chunk_locations under sustained writes ==="
+snapshot_log T48
+if should_run T48; then
+T48_FILE="$MOUNT/t48_bgpush.bin"
+T48_CHUNKS=8
+T48_CHUNK_BYTES=$(( 4 * 1024 * 1024 ))
+
+# Run the writer in the background and keep the fd open across all chunks — the
+# CRITICAL part of this test is checking metadata WHILE the file is still open,
+# before close()/release() ever runs. release() takes the already-correct
+# force/fsync branch (full reconcile against chunk_map), which would silently
+# repair any corruption the background-tick branch caused in between — checking
+# only after close would never see the regression this test exists to catch.
+python3 -c "
+import os, time, sys
+path, chunks, chunk_bytes = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+for i in range(chunks):
+    os.write(fd, bytes([i % 256]) * chunk_bytes)
+    # No fsync here on purpose — see this test's header comment.
+    time.sleep(2.5)
+os.close(fd)
+" "$T48_FILE" "$T48_CHUNKS" "$T48_CHUNK_BYTES" &
+T48_WRITER_PID=$!
+
+# Let ~4 of the 8 chunks land (each write + 2.5s sleep), giving the background
+# tick's own 2s throttle multiple chances to fire, then check the leader's
+# persisted view WHILE the writer still holds the fd open.
+sleep 11
+T48_MIDWRITE_COUNT=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t48_bgpush.bin 2>/dev/null \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('chunk_locations', [])))" 2>/dev/null)
+echo "  T48: mid-write (file still open), leader reports $T48_MIDWRITE_COUNT chunk(s) (~4 expected so far)"
+T48_MIDWRITE_OK=PASS
+[ "${T48_MIDWRITE_COUNT:-0}" -ge 3 ] || T48_MIDWRITE_OK=FAIL
+check "T48a mid-write: background-tick pushes keep chunk_locations growing, not truncated to empty" "$T48_MIDWRITE_OK"
+
+wait "$T48_WRITER_PID"
+dfs_sync
+
+T48_OK=PASS
+python3 -c "
+import sys
+path, chunks, chunk_bytes = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(path, 'rb') as f:
+    for i in range(chunks):
+        data = f.read(chunk_bytes)
+        expected = bytes([i % 256]) * chunk_bytes
+        if data != expected:
+            print(f'chunk {i} MISMATCH: got {len(data)} bytes, expected first byte {i % 256}, got {data[0] if data else None}')
+            sys.exit(1)
+print('all chunks verified')
+" "$T48_FILE" "$T48_CHUNKS" "$T48_CHUNK_BYTES" || T48_OK=FAIL
+check "T48b all chunks intact after sustained background-tick pushes" "$T48_OK"
+
+# Cross-check the leader's own persisted view — the exact regression this guards
+# against is a background push silently truncating FILE_TABLE's chunk_locations,
+# which read-back alone might not catch if the client's local cache masks it.
+T48_CHUNK_COUNT=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t48_bgpush.bin 2>/dev/null \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('chunk_locations', [])))" 2>/dev/null)
+echo "  T48: dfs-admin reports $T48_CHUNK_COUNT chunk(s) for the file (expect $T48_CHUNKS)"
+[ "${T48_CHUNK_COUNT:-0}" -eq "$T48_CHUNKS" ] \
+    && check "T48c persisted metadata shows all chunks (not truncated by background push)" PASS \
+    || check "T48c persisted metadata shows all chunks (not truncated by background push): got ${T48_CHUNK_COUNT:-0}, want $T48_CHUNKS" FAIL
+
+rm -f "$T48_FILE"
+fi # should_run T48
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

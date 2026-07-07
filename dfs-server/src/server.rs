@@ -1112,7 +1112,10 @@ impl Server {
                         continue;
                     }
 
-                    let req = Request::PutFileMetadata { metadata: metadata.clone() };
+                    let req = Request::PutFileMetadata {
+                        metadata: metadata.clone(),
+                        covers_from_write_seq: metadata.write_seq,
+                    };
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         server.client.send_message(leader_addr, Message::Request(req)),
@@ -1612,9 +1615,9 @@ impl Server {
                 self.ops_tracker.inc_meta();
                 self.handle_get_file_metadata_by_path(path, if_modified_since).await
             }
-            Request::PutFileMetadata { metadata } => {
+            Request::PutFileMetadata { metadata, covers_from_write_seq } => {
                 self.ops_tracker.inc_meta();
-                self.handle_put_file_metadata(metadata).await
+                self.handle_put_file_metadata(metadata, covers_from_write_seq).await
             }
             Request::ListDirectory { path } => {
                 self.ops_tracker.inc_meta();
@@ -4249,13 +4252,49 @@ impl Server {
         });
     }
 
+    /// Detect a genuine write_seq gap, distinct from a benign coalesced jump.
+    ///
+    /// `covers_from_write_seq` is the lowest write_seq the incoming push's
+    /// chunk_locations fully accounts for (see Request::PutFileMetadata's doc
+    /// comment) — equal to `incoming_write_seq` for a standalone push, lower when
+    /// the client's MetadataQueue coalesced multiple pending pushes for this file
+    /// into one before sending (their chunk_locations were unioned first). As long
+    /// as every stamped write_seq ends up represented in some push that reaches the
+    /// leader — standalone or coalesced — covers_from_write_seq <= stored+1 always
+    /// holds. A higher value means write_seq range [stored+1, covers_from-1] was
+    /// never represented in anything we've seen: the client crashed before
+    /// delivering it, or there's a bug in queue coalescing/delivery (this is
+    /// exactly the class of bug fixed across 4 layers in commit 08a6201 — see
+    /// project memory project_t48_four_layer_chunk_drop_fix). This check is pure
+    /// detection: it only logs, never changes what gets persisted.
+    ///
+    /// write_seq==0 means "not using write_seq ordering for this push" (matches the
+    /// sentinel convention used by the stale-write guard elsewhere) — always
+    /// returns None in that case rather than false-positive on it.
+    fn detect_metadata_write_seq_gap(
+        stored_write_seq: u64,
+        covers_from_write_seq: u64,
+        incoming_write_seq: u64,
+    ) -> Option<(u64, u64)> {
+        if incoming_write_seq > 0 && covers_from_write_seq > stored_write_seq + 1 {
+            Some((stored_write_seq + 1, covers_from_write_seq - 1))
+        } else {
+            None
+        }
+    }
+
     /// Handle put file metadata request.
     ///
     /// If this node is not the leader, return NotLeader so the client can redirect.
     /// The leader stores locally, enqueues for followers, and returns Ok.
     /// A non-leader that receives a direct write (e.g. quorum replica) stores locally
     /// only — the leader will disseminate to the remaining followers.
-    async fn handle_put_file_metadata(&self, metadata: FileMetadata) -> Response {
+    ///
+    /// `covers_from_write_seq`: the lowest write_seq this push's chunk_locations
+    /// fully accounts for (see Request::PutFileMetadata's doc comment). Used purely
+    /// as a detection signal — see the gap check below — never to change what gets
+    /// persisted.
+    async fn handle_put_file_metadata(&self, metadata: FileMetadata, covers_from_write_seq: u64) -> Response {
         info!(
             "[META SERVER] put path={} id={} seq={} size={} is_leader={}",
             metadata.path, metadata.id, metadata.write_seq, metadata.size,
@@ -4321,6 +4360,20 @@ impl Server {
         let incoming_write_seq = metadata.write_seq;
         if incoming_write_seq > stored_write_seq {
             self.file_write_seqs.insert(metadata.id, incoming_write_seq);
+        }
+        // Gap detection — see detect_metadata_write_seq_gap's doc comment for the
+        // reasoning (legitimate coalescing vs. genuine loss).
+        if let Some((missing_from, missing_to)) = Self::detect_metadata_write_seq_gap(
+            stored_write_seq, covers_from_write_seq, incoming_write_seq,
+        ) {
+            warn!(
+                "[META GAP] path={} id={} stored_write_seq={} covers_from_write_seq={} \
+                 incoming_write_seq={} — write_seq {}..{} was never represented in any \
+                 push that reached this leader (client crash before delivery, or a bug \
+                 in queue coalescing/delivery)",
+                metadata.path, metadata.id, stored_write_seq, covers_from_write_seq,
+                incoming_write_seq, missing_from, missing_to
+            );
         }
         // The leader's chunk_map is updated by ReplicateChunkLocation (RCL) after each
         // confirmed write. When RCL succeeds, chunk_map is authoritative and newer than
@@ -4576,7 +4629,10 @@ impl Server {
                     }
                 };
                 for newer in corrections {
-                    let req = dfs_common::Request::PutFileMetadata { metadata: newer.clone() };
+                    let req = dfs_common::Request::PutFileMetadata {
+                        metadata: newer.clone(),
+                        covers_from_write_seq: newer.write_seq,
+                    };
                     match client.send_message(leader_addr, dfs_common::Message::Request(req)).await {
                         Ok(_) => debug!("disseminate correction: sent write_seq={} for {} to leader",
                                         newer.write_seq, newer.path),
@@ -7338,6 +7394,60 @@ mod tests {
     use super::*;
     use dfs_common::hash::compute_chunk_hash;
     use tempfile::TempDir;
+
+    /// Regression tests for the write_seq gap-detection defense-in-depth added
+    /// alongside the 4-layer chunk_locations drop fix (2026-07-07, commit 08a6201).
+    /// The check must fire on a genuine, unaccounted-for gap but stay silent on a
+    /// legitimate MetadataQueue coalesce (where covers_from_write_seq widens to
+    /// include everything that was merged before sending).
+    mod write_seq_gap_detection {
+        use super::*;
+
+        #[test]
+        fn no_gap_for_a_normal_standalone_push() {
+            // stored=5, next push write_seq=6, covers_from=6 (no coalescing).
+            assert_eq!(Server::detect_metadata_write_seq_gap(5, 6, 6), None);
+        }
+
+        #[test]
+        fn no_gap_for_a_legitimate_coalesced_push() {
+            // Client coalesced write_seq 6 and 7 into one push before sending:
+            // covers_from=6, write_seq=7. stored=5 — fully bridged, no gap.
+            assert_eq!(Server::detect_metadata_write_seq_gap(5, 6, 7), None);
+        }
+
+        #[test]
+        fn no_gap_on_brand_new_file_first_push() {
+            assert_eq!(Server::detect_metadata_write_seq_gap(0, 1, 1), None);
+        }
+
+        #[test]
+        fn detects_a_genuine_gap() {
+            // stored=5, push arrives at write_seq=8 claiming covers_from=8 (not
+            // coalesced) — write_seq 6 and 7 were never represented in anything
+            // that reached the leader.
+            assert_eq!(Server::detect_metadata_write_seq_gap(5, 8, 8), Some((6, 7)));
+        }
+
+        #[test]
+        fn detects_a_partially_coalesced_gap() {
+            // Client coalesced 7 and 8 together (covers_from=7), but 6 is still
+            // missing — stored=5, so [6,6] was never represented anywhere.
+            assert_eq!(Server::detect_metadata_write_seq_gap(5, 7, 8), Some((6, 6)));
+        }
+
+        #[test]
+        fn write_seq_zero_is_never_flagged() {
+            // write_seq=0 means "not using write_seq ordering" — must not false-positive.
+            assert_eq!(Server::detect_metadata_write_seq_gap(0, 5, 0), None);
+        }
+
+        #[test]
+        fn stale_resend_is_not_a_gap() {
+            // A retried/duplicate push at or below stored is not a gap.
+            assert_eq!(Server::detect_metadata_write_seq_gap(10, 5, 5), None);
+        }
+    }
 
     #[tokio::test]
     async fn test_server_write_read_local() {

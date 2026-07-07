@@ -206,6 +206,15 @@ pub enum Request {
     /// Put file metadata (create or update)
     PutFileMetadata {
         metadata: FileMetadata,
+        /// Lowest write_seq this push's chunk_locations fully accounts for. Equal to
+        /// metadata.write_seq for a standalone push; lower when the client's
+        /// MetadataQueue coalesced multiple pending pushes for this file into one
+        /// (their chunk_locations were unioned before sending — see
+        /// MetadataQueue::push_inner). Lets the server tell "this jump in write_seq
+        /// is fully accounted for by coalescing" apart from "some write_seq in
+        /// between was never represented in any push that reached us" — see
+        /// handle_put_file_metadata's gap check.
+        covers_from_write_seq: u64,
     },
 
     /// List directory contents

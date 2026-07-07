@@ -358,6 +358,12 @@ struct MetadataEntry {
     enqueued_at: Instant,
     /// If Some, worker signals this channel after delivery (release/sync path).
     done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Lowest write_seq this entry's (possibly coalesced) chunk_locations fully
+    /// accounts for. Starts equal to the entry's own write_seq; lowered by min()
+    /// on every coalesce merge in push_inner, since coalescing unions in an older
+    /// push's chunk_locations too. Sent to the server as covers_from_write_seq so
+    /// it can distinguish a benign coalesced write_seq jump from a genuine gap.
+    covers_from_write_seq: u64,
 }
 
 impl MetadataQueue {
@@ -461,6 +467,11 @@ impl MetadataQueue {
                 // in the persisted chunk count under concurrent/rapid flush cycles.
                 // Dedup by file_offset: a genuine conflict (same offset, both sides
                 // recorded a write to it) prefers the scalar-comparison winner's version.
+                // This coalesce is absorbing incoming's write_seq into entry — entry's
+                // covers_from must widen to include it, regardless of which side wins
+                // the scalar comparison below.
+                entry.covers_from_write_seq = entry.covers_from_write_seq.min(metadata.write_seq);
+
                 let winner_is_incoming = metadata.write_seq >= entry.metadata.write_seq;
                 let (base_locs, other_locs) = if winner_is_incoming {
                     (&metadata.chunk_locations, &entry.metadata.chunk_locations)
@@ -523,7 +534,8 @@ impl MetadataQueue {
         );
         let pos = q.len();
         idx.insert(metadata.id, pos);
-        q.push_back(MetadataEntry { metadata, enqueued_at: Instant::now(), done_tx });
+        let covers_from_write_seq = metadata.write_seq;
+        q.push_back(MetadataEntry { metadata, enqueued_at: Instant::now(), done_tx, covers_from_write_seq });
         drop(q);
         drop(idx);
         self.notify.notify_one();
@@ -6232,10 +6244,17 @@ leader_addr: Arc::new(RwLock::new(None)),
     ///   2. If the response is NotLeader{leader_addr}, update our cached leader and retry.
     ///   3. After getting leader ack, send to one non-leader for durability (fire-and-forget).
     ///   4. Up to 4 retries total; on exhaustion, fall back to single-node write.
+    ///
+    /// `covers_from_write_seq`: pass the queue entry's coalesced lower bound when
+    /// called from the metadata-queue worker/rescue paths; None for any standalone
+    /// send (defaults to metadata.write_seq — i.e. "this push only accounts for
+    /// itself"). See MetadataEntry::covers_from_write_seq and
+    /// handle_put_file_metadata's gap check.
     pub async fn put_file_metadata_with_quorum(
         &self,
         metadata: &FileMetadata,
-        _replica_nodes: Option<(SocketAddr, SocketAddr)>
+        _replica_nodes: Option<(SocketAddr, SocketAddr)>,
+        covers_from_write_seq: Option<u64>,
     ) -> Result<()> {
         let nodes = self.cluster_nodes.read().await.clone();
         if nodes.is_empty() {
@@ -6245,7 +6264,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         // --- Step 1: Send to leader with time-based retry. ---
         // Uses send_to_leader_with_retry which retries for up to 15s on network failures,
         // following NotLeader redirects immediately.
-        let req = Request::PutFileMetadata { metadata: metadata.clone() };
+        let req = Request::PutFileMetadata {
+            metadata: metadata.clone(),
+            covers_from_write_seq: covers_from_write_seq.unwrap_or(metadata.write_seq),
+        };
         match self.send_to_leader_with_retry(req).await? {
             Response::Ok { .. } => {}
             Response::Error { message, .. } => anyhow::bail!("PutFileMetadata: {}", message),
@@ -6272,6 +6294,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     async fn put_file_metadata_single(&self, metadata: &FileMetadata) -> Result<()> {
         let request = Request::PutFileMetadata {
             metadata: metadata.clone(),
+            covers_from_write_seq: metadata.write_seq,
         };
 
         // Track which node handles the write for read-after-write consistency
@@ -6296,7 +6319,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Automatically uses quorum writes when enough nodes are available
     pub async fn put_file_metadata(&self, metadata: &FileMetadata) -> Result<()> {
         // Use quorum writes by default (will fall back internally if not enough nodes)
-        self.put_file_metadata_with_quorum(metadata, None).await
+        self.put_file_metadata_with_quorum(metadata, None, None).await
     }
 
     /// Seed the per-file write sequence counter from an existing server record.
@@ -6370,7 +6393,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // Attempt 1: normal quorum write with 2s timeout.
                     let delivered = tokio::time::timeout(
                         Duration::from_secs(2),
-                        self.put_file_metadata_with_quorum(&stalled.metadata, None),
+                        self.put_file_metadata_with_quorum(
+                            &stalled.metadata, None, Some(stalled.covers_from_write_seq),
+                        ),
                     ).await.ok().and_then(|r| r.ok()).is_some();
 
                     if delivered {
@@ -6381,12 +6406,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                         *self.leader_addr.write().await = None;
                         let nodes = self.cluster_nodes.read().await.clone();
                         let meta = stalled.metadata.clone();
+                        let covers_from_write_seq = stalled.covers_from_write_seq;
                         let rescued = if !nodes.is_empty() {
                             let futs: Vec<_> = nodes.iter().map(|&addr| {
                                 let client = self.clone();
                                 let m = meta.clone();
                                 async move {
-                                    let req = Request::PutFileMetadata { metadata: m };
+                                    let req = Request::PutFileMetadata { metadata: m, covers_from_write_seq };
                                     match tokio::time::timeout(
                                         Duration::from_secs(2),
                                         client.send_request(addr, req),
@@ -6568,7 +6594,9 @@ leader_addr: Arc::new(RwLock::new(None)),
                     loop {
                         let result = tokio::time::timeout(
                             Duration::from_secs(2),
-                            client.put_file_metadata_with_quorum(&entry.metadata, None),
+                            client.put_file_metadata_with_quorum(
+                                &entry.metadata, None, Some(entry.covers_from_write_seq),
+                            ),
                         ).await;
                         match result {
                             Ok(Ok(())) => {

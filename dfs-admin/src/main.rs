@@ -1413,7 +1413,10 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
     println!("Updating metadata on {} nodes...", all_nodes.len());
     let mut metadata_ok = 0;
     for &node in &all_nodes {
-        match send_request(node, Request::PutFileMetadata { metadata: new_metadata.clone() }).await {
+        match send_request(node, Request::PutFileMetadata {
+            metadata: new_metadata.clone(),
+            covers_from_write_seq: new_metadata.write_seq,
+        }).await {
             Ok(Response::Ok { .. }) => { metadata_ok += 1; }
             Ok(Response::Error { message, .. }) => { warn!("Metadata update failed on {}: {}", node, message); }
             Err(e) => { warn!("Failed to reach {} for metadata update: {}", node, e); }

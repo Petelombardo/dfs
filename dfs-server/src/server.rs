@@ -182,6 +182,28 @@ pub struct Server {
     /// write has landed, without polling.
     sled_write_progress: Arc<tokio::sync::Notify>,
 
+    /// FileIds with a rename currently in flight in handle_rename_file — from
+    /// just before its wait_for_pending_metadata_write check through the old
+    /// path's index deletion. This is the mirror image of pending_metadata_writes:
+    /// that one makes a rename wait for a write queued *before* it started: this
+    /// one makes a regular metadata push (write/setattr/release/ticker — anything
+    /// that isn't itself a rename) wait for a rename *currently in progress* before
+    /// snapping its `.path` field to the canonical one in handle_put_file_metadata.
+    /// Without this, a push whose enqueue-time snap-check races a concurrent
+    /// rename that hasn't committed its new path to redb *yet* sees no mismatch,
+    /// gets queued carrying the old path, and resurrects the old PATH_TABLE entry
+    /// whenever the batching worker eventually drains it — independent of (and
+    /// unprotected by) pending_metadata_writes, since that push was never queued
+    /// *before* the rename's own wait check ran. See rename_progress and
+    /// wait_for_pending_rename.
+    pending_renames: Arc<dashmap::DashSet<FileId>>,
+
+    /// Fired by handle_rename_file when it finishes (success or error) and
+    /// removes a file_id from pending_renames. Paired with pending_renames to let
+    /// wait_for_pending_rename block until a specific file's in-flight rename has
+    /// resolved, without polling.
+    rename_progress: Arc<tokio::sync::Notify>,
+
     /// Per-chunk serialization locks for MultiPatch.
     /// Serializes all patches to the same (FileId, chunk_idx) pair so that two
     /// concurrent patches (A→B and B→C) cannot race in spawn_blocking: without
@@ -263,6 +285,31 @@ pub struct Server {
 /// Folding only resolves ordering/dedup *within* this batch — a late-arriving
 /// straggler from a different batch still goes through put_file_in_txn's normal
 /// staleness guard against whatever's already committed in redb, unchanged.
+/// RAII marker for "a rename of this file_id is currently in flight" — see
+/// pending_renames/wait_for_pending_rename's doc comments for why this exists.
+/// Insert on construction, remove (and wake any waiters) on drop, so every exit
+/// path out of handle_rename_file (success, error, or an early `return`) clears
+/// the marker automatically without needing matching cleanup at each return site.
+struct PendingRenameGuard {
+    pending_renames: Arc<dashmap::DashSet<FileId>>,
+    rename_progress: Arc<tokio::sync::Notify>,
+    file_id: FileId,
+}
+
+impl PendingRenameGuard {
+    fn new(pending_renames: Arc<dashmap::DashSet<FileId>>, rename_progress: Arc<tokio::sync::Notify>, file_id: FileId) -> Self {
+        pending_renames.insert(file_id);
+        Self { pending_renames, rename_progress, file_id }
+    }
+}
+
+impl Drop for PendingRenameGuard {
+    fn drop(&mut self) {
+        self.pending_renames.remove(&self.file_id);
+        self.rename_progress.notify_waiters();
+    }
+}
+
 fn fold_metadata_batch(items: Vec<FileMetadata>) -> Vec<FileMetadata> {
     let mut order: Vec<FileId> = Vec::new();
     let mut acc: std::collections::HashMap<FileId, FileMetadata> =
@@ -721,6 +768,8 @@ impl Server {
         let sled_write_backlog: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pending_metadata_writes: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
         let sled_write_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let pending_renames: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
+        let rename_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
         let sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>> = {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
             let meta_bg = metadata.clone();
@@ -886,6 +935,8 @@ impl Server {
             sled_write_tx,
             pending_metadata_writes,
             sled_write_progress,
+            pending_renames,
+            rename_progress,
         };
 
         server
@@ -1111,6 +1162,13 @@ impl Server {
             } else {
                 metadata.chunk_locations.as_ref().clone()
             };
+            // Drop any file_offset:None entries before they enter chunk_map — see
+            // merge_file_metadata's matching guard for why: such an entry carries
+            // no reliable position in the current chunk_idx-keyed model, and once
+            // adopted here it becomes the seed for every future merge/broadcast to
+            // propagate (chunk_map is exactly what the metadata healer and
+            // dissemination paths copy wholesale into outgoing FileMetadata).
+            let new_locs: Vec<ChunkLocation> = new_locs.into_iter().filter(|l| l.file_offset.is_some()).collect();
             for loc in new_locs.iter() {
                 self.chunk_to_file.insert(loc.chunk_id, metadata.id);
             }
@@ -5167,12 +5225,18 @@ impl Server {
         // used by chunk_map_update's GHOST-reversion guard. Fresh writes (written_at=None)
         // from the client always win; a timestamped server entry only wins if its timestamp
         // is strictly greater than the client's.
+        // A regular metadata update (write/setattr/release, or the background
+        // ticker) must never move a file's path — only RenameFile does that. This
+        // request may have been built before a concurrent rename completed. Wait
+        // for any in-flight rename on this file_id to finish BEFORE reading
+        // "current canonical path" below — otherwise a rename that's still mid-
+        // commit leaves redb showing the old path, the snap-check below sees no
+        // mismatch, and this stale push proceeds carrying the old path (see
+        // wait_for_pending_rename's doc comment for the full race).
+        self.wait_for_pending_rename(metadata.id).await;
         let metadata = {
             let mut m = metadata;
-            // A regular metadata update (write/setattr/release) must never move a
-            // file's path — only RenameFile does that. This request may have been
-            // built before a concurrent rename completed, so it can carry the old
-            // path. Snap to the current canonical path so it can't resurrect the
+            // Snap to the current canonical path so this push can't resurrect the
             // old path index entry or strand its fields (e.g. modified_at) under
             // a stale path key that get_file_by_path will never see again.
             if let Ok(Some(existing)) = self.metadata.get_file(&m.id) {
@@ -5292,6 +5356,30 @@ impl Server {
         loop {
             let notified = self.sled_write_progress.notified();
             if !self.pending_metadata_writes.contains(&file_id) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Block until any rename currently in flight for `file_id` (see
+    /// PendingRenameGuard) has finished. A no-op if none is in progress.
+    ///
+    /// Mirrors wait_for_pending_metadata_write in the other direction: a regular
+    /// metadata push (write/setattr/release/ticker — anything that isn't itself a
+    /// rename) must never let its `.path` field win over the canonical one, but
+    /// handle_put_file_metadata's snap-to-canonical-path check only asks redb what
+    /// the canonical path currently is — if a rename is *concurrently* in flight
+    /// and hasn't committed its new path yet, redb still shows the old path, the
+    /// snap-check sees no mismatch, and the stale push proceeds carrying the old
+    /// path — later resurrecting it once queued/batched onto redb, regardless of
+    /// what the rename itself eventually commits. Waiting here first closes that
+    /// gap: by the time the snap-check runs, any in-flight rename has already
+    /// committed, so redb's canonical path is guaranteed current.
+    async fn wait_for_pending_rename(&self, file_id: FileId) {
+        loop {
+            let notified = self.rename_progress.notified();
+            if !self.pending_renames.contains(&file_id) {
                 return;
             }
             notified.await;
@@ -7881,6 +7969,13 @@ impl Server {
                 };
             }
         };
+        // Mark this rename in flight for the entire remainder of this function —
+        // see PendingRenameGuard/wait_for_pending_rename's doc comments. Dropped
+        // automatically on every exit path (including the early `return`s below),
+        // so a concurrent regular metadata push for this file_id can never observe
+        // a "no mismatch yet" false negative in handle_put_file_metadata's
+        // snap-to-canonical-path check while this rename is still committing.
+        let _rename_guard = PendingRenameGuard::new(self.pending_renames.clone(), self.rename_progress.clone(), file_id);
         self.wait_for_pending_metadata_write(file_id).await;
 
         // Get existing metadata

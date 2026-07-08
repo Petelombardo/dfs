@@ -848,29 +848,37 @@ fn splice_chunk_location(
     loc: dfs_common::ChunkLocation,
     client: &Arc<DfsClient>,
 ) {
-    // chunk_locations is sorted by file_offset (None entries are legacy and pushed to the
-    // end). Use binary search instead of linear scan — O(log n) vs O(n) per flush.
-    match loc.file_offset {
-        Some(offset) => {
-            match chunk_locations.binary_search_by(|l| {
-                l.file_offset.unwrap_or(u64::MAX).cmp(&offset)
-            }) {
-                Ok(pos) => {
-                    let old_cid = chunk_locations[pos].chunk_id;
-                    if old_cid != loc.chunk_id {
-                        let client = client.clone();
-                        tokio::spawn(async move {
-                            let _ = client.chunk_cache.remove(&old_cid);
-                        });
-                    }
-                    chunk_locations[pos] = loc;
-                }
-                Err(insert_pos) => {
-                    chunk_locations.insert(insert_pos, loc);
-                }
+    // chunk_locations is sorted by file_offset. Use binary search instead of linear
+    // scan — O(log n) vs O(n) per flush.
+    //
+    // A file_offset:None `loc` carries no reliable position in the current
+    // chunk_idx-keyed model (every real write path sets file_offset) and must be
+    // dropped, not appended: appending would violate binary_search_by's
+    // sortedness assumption below for every future splice on this list, and a
+    // stray None-offset entry that happens to share a chunk_id with a real,
+    // positioned entry elsewhere in the list can later collide with and clobber
+    // it during a server-side merge (root-caused live via T48/T22's intermittent
+    // chunk-count and patched-region corruption under full-suite concurrent
+    // load — see merge_file_metadata's matching guard on the server side, fixed
+    // the same way). Symmetric with update_chunk_map_window's read-side handling
+    // of the identical case.
+    let Some(offset) = loc.file_offset else { return };
+    match chunk_locations.binary_search_by(|l| {
+        l.file_offset.unwrap_or(u64::MAX).cmp(&offset)
+    }) {
+        Ok(pos) => {
+            let old_cid = chunk_locations[pos].chunk_id;
+            if old_cid != loc.chunk_id {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let _ = client.chunk_cache.remove(&old_cid);
+                });
             }
+            chunk_locations[pos] = loc;
         }
-        None => chunk_locations.push(loc),
+        Err(insert_pos) => {
+            chunk_locations.insert(insert_pos, loc);
+        }
     }
 }
 

@@ -945,7 +945,19 @@ async fn handle_file_command(
                 Request::GetFileInfo { path: path.clone() }
             };
 
-            let response = send_request(cluster_addrs[0], request).await?;
+            // Query the leader, not cluster_addrs[0] — FILE_TABLE is only
+            // guaranteed complete/authoritative on the leader; followers catch up
+            // asynchronously via dissemination and can legitimately lag by however
+            // long that takes. Querying whichever node happens to be first in
+            // --cluster (which isn't necessarily the leader — leadership isn't
+            // pinned to any particular node) reports a stale, incomplete chunk
+            // count for a file that's actually fully committed and correct on the
+            // leader. Root-caused live via the T48 background-tick test's
+            // intermittent "got 7, want 8" failures under full-suite load: the
+            // leader's own persisted record was always correct; this command was
+            // just asking the wrong node.
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, request).await?;
 
             match response {
                 Response::FileInfo {
@@ -1078,7 +1090,10 @@ async fn handle_file_command(
             }
         }
         FileCommands::List => {
-            let response = send_request(cluster_addrs[0], Request::ListAllFiles).await?;
+            // Query the leader, not cluster_addrs[0] — see FileCommands::Info's
+            // matching comment for why.
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, Request::ListAllFiles).await?;
 
             match response {
                 Response::FileList { files, total_count } => {

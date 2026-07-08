@@ -503,6 +503,23 @@ impl MetadataStore {
             .enumerate().filter_map(|(i, l)| l.file_offset.map(|o| (o, i))).collect();
 
         for incoming_loc in incoming.chunk_locations.iter() {
+            // A file_offset:None entry carries no reliable position in the current
+            // chunk_idx-keyed file model — every real write path sets file_offset
+            // (see this loop's own doc comment above and update_chunk_map_window's
+            // matching guard on the read side, which already treats a None-offset
+            // entry as "stale/orphaned... merging it anywhere is strictly worse
+            // than leaving that slot alone"). Applying that same rule here too is
+            // the fix: without it, Rule 1 below (same chunk_id already present)
+            // blindly took incoming's fields — including a missing file_offset —
+            // clobbering a perfectly valid, correctly-positioned entry and losing
+            // its coordinate. Once merged in, that corrupted entry then persists
+            // and self-propagates through every subsequent merge and metadata
+            // fetch — root-caused live via T48/T22's intermittent chunk-count and
+            // patched-region corruption under full-suite concurrent load. Drop it
+            // instead of merging it in, symmetric with the read side.
+            if incoming_loc.file_offset.is_none() {
+                continue;
+            }
             if let Some(&idx) = id_index.get(&incoming_loc.chunk_id) {
                 // Rule 1: same chunk_id already present — union node lists,
                 // otherwise take incoming's fields (mirrors the pre-union
@@ -2743,6 +2760,64 @@ mod tests {
         assert!(offsets.contains(&loc0.file_offset), "chunk from the out-of-order stale push must survive, not be silently dropped");
         assert!(offsets.contains(&loc1.file_offset), "chunk from the newer record must still be present");
         assert_eq!(retrieved.chunk_locations.len(), 2, "must be a union, not a wholesale discard of the stale push");
+    }
+
+    /// Regression test for a real bug found live via T48/T22 under full local-suite
+    /// load (2026-07-08): a file_offset:None chunk_locations entry carries no
+    /// reliable position in the current chunk_idx-keyed file model (every real
+    /// write path sets file_offset — the read side already treats a None-offset
+    /// entry as stale/orphaned and skips it, see update_chunk_map_window in
+    /// read_engine.rs). merge_file_metadata's Rule 1 (same chunk_id already
+    /// present) used to blindly take the incoming entry's fields when a chunk_id
+    /// matched — including a missing file_offset — clobbering a perfectly valid,
+    /// correctly-positioned entry and losing its coordinate. Once merged in, the
+    /// corrupted entry then self-propagated through every subsequent merge and
+    /// metadata fetch: observed live as dfs-admin reporting one fewer chunk than
+    /// was actually written (T48c) and, more severely, patched regions reading
+    /// back as all-zero (T22c) because the position that should have resolved to
+    /// real content had been overwritten by an unpositioned duplicate.
+    #[test]
+    fn test_put_file_ignores_none_offset_entry_sharing_a_positioned_chunk_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let node = NodeId::new();
+
+        let shared_chunk_id = ChunkId::from_hash([9u8; 32]);
+
+        let mut metadata = FileMetadata::new("/none_offset_clobber.bin".to_string(), FileType::RegularFile);
+        metadata.write_seq = 1;
+        let real_chunk0 = dfs_common::ChunkLocation {
+            chunk_id: shared_chunk_id,
+            nodes: vec![node],
+            size: 4 * 1024 * 1024,
+            checksum: shared_chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: Some(1),
+            file_id: Some(metadata.id),
+        };
+        metadata.chunk_locations = Arc::new(vec![real_chunk0.clone()]);
+        store.put_file(&metadata).unwrap();
+
+        // A second push carries the SAME chunk_id (e.g. a stray/legacy record — see
+        // this test's doc comment) but with file_offset stripped. This must not be
+        // allowed to overwrite chunk 0's real, positioned entry.
+        let mut stray_push = metadata.clone();
+        stray_push.write_seq = 2;
+        let stray_entry = dfs_common::ChunkLocation {
+            file_offset: None,
+            client_write_seq: Some(2),
+            ..real_chunk0.clone()
+        };
+        stray_push.chunk_locations = Arc::new(vec![stray_entry]);
+        store.put_file(&stray_push).unwrap();
+
+        let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
+        assert_eq!(retrieved.chunk_locations.len(), 1,
+            "the None-offset duplicate must be dropped, not appended as a second entry");
+        assert_eq!(retrieved.chunk_locations[0].file_offset, Some(0),
+            "chunk 0's real position must survive — the None-offset entry must never clobber it");
+        assert_eq!(retrieved.chunk_locations[0].chunk_id, shared_chunk_id);
     }
 
     #[test]

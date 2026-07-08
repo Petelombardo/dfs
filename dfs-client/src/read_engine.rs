@@ -269,11 +269,17 @@ impl InodeReadEngine {
 
         const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
         for loc in window.into_iter() {
-            let idx = if let Some(offset) = loc.file_offset {
-                (offset / CHUNK_SIZE_U64) as usize
-            } else {
-                from
-            };
+            // A file_offset:None entry carries no reliable position — it's a stale/
+            // orphaned chunk_locations record (see the T48-class chunk_locations-
+            // hygiene gap), not a placeholder for "this window's start". Defaulting
+            // it to `idx = from` used to silently claim whatever real chunk's slot
+            // happened to sit at the window's start index (index 0 for a full
+            // from-leader refresh) — clobbering that chunk's correct ChunkLocation
+            // with an unrelated one and causing reads of a perfectly valid chunk to
+            // fetch the wrong 4MB blob. Skip it: we have no chunk_idx to place it at,
+            // and merging it anywhere is strictly worse than leaving that slot alone.
+            let Some(offset) = loc.file_offset else { continue };
+            let idx = (offset / CHUNK_SIZE_U64) as usize;
             if idx < new_map.len() {
                 // Guard: for server-refresh calls, only update if the incoming seq is
                 // strictly newer (prevents equal-seq server entries from reverting the
@@ -615,5 +621,51 @@ mod tests {
             assert_ne!(primary, addr_c);
             assert!(!fallbacks.contains(&addr_c));
         }
+    }
+
+    /// Real bug reproduced live via test_dvr_stream.sh: a stale `file_offset: None`
+    /// chunk_locations entry (leftover from the T48-class chunk_locations-hygiene
+    /// gap — confirmed via dfs-admin showing 10 chunk_locations for an 8-chunk
+    /// file) causes update_chunk_map_window's None-offset fallback
+    /// (`idx = from_chunk`, i.e. 0 for a full from-leader refresh) to collide with
+    /// chunk 0's own real slot. Whichever entry processes last in the window Vec
+    /// wins the should_update race, so chunk 0's real, correct ChunkLocation can be
+    /// silently clobbered by the stray entry — even though the stray entry's own
+    /// bytes are perfectly valid data for a DIFFERENT (unrelated) chunk. A read for
+    /// chunk 0 then fetches the wrong 4MB blob instead of erroring, which is a much
+    /// worse failure mode than the sparse-hole case this module already guards.
+    #[test]
+    fn test_stale_none_offset_entry_does_not_clobber_real_chunk_zero() {
+        const MB4: usize = 4 * 1024 * 1024;
+        let engine = InodeReadEngine::new(1);
+
+        let real_chunk0 = loc_with_nodes(chunk_id_with_hash0(1), vec![dfs_common::NodeId::new()]);
+        let real_chunk0 = ChunkLocation { file_offset: Some(0), size: MB4, ..real_chunk0 };
+        let real_chunk1 = ChunkLocation {
+            file_offset: Some(MB4 as u64),
+            ..loc_with_nodes(chunk_id_with_hash0(2), vec![dfs_common::NodeId::new()])
+        };
+        // The stray entry: a real, valid chunk elsewhere in the cluster, but with no
+        // file_offset recorded against THIS file — exactly what dfs-admin showed
+        // ("Offset: ?") for the two extra entries beyond the file's real 8 chunks.
+        let stray = ChunkLocation {
+            file_offset: None,
+            ..loc_with_nodes(chunk_id_with_hash0(99), vec![dfs_common::NodeId::new()])
+        };
+
+        // Window order matches what a real leader response looks like: real chunks
+        // in order, stray/garbage entries trailing at the end of the Vec.
+        let window = vec![real_chunk0.clone(), real_chunk1.clone(), stray.clone()];
+        engine.update_chunk_map_window(window, 0, 3, Arc::new(HashMap::new()), (2 * MB4) as u64, false);
+
+        let (map, offsets, _) = engine.snapshot();
+        assert_eq!(map[0].chunk_id, real_chunk0.chunk_id,
+            "chunk 0's real entry must survive — a stray file_offset:None record must never \
+             overwrite a real chunk's slot in the map");
+
+        let r = InodeReadEngine::chunks_for_range(&offsets, 0, 4096);
+        assert_eq!(r.len(), 1, "reading chunk 0 must resolve to exactly one entry");
+        assert_eq!(map[r[0].0].chunk_id, real_chunk0.chunk_id,
+            "reading offset 0 must fetch chunk 0's real chunk_id, not the stray entry's");
     }
 }

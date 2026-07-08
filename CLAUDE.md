@@ -11,7 +11,6 @@ We run one service in staging, a hdhomerun dvr.  It runs from /mnt/test/podman/d
 Band-aids to the code are a last-resort.  We should always try to fix the underlying problem at its root.
 Propose protocol updates if they will make our app more efficient.
 Do not push code until we verify that we do not have regressions.  Our test script is ./scripts/test_local_suite.sh
-Do not run the test suite, let the user run it and report issues.
 While it is important to make our code robust, it's imperative that we prioritize resolving the root cause of any problems.  When we identify a new problem that is difficult to resolve, we should attempt to create a local test to reproduce it so that we can easily validate when our solution works.
 
 
@@ -26,6 +25,7 @@ The suite runs 5-node local cluster on ports 8900–8904, mounts at /tmp/dfs-mou
 T1–T22. Logs go to /tmp/dfs-test-logs/. The client runs at **debug** log level so all events are
 captured. Per-test snapshots are written to T<N>.log (e.g. T7.log) so each test's log is isolated.
 When we create a new test, we should run it in an isolated manner and reproduce it, first, without the fixes so that we know if the fixes actually work.
+Pipe the output of the test suite to a log file and print the log file path to the user so that they can monitor while the tests run.
 
 ### Reading logs effectively
 

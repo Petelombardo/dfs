@@ -674,6 +674,7 @@ async fn handle_healing_command(
                     heal_max_concurrent,
                     heal_max_concurrent_per_node,
                     heal_transfer_timeout_secs,
+                    pending_patches_outstanding,
                 } => {
                     if json_output {
                         let output = serde_json::json!({
@@ -688,6 +689,7 @@ async fn handle_healing_command(
                             "heal_max_concurrent": heal_max_concurrent,
                             "heal_max_concurrent_per_node": heal_max_concurrent_per_node,
                             "heal_transfer_timeout_secs": heal_transfer_timeout_secs,
+                            "pending_patches_outstanding": pending_patches_outstanding,
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
@@ -702,6 +704,7 @@ async fn handle_healing_command(
                         println!("Max Concurrent Per Node: {}", heal_max_concurrent_per_node);
                         println!("Transfer Timeout: {}s", heal_transfer_timeout_secs);
                         println!("Last Check:    {} seconds ago", last_check);
+                        println!("Pending patches outstanding: {}", pending_patches_outstanding);
                     }
                 }
                 Response::Error { message, .. } => {
@@ -1199,7 +1202,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
     ).await?;
 
     let (metadata, existing_locations) = match response {
-        Response::FileInfo { metadata, chunk_locations } => (metadata, chunk_locations),
+        Response::FileInfo { metadata, chunk_locations, .. } => (metadata, chunk_locations),
         Response::Error { message, code } => {
             if code == dfs_common::ErrorCode::NotFound {
                 anyhow::bail!("File not found: {}", path);

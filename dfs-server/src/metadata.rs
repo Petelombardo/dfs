@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use dfs_common::{ChunkId, ChunkLocation, FileId, FileMetadata, NodeId};
-use redb::{Database, Durability, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 // On Linux, Durability::Eventual calls fdatasync (same as Immediate). Only the macOS
 // backend (F_BARRIERFSYNC) distinguishes them. Durability::None writes to the OS page
 // cache without fdatasync — fast, immediately visible to reads, survives process crashes,
@@ -70,6 +70,36 @@ const CHUNK_REFCOUNT_TABLE: TableDefinition<&str, u64> = TableDefinition::new("c
 /// not a new failure mode).
 const CHUNK_PATCH_JOURNAL_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("chunk_patch_journal");
 
+/// public_token hex string → bincode(PatchState).
+///
+/// Deferred chunk-patch consolidation ("delayed write"): a small patch becomes a
+/// cheap standalone delta chunk on disk (hashed only over its own bytes, not the
+/// full ~4MB chunk), and the client is handed back a PUBLIC TOKEN chunk_id — never
+/// a real, independently-readable chunk on disk, only ever resolved through this
+/// table. This is deliberate: the delta's own raw chunk_id and the pre-patch base's
+/// chunk_id must never be mistaken for directly-readable, standalone content by
+/// anything that doesn't know to check here first (the healer replicating to a new
+/// node, a stale peer's chunk_map, etc.) — routing everything through an opaque
+/// token that only resolves via this table makes that mistake structurally
+/// impossible, rather than relying on every caller to remember a special case.
+///
+/// At most one row is ever outstanding per (file_id, chunk_idx) — see
+/// PATCH_STATE_SLOT_TABLE. Lazily created on first write, same as
+/// CHUNK_REFCOUNT_TABLE — no migration needed, not in the startup table-open list.
+const PATCH_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("patch_state");
+
+/// "{file_id}:{chunk_idx}" → public_token hex string (the PATCH_STATE_TABLE key
+/// currently outstanding for this slot).
+///
+/// At most one patch_state is ever outstanding per (file_id, chunk_idx) at a time:
+/// when a *new* patch lands on the same slot, that's proof a writer already learned
+/// the previous public_token's resolution (it had to, to base this new patch on it)
+/// — so the previous row can be retired immediately. This table exists purely so a
+/// new patch can find the previous row's key in O(1) (PATCH_STATE_TABLE itself is
+/// keyed by the token, not by slot, since that's what the read path needs) instead
+/// of a reverse scan. Lazily created on first write.
+const PATCH_STATE_SLOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("patch_state_slot");
+
 // ---------------------------------------------------------------------------
 
 /// Decode a 64-character lowercase hex string (as produced by `ChunkId::to_hex`)
@@ -116,6 +146,27 @@ pub struct PatchJournalEntry {
     pub new_chunk_id: ChunkId,
     /// (offset within chunk, original bytes that were about to be overwritten)
     pub patches: Vec<(usize, Vec<u8>)>,
+}
+
+/// What a PATCH_STATE_TABLE public token currently resolves to. See
+/// PATCH_STATE_TABLE's doc comment for why the token itself is never a real
+/// on-disk chunk_id — every read of it goes through one of these two arms.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum PatchState {
+    /// The background fold hasn't completed (or run) yet: resolve by reading
+    /// `base_chunk_id` and applying `delta_chunk_id`'s own (intra_offset, bytes)
+    /// patches on top. `delta_chunk_id`'s file holds bincode(Vec<(usize, Vec<u8>)>)
+    /// — the same shape MultiPatch/PatchChunk already carry.
+    Pending {
+        base_chunk_id: ChunkId,
+        delta_chunk_id: ChunkId,
+        size: usize,
+        written_at: u64,
+        client_write_seq: Option<u64>,
+    },
+    /// The fold completed: redirect straight to the real, standalone,
+    /// content-addressed result.
+    Folded(ChunkId),
 }
 
 /// Metadata storage using redb embedded database.
@@ -753,6 +804,15 @@ impl MetadataStore {
         }
     }
 
+    /// Async wrapper for get_file_by_path — see get_file_async for why the sync
+    /// version must never be called directly from async request-handling code.
+    pub async fn get_file_by_path_async(self: &Arc<Self>, path: String) -> Result<Option<FileMetadata>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_file_by_path(&path))
+            .await
+            .context("spawn_blocking panicked in get_file_by_path_async")?
+    }
+
     /// Delete file metadata (removes both file and path index entries).
     pub fn delete_file(&self, file_id: &FileId) -> Result<()> {
         let file_id_str = format!("{}", file_id);
@@ -1230,6 +1290,225 @@ impl MetadataStore {
                 .context("Failed to deserialize patch journal entry")?);
         }
         Ok(out)
+    }
+
+    // -------------------------------------------------------------------------
+    // Patch state (deferred single-patch consolidation — see PATCH_STATE_TABLE)
+    // -------------------------------------------------------------------------
+
+    /// Register a new Pending patch_state row for `public_token`, retiring
+    /// whatever row was previously outstanding for this (file_id, chunk_idx) slot
+    /// (if any) in the same transaction. Returns the retired token, if there was
+    /// one, so the caller can also drop it from any in-memory fast-path index.
+    pub fn put_patch_state_pending(
+        &self, file_id: FileId, chunk_idx: u64, public_token: &ChunkId,
+        base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
+        written_at: u64, client_write_seq: Option<u64>,
+    ) -> Result<Option<ChunkId>> {
+        let slot_key = format!("{}:{}", file_id, chunk_idx);
+        let token_key = format!("{}", public_token);
+        let state = PatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq };
+        let value = bincode::serialize(&state).context("Failed to serialize patch state")?;
+
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+
+        let retired = {
+            let mut slot_table = txn.open_table(PATCH_STATE_SLOT_TABLE)?;
+            let retired = slot_table.get(slot_key.as_str())?
+                .map(|v| v.value().to_vec())
+                .map(String::from_utf8)
+                .transpose()
+                .context("corrupt patch state slot entry (not utf8)")?;
+            slot_table.insert(slot_key.as_str(), token_key.as_bytes())?;
+            retired
+        };
+        {
+            let mut state_table = txn.open_table(PATCH_STATE_TABLE)?;
+            if let Some(retired) = &retired {
+                state_table.remove(retired.as_str())?;
+            }
+            state_table.insert(token_key.as_str(), value.as_slice())?;
+        }
+        txn.commit()?;
+
+        Ok(retired.and_then(|hex| decode_hex_32(&hex)).map(ChunkId::from_hash))
+    }
+
+    /// Async wrapper for put_patch_state_pending — patches are a normal-volume
+    /// client write path; see put_chunk_location_async for why this matters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_patch_state_pending_async(
+        self: &Arc<Self>, file_id: FileId, chunk_idx: u64, public_token: ChunkId,
+        base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
+        written_at: u64, client_write_seq: Option<u64>,
+    ) -> Result<Option<ChunkId>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_patch_state_pending(
+            file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id, size, written_at, client_write_seq,
+        )).await.context("spawn_blocking panicked in put_patch_state_pending_async")?
+    }
+
+    /// Flip an existing patch_state row from Pending to Folded once the
+    /// background fold completes. Same key (`public_token`), no slot-table
+    /// change — the slot's outstanding token doesn't change, only what it
+    /// resolves to.
+    pub fn update_patch_state_folded(&self, public_token: &ChunkId, new_chunk_id: ChunkId) -> Result<()> {
+        let token_key = format!("{}", public_token);
+        let value = bincode::serialize(&PatchState::Folded(new_chunk_id))
+            .context("Failed to serialize patch state")?;
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(PATCH_STATE_TABLE)?;
+            table.insert(token_key.as_str(), value.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Async wrapper for update_patch_state_folded — see put_chunk_location_async.
+    pub async fn update_patch_state_folded_async(self: &Arc<Self>, public_token: ChunkId, new_chunk_id: ChunkId) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.update_patch_state_folded(&public_token, new_chunk_id))
+            .await
+            .context("spawn_blocking panicked in update_patch_state_folded_async")?
+    }
+
+    /// Look up a patch_state row by its public token. `None` means `chunk_id` is
+    /// not a currently-outstanding patch token at all — callers should treat it
+    /// as ordinary, directly-readable chunk content.
+    pub fn get_patch_state(&self, public_token: &ChunkId) -> Result<Option<PatchState>> {
+        let key = format!("{}", public_token);
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        // Not pre-created at startup (lazy, like CHUNK_REFCOUNT_TABLE) — a store
+        // that has never had a patch yet errors on the read-side open_table
+        // (unlike the write side, which auto-creates). Treat as "no such state".
+        let table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match table.get(key.as_str())? {
+            Some(v) => Ok(Some(bincode::deserialize::<PatchState>(v.value())
+                .with_context(|| format!("Failed to deserialize patch state {}", public_token))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Async wrapper for get_patch_state — see get_chunk_location_async for why
+    /// this must go through spawn_blocking from request-handling code.
+    pub async fn get_patch_state_async(self: &Arc<Self>, public_token: ChunkId) -> Result<Option<PatchState>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_patch_state(&public_token))
+            .await
+            .context("spawn_blocking panicked in get_patch_state_async")?
+    }
+
+    /// Every `base_chunk_id` and `delta_chunk_id` referenced by a currently-Pending
+    /// patch_state row, cluster-wide on this node. Used by handle_confirm_chunks_live
+    /// and the healing discovery pass to keep both files alive while their fold is
+    /// in flight — neither has a normal ChunkLocation/chunk_map/FILE_TABLE reference
+    /// while Pending (see PATCH_STATE_TABLE's doc comment), so without this they'd
+    /// look exactly like orphaned disk files to the usual liveness scans. Folded
+    /// rows are excluded on purpose: their target already has its own, normally-
+    /// registered ChunkLocation from the fold itself, so it's already protected by
+    /// the ordinary liveness rules with no special-casing needed.
+    pub fn all_pending_patch_chunk_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(std::collections::HashSet::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ids = std::collections::HashSet::new();
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            let state = bincode::deserialize::<PatchState>(v.value())
+                .context("Failed to deserialize patch state")?;
+            if let PatchState::Pending { base_chunk_id, delta_chunk_id, .. } = state {
+                ids.insert(base_chunk_id);
+                ids.insert(delta_chunk_id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Async wrapper for all_pending_patch_chunk_ids — see get_chunk_location_async.
+    pub async fn all_pending_patch_chunk_ids_async(self: &Arc<Self>) -> Result<std::collections::HashSet<ChunkId>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.all_pending_patch_chunk_ids())
+            .await
+            .context("spawn_blocking panicked in all_pending_patch_chunk_ids_async")?
+    }
+
+    /// Every currently-outstanding public token — every PATCH_STATE_TABLE key,
+    /// Pending or Folded. Used by the healing discovery pass to exclude tokens
+    /// from its own "is this chunk under-replicated" classification entirely: a
+    /// token never names a real file (Pending) or is a permanent alias to one
+    /// living at a different identity (Folded) — either way, treating its own
+    /// ChunkLocation entry as something to actively heal to full RF is
+    /// meaningless. The table is tiny and short-lived-ish (bounded by distinct
+    /// (file, chunk_idx) slots ever patched), so a full scan here — once per
+    /// discovery pass, not per chunk — is cheap.
+    pub fn all_patch_token_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(std::collections::HashSet::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut ids = std::collections::HashSet::new();
+        for item in table.range::<&str>(..)? {
+            let (k, _) = item?;
+            if let Some(hash) = decode_hex_32(k.value()) {
+                ids.insert(ChunkId::from_hash(hash));
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Async wrapper for all_patch_token_ids — see get_chunk_location_async.
+    pub async fn all_patch_token_ids_async(self: &Arc<Self>) -> Result<std::collections::HashSet<ChunkId>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.all_patch_token_ids())
+            .await
+            .context("spawn_blocking panicked in all_patch_token_ids_async")?
+    }
+
+    /// Total PATCH_STATE_TABLE row count still in the Pending state (not yet
+    /// folded) — used for Response::HealingStatus's outstanding-patches gauge.
+    pub fn count_pending_patch_entries(&self) -> Result<usize> {
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut count = 0usize;
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            let state = bincode::deserialize::<PatchState>(v.value())
+                .context("Failed to deserialize patch state")?;
+            if matches!(state, PatchState::Pending { .. }) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Async wrapper for count_pending_patch_entries — see get_chunk_location_async.
+    pub async fn count_pending_patch_entries_async(self: &Arc<Self>) -> Result<usize> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.count_pending_patch_entries())
+            .await
+            .context("spawn_blocking panicked in count_pending_patch_entries_async")?
     }
 
     // -------------------------------------------------------------------------
@@ -1894,9 +2173,9 @@ impl MetadataStore {
     // -------------------------------------------------------------------------
 
     /// Bytes-valued tables copied/diffed as a unit by compact_db()'s shadow-copy pass.
-    const BYTES_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 7] = [
+    const BYTES_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 9] = [
         FILE_TABLE, PATH_TABLE, CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX,
-        DELETE_QUEUE_TABLE, CHUNK_PATCH_JOURNAL_TABLE,
+        DELETE_QUEUE_TABLE, CHUNK_PATCH_JOURNAL_TABLE, PATCH_STATE_TABLE, PATCH_STATE_SLOT_TABLE,
     ];
 
     /// u64-valued tables copied/diffed as a unit by compact_db()'s shadow-copy pass.
@@ -1907,8 +2186,9 @@ impl MetadataStore {
     /// still diffs via a full scan, since only FILE_TABLE/PATH_TABLE have dirty-key
     /// tracking (see dirty_files/dirty_paths). Individually much smaller per-row than
     /// full serialized FileMetadata blobs, so their O(size) cost isn't the bottleneck.
-    const OTHER_BYTES_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 5] = [
+    const OTHER_BYTES_TABLES: [TableDefinition<'static, &'static str, &'static [u8]>; 7] = [
         CHUNK_TABLE, META_QUEUE_TABLE, META_QUEUE_IDX, DELETE_QUEUE_TABLE, CHUNK_PATCH_JOURNAL_TABLE,
+        PATCH_STATE_TABLE, PATCH_STATE_SLOT_TABLE,
     ];
 
     /// Copy every row of `def` from `src` into `dst`, overwriting whatever's there.

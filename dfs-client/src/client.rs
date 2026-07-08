@@ -2333,6 +2333,34 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 break;
                             }
                         }
+                        // Fall back to the leader's own fresh chunk_id if the preferred one
+                        // (recent_chunk_writes) is unreachable everywhere. "The client is
+                        // authoritative for what it wrote" no longer holds unconditionally:
+                        // a server can now change a chunk's identity after acking our write
+                        // without a further client-visible RPC (deferred chunk-patch
+                        // consolidation folds a stacked overlay chain in the background) —
+                        // recent_chunk_writes can legitimately point at an identity that's
+                        // been superseded on every replica by the time we read it back.
+                        if retry_data.is_none() {
+                            if let Some(fresh_loc) = fresh_map.get(idx) {
+                                if fresh_loc.chunk_id != fresh_cid {
+                                    let (fp2, ffb2) = InodeReadEngine::resolve_primary(
+                                        fresh_loc, &fresh_nim, &fresh_nodes, selector + idx as u64,
+                                    ).unwrap_or_else(|| {
+                                        let p = fresh_nodes[selector as usize % fresh_nodes.len()];
+                                        (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
+                                    });
+                                    for &addr in std::iter::once(&fp2).chain(ffb2.iter()) {
+                                        if let Ok(data) = self.read_chunk_range_from_server(
+                                            addr, fresh_loc.chunk_id, offset_in_chunk as u64, len_in_chunk as u64, None,
+                                        ).await {
+                                            retry_data = Some(data);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let data = retry_data.ok_or_else(|| anyhow::anyhow!(
                             "Failed to fetch range for chunk {} after metadata refresh", fresh_cid
                         ))?;

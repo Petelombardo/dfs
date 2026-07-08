@@ -374,6 +374,15 @@ impl ChunkStorage {
         Ok(())
     }
 
+    /// Insert already-known content into the cache directly, without touching disk.
+    /// Used to cache the result of composing an overlay chain (see
+    /// `Server::resolve_chunk_content`) so a subsequent read of the same head
+    /// chunk_id doesn't repeat the composition.
+    pub fn cache_put(&self, chunk_id: ChunkId, data: Arc<Vec<u8>>) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.put(chunk_id, data);
+    }
+
     /// Remove a chunk from the in-memory cache. Must be called whenever the on-disk
     /// content for a chunk_id is rewritten (PatchChunk same→same, repair, etc.) or the
     /// chunk is deleted. Without this, read_chunk_arc returns stale bytes and subsequent

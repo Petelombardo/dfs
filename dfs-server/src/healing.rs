@@ -1315,8 +1315,19 @@ impl HealingManager {
                 }
             }
             // Every other node is online and has been stable for long enough —
-            // this leader's own local view is authoritative.
-            candidates.to_vec()
+            // this leader's own local view is authoritative. Still must exclude any
+            // candidate currently a base_chunk_id or delta_chunk_id of a Pending
+            // patch (deferred chunk-patch consolidation) — non-leader nodes get this
+            // same protection via handle_confirm_chunks_live's liveness union, but
+            // the leader takes this branch instead of calling that RPC on itself, so
+            // the same check has to be applied directly here.
+            match self.metadata.all_pending_patch_chunk_ids_async().await {
+                Ok(pending_ids) => candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect(),
+                Err(e) => {
+                    warn!("Live-file orphan sweep: failed to read pending patch chunk_ids, deferring this cycle: {}", e);
+                    Vec::new()
+                }
+            }
         } else {
             let leader_addr = match self.cluster.get_leader_addr().await {
                 Some(addr) => addr,
@@ -1606,6 +1617,14 @@ impl HealingManager {
         // Accumulate chunk location updates for batch broadcast at end of pass.
         let mut location_updates: Vec<ChunkLocation> = Vec::new();
 
+        // Patch tokens (deferred chunk-patch consolidation) are never worth
+        // actively healing directly — a token never names a real file (Pending) or
+        // is a permanent alias to one living at a different identity (Folded),
+        // which gets its own normal ChunkLocation and is healed on its own merits.
+        // Prefetched once here (the table is tiny) instead of a per-chunk lookup
+        // inside the classification loop below, which can scan 500K+ chunks.
+        let patch_token_ids = self.metadata.all_patch_token_ids_async().await.unwrap_or_default();
+
         // Classify all chunks — no work cap here. Every chunk must be classified so
         // that pending_healing timestamps are updated for all under-replicated chunks,
         // not just the first max_heal_per_cycle. Without this, chunks past position 200
@@ -1621,6 +1640,9 @@ impl HealingManager {
             classify_count += 1;
             if classify_count % 100 == 0 {
                 tokio::task::yield_now().await;
+            }
+            if patch_token_ids.contains(&chunk_id) {
+                continue;
             }
 
             let metadata_node_count = location.nodes.len();

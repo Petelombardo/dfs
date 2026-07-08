@@ -759,6 +759,12 @@ pub enum Response {
         /// mid-list insertion would misalign every field after it on wire-version skew.
         #[serde(default)]
         heal_max_concurrent_per_node: usize,
+        /// Patches currently pending their background fold, cluster-wide on this
+        /// node (deferred chunk-patch consolidation) — PATCH_STATE_TABLE rows still
+        /// in the Pending state. Same acceptable field-addition reasoning as the
+        /// fields above (live, non-persisted RPC response).
+        #[serde(default)]
+        pending_patches_outstanding: usize,
     },
 
     /// File info with chunk locations

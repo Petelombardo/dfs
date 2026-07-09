@@ -1048,10 +1048,49 @@ impl Server {
             let result = metadata.scan_files(|file| {
                 total += 1;
                 if !file.chunk_locations.is_empty() {
-                    // or_insert_with: don't overwrite entries already added by incoming RCLs
-                    // while the scan is running — the RCL is always newer than redb state.
-                    let inserted = chunk_map.entry(file.id)
-                        .or_insert_with(|| (file.chunk_locations.as_ref().clone(), file.write_seq));
+                    const CHUNK_SIZE_REBUILD: u64 = 4 * 1024 * 1024;
+                    // Sort by file_offset before seeding: chunk_map_update_location_for_file's
+                    // partition_point binary search assumes this Vec stays sorted by chunk_idx,
+                    // an invariant it maintains itself for entries it touches but can't repair
+                    // for entries it never touches. A record persisted before
+                    // merge_file_metadata's own sort fix (or one whose chunks simply merged
+                    // out of offset order — routine under buffered/background-tick writes)
+                    // would otherwise seed chunk_map already-unsorted, and every later binary
+                    // search against it is then working over broken invariants.
+                    let mut sorted_locs = file.chunk_locations.as_ref().clone();
+                    sorted_locs.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+
+                    // Merge into whatever's already there instead of skipping outright —
+                    // an incoming RCL that raced this scan and created the entry first
+                    // only ever reports ONE chunk_idx, not the whole file. The old
+                    // `or_insert_with` treated that lone chunk as proof the entry was
+                    // already fully up to date and left it there untouched, silently
+                    // discarding every OTHER chunk this scan would have restored —
+                    // reproduced live via an upgrade-compat test: a 3-chunk file's
+                    // chunk_map got stuck at 1 chunk after restart because a post-join
+                    // self-report RCL for chunk 0 beat this scan to the entry.
+                    // Per-chunk_idx precedence: keep whatever's already at an index
+                    // (the RCL is fresher for that one slot), only add indices this
+                    // entry doesn't have yet.
+                    chunk_map.entry(file.id)
+                        .and_modify(|(existing_locs, existing_seq)| {
+                            let mut have: std::collections::HashSet<u64> = existing_locs.iter()
+                                .filter_map(|l| l.file_offset.map(|o| o / CHUNK_SIZE_REBUILD))
+                                .collect();
+                            for loc in &sorted_locs {
+                                let idx = loc.file_offset.map(|o| o / CHUNK_SIZE_REBUILD);
+                                if idx.is_none_or(|i| !have.contains(&i)) {
+                                    if let Some(i) = idx {
+                                        have.insert(i);
+                                    }
+                                    existing_locs.push(loc.clone());
+                                }
+                            }
+                            existing_locs.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+                            *existing_seq = (*existing_seq).max(file.write_seq);
+                        })
+                        .or_insert_with(|| (sorted_locs, file.write_seq));
+                    let inserted = chunk_map.get(&file.id).expect("just inserted or modified above");
                     let (locs, _) = inserted.value();
                     for loc in locs {
                         chunk_to_file.insert(loc.chunk_id, file.id);
@@ -7790,10 +7829,21 @@ impl Server {
             // The client window tracking uses this to know when it has fetched
             // the complete map — returning locations.len() would cause constant
             // re-fetches for sparse files where reads land beyond the last chunk.
-            // locations is sorted by file_offset (None entries sort last via unwrap_or(u64::MAX)).
-            // Scan from the end to find the highest real offset in O(1).
-            let max_chunk_idx = locations.iter().rev()
-                .find_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE) as u32))
+            // merge_file_metadata keeps chunk_locations sorted by file_offset going
+            // forward (None sorts last), but this record may predate that fix — a
+            // scan-from-the-end assuming sorted order silently computed the wrong
+            // total_chunks whenever a tail chunk happened to merge in before the
+            // head chunk (routine under buffered/background-tick writes) and
+            // stayed at index 0 forever, since in-place Rule 1/2 updates never
+            // reorder existing entries. A two-chunk file then got served as if it
+            // had only one, truncating every read past the first chunk (found via
+            // an old-binary-to-new-binary upgrade compat test: t_patched.bin's
+            // tail chunk had flushed first). Take the actual max instead of
+            // trusting order — same O(n) cost, correct regardless of how this
+            // particular record's chunk_locations ended up ordered.
+            let max_chunk_idx = locations.iter()
+                .filter_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE) as u32))
+                .max()
                 .unwrap_or(locations.len().saturating_sub(1) as u32);
             let total_chunks = max_chunk_idx + 1;
 
@@ -7803,7 +7853,7 @@ impl Server {
             // pruning, re-replication, over-replication trim) updates CHUNK_TABLE directly
             // but never touches this in-memory/inline chunk_locations copy, so without this
             // clients can be routed to a node the healer already moved the chunk away from.
-            let window: Vec<dfs_common::ChunkLocation> = locations.iter()
+            let mut window: Vec<dfs_common::ChunkLocation> = locations.iter()
                 .filter(|l| {
                     let idx = l.file_offset.map(|o| (o / CHUNK_SIZE) as u32).unwrap_or(0);
                     idx >= from_chunk && idx < from_chunk.saturating_add(count)
@@ -7813,6 +7863,12 @@ impl Server {
                     _ => l.clone(),
                 })
                 .collect();
+            // Sort what's actually sent, independent of `locations`' own order —
+            // update_chunk_map_window (client) and the client-side binary searches
+            // in fuse_impl.rs/client.rs assume the response is offset-ordered. Cheap
+            // safety net for records persisted before merge_file_metadata's own sort
+            // fix (see max_chunk_idx's comment above for the same root cause).
+            window.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
 
             Response::FileChunkMap {
                 file_id,

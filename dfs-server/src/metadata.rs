@@ -580,7 +580,9 @@ impl MetadataStore {
                     continue;
                 }
             }
-            // Genuinely new slot — append.
+            // Genuinely new slot — append. Position is fixed up by the sort below;
+            // id_index/offset_index only need to resolve to *some* valid index for
+            // the rest of this merge call, not the final sorted one.
             let new_idx = merged_locs.len();
             id_index.insert(incoming_loc.chunk_id, new_idx);
             if let Some(offset) = incoming_loc.file_offset {
@@ -588,6 +590,23 @@ impl MetadataStore {
             }
             merged_locs.push(incoming_loc.clone());
         }
+
+        // Restore offset order. Entries land here in whatever order distinct
+        // offsets were first seen across this file's entire push history — under
+        // buffered/background-tick writes the tail chunk routinely flushes before
+        // the head chunk, so "genuinely new slot" appends above do NOT produce an
+        // offset-sorted array on their own, and in-place Rule 1/2 updates preserve
+        // whatever position an entry already has. Multiple consumers assume sorted
+        // order for O(log n) binary search (handle_get_file_chunk_map's max-chunk-
+        // index scan, chunk_map_update_location_for_file's partition_point, and
+        // the client-side lookups in fuse_impl.rs/client.rs) — leaving this array
+        // unsorted makes those silently return wrong results instead of erroring,
+        // which is how a two-chunk file can end up served as if it were one chunk
+        // (root-caused via a compat/upgrade test: t_patched.bin's tail chunk
+        // flushed first, landed at index 0 forever, and handle_get_file_chunk_map's
+        // sorted-from-the-end scan then computed total_chunks=1). None-offset
+        // entries sort last, matching update_chunk_map_window's convention.
+        merged_locs.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
 
         // Scalar fields (size, mtime, write_seq, ...) come from whichever side is
         // authoritative by write_seq — existing if incoming is stale, else incoming

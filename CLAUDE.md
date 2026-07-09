@@ -19,7 +19,7 @@ Always redirect the output of a build into a log file so that you can grep for e
 
 ## Local test suite
 
-Run with: `bash scripts/test_local_suite.sh`
+Run with: `time ./scripts/test_local_suite.sh`
 
 The suite runs 5-node local cluster on ports 8900–8904, mounts at /tmp/dfs-mount, and exercises
 T1–T22. Logs go to /tmp/dfs-test-logs/. The client runs at **debug** log level so all events are

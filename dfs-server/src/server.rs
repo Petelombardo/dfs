@@ -1,7 +1,7 @@
 use crate::chunker::Chunker;
 use crate::cluster::ClusterManager;
 use crate::healing::HealingManager;
-use crate::metadata::{MetadataStore, PatchState};
+use crate::metadata::{MetadataStore, PatchState, PutFileResult};
 use crate::network::{MessageHandler, NetworkClient};
 use crate::stats::OpsTracker;
 use crate::storage::ChunkStorage;
@@ -783,35 +783,59 @@ impl OverlayForkCtx {
         // public_token or report its true (growing) replica count; see
         // ReplicatePatchFold's doc comment.
         if let Some(new_loc) = new_loc {
-            let nodes = self.cluster.get_all_nodes().await;
-            let local_id = self.cluster.local_node_id();
-            for node in nodes {
-                if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
-                    continue;
-                }
-                let request = Request::ReplicateChunkLocation { location: new_loc.clone(), file_id: new_loc.file_id };
-                if let Err(e) = self.client.send_message(node.addr, Message::Request(request)).await {
-                    warn!("single fold: failed to broadcast new location {} to node {}: {}", new_chunk_id, node.id, e);
-                }
-                let fold_request = Request::ReplicatePatchFold {
-                    public_token, real_chunk_id: new_chunk_id, file_id, chunk_idx,
-                };
-                if let Err(e) = self.client.send_message(node.addr, Message::Request(fold_request)).await {
-                    warn!("single fold: failed to broadcast patch fold {} -> {} to node {}: {}", public_token, new_chunk_id, node.id, e);
-                }
-            }
-            // Register for periodic re-announcement regardless of how the
-            // immediate pass above went — a peer that wasn't Online yet at this
-            // exact instant was silently skipped above with no way to know it
-            // missed anything. start_patch_fold_rebroadcast_loop is the backstop
-            // that actually closes that gap; see pending_patch_fold_broadcasts's
+            // Register for periodic re-announcement unconditionally and BEFORE
+            // attempting the immediate broadcast below — start_patch_fold_rebroadcast_loop
+            // is the backstop that closes the gap for any peer the immediate pass
+            // below misses (not Online yet, or the broadcast is still in flight
+            // when this node happens to get asked); see pending_patch_fold_broadcasts's
             // doc comment for the incident this fixes.
             self.pending_patch_fold_broadcasts.insert(public_token, PendingPatchFoldBroadcast {
-                location: new_loc,
+                location: new_loc.clone(),
                 file_id,
                 chunk_idx,
                 real_chunk_id: new_chunk_id,
                 first_seen: std::time::Instant::now(),
+            });
+
+            // Broadcast in a detached background task instead of inline: this fold
+            // has already fully committed locally by this point (file on disk,
+            // ChunkLocation registered, patch_state flipped to Folded) — nothing
+            // about *this* node's correctness depends on the broadcast landing
+            // before this function returns. Awaiting it inline used to run up to
+            // 2 sequential network round-trips per other online node while still
+            // holding chunk_patch_locks (fold_slot_now holds it for this whole
+            // call) — under any network hiccup that's several seconds with the
+            // slot's lock held, during which the *next* patch to this same slot
+            // queues up server-side. If the client's own RPC timeout is shorter
+            // than that stall, it gives up and retries — creating a second
+            // outstanding request for a slot whose token is about to move out
+            // from under it the moment this fold's caller (fold_slot_now) finally
+            // releases the lock. That race is the leading suspect for a real
+            // 2026-07-09 incident (VM100/server5, kdiskmark under load) where a
+            // patch's claimed base ended up neither a real file nor a live
+            // patch_state row. The rebroadcast loop above is already the proven
+            // backstop for a broadcast that doesn't land immediately, so paying
+            // for it here synchronously was pure unnecessary lock-hold time.
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let nodes = cluster.get_all_nodes().await;
+                let local_id = cluster.local_node_id();
+                for node in nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let request = Request::ReplicateChunkLocation { location: new_loc.clone(), file_id: new_loc.file_id };
+                    if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
+                        warn!("single fold: failed to broadcast new location {} to node {}: {}", new_chunk_id, node.id, e);
+                    }
+                    let fold_request = Request::ReplicatePatchFold {
+                        public_token, real_chunk_id: new_chunk_id, file_id, chunk_idx,
+                    };
+                    if let Err(e) = client.send_message(node.addr, Message::Request(fold_request)).await {
+                        warn!("single fold: failed to broadcast patch fold {} -> {} to node {}: {}", public_token, new_chunk_id, node.id, e);
+                    }
+                }
             });
         } else {
             warn!("single fold: no ChunkLocation found for freshly-folded {} — cannot broadcast to cluster", new_chunk_id);
@@ -6340,8 +6364,41 @@ impl Server {
                         ErrorCode::NotFound,
                     ));
                 }
-                let size = self.metadata.get_chunk_location_async(base_for_lookup).await
-                    .ok().flatten().map(|loc| loc.size).unwrap_or(0);
+                // The base's own ChunkLocation must still be registered here — a fresh
+                // accumulator always deletes its base's ChunkLocation once superseded
+                // (see the end of this match's Ok path below), so a *missing* location
+                // on a base whose *file* still physically exists is the unambiguous
+                // signature of a second concurrent request racing the first one: both
+                // read chunk_id as the slot's current identity before either had
+                // patched anything, so both independently resolved patch_state to None
+                // and took this same fresh-accumulator branch — but by the time this
+                // second one got here, chunk_patch_locks had already let the first one
+                // through to completion, which deleted this exact ChunkLocation. Prior
+                // to this check, that raced request silently defaulted to size=0 and
+                // built an accumulator that thought the chunk was empty except for its
+                // own tiny patch — the true, confirmed mechanism (found via T22c/T18
+                // corruption, 2026-07-09) behind a fold later truncating away
+                // everything the *winning* concurrent request had just written. This
+                // should have been caught earlier as ChunkStale by the client's own
+                // (already-stale) chunk_id not matching chunk_map's current entry, but
+                // isn't a case worth chasing further here — treat it exactly like the
+                // ghost-chunk guard above: fail loudly so the caller's existing
+                // stale-chunk-id retry (re-fetch current location, resend) fixes it,
+                // instead of silently proceeding on a wrong assumption.
+                let size = match self.metadata.get_chunk_location_async(base_for_lookup).await {
+                    Ok(Some(loc)) => loc.size,
+                    Ok(None) => {
+                        drop(patch_guard);
+                        return Err((
+                            format!("Chunk {} has no registered location — likely superseded by a concurrent patch; retry with current chunk_id", base_for_lookup),
+                            ErrorCode::NotFound,
+                        ));
+                    }
+                    Err(e) => {
+                        drop(patch_guard);
+                        return Err((format!("Failed to look up chunk location for {}: {}", base_for_lookup, e), ErrorCode::InternalError));
+                    }
+                };
                 (base_for_lookup, None, size, false)
             }
         };
@@ -8423,12 +8480,55 @@ impl Server {
                 // Bump write_seq so put_file's stale-drop guard never rejects this.
                 // The path: index entry may have write_seq=0 (loaded from sled via
                 // get_file_by_path), while the file: entry has a higher write_seq
-                // from the client's enqueue. Incrementing ensures we always win.
+                // from the client's enqueue. Incrementing ensures we always win —
+                // usually. put_file_async can still return Stale if something else
+                // concurrently committed a write_seq at or above this one between
+                // our read above and this call; see the retry loop below for why
+                // that case can't just be treated as success.
                 metadata.write_seq = metadata.write_seq.saturating_add(1);
 
-                // Store new metadata locally first
-                match self.metadata.put_file_async(metadata.clone()).await {
-                    Ok(_) => {
+                // Store new metadata locally first. put_file_async can silently drop
+                // this write (PutFileResult::Stale) if something else concurrently
+                // committed a write_seq at or above ours — matching Ok(_) regardless
+                // of variant, as this used to, treats a dropped write as success: the
+                // function goes on to replicate the (never-actually-locally-applied)
+                // metadata to peers, delete the old path index, and tell the client
+                // "renamed" — while no node's durable state ever actually changes.
+                // Confirmed as the cause of a real, non-flaky T14 failure (2026-07-09,
+                // full-suite load): the client got a successful rename response but
+                // old_path lingered in FILE_TABLE on every node indefinitely, because
+                // nothing here ever retried the loser or reported it lost. Retry with
+                // a write_seq bumped past whatever won, bounded so a pathological
+                // back-to-back-loss can't hang the request.
+                const MAX_RENAME_STALE_RETRIES: u32 = 5;
+                let mut put_result = None;
+                for attempt in 0..MAX_RENAME_STALE_RETRIES {
+                    match self.metadata.put_file_async(metadata.clone()).await {
+                        Ok(PutFileResult::Stored) => {
+                            put_result = Some(Ok(()));
+                            break;
+                        }
+                        Ok(PutFileResult::Stale(existing)) => {
+                            warn!("Rename {} -> {}: put_file_async dropped write_seq={} as stale against existing write_seq={} (attempt {}/{}) — retrying with a higher write_seq",
+                                old_path, new_path, metadata.write_seq, existing.write_seq, attempt + 1, MAX_RENAME_STALE_RETRIES);
+                            metadata.write_seq = existing.write_seq.saturating_add(1);
+                            continue;
+                        }
+                        Err(e) => {
+                            put_result = Some(Err(e));
+                            break;
+                        }
+                    }
+                }
+                let put_result = put_result.unwrap_or_else(|| {
+                    Err(anyhow::anyhow!(
+                        "exhausted {} retries — write_seq kept losing to concurrent writers",
+                        MAX_RENAME_STALE_RETRIES
+                    ))
+                });
+
+                match put_result {
+                    Ok(()) => {
                         // Now replicate to all servers BEFORE deleting old path
                         // This ensures the new metadata exists everywhere before we delete the old
                         let nodes = self.cluster.get_all_nodes().await;

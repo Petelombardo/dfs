@@ -323,6 +323,7 @@ dd if=/dev/urandom of="$T/rename_src.bin" bs=1M count=2 2>/dev/null
 cp "$T/rename_src.bin" "$MOUNT/t13_src.bin"
 dfs_sync
 mv "$MOUNT/t13_src.bin" "$MOUNT/t13_dst.bin"
+dfs_sync  # commit the rename's metadata to the leader before T14 checks it
 cp "$MOUNT/t13_dst.bin" "$T/rename_dst_read.bin"
 m1=$(md5sum "$T/rename_src.bin"      | cut -d' ' -f1)
 m2=$(md5sum "$T/rename_dst_read.bin" | cut -d' ' -f1)
@@ -335,31 +336,59 @@ snapshot_log T14
 if should_run T14; then
 echo ""
 echo "=== T14: metadata consistency after renames ==="
-sleep 3  # let dissemination propagate
 
-# Verify t12_after.txt appears on all nodes with correct path
-OK=PASS
-for port in 8900 8901 8902 8903 8904; do
-    LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null)
-    echo "$LIST" | grep -q "t12_after.txt" || { OK=FAIL; echo "  Node $port missing t12_after.txt"; }
-    echo "$LIST" | grep -q "t12_before.txt" && { OK=FAIL; echo "  Node $port still has t12_before.txt"; }
-    echo "$LIST" | grep -q "t13_dst.bin"   || { OK=FAIL; echo "  Node $port missing t13_dst.bin"; }
-    echo "$LIST" | grep -q "t13_src.bin"   && { OK=FAIL; echo "  Node $port still has t13_src.bin"; }
+# Verify t12_after.txt/t13_dst.bin (and NOT t12_before.txt/t13_src.bin) appear on
+# all nodes. Non-leader nodes only receive rename metadata via async
+# dissemination/healing (up to ~25s), so poll with retry instead of a single
+# fixed sleep+check — a one-shot 3s sleep was flaky under full-suite load
+# whenever a follower's healing pass took longer than that window.
+T14A_MAX_WAIT=25
+T14A_POLL_INTERVAL=2
+T14A_ELAPSED=0
+OK=FAIL
+FAILURES=""
+while [ "$T14A_ELAPSED" -le "$T14A_MAX_WAIT" ]; do
+    OK=PASS
+    FAILURES=""
+    for port in 8900 8901 8902 8903 8904; do
+        LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:$port" file list 2>/dev/null)
+        echo "$LIST" | grep -q "t12_after.txt" || { OK=FAIL; FAILURES="${FAILURES}  Node $port missing t12_after.txt\n"; }
+        echo "$LIST" | grep -q "t12_before.txt" && { OK=FAIL; FAILURES="${FAILURES}  Node $port still has t12_before.txt\n"; }
+        echo "$LIST" | grep -q "t13_dst.bin"   || { OK=FAIL; FAILURES="${FAILURES}  Node $port missing t13_dst.bin\n"; }
+        echo "$LIST" | grep -q "t13_src.bin"   && { OK=FAIL; FAILURES="${FAILURES}  Node $port still has t13_src.bin\n"; }
+    done
+    [ "$OK" = "PASS" ] && break
+    sleep "$T14A_POLL_INTERVAL"
+    T14A_ELAPSED=$((T14A_ELAPSED + T14A_POLL_INTERVAL))
 done
+[ "$OK" = "FAIL" ] && printf "%b" "$FAILURES"
 check "T14a rename paths propagated to all nodes" $OK
 
-# Verify the leader has the authoritative file list.
-# Non-leader nodes receive metadata updates via healing (up to ~25s), so we only
-# check strong consistency where we guarantee it: the write-quorum leader (8900).
-LEADER_LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:8900" file list 2>/dev/null \
-    | grep -E "^[0-9a-f]{8}" | awk '{print $1, $2, $3}' | sort)
+# Verify the leader has the authoritative file list. T13's dfs_sync should make
+# this immediately consistent (flush_metadata_sync commits to the leader
+# synchronously) — poll briefly anyway as a safety margin against any transient
+# debounce/queue delay rather than a single fixed check.
+T14B_MAX_WAIT=5
+T14B_POLL_INTERVAL=1
+T14B_ELAPSED=0
+T14B_OK=FAIL
+FAILURES_B=""
+while [ "$T14B_ELAPSED" -le "$T14B_MAX_WAIT" ]; do
+    LEADER_LIST=$("$BIN/dfs-admin" --cluster "127.0.0.1:8900" file list 2>/dev/null \
+        | grep -E "^[0-9a-f]{8}" | awk '{print $1, $2, $3}' | sort)
 
-T14B_OK=PASS
-echo "$LEADER_LIST" | grep -q "t12_after.txt" || { T14B_OK=FAIL; echo "  Leader missing t12_after.txt"; }
-echo "$LEADER_LIST" | grep -q "t12_before.txt" && { T14B_OK=FAIL; echo "  Leader still has t12_before.txt"; }
-echo "$LEADER_LIST" | grep -q "t13_dst.bin"   || { T14B_OK=FAIL; echo "  Leader missing t13_dst.bin"; }
-echo "$LEADER_LIST" | grep -q "t13_src.bin"   && { T14B_OK=FAIL; echo "  Leader still has t13_src.bin"; }
-echo "$LEADER_LIST" | grep -q "t6_4.txt"      && { T14B_OK=FAIL; echo "  Leader still has deleted t6_4.txt"; }
+    T14B_OK=PASS
+    FAILURES_B=""
+    echo "$LEADER_LIST" | grep -q "t12_after.txt" || { T14B_OK=FAIL; FAILURES_B="${FAILURES_B}  Leader missing t12_after.txt\n"; }
+    echo "$LEADER_LIST" | grep -q "t12_before.txt" && { T14B_OK=FAIL; FAILURES_B="${FAILURES_B}  Leader still has t12_before.txt\n"; }
+    echo "$LEADER_LIST" | grep -q "t13_dst.bin"   || { T14B_OK=FAIL; FAILURES_B="${FAILURES_B}  Leader missing t13_dst.bin\n"; }
+    echo "$LEADER_LIST" | grep -q "t13_src.bin"   && { T14B_OK=FAIL; FAILURES_B="${FAILURES_B}  Leader still has t13_src.bin\n"; }
+    echo "$LEADER_LIST" | grep -q "t6_4.txt"      && { T14B_OK=FAIL; FAILURES_B="${FAILURES_B}  Leader still has deleted t6_4.txt\n"; }
+    [ "$T14B_OK" = "PASS" ] && break
+    sleep "$T14B_POLL_INTERVAL"
+    T14B_ELAPSED=$((T14B_ELAPSED + T14B_POLL_INTERVAL))
+done
+[ "$T14B_OK" = "FAIL" ] && printf "%b" "$FAILURES_B"
 
 check "T14b leader metadata correct after renames/deletes" $T14B_OK
 
@@ -3592,7 +3621,12 @@ T49_WANT=$(md5sum "$T49_LOCAL" | awk '{print $1}')
 
 # Patch 16KB at offset 1MB — well inside chunk 0, nowhere near the tail chunk.
 dd if=/dev/urandom of="$T49_LOCAL" bs=4096 count=4 seek=256 conv=notrunc 2>/dev/null
-dd if="$T49_LOCAL" of="$T49_FILE" bs=4096 count=4 seek=256 conv=notrunc 2>/dev/null
+# skip=256 is required here: without it, dd reads from the START of T49_LOCAL
+# (offset 0) instead of the just-randomized region at offset 1MB, copying the
+# wrong 16KB into the mount and making T49b fail even when the patch path is
+# byte-for-byte correct end to end (root-caused 2026-07-09 — see
+# project_t49_write_loss_unresolved memory).
+dd if="$T49_LOCAL" of="$T49_FILE" bs=4096 count=4 seek=256 skip=256 conv=notrunc 2>/dev/null
 dfs_sync
 
 T49_GOT=$(md5sum "$T49_FILE" | awk '{print $1}')

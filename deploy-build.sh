@@ -38,6 +38,20 @@ resolve_ip() {
 	getent hosts "$1" | awk '{print $1; exit}'
 }
 
+# backup_remote_binaries <host> <binary> [binary ...]
+# Copies each /usr/bin/<binary> to /usr/bin/<binary>.old on the remote host
+# before it gets overwritten by the new build, so a bad deploy can be rolled
+# back with `cp /usr/bin/<binary>.old /usr/bin/<binary>` + a service restart
+# instead of needing a fresh build. Overwrites any previous .old — it's meant
+# to hold the immediately-prior version, not a longer history.
+backup_remote_binaries() {
+	local host="$1"; shift
+	for bin in "$@"; do
+		echo "  [$host] Backing up /usr/bin/$bin -> /usr/bin/$bin.old"
+		ssh root@"$host" "[ -f /usr/bin/$bin ] && cp -f /usr/bin/$bin /usr/bin/$bin.old || true"
+	done
+}
+
 # wait_for_convergence <ip> <baseline_count> <label>
 # Polls the given node's own file list until it reports at least baseline_count
 # files, or gives up after ~90s. A node that just restarted may not yet have
@@ -82,6 +96,8 @@ deploy_dfs_client() {
 	local containers="$2"
 	local mountpoint
 	mountpoint=$(get_dfs_mountpoint "$host")
+
+	backup_remote_binaries "$host" dfs-client
 
 	echo "  [$host] Copying binary"
 	scp target/release/dfs-client root@"$host":/usr/bin/
@@ -130,6 +146,7 @@ if [ "$1" == "all" ] || [ "$1" == "server" ]; then
 		echo "Deploying to $i"
 		ssh root@$i systemctl stop dfs-server
 		sleep 1
+		backup_remote_binaries "$i" dfs-server dfs-admin dfs-client
 		scp target/release/dfs-server target/release/dfs-admin target/release/dfs-client root@$i:/usr/bin/
 		ssh root@$i systemctl start dfs-server
 		wait_for_convergence "$(resolve_ip $i)" "$baseline_count" "$i"

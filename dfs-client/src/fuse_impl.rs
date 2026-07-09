@@ -2231,7 +2231,23 @@ impl FlushHandle {
                     // next access to this chunk).
                     let pending_cache_update = {
                         let cached = self.client.chunk_cache.get(&old_location.chunk_id);
-                        cached.map(|cached_arc| {
+                        cached.filter(|cached_arc| {
+                            // A cache entry that's shorter than the chunk's real, known
+                            // size isn't the whole chunk — e.g. only the byte range a
+                            // prior partial/range-fetch read actually touched. Patching
+                            // on top of it and re-caching the result under the new
+                            // chunk_id below would silently poison the cache with a
+                            // truncated buffer: every later read of a perfectly good,
+                            // fully-present-on-disk chunk would then be served bytes cut
+                            // off wherever this one patch happened to reach, instead of
+                            // the correct content the server actually has (reproduced via
+                            // T49 — a chunk warmed by a prior read, then patched, served
+                            // truncated/wrong data on every read after, even though the
+                            // server-side chunk was always complete and correct). Skip the
+                            // optimization instead — the next read just pays a cold
+                            // read-back, same as an ordinary cache miss.
+                            cached_arc.len() as u64 == old_location.size as u64
+                        }).map(|cached_arc| {
                             let mut patched = (*cached_arc).clone();
                             for (intra, data) in &patches {
                                 let end = intra + data.len();
@@ -2472,7 +2488,15 @@ impl FlushHandle {
                     // read the old chunk, overlay the dirty ranges, write the new chunk.
                     // Reads then fall through byte_range_cache (miss, invalidated below) to
                     // chunk_cache (hit) — one authoritative source, no priority race.
-                    if let Some(base) = self.client.chunk_cache.get(&old_location.chunk_id) {
+                    // Guard: a cache entry shorter than the chunk's known size isn't the
+                    // whole chunk (e.g. only a prior partial/range-fetch's coverage) —
+                    // patching on top of it and re-caching under new_location.chunk_id
+                    // would poison the cache with a truncated buffer for a chunk that's
+                    // actually complete and correct on disk. See the matching guard in
+                    // the MultiPatch cache-update above (T49) for the full incident.
+                    if let Some(base) = self.client.chunk_cache.get(&old_location.chunk_id)
+                        .filter(|base| base.len() as u64 == old_location.size as u64)
+                    {
                         let mut patched = (*base).clone();
                         for &(s, e) in &dirty_ranges {
                             let e = e.min(slot_data.len());

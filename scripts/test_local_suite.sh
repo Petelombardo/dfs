@@ -3560,6 +3560,60 @@ echo "  T48: dfs-admin reports $T48_CHUNK_COUNT chunk(s) for the file (expect $T
 rm -f "$T48_FILE"
 fi # should_run T48
 
+# ── Test 49: patch an earlier chunk of a file with a non-4MB tail chunk ────────
+#
+# Reproduces a bug found via an upgrade-compatibility test (2026-07-08): a file
+# whose LAST chunk is smaller than the standard 4MB (i.e. size is not a multiple
+# of the chunk size — every file with a partial tail chunk, which is most files)
+# gets corrupted across its entire tail — not just the patched region — the
+# moment an EARLIER chunk is patched. T22/T25 patch multi-chunk files heavily but
+# always use sizes that are exact multiples of 4MB (no partial tail chunk), which
+# is why they never caught this. Black-box only: compare against a local mirror
+# file byte-for-byte via md5sum — the point of this bug is that it doesn't matter
+# which chunk_id ends up serving the read, only whether the bytes match.
+snapshot_log T49
+if should_run T49; then
+echo ""
+echo "=== T49: patching an earlier chunk doesn't corrupt a non-4MB tail chunk ==="
+
+T49_FILE="$MOUNT/t49_tail.bin"
+T49_LOCAL="$T/t49_local.bin"
+
+# 6MB = one full 4MB chunk + one 2MB (partial/tail) chunk.
+dd if=/dev/urandom of="$T49_LOCAL" bs=1M count=6 2>/dev/null
+cp "$T49_LOCAL" "$T49_FILE"
+dfs_sync
+
+T49_GOT=$(md5sum "$T49_FILE" | awk '{print $1}')
+T49_WANT=$(md5sum "$T49_LOCAL" | awk '{print $1}')
+[ "$T49_GOT" = "$T49_WANT" ] \
+    && check "T49a fresh 6MB write (full chunk + partial tail chunk) correct" PASS \
+    || check "T49a fresh write corrupt (want $T49_WANT got $T49_GOT)" FAIL
+
+# Patch 16KB at offset 1MB — well inside chunk 0, nowhere near the tail chunk.
+dd if=/dev/urandom of="$T49_LOCAL" bs=4096 count=4 seek=256 conv=notrunc 2>/dev/null
+dd if="$T49_LOCAL" of="$T49_FILE" bs=4096 count=4 seek=256 conv=notrunc 2>/dev/null
+dfs_sync
+
+T49_GOT=$(md5sum "$T49_FILE" | awk '{print $1}')
+T49_WANT=$(md5sum "$T49_LOCAL" | awk '{print $1}')
+[ "$T49_GOT" = "$T49_WANT" ] \
+    && check "T49b patch to chunk 0 leaves whole file (incl. tail chunk) correct" PASS \
+    || check "T49b patch to chunk 0 corrupted the file (want $T49_WANT got $T49_GOT)" FAIL
+
+# Pinpoint: does corruption (if any) start exactly at the patch offset and run
+# to EOF, or is it localized to just the patched 16KB? Diagnostic only — T49b
+# above is the real pass/fail signal.
+if [ "$T49_GOT" != "$T49_WANT" ]; then
+    T49_FIRST_DIFF=$(cmp "$T49_LOCAL" "$T49_FILE" 2>&1 | grep -oP 'byte \K[0-9]+' || echo "?")
+    echo "  T49 diagnostic: first differing byte = $T49_FIRST_DIFF (patch started at byte 1048577)"
+    echo "  T49 diagnostic: server-side (FILE_TABLE) view via dfs-admin:"
+    "$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t49_tail.bin 2>&1
+fi
+
+rm -f "$T49_FILE" "$T49_LOCAL"
+fi # should_run T49
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

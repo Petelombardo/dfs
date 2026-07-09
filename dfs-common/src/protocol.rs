@@ -319,6 +319,25 @@ pub enum Request {
         locations: Vec<ChunkLocation>,
     },
 
+    /// Broadcast a completed background fold's token→real-chunk redirect to every
+    /// other online node (deferred chunk-patch consolidation — see PATCH_STATE_TABLE
+    /// in metadata.rs). PATCH_STATE_TABLE is otherwise node-local and never
+    /// disseminated, which left two gaps a public_token that outlives its own node's
+    /// knowledge would fall into: (1) a read of `public_token` served by any other
+    /// node hard-fails (no local Pending/Folded row to resolve through, and the
+    /// token itself is never a real on-disk file), and (2) GetFileInfo answered by
+    /// any other node reports the token's own frozen ChunkLocation (whatever node
+    /// count it had at patch time) forever, instead of `real_chunk_id`'s actual,
+    /// growing replica set. Sent once, right after the local fold flips
+    /// patch_state to Folded, alongside the existing ReplicateChunkLocation
+    /// broadcast for `real_chunk_id`'s own location.
+    ReplicatePatchFold {
+        public_token: ChunkId,
+        real_chunk_id: ChunkId,
+        file_id: FileId,
+        chunk_idx: u64,
+    },
+
     /// Batch replicate file metadata — one round-trip replaces N×ReplicateMetadata.
     /// Used by the metadata retry loop to drain failed replications efficiently.
     ReplicateMetadataBatch {
@@ -527,6 +546,19 @@ pub enum Request {
         chunk_ids: Vec<ChunkId>,
     },
 
+    /// Ask a node for every chunk_id currently outstanding in its LOCAL
+    /// PATCH_STATE_TABLE (deferred chunk-patch consolidation), Pending or Folded.
+    /// PATCH_STATE_TABLE is node-local and never disseminated — a patch can be
+    /// applied by any node in the cluster, not just the leader — so the leader's
+    /// healing discovery pass must union this across every online node instead of
+    /// trusting its own local table alone. Without this, a token created on a
+    /// follower is invisible to the leader's exclusion check, gets classified as
+    /// an ordinary chunk, and HasChunks correctly (but misleadingly) reports it
+    /// absent everywhere — since a token is never a real on-disk file — which can
+    /// stall its replica count forever or, worse, walk it into the DATA LOSS purge
+    /// path (see PATCH_STATE_TABLE's doc comment in metadata.rs).
+    GetPatchTokenIds,
+
     /// Ask any node to immediately run its local orphan reconciliation sweep instead
     /// of waiting for the next scheduled cycle. Safety gating (age grace, two-pass
     /// confirmation, leader cross-check or all-nodes-stability) still applies —
@@ -693,6 +725,12 @@ pub enum Response {
     /// alone is not sufficient to delete; see ConfirmChunksLive's doc comment.
     ChunkLiveness {
         live: Vec<ChunkId>,
+    },
+
+    /// Response to GetPatchTokenIds: every chunk_id currently outstanding in the
+    /// responding node's local PATCH_STATE_TABLE.
+    PatchTokenIds {
+        ids: Vec<ChunkId>,
     },
 
     /// Chunk IDs response (for WriteFile)

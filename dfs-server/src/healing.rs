@@ -1621,9 +1621,39 @@ impl HealingManager {
         // actively healing directly — a token never names a real file (Pending) or
         // is a permanent alias to one living at a different identity (Folded),
         // which gets its own normal ChunkLocation and is healed on its own merits.
-        // Prefetched once here (the table is tiny) instead of a per-chunk lookup
-        // inside the classification loop below, which can scan 500K+ chunks.
-        let patch_token_ids = self.metadata.all_patch_token_ids_async().await.unwrap_or_default();
+        //
+        // PATCH_STATE_TABLE is node-local and never disseminated, and a patch can
+        // land on any node in the cluster, not just this one — a local-only lookup
+        // here is blind to every token created on a follower. Gather every online
+        // node's token set (this node's own plus one GetPatchTokenIds RPC per peer,
+        // the table is tiny) and union them before classifying. Without this union,
+        // a follower-created token slips through this exclusion, gets classified as
+        // an ordinary chunk below, and HasChunks correctly (but misleadingly)
+        // reports it absent everywhere — a token is never a real on-disk file —
+        // which can stall its reported replica count forever or, worse, walk it
+        // into the DATA LOSS purge path below.
+        let mut patch_token_ids = self.metadata.all_patch_token_ids_async().await.unwrap_or_default();
+        for node_info in &online_nodes {
+            if node_info.id == local_id {
+                continue;
+            }
+            if !self.cluster.is_leader().await {
+                debug!("Leadership changed during GetPatchTokenIds RPCs — aborting discovery pass");
+                return Ok(());
+            }
+            match self.client.send_message(node_info.addr, Message::Request(Request::GetPatchTokenIds)).await {
+                Ok(envelope) => {
+                    if let Message::Response(Response::PatchTokenIds { ids }) = envelope.message {
+                        patch_token_ids.extend(ids);
+                    } else {
+                        warn!("Unexpected response to GetPatchTokenIds from node {}", node_info.id);
+                    }
+                }
+                Err(e) => {
+                    warn!("GetPatchTokenIds RPC failed for node {} ({}): its patch tokens are invisible this cycle", node_info.id, e);
+                }
+            }
+        }
 
         // Classify all chunks — no work cap here. Every chunk must be classified so
         // that pending_healing timestamps are updated for all under-replicated chunks,
@@ -1642,6 +1672,15 @@ impl HealingManager {
                 tokio::task::yield_now().await;
             }
             if patch_token_ids.contains(&chunk_id) {
+                // Never actively healed (see patch_token_ids' doc comment above), so
+                // it must not be left sitting in pending_healing either — nothing
+                // past this `continue` will ever reach this chunk_id's clear_pending
+                // call again. Without this, a chunk_id that was marked pending
+                // before it was recognized as a token (e.g. an explicit `dfs-admin
+                // healing file` trigger, which marks every chunk in a file
+                // unconditionally) stays in the reported heal queue forever, even
+                // though there is deliberately nothing left to do for it.
+                self.clear_pending(&chunk_id).await;
                 continue;
             }
 

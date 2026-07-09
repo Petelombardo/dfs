@@ -714,7 +714,11 @@ impl OverlayForkCtx {
         // WITHOUT any client-visible RPC — nothing else in the cluster would ever
         // learn about it otherwise. Broadcast it ourselves to every other online
         // node, the same way HealingManager::broadcast_chunk_location_shared
-        // already does after a heal.
+        // already does after a heal. Also broadcast the token->real_chunk_id
+        // redirect itself (ReplicatePatchFold) — PATCH_STATE_TABLE is otherwise
+        // node-local, so without this, only this node can ever resolve a read of
+        // public_token or report its true (growing) replica count; see
+        // ReplicatePatchFold's doc comment.
         if let Some(new_loc) = new_loc {
             let nodes = self.cluster.get_all_nodes().await;
             let local_id = self.cluster.local_node_id();
@@ -725,6 +729,12 @@ impl OverlayForkCtx {
                 let request = Request::ReplicateChunkLocation { location: new_loc.clone(), file_id: new_loc.file_id };
                 if let Err(e) = self.client.send_message(node.addr, Message::Request(request)).await {
                     warn!("single fold: failed to broadcast new location {} to node {}: {}", new_chunk_id, node.id, e);
+                }
+                let fold_request = Request::ReplicatePatchFold {
+                    public_token, real_chunk_id: new_chunk_id, file_id, chunk_idx,
+                };
+                if let Err(e) = self.client.send_message(node.addr, Message::Request(fold_request)).await {
+                    warn!("single fold: failed to broadcast patch fold {} -> {} to node {}: {}", public_token, new_chunk_id, node.id, e);
                 }
             }
         } else {
@@ -2219,6 +2229,9 @@ impl Server {
             Request::ReplicateChunkLocations { locations } => {
                 self.handle_replicate_chunk_locations(locations).await
             }
+            Request::ReplicatePatchFold { public_token, real_chunk_id, file_id, chunk_idx } => {
+                self.handle_replicate_patch_fold(public_token, real_chunk_id, file_id, chunk_idx).await
+            }
             Request::PurgeChunkLocation { chunk_id } => {
                 self.handle_purge_chunk_location(chunk_id).await
             }
@@ -2228,6 +2241,7 @@ impl Server {
             Request::ConfirmChunksLive { chunk_ids } => {
                 self.handle_confirm_chunks_live(chunk_ids).await
             }
+            Request::GetPatchTokenIds => self.handle_get_patch_token_ids().await,
             Request::TriggerOrphanCleanup => {
                 self.handle_trigger_orphan_cleanup().await
             }
@@ -3368,6 +3382,20 @@ impl Server {
         }
     }
 
+    /// Answer GetPatchTokenIds using this node's own local PATCH_STATE_TABLE. See
+    /// Request::GetPatchTokenIds's doc comment for why the leader's healing
+    /// discovery pass must gather this from every online node instead of trusting
+    /// its own local table alone.
+    async fn handle_get_patch_token_ids(&self) -> Response {
+        match self.metadata.all_patch_token_ids_async().await {
+            Ok(ids) => Response::PatchTokenIds { ids: ids.into_iter().collect() },
+            Err(e) => {
+                warn!("handle_get_patch_token_ids: failed to read local patch_state table: {}", e);
+                Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError }
+            }
+        }
+    }
+
     /// Run this node's local orphan reconciliation sweep right now instead of
     /// waiting for the next scheduled cycle. Fire-and-forget — all the usual safety
     /// gating (age grace, two-pass confirmation, leader cross-check / stability
@@ -3675,6 +3703,28 @@ impl Server {
                 code: ErrorCode::InternalError,
             }
         }
+    }
+
+    /// Receive a completed fold's token→real-chunk redirect from the node that ran
+    /// it. See Request::ReplicatePatchFold's doc comment for why this must be
+    /// disseminated at all: without it, only the originating node can resolve
+    /// reads or report accurate replica counts for `public_token`.
+    async fn handle_replicate_patch_fold(
+        &self, public_token: ChunkId, real_chunk_id: ChunkId, file_id: FileId, chunk_idx: u64,
+    ) -> Response {
+        if let Err(e) = self.metadata.update_patch_state_folded_async(public_token, real_chunk_id).await {
+            warn!("handle_replicate_patch_fold: failed to record {} -> {}: {}", public_token, real_chunk_id, e);
+            return Response::Error {
+                message: format!("Failed to record patch fold: {}", e),
+                code: ErrorCode::InternalError,
+            };
+        }
+        // Same fast local index resolve_chunk_content consults before bothering to
+        // check patch_state at all — without this, a read of public_token on this
+        // node takes the "ordinary chunk" fallback and hard-fails NotFound despite
+        // the patch_state row we just wrote.
+        self.pending_patch_ids.insert(public_token, (file_id, chunk_idx));
+        Response::Ok { data: None }
     }
 
     async fn handle_replicate_metadata_batch(&self, items: Vec<FileMetadata>) -> Response {
@@ -7646,17 +7696,35 @@ impl Server {
         }
     }
 
+    /// Resolve an inline (FileMetadata-embedded) ChunkLocation for external
+    /// reporting (GetFileInfo/dfs-admin). If `inline.chunk_id` is a patch token
+    /// (deferred chunk-patch consolidation) whose fold has already completed, its
+    /// own ChunkLocation is a frozen self-registration from patch time — inherited
+    /// from the pre-patch base and never updated again (see apply_patch) — that
+    /// never reflects the real content's growing replica count under
+    /// `real_chunk_id`. Report that live node list instead. Every node can now
+    /// answer this correctly, not just the one that ran the fold — see
+    /// ReplicatePatchFold's doc comment for why that dissemination was needed.
+    fn resolve_chunk_location_for_info(&self, inline: &ChunkLocation) -> ChunkLocation {
+        if let Ok(Some(PatchState::Folded(real_chunk_id))) = self.metadata.get_patch_state(&inline.chunk_id) {
+            if let Ok(Some(real_loc)) = self.metadata.get_chunk_location(&real_chunk_id) {
+                return ChunkLocation { nodes: real_loc.nodes, ..inline.clone() };
+            }
+        }
+        match self.metadata.get_chunk_location(&inline.chunk_id) {
+            Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(inline, sled_loc),
+            _ => inline.clone(),
+        }
+    }
+
     async fn handle_get_file_info(&self, path: String) -> Response {
         debug!("Handling get file info: {}", path);
 
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                let chunk_locations: Vec<ChunkLocation> = metadata.chunk_locations.iter().map(|inline| {
-                    match self.metadata.get_chunk_location(&inline.chunk_id) {
-                        Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(inline, sled_loc),
-                        _ => inline.clone(),
-                    }
-                }).collect();
+                let chunk_locations: Vec<ChunkLocation> = metadata.chunk_locations.iter()
+                    .map(|inline| self.resolve_chunk_location_for_info(inline))
+                    .collect();
 
                 Response::FileInfo {
                     metadata,
@@ -7683,12 +7751,9 @@ impl Server {
 
         match self.metadata.get_file(&file_id) {
             Ok(Some(metadata)) => {
-                let chunk_locations: Vec<ChunkLocation> = metadata.chunk_locations.iter().map(|inline| {
-                    match self.metadata.get_chunk_location(&inline.chunk_id) {
-                        Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(inline, sled_loc),
-                        _ => inline.clone(),
-                    }
-                }).collect();
+                let chunk_locations: Vec<ChunkLocation> = metadata.chunk_locations.iter()
+                    .map(|inline| self.resolve_chunk_location_for_info(inline))
+                    .collect();
 
                 Response::FileInfo {
                     metadata,

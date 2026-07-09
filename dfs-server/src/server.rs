@@ -1,7 +1,7 @@
 use crate::chunker::Chunker;
 use crate::cluster::ClusterManager;
 use crate::healing::HealingManager;
-use crate::metadata::{MetadataStore, PatchJournalEntry, PatchState};
+use crate::metadata::{MetadataStore, PatchState};
 use crate::network::{MessageHandler, NetworkClient};
 use crate::stats::OpsTracker;
 use crate::storage::ChunkStorage;
@@ -222,6 +222,51 @@ pub struct Server {
     /// for the overwhelming common case (a chunk_id that was never patched, or
     /// whose patch settled long ago) — see resolve_chunk_content.
     pending_patch_ids: Arc<DashMap<ChunkId, (FileId, u64)>>,
+
+    /// Retry backstop for the ReplicateChunkLocation/ReplicatePatchFold broadcast
+    /// run_single_fold sends immediately after a fold completes. That broadcast
+    /// skips any peer not currently NodeStatus::Online and is otherwise
+    /// fire-and-forget — a peer that isn't Online yet at that exact instant (most
+    /// likely during a rolling multi-node deploy/restart) permanently misses it,
+    /// since nothing else ever resends it. That peer is then stuck unable to
+    /// resolve reads for that one public_token — via resolve_chunk_content's
+    /// pending_patch_ids fast-path miss, falling through to a raw disk read that
+    /// hard-fails, since a public token never has a physical chunk file — until
+    /// this exact (file_id, chunk_idx) slot happens to get patched again,
+    /// producing a fresh token whose broadcast gets a new chance to reach every
+    /// peer. Real incident: 2026-07-09 staging deploy, a completed DVR recording's
+    /// chunk 0 stayed permanently unreadable on 2 of 3 replicas because it was
+    /// never patched again after the deploy.
+    ///
+    /// start_patch_fold_rebroadcast_loop drains this every 10s (leader and
+    /// followers both — any node that itself ran a fold owns re-announcing it)
+    /// and resends to every currently-Online peer; ReplicateChunkLocation and
+    /// ReplicatePatchFold are both idempotent, so redundant resends to a peer
+    /// that already has the state are harmless no-ops. Entries expire after
+    /// PATCH_FOLD_REBROADCAST_TTL so a peer that stays offline longer than that
+    /// falls back to normal healing/restart catch-up instead of growing this map
+    /// unboundedly.
+    pending_patch_fold_broadcasts: Arc<DashMap<ChunkId, PendingPatchFoldBroadcast>>,
+
+    /// (file_id, chunk_idx) slots with an un-folded Pending patch_state.
+    /// Populated by apply_patch every time it merges a new patch into a slot's
+    /// existing Pending delta instead of folding immediately (2026-07-09
+    /// VM-install regression: folding on every single patch serializes hot
+    /// chunks — repeated patches to the same slot — behind chunk_patch_locks
+    /// with zero overlap benefit, since the next patch already has to wait for
+    /// the current fold either way; deferring pays the extra delta-write cost
+    /// for nothing in that case).
+    ///
+    /// Debounced, not periodic: the first patch on a fresh accumulator spawns
+    /// one debounce_fold_slot task (see its doc comment) that folds 500ms after
+    /// the *last* patch to this slot, resetting on every subsequent merge, up
+    /// to a hard PATCH_DEBOUNCE_MAX_WAIT cap so a continuously-hot chunk still
+    /// gets folded periodically rather than accumulating forever. That task
+    /// reads last_patch_at from here on every wake to decide whether to fold or
+    /// keep waiting. resolve_chunk_content also forces an immediate fold on
+    /// read (see fold_slot_now) instead of composing on the fly, so a cold read
+    /// is never stuck behind the debounce window either.
+    dirty_patch_slots: Arc<DashMap<(FileId, u64), DirtyPatchSlot>>,
 
     /// Per-chunk_id read-exclusion lock for in-place patching. The in-place
     /// patch path (handle_patch_chunk/handle_multi_patch) mutates the
@@ -446,7 +491,6 @@ async fn full_rewrite_chunk(
     let metadata_inner = metadata.clone();
     let result = tokio::task::spawn_blocking(move || {
         use std::fs;
-        use std::io::{Seek, SeekFrom, Write};
         let storage = storage_inner;
         let metadata = metadata_inner;
         let _io_guard = io_guard;
@@ -471,10 +515,8 @@ async fn full_rewrite_chunk(
             .max(buf.len());
         buf.resize(needed_len, 0);
 
-        let mut undo_patches: Vec<(usize, Vec<u8>)> = Vec::with_capacity(patches.len());
         for (intra_offset, patch_data) in &patches {
             let end = *intra_offset + patch_data.len();
-            undo_patches.push((*intra_offset, buf[*intra_offset..end].to_vec()));
             buf[*intra_offset..end].copy_from_slice(patch_data);
         }
 
@@ -484,52 +526,23 @@ async fn full_rewrite_chunk(
         );
 
         if new_chunk_id != old_chunk_id {
-            let journal = PatchJournalEntry {
-                old_chunk_id,
-                new_chunk_id,
-                patches: undo_patches,
-            };
-            metadata.put_patch_journal(&journal)
-                .map_err(|e| (format!("Failed to write patch journal: {}", e), ErrorCode::InternalError))?;
-
-            let write_result = (|| -> Result<(), (String, ErrorCode)> {
-                let mut f = fs::OpenOptions::new().write(true).open(&old_path)
-                    .map_err(|e| (format!("Failed to open chunk for patch: {}", e), ErrorCode::InternalError))?;
-                for (intra_offset, patch_data) in &patches {
-                    f.seek(SeekFrom::Start(*intra_offset as u64))
-                        .map_err(|e| (format!("Failed to seek chunk: {}", e), ErrorCode::InternalError))?;
-                    f.write_all(patch_data)
-                        .map_err(|e| (format!("Failed to write patch: {}", e), ErrorCode::InternalError))?;
-                }
-                f.sync_data()
-                    .map_err(|e| (format!("Failed to sync patched chunk: {}", e), ErrorCode::InternalError))?;
-                Ok(())
-            })();
-            if let Err(e) = write_result {
-                // Leave the journal entry — startup recovery restores old_path.
-                return Err(e);
-            }
-
-            let new_path = storage.get_chunk_path(&new_chunk_id);
-            if let Some(parent) = new_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| (format!("Failed to create chunk directory: {}", e), ErrorCode::InternalError))?;
-            }
-            fs::rename(&old_path, &new_path)
-                .map_err(|e| (format!("Failed to rename patched chunk: {}", e), ErrorCode::InternalError))?;
-
-            // See the original inline version of this dance (git history) for why it's
-            // safe to drop the write-exclusion guard here: the rename above is the last
-            // step that touches chunk bytes a concurrent reader could observe.
-            drop(_io_guard);
-
-            let _ = metadata.delete_chunk_location(&old_chunk_id);
-            storage.invalidate_cache(&old_chunk_id);
+            // Write the full patched buffer under a fresh, uniquely-named temp file
+            // and atomically rename it into place (ChunkStorage::write_chunk) —
+            // old_chunk_id's own file is never opened for writing. A crash at any
+            // point up to and including a failed rename leaves old_chunk_id
+            // byte-for-byte intact (still a valid, independently readable chunk)
+            // and the orphaned temp file unreferenced by any metadata — nothing to
+            // undo, nothing to recover at startup. This replaces an earlier design
+            // that patched old_path's bytes in place before renaming, which could
+            // leave old_chunk_id corrupted (bytes changed, name/hash not yet) if
+            // the process died mid-write, and needed a durable write-ahead undo
+            // journal (PatchJournalEntry, removed 2026-07-09) to recover from that.
+            // See run_single_fold's caller for why a crash before this point is
+            // also safe: patch_state is still Pending and base_chunk_id/
+            // delta_chunk_id are both still untouched, so the fold just retries.
+            storage.write_chunk(&new_chunk_id, &buf)
+                .map_err(|e| (format!("Failed to write consolidated chunk: {}", e), ErrorCode::InternalError))?;
             storage.invalidate_cache(&new_chunk_id);
-
-            if let Err(e) = metadata.delete_patch_journal(&old_chunk_id) {
-                warn!("full_rewrite_chunk: failed to clear patch journal for {}: {}", old_chunk_id, e);
-            }
         }
 
         // (Re-)register new_chunk_id's ChunkLocation unconditionally — even when the
@@ -567,6 +580,16 @@ async fn full_rewrite_chunk(
             }
         }
 
+        if new_chunk_id != old_chunk_id {
+            // Only now — new_chunk_id is durably on disk and registered — is
+            // old_chunk_id's file safe to reclaim. Best-effort: a crash or failure
+            // here just leaves it as a harmless orphan (unreferenced by any
+            // metadata) for the storage-reconciliation sweep to eventually clean up.
+            let _ = fs::remove_file(&old_path);
+            let _ = metadata.delete_chunk_location(&old_chunk_id);
+            storage.invalidate_cache(&old_chunk_id);
+        }
+
         Ok((new_chunk_id, final_size, Arc::new(buf)))
     }).await;
 
@@ -589,9 +612,49 @@ struct OverlayForkCtx {
     chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
     chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>>,
     pending_patch_ids: Arc<DashMap<ChunkId, (FileId, u64)>>,
+    pending_patch_fold_broadcasts: Arc<DashMap<ChunkId, PendingPatchFoldBroadcast>>,
+    dirty_patch_slots: Arc<DashMap<(FileId, u64), DirtyPatchSlot>>,
+    chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
     cluster: Arc<ClusterManager>,
     client: Arc<NetworkClient>,
 }
+
+/// One completed fold, kept around for start_patch_fold_rebroadcast_loop to
+/// keep re-announcing to any peer that missed the original broadcast. See
+/// Server::pending_patch_fold_broadcasts's doc comment for the full incident.
+#[derive(Clone)]
+struct PendingPatchFoldBroadcast {
+    location: ChunkLocation,
+    file_id: FileId,
+    chunk_idx: u64,
+    real_chunk_id: ChunkId,
+    first_seen: std::time::Instant,
+}
+
+/// Value type for Server::dirty_patch_slots — see its doc comment. `token` is
+/// the slot's current public_token (what fold_slot_now looks up in
+/// PATCH_STATE_TABLE); `last_patch_at` is what debounce_fold_slot polls to
+/// decide whether the accumulator has quiesced yet.
+#[derive(Clone, Copy)]
+struct DirtyPatchSlot {
+    token: ChunkId,
+    last_patch_at: std::time::Instant,
+}
+
+/// How long a slot's accumulator must sit idle (no new patch) before
+/// debounce_fold_slot folds it. Chosen to comfortably coalesce a burst of
+/// rapid patches (e.g. qcow2 metadata rewrites during a VM install, which
+/// land only milliseconds apart) into one fold, without leaving a
+/// genuinely-done chunk waiting long for reads to force it.
+const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Hard ceiling on how long a continuously-hot slot's accumulator can grow
+/// before being folded regardless of ongoing activity — resetting the debounce
+/// timer forever on a chunk that never quiesces would grow its delta (and the
+/// eventual fold's cost) unboundedly. Past this point there's no expected gain
+/// left to coalesce (the chunk is already getting full of dirty data), so cut
+/// losses and fold.
+const PATCH_DEBOUNCE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
 impl OverlayForkCtx {
     /// Consolidate the one pending patch on (file_id, chunk_idx) into a single
@@ -614,17 +677,17 @@ impl OverlayForkCtx {
         base_chunk_id: ChunkId,
         delta_chunk_id: ChunkId,
         delta_client_write_seq: Option<u64>,
-    ) {
+    ) -> bool {
         let storage = self.storage.clone();
         let read_result = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&delta_chunk_id)).await;
         let delta_bytes = match read_result {
             Ok(Ok(b)) => b,
-            Ok(Err(e)) => { warn!("single fold: failed to read delta chunk {}: {}", delta_chunk_id, e); return; }
-            Err(e) => { warn!("single fold: spawn_blocking panicked reading delta chunk {}: {}", delta_chunk_id, e); return; }
+            Ok(Err(e)) => { warn!("single fold: failed to read delta chunk {}: {}", delta_chunk_id, e); return false; }
+            Err(e) => { warn!("single fold: spawn_blocking panicked reading delta chunk {}: {}", delta_chunk_id, e); return false; }
         };
         let patches: Vec<(usize, Vec<u8>)> = match bincode::deserialize(&delta_bytes) {
             Ok(p) => p,
-            Err(e) => { warn!("single fold: corrupt delta chunk {}: {}", delta_chunk_id, e); return; }
+            Err(e) => { warn!("single fold: corrupt delta chunk {}: {}", delta_chunk_id, e); return false; }
         };
 
         // base_chunk_id's own ChunkLocation was deleted the moment apply_patch
@@ -659,7 +722,7 @@ impl OverlayForkCtx {
                 // demand. The guard this task holds is dropped when it returns,
                 // letting a subsequent patch to this slot proceed — its staleness
                 // check will see patch_state still Pending and can retry the fold.
-                return;
+                return false;
             }
         };
 
@@ -737,6 +800,19 @@ impl OverlayForkCtx {
                     warn!("single fold: failed to broadcast patch fold {} -> {} to node {}: {}", public_token, new_chunk_id, node.id, e);
                 }
             }
+            // Register for periodic re-announcement regardless of how the
+            // immediate pass above went — a peer that wasn't Online yet at this
+            // exact instant was silently skipped above with no way to know it
+            // missed anything. start_patch_fold_rebroadcast_loop is the backstop
+            // that actually closes that gap; see pending_patch_fold_broadcasts's
+            // doc comment for the incident this fixes.
+            self.pending_patch_fold_broadcasts.insert(public_token, PendingPatchFoldBroadcast {
+                location: new_loc,
+                file_id,
+                chunk_idx,
+                real_chunk_id: new_chunk_id,
+                first_seen: std::time::Instant::now(),
+            });
         } else {
             warn!("single fold: no ChunkLocation found for freshly-folded {} — cannot broadcast to cluster", new_chunk_id);
         }
@@ -750,6 +826,94 @@ impl OverlayForkCtx {
 
         info!("Single fold: file {} chunk_idx {} consolidated ({} + delta -> {}, final size {})",
             file_id, chunk_idx, base_chunk_id, new_chunk_id, final_size);
+        true
+    }
+
+    /// Fold whatever is currently accumulated for (file_id, chunk_idx), if
+    /// anything — the coalescing counterpart to the old per-patch
+    /// tokio::spawn(run_single_fold): apply_patch no longer folds on every
+    /// patch, only merges into dirty_patch_slots (see its doc comment), so this
+    /// is the one place that actually turns an accumulated Pending delta back
+    /// into real, directly-readable content. Two callers: debounce_fold_slot
+    /// (the normal path, once a slot's accumulator quiesces or hits its max
+    /// wait) and a forced fold on read (resolve_chunk_content) — both just need
+    /// "make this slot's current state real right now," which is exactly what
+    /// this does.
+    ///
+    /// Acquires chunk_patch_locks itself (unlike run_single_fold, which expects
+    /// an already-held guard handed to it) since callers here never held it to
+    /// begin with — merges in apply_patch release it immediately after writing
+    /// their delta.
+    async fn fold_slot_now(&self, file_id: FileId, chunk_idx: u64) -> bool {
+        let lock = self.chunk_patch_locks
+            .entry((file_id, chunk_idx))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock_owned().await;
+
+        // Re-check under the lock: another caller (debounce task vs. forced-read
+        // racing, or this slot simply has nothing pending) may have already
+        // handled it.
+        let Some(public_token) = self.dirty_patch_slots.get(&(file_id, chunk_idx)).map(|e| e.value().token) else {
+            return true; // nothing pending — already folded, trivially "successful"
+        };
+        let pending = match self.metadata.get_patch_state_async(public_token).await {
+            Ok(Some(PatchState::Pending { base_chunk_id, delta_chunk_id, client_write_seq, .. })) => {
+                (base_chunk_id, delta_chunk_id, client_write_seq)
+            }
+            Ok(Some(PatchState::Folded(_))) | Ok(None) => {
+                // Already folded (another caller beat us to it) or the slot moved
+                // on to a newer token since we read dirty_patch_slots above.
+                self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+                return true;
+            }
+            Err(e) => {
+                warn!("fold_slot_now: failed to resolve patch state for {}: {}", public_token, e);
+                return false;
+            }
+        };
+        let (base_chunk_id, delta_chunk_id, client_write_seq) = pending;
+        const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
+        let chunk_file_offset = chunk_idx * CHUNK_SIZE_U64;
+
+        let ok = self.run_single_fold(
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, client_write_seq,
+        ).await;
+        if ok {
+            self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+        }
+        ok
+    }
+
+    /// Spawned once by apply_patch when a slot's accumulator starts fresh
+    /// (never for a merge onto an existing one — see its call site). Polls
+    /// dirty_patch_slots every PATCH_DEBOUNCE_IDLE and folds once either:
+    ///   - the slot has gone PATCH_DEBOUNCE_IDLE since its *last* patch (a
+    ///     burst quieted down), or
+    ///   - PATCH_DEBOUNCE_MAX_WAIT has elapsed since this task started (the
+    ///     slot never quiets down — cut losses rather than let the
+    ///     accumulator grow forever).
+    /// Exits immediately, without folding, if the slot is gone by the time it
+    /// wakes (fold_slot_now already handled it via a forced read).
+    async fn debounce_fold_slot(&self, file_id: FileId, chunk_idx: u64) {
+        let started_at = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(PATCH_DEBOUNCE_IDLE).await;
+
+            let Some(last_patch_at) = self.dirty_patch_slots
+                .get(&(file_id, chunk_idx))
+                .map(|e| e.value().last_patch_at)
+            else {
+                return; // already folded elsewhere (e.g. a forced read) — nothing to do
+            };
+
+            if last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE || started_at.elapsed() >= PATCH_DEBOUNCE_MAX_WAIT {
+                self.fold_slot_now(file_id, chunk_idx).await;
+                return;
+            }
+            // Else: a patch landed within the last debounce window — loop and
+            // sleep again rather than folding yet.
+        }
     }
 }
 
@@ -931,6 +1095,8 @@ impl Server {
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             chunk_patch_locks: Arc::new(DashMap::new()),
             pending_patch_ids: Arc::new(DashMap::new()),
+            pending_patch_fold_broadcasts: Arc::new(DashMap::new()),
+            dirty_patch_slots: Arc::new(DashMap::new()),
             chunk_io_locks: Arc::new(DashMap::new()),
             chunk_prefetch: Arc::new(DashMap::new()),
             recently_patched: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))),
@@ -971,63 +1137,6 @@ impl Server {
             warn!("drain_sled_writes: flush_durable failed: {}", e);
         }
         info!("drain_sled_writes: all pending metadata writes flushed to disk");
-    }
-
-    /// Replay or discard leftover patch-journal entries from a crash that
-    /// interrupted handle_patch_chunk/handle_multi_patch's in-place mutation.
-    /// Must run once at startup, before the server accepts any PatchChunk or
-    /// ReadChunk request.
-    pub fn recover_patch_journal(&self) {
-        let entries = match self.metadata.scan_patch_journal() {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("recover_patch_journal: failed to scan journal: {}", e);
-                return;
-            }
-        };
-        if entries.is_empty() {
-            return;
-        }
-        info!("recover_patch_journal: replaying {} leftover patch journal entries", entries.len());
-        for entry in entries {
-            let old_path = self.storage.get_chunk_path(&entry.old_chunk_id);
-            if old_path.exists() {
-                // Crash happened before (or during) the in-place write — restore
-                // old_path's bytes exactly so its content matches old_chunk_id
-                // again. Unwind sub-patches in reverse in case any of them
-                // overlapped within the same journal entry.
-                let restore = (|| -> std::io::Result<()> {
-                    use std::io::{Seek, SeekFrom, Write};
-                    let mut f = std::fs::OpenOptions::new().write(true).open(&old_path)?;
-                    for (offset, undo_bytes) in entry.patches.iter().rev() {
-                        f.seek(SeekFrom::Start(*offset as u64))?;
-                        f.write_all(undo_bytes)?;
-                    }
-                    f.sync_data()
-                })();
-                match restore {
-                    Ok(()) => {
-                        info!("recover_patch_journal: restored {} from undo journal", entry.old_chunk_id);
-                        self.storage.invalidate_cache(&entry.old_chunk_id);
-                    }
-                    Err(e) => {
-                        warn!("recover_patch_journal: failed to restore {}: {} — leaving journal entry for next attempt",
-                            entry.old_chunk_id, e);
-                        continue;
-                    }
-                }
-            } else {
-                // old_path is gone — the rename completed before the crash, so the
-                // data under new_chunk_id is intact. This degrades to the same
-                // metadata-propagation gap the orphan reconciliation sweep already
-                // covers, not a new failure mode — just discard the journal entry.
-                info!("recover_patch_journal: {} already renamed to {} — discarding journal entry",
-                    entry.old_chunk_id, entry.new_chunk_id);
-            }
-            if let Err(e) = self.metadata.delete_patch_journal(&entry.old_chunk_id) {
-                warn!("recover_patch_journal: failed to clear journal entry for {}: {}", entry.old_chunk_id, e);
-            }
-        }
     }
 
     /// Rebuild the in-memory chunk map by scanning all file metadata.
@@ -2480,18 +2589,6 @@ impl Server {
                 .context("spawn_blocking panicked in resolve_chunk_content")?;
         };
 
-        // Wait out any fold currently in flight for this slot. Acquiring and
-        // immediately releasing is intentional — we don't want to hold the lock
-        // while composing/reading, only to block until whatever fold holds it
-        // (if any) has finished.
-        {
-            let lock = self.chunk_patch_locks
-                .entry(slot)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone();
-            drop(lock.lock_owned().await);
-        }
-
         match self.metadata.get_patch_state_async(chunk_id).await
             .context("resolve_chunk_content: get_patch_state failed")?
         {
@@ -2506,7 +2603,36 @@ impl Server {
                 Ok(arc)
             }
             Some(PatchState::Pending { base_chunk_id, delta_chunk_id, .. }) => {
-                self.compose_one_patch(base_chunk_id, delta_chunk_id).await
+                // A read forces the fold to happen right now instead of composing
+                // on the fly — bounds how large a hot chunk's accumulator can grow
+                // (see dirty_patch_slots's doc comment) and makes every subsequent
+                // read of this chunk a cheap direct read instead of repeatedly
+                // paying a live base+delta compose. The client caches aggressively,
+                // so making this one read wait for the fold is the right trade.
+                let (file_id, chunk_idx) = slot;
+                if self.overlay_ctx().fold_slot_now(file_id, chunk_idx).await {
+                    if let Some(PatchState::Folded(real_chunk_id)) = self.metadata
+                        .get_patch_state_async(chunk_id).await
+                        .context("resolve_chunk_content: get_patch_state failed after fold")?
+                    {
+                        let storage = self.storage.clone();
+                        let arc = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&real_chunk_id))
+                            .await
+                            .context("spawn_blocking panicked in resolve_chunk_content")??;
+                        self.storage.cache_put(chunk_id, arc.clone());
+                        return Ok(arc);
+                    }
+                }
+                // Fold failed, or the slot raced onto a newer token mid-fold —
+                // fall back to a live compose of whatever's current rather than
+                // failing the read outright.
+                match self.metadata.get_patch_state_async(chunk_id).await
+                    .context("resolve_chunk_content: get_patch_state failed (post-fold fallback)")?
+                {
+                    Some(PatchState::Pending { base_chunk_id, delta_chunk_id, .. }) =>
+                        self.compose_one_patch(base_chunk_id, delta_chunk_id).await,
+                    _ => self.compose_one_patch(base_chunk_id, delta_chunk_id).await,
+                }
             }
             None => {
                 // Retired since the pending_patch_ids check above (this slot's
@@ -2802,27 +2928,26 @@ impl Server {
     /// for handle_push_chunk_to's use. Healing must never replicate a patch
     /// delta's raw bytes to a new node as if they were standalone content, or
     /// push a bare public token that names no file at all (see
-    /// PATCH_STATE_TABLE's doc comment). If `chunk_id` is currently tracked
-    /// (a patch token, or an in-flight fold's base), wait for that fold — a
-    /// no-op if none is running — then re-resolve via patch_state. Returns an
-    /// error if it's still Pending afterward: that fold genuinely failed (a real
-    /// anomaly, not a race), and the leader's next healing discovery pass will
-    /// simply retry this chunk.
+    /// PATCH_STATE_TABLE's doc comment). If `chunk_id` is currently tracked (a
+    /// patch token, or an in-flight fold's base) and still Pending, force its
+    /// fold now — with coalescing (see dirty_patch_slots), Pending is the normal
+    /// steady state between periodic sweeps, not evidence of a failed fold, so
+    /// this can no longer just wait-then-error the way it used to.
     async fn resolve_push_target(&self, chunk_id: ChunkId) -> Result<ChunkId> {
-        let Some(slot) = self.pending_patch_ids.get(&chunk_id).map(|e| *e) else {
+        let Some((file_id, chunk_idx)) = self.pending_patch_ids.get(&chunk_id).map(|e| *e) else {
             return Ok(chunk_id);
         };
-        {
-            let lock = self.chunk_patch_locks
-                .entry(slot)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone();
-            drop(lock.lock_owned().await);
-        }
         match self.metadata.get_patch_state_async(chunk_id).await? {
             Some(PatchState::Folded(real)) => Ok(real),
             Some(PatchState::Pending { .. }) => {
-                anyhow::bail!("patch_state for {} is still Pending after its fold's lock was released — that fold must have failed", chunk_id)
+                if self.overlay_ctx().fold_slot_now(file_id, chunk_idx).await {
+                    match self.metadata.get_patch_state_async(chunk_id).await? {
+                        Some(PatchState::Folded(real)) => Ok(real),
+                        _ => anyhow::bail!("patch_state for {} still not Folded after forced fold — slot raced onto a newer token", chunk_id),
+                    }
+                } else {
+                    anyhow::bail!("forced fold failed for {} — the leader's next healing discovery pass will retry this chunk", chunk_id)
+                }
             }
             None => Ok(chunk_id), // retired since the membership check above
         }
@@ -3763,6 +3888,8 @@ impl Server {
         // node takes the "ordinary chunk" fallback and hard-fails NotFound despite
         // the patch_state row we just wrote.
         self.pending_patch_ids.insert(public_token, (file_id, chunk_idx));
+        debug!("handle_replicate_patch_fold: recorded {} -> {} for file {} chunk_idx {}",
+            public_token, real_chunk_id, file_id, chunk_idx);
         Response::Ok { data: None }
     }
 
@@ -5091,6 +5218,116 @@ impl Server {
         }
     }
 
+    /// Retry backstop for run_single_fold's ReplicateChunkLocation/ReplicatePatchFold
+    /// broadcast — see pending_patch_fold_broadcasts's doc comment on Server for the
+    /// gap this closes. Runs on every node (not leader-only, unlike the metadata
+    /// healer above) since any node can independently run a fold and is the one
+    /// responsible for re-announcing its own. Every 10s, resend each pending entry
+    /// to every currently-Online peer; both RPCs are idempotent, so a peer that
+    /// already has the state just does a harmless redundant update. Entries older
+    /// than PATCH_FOLD_REBROADCAST_TTL are dropped — a peer offline that long needs
+    /// real healing/restart catch-up, not an ever-growing retry list.
+    /// Backstop for apply_patch's per-slot debounce_fold_slot tasks (see
+    /// dirty_patch_slots's doc comment for the primary mechanism). Every
+    /// accumulator is already scheduled to fold itself — 500ms after its last
+    /// patch, or PATCH_DEBOUNCE_MAX_WAIT after its first — so under normal
+    /// operation this loop finds nothing to do. It exists purely so that if a
+    /// debounce task ever dies without folding (a panic, or a bug), the slot
+    /// doesn't stay stuck forever: a long interval is fine precisely because
+    /// this is a last-resort net, not the mechanism doing the real work.
+    /// Each node sweeps its own dirty_patch_slots — whichever node actually ran
+    /// the merges is the one that needs to fold them; other replicas learn the
+    /// result via the existing ReplicateChunkLocation / ReplicatePatchFold
+    /// broadcast (see start_patch_fold_rebroadcast_loop). Slots are folded
+    /// concurrently (one spawned task each) so one slow fold can't hold up
+    /// unrelated hot chunks.
+    pub fn start_patch_fold_sweep_loop(self: Arc<Self>) {
+        let server = self;
+        tokio::spawn(async move {
+            const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                if server.dirty_patch_slots.is_empty() {
+                    continue;
+                }
+                let stale: Vec<(FileId, u64)> = server.dirty_patch_slots.iter()
+                    .filter(|e| e.value().last_patch_at.elapsed() >= PATCH_DEBOUNCE_MAX_WAIT)
+                    .map(|e| *e.key())
+                    .collect();
+                if stale.is_empty() {
+                    continue;
+                }
+                warn!("patch_fold_sweep: {} slot(s) still dirty well past their debounce deadline — \
+                       a debounce_fold_slot task may have died; folding as a backstop", stale.len());
+                for (file_id, chunk_idx) in stale {
+                    let ctx = server.overlay_ctx();
+                    tokio::spawn(async move {
+                        ctx.fold_slot_now(file_id, chunk_idx).await;
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn start_patch_fold_rebroadcast_loop(self: Arc<Self>) {
+        let server = self;
+        tokio::spawn(async move {
+            const REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+            const PATCH_FOLD_REBROADCAST_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+            loop {
+                tokio::time::sleep(REBROADCAST_INTERVAL).await;
+
+                if server.pending_patch_fold_broadcasts.is_empty() {
+                    continue;
+                }
+
+                // Drop expired entries first so the resend pass below only touches live ones.
+                server.pending_patch_fold_broadcasts
+                    .retain(|_, entry| entry.first_seen.elapsed() < PATCH_FOLD_REBROADCAST_TTL);
+
+                if server.pending_patch_fold_broadcasts.is_empty() {
+                    continue;
+                }
+
+                let entries: Vec<(ChunkId, PendingPatchFoldBroadcast)> = server.pending_patch_fold_broadcasts
+                    .iter()
+                    .map(|e| (*e.key(), e.value().clone()))
+                    .collect();
+                let nodes = server.cluster.get_all_nodes().await;
+                let local_id = server.cluster.local_node_id();
+                let online_peers: Vec<_> = nodes.into_iter()
+                    .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+                    .collect();
+                if online_peers.is_empty() {
+                    continue;
+                }
+
+                info!("patch_fold_rebroadcast: resending {} pending fold(s) to {} online peer(s)",
+                    entries.len(), online_peers.len());
+
+                for (public_token, entry) in &entries {
+                    for node in &online_peers {
+                        let loc_request = Request::ReplicateChunkLocation {
+                            location: entry.location.clone(), file_id: entry.location.file_id,
+                        };
+                        match server.client.send_message(node.addr, Message::Request(loc_request)).await {
+                            Ok(_) => info!("patch_fold_rebroadcast: DBG location send to {} OK", node.id),
+                            Err(e) => info!("patch_fold_rebroadcast: failed to resend location {} to node {}: {}", public_token, node.id, e),
+                        }
+                        let fold_request = Request::ReplicatePatchFold {
+                            public_token: *public_token, real_chunk_id: entry.real_chunk_id,
+                            file_id: entry.file_id, chunk_idx: entry.chunk_idx,
+                        };
+                        match server.client.send_message(node.addr, Message::Request(fold_request)).await {
+                            Ok(resp) => info!("patch_fold_rebroadcast: DBG fold send to {} OK, resp={:?}", node.id, resp.message),
+                            Err(e) => info!("patch_fold_rebroadcast: failed to resend fold {} -> {} to node {}: {}", public_token, entry.real_chunk_id, node.id, e),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Periodic long-term reconciliation loop: every 5 minutes the leader collects
     /// its authoritative file inventory and sends ReconcileMetadata to each follower,
     /// waiting for each follower to ack before moving to the next.
@@ -5989,6 +6226,9 @@ impl Server {
             chunk_map: self.chunk_map.clone(),
             chunk_io_locks: self.chunk_io_locks.clone(),
             pending_patch_ids: self.pending_patch_ids.clone(),
+            pending_patch_fold_broadcasts: self.pending_patch_fold_broadcasts.clone(),
+            dirty_patch_slots: self.dirty_patch_slots.clone(),
+            chunk_patch_locks: self.chunk_patch_locks.clone(),
             cluster: self.cluster.clone(),
             client: self.client.clone(),
         }
@@ -6057,49 +6297,74 @@ impl Server {
         };
         let patch_guard = patch_guard.expect("chunk_idx Some implies patch_guard Some (see callers)");
 
-        // Resolve chunk_id to the real, standalone content it names. If it's a
-        // previous patch's public token, follow it to what the fold produced — by
-        // the time we hold chunk_patch_locks for this slot, that fold is
-        // guaranteed complete (the fold itself holds this same lock throughout —
-        // see run_single_fold's caller). A token still resolving to Pending here
-        // means that fold genuinely failed (returned without ever flipping to
-        // Folded) — a real anomaly, not a race — so surface it rather than
-        // silently building a new patch on top of a half-consolidated identity.
-        let real_base = match self.metadata.get_patch_state_async(chunk_id).await {
-            Ok(Some(PatchState::Folded(real))) => real,
-            Ok(Some(PatchState::Pending { .. })) => {
-                drop(patch_guard);
-                warn!("apply_patch: {} still Pending for file {} chunk_idx {} — a previous fold must have failed; rejecting so the client retries",
-                    chunk_id, file_id, cidx);
-                return Err(("Previous fold for this chunk did not complete".to_string(), ErrorCode::InternalError));
-            }
-            Ok(None) => chunk_id,
+        // Resolve chunk_id to what it currently means. Three cases:
+        //   Folded(real)  — previous patch (if any) already consolidated; this
+        //                   patch starts a brand-new accumulator on top of real.
+        //   None          — chunk_id was never patched; starts a brand-new
+        //                   accumulator on top of chunk_id itself.
+        //   Pending{..}   — a patch (or several, coalesced) is already
+        //                   accumulated and not yet folded. MERGE this patch
+        //                   into it instead of folding — see dirty_patch_slots's
+        //                   doc comment for why folding on every single patch
+        //                   was a real regression (2026-07-09 VM-install: hot
+        //                   chunks got zero overlap benefit from deferring,
+        //                   since chunk_patch_locks already serializes the next
+        //                   patch behind the current fold either way, so paying
+        //                   for an extra delta-write on top was pure waste).
+        let merge_base = match self.metadata.get_patch_state_async(chunk_id).await {
+            Ok(Some(PatchState::Folded(real))) => Some((real, None)),
+            Ok(Some(pending @ PatchState::Pending { .. })) => Some((chunk_id, Some(pending))),
+            Ok(None) => Some((chunk_id, None)),
             Err(e) => {
                 drop(patch_guard);
                 return Err((format!("Failed to resolve patch state: {}", e), ErrorCode::InternalError));
             }
         };
+        let (base_for_lookup, existing_pending) = merge_base.expect("all three match arms above produce Some");
 
-        // Ghost-chunk guard: real_base is about to become the base of a brand-new
-        // pending patch, so its bytes must actually be present on THIS node's
-        // disk. The cheap path below never reads it (that's the whole
-        // optimization), so nothing else would catch a ghost chunk_map entry here
-        // (ReplicateChunkLocation/an RF=3 write landing on only 2 of 3 nodes
-        // listed this node as a holder before the healer actually copied the
-        // bytes over) — building a pending patch on a base that was never really
-        // here is silently unrecoverable.
-        if !self.storage.has_chunk(&real_base) {
-            drop(patch_guard);
-            return Err((
-                format!("Failed to read chunk range: Failed to open chunk file for {}", real_base),
-                ErrorCode::NotFound,
-            ));
-        }
+        let (base_chunk_id, prior_delta, base_size, is_merge) = match existing_pending {
+            Some(PatchState::Pending { base_chunk_id, delta_chunk_id, size, .. }) => {
+                (base_chunk_id, Some(delta_chunk_id), size, true)
+            }
+            _ => {
+                // Fresh accumulator. Ghost-chunk guard: base_for_lookup is about to
+                // become the base of a brand-new pending patch, so its bytes must
+                // actually be present on THIS node's disk — nothing else would catch
+                // a ghost chunk_map entry here (ReplicateChunkLocation/an RF=3 write
+                // landing on only 2 of 3 nodes listed this node as a holder before
+                // the healer actually copied the bytes over).
+                if !self.storage.has_chunk(&base_for_lookup) {
+                    drop(patch_guard);
+                    return Err((
+                        format!("Failed to read chunk range: Failed to open chunk file for {}", base_for_lookup),
+                        ErrorCode::NotFound,
+                    ));
+                }
+                let size = self.metadata.get_chunk_location_async(base_for_lookup).await
+                    .ok().flatten().map(|loc| loc.size).unwrap_or(0);
+                (base_for_lookup, None, size, false)
+            }
+        };
 
-        let base_size = self.metadata.get_chunk_location_async(real_base).await
-            .ok().flatten().map(|loc| loc.size).unwrap_or(0);
+        // Merge: concatenate onto whatever's already accumulated. compose_one_patch
+        // (and the eventual fold) applies patches in order, so a later entry
+        // correctly overwrites an earlier one's overlapping bytes — same semantics
+        // a single patch's own multi-range Vec already relies on, just extended
+        // across accumulation cycles.
+        let mut merged_patches = if let Some(prior_delta_id) = prior_delta {
+            let storage = self.storage.clone();
+            let prior_bytes = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&prior_delta_id))
+                .await
+                .map_err(|e| (format!("spawn_blocking panicked reading prior delta: {}", e), ErrorCode::InternalError))?
+                .map_err(|e| (format!("Failed to read prior delta chunk: {}", e), ErrorCode::InternalError))?;
+            bincode::deserialize::<Vec<(usize, Vec<u8>)>>(&prior_bytes)
+                .map_err(|e| (format!("Corrupt prior delta chunk: {}", e), ErrorCode::InternalError))?
+        } else {
+            Vec::with_capacity(patches.len())
+        };
+        merged_patches.extend(patches.iter().cloned());
 
-        let delta_bytes = bincode::serialize(&patches)
+        let delta_bytes = bincode::serialize(&merged_patches)
             .map_err(|e| (format!("Failed to serialize patch delta: {}", e), ErrorCode::InternalError))?;
         let delta_chunk_id = ChunkId::from_hash(
             dfs_common::compute_chunk_hash_at(&delta_bytes, chunk_file_offset, file_id)
@@ -6113,10 +6378,16 @@ impl Server {
                 .map_err(|e| (format!("spawn_blocking panicked writing patch delta: {}", e), ErrorCode::InternalError))?
                 .map_err(|e| (format!("Failed to write patch delta: {}", e), ErrorCode::InternalError))?;
         }
+        if let Some(prior_delta_id) = prior_delta {
+            // Superseded by the merged delta above — clean up so accumulating
+            // many patches into one slot doesn't leak one delta file per patch.
+            let storage = self.storage.clone();
+            let _ = tokio::task::spawn_blocking(move || storage.delete_chunk(&prior_delta_id)).await;
+        }
 
         // Public token: derived from the delta's own hash through a second,
         // domain-separated Blake3 pass, so it can never coincide with any real
-        // content hash (delta_chunk_id, real_base, or a future full-chunk hash).
+        // content hash (delta_chunk_id, base_chunk_id, or a future full-chunk hash).
         // See PATCH_STATE_TABLE's doc comment for why that separation is the
         // whole point — nothing (the healer replicating to a new node, a stale
         // peer's chunk_map) must ever be able to mistake this for directly-
@@ -6130,7 +6401,7 @@ impl Server {
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
 
         let retired_token = self.metadata.put_patch_state_pending_async(
-            file_id, cidx, public_token, real_base, delta_chunk_id, needed_len, now_secs, client_write_seq,
+            file_id, cidx, public_token, base_chunk_id, delta_chunk_id, needed_len, now_secs, client_write_seq,
         ).await.map_err(|e| (format!("Failed to record patch state: {}", e), ErrorCode::InternalError))?;
         if let Some(retired) = retired_token {
             // The slot's previous public_token is now provably unreachable (proof:
@@ -6139,40 +6410,69 @@ impl Server {
             // now correctly hard-fails, prompting the reader's existing
             // stale-metadata-refresh retry, same as pre-deferred-write semantics.
             self.pending_patch_ids.remove(&retired);
+            self.pending_patch_fold_broadcasts.remove(&retired);
         }
 
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        if let Ok(Some(old_loc)) = self.metadata.get_chunk_location_async(real_base).await {
-            let new_loc = ChunkLocation {
-                chunk_id: public_token,
-                nodes: old_loc.nodes,
-                size: needed_len,
-                checksum: public_token.hash,
-                file_offset: old_loc.file_offset,
-                written_at: Some(now_ms),
-                client_write_seq,
-                file_id: Some(file_id),
-            };
-            if let Err(e) = self.metadata.put_chunk_location_async(new_loc).await {
-                warn!("apply_patch: failed to register {} in metadata: {}", public_token, e);
+        if !is_merge {
+            // Only a fresh accumulator needs a brand-new ChunkLocation registered
+            // (copying nodes/file_offset from the base it's replacing) and the
+            // base's own location retired — a merge keeps reusing the location
+            // already registered under the previous public_token in this same
+            // accumulation cycle; update_chunk_map_after_patch below still moves
+            // it forward to the new token either way.
+            if let Ok(Some(old_loc)) = self.metadata.get_chunk_location_async(base_chunk_id).await {
+                let new_loc = ChunkLocation {
+                    chunk_id: public_token,
+                    nodes: old_loc.nodes,
+                    size: needed_len,
+                    checksum: public_token.hash,
+                    file_offset: old_loc.file_offset,
+                    written_at: Some(now_ms),
+                    client_write_seq,
+                    file_id: Some(file_id),
+                };
+                if let Err(e) = self.metadata.put_chunk_location_async(new_loc).await {
+                    warn!("apply_patch: failed to register {} in metadata: {}", public_token, e);
+                }
             }
+            let _ = self.metadata.delete_chunk_location_async(base_chunk_id).await;
+        } else {
+            // Slide the existing ChunkLocation (registered under the now-retired
+            // previous token) forward to the new token, updating size in case
+            // this merge extended the accumulator past the prior needed_len.
+            if let Ok(Some(mut loc)) = self.metadata.get_chunk_location_async(chunk_id).await {
+                loc.chunk_id = public_token;
+                loc.size = needed_len;
+                loc.checksum = public_token.hash;
+                loc.written_at = Some(now_ms);
+                loc.client_write_seq = client_write_seq;
+                if let Err(e) = self.metadata.put_chunk_location_async(loc).await {
+                    warn!("apply_patch: failed to slide {} -> {} in metadata: {}", chunk_id, public_token, e);
+                }
+            }
+            let _ = self.metadata.delete_chunk_location_async(chunk_id).await;
         }
-        let _ = self.metadata.delete_chunk_location_async(real_base).await;
         update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_id, public_token, needed_len, now_ms);
 
         self.pending_patch_ids.insert(public_token, (file_id, cidx));
-        self.pending_patch_ids.insert(real_base, (file_id, cidx));
-
-        // Fold always runs immediately, but in the background — never blocking
-        // this ack. Hand off the already-held (file_id, chunk_idx) lock so it
-        // keeps excluding other writers to this exact chunk (and only this
-        // chunk — every other chunk on this node is untouched) until the fold
-        // completes.
-        let ctx = self.overlay_ctx();
-        tokio::spawn(async move {
-            let _guard = patch_guard;
-            ctx.run_single_fold(file_id, cidx, chunk_file_offset, public_token, real_base, delta_chunk_id, client_write_seq).await;
+        self.pending_patch_ids.insert(base_chunk_id, (file_id, cidx));
+        self.dirty_patch_slots.insert((file_id, cidx), DirtyPatchSlot {
+            token: public_token,
+            last_patch_at: std::time::Instant::now(),
         });
+        if !is_merge {
+            // Fresh accumulator: this is the one patch in this cycle responsible
+            // for scheduling its eventual fold. Every subsequent merge onto the
+            // same accumulator just updated last_patch_at above, which the
+            // already-running debounce_fold_slot task (spawned right here, the
+            // first time) polls to decide when to actually fold.
+            let ctx = self.overlay_ctx();
+            tokio::spawn(async move {
+                ctx.debounce_fold_slot(file_id, cidx).await;
+            });
+        }
+        drop(patch_guard);
 
         Ok((public_token, needed_len, Some(now_ms), None))
     }
@@ -6312,16 +6612,29 @@ impl Server {
             });
             if let Some(loc) = stale_candidate {
                 if loc.chunk_id != chunk_id && !self.patch_token_resolves_to(chunk_id, loc.chunk_id).await {
-                    // Before returning ChunkStale, verify the "current" chunk exists on disk.
-                    // A stale broadcast can revert chunk_map to an old hash whose file was
-                    // already renamed away by a subsequent patch. Returning ChunkStale with
-                    // that ghost hash sends the client into an infinite retry loop: the
-                    // "corrected" hash is unreachable, so every retry fails. Instead, let
-                    // the request proceed — spawn_blocking will open the file by the client's
-                    // chunk_id; if it exists we patch correctly, if not it returns NotFound.
+                    // Before returning ChunkStale, verify the "current" chunk is actually
+                    // reachable — either a real file on disk (pre-overlay world) or a live
+                    // PATCH_STATE_TABLE row (the overlay's Pending accumulators, which by
+                    // design are never a file on disk — see PATCH_STATE_TABLE's doc comment
+                    // — so current_path.exists() alone is routinely false for the overwhelmingly
+                    // common case of chunk_map pointing at an in-progress accumulator, not
+                    // just the rare stale/reverted case this check was written for). Getting
+                    // this wrong lets a genuinely stale client request fall through to
+                    // apply_patch's ghost-chunk guard, which hard-fails instead of retrying —
+                    // a real 2026-07-09 incident: concurrent duplicate patches to the same hot
+                    // (file, chunk_idx) under kdiskmark's I/O pattern permanently EIO'd a VM
+                    // disk once the losing request's stale token got treated as unreachable.
+                    // A stale broadcast can still genuinely revert chunk_map to a ghost hash
+                    // whose file was already renamed away by a subsequent patch — that's the
+                    // case this fallback still needs to catch. Returning ChunkStale with a
+                    // truly-ghost hash sends the client into an infinite retry loop, so only
+                    // fall through (proceed with the client's chunk_id) when neither a file
+                    // nor a patch_state row backs the "current" entry.
                     let current_path = self.storage.get_chunk_path(&loc.chunk_id);
-                    if !current_path.exists() {
-                        warn!("[GHOST-stale-check] chunk_map has {} for file {} chunk {} (written_at={:?}) but file NOT on disk — chunk_map is stale/reverted; proceeding with client's {} (file exists={})",
+                    let current_reachable = current_path.exists()
+                        || matches!(self.metadata.get_patch_state_async(loc.chunk_id).await, Ok(Some(_)));
+                    if !current_reachable {
+                        warn!("[GHOST-stale-check] chunk_map has {} for file {} chunk {} (written_at={:?}) but it's neither a file on disk nor a patch_state row — chunk_map is stale/reverted; proceeding with client's {} (file exists={})",
                             loc.chunk_id, file_id, cidx, loc.written_at, chunk_id,
                             self.storage.get_chunk_path(&chunk_id).exists());
                     } else {
@@ -9410,73 +9723,19 @@ mod tests {
         }
     }
 
-    /// Pre-existing gap this feature closes alongside its own crash-recovery story:
-    /// recover_patch_journal had zero test coverage anywhere in the repo.
-    mod recover_patch_journal_tests {
+    /// Crash-safety for full_rewrite_chunk's write path: it must never mutate
+    /// old_chunk_id's own file. The patched buffer goes to a fresh temp file that
+    /// only becomes visible via an atomic rename (ChunkStorage::write_chunk) — so
+    /// a crash at any point before that rename leaves old_chunk_id byte-for-byte
+    /// untouched, and a fold's patch_state row (still Pending) can simply be
+    /// retried from scratch. This replaces the write-ahead undo journal
+    /// (PatchJournalEntry, removed 2026-07-09) that the old in-place-patch design
+    /// needed to recover from the same class of crash.
+    mod full_rewrite_chunk_crash_safety_tests {
         use super::*;
-        use crate::metadata::PatchJournalEntry;
 
-        #[test]
-        fn restores_old_chunk_when_rename_never_happened() {
-            let h = make_overlay_test_harness();
-            let old_id = ChunkId::from_hash([1u8; 32]);
-            let new_id = ChunkId::from_hash([2u8; 32]);
-
-            // Simulate a crash between the journal write and the rename: old_path
-            // still exists, with the patch already applied in place (undo bytes are
-            // what was there BEFORE the patch).
-            let mut patched = vec![0u8; 64];
-            patched[0..8].copy_from_slice(&[0xAAu8; 8]); // the in-place patch that was applied
-            h.storage.write_chunk(&old_id, &patched).unwrap();
-
-            let undo_bytes = vec![0u8; 8]; // original content before the patch
-            h.metadata.put_patch_journal(&PatchJournalEntry {
-                old_chunk_id: old_id,
-                new_chunk_id: new_id,
-                patches: vec![(0, undo_bytes.clone())],
-            }).unwrap();
-
-            h.server.recover_patch_journal();
-
-            let restored = h.storage.read_chunk(&old_id).unwrap();
-            assert_eq!(&restored[0..8], undo_bytes.as_slice(),
-                "recovery must restore old_path's pre-patch bytes exactly");
-            assert!(h.metadata.scan_patch_journal().unwrap().is_empty(),
-                "journal entry must be cleared after successful recovery");
-        }
-
-        #[test]
-        fn discards_entry_when_rename_already_completed() {
-            let h = make_overlay_test_harness();
-            let old_id = ChunkId::from_hash([3u8; 32]);
-            let new_id = ChunkId::from_hash([4u8; 32]);
-
-            // Simulate a crash AFTER the rename completed: old_path is gone, new_path
-            // holds the final content. Recovery must discard the leftover entry
-            // without touching new_path.
-            h.storage.write_chunk(&new_id, &vec![0xBBu8; 64]).unwrap();
-            h.metadata.put_patch_journal(&PatchJournalEntry {
-                old_chunk_id: old_id,
-                new_chunk_id: new_id,
-                patches: vec![(0, vec![0u8; 8])],
-            }).unwrap();
-
-            h.server.recover_patch_journal();
-
-            assert!(!h.storage.get_chunk_path(&old_id).exists(), "old_path must stay absent — nothing to restore");
-            assert_eq!(h.storage.read_chunk(&new_id).unwrap(), vec![0xBBu8; 64], "new_path content must be untouched");
-            assert!(h.metadata.scan_patch_journal().unwrap().is_empty(),
-                "leftover journal entry must be discarded once the rename is confirmed complete");
-        }
-
-        /// Fold-specific crash scenario: a crash between the fold's journal write and
-        /// its rename leaves the ORIGINAL base restorable via the exact same
-        /// mechanism a plain patch already uses (full_rewrite_chunk is the same code
-        /// either way, whether called directly or from inside run_single_fold) — and,
-        /// critically, must leave the pending patch_state row completely untouched so
-        /// the fold can simply be retried from scratch.
         #[tokio::test]
-        async fn mid_fold_crash_restores_base_and_preserves_patch_state() {
+        async fn old_chunk_untouched_and_patch_state_retryable_if_fold_never_completes() {
             let h = make_overlay_test_harness();
             let file_id = dfs_common::FileId::new();
             let chunk_idx = 0u64;
@@ -9500,28 +9759,15 @@ mod tests {
                 file_id, chunk_idx, &public_token, original_chunk_id, delta_chunk_id, 4096, 1000, Some(1),
             ).unwrap();
 
-            // Simulate a crash mid-fold: journal written for original_chunk_id (as
-            // full_rewrite_chunk would durably commit before touching a single byte),
-            // but the pwrite+rename never happened — old_path (the original base)
-            // still holds its pre-fold bytes.
-            let undo_bytes = original_data[0..100].to_vec();
-            h.metadata.put_patch_journal(&PatchJournalEntry {
-                old_chunk_id: original_chunk_id,
-                new_chunk_id: ChunkId::from_hash([9u8; 32]),
-                patches: vec![(0, undo_bytes.clone())],
-            }).unwrap();
-
-            h.server.recover_patch_journal();
-
-            // The original base is restored to its untouched pre-fold state...
+            // No fold has run yet — nothing has touched original_chunk_id or
+            // delta_chunk_id, exactly the state a crash at any point before
+            // full_rewrite_chunk's rename would leave behind (it reads a fresh copy
+            // and only ever writes to a brand-new temp file first).
             assert_eq!(h.storage.read_chunk(&original_chunk_id).unwrap(), original_data,
-                "recovery must restore the original base exactly since the fold's rename never happened");
-            assert!(h.metadata.scan_patch_journal().unwrap().is_empty());
+                "original base must be untouched before any fold has run");
 
-            // ...and the patch_state row built before the (simulated) crash is
-            // completely untouched — the fold can simply be retried from scratch.
             let state = h.metadata.get_patch_state(&public_token).unwrap()
-                .expect("patch_state must survive a mid-fold crash untouched");
+                .expect("patch_state row must exist");
             match state {
                 PatchState::Pending { base_chunk_id, delta_chunk_id: dcid, .. } => {
                     assert_eq!(base_chunk_id, original_chunk_id);
@@ -9530,6 +9776,30 @@ mod tests {
                 other => panic!("expected Pending, got {:?}", other),
             }
             assert!(h.storage.get_chunk_path(&delta_chunk_id).exists(), "delta chunk must still be present");
+
+            // fold_slot_now reads its target token from dirty_patch_slots (an
+            // in-memory index apply_patch would normally have populated) — set it
+            // directly since this test built the Pending row by hand.
+            h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+                token: public_token,
+                last_patch_at: std::time::Instant::now(),
+            });
+
+            // Now actually run the fold to completion and confirm it succeeds cleanly
+            // from this exact state — i.e. this is a valid, retryable starting point.
+            // Force it directly rather than waiting on the debounce timer, since
+            // apply_patch was never called here to spawn one.
+            assert!(h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx).await,
+                "fold must succeed from this Pending state");
+            let state = h.metadata.get_patch_state(&public_token).unwrap().unwrap();
+            let folded = match state {
+                PatchState::Folded(real) => real,
+                other => panic!("expected Folded after fold_slot_now, got {:?}", other),
+            };
+            let resolved = h.server.resolve_chunk_content(folded).await.unwrap();
+            let mut expected = original_data.clone();
+            expected[0..100].copy_from_slice(&[1u8; 100]);
+            assert_eq!(resolved.as_slice(), expected.as_slice());
         }
     }
 

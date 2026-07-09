@@ -53,6 +53,16 @@ pub struct InodeReadEngine {
     /// Set while a refresh is in progress; prevents duplicate concurrent refreshes.
     pub refresh_in_progress: AtomicBool,
 
+    /// Fired every time a refresh finishes (success or failure) and clears
+    /// refresh_in_progress. A caller that loses the refresh_in_progress race in
+    /// Client::refresh_engine awaits this instead of returning immediately with
+    /// a possibly-still-empty snapshot — see refresh_engine's doc comment for
+    /// the T28 regression this fixes (2026-07-09): concurrent cold-cache reads
+    /// racing on refresh_in_progress let the loser fall through read_file's
+    /// "chunk map still empty" sparse-hole path and return zeros for a real,
+    /// non-sparse file.
+    pub refresh_done: tokio::sync::Notify,
+
     /// Monotonic ms timestamp of the last refresh that returned no chunk map from the leader.
     pub last_failed_refresh_ms: AtomicU64,
 
@@ -93,6 +103,7 @@ impl InodeReadEngine {
             pipeline_head: AtomicUsize::new(0),
             pipeline_depth: 4,
             refresh_in_progress: AtomicBool::new(false),
+            refresh_done: tokio::sync::Notify::new(),
             last_failed_refresh_ms: AtomicU64::new(0),
             last_window_start: AtomicU32::new(0),
             last_window_end: AtomicU32::new(0),

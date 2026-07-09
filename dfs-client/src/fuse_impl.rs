@@ -2561,6 +2561,19 @@ impl FlushHandle {
                     // The length check alone misses same-region overwrites (T26: 20 sequential
                     // patches at the same 1MB intra-chunk offset each leave slot len unchanged).
                     let patched_len = slot_data.len(); // snapshot length = what we actually sent
+                    // The chunk's true known size must never shrink from an overwrite/patch of
+                    // an existing chunk — slot_data here is only the patched sub-range (e.g. a
+                    // 12KB header rewrite), not the whole chunk, so what gets recorded into
+                    // flushed_sizes (read back as existing_chunk_size on the NEXT flush this
+                    // session — see its lookup at the top of this function) must be the larger
+                    // of the two, not patched_len alone. Storing patched_len alone corrupts
+                    // every subsequent write to this chunk this session into believing the
+                    // chunk shrank to just the patched region's length: the next write that
+                    // reaches that length is misclassified as a full replacement and genuinely
+                    // truncates the chunk on the server. Found via a rapid-repeated-patch
+                    // repro (DVR app rewriting a recording's header on every open) that
+                    // silently zeroed most of the chunk's real content.
+                    let known_chunk_size = patched_len.max(existing_chunk_size);
                     if let Some(state_arc) = self.write_buffers.get(&ino) {
                         let mut state = state_arc.lock().await;
                         let buf_id = state.expected_file_id;
@@ -2587,7 +2600,7 @@ impl FlushHandle {
                             if new_data_arrived {
                                 // New data arrived during the patch — keep slot, update flushed_sizes
                                 // so the next flush knows where the server's content ends.
-                                state.flushed_sizes.insert(chunk_idx, patched_len);
+                                state.flushed_sizes.insert(chunk_idx, known_chunk_size);
                                 if let Some(slot) = state.slots.get_mut(&chunk_idx) {
                                     slot.flushing = false;
                                 }
@@ -2596,8 +2609,8 @@ impl FlushHandle {
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
                             } else {
-                                if patched_len > 0 {
-                                    state.flushed_sizes.insert(chunk_idx, patched_len);
+                                if known_chunk_size > 0 {
+                                    state.flushed_sizes.insert(chunk_idx, known_chunk_size);
                                 }
                                 // Subtract the slot's actual resident size, not patched_len — the
                                 // slot is being removed here, freeing its full allocation

@@ -3648,6 +3648,85 @@ fi
 rm -f "$T49_FILE" "$T49_LOCAL"
 fi # should_run T49
 
+# ── Test 50: rapid repeated patches to the same chunk don't truncate it ───────
+#
+# Reproduces a real staging incident (2026-07-09): a DVR app that rewrites a
+# ~12KB header block at the start of a recording every time it opens the file
+# (e.g. on fast-forward) issued several such patches in quick succession.
+# flush_buffer_async_one's post-patch bookkeeping recorded flushed_sizes[idx]
+# as just the patch payload's length (e.g. 12032 bytes) instead of the chunk's
+# true total size (4194304) whenever a concurrent write arrived while a patch
+# was still in flight — which rapid back-to-back patches make likely. The next
+# write to that chunk then read existing_chunk_size back from flushed_sizes,
+# saw only 12032, and misclassified itself as a full replacement — genuinely
+# truncating the chunk's real content on the server. Confirmed on staging: one
+# node's chunk_location record showed size=12032 where it should have been
+# 4194304, and reads beyond the patched header returned zeros. Black-box only:
+# compare against a local mirror file byte-for-byte via md5sum.
+snapshot_log T50
+if should_run T50; then
+echo ""
+echo "=== T50: rapid repeated patches to the same chunk don't truncate it ==="
+
+T50_FILE="$MOUNT/t50_dvr.mpg"
+T50_LOCAL="$T/t50_local.mpg"
+
+# 12MB = one full 4MB chunk (chunk 0, the one we repeatedly patch) + a 8MB tail
+# spanning 2 more chunks, so a truncation of chunk 0 is unambiguous in the
+# whole-file checksum.
+dd if=/dev/urandom of="$T50_LOCAL" bs=1M count=12 2>/dev/null
+cp "$T50_LOCAL" "$T50_FILE"
+dfs_sync
+
+T50_GOT=$(md5sum "$T50_FILE" | awk '{print $1}')
+T50_WANT=$(md5sum "$T50_LOCAL" | awk '{print $1}')
+[ "$T50_GOT" = "$T50_WANT" ] \
+    && check "T50a fresh 12MB write correct" PASS \
+    || check "T50a fresh write corrupt (want $T50_WANT got $T50_GOT)" FAIL
+
+# Rewrite the first 12032 bytes 25 times, back-to-back, via separate
+# open/write/close cycles — matching the real DVR app's pattern (a fresh
+# open() on every fast-forward, not one long-lived fd) closely enough to hit
+# the same "next write arrives while the previous patch is still in flight"
+# window, without needing multi-minute wall-clock spacing to do it.
+python3 -c "
+import os
+path = '$T50_FILE'
+for i in range(1, 26):
+    fd = os.open(path, os.O_RDWR)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, bytes([i % 256]) * 12032)
+    os.close(fd)
+"
+# Mirror only the LAST patch's effect onto the local reference file — every
+# earlier patch was overwritten by the next one at the same offset.
+python3 -c "
+path = '$T50_LOCAL'
+with open(path, 'r+b') as f:
+    f.seek(0)
+    f.write(bytes([25 % 256]) * 12032)
+"
+dfs_sync
+
+T50_GOT=$(md5sum "$T50_FILE" | awk '{print $1}')
+T50_WANT=$(md5sum "$T50_LOCAL" | awk '{print $1}')
+[ "$T50_GOT" = "$T50_WANT" ] \
+    && check "T50b 25 rapid repeated patches leave the whole file (incl. untouched tail) correct" PASS \
+    || check "T50b rapid repeated patches corrupted/truncated the file (want $T50_WANT got $T50_GOT)" FAIL
+
+# Cross-check the leader's own persisted chunk_locations — the exact
+# regression this guards against is chunk 0's registered size collapsing to
+# the last patch's payload length (12032) instead of staying 4194304.
+T50_CHUNK0_SIZE=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t50_dvr.mpg 2>/dev/null \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['chunk_locations'][0]['size'])" 2>/dev/null)
+echo "  T50: dfs-admin reports chunk 0 size=$T50_CHUNK0_SIZE (expect 4194304)"
+[ "${T50_CHUNK0_SIZE:-0}" -eq 4194304 ] \
+    && check "T50c persisted chunk 0 size not truncated by rapid patching" PASS \
+    || check "T50c persisted chunk 0 size truncated: got ${T50_CHUNK0_SIZE:-0}, want 4194304" FAIL
+
+rm -f "$T50_FILE" "$T50_LOCAL"
+fi # should_run T50
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

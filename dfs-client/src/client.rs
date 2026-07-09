@@ -3143,9 +3143,27 @@ leader_addr: Arc::new(RwLock::new(None)),
         from_chunk: u32,
     ) {
         use std::sync::atomic::Ordering;
+        // Arm the notification before attempting the exchange — enable() must
+        // happen first so a concurrent refresh that finishes between our failed
+        // exchange below and our await can't be missed (same enable-before-check
+        // pattern the metadata queue worker uses for the same reason).
+        let notified = engine.refresh_done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         if engine.refresh_in_progress.compare_exchange(
             false, true, Ordering::AcqRel, Ordering::Relaxed,
         ).is_err() {
+            // Someone else is already refreshing this engine — wait for them to
+            // finish instead of returning immediately. A caller that returned
+            // here with the engine's snapshot still empty used to fall through
+            // read_file's "chunk map still empty after refresh" sparse-hole
+            // check and serve zeros for a real, non-sparse file (2026-07-09,
+            // found via T28: concurrent cold-cache reads on a freshly restarted
+            // client all race this exchange on the first read of a file).
+            if tokio::time::timeout(std::time::Duration::from_secs(10), notified).await.is_err() {
+                warn!("refresh_engine: inode={} timed out waiting for a concurrent refresh to finish", engine.inode);
+            }
             return;
         }
         self.refresh_engine_flagged(engine, file_id, file_size, from_chunk).await;
@@ -3187,6 +3205,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         engine.refresh_in_progress.store(false, Ordering::Release);
+        engine.refresh_done.notify_waiters();
     }
 
     /// Notify the read engine that a new chunk was appended by the write path.

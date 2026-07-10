@@ -746,6 +746,16 @@ pub struct DfsClient {
     /// Seeded from the server's stored write_seq on first open-for-write.
     write_seq: Arc<DashMap<FileId, u64>>,
 
+    /// Per-(file, chunk_idx) monotonic sequence counter, deliberately separate from
+    /// `write_seq` above (that one gates file-level metadata merge Rule 1/Rule 2 —
+    /// not touched by this). Incremented once per patch to a specific chunk slot
+    /// and sent as `new_chunk_seq` on PatchChunk/MultiPatch — see CHUNK_SEQ_TABLE's
+    /// doc comment in dfs-server/src/metadata.rs for the rationale (a plain integer
+    /// compare instead of chasing chunk_id identity through a fold/merge chain).
+    /// Currently only ever incremented and sent; nothing consumes the server's
+    /// returned chunk_seq yet — see that doc comment for the follow-up.
+    chunk_seq: Arc<DashMap<(FileId, u64), u64>>,
+
     /// Cache of chunk_id -> (write_seq, inserted_at) for read operations.
     /// Populated in read_file() from the file's metadata and looked up by read_chunk_from_server()
     /// to enable client-driven metadata staleness detection. Entries are content-addressed
@@ -908,6 +918,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             metadata_queue: MetadataQueue::new(),
             pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             write_seq: Arc::new(DashMap::new()),
+            chunk_seq: Arc::new(DashMap::new()),
             read_write_seq_cache: Arc::new(DashMap::new()),
             read_engines: ReadEngineMap::new(),
             recent_chunk_writes: Arc::new(DashMap::new()),
@@ -5643,6 +5654,9 @@ leader_addr: Arc::new(RwLock::new(None)),
     ) -> Result<dfs_common::ChunkLocation> {
         // On ChunkStale, the server tells us the current chunk_id — retry once with it.
         let mut current_location = old_location.clone();
+        // Computed once outside the retry loop below: a ChunkStale retry is the same
+        // logical operation, not a new one, so it must reuse the same target sequence.
+        let new_chunk_seq = chunk_idx.map(|cidx| self.next_chunk_seq(file_id, cidx));
         for attempt in 0u8..2 {
         // Resolve NodeId -> SocketAddr for the replica nodes
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
@@ -5672,6 +5686,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             chunk_file_offset,
             intra_offset,
             data: patch_data.clone(),
+            new_chunk_seq,
         };
 
         let futures: Vec<_> = replica_addrs.iter().map(|&addr| {
@@ -5689,7 +5704,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         for (addr, result) in results {
             match result {
-                Ok(Response::PatchChunkResult { new_chunk_id: ncid, size }) => {
+                Ok(Response::PatchChunkResult { new_chunk_id: ncid, size, chunk_seq: _ }) => {
                     // A non-empty patch that returns the same chunk_id means the node read stale
                     // base data and the patch landed on wrong content. Skip this result so
                     // the stale node doesn't contaminate the consensus hash.
@@ -5885,6 +5900,10 @@ leader_addr: Arc::new(RwLock::new(None)),
         let original_old_chunk_id = old_chunk_id;
         let mut current_location = old_location.clone();
         let mut skip_addrs: Vec<SocketAddr> = vec![];
+        // Computed once for the whole call, unlike patch_client_write_seq below: a
+        // ChunkStale retry within the loop is the same logical operation resent with
+        // a corrected base, not a new one, so it must target the same sequence value.
+        let new_chunk_seq = chunk_idx.map(|cidx| self.next_chunk_seq(file_id, cidx));
         'retry: for attempt in 0u8..2 {
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
@@ -6023,6 +6042,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     expected_new_chunk_id,
                     client_write_seq: patch_client_write_seq,
                     prefetch_hints: hints,
+                    new_chunk_seq,
                 };
                 async move {
                     let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
@@ -6048,6 +6068,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     expected_new_chunk_id,
                     client_write_seq: patch_client_write_seq,
                     prefetch_hints: hints,
+                    new_chunk_seq,
                 };
                 async move { (addr, client.send_request(addr, req).await) }
             }).collect();
@@ -6072,7 +6093,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         let mut stale_ahead: Vec<(SocketAddr, ChunkId)> = Vec::new();
         for (addr, result) in results {
             match result {
-                Ok(Response::MultiPatchResult { new_chunk_id: ncid, size, patch_ts }) => {
+                Ok(Response::MultiPatchResult { new_chunk_id: ncid, size, patch_ts, chunk_seq: _ }) => {
                     // ncid == old_chunk_id means the patch produced no content change (hash
                     // unchanged). This is always a legitimate no-op — the server applied the
                     // patch bytes and got the same hash back. A stale base is signalled by the
@@ -6385,6 +6406,14 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Increment and return the next write sequence number for a file.
     fn next_write_seq(&self, file_id: FileId) -> u64 {
         let mut entry = self.write_seq.entry(file_id).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// Increment and return the next per-slot sequence number for (file_id, chunk_idx).
+    /// See the `chunk_seq` field's doc comment.
+    fn next_chunk_seq(&self, file_id: FileId, chunk_idx: u64) -> u64 {
+        let mut entry = self.chunk_seq.entry((file_id, chunk_idx)).or_insert(0);
         *entry += 1;
         *entry
     }

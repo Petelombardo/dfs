@@ -373,6 +373,12 @@ pub enum Request {
         intra_offset: usize,
         /// The patch bytes to splice in
         data: Vec<u8>,
+        /// Client-assigned sequence number for this (file_id, chunk_idx) slot —
+        /// see CHUNK_SEQ_TABLE's doc comment in dfs-server/src/metadata.rs. None
+        /// from a caller that hasn't adopted per-slot sequencing yet. Currently
+        /// record-only: the server stores it but does not yet gate on it.
+        #[serde(default)]
+        new_chunk_seq: Option<u64>,
     },
 
     /// Apply multiple non-contiguous byte-range patches to a chunk in a single RPC.
@@ -410,6 +416,12 @@ pub enum Request {
         /// Server skips any chunk already being prefetched (contains_key guard).
         #[serde(default)]
         prefetch_hints: Option<Vec<ChunkId>>,
+        /// Client-assigned sequence number for this (file_id, chunk_idx) slot —
+        /// see CHUNK_SEQ_TABLE's doc comment in dfs-server/src/metadata.rs. None
+        /// from a caller that hasn't adopted per-slot sequencing yet. Currently
+        /// record-only: the server stores it but does not yet gate on it.
+        #[serde(default)]
+        new_chunk_seq: Option<u64>,
     },
 
     // Admin requests
@@ -852,6 +864,11 @@ pub enum Response {
         new_chunk_id: ChunkId,
         /// Chunk size in bytes after patch
         size: usize,
+        /// This replica's recorded chunk_seq for the slot after applying, if the
+        /// request carried one — see CHUNK_SEQ_TABLE's doc comment. None if the
+        /// request didn't carry new_chunk_seq.
+        #[serde(default)]
+        chunk_seq: Option<u64>,
     },
 
     /// Response to MultiPatch — new chunk identity after all patches applied
@@ -863,6 +880,11 @@ pub enum Response {
         /// future guard comparisons are all in server time, preventing clock-skew
         /// between client and server from defeating the stale-broadcast guard.
         patch_ts: Option<u64>,
+        /// This replica's recorded chunk_seq for the slot after applying, if the
+        /// request carried one — see CHUNK_SEQ_TABLE's doc comment. None if the
+        /// request didn't carry new_chunk_seq.
+        #[serde(default)]
+        chunk_seq: Option<u64>,
     },
 
     /// Returned when a client sends PutFileMetadata to a non-leader.

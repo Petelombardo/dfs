@@ -2528,13 +2528,13 @@ impl Server {
                 self.ops_tracker.inc_write();
                 self.handle_write_file_local_only(data, file_offset, file_id).await
             }
-            Request::PatchChunk { chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data } => {
+            Request::PatchChunk { chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data, new_chunk_seq } => {
                 self.ops_tracker.inc_write();
-                self.handle_patch_chunk(chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data).await
+                self.handle_patch_chunk(chunk_id, file_id, chunk_idx, chunk_file_offset, intra_offset, data, new_chunk_seq).await
             }
-            Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints } => {
+            Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq } => {
                 self.ops_tracker.inc_write();
-                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints).await
+                self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq).await
             }
             Request::DeleteFile { path } => {
                 self.ops_tracker.inc_meta();
@@ -6719,6 +6719,7 @@ impl Server {
         chunk_file_offset: u64,
         intra_offset: usize,
         patch_data: Vec<u8>,
+        new_chunk_seq: Option<u64>,
     ) -> Response {
         {
             let now_ms = std::time::SystemTime::now()
@@ -6784,7 +6785,14 @@ impl Server {
         match result {
             Ok((new_chunk_id, size, _patch_ts, _buf)) => {
                 info!("PatchChunk: {} -> {} ({} bytes at intra_offset={})", chunk_id, new_chunk_id, patch_len, intra_offset);
-                Response::PatchChunkResult { new_chunk_id, size }
+                // Record-only for now — see CHUNK_SEQ_TABLE's doc comment. Nothing
+                // rejects on this yet, so failures here are logged, not fatal.
+                if let (Some(cidx), Some(seq)) = (chunk_idx, new_chunk_seq) {
+                    if let Err(e) = self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
+                        warn!("PatchChunk: failed to record chunk_seq {} for file {} chunk {}: {}", seq, file_id, cidx, e);
+                    }
+                }
+                Response::PatchChunkResult { new_chunk_id, size, chunk_seq: new_chunk_seq }
             }
             Err((msg, code)) => {
                 warn!("PatchChunk {}: {}", chunk_id, msg);
@@ -6803,6 +6811,7 @@ impl Server {
         _expected_new_chunk_id: Option<dfs_common::ChunkId>,
         client_write_seq: Option<u64>,
         prefetch_hints: Option<Vec<ChunkId>>,
+        new_chunk_seq: Option<u64>,
     ) -> Response {
         // Mutable so the staleness check below can rebase onto the current value
         // in place instead of bouncing ChunkStale back to the client for an external
@@ -7010,7 +7019,14 @@ impl Server {
                     }
                 }
 
-                Response::MultiPatchResult { new_chunk_id, size: final_size, patch_ts }
+                // Record-only for now — see CHUNK_SEQ_TABLE's doc comment. Nothing
+                // rejects on this yet, so failures here are logged, not fatal.
+                if let (Some(cidx), Some(seq)) = (chunk_idx, new_chunk_seq) {
+                    if let Err(e) = self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
+                        warn!("MultiPatch: failed to record chunk_seq {} for file {} chunk {}: {}", seq, file_id, cidx, e);
+                    }
+                }
+                Response::MultiPatchResult { new_chunk_id, size: final_size, patch_ts, chunk_seq: new_chunk_seq }
             }
             Err((msg, code)) => {
                 warn!("MultiPatch {}: {}", chunk_id, msg);
@@ -9725,7 +9741,7 @@ mod tests {
             h.server.metadata.put_chunk_location(&ghost_loc).unwrap();
 
             let resp = h.server.handle_multi_patch(
-                ghost_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, None, None,
+                ghost_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, None, None, None,
             ).await;
             match resp {
                 Response::Error { code, .. } => assert_eq!(code, dfs_common::ErrorCode::NotFound,
@@ -9780,7 +9796,7 @@ mod tests {
             h.server.metadata.put_chunk_location(&original_loc).unwrap();
 
             let resp = h.server.handle_multi_patch(
-                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![patch], None, Some(2), None,
+                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![patch], None, Some(2), None, None,
             ).await;
             let public_token = match resp {
                 Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
@@ -9869,7 +9885,7 @@ mod tests {
                 expected.extend_from_slice(&data);
 
                 let resp = h.server.handle_multi_patch(
-                    head, file_id, Some(0), chunk_file_offset, vec![(append_offset, data)], None, Some(seq), None,
+                    head, file_id, Some(0), chunk_file_offset, vec![(append_offset, data)], None, Some(seq), None, None,
                 ).await;
                 head = match resp {
                     Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
@@ -9925,7 +9941,7 @@ mod tests {
             h.server.metadata.put_chunk_location(&original_loc).unwrap();
 
             let resp = h.server.handle_multi_patch(
-                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![2u8; 100])], None, Some(2), None,
+                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![2u8; 100])], None, Some(2), None, None,
             ).await;
             let public_token = match resp { Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id, o => panic!("{:?}", o) };
             let folded_chunk_id = wait_for_folded(&h, public_token, 2000).await;
@@ -10016,7 +10032,7 @@ mod tests {
             h.server.metadata.put_chunk_location(&original_loc).unwrap();
 
             let resp1 = h.server.handle_multi_patch(
-                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, Some(2), None,
+                original_chunk_id, file_id, Some(0), chunk_file_offset, vec![(0, vec![1u8; 100])], None, Some(2), None, None,
             ).await;
             let public_token_1 = match resp1 { Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id, o => panic!("{:?}", o) };
             wait_for_folded(&h, public_token_1, 2000).await;
@@ -10025,7 +10041,7 @@ mod tests {
             // bookkeeping would use, unaware the fold already moved chunk_map on to
             // the real folded identity. Must succeed directly, not ChunkStale.
             let resp2 = h.server.handle_multi_patch(
-                public_token_1, file_id, Some(0), chunk_file_offset, vec![(100, vec![2u8; 100])], None, Some(3), None,
+                public_token_1, file_id, Some(0), chunk_file_offset, vec![(100, vec![2u8; 100])], None, Some(3), None, None,
             ).await;
             let public_token_2 = match resp2 {
                 Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
@@ -10097,7 +10113,7 @@ mod tests {
                         let patch = vec![(200 + i, vec![(i % 256) as u8; 16])];
                         let resp = server.handle_multi_patch(
                             claimed, file_id, Some(chunk_idx), chunk_file_offset,
-                            patch, None, Some(1000 + i as u64), None,
+                            patch, None, Some(1000 + i as u64), None, None,
                         ).await;
                         match resp {
                             Response::MultiPatchResult { .. } => return Ok(attempt),

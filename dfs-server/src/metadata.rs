@@ -86,6 +86,35 @@ const PATCH_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pa
 /// of a reverse scan. Lazily created on first write.
 const PATCH_STATE_SLOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("patch_state_slot");
 
+/// "{file_id}:{chunk_idx}" → last-applied client-assigned per-slot sequence number.
+///
+/// Deliberately separate from FileMetadata.write_seq (the existing per-*file*
+/// counter used by put_file's Rule 1/Rule 2 merge logic) and from
+/// ChunkLocation.client_write_seq (the same per-file value, just carried
+/// alongside a chunk_id) — this branch's history is chunk_id-identity staleness
+/// bugs (see [[project_chunk_patch_overlay_consolidation]] items 7 and 8), and
+/// every one of them came from treating chunk_id, which encodes a whole
+/// fold/merge chain that's only disseminated cross-node via best-effort
+/// broadcasts, as the thing that gates whether a patch may apply. A per-slot
+/// sequence is a much smaller, simpler claim: "have I applied every patch up to
+/// N for this exact (file, chunk_idx)?" — a plain integer comparison, no
+/// content-hash chain to resolve. Since this DFS has exactly one active writer
+/// per file, the client can assign these values authoritatively and a replica
+/// only ever needs to compare its own last-applied value against what an
+/// incoming patch claims to determine, unambiguously, whether it can apply
+/// directly (exactly one behind), it's a stale/duplicate retry (already at or
+/// past it), or it has a gap and must refresh a full copy before applying
+/// (more than one behind) — no ChunkStale round-trip, no patch_state/chunk_map
+/// resolution needed for this decision.
+///
+/// This table is wired into the wire protocol (MultiPatch/PatchChunk request
+/// and result fields) as of 2026-07-10 but is currently record-only: nothing
+/// yet rejects or gap-detects using these values — see apply_patch/
+/// handle_multi_patch for the follow-up that makes it load-bearing. Lazily
+/// created on first write, same as CHUNK_REFCOUNT_TABLE — no migration needed,
+/// not in the startup table-open list.
+const CHUNK_SEQ_TABLE: TableDefinition<&str, u64> = TableDefinition::new("chunk_seq");
+
 // ---------------------------------------------------------------------------
 
 /// Decode a 64-character lowercase hex string (as produced by `ChunkId::to_hex`)
@@ -1231,6 +1260,60 @@ impl MetadataStore {
         }
         txn.commit()?;
         Ok(result)
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-slot chunk sequence (see CHUNK_SEQ_TABLE's doc comment)
+    // -------------------------------------------------------------------------
+
+    /// Last-applied client-assigned sequence number for (file_id, chunk_idx),
+    /// or None if this slot has never recorded one (pre-dates this table, or
+    /// simply never patched).
+    pub fn get_chunk_seq(&self, file_id: FileId, chunk_idx: u64) -> Result<Option<u64>> {
+        let key = format!("{}:{}", file_id, chunk_idx);
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        // Lazily created (like CHUNK_REFCOUNT_TABLE) — a store that has never
+        // recorded a chunk_seq yet errors on the read-side open_table.
+        let table = match txn.open_table(CHUNK_SEQ_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(table.get(key.as_str())?.map(|v| v.value()))
+    }
+
+    /// Async wrapper for get_chunk_seq — see put_chunk_location_async.
+    pub async fn get_chunk_seq_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64) -> Result<Option<u64>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_chunk_seq(file_id, chunk_idx))
+            .await
+            .context("spawn_blocking panicked in get_chunk_seq_async")?
+    }
+
+    /// Record `seq` as the last-applied sequence number for (file_id, chunk_idx).
+    /// Currently unconditional (record-only, no CAS/rejection) — see
+    /// CHUNK_SEQ_TABLE's doc comment for the follow-up that makes this
+    /// load-bearing in apply_patch/handle_multi_patch.
+    pub fn put_chunk_seq(&self, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<()> {
+        let key = format!("{}:{}", file_id, chunk_idx);
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(CHUNK_SEQ_TABLE)?;
+            table.insert(key.as_str(), seq)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Async wrapper for put_chunk_seq — see put_chunk_location_async.
+    pub async fn put_chunk_seq_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_chunk_seq(file_id, chunk_idx, seq))
+            .await
+            .context("spawn_blocking panicked in put_chunk_seq_async")?
     }
 
     // -------------------------------------------------------------------------
@@ -2924,6 +3007,26 @@ mod tests {
         store.delete_pending_healing(&chunk_a).unwrap();
         let inventory = store.get_pending_healing_inventory().unwrap();
         assert_eq!(inventory, vec![(chunk_b, 2_000)]);
+    }
+
+    #[test]
+    fn test_chunk_seq_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let file_id = FileId::new();
+
+        // Lazily-created table: no chunk_seq recorded yet reads as None, not an error.
+        assert_eq!(store.get_chunk_seq(file_id, 5).unwrap(), None);
+
+        store.put_chunk_seq(file_id, 5, 1).unwrap();
+        assert_eq!(store.get_chunk_seq(file_id, 5).unwrap(), Some(1));
+
+        // A different chunk_idx on the same file is a distinct slot.
+        assert_eq!(store.get_chunk_seq(file_id, 6).unwrap(), None);
+
+        // Overwriting advances the recorded value.
+        store.put_chunk_seq(file_id, 5, 2).unwrap();
+        assert_eq!(store.get_chunk_seq(file_id, 5).unwrap(), Some(2));
     }
 
     #[test]

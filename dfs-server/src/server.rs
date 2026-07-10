@@ -424,14 +424,36 @@ fn update_chunk_map_after_patch(
     if let Some(mut entry) = chunk_map.get_mut(&file_id) {
         let (locations, _) = entry.value_mut();
         let found = match chunk_idx {
+            // Match by position only, NOT also by old_chunk_id. Every caller holds
+            // chunk_patch_locks for this exact (file_id, chunk_idx) for the entire
+            // span from resolving what to fold/merge through to this call, so
+            // whatever chunk_map currently holds at this position IS the immediately
+            // prior state for this slot, unconditionally — there is no concurrent
+            // writer it could be racing. Requiring old_chunk_id to also match was
+            // actively harmful: a fold's old_chunk_id is the token it started
+            // resolving from, which can lag behind chunk_map's current value when a
+            // merge chain advances the slot again while that fold is still running
+            // (they target different generations of the same slot by construction —
+            // the fold began before the merges that overtook it). That mismatch
+            // silently no-ops the update, leaving chunk_map stuck forever on a
+            // superseded value — confirmed via a real 2026-07-09 staging incident
+            // (VM-111 install, chunk_idx 1802) where this exact no-op left chunk_map
+            // pointing at an already-retired token indefinitely, so every subsequent
+            // MultiPatch kept being told to rebase onto a chunk_id whose backing file
+            // no longer existed anywhere, eventually exhausting the client's retry
+            // budget and returning a real EIO to the guest OS.
             Some(cidx) => locations.iter_mut().find(|l| {
-                l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx) && l.chunk_id == old_chunk_id
+                l.file_offset.map(|o| o / CHUNK_SIZE) == Some(cidx)
             }),
             // No chunk_idx: still an O(1) lookup by file_id (this fn is only ever
             // called for one file_id's own small chunk list), just without the offset
             // filter — mirrors dfs-client's multi_patch_chunk_on_replicas fallback
             // path, which always omits chunk_idx (see handle_multi_patch's original
-            // comment on this case, preserved verbatim in spirit here).
+            // comment on this case, preserved verbatim in spirit here). This path
+            // isn't part of the merge/fold accumulator chain (no chunk_patch_locks,
+            // no patch_state), so old_chunk_id is always exactly what the caller
+            // passed in — matching by it here is still correct and necessary since
+            // there's no position to key on instead.
             None => locations.iter_mut().find(|l| l.chunk_id == old_chunk_id),
         };
         if let Some(loc) = found {

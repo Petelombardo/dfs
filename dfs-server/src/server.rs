@@ -703,6 +703,7 @@ struct OverlayForkCtx {
     chunk_ring: Arc<std::sync::Mutex<lru::LruCache<ChunkId, Arc<Vec<u8>>>>>,
     cluster: Arc<ClusterManager>,
     client: Arc<NetworkClient>,
+    healing: Arc<tokio::sync::RwLock<Option<Arc<HealingManager>>>>,
 }
 
 /// One completed fold, kept around for start_patch_fold_rebroadcast_loop to
@@ -793,6 +794,29 @@ impl OverlayForkCtx {
         delta_chunk_id: ChunkId,
         delta_client_write_seq: Option<u64>,
     ) -> bool {
+        // Cancel base_chunk_id's healing in the background, right away — base_chunk_id
+        // is about to be retired by this fold, and there should never be a need for
+        // a heal and a fold's retirement of the same chunk to race. See
+        // spawn_cancel_healing_for_chunk's doc comment for why this runs detached
+        // (not awaited here) and for the full incident this closes (2026-07-10,
+        // VM-111 install: a heal that started before this exact fold committed its
+        // stale ChunkLocation *after* the fold had already moved chunk_map past
+        // base_chunk_id, silently reverting it back to the retired identity).
+        // Joined (cancel_healing_task.await) right before this fold's own metadata
+        // commit below, after the expensive local disk work — see that call site.
+        //
+        // healing_cancel_guard retracts automatically on every early return below
+        // (delta read failure, corrupt delta, consolidation failure — all cases
+        // where base_chunk_id is still genuinely needed) unless keep_cancelled()
+        // is explicitly called, which only happens once this fold actually
+        // succeeds with a new, different chunk_id.
+        let cancel_healing_task = spawn_cancel_healing_for_chunk(
+            self.cluster.clone(), self.client.clone(), self.healing.clone(), base_chunk_id,
+        );
+        let healing_cancel_guard = FoldHealingCancelGuard::new(
+            self.cluster.clone(), self.client.clone(), self.healing.clone(), base_chunk_id,
+        );
+
         let storage = self.storage.clone();
         let read_result = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&delta_chunk_id)).await;
         let delta_bytes = match read_result {
@@ -858,12 +882,33 @@ impl OverlayForkCtx {
         // full_rewrite_chunk renames it away, so pop it; new_chunk_id becomes
         // whatever the *next* fold or read on this slot needs, kept warm without
         // paying for another disk read.
+        if new_chunk_id != base_chunk_id {
+            // Genuine supersession — base_chunk_id is permanently retired, so the
+            // healing cancellation should outlive this guard rather than being
+            // retracted. See FoldHealingCancelGuard's doc comment.
+            healing_cancel_guard.keep_cancelled();
+        }
+        // Else: a byte-identical (no-op) fold — base_chunk_id is still genuinely
+        // current, so healing_cancel_guard stays armed and retracts the
+        // cancellation when it drops at the end of this function, exactly like
+        // the early-return failure paths above.
         {
             let mut ring = self.chunk_ring.lock().unwrap();
             ring.pop(&base_chunk_id);
             if new_chunk_id != base_chunk_id {
                 ring.put(new_chunk_id, fold_buf);
             }
+        }
+
+        // Join the background healing-cancellation task now, right before this
+        // fold's own metadata commit below — see spawn_cancel_healing_for_chunk's
+        // doc comment for why joining here instead of at the top costs ~nothing in
+        // the common case (the disk read + full_rewrite_chunk work above already
+        // gave the RPC time to complete) while still surfacing a signal if it
+        // didn't land. Doesn't gate whether the commit proceeds — leader
+        // unreachable is already handled inside the task itself (logs, returns).
+        if let Err(e) = cancel_healing_task.await {
+            warn!("single fold: cancel_healing_for_chunk task panicked for {}: {}", base_chunk_id, e);
         }
 
         // Correct client_write_seq BEFORE flipping patch_state to Folded — any
@@ -1078,6 +1123,134 @@ impl OverlayForkCtx {
             // Else: a patch landed within the last debounce window — loop and
             // sleep again rather than folding yet.
         }
+    }
+}
+
+/// Ask the leader to cancel any healing in progress for `chunk_id` and
+/// tombstone it — spawned at the very start of every fold, *before* any
+/// read/consolidation work, so a heal that's already mid-transfer for the
+/// exact chunk this fold is about to retire never gets a chance to resurrect
+/// it into chunk_map afterward. See HealingManager::cancel_healing and
+/// do_heal_chunk_inner's pre-commit check for the other half of this.
+///
+/// Runs as a detached background task, not awaited inline — an earlier
+/// version of this call blocked every fold on the round-trip before doing any
+/// local work, which reproduced (under a 1025-chunk qcow2 disk's heavy
+/// concurrent fold pressure, 2026-07-10, server5/kdiskmark) the exact
+/// lock-held-across-network-hiccup stall this file's own comment already
+/// warned about for the *other* broadcast in run_single_fold ("used to run up
+/// to 2 sequential network round-trips per other online node while still
+/// holding chunk_patch_locks... under any network hiccup that's several
+/// seconds with the slot's lock held"). Callers should join the returned
+/// handle right before their own metadata commit rather than immediately:
+/// waiting doesn't change *whether* the cancellation beats a stale heal's
+/// commit (that's decided by whichever message reaches the leader first,
+/// independent of whether this task is blocked on it) — what it buys is (a)
+/// overlapping this RPC with the fold's own local disk I/O, which usually
+/// takes longer than a LAN round-trip anyway, so joining late costs ~nothing
+/// in the common case, and (b) a real signal to log if the cancellation
+/// hadn't landed by the time it mattered.
+///
+/// Same is-leader-aware dispatch as refresh_slot_from_leader: handled as a
+/// direct local call with no RPC when this node already is the leader
+/// (healing state and decisions only ever live there — see pending_healing's
+/// doc comment), otherwise routed to the leader over the network. Best-effort
+/// on an unreachable leader (logs and returns) rather than blocking
+/// indefinitely — favors availability the same way refresh_slot_from_leader
+/// does; the (much rarer, timing-dependent) race this closes is not worth
+/// stalling on a partitioned leader.
+fn spawn_cancel_healing_for_chunk(
+    cluster: Arc<ClusterManager>,
+    client: Arc<NetworkClient>,
+    healing: Arc<tokio::sync::RwLock<Option<Arc<HealingManager>>>>,
+    chunk_id: ChunkId,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if cluster.is_leader().await {
+            if let Some(h) = healing.read().await.as_ref() {
+                h.cancel_healing(chunk_id).await;
+            }
+            return;
+        }
+        let Some(leader_addr) = cluster.get_leader_addr().await else {
+            warn!("cancel_healing_for_chunk: no leader available to cancel healing for {} — proceeding with fold anyway", chunk_id);
+            return;
+        };
+        let req = Request::CancelHealing { chunk_id };
+        if let Err(e) = client.send_message(leader_addr, Message::Request(req)).await {
+            warn!("cancel_healing_for_chunk: failed to reach leader to cancel healing for {}: {} — proceeding with fold anyway", chunk_id, e);
+        }
+    })
+}
+
+/// RAII guard pairing cancel_healing_for_chunk with a retraction, so every one
+/// of run_single_fold's several early-return paths (delta read failure, corrupt
+/// delta, consolidation failure — all cases where base_chunk_id turns out to
+/// still be genuinely needed, same as a no-op fold) automatically retracts the
+/// cancellation without each call site having to remember to. Armed on
+/// construction (default: retract on drop); call `keep_cancelled()` exactly
+/// once, only when the fold actually succeeds with a new, different chunk_id —
+/// that's the one case base_chunk_id is genuinely, permanently retired and the
+/// tombstone should stay in place.
+///
+/// Drop is sync but the retraction needs an async RPC (when this node isn't the
+/// leader), so it spawns a detached task holding cloned Arc handles rather than
+/// a `&Server` borrow — mirrors how the fold's own post-commit broadcast
+/// (below, in run_single_fold) already detaches itself for the same structural
+/// reason (nothing about this node's own correctness depends on the retraction
+/// landing before the caller who dropped the guard proceeds).
+struct FoldHealingCancelGuard {
+    cluster: Arc<ClusterManager>,
+    client: Arc<NetworkClient>,
+    healing: Arc<tokio::sync::RwLock<Option<Arc<HealingManager>>>>,
+    chunk_id: ChunkId,
+    retract_on_drop: bool,
+}
+
+impl FoldHealingCancelGuard {
+    fn new(
+        cluster: Arc<ClusterManager>,
+        client: Arc<NetworkClient>,
+        healing: Arc<tokio::sync::RwLock<Option<Arc<HealingManager>>>>,
+        chunk_id: ChunkId,
+    ) -> Self {
+        Self {
+            cluster,
+            client,
+            healing,
+            chunk_id,
+            retract_on_drop: true,
+        }
+    }
+
+    /// Call when the fold actually succeeds with a new, different chunk_id —
+    /// base_chunk_id is genuinely retired now, so the cancellation should
+    /// outlive this guard instead of being retracted on drop.
+    fn keep_cancelled(mut self) {
+        self.retract_on_drop = false;
+    }
+}
+
+impl Drop for FoldHealingCancelGuard {
+    fn drop(&mut self) {
+        if !self.retract_on_drop {
+            return;
+        }
+        let cluster = self.cluster.clone();
+        let client = self.client.clone();
+        let healing = self.healing.clone();
+        let chunk_id = self.chunk_id;
+        tokio::spawn(async move {
+            if cluster.is_leader().await {
+                if let Some(h) = healing.read().await.as_ref() {
+                    h.retract_healing_cancellation(chunk_id);
+                }
+                return;
+            }
+            let Some(leader_addr) = cluster.get_leader_addr().await else { return };
+            let req = Request::RetractHealingCancellation { chunk_id };
+            let _ = client.send_message(leader_addr, Message::Request(req)).await;
+        });
     }
 }
 
@@ -2520,6 +2693,8 @@ impl Server {
             Request::PushChunkTo { chunk_id, target_addr, leader_id } => {
                 self.handle_push_chunk_to(chunk_id, target_addr, leader_id).await
             }
+            Request::CancelHealing { chunk_id } => self.handle_cancel_healing(chunk_id).await,
+            Request::RetractHealingCancellation { chunk_id } => self.handle_retract_healing_cancellation(chunk_id).await,
             Request::DeleteChunkReplica { chunk_id, leader_id } => {
                 self.handle_delete_chunk_replica(chunk_id, leader_id).await
             }
@@ -3116,6 +3291,36 @@ impl Server {
             }
             None => Ok(chunk_id), // retired since the membership check above
         }
+    }
+
+    /// Handle a peer's request to cancel healing for `chunk_id` — see
+    /// cancel_healing_for_chunk (the dispatching side, called at the start of
+    /// every fold) and HealingManager::cancel_healing's doc comment for why.
+    /// Only meaningful on the leader (healing state is leader-only — see
+    /// pending_healing's doc comment), but answers Ok unconditionally even if
+    /// this node has no HealingManager or isn't the leader: cancel_healing_for_chunk
+    /// only ever sends this to the leader in the first place (routing through
+    /// get_leader_addr, same as refresh_slot_from_leader), so reaching this
+    /// handler at all implies that's already been resolved correctly — no
+    /// separate leader-identity validation needed the way handle_push_chunk_to's
+    /// leader_id param requires (that one guards a *destructive* leader-only
+    /// action being spoofed by a non-leader; this one is idempotent and
+    /// harmless to run on the wrong node, it just wouldn't do anything useful).
+    async fn handle_cancel_healing(&self, chunk_id: ChunkId) -> Response {
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            healing.cancel_healing(chunk_id).await;
+        }
+        Response::Ok { data: None }
+    }
+
+    /// Handle a peer's request to retract a prior CancelHealing for `chunk_id` —
+    /// see retract_healing_cancellation_for_chunk (the dispatching side, called
+    /// when a fold turns out to be a no-op) for why.
+    async fn handle_retract_healing_cancellation(&self, chunk_id: ChunkId) -> Response {
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            healing.retract_healing_cancellation(chunk_id);
+        }
+        Response::Ok { data: None }
     }
 
     /// Handle push-chunk-to request: read chunk locally and send it to target_addr.
@@ -6454,6 +6659,7 @@ impl Server {
             chunk_ring: self.chunk_ring.clone(),
             cluster: self.cluster.clone(),
             client: self.client.clone(),
+            healing: self.healing.clone(),
         }
     }
 
@@ -6507,6 +6713,80 @@ impl Server {
         (loc.chunk_id != stale_chunk_id).then_some(loc)
     }
 
+    /// Self-heal a chunk that's missing locally by pulling it from any online peer
+    /// in `candidate_nodes`, verifying content against the chunk's own file-scoped
+    /// hash before trusting it, and persisting a local copy on success.
+    ///
+    /// Closes a real 2026-07-10 incident (VM-111 install, chunk_idx 3294 of a qcow2
+    /// disk): a chunk's ChunkLocation listed 2 nodes as holders, but neither
+    /// actually had the physical bytes (one likely never received them before the
+    /// under-RF union-merge registered it — see handle_replicate_chunk_location's
+    /// doc comment — the other lost them some other way). A 3rd node picked up a
+    /// legitimate copy via ordinary healing, but nothing could ever route reads or
+    /// patches there: refresh_slot_from_leader only detects a *changed* chunk_id,
+    /// not a changed node list for a stable one, and dfs-client's
+    /// canonical_write_nodes deliberately ignores fresher node lists once a
+    /// session's replica pair is established (see its own doc comment — that's
+    /// there on purpose, to avoid trusting a possibly-stale healer-added replica).
+    /// The result was a permanent EIO: every retry hit the same 2 dead nodes
+    /// forever, 30+ minutes with zero progress.
+    ///
+    /// Pulling and verifying by content hash sidesteps the whole class of "who's
+    /// the true current holder" staleness question this branch has hit repeatedly
+    /// (see feedback_seq_only_safe_for_gaps_not_dedup and the PATCH_STATE_TABLE
+    /// node-local pattern noted across bugs 6/8/9) — it doesn't matter whether our
+    /// local view of the node list is stale or wrong, only whether *some* online
+    /// node actually has the verified bytes right now.
+    async fn pull_chunk_from_peers(
+        &self,
+        chunk_id: ChunkId,
+        candidate_nodes: &[dfs_common::NodeId],
+        file_id: FileId,
+        file_offset: u64,
+    ) -> Option<Arc<Vec<u8>>> {
+        let local_id = self.cluster.local_node_id();
+        let nodes = self.cluster.get_all_nodes().await;
+        for &node_id in candidate_nodes {
+            if node_id == local_id {
+                continue;
+            }
+            let Some(node) = nodes.iter().find(|n| n.id == node_id) else { continue };
+            if node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+            let req = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: None };
+            let resp = match self.client.send_message(node.addr, Message::Request(req)).await {
+                Ok(envelope) => envelope.message,
+                Err(e) => {
+                    warn!("pull_chunk_from_peers: failed to reach {} for chunk {}: {}", node.addr, chunk_id, e);
+                    continue;
+                }
+            };
+            let data = match resp {
+                Message::Response(Response::ChunkData { arc_data: Some(arc), .. }) => arc,
+                Message::Response(Response::ChunkData { data, arc_data: None, .. }) => Arc::new(data),
+                _ => continue,
+            };
+            let actual_hash = dfs_common::compute_chunk_hash_at(&data, file_offset, file_id);
+            if actual_hash != chunk_id.hash {
+                warn!("pull_chunk_from_peers: chunk {} from {} failed content hash verification — ignoring",
+                    chunk_id, node.addr);
+                continue;
+            }
+            let storage = self.storage.clone();
+            let data_for_write = data.clone();
+            let write_ok = tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data_for_write))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            if write_ok {
+                info!("pull_chunk_from_peers: self-healed chunk {} from {}", chunk_id, node.addr);
+                return Some(data);
+            }
+        }
+        None
+    }
+
     /// Core patch-apply logic shared by handle_patch_chunk (single patch) and
     /// handle_multi_patch (N disjoint patches applied together), once the caller has
     /// already: acquired chunk_patch_locks for (file_id, chunk_idx) (iff chunk_idx is
@@ -6540,13 +6820,36 @@ impl Server {
             // No stable per-slot key to track a pending patch against — see
             // handle_multi_patch's original "No chunk_idx" comment for when this
             // happens on real writes. Fall straight through to the original full
-            // read+hash+rename dance, unchanged. No guard was acquired for this case
-            // either (see the two callers), so there's nothing to drop here.
+            // read+hash+rename dance, unchanged. No chunk_patch_locks guard was
+            // acquired for this case either (see the two callers), so there's
+            // nothing to drop here for that lock — but this is still a fold
+            // (full_rewrite_chunk retiring chunk_id) in every sense that matters
+            // to healing, so it gets the same background cancel-and-join as
+            // run_single_fold — see spawn_cancel_healing_for_chunk's doc comment
+            // for the incident this closes and why it's not awaited inline.
+            // healing_cancel_guard retracts automatically on the `?` early-return
+            // below (base still genuinely needed if the fold fails) or if it's a
+            // no-op (new_chunk_id == chunk_id).
+            let cancel_healing_task = spawn_cancel_healing_for_chunk(
+                self.cluster.clone(), self.client.clone(), self.healing.clone(), chunk_id,
+            );
+            let healing_cancel_guard = FoldHealingCancelGuard::new(
+                self.cluster.clone(), self.client.clone(), self.healing.clone(), chunk_id,
+            );
             let (new_chunk_id, size, buf) = full_rewrite_chunk(
                 self.storage.clone(), self.metadata.clone(), self.chunk_io_locks.clone(),
                 file_id, chunk_file_offset, chunk_id, patches, prefetched, None,
                 self.cluster.local_node_id(),
             ).await?;
+            if new_chunk_id != chunk_id {
+                healing_cancel_guard.keep_cancelled();
+            }
+            // Join right before the metadata commit below — see
+            // spawn_cancel_healing_for_chunk's doc comment for why this is cheap
+            // (the disk work above already gave the RPC time to land).
+            if let Err(e) = cancel_healing_task.await {
+                warn!("apply_patch: cancel_healing_for_chunk task panicked for {}: {}", chunk_id, e);
+            }
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
             update_chunk_map_after_patch(&self.chunk_map, file_id, None, chunk_id, new_chunk_id, size, now_ms);
             return Ok((new_chunk_id, size, if new_chunk_id != chunk_id { Some(now_ms) } else { None }, Some(buf)));
@@ -6567,58 +6870,66 @@ impl Server {
         //                   since chunk_patch_locks already serializes the next
         //                   patch behind the current fold either way, so paying
         //                   for an extra delta-write on top was pure waste).
+        // resolved_via_local_fold distinguishes *how* base_for_lookup was
+        // determined, which matters below: Folded(real) is first-hand, locally-
+        // verified knowledge (this exact node's own patch_state table already
+        // recorded that chunk_id was folded to real — either it ran that fold
+        // itself, or a ReplicatePatchFold broadcast already landed here). Ok(None)
+        // is the opposite: nothing local backs the client's claim at all. Only
+        // the second case needs the leader-confirmation check below — asking the
+        // leader to arbitrate the *first* case would let a leader that's simply
+        // ignorant of a fold (its own chunk_map never caught up — the fold ran on
+        // 2 other nodes and the broadcast to it was lost) override this node's
+        // own correct, verified answer with a stale one. Real 2026-07-10 incident
+        // (staging, a rapidly-appended DVR log file): exactly this — the leader's
+        // chunk_map was behind two non-leader replicas that had already folded
+        // past it, and trusting the leader unconditionally turned a case this
+        // node could resolve correctly on its own into a livelock (every retry
+        // re-asked the same wrong leader, got the same stale answer).
         let merge_base = match self.metadata.get_patch_state_async(chunk_id).await {
-            Ok(Some(PatchState::Folded(real))) => Some((real, None)),
-            Ok(Some(pending @ PatchState::Pending { .. })) => Some((chunk_id, Some(pending))),
-            Ok(None) => Some((chunk_id, None)),
+            Ok(Some(PatchState::Folded(real))) => Some((real, None, true)),
+            Ok(Some(pending @ PatchState::Pending { .. })) => Some((chunk_id, Some(pending), true)),
+            Ok(None) => Some((chunk_id, None, false)),
             Err(e) => {
                 drop(patch_guard);
                 return Err((format!("Failed to resolve patch state: {}", e), ErrorCode::InternalError));
             }
         };
-        let (base_for_lookup, existing_pending) = merge_base.expect("all three match arms above produce Some");
+        let (base_for_lookup, existing_pending, resolved_via_local_fold) = merge_base.expect("all three match arms above produce Some");
 
         let (base_chunk_id, prior_delta, base_size, is_merge) = match existing_pending {
             Some(PatchState::Pending { base_chunk_id, delta_chunk_id, size, .. }) => {
                 (base_chunk_id, Some(delta_chunk_id), size, true)
             }
             _ => {
-                // Fresh accumulator. Ghost-chunk guard: base_for_lookup is about to
-                // become the base of a brand-new pending patch, so its bytes must
-                // actually be present on THIS node's disk — nothing else would catch
-                // a ghost chunk_map entry here (ReplicateChunkLocation/an RF=3 write
-                // landing on only 2 of 3 nodes listed this node as a holder before
-                // the healer actually copied the bytes over).
-                if !self.storage.has_chunk(&base_for_lookup) {
-                    drop(patch_guard);
-                    return Err((
-                        format!("Failed to read chunk range: Failed to open chunk file for {}", base_for_lookup),
-                        ErrorCode::NotFound,
-                    ));
-                }
-                // The base's own ChunkLocation must still be registered here — a fresh
-                // accumulator always deletes its base's ChunkLocation once superseded
-                // (see the end of this match's Ok path below), so a *missing* location
-                // on a base whose *file* still physically exists is the unambiguous
-                // signature of a second concurrent request racing the first one: both
-                // read chunk_id as the slot's current identity before either had
-                // patched anything, so both independently resolved patch_state to None
-                // and took this same fresh-accumulator branch — but by the time this
-                // second one got here, chunk_patch_locks had already let the first one
-                // through to completion, which deleted this exact ChunkLocation. Prior
-                // to this check, that raced request silently defaulted to size=0 and
-                // built an accumulator that thought the chunk was empty except for its
-                // own tiny patch — the true, confirmed mechanism (found via T22c/T18
+                // Fresh accumulator. The base's own ChunkLocation must still be
+                // registered here — a fresh accumulator always deletes its base's
+                // ChunkLocation once superseded (see the end of this match's Ok path
+                // below), so a *missing* location on a base whose *file* still
+                // physically exists is the unambiguous signature of a second
+                // concurrent request racing the first one: both read chunk_id as the
+                // slot's current identity before either had patched anything, so both
+                // independently resolved patch_state to None and took this same
+                // fresh-accumulator branch — but by the time this second one got
+                // here, chunk_patch_locks had already let the first one through to
+                // completion, which deleted this exact ChunkLocation. Prior to this
+                // check, that raced request silently defaulted to size=0 and built an
+                // accumulator that thought the chunk was empty except for its own
+                // tiny patch — the true, confirmed mechanism (found via T22c/T18
                 // corruption, 2026-07-09) behind a fold later truncating away
                 // everything the *winning* concurrent request had just written. This
                 // should have been caught earlier as ChunkStale by the client's own
-                // (already-stale) chunk_id not matching chunk_map's current entry, but
-                // isn't a case worth chasing further here — treat it exactly like the
-                // ghost-chunk guard above: fail loudly so the caller's existing
+                // (already-stale) chunk_id not matching chunk_map's current entry,
+                // but isn't a case worth chasing further here — treat it exactly like
+                // the ghost-chunk guard below: fail loudly so the caller's existing
                 // stale-chunk-id retry (re-fetch current location, resend) fixes it,
                 // instead of silently proceeding on a wrong assumption.
-                let size = match self.metadata.get_chunk_location_async(base_for_lookup).await {
-                    Ok(Some(loc)) => loc.size,
+                //
+                // Looked up before the has_chunk check (unlike before) because the
+                // ghost-chunk guard below needs its `nodes` list to attempt a
+                // self-heal pull.
+                let loc = match self.metadata.get_chunk_location_async(base_for_lookup).await {
+                    Ok(Some(loc)) => loc,
                     Ok(None) => {
                         drop(patch_guard);
                         return Err((
@@ -6631,7 +6942,71 @@ impl Server {
                         return Err((format!("Failed to look up chunk location for {}: {}", base_for_lookup, e), ErrorCode::InternalError));
                     }
                 };
-                (base_for_lookup, None, size, false)
+                // Confirm with the leader that base_for_lookup is still genuinely
+                // current for this slot BEFORE starting a fresh accumulator on top of
+                // it — but ONLY when resolved_via_local_fold is false (base_for_lookup
+                // is the client's unverified claim, chunk_id itself, because this
+                // node's patch_state has no record of it at all). When
+                // resolved_via_local_fold is true, base_for_lookup came from this
+                // node's OWN first-hand patch_state resolution (Folded(real)) —
+                // either it ran that fold itself or a ReplicatePatchFold broadcast
+                // already landed here — and that is strictly better evidence than
+                // asking the leader, which can be *wrong in the other direction*: a
+                // leader whose chunk_map simply never caught up with a fold that ran
+                // on two other (non-leader) replicas will confidently report the
+                // OLD identity as current, and blindly trusting it would override
+                // this node's correct, verified answer with a stale one. Real
+                // 2026-07-10 incident (staging, a rapidly-appended DVR log file):
+                // exactly this — asking the leader unconditionally turned a case
+                // this node could already resolve correctly on its own into a
+                // livelock (every retry re-asked the same behind leader, got the
+                // same stale answer back, forever).
+                //
+                // The risk this check exists for — a lagging replica silently
+                // building on stale-but-physically-present bytes (see
+                // pull_chunk_from_peers's doc comment for the incident that
+                // motivated it) — only applies to the Ok(None) case: nothing local
+                // backs the claim, so there's no local signal to prefer over the
+                // leader's. Runs once per fold cycle (a fresh accumulator start,
+                // never a coalesced merge) when it does run, so cost is bounded by
+                // fold frequency, not patch frequency.
+                if !resolved_via_local_fold {
+                    if let Some(fresh_loc) = self.refresh_slot_from_leader(file_id, cidx, base_for_lookup).await {
+                        drop(patch_guard);
+                        return Err((
+                            format!("Chunk {} is superseded (leader reports {} is current) — retry with current chunk_id",
+                                base_for_lookup, fresh_loc.chunk_id),
+                            ErrorCode::NotFound,
+                        ));
+                    }
+                }
+                // Ghost-chunk guard: base_for_lookup is about to become the base of a
+                // brand-new pending patch, so its bytes must actually be present on
+                // THIS node's disk — nothing else would catch a ghost chunk_map entry
+                // here (ReplicateChunkLocation/an RF=3 write landing on only 2 of 3
+                // nodes listed this node as a holder before the healer actually
+                // copied the bytes over). Self-heal via pull_chunk_from_peers before
+                // failing — see that function's doc comment for the real incident
+                // (2026-07-10, VM-111 install) this closes: a permanent EIO because
+                // nothing could ever route this node's patches to a peer that
+                // actually had the chunk once this node's own copy went missing.
+                // Runs regardless of resolved_via_local_fold (unlike the
+                // leader-confirmation above): base_for_lookup's *identity* is
+                // trustworthy either way by this point (client-confirmed-fresh via
+                // the leader, or locally-verified via this node's own patch_state) —
+                // this check is only asking whether the bytes for that already-
+                // trusted identity happen to be physically present here, pulling a
+                // hash-verified copy from a peer in loc.nodes if not.
+                if !self.storage.has_chunk(&base_for_lookup) {
+                    if self.pull_chunk_from_peers(base_for_lookup, &loc.nodes, file_id, chunk_file_offset).await.is_none() {
+                        drop(patch_guard);
+                        return Err((
+                            format!("Failed to read chunk range: Failed to open chunk file for {}", base_for_lookup),
+                            ErrorCode::NotFound,
+                        ));
+                    }
+                }
+                (base_for_lookup, None, loc.size, false)
             }
         };
 

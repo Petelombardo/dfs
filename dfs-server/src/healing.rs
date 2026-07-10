@@ -243,6 +243,17 @@ pub struct HealingManager {
     /// first scheduling works correctly.
     pending_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
 
+    /// Chunk IDs a fold has claimed as "about to be retired" — checked by
+    /// do_heal_chunk_inner right before it commits a heal's ChunkLocation update,
+    /// so a heal that's already in flight when a fold starts still gets discarded
+    /// instead of resurrecting a superseded identity. See Server::cancel_healing_for_chunk
+    /// (called at the start of every fold) and this file's own cancel_healing/
+    /// retract_healing_cancellation. Maps chunk_id -> when the cancellation was
+    /// recorded, so a stale entry (the fold that requested it crashed or never
+    /// retracted for some other reason) expires rather than permanently blocking
+    /// healing for that identity — see CANCEL_TOMBSTONE_TTL.
+    cancelled_heals: Arc<DashMap<ChunkId, Instant>>,
+
     /// Chunks currently being transferred — prevents double-dispatch across drain
     /// ticks. Inserted just before PushChunkTo; removed on completion or timeout.
     in_flight_healing: Arc<RwLock<HashSet<ChunkId>>>,
@@ -384,6 +395,7 @@ impl HealingManager {
             heal_max_pct,
             pending_healing: Arc::new(RwLock::new(pending_healing_map)),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
+            cancelled_heals: Arc::new(DashMap::new()),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
             stalled_healing: Arc::new(RwLock::new(HashSet::new())),
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
@@ -662,6 +674,48 @@ impl HealingManager {
     /// longer relevant) and clear its persisted detection time.
     async fn clear_pending(&self, chunk_id: &ChunkId) {
         Self::clear_pending_static(&self.pending_healing, &self.metadata, chunk_id).await;
+    }
+
+    /// A fold is about to retire `chunk_id` as the base it's consolidating —
+    /// remove it from both pending_healing (never dispatch a heal for it) and
+    /// in_flight_healing (don't let an already-dispatched-but-not-yet-committed
+    /// heal task believe it still owns exclusivity over this chunk_id) and
+    /// tombstone it so do_heal_chunk_inner's pre-commit check (see that
+    /// function) discards any heal for this identity that's already past both
+    /// of those guards and racing toward a commit. See Server::cancel_healing_for_chunk
+    /// for why this must happen at every fold's start, not just here — this method
+    /// is the leader-local implementation; the RPC-forwarding wrapper lives on Server.
+    pub async fn cancel_healing(&self, chunk_id: ChunkId) {
+        Self::clear_pending_static(&self.pending_healing, &self.metadata, &chunk_id).await;
+        self.in_flight_healing.write().await.remove(&chunk_id);
+        self.cancelled_heals.insert(chunk_id, Instant::now());
+    }
+
+    /// Undo cancel_healing for `chunk_id` — used when the fold that requested the
+    /// cancellation turns out to be a no-op (new_chunk_id == base_chunk_id, e.g. a
+    /// patch that overwrote a region with its own existing content). In that case
+    /// base_chunk_id is still genuinely the slot's current, correct identity —
+    /// leaving it tombstoned would block it from ever being healed again until
+    /// CANCEL_TOMBSTONE_TTL expires, even though nothing about it was actually
+    /// superseded.
+    pub fn retract_healing_cancellation(&self, chunk_id: ChunkId) {
+        self.cancelled_heals.remove(&chunk_id);
+    }
+
+    /// How long a cancel_healing tombstone blocks do_heal_chunk_inner from
+    /// committing a heal for that chunk_id, if retract_healing_cancellation is
+    /// never called (the fold that requested it crashed, or the process
+    /// restarted). Comfortably longer than PushChunkTo's own 90s timeout plus its
+    /// post-push HasChunks verification round trip, so a legitimate in-flight heal
+    /// racing the cancellation always has time to observe it before committing.
+    const CANCEL_TOMBSTONE_TTL: Duration = Duration::from_secs(150);
+
+    /// Checked by do_heal_chunk_inner immediately before it commits a healed
+    /// chunk's ChunkLocation update — see cancel_healing's doc comment.
+    fn is_healing_cancelled(cancelled_heals: &Arc<DashMap<ChunkId, Instant>>, chunk_id: &ChunkId) -> bool {
+        cancelled_heals.get(chunk_id)
+            .map(|e| e.elapsed() < Self::CANCEL_TOMBSTONE_TTL)
+            .unwrap_or(false)
     }
 
     /// Classify a chunk_id that has 0 accessible replicas: is it safe to purge
@@ -2267,6 +2321,7 @@ impl HealingManager {
                 let client = self.client.clone();
                 let pending_healing = self.pending_healing.clone();
                 let in_flight_healing = self.in_flight_healing.clone();
+                let cancelled_heals = self.cancelled_heals.clone();
                 let stalled_healing = self.stalled_healing.clone();
                 let heal_semaphore = self.heal_semaphore.clone();
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
@@ -2283,7 +2338,7 @@ impl HealingManager {
                             ReplicationStatus::UnderReplicated => {
                                 HealingManager::do_heal_chunk_shared(
                                     &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
-                                    &pending_healing, &in_flight_healing, replication_factor, &bandwidth_limiter,
+                                    &pending_healing, &in_flight_healing, &cancelled_heals, replication_factor, &bandwidth_limiter,
                                     &node_inflight, &heal_max_concurrent_per_node,
                                 ).await
                             }
@@ -2371,6 +2426,7 @@ impl HealingManager {
         client: &Arc<NetworkClient>,
         pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
         in_flight_healing: &Arc<RwLock<HashSet<ChunkId>>>,
+        cancelled_heals: &Arc<DashMap<ChunkId, Instant>>,
         replication_factor: usize,
         bandwidth_limiter: &Arc<BandwidthLimiter>,
         node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
@@ -2387,7 +2443,7 @@ impl HealingManager {
         }
 
         let result = Self::do_heal_chunk_inner(
-            chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, pending_healing, replication_factor, bandwidth_limiter,
+            chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, pending_healing, cancelled_heals, replication_factor, bandwidth_limiter,
             node_inflight, heal_max_concurrent_per_node,
         ).await;
         in_flight_healing.write().await.remove(chunk_id);
@@ -2402,6 +2458,7 @@ impl HealingManager {
         cluster: &Arc<ClusterManager>,
         client: &Arc<NetworkClient>,
         pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
+        cancelled_heals: &Arc<DashMap<ChunkId, Instant>>,
         replication_factor: usize,
         bandwidth_limiter: &Arc<BandwidthLimiter>,
         node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
@@ -2473,11 +2530,17 @@ impl HealingManager {
         let needed = replication_factor.saturating_sub(replica_count);
         let base_nodes: Vec<NodeId> = alive.iter().map(|(id, _)| *id).collect();
         if needed == 0 {
-            if local_added_via_fallback {
+            if local_added_via_fallback && !Self::is_healing_cancelled(cancelled_heals, chunk_id) {
                 // Reconcile routing table: this node holds a verified copy the routing
                 // table doesn't know about. Record it now so discovery stops reporting
                 // this chunk as under-replicated and the orphan sweep doesn't delete
                 // this now-needed replica.
+                //
+                // client_write_seq preserved from the original record (not hardcoded
+                // None) — see the identical fix/rationale below this function's main
+                // healed-replica commit. Also gated on !is_healing_cancelled for the
+                // same reason as that commit: a fold may have started retiring this
+                // exact chunk_id while this reconcile was in flight.
                 let updated_location = ChunkLocation {
                     chunk_id: *chunk_id,
                     nodes: base_nodes,
@@ -2485,7 +2548,7 @@ impl HealingManager {
                     checksum: location.checksum,
                     file_offset: location.file_offset,
                     written_at: Some(Self::now_ms()),
-                    client_write_seq: None,
+                    client_write_seq: location.client_write_seq,
                     file_id: location.file_id,
                 };
                 let meta = Arc::clone(metadata);
@@ -2641,6 +2704,21 @@ impl HealingManager {
         if !replicated.is_empty() {
             info!("Healed chunk {}: added {} replicas", chunk_id, replicated.len());
 
+            // Cancellation check: a fold may have started retiring this exact
+            // chunk_id as its base while this heal was in flight (source read +
+            // network transfer + target verification above can take seconds) —
+            // see Server::cancel_healing_for_chunk, called at the start of every
+            // fold specifically to prevent this heal from resurrecting an
+            // already-superseded identity into chunk_map. Checked first, before
+            // the network round-trip below, since it's a cheap local lookup and
+            // means the fold's cancellation always wins the race regardless of
+            // how far this heal has already gotten.
+            if Self::is_healing_cancelled(cancelled_heals, chunk_id) {
+                info!("Healer: chunk {} healing was cancelled by a concurrent fold — discarding healed replica", chunk_id);
+                Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
+                return Ok(());
+            }
+
             // CAS-style freshness check: verify the source node still holds the chunk
             // before broadcasting the healed replica into the chunk map. Between our scan
             // and now, a client write may have patched the source: it renames chunk_id
@@ -2683,7 +2761,18 @@ impl HealingManager {
                 checksum: location.checksum,
                 file_offset: location.file_offset,
                 written_at: Some(Self::now_ms()),
-                client_write_seq: None,
+                // Preserve the original record's client_write_seq instead of
+                // dropping it to None — chunk_map_update_location_for_file's
+                // staleness guard uses this to reject a late-arriving stale
+                // broadcast for a position that's since advanced to a newer
+                // client_write_seq (see that function's (Some,Some)/(None,Some)
+                // match arms). Hardcoding None here defeated that guard for every
+                // heal-completion broadcast, regardless of whether the original
+                // chunk genuinely carried a real sequence number — belt-and-
+                // suspenders alongside the cancellation check above, for any
+                // heal that started (and got as far as this commit) before a
+                // fold began, so cancel_healing's tombstone window never opened.
+                client_write_seq: location.client_write_seq,
                 file_id: location.file_id,
             };
 

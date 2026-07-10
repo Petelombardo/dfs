@@ -675,6 +675,27 @@ pub enum Request {
     SetReplicationFactor {
         replication_factor: usize,
     },
+
+    /// Sent by a node about to fold a base chunk into a new one — tells the
+    /// leader (which owns all healing decisions/state) to drop `chunk_id` from
+    /// its heal queue and in-flight set, and tombstone it so any heal already
+    /// past those guards discards its result instead of committing a
+    /// ChunkLocation update for an identity the fold is about to retire.
+    /// Handled locally without an RPC when the caller already is the leader.
+    /// Appended at the end of the enum, not inserted mid-list — see
+    /// TriggerPhantomReconciliation's doc comment for why (bincode is
+    /// positional; a mid-list insertion breaks wire compatibility with any
+    /// peer running a binary built before the insertion).
+    CancelHealing {
+        chunk_id: ChunkId,
+    },
+
+    /// Undo a prior CancelHealing for `chunk_id` — sent when the fold that
+    /// requested it turns out to be a no-op (the "base chunk" never actually
+    /// got superseded, so it's still fine, even necessary, to heal normally).
+    RetractHealingCancellation {
+        chunk_id: ChunkId,
+    },
 }
 
 /// Response types

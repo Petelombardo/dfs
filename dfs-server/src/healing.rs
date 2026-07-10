@@ -1299,6 +1299,27 @@ impl HealingManager {
         if self.cluster.is_leader().await {
             let nodes = self.cluster.get_all_nodes().await;
             let local_id = self.cluster.local_node_id();
+            // Started from this node's own local set; every online peer's own set
+            // (queried below, same loop as the stability check) gets unioned in.
+            // PATCH_STATE_TABLE is node-local and never disseminated, and a patch
+            // can land on any node in the cluster, not just the leader — trusting
+            // only this node's own view here is exactly what let a real 2026-07-10
+            // data-loss incident through (VM-111 install): gluster4 asked leader
+            // gluster1 to authorize a candidate that gluster1 itself had already
+            // moved past locally, but gluster3 — never asked — still held it as a
+            // live Pending base. gluster1 said "not live" from pure local
+            // ignorance, gluster4 deleted its own copy for real, RF dropped from 3
+            // to 2 on exactly the two nodes the client's deterministic replica
+            // selection kept picking. Non-leader nodes always got this union via
+            // handle_confirm_chunks_live; the leader was taking a shortcut around
+            // it by answering its own candidates directly. Same fix, same place.
+            let mut pending_ids = match self.metadata.all_pending_patch_chunk_ids_async().await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    warn!("Live-file orphan sweep: failed to read local pending patch chunk_ids, deferring this cycle: {}", e);
+                    return Vec::new();
+                }
+            };
             for node in &nodes {
                 if node.id == local_id {
                     continue;
@@ -1327,21 +1348,22 @@ impl HealingManager {
                         return Vec::new();
                     }
                 }
-            }
-            // Every other node is online and has been stable for long enough —
-            // this leader's own local view is authoritative. Still must exclude any
-            // candidate currently a base_chunk_id or delta_chunk_id of a Pending
-            // patch (deferred chunk-patch consolidation) — non-leader nodes get this
-            // same protection via handle_confirm_chunks_live's liveness union, but
-            // the leader takes this branch instead of calling that RPC on itself, so
-            // the same check has to be applied directly here.
-            match self.metadata.all_pending_patch_chunk_ids_async().await {
-                Ok(pending_ids) => candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect(),
-                Err(e) => {
-                    warn!("Live-file orphan sweep: failed to read pending patch chunk_ids, deferring this cycle: {}", e);
-                    Vec::new()
+                let req = Request::GetPendingPatchChunkIds;
+                match tokio::time::timeout(RPC_TIMEOUT, self.client.send_message(node.addr, Message::Request(req))).await {
+                    Ok(Ok(envelope)) => match envelope.message {
+                        Message::Response(Response::PendingPatchChunkIds { ids }) => pending_ids.extend(ids),
+                        _ => {
+                            debug!("Live-file orphan sweep: deferring — unexpected response to GetPendingPatchChunkIds from {}", node.id);
+                            return Vec::new();
+                        }
+                    },
+                    _ => {
+                        debug!("Live-file orphan sweep: deferring — GetPendingPatchChunkIds failed/timed out for node {}", node.id);
+                        return Vec::new();
+                    }
                 }
             }
+            candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect()
         } else {
             let leader_addr = match self.cluster.get_leader_addr().await {
                 Some(addr) => addr,

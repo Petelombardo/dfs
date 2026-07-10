@@ -571,6 +571,24 @@ pub enum Request {
     /// path (see PATCH_STATE_TABLE's doc comment in metadata.rs).
     GetPatchTokenIds,
 
+    /// Ask a node for the base_chunk_id/delta_chunk_id set of every currently-
+    /// Pending row in its OWN local PATCH_STATE_TABLE (not the token keys — see
+    /// GetPatchTokenIds for those). Used by handle_confirm_chunks_live so a
+    /// live-file orphan sweep's authorization check unions this across every
+    /// online node instead of trusting whichever single node answers the RPC
+    /// (almost always the leader) — a patch can land on any node, not just the
+    /// leader, and PATCH_STATE_TABLE is node-local, never disseminated. Without
+    /// this, a chunk still a live Pending base on a follower the leader has
+    /// already itself moved past looks "not live" to the leader's own three
+    /// sources, gets authorized for deletion, and a real data-loss incident
+    /// results the moment the requesting node's own physical copy is the last
+    /// one anywhere still relied on by a client's in-flight patch (2026-07-10,
+    /// VM-111 install: gluster4 asked leader gluster1 — who had already moved
+    /// past the chunk itself — deleted its own copy, RF dropped from 3 to 2
+    /// exactly on the two nodes the client's deterministic replica selection
+    /// kept picking, EIO).
+    GetPendingPatchChunkIds,
+
     /// Ask any node to immediately run its local orphan reconciliation sweep instead
     /// of waiting for the next scheduled cycle. Safety gating (age grace, two-pass
     /// confirmation, leader cross-check or all-nodes-stability) still applies —
@@ -742,6 +760,13 @@ pub enum Response {
     /// Response to GetPatchTokenIds: every chunk_id currently outstanding in the
     /// responding node's local PATCH_STATE_TABLE.
     PatchTokenIds {
+        ids: Vec<ChunkId>,
+    },
+
+    /// Response to GetPendingPatchChunkIds: the responding node's own
+    /// all_pending_patch_chunk_ids() — base_chunk_id/delta_chunk_id for every
+    /// currently-Pending row in its local PATCH_STATE_TABLE.
+    PendingPatchChunkIds {
         ids: Vec<ChunkId>,
     },
 

@@ -2487,6 +2487,7 @@ impl Server {
                 self.handle_confirm_chunks_live(chunk_ids).await
             }
             Request::GetPatchTokenIds => self.handle_get_patch_token_ids().await,
+            Request::GetPendingPatchChunkIds => self.handle_get_pending_patch_chunk_ids().await,
             Request::TriggerOrphanCleanup => {
                 self.handle_trigger_orphan_cleanup().await
             }
@@ -3625,9 +3626,52 @@ impl Server {
                 // still reading it. The delta chunk is never referenced by any
                 // ChunkLocation at all. Both would look exactly like orphaned disk
                 // files without this.
+                //
+                // PATCH_STATE_TABLE is node-local and never disseminated, and a patch
+                // can land on any node in the cluster, not just whichever node answers
+                // this RPC (almost always the leader, since that's who callers of
+                // authorize_live_file_orphan_deletes ask) — a local-only lookup here is
+                // blind to every Pending row on a follower. Gather every online peer's
+                // own set via GetPendingPatchChunkIds and union it in, same pattern as
+                // run_discovery_pass already uses for GetPatchTokenIds. Without this: a
+                // chunk still a live Pending base on a follower, but already superseded
+                // on whichever node answers this RPC, looks "not live" here, gets
+                // authorized for deletion, and the requesting node's physical copy gets
+                // deleted for real — a confirmed 2026-07-10 incident (VM-111 install):
+                // gluster4 asked leader gluster1, who had already moved past the chunk
+                // itself, got "not live", deleted its own copy, and RF quietly dropped
+                // from 3 to 2 on exactly the two nodes the client's deterministic
+                // replica selection kept picking — EIO on every subsequent patch.
+                //
+                // Failing conservatively matters here more than usual: unlike most
+                // liveness checks, a wrong answer here causes an immediate, real
+                // deletion, not just a deferred retry. If any online peer can't be
+                // reached, treat every candidate as live rather than authorize deletion
+                // of a set we couldn't fully verify.
                 match self.metadata.all_pending_patch_chunk_ids_async().await {
                     Ok(pending_ids) => live_set.extend(pending_ids),
                     Err(e) => warn!("handle_confirm_chunks_live: failed to read pending patch chunk_ids: {}", e),
+                }
+                let local_id = self.cluster.local_node_id();
+                let peers = self.cluster.get_all_nodes().await;
+                for peer in &peers {
+                    if peer.id == local_id || peer.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let req = Request::GetPendingPatchChunkIds;
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), self.client.send_message(peer.addr, Message::Request(req))).await {
+                        Ok(Ok(envelope)) => match envelope.message {
+                            Message::Response(Response::PendingPatchChunkIds { ids }) => live_set.extend(ids),
+                            _ => {
+                                warn!("handle_confirm_chunks_live: unexpected response to GetPendingPatchChunkIds from {} — treating all candidates as live this cycle", peer.id);
+                                return Response::ChunkLiveness { live: chunk_ids };
+                            }
+                        },
+                        _ => {
+                            warn!("handle_confirm_chunks_live: GetPendingPatchChunkIds failed/timed out for {} — treating all candidates as live this cycle", peer.id);
+                            return Response::ChunkLiveness { live: chunk_ids };
+                        }
+                    }
                 }
                 let live: Vec<ChunkId> = chunk_ids.into_iter().filter(|id| live_set.contains(id)).collect();
                 Response::ChunkLiveness { live }
@@ -3652,6 +3696,20 @@ impl Server {
             Ok(ids) => Response::PatchTokenIds { ids: ids.into_iter().collect() },
             Err(e) => {
                 warn!("handle_get_patch_token_ids: failed to read local patch_state table: {}", e);
+                Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError }
+            }
+        }
+    }
+
+    /// Answer GetPendingPatchChunkIds using this node's own local PATCH_STATE_TABLE.
+    /// See Request::GetPendingPatchChunkIds's doc comment for why
+    /// handle_confirm_chunks_live must gather this from every online node instead
+    /// of trusting its own local table alone.
+    async fn handle_get_pending_patch_chunk_ids(&self) -> Response {
+        match self.metadata.all_pending_patch_chunk_ids_async().await {
+            Ok(ids) => Response::PendingPatchChunkIds { ids: ids.into_iter().collect() },
+            Err(e) => {
+                warn!("handle_get_pending_patch_chunk_ids: failed to read local patch_state table: {}", e);
                 Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError }
             }
         }

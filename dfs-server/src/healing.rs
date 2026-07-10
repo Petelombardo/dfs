@@ -21,6 +21,34 @@ use crate::storage::ChunkStorage;
 /// deleting anything.
 pub const LEADER_CHANGE_GRACE_SECS: u64 = 1200;
 
+/// Suspend disk-orphan-sweep-family destructive decisions for this many seconds
+/// after THIS node's own process starts, regardless of leadership status.
+///
+/// LEADER_CHANGE_GRACE_SECS above only fires for a node that has itself been (or
+/// recently became) leader — `time_since_became_leader()` returns None for a plain
+/// follower, and the `.map_or(true, ...)` default trivially passes the check for
+/// every follower, unconditionally, no matter how recently it restarted. That's a
+/// real gap: `rebuild_chunk_map_from_metadata` on startup is fast (typically well
+/// under a second even for tens of thousands of chunks), but the chunk_map it
+/// rebuilds is only ever as fresh as the last durable FileMetadata sync — nowhere
+/// near as current as a long-running peer's in-memory chunk_map, which is updated
+/// synchronously on every single patch. A freshly-restarted follower's own
+/// live_chunk_ids()/chunk_map union can legitimately be missing entries for
+/// recently-active files for as long as it takes normal traffic (background-tick
+/// pushes, new patches, peer broadcasts) to catch it back up — there's no
+/// "rebuild finished" signal that means "and now I'm current."
+///
+/// Confirmed 2026-07-10: gluster2 restarted (redeploy) at a moment of the cluster's
+/// choosing, its chunk_map rebuild completed in ~1s, but its view of an
+/// actively-patched file was still stale minutes later — its own
+/// [GHOST-stale-check] logged exactly this for the same file. A disk-orphan-sweep
+/// pass ran in that window, misread ~70 real, live chunks belonging to
+/// not-yet-caught-up files as "patch-superseded, cleanup missed," and (after
+/// cross-node authorization that only protects Pending patch state, not ordinary
+/// live chunks — see handle_confirm_chunks_live) deleted its own only-recently-
+/// created copies of at least one of them, for real.
+pub const SELF_RESTART_GRACE_SECS: u64 = LEADER_CHANGE_GRACE_SECS;
+
 /// Token-bucket bandwidth limiter for heal traffic. Unlike a bytes-in-flight
 /// semaphore (which only bounds concurrency — a transfer that completes instantly
 /// just frees its permits for the next one to start at full speed), this paces
@@ -255,6 +283,13 @@ pub struct HealingManager {
     /// All loop iterations check this flag; when false, they skip their work and
     /// sleep until re-enabled.
     pub healing_enabled: Arc<std::sync::atomic::AtomicBool>,
+
+    /// When this process started (approximately — set at HealingManager
+    /// construction, which happens moments after rebuild_chunk_map_from_metadata
+    /// is kicked off in main.rs, close enough for a 20-minute grace window). See
+    /// SELF_RESTART_GRACE_SECS's doc comment for why this exists independently of
+    /// LEADER_CHANGE_GRACE_SECS's own (leader-only) tracking.
+    local_started_at: Instant,
 }
 
 impl HealingManager {
@@ -355,6 +390,7 @@ impl HealingManager {
             heal_transfer_timeout_secs,
             phantom_reconcile_in_progress: std::sync::atomic::AtomicBool::new(false),
             healing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(auto_heal)),
+            local_started_at: Instant::now(),
         }
     }
 
@@ -1108,6 +1144,17 @@ impl HealingManager {
                     .map_or(0.0, |d| d.as_secs_f64());
                 warn!("Skipping disk orphan sweep — within grace period after leader election ({:.0}s elapsed of {}s)",
                     elapsed, LEADER_CHANGE_GRACE_SECS);
+                return;
+            }
+            // See SELF_RESTART_GRACE_SECS's doc comment: the check above only ever
+            // fires for a node that's been (or recently became) leader — a plain
+            // follower always passes it trivially, no matter how recently it
+            // restarted. This is the independent check for that case: THIS node's
+            // own local_started_at, regardless of leadership.
+            let self_uptime = self.local_started_at.elapsed().as_secs();
+            if self_uptime < SELF_RESTART_GRACE_SECS {
+                warn!("Skipping disk orphan sweep — this node restarted {}s ago (< {}s grace period, chunk_map may not have caught up to current cluster state yet)",
+                    self_uptime, SELF_RESTART_GRACE_SECS);
                 return;
             }
         }
@@ -3356,7 +3403,10 @@ mod tests {
     async fn test_disk_orphan_sweep_evicts_live_file_orphan_after_two_pass_when_authorized() {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
-        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        let (storage, metadata, mut healing, _t1, _t2) = make_healing(node_id, addr);
+        // Past SELF_RESTART_GRACE_SECS — this test exercises the two-pass eviction
+        // logic itself, not the restart-grace gate (covered by its own test below).
+        healing.local_started_at = Instant::now() - Duration::from_secs(SELF_RESTART_GRACE_SECS + 1);
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"live-file-orphan-test"));
         storage.write_chunk(&chunk_id, b"some data").unwrap();
@@ -3389,7 +3439,12 @@ mod tests {
     async fn test_disk_orphan_sweep_never_evicts_recent_live_file_orphan() {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
-        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        let (storage, metadata, mut healing, _t1, _t2) = make_healing(node_id, addr);
+        // Past SELF_RESTART_GRACE_SECS — this test exercises the chunk-age grace
+        // logic itself, not the restart-grace gate (covered by its own test below);
+        // without this the sweep would no-op for the wrong reason and the
+        // assertion below would pass vacuously.
+        healing.local_started_at = Instant::now() - Duration::from_secs(SELF_RESTART_GRACE_SECS + 1);
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"too-recent-orphan"));
         storage.write_chunk(&chunk_id, b"some data").unwrap();
@@ -3410,6 +3465,44 @@ mod tests {
             healing.run_disk_orphan_sweep().await;
         }
         assert!(storage.get_chunk_path(&chunk_id).exists(), "must never evict a candidate still inside the age grace");
+    }
+
+    /// Regression test for the 2026-07-10 incident: a freshly-restarted node's
+    /// disk-orphan-sweep must not delete anything, even for a candidate that's
+    /// otherwise old enough and would normally be authorized on a second pass —
+    /// SELF_RESTART_GRACE_SECS must gate this independently of chunk age and
+    /// independently of leadership (this node is never leader in this test, so
+    /// LEADER_CHANGE_GRACE_SECS's own check trivially passes and would not have
+    /// caught this).
+    #[tokio::test]
+    async fn test_disk_orphan_sweep_defers_within_self_restart_grace_period() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        // Freshly constructed — local_started_at defaults to "now", well within
+        // SELF_RESTART_GRACE_SECS.
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"restart-grace-test"));
+        storage.write_chunk(&chunk_id, b"some data").unwrap();
+        let old_ts = dfs_common::types::current_timestamp().saturating_sub(700);
+        storage.set_chunk_mtime(&chunk_id, old_ts);
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: 9,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: Some(old_ts * 1000),
+            client_write_seq: None,
+            file_id: None,
+        }).unwrap();
+
+        for _ in 0..3 {
+            healing.run_disk_orphan_sweep().await;
+        }
+        assert!(storage.get_chunk_path(&chunk_id).exists(),
+            "must never evict anything while this node is within its own post-restart grace period, \
+             regardless of chunk age or authorization outcome");
     }
 
     /// Regression test for the 2026-07-06 incident: a metadata read error must defer

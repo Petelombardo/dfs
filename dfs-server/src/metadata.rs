@@ -99,20 +99,24 @@ const PATCH_STATE_SLOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::ne
 /// sequence is a much smaller, simpler claim: "have I applied every patch up to
 /// N for this exact (file, chunk_idx)?" — a plain integer comparison, no
 /// content-hash chain to resolve. Since this DFS has exactly one active writer
-/// per file, the client can assign these values authoritatively and a replica
-/// only ever needs to compare its own last-applied value against what an
-/// incoming patch claims to determine, unambiguously, whether it can apply
-/// directly (exactly one behind), it's a stale/duplicate retry (already at or
-/// past it), or it has a gap and must refresh a full copy before applying
-/// (more than one behind) — no ChunkStale round-trip, no patch_state/chunk_map
-/// resolution needed for this decision.
+/// per file, the client can assign these values authoritatively.
 ///
-/// This table is wired into the wire protocol (MultiPatch/PatchChunk request
-/// and result fields) as of 2026-07-10 but is currently record-only: nothing
-/// yet rejects or gap-detects using these values — see apply_patch/
-/// handle_multi_patch for the follow-up that makes it load-bearing. Lazily
-/// created on first write, same as CHUNK_REFCOUNT_TABLE — no migration needed,
-/// not in the startup table-open list.
+/// Only the "gap" direction is safe to act on unilaterally: a new_chunk_seq more
+/// than one ahead of what's recorded means this replica is missing prior patches
+/// to this exact slot, so handle_multi_patch proactively refreshes from the
+/// leader before applying — see that function's comment. The mirror-image idea —
+/// treating a new_chunk_seq at or behind what's recorded as a safe-to-skip
+/// duplicate — was tried and reverted the same day (2026-07-10) after it caused
+/// real data loss in the T28 patch-storm test: chunk_patch_locks only serializes
+/// *processing* order, not *arrival* order, so two concurrent patches to the same
+/// slot touching different byte ranges can have a higher-seq one win the lock and
+/// apply first, making a genuinely-not-yet-applied lower-seq patch look like a
+/// stale duplicate and get silently dropped. Detecting real duplicates safely
+/// needs more than a plain integer compare (e.g. content-based dedup, or the
+/// client guaranteeing strict per-slot in-flight ordering) — not implemented.
+///
+/// Lazily created on first write, same as CHUNK_REFCOUNT_TABLE — no migration
+/// needed, not in the startup table-open list.
 const CHUNK_SEQ_TABLE: TableDefinition<&str, u64> = TableDefinition::new("chunk_seq");
 
 // ---------------------------------------------------------------------------

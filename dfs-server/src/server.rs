@@ -6843,6 +6843,39 @@ impl Server {
             None
         };
 
+        // Fast pre-check using the per-slot chunk_seq (see CHUNK_SEQ_TABLE's doc
+        // comment) — now that chunk_patch_locks is held for this exact slot, so this
+        // read is consistent with nothing else able to change it underneath us.
+        // Additive to the chunk_id-based staleness check below, not yet a
+        // replacement, and deliberately one-sided: a chunk_seq that's more than one
+        // ahead of what's recorded proactively refreshes from the leader before
+        // falling through — safe, since it never skips applying anything, only ever
+        // adds a refresh-and-retry ahead of the same logic that already runs today.
+        //
+        // The mirror-image check — new_seq <= current_seq means "already applied,
+        // short-circuit to current state" — was here and got removed 2026-07-10
+        // after it caused a real T28 data-loss regression (thick-file md5 mismatch
+        // after a patch storm + restart): chunk_patch_locks only serializes
+        // *processing* order, not *arrival* order, so two concurrent patches to the
+        // same slot touching different byte ranges can have their sequence numbers
+        // race — a higher-seq patch can win the lock and get applied first, and the
+        // lower-seq one arriving after it then looked like a stale duplicate and got
+        // silently dropped, even though its bytes were never actually applied
+        // anywhere. Detecting genuine duplicates safely needs more than a plain
+        // integer compare (e.g. content-based dedup, or the client guaranteeing
+        // strict per-slot in-flight ordering) — not implemented here.
+        if let (Some(cidx), Some(new_seq)) = (chunk_idx, new_chunk_seq) {
+            if let Ok(Some(current_seq)) = self.metadata.get_chunk_seq_async(file_id, cidx).await {
+                if new_seq > current_seq + 1 {
+                    info!("MultiPatch: chunk_seq gap ({} vs expected {}) for file {} chunk {} — refreshing from leader before applying",
+                        new_seq, current_seq + 1, file_id, cidx);
+                    if let Some(fresh_loc) = self.refresh_slot_from_leader(file_id, cidx, chunk_id).await {
+                        chunk_id = fresh_loc.chunk_id;
+                    }
+                }
+            }
+        }
+
         if let Some(cidx) = chunk_idx {
             // See the matching comment in handle_patch_chunk: clone the candidate
             // location out and drop the DashMap guard *before* the .await below —
@@ -9752,6 +9785,55 @@ mod tests {
             // No patch_state should have been created for a base we never actually had.
             assert!(h.metadata.get_patch_state(&ghost_id).unwrap().is_none(),
                 "no patch_state should be started on top of a ghost base");
+        }
+
+        /// A chunk_seq that jumps far ahead of what's recorded (a "gap" from this
+        /// replica's point of view) triggers a proactive refresh from the leader
+        /// before falling through to the existing chunk_id logic. In a single-node
+        /// harness this node IS the leader, so the refresh reads its own
+        /// already-correct chunk_map and finds nothing fresher — this verifies that
+        /// path doesn't itself break or interfere with an apply that was going to
+        /// succeed anyway (the actual cross-node recovery case needs a multi-node
+        /// integration test, not a single-process unit test).
+        #[tokio::test]
+        async fn chunk_seq_gap_falls_through_to_normal_apply_when_nothing_actually_stale() {
+            let h = make_overlay_test_harness();
+            assert!(h.server.cluster.is_leader().await, "single-node harness must be its own leader");
+            let file_id = dfs_common::FileId::new();
+            let chunk_file_offset = 0u64;
+            let original_data = vec![0u8; 4096];
+            let original_chunk_id = ChunkId::from_hash(compute_chunk_hash(&original_data));
+            h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+            let original_loc = ChunkLocation {
+                chunk_id: original_chunk_id, nodes: vec![], size: 4096, checksum: original_chunk_id.hash,
+                file_offset: Some(chunk_file_offset), written_at: Some(1000), client_write_seq: None, file_id: Some(file_id),
+            };
+            h.server.chunk_map.insert(file_id, (vec![original_loc.clone()], 1));
+            h.server.metadata.put_chunk_location(&original_loc).unwrap();
+
+            let resp1 = h.server.handle_multi_patch(
+                original_chunk_id, file_id, Some(0), chunk_file_offset,
+                vec![(0, vec![1u8; 100])], None, None, None, Some(1),
+            ).await;
+            let first_new_id = match resp1 {
+                Response::MultiPatchResult { new_chunk_id, chunk_seq, .. } => { assert_eq!(chunk_seq, Some(1)); new_chunk_id }
+                other => panic!("expected MultiPatchResult, got {:?}", other),
+            };
+
+            // Big jump in new_chunk_seq (1 -> 50) — a "gap" by the plain integer
+            // check, even though nothing is actually wrong. Must still apply
+            // successfully: refresh_slot_from_leader finds nothing fresher (this
+            // node already IS current, being both the leader and the one that
+            // applied patch 1), so it falls through and applies normally.
+            let resp2 = h.server.handle_multi_patch(
+                first_new_id, file_id, Some(0), chunk_file_offset,
+                vec![(200, vec![2u8; 50])], None, None, None, Some(50),
+            ).await;
+            match resp2 {
+                Response::MultiPatchResult { chunk_seq, .. } => assert_eq!(chunk_seq, Some(50)),
+                other => panic!("gap detection with no actual staleness must not break a normal apply, got {:?}", other),
+            }
+            assert_eq!(h.metadata.get_chunk_seq(file_id, 0).unwrap(), Some(50));
         }
 
         /// A single cheap patch acks immediately with a public token distinct from

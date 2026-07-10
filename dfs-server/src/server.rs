@@ -700,6 +700,7 @@ struct OverlayForkCtx {
     pending_patch_fold_broadcasts: Arc<DashMap<ChunkId, PendingPatchFoldBroadcast>>,
     dirty_patch_slots: Arc<DashMap<(FileId, u64), DirtyPatchSlot>>,
     chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
+    chunk_ring: Arc<std::sync::Mutex<lru::LruCache<ChunkId, Arc<Vec<u8>>>>>,
     cluster: Arc<ClusterManager>,
     client: Arc<NetworkClient>,
 }
@@ -755,6 +756,21 @@ const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_milli
 /// losses and fold.
 const PATCH_DEBOUNCE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// 2026-07-10: a DFS_PATCH_FOLD_IMMEDIATE kill switch briefly lived here to
+/// A-B test folding every patch immediately instead of waiting for
+/// debounce_fold_slot. Removed after a live staging measurement (kdiskmark
+/// Q32T1/Q1T1) showed folding per-patch collapses throughput ~60-100x under
+/// concurrent hot-chunk writers: full_rewrite_chunk's read-4MB+write-4MB+
+/// rename dance, run once per patch instead of once per coalesced burst,
+/// serializes the whole burst behind chunk_patch_locks (the same per-slot
+/// lock the direct/full-rewrite path also holds for its full duration — see
+/// handle_multi_patch's lock acquisition). Confirms DirtyPatchSlot's
+/// pre-2026-07-09 finding still holds: coalescing is load-bearing for
+/// throughput, not just a nice-to-have. See run_single_fold's chunk_ring
+/// seed/consult (added same day) for the actual follow-up: make each fold
+/// cheaper via a warm cache instead of trying to make folds happen less
+/// expensively-but-more-often.
+
 impl OverlayForkCtx {
     /// Consolidate the one pending patch on (file_id, chunk_idx) into a single
     /// fresh, standalone chunk via `full_rewrite_chunk` — unchanged, the same
@@ -796,6 +812,16 @@ impl OverlayForkCtx {
         // per-slot lock) and carries the same nodes/file_offset base_chunk_id did.
         let loc_seed = self.metadata.get_chunk_location_async(public_token).await.ok().flatten();
 
+        // Consult the ring before paying for a disk read: a hot slot folds
+        // through a chain of chunk_ids (each fold's output becomes the next
+        // accumulator's base), and the ring gets seeded with exactly this
+        // fold's own output below — so the *next* fold on this same slot finds
+        // its base already warm in memory instead of re-reading what this node
+        // just wrote a moment ago. Nothing else can have superseded base_chunk_id
+        // while this fold holds the per-slot lock, so a ring hit here is always
+        // correct, not just fresh-enough.
+        let ring_prefetched = self.chunk_ring.lock().unwrap().get(&base_chunk_id).cloned();
+
         let fold_result = full_rewrite_chunk(
             self.storage.clone(),
             self.metadata.clone(),
@@ -804,12 +830,12 @@ impl OverlayForkCtx {
             chunk_file_offset,
             base_chunk_id,
             patches,
-            None,
+            ring_prefetched,
             loc_seed,
             self.cluster.local_node_id(),
         ).await;
 
-        let (new_chunk_id, final_size, _buf) = match fold_result {
+        let (new_chunk_id, final_size, fold_buf) = match fold_result {
             Ok(v) => v,
             Err((msg, _code)) => {
                 warn!("single fold: consolidation failed for file {} chunk_idx {} (base {}): {} — \
@@ -825,6 +851,20 @@ impl OverlayForkCtx {
                 return false;
             }
         };
+
+        // Seed the ring with this fold's own output — mirrors the re-key MultiPatch
+        // already does for its chunk_idx=None fallback path (see that call site's
+        // "Re-key ring" comment). base_chunk_id's file is gone the moment
+        // full_rewrite_chunk renames it away, so pop it; new_chunk_id becomes
+        // whatever the *next* fold or read on this slot needs, kept warm without
+        // paying for another disk read.
+        {
+            let mut ring = self.chunk_ring.lock().unwrap();
+            ring.pop(&base_chunk_id);
+            if new_chunk_id != base_chunk_id {
+                ring.put(new_chunk_id, fold_buf);
+            }
+        }
 
         // Correct client_write_seq BEFORE flipping patch_state to Folded — any
         // reader that observes Folded must see fully-settled, correct state, not
@@ -6411,6 +6451,7 @@ impl Server {
             pending_patch_fold_broadcasts: self.pending_patch_fold_broadcasts.clone(),
             dirty_patch_slots: self.dirty_patch_slots.clone(),
             chunk_patch_locks: self.chunk_patch_locks.clone(),
+            chunk_ring: self.chunk_ring.clone(),
             cluster: self.cluster.clone(),
             client: self.client.clone(),
         }

@@ -649,6 +649,20 @@ impl HealingManager {
             // same as before this was extracted into its own method.
             _ => return Some(false),
         };
+        // Check the in-memory chunk_map first: it's updated synchronously by every
+        // patch/replicate-location handler (see the `chunk_map` field doc comment),
+        // so under the overlay-consolidation design's high fold-churn rate it can be
+        // generations ahead of the durable FileMetadata below. Landing a healing scan
+        // in that lag window previously caused a real false-positive DATA LOSS purge
+        // of a chunk that a concurrent fold had already superseded (2026-07-09).
+        if let Some(entry) = self.chunk_map.get(&file_id) {
+            let (locs, _) = entry.value();
+            let current = locs.iter().find(|l| l.file_offset == Some(file_offset));
+            return Some(match current {
+                Some(cur) => cur.chunk_id != chunk_id,
+                None => true, // position removed from the fresh view — orphaned
+            });
+        }
         match self.metadata.get_file(&file_id) {
             Ok(Some(file_meta)) => {
                 // If the active chunk at this file position is a different

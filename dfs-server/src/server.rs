@@ -443,6 +443,43 @@ fn update_chunk_map_after_patch(
     }
 }
 
+/// On-disk format for an overlay patch delta: a plain concatenation of records,
+/// each `[offset: u64 LE][len: u32 LE][data: len bytes]`, with no overall count
+/// or length prefix — parsed by reading records until EOF. Deliberately not
+/// bincode's `Vec<(usize, Vec<u8>)>` encoding, which prefixes the element count:
+/// appending one more element changes bytes at the *front* of the buffer, so
+/// growing that encoding always means re-serializing everything accumulated so
+/// far. This format never needs to be rewritten to add a record — a merge can
+/// open the existing delta file and literally append the new record's bytes.
+fn encode_delta_record(offset: usize, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + 4 + data.len());
+    buf.extend_from_slice(&(offset as u64).to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Parse the append-only delta format (see encode_delta_record) back into the
+/// (offset, data) pairs run_single_fold and compose_one_patch apply in order.
+fn parse_delta_records(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        if pos + 12 > bytes.len() {
+            anyhow::bail!("truncated delta record header at offset {}", pos);
+        }
+        let offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap()) as usize;
+        pos += 12;
+        if pos + len > bytes.len() {
+            anyhow::bail!("truncated delta record data at offset {} (need {} bytes)", pos, len);
+        }
+        out.push((offset, bytes[pos..pos + len].to_vec()));
+        pos += len;
+    }
+    Ok(out)
+}
+
 /// Read-modify-write the *entire* current content of `old_chunk_id`, apply every
 /// patch in `patches` in order, recompute the position-aware Blake3 hash over the
 /// whole result, and rename to the new content-addressed name if it changed. This is
@@ -635,10 +672,24 @@ struct PendingPatchFoldBroadcast {
 /// the slot's current public_token (what fold_slot_now looks up in
 /// PATCH_STATE_TABLE); `last_patch_at` is what debounce_fold_slot polls to
 /// decide whether the accumulator has quiesced yet.
-#[derive(Clone, Copy)]
+///
+/// `delta_hasher` is the running content hash of the delta file's current
+/// on-disk bytes: seeded once, when a fresh accumulator starts, with
+/// file_id + chunk_file_offset (the same domain separation compute_chunk_hash_at
+/// uses), then fed only each merge's *new* record bytes. Cloned out, updated,
+/// and cloned back in on every merge (apply_patch) — cheap, since a blake3
+/// Hasher's internal state is small and fixed-size regardless of how much data
+/// has been fed through it, unlike re-hashing the whole accumulated delta from
+/// scratch every merge (the pre-2026-07-09 behavior, and a real measured
+/// contributor to a multi-patch-write throughput regression: apply_patch's
+/// merge path used to pay O(total accumulated size) per merge for both
+/// re-serializing the whole bincode Vec *and* re-hashing it, instead of O(new
+/// bytes) for both).
+#[derive(Clone)]
 struct DirtyPatchSlot {
     token: ChunkId,
     last_patch_at: std::time::Instant,
+    delta_hasher: blake3::Hasher,
 }
 
 /// How long a slot's accumulator must sit idle (no new patch) before
@@ -685,7 +736,7 @@ impl OverlayForkCtx {
             Ok(Err(e)) => { warn!("single fold: failed to read delta chunk {}: {}", delta_chunk_id, e); return false; }
             Err(e) => { warn!("single fold: spawn_blocking panicked reading delta chunk {}: {}", delta_chunk_id, e); return false; }
         };
-        let patches: Vec<(usize, Vec<u8>)> = match bincode::deserialize(&delta_bytes) {
+        let patches: Vec<(usize, Vec<u8>)> = match parse_delta_records(&delta_bytes) {
             Ok(p) => p,
             Err(e) => { warn!("single fold: corrupt delta chunk {}: {}", delta_chunk_id, e); return false; }
         };
@@ -2575,7 +2626,7 @@ impl Server {
                 .clone();
             let delta_bytes = storage.read_chunk_arc(&delta_chunk_id)
                 .with_context(|| format!("patch compose: failed to read delta chunk {}", delta_chunk_id))?;
-            let patches: Vec<(usize, Vec<u8>)> = bincode::deserialize(&delta_bytes)
+            let patches: Vec<(usize, Vec<u8>)> = parse_delta_records(&delta_bytes)
                 .with_context(|| format!("patch compose: corrupt delta chunk {}", delta_chunk_id))?;
             for (offset, data) in patches {
                 let end = offset + data.len();
@@ -6403,43 +6454,110 @@ impl Server {
             }
         };
 
-        // Merge: concatenate onto whatever's already accumulated. compose_one_patch
-        // (and the eventual fold) applies patches in order, so a later entry
-        // correctly overwrites an earlier one's overlapping bytes — same semantics
-        // a single patch's own multi-range Vec already relies on, just extended
-        // across accumulation cycles.
-        let mut merged_patches = if let Some(prior_delta_id) = prior_delta {
-            let storage = self.storage.clone();
-            let prior_bytes = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&prior_delta_id))
-                .await
-                .map_err(|e| (format!("spawn_blocking panicked reading prior delta: {}", e), ErrorCode::InternalError))?
-                .map_err(|e| (format!("Failed to read prior delta chunk: {}", e), ErrorCode::InternalError))?;
-            bincode::deserialize::<Vec<(usize, Vec<u8>)>>(&prior_bytes)
-                .map_err(|e| (format!("Corrupt prior delta chunk: {}", e), ErrorCode::InternalError))?
-        } else {
-            Vec::with_capacity(patches.len())
-        };
-        merged_patches.extend(patches.iter().cloned());
+        // What chunk_map's entry for this slot currently holds, right now — needed
+        // below to correctly retarget it to the new public_token. For a merge this
+        // is chunk_id itself (merges only happen when the client's claimed chunk_id
+        // resolves directly to the slot's live Pending row, i.e. it IS the current
+        // entry by construction). For a fresh accumulator it's base_chunk_id, NOT
+        // chunk_id: when chunk_id resolved via the Folded(real) fast path above
+        // (patch_token_resolves_to's "skip the ChunkStale round trip" case),
+        // chunk_id is the client's already-superseded claim — chunk_map was already
+        // moved to `real` whenever that fold happened. Using chunk_id here in that
+        // case makes update_chunk_map_after_patch's search for a matching entry
+        // silently find nothing (chunk_map has `real`, not chunk_id), leaving
+        // chunk_map permanently stuck on the stale value — confirmed as a real bug
+        // via a local repro (2026-07-09, fio randwrite+fsync against an ext4 file
+        // on the DFS mount): a slot's chunk_map entry stopped advancing entirely
+        // after its first Folded-fast-path patch, so every subsequent request kept
+        // being told a chunk_id was "current" that had actually been superseded
+        // several patches ago, hitting the ghost-chunk guard over and over.
+        let chunk_map_old_id = if is_merge { chunk_id } else { base_chunk_id };
 
-        let delta_bytes = bincode::serialize(&merged_patches)
-            .map_err(|e| (format!("Failed to serialize patch delta: {}", e), ErrorCode::InternalError))?;
-        let delta_chunk_id = ChunkId::from_hash(
-            dfs_common::compute_chunk_hash_at(&delta_bytes, chunk_file_offset, file_id)
-        );
-
-        let storage = self.storage.clone();
-        {
-            let write_bytes = delta_bytes.clone();
-            tokio::task::spawn_blocking(move || storage.write_chunk(&delta_chunk_id, &write_bytes))
-                .await
-                .map_err(|e| (format!("spawn_blocking panicked writing patch delta: {}", e), ErrorCode::InternalError))?
-                .map_err(|e| (format!("Failed to write patch delta: {}", e), ErrorCode::InternalError))?;
+        // Merge: append this call's patches onto whatever's already accumulated, as
+        // new records in the append-only delta format (encode_delta_record) — never
+        // re-serializing or re-reading the whole accumulated delta. compose_one_patch
+        // (and the eventual fold) parse and apply records in order, so a later entry
+        // correctly overwrites an earlier one's overlapping bytes — same semantics a
+        // single patch's own multi-range Vec already relies on, just extended across
+        // accumulation cycles.
+        let mut new_record_bytes = Vec::new();
+        for (off, data) in &patches {
+            new_record_bytes.extend_from_slice(&encode_delta_record(*off, data));
         }
-        if let Some(prior_delta_id) = prior_delta {
-            // Superseded by the merged delta above — clean up so accumulating
-            // many patches into one slot doesn't leak one delta file per patch.
-            let storage = self.storage.clone();
-            let _ = tokio::task::spawn_blocking(move || storage.delete_chunk(&prior_delta_id)).await;
+
+        // Running content hash for this accumulator (see DirtyPatchSlot::delta_hasher's
+        // doc comment): reuse it from this node's own in-memory tracking when present
+        // (the common case — every merge but the first on this node for this slot),
+        // falling back to bootstrapping it from the prior delta's actual on-disk bytes
+        // only when this node never saw this accumulator's earlier merges (e.g. a
+        // replica handling its first MultiPatch for an already-Pending slot it learned
+        // about via ReplicateChunkLocation/healing, not by building it locally).
+        let mut hasher = match prior_delta {
+            Some(prior_delta_id) => {
+                let cached = self.dirty_patch_slots.get(&(file_id, cidx))
+                    .map(|e| e.value().delta_hasher.clone());
+                match cached {
+                    Some(h) => h,
+                    None => {
+                        let storage = self.storage.clone();
+                        let prior_bytes = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&prior_delta_id))
+                            .await
+                            .map_err(|e| (format!("spawn_blocking panicked reading prior delta: {}", e), ErrorCode::InternalError))?
+                            .map_err(|e| (format!("Failed to read prior delta chunk: {}", e), ErrorCode::InternalError))?;
+                        let mut h = blake3::Hasher::new();
+                        h.update(file_id.as_bytes());
+                        h.update(&chunk_file_offset.to_le_bytes());
+                        h.update(&prior_bytes);
+                        h
+                    }
+                }
+            }
+            None => {
+                let mut h = blake3::Hasher::new();
+                h.update(file_id.as_bytes());
+                h.update(&chunk_file_offset.to_le_bytes());
+                h
+            }
+        };
+        hasher.update(&new_record_bytes);
+        let delta_chunk_id = ChunkId::from_hash(*hasher.finalize().as_bytes());
+
+        // Write: a fresh accumulator writes a brand-new file (needs_patch's first
+        // record); a merge appends to the prior delta's existing file in place, then
+        // atomically renames it to reflect the updated content hash — the rename
+        // itself is what makes this a real content-addressed identity (and what scrub
+        // verifies), but unlike the old re-serialize-the-whole-thing approach, it's
+        // O(1) metadata work, not another O(total accumulated size) rewrite. Renaming
+        // away the prior path also replaces the old cleanup-delete-prior-delta step —
+        // there's no separate file left to delete.
+        let storage = self.storage.clone();
+        match prior_delta {
+            Some(prior_delta_id) => {
+                let append_bytes = new_record_bytes.clone();
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    use std::io::Write;
+                    let prior_path = storage.get_chunk_path(&prior_delta_id);
+                    let mut f = std::fs::OpenOptions::new().append(true).open(&prior_path)
+                        .map_err(|e| format!("Failed to open prior delta for append: {}", e))?;
+                    f.write_all(&append_bytes).map_err(|e| format!("Failed to append patch delta: {}", e))?;
+                    f.sync_data().map_err(|e| format!("Failed to sync appended delta: {}", e))?;
+                    drop(f);
+                    let new_path = storage.get_chunk_path(&delta_chunk_id);
+                    if let Some(parent) = new_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create chunk directory: {}", e))?;
+                    }
+                    std::fs::rename(&prior_path, &new_path).map_err(|e| format!("Failed to rename appended delta: {}", e))?;
+                    Ok(())
+                }).await
+                    .map_err(|e| (format!("spawn_blocking panicked appending patch delta: {}", e), ErrorCode::InternalError))?
+                    .map_err(|e| (e, ErrorCode::InternalError))?;
+            }
+            None => {
+                tokio::task::spawn_blocking(move || storage.write_chunk(&delta_chunk_id, &new_record_bytes))
+                    .await
+                    .map_err(|e| (format!("spawn_blocking panicked writing patch delta: {}", e), ErrorCode::InternalError))?
+                    .map_err(|e| (format!("Failed to write patch delta: {}", e), ErrorCode::InternalError))?;
+            }
         }
 
         // Public token: derived from the delta's own hash through a second,
@@ -6510,13 +6628,14 @@ impl Server {
             }
             let _ = self.metadata.delete_chunk_location_async(chunk_id).await;
         }
-        update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_id, public_token, needed_len, now_ms);
+        update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_map_old_id, public_token, needed_len, now_ms);
 
         self.pending_patch_ids.insert(public_token, (file_id, cidx));
         self.pending_patch_ids.insert(base_chunk_id, (file_id, cidx));
         self.dirty_patch_slots.insert((file_id, cidx), DirtyPatchSlot {
             token: public_token,
             last_patch_at: std::time::Instant::now(),
+            delta_hasher: hasher,
         });
         if !is_merge {
             // Fresh accumulator: this is the one patch in this cycle responsible
@@ -6631,6 +6750,11 @@ impl Server {
         client_write_seq: Option<u64>,
         prefetch_hints: Option<Vec<ChunkId>>,
     ) -> Response {
+        // Mutable so the staleness check below can rebase onto the current value
+        // in place instead of bouncing ChunkStale back to the client for an external
+        // round trip — see that check's doc comment for why the round trip itself
+        // was a real livelock source under high concurrency on one hot chunk.
+        let mut chunk_id = chunk_id;
         {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -6669,7 +6793,7 @@ impl Server {
             });
             if let Some(loc) = stale_candidate {
                 if loc.chunk_id != chunk_id && !self.patch_token_resolves_to(chunk_id, loc.chunk_id).await {
-                    // Before returning ChunkStale, verify the "current" chunk is actually
+                    // Before rebasing onto the "current" chunk, verify it's actually
                     // reachable — either a real file on disk (pre-overlay world) or a live
                     // PATCH_STATE_TABLE row (the overlay's Pending accumulators, which by
                     // design are never a file on disk — see PATCH_STATE_TABLE's doc comment
@@ -6683,10 +6807,9 @@ impl Server {
                     // disk once the losing request's stale token got treated as unreachable.
                     // A stale broadcast can still genuinely revert chunk_map to a ghost hash
                     // whose file was already renamed away by a subsequent patch — that's the
-                    // case this fallback still needs to catch. Returning ChunkStale with a
-                    // truly-ghost hash sends the client into an infinite retry loop, so only
-                    // fall through (proceed with the client's chunk_id) when neither a file
-                    // nor a patch_state row backs the "current" entry.
+                    // case this fallback still needs to catch. When neither a file nor a
+                    // patch_state row backs the "current" entry, fall through and proceed
+                    // with the client's own chunk_id instead of rebasing onto a ghost.
                     let current_path = self.storage.get_chunk_path(&loc.chunk_id);
                     let current_reachable = current_path.exists()
                         || matches!(self.metadata.get_patch_state_async(loc.chunk_id).await, Ok(Some(_)));
@@ -6695,12 +6818,25 @@ impl Server {
                             loc.chunk_id, file_id, cidx, loc.written_at, chunk_id,
                             self.storage.get_chunk_path(&chunk_id).exists());
                     } else {
-                        info!("MultiPatch: stale chunk_id from client — file {} chunk {} client={} server={}",
+                        // Rebase onto the current value in place instead of returning
+                        // ChunkStale for the client to retry externally. We're already
+                        // holding chunk_patch_locks for this slot — nothing else can change
+                        // chunk_map for it until we release the guard — so there is no reason
+                        // to bounce this back over the network: apply_patch below resolves
+                        // patch_state from *this* value anyway (Folded → fresh accumulator on
+                        // the real chunk; Pending → merge), exactly what a client-side retry
+                        // using this same value would have produced, just without paying for
+                        // a round trip that a livelock can win. That round trip was a real,
+                        // confirmed problem: under kdiskmark's queue-depth-32 pattern hammering
+                        // one hot chunk (e.g. ext4's superblock/journal region), the "current"
+                        // answer we hand back can be superseded again by another queued
+                        // request before the client's retry even lands — repeatedly, for
+                        // hundreds of milliseconds straight in production logs — so a caller
+                        // bounded to a handful of retries could exhaust its budget and EIO
+                        // even though the system as a whole kept making progress underneath it.
+                        info!("MultiPatch: stale chunk_id from client — file {} chunk {} client={} server={} — rebasing in place",
                             file_id, cidx, chunk_id, loc.chunk_id);
-                        return Response::ChunkStale {
-                            current_chunk_id: loc.chunk_id,
-                            current_nodes: loc.nodes.clone(),
-                        };
+                        chunk_id = loc.chunk_id;
                     }
                 }
             }
@@ -9821,6 +9957,93 @@ mod tests {
             assert_eq!(resolved.as_slice(), expected.as_slice(),
                 "both sequential patches must be reflected in the final content, in order");
         }
+
+        /// Real staging incident (2026-07-09, VM install under kdiskmark's queue-depth-32
+        /// random-write pattern): many concurrent writers hammering the SAME (file_id,
+        /// chunk_idx) — realistic for a hot region like ext4's superblock/journal, touched
+        /// by nearly every filesystem operation — can hit a livelock, not corruption.
+        /// chunk_patch_locks + the ghost-chunk/base_size guards (fixed the same day)
+        /// already guarantee no request ever silently corrupts the chunk; every request
+        /// either succeeds or gets a clear ChunkStale/NotFound to retry on. But the
+        /// staleness check answers "current is X" truthfully at the instant it's
+        /// computed, then releases the lock — and under high enough concurrency on one
+        /// chunk, another queued request can race ahead and supersede X again before the
+        /// first request's retry (bearing X) even lands. Confirmed in production logs:
+        /// the exact same chunk_id got rejected as "already superseded" repeatedly for
+        /// ~500ms straight before a fold finally broke the cycle — long enough that a
+        /// caller bounded to a handful of retries can exhaust its budget and fail even
+        /// though the system as a whole keeps making progress.
+        ///
+        /// This test drives many concurrent handle_multi_patch calls at one slot, each
+        /// with a client-style bounded retry loop (follow ChunkStale/the "no registered
+        /// location" NotFound to whatever the server says is current, same as
+        /// flush_buffer_async_one's real recovery path), and asserts every one of them
+        /// eventually succeeds within a generous retry budget. Failing this reproduces
+        /// the livelock; it is not testing for corruption (that's covered elsewhere).
+        #[tokio::test]
+        async fn many_concurrent_writers_to_one_hot_chunk_all_eventually_succeed() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let chunk_idx = 0u64;
+            let chunk_file_offset = 0u64;
+
+            let original_data = vec![0u8; 4096];
+            let original_hash = compute_chunk_hash(&original_data);
+            let original_chunk_id = ChunkId::from_hash(original_hash);
+            h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+            let original_loc = ChunkLocation {
+                chunk_id: original_chunk_id, nodes: vec![NodeId::new(), NodeId::new()],
+                size: original_data.len(), checksum: original_hash,
+                file_offset: Some(chunk_file_offset), written_at: Some(1000),
+                client_write_seq: Some(1), file_id: Some(file_id),
+            };
+            h.server.chunk_map.insert(file_id, (vec![original_loc.clone()], 1));
+            h.server.metadata.put_chunk_location(&original_loc).unwrap();
+
+            const CONCURRENCY: usize = 24;
+            const MAX_RETRIES: usize = 20;
+            let server_arc = std::sync::Arc::new(h.server);
+            let mut tasks = Vec::new();
+            for i in 0..CONCURRENCY {
+                let server = server_arc.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut claimed = original_chunk_id;
+                    for attempt in 0..MAX_RETRIES {
+                        let patch = vec![(200 + i, vec![(i % 256) as u8; 16])];
+                        let resp = server.handle_multi_patch(
+                            claimed, file_id, Some(chunk_idx), chunk_file_offset,
+                            patch, None, Some(1000 + i as u64), None,
+                        ).await;
+                        match resp {
+                            Response::MultiPatchResult { .. } => return Ok(attempt),
+                            Response::ChunkStale { current_chunk_id, .. } => {
+                                claimed = current_chunk_id;
+                            }
+                            Response::Error { message, .. } if message.contains("no registered location") => {
+                                // Client-style recovery (flush_buffer_async_one): ask for
+                                // this slot's current location and retry with it.
+                                if let Some(entry) = server.chunk_map.get(&file_id) {
+                                    let locations: &Vec<ChunkLocation> = &entry.value().0;
+                                    if let Some(pos) = Server::chunk_map_find_by_idx(locations, chunk_idx) {
+                                        claimed = locations[pos].chunk_id;
+                                    }
+                                }
+                            }
+                            other => return Err(format!("job {} attempt {}: unexpected response {:?}", i, attempt, other)),
+                        }
+                    }
+                    Err(format!("job {} exhausted {} retries (livelock)", i, MAX_RETRIES))
+                }));
+            }
+
+            let mut failures = Vec::new();
+            for task in tasks {
+                if let Err(e) = task.await.unwrap() {
+                    failures.push(e);
+                }
+            }
+            assert!(failures.is_empty(), "some concurrent writers never succeeded:\n{}", failures.join("\n"));
+        }
     }
 
     /// Crash-safety for full_rewrite_chunk's write path: it must never mutate
@@ -9850,8 +10073,7 @@ mod tests {
             // delta chunk, constructed directly rather than through handle_multi_patch
             // so this test isn't racing that patch's own real, immediately-triggered
             // background fold.
-            let delta_patches: Vec<(usize, Vec<u8>)> = vec![(0, vec![1u8; 100])];
-            let delta_bytes = bincode::serialize(&delta_patches).unwrap();
+            let delta_bytes = encode_delta_record(0, &[1u8; 100]);
             let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
             h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
             let public_token = ChunkId::from_hash(compute_chunk_hash(b"mid-fold-crash-token"));
@@ -9883,6 +10105,7 @@ mod tests {
             h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
                 token: public_token,
                 last_patch_at: std::time::Instant::now(),
+                delta_hasher: blake3::Hasher::new(),
             });
 
             // Now actually run the fold to completion and confirm it succeeds cleanly

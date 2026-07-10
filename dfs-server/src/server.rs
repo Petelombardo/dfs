@@ -6349,6 +6349,38 @@ impl Server {
         )
     }
 
+    /// Called when apply_patch's ghost-chunk guard trips (NotFound: base/prior chunk
+    /// missing locally) — asks the leader for this slot's current ChunkLocation
+    /// instead of hard-failing. The leader is always one of the two nodes any
+    /// MultiPatch fans out to (dfs-client's deterministic sort puts it first), so it
+    /// processes every patch to a slot first-hand and its chunk_map never depends on
+    /// the same best-effort ReplicateChunkLocation/ReplicatePatchFold broadcasts a
+    /// lagging replica's own view can fall behind on — see handle_multi_patch's call
+    /// site for the 2026-07-09 incident this closes. Returns None if unreachable, if
+    /// the leader has no fresher answer, or if its answer is the same stale value
+    /// we already tried (nothing gained by retrying).
+    async fn refresh_slot_from_leader(&self, file_id: FileId, chunk_idx: u64, stale_chunk_id: ChunkId) -> Option<ChunkLocation> {
+        let loc = if self.cluster.is_leader().await {
+            let entry = self.chunk_map.get(&file_id)?;
+            let (locations, _) = entry.value();
+            Self::chunk_map_find_by_idx(locations, chunk_idx).map(|pos| locations[pos].clone())?
+        } else {
+            let leader_addr = self.cluster.get_leader_addr().await?;
+            let req = Request::GetFileChunkMap { file_id, from_chunk: chunk_idx as u32, count: 1 };
+            match self.client.send_message(leader_addr, Message::Request(req)).await {
+                Ok(envelope) => match envelope.message {
+                    Message::Response(Response::FileChunkMap { locations, .. }) => locations.into_iter().next()?,
+                    _ => return None,
+                },
+                Err(e) => {
+                    warn!("refresh_slot_from_leader: failed to query leader for file {} chunk {}: {}", file_id, chunk_idx, e);
+                    return None;
+                }
+            }
+        };
+        (loc.chunk_id != stale_chunk_id).then_some(loc)
+    }
+
     /// Core patch-apply logic shared by handle_patch_chunk (single patch) and
     /// handle_multi_patch (N disjoint patches applied together), once the caller has
     /// already: acquired chunk_patch_locks for (file_id, chunk_idx) (iff chunk_idx is
@@ -6898,10 +6930,41 @@ impl Server {
             None
         };
 
-        let result = self.apply_patch(
+        let mut result = self.apply_patch(
             _chunk_patch_guard, chunk_id, file_id, chunk_idx, chunk_file_offset,
-            patches, client_write_seq, prefetched,
+            patches.clone(), client_write_seq, prefetched.clone(),
         ).await;
+
+        // apply_patch's ghost-chunk guard (NotFound: base/prior chunk not physically
+        // present, or its ChunkLocation missing) means THIS node's local view of the
+        // slot — chunk_map and/or patch_state, both node-local — is stale. That can
+        // happen even after passing the staleness check above, when this node's own
+        // chunk_map is ALSO behind: ReplicateChunkLocation/ReplicatePatchFold are
+        // fire-and-forget broadcasts with only a 10s backstop, and a hot chunk folding
+        // several times a second can retire a backstop entry (superseded by the next
+        // generation) before a lagging replica ever catches up — see this fix's own
+        // 2026-07-09 staging incident (VM-111 install, chunk_idx 1802/3584): a replica
+        // stuck on an already-retired token had no way to learn the real current
+        // identity, hard-failed every retry, and eventually exhausted the client's
+        // budget into a real EIO. Rather than hard-failing immediately, ask the leader
+        // once — it's always one of the two nodes any MultiPatch fans out to (the
+        // client's deterministic sort always puts it first), so it processes every
+        // patch to a slot first-hand and never depends on this same broadcast path.
+        if let (Err((_, ErrorCode::NotFound)), Some(cidx)) = (&result, chunk_idx) {
+            if let Some(fresh_loc) = self.refresh_slot_from_leader(file_id, cidx, chunk_id).await {
+                info!("MultiPatch: ghost-chunk guard tripped for file {} chunk {} (tried {}) — leader reports {} is current, retrying",
+                    file_id, cidx, chunk_id, fresh_loc.chunk_id);
+                let lock = self.chunk_patch_locks
+                    .entry((file_id, cidx))
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone();
+                let retry_guard = lock.lock_owned().await;
+                result = self.apply_patch(
+                    Some(retry_guard), fresh_loc.chunk_id, file_id, chunk_idx, chunk_file_offset,
+                    patches, client_write_seq, prefetched,
+                ).await;
+            }
+        }
 
         match result {
             Ok((new_chunk_id, final_size, patch_ts, final_buf)) => {

@@ -536,6 +536,7 @@ async fn full_rewrite_chunk(
     patches: Vec<(usize, Vec<u8>)>,
     prefetched: Option<Arc<Vec<u8>>>,
     loc_seed: Option<ChunkLocation>,
+    local_node_id: NodeId,
 ) -> Result<(ChunkId, usize, Arc<Vec<u8>>), (String, ErrorCode)> {
     let old_path = storage.get_chunk_path(&old_chunk_id);
 
@@ -624,9 +625,34 @@ async fn full_rewrite_chunk(
             .as_millis() as u64;
         let old_loc = metadata.get_chunk_location(&old_chunk_id).ok().flatten().or(loc_seed);
         if let Some(old_loc) = old_loc {
+            // nodes: [local_node_id] only — NOT old_loc.nodes carried forward
+            // (tried 2026-07-10, reverted same day after it caused a real T28
+            // data-loss regression: appending onto whatever the prior token's
+            // registration said makes the list grow monotonically across every
+            // generation this slot ever passes through, including nodes that
+            // only ever held some now-irrelevant earlier generation — a later
+            // patch's deterministic dual-RF node selection can then pick one of
+            // those stale entries as a write target, corrupting the file).
+            //
+            // A single-node list is deliberately correct-by-construction here:
+            // this node just wrote new_chunk_id's bytes locally, so it
+            // unambiguously holds it, and nothing else can be claimed with the
+            // same certainty. This is not the final, authoritative multi-node
+            // record — see handle_replicate_chunk_location's "Both sides are
+            // under-RF — union the node sets" merge rule, which is explicitly
+            // designed for exactly this: each node that independently processes
+            // the same generation (this fold runs once per replica that got the
+            // triggering patch) broadcasts its own single-node view, and every
+            // receiver unions them into the complete set as they arrive — the
+            // same convergence path already used for the ordinary write case
+            // ("followers each push their single-node record").
+            //
+            // The previous bug this replaced (a fold not listing the node that
+            // performed it) is still fixed by this: local_node_id is always in
+            // the registered set, never dropped.
             let new_loc = ChunkLocation {
                 chunk_id: new_chunk_id,
-                nodes: old_loc.nodes,
+                nodes: vec![local_node_id],
                 size: final_size,
                 checksum: new_chunk_id.hash,
                 file_offset: old_loc.file_offset,
@@ -780,6 +806,7 @@ impl OverlayForkCtx {
             patches,
             None,
             loc_seed,
+            self.cluster.local_node_id(),
         ).await;
 
         let (new_chunk_id, final_size, _buf) = match fold_result {
@@ -6477,6 +6504,7 @@ impl Server {
             let (new_chunk_id, size, buf) = full_rewrite_chunk(
                 self.storage.clone(), self.metadata.clone(), self.chunk_io_locks.clone(),
                 file_id, chunk_file_offset, chunk_id, patches, prefetched, None,
+                self.cluster.local_node_id(),
             ).await?;
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
             update_chunk_map_after_patch(&self.chunk_map, file_id, None, chunk_id, new_chunk_id, size, now_ms);
@@ -6709,9 +6737,21 @@ impl Server {
             // accumulation cycle; update_chunk_map_after_patch below still moves
             // it forward to the new token either way.
             if let Ok(Some(old_loc)) = self.metadata.get_chunk_location_async(base_chunk_id).await {
+                // nodes: [local_node_id] only — see full_rewrite_chunk's identical
+                // fix for the full rationale. Carrying old_loc.nodes forward (even
+                // with the local node appended) makes the list grow monotonically
+                // across every generation this slot passes through, including
+                // nodes that only ever held some now-irrelevant earlier
+                // generation — confirmed to cause a real T28 data corruption
+                // regression when a later patch's node selection picked one of
+                // those stale entries as a write target. A single-node list is
+                // correct-by-construction (this node just wrote this generation's
+                // delta locally) and converges to the full accurate set via
+                // handle_replicate_chunk_location's existing under-RF union merge
+                // once the client's own authoritative broadcast lands.
                 let new_loc = ChunkLocation {
                     chunk_id: public_token,
-                    nodes: old_loc.nodes,
+                    nodes: vec![self.cluster.local_node_id()],
                     size: needed_len,
                     checksum: public_token.hash,
                     file_offset: old_loc.file_offset,
@@ -6734,6 +6774,11 @@ impl Server {
                 loc.checksum = public_token.hash;
                 loc.written_at = Some(now_ms);
                 loc.client_write_seq = client_write_seq;
+                // Same fix as the fresh-accumulator branch above, same rationale:
+                // nodes: [local_node_id] only, not old nodes + append — see that
+                // branch's comment for why carrying the list forward caused a
+                // real T28 data corruption regression.
+                loc.nodes = vec![self.cluster.local_node_id()];
                 if let Err(e) = self.metadata.put_chunk_location_async(loc).await {
                     warn!("apply_patch: failed to slide {} -> {} in metadata: {}", chunk_id, public_token, e);
                 }
@@ -9920,6 +9965,7 @@ mod tests {
             let (reference_chunk_id, _size, _buf) = full_rewrite_chunk(
                 ref_storage.clone(), ref_metadata.clone(), chunk_io_locks.clone(),
                 file_id, chunk_file_offset, original_chunk_id, vec![patch.clone()], None, None,
+                NodeId::new(),
             ).await.unwrap();
             let reference_bytes = ref_storage.read_chunk(&reference_chunk_id).unwrap();
 
@@ -9956,16 +10002,31 @@ mod tests {
                  chunk_id whether it went through a fold or a direct full rewrite");
 
             // Regression coverage for a real bug: the fold's own CHUNK_TABLE
-            // registration must actually succeed, carrying forward the correct
-            // nodes/file_offset — not silently no-op because the base's own
-            // ChunkLocation had already been deleted the moment the patch landed.
-            // Without this, nothing is ever registered for a fold's output, so its
-            // cluster broadcast becomes a permanent no-op and no other node (or the
-            // client) ever learns the fold happened.
+            // registration must actually succeed — not silently no-op because the
+            // base's own ChunkLocation had already been deleted the moment the
+            // patch landed. Without this, nothing is ever registered for a fold's
+            // output, so its cluster broadcast becomes a permanent no-op and no
+            // other node (or the client) ever learns the fold happened.
+            //
+            // Also covers a second, more severe real bug (2026-07-10 DATA LOSS
+            // incident, then a THIRD bug found fixing the second): the fold must
+            // list the node performing it as a holder. The first fix attempt
+            // carried the original nodes list forward AND appended the local
+            // node — reverted the same day after it caused a real T28 data
+            // corruption regression (a monotonically-growing nodes list
+            // accumulates stale nodes from earlier generations, which a later
+            // patch's node selection can then pick as a write target). The
+            // correct fix registers nodes: [local_node_id] only — this node
+            // just wrote the bytes locally, so it's correct-by-construction, and
+            // the full multi-node set converges via handle_replicate_chunk_location's
+            // existing under-RF union merge once the client's own authoritative
+            // broadcast lands, exactly as it already does for the ordinary
+            // (non-fold) write case. See full_rewrite_chunk's fix comment.
             let persisted = h.metadata.get_chunk_location(&folded_chunk_id).unwrap()
                 .expect("fold must register a CHUNK_TABLE entry for its output chunk_id");
-            assert_eq!(persisted.nodes, expected_nodes,
-                "fold's registered ChunkLocation must carry forward the original nodes list");
+            assert_eq!(persisted.nodes, vec![h.server.cluster.local_node_id()],
+                "fold's registered ChunkLocation must list exactly the node that performed it, \
+                 not carry forward a (potentially stale) prior nodes list");
             assert_eq!(persisted.file_offset, Some(chunk_file_offset));
 
             // Regression coverage for a second real bug found via the T22 storm:

@@ -476,6 +476,30 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             ).await;
             info!("Shutting down...");
             server_handle.abort();
+            // Clean up addr file so dfs-admin auto-discovery doesn't see a stale entry.
+            // Must happen here, before exit — std::process::exit() below terminates the
+            // process immediately and skips any code after the select! block entirely.
+            let _ = std::fs::remove_file(&addr_file);
+            // Exit immediately rather than returning normally from main() and letting
+            // tokio's default runtime-drop behavior take over — that waits for every
+            // in-flight spawn_blocking task to finish before the process can exit, with
+            // no timeout of its own. All of our own explicit graceful-shutdown steps
+            // (GracefulLeave broadcast, leader handoff grace, drain_sled_writes) have
+            // already completed by this point via awaited, bounded calls above — the
+            // only thing std::process::exit skips is that unbounded wait on whatever
+            // else might still be running in the background (e.g. an in-flight
+            // metadata compaction), which is exactly what should NOT be allowed to
+            // block a shutdown that has already done its own cleanup.
+            //
+            // Root-caused 2026-07-11: a wedged compaction (see compact_db_prepare's
+            // now-added Phase 1-2 timeout) meant a `systemctl restart` hung the full
+            // 90s systemd TimeoutStopSec waiting on exactly this before SIGKILL forced
+            // it — during which the node was unreachable, cascading into a real
+            // healing backlog once it came back. The Phase 1-2 timeout prevents this
+            // specific trigger from recurring, but this exit fixes the general case:
+            // shutdown should never be held hostage by an unrelated stuck background
+            // task once our own explicit cleanup is done.
+            std::process::exit(0);
         }
         result = &mut server_handle => {
             match result {
@@ -494,18 +518,11 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             std::process::exit(1);
         }
     }
-
-    // Clean up addr file so dfs-admin auto-discovery doesn't see a stale entry
-    let _ = std::fs::remove_file(&addr_file);
-
-    // healer_runtime's Drop blocks joining its worker thread, which Tokio forbids
-    // from within an async task — letting it drop here when main() returns would
-    // panic ("Cannot drop a runtime in a context where blocking is not allowed").
-    // shutdown_background() consumes it without blocking, which is safe here since
-    // the process is exiting right after anyway.
-    healer_runtime.shutdown_background();
-
-    Ok(())
+    // Both select! arms above exit the process directly (std::process::exit), so
+    // nothing after this point ever runs — including healer_runtime's drop, which
+    // is fine: process exit doesn't run Drop glue anyway, and shutdown_background()
+    // existed only to avoid a would-be panic from dropping a runtime inside an
+    // async context, a case that no longer occurs now that we never fall through.
 }
 
 /// Attempt to join cluster via seed nodes

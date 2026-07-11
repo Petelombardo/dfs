@@ -5782,11 +5782,41 @@ impl Server {
                     }
                     // Phases 1-2 (shared read lock only) can legitimately take a while
                     // under heavy write churn without blocking anything else on this
-                    // node — no tight timeout here. A plain Err (e.g. "deferred: ...")
+                    // node, so this timeout is far more generous than Phase 3's tight
+                    // 20s — but it must still exist. A plain Err (e.g. "deferred: ...")
                     // is handled below exactly like the old all-in-one compact_db() did.
+                    //
+                    // Added 2026-07-11, same day as the Phase 1-2/Phase 3 split: the
+                    // split's own doc comment said Phase 1-2 "can legitimately take a
+                    // while" and deliberately dropped the outer timeout entirely on
+                    // that reasoning — true for *slow*, but wrong for *stuck forever*,
+                    // and there's no way to tell those apart from the outside without
+                    // a bound. A real incident the same day: a Phase 1-2 call wedged
+                    // (spawn_blocking task never returned) and sat completely
+                    // undetected for over an hour — the old all-in-one 60s timeout
+                    // would at least have caught this, and removing it without a
+                    // replacement was a genuine regression. It surfaced only when a
+                    // manual `systemctl restart` hung the full 90s (tokio's default
+                    // runtime-shutdown blocks on in-flight spawn_blocking tasks) before
+                    // systemd SIGKILLed it — and the fresh process's own compaction,
+                    // on a clean redb handle, completed in well under a second,
+                    // confirming the original attempt wasn't legitimately slow, it was
+                    // truly wedged. 60s matches the pre-split timeout's original value,
+                    // restoring that safety margin for this now-separated part of the
+                    // operation.
                     let m = metadata.clone();
                     let prep_task = tokio::task::spawn_blocking(move || m.compact_db_prepare(std::time::Duration::from_secs(5), 64));
-                    let prep_result = prep_task.await;
+                    let prep_result = match tokio::time::timeout(std::time::Duration::from_secs(60), prep_task).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            error!(
+                                "redb compact_db Phase 1-2 exceeded 60s — the shared read lock \
+                                 path is wedged on this node. Restarting so HA replicas can \
+                                 continue serving."
+                            );
+                            std::process::exit(1);
+                        }
+                    };
 
                     let result: Result<Result<(u64, u64), anyhow::Error>, tokio::task::JoinError> = match prep_result {
                         Err(join_err) => Err(join_err),

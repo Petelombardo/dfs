@@ -4775,15 +4775,27 @@ impl Filesystem for DfsFilesystem {
                     } else {
                         true // doesn't exist, nothing to remove
                     };
-                    if safe_to_remove {
-                        self.write_buffers.remove(&ino);
-                        // Do NOT evict recent_chunk_writes here. For VM disks, QEMU opens and
-                        // closes the file every few seconds (BLKFLSBUF cycles). Evicting on every
-                        // close wipes the chunk-ID cache, forcing every subsequent patch to use the
-                        // stale metadata_cache (leader hasn't received async updates yet) and
-                        // incur a stale-base retry. The 10-second TTL in recent_chunk_writes
-                        // handles natural expiry; file_id filtering prevents cross-file pollution.
-                    }
+                    // safe_to_remove only tells us it's safe — it doesn't mean removal is
+                    // useful. The original purpose here was discarding a stale buffer left
+                    // over from a session where release() never ran (client crash/restart),
+                    // per this block's opening comment. But when safe_to_remove is true there
+                    // is, by definition, no unflushed data sitting in the buffer for THIS
+                    // open to protect against — so removing it has no protective effect. Its
+                    // only real effect is discarding flushed_sizes / canonical_write_nodes /
+                    // canonical_node_miss_streak, which is exactly the same load-bearing
+                    // bookkeeping release() now preserves for the identical reason (see its
+                    // "no unflushed data" cleanup comment). QEMU's close+reopen cycling means
+                    // this open() runs moments after a clean release() far more often than
+                    // after a crash, and blindly wiping here defeated that fix — confirmed
+                    // live via [SLOT-TRACE]: flushed_sizes still read back as 0 on the next
+                    // write_at() even after release() stopped removing the entry, because
+                    // THIS site was doing it instead. Do NOT evict recent_chunk_writes here
+                    // either. For VM disks, QEMU opens and closes the file every few seconds
+                    // (BLKFLSBUF cycles). Evicting on every close wipes the chunk-ID cache,
+                    // forcing every subsequent patch to use the stale metadata_cache (leader
+                    // hasn't received async updates yet) and incur a stale-base retry. The
+                    // 10-second TTL in recent_chunk_writes handles natural expiry; file_id
+                    // filtering prevents cross-file pollution.
                     // Clear any pending truncate flag — new write session starts clean.
                     self.truncated_inodes.remove(&ino);
                 }
@@ -7154,7 +7166,31 @@ impl Filesystem for DfsFilesystem {
                         .map(|s| s.try_lock().map(|st| st.slots.values().any(|sl| !sl.data.is_empty())).unwrap_or(true))
                         .unwrap_or(false);
                     if !has_new_writer && is_our_buffer_sync && !has_unflushed_data_sync {
-                        write_buffers.remove(&ino);
+                        // Do NOT remove write_buffers itself here. slots is already empty
+                        // (has_unflushed_data_sync=false), so removing the entry serves no
+                        // cleanup purpose — its only effect is discarding flushed_sizes /
+                        // canonical_write_nodes / canonical_node_miss_streak, which are cheap
+                        // (one HashMap entry per touched chunk) but load-bearing: they're what
+                        // lets the next write_at() know a chunk already has content on the
+                        // server. QEMU (qcow2 preallocation, mkfs.ext4, etc.) closes and
+                        // reopens VM disk images multiple times per second — same pattern
+                        // already documented below for recent_chunk_writes. Losing
+                        // flushed_sizes across one of those reopens means the next fresh
+                        // write to a chunk that already has content builds its slot with zero
+                        // knowledge of the existing size, and a later patch decision that
+                        // should target the same generation instead straddles two disconnected
+                        // ones. Root-caused 2026-07-11 via a local qemu-img convert -O qcow2
+                        // repro: confirmed live (flushed_sizes read as 0 immediately after a
+                        // release, despite the chunk holding real server-confirmed content
+                        // moments earlier) and correlated with a deterministic qcow2 "overlaps
+                        // with active L2 table" corruption that a byte-identical raw-format
+                        // conversion under the same write pattern does NOT reproduce — ruling
+                        // out data loss and pointing at exactly this kind of session-boundary
+                        // bookkeeping gap. Reused safely across reopen: same inode, same path,
+                        // same file identity — unlike create()'s stale-buffer hazard (see its
+                        // O_CREAT comment), nothing here changes across a plain close+reopen.
+                        // Genuine identity changes (truncate, unlink, delete+recreate) already
+                        // have their own explicit write_buffers.remove() call elsewhere.
                         size_high_water_for_release.remove(&ino);
                         // Do NOT evict recent_chunk_writes here — see open() is_first_writer
                         // comment. QEMU closes and reopens the disk every few seconds; evicting
@@ -7333,7 +7369,9 @@ impl Filesystem for DfsFilesystem {
                         .map(|s| s.try_lock().map(|st| st.slots.values().any(|sl| !sl.data.is_empty())).unwrap_or(true))
                         .unwrap_or(false);
                     if !has_new_writer && is_our_buffer && !has_unflushed_data {
-                        write_buffers.remove(&ino);
+                        // Do NOT remove write_buffers itself — see the sync release path's
+                        // identical guard for the full explanation (flushed_sizes/
+                        // canonical_write_nodes continuity across a same-file reopen).
                         size_high_water_for_release.remove(&ino);
                         // Do NOT evict recent_chunk_writes — see sync release path comment.
                         chunk_write_locks_for_release.remove(&ino);

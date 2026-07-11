@@ -5895,13 +5895,17 @@ impl Server {
         tokio::spawn(async move {
             const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
             const MIN_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+            // First pass runs immediately, not after the first SWEEP_INTERVAL —
+            // an existing backlog (e.g. from before this GC existed at all)
+            // should start clearing right away rather than wait up to 30
+            // minutes after every restart.
             loop {
-                tokio::time::sleep(SWEEP_INTERVAL).await;
                 match metadata.prune_stale_folded_patch_states_async(MIN_AGE).await {
                     Ok(0) => {}
                     Ok(n) => info!("patch_state GC: pruned {} stale Folded row(s)", n),
                     Err(e) => warn!("patch_state GC: sweep failed: {}", e),
                 }
+                tokio::time::sleep(SWEEP_INTERVAL).await;
             }
         });
     }
@@ -6135,6 +6139,58 @@ impl Server {
                         ctx.fold_slot_now(file_id, chunk_idx).await;
                     });
                 }
+            }
+        });
+    }
+
+    /// One-shot startup sweep: re-discover every Pending PATCH_STATE_TABLE row
+    /// directly from disk and resume folding it.
+    ///
+    /// dirty_patch_slots (what debounce_fold_slot, its retry loop, and
+    /// start_patch_fold_sweep_loop's backstop all key off of) is in-memory
+    /// only and starts empty on every process restart — a Pending row that
+    /// existed at the moment of a restart has no live task tracking it in the
+    /// new process and is otherwise orphaned indefinitely, since nothing else
+    /// re-discovers a Pending row from the persisted table alone. Confirmed
+    /// live (2026-07-11): 3 patches stuck Pending on a fully idle cluster.
+    /// Runs once at startup rather than periodically — start_patch_fold_sweep_loop
+    /// already covers the in-session case (a debounce task dying after this
+    /// process's own writes), so this only needs to catch what a restart itself
+    /// orphaned.
+    pub fn start_patch_state_resume_sweep(self: Arc<Self>) {
+        let server = self;
+        tokio::spawn(async move {
+            let pending = match server.metadata.all_pending_patch_slots_async().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("patch_state resume sweep: failed to scan for orphaned Pending rows: {}", e);
+                    return;
+                }
+            };
+            if pending.is_empty() {
+                return;
+            }
+            info!("patch_state resume sweep: found {} Pending row(s) from before this process started — resuming",
+                pending.len());
+            for (file_id, chunk_idx, token) in pending {
+                // entry().or_insert_with(), not a blind insert: real write
+                // traffic may have already started by the time this sweep
+                // runs and created its own fresh (newer) entry for this exact
+                // slot — must not clobber that with the stale on-disk token
+                // this sweep found.
+                server.dirty_patch_slots.entry((file_id, chunk_idx)).or_insert_with(|| DirtyPatchSlot {
+                    token,
+                    last_patch_at: std::time::Instant::now(),
+                    delta_hasher: blake3::Hasher::new(),
+                });
+                let ctx = server.overlay_ctx();
+                tokio::spawn(async move {
+                    if !ctx.fold_slot_now(file_id, chunk_idx).await {
+                        warn!("patch_state resume sweep: fold failed for file={} chunk={} — \
+                               left Pending, will retry via the normal backstop paths",
+                            file_id, chunk_idx);
+                    }
+                });
             }
         });
     }

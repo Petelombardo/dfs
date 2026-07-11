@@ -1513,6 +1513,60 @@ impl MetadataStore {
             .context("spawn_blocking panicked in all_pending_patch_chunk_ids_async")?
     }
 
+    /// Every (file_id, chunk_idx, public_token) whose PATCH_STATE_TABLE row is
+    /// still Pending — i.e. every slot with a fold that hasn't happened yet,
+    /// found by walking PATCH_STATE_SLOT_TABLE (the only place the slot ->
+    /// token mapping exists; PatchState::Pending itself carries no file_id/
+    /// chunk_idx) and checking each token's current state.
+    ///
+    /// For server.rs's startup resume sweep: dirty_patch_slots (the in-memory
+    /// map debounce_fold_slot and its retry loop key off of) is wiped on every
+    /// process restart, so any Pending row that existed at the moment of a
+    /// restart has zero live task tracking it afterward — orphaned
+    /// indefinitely, since nothing else re-discovers a Pending row from the
+    /// persisted table alone. Confirmed live (2026-07-11): 3 patches stuck
+    /// Pending on a fully idle cluster with no client connected.
+    pub fn all_pending_patch_slots(&self) -> Result<Vec<(FileId, u64, ChunkId)>> {
+        let _db = self.db.read().unwrap();
+        let txn = _db.begin_read()?;
+        let slot_table = match txn.open_table(PATCH_STATE_SLOT_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let state_table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut out = Vec::new();
+        for item in slot_table.range::<&str>(..)? {
+            let (slot_key, token_bytes) = item?;
+            let Some((file_id_str, chunk_idx_str)) = slot_key.value().rsplit_once(':') else { continue };
+            let Ok(file_uuid) = uuid::Uuid::parse_str(file_id_str) else { continue };
+            let Ok(chunk_idx) = chunk_idx_str.parse::<u64>() else { continue };
+            let Ok(token_str) = std::str::from_utf8(token_bytes.value()) else { continue };
+            let Some(token_hash) = decode_hex_32(token_str) else { continue };
+            let token = ChunkId::from_hash(token_hash);
+
+            if let Some(v) = state_table.get(token_str)? {
+                if let Ok(PatchState::Pending { .. }) = bincode::deserialize::<PatchState>(v.value()) {
+                    out.push((FileId::from_uuid(file_uuid), chunk_idx, token));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Async wrapper for all_pending_patch_slots — see get_chunk_location_async.
+    pub async fn all_pending_patch_slots_async(self: &Arc<Self>) -> Result<Vec<(FileId, u64, ChunkId)>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.all_pending_patch_slots())
+            .await
+            .context("spawn_blocking panicked in all_pending_patch_slots_async")?
+    }
+
     /// Every currently-outstanding public token — every PATCH_STATE_TABLE key,
     /// Pending or Folded. Used by the healing discovery pass to exclude tokens
     /// from its own "is this chunk under-replicated" classification entirely: a

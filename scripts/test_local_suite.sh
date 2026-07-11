@@ -47,6 +47,32 @@ dfs_sync() {
     mountpoint -q "$MOUNT" 2>/dev/null && sync "$MOUNT" || true
 }
 
+# kill_client_and_wait <pid>: SIGTERM a dfs-client and block until it's
+# actually gone (bounded, falls back to -9) before the caller proceeds to
+# remount. Every remount site used to do a bare `kill $PID; sleep 1` — a fixed
+# 1s guess, not a confirmation — so a client still mid-drain past that 1s
+# became an orphan: still running, no longer tracked by any $CLIENT_PID
+# variable, invisible to every later remount's own kill. Found 2026-07-11 as
+# the root cause of an intermittent T41 failure: by the time T41 runs, up to
+# 7 earlier remounts could each have leaked an orphan, and T41's own
+# `pgrep -f "dfs-client mount $MOUNT" | head -1` — the same
+# lowest-PID-wins ambiguity already fixed at the suite's final cleanup below
+# (see that fix's comment) — would grab an old orphan instead of the actually
+# -live client, then wait 30s for a process that was never going to respond
+# to what T41 thought was "the" client's mount-serving instance.
+kill_client_and_wait() {
+    local pid="$1"
+    [ -z "$pid" ] && return 0
+    kill "$pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 0.1
+        waited=$((waited+1))
+        [ "$waited" -gt 50 ] && break   # 5s cap
+    done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+}
+
 # ── cleanup ──────────────────────────────────────────────────────────────────
 pkill -f "dfs-server" 2>/dev/null || true
 pkill -f "dfs-client" 2>/dev/null || true
@@ -228,8 +254,7 @@ dfs_sync
 echo "  Unmounting..."
 fusermount -u "$MOUNT" 2>/dev/null || true
 sleep 0.5
-kill $CLIENT_PID 2>/dev/null || true
-sleep 1
+kill_client_and_wait "$CLIENT_PID"
 
 echo "  Remounting..."
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
@@ -1004,8 +1029,7 @@ T23_SIZE=$(( 3 * 4 * 1024 * 1024 ))   # 12MB — 3 full chunks
 # Remount first so the file is written fresh on the new client — this means
 # the kernel page cache has never seen it, so all reads go through FUSE.
 fusermount -u "$MOUNT" 2>/dev/null || true
-kill "$CLIENT_PID2" 2>/dev/null || true
-sleep 1
+kill_client_and_wait "$CLIENT_PID2"
 T23_CLIENT_LOG="$LOG/client_t23.log"
 : > "$T23_CLIENT_LOG"
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
@@ -1032,8 +1056,7 @@ dfs_sync
 # The remount alone is not enough: the kernel page cache persists across FUSE
 # remounts (keyed by inode on the underlying fs). drop_caches flushes it fully.
 fusermount -u "$MOUNT" 2>/dev/null || true
-kill "$CLIENT_PID2" 2>/dev/null || true
-sleep 1
+kill_client_and_wait "$CLIENT_PID2"
 : > "$T23_CLIENT_LOG"
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
     --log-file "$T23_CLIENT_LOG" --allow-other --log-level debug &
@@ -1118,8 +1141,7 @@ dfs_sync
 
 # Remount for cold cache — ensures all reads go through FUSE to DFS.
 fusermount -u "$MOUNT" 2>/dev/null || true
-kill "$CLIENT_PID2" 2>/dev/null || true
-sleep 1
+kill_client_and_wait "$CLIENT_PID2"
 T24_CLIENT_LOG="$LOG/client_t24.log"
 : > "$T24_CLIENT_LOG"
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
@@ -1960,8 +1982,7 @@ echo "  Reference md5: $T28_REF_MD5"
 echo "  Restarting dfs-client (cold cache)..."
 fusermount -u "$MOUNT" 2>/dev/null || true
 sleep 0.3
-kill $CLIENT_PID2 2>/dev/null || true
-sleep 1
+kill_client_and_wait "$CLIENT_PID2"
 T28_CLIENT_LOG="$LOG/client_t28.log"
 : > "$T28_CLIENT_LOG"
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
@@ -2046,8 +2067,7 @@ dfs_sync
 # for the gap, and resets pipeline_head/in_flight so prefetch fires from scratch.
 fusermount -u "$MOUNT" 2>/dev/null || true
 sleep 0.3
-kill $CLIENT_PID2 2>/dev/null || true
-sleep 1
+kill_client_and_wait "$CLIENT_PID2"
 T29_CLIENT_LOG="$LOG/client_t29.log"
 : > "$T29_CLIENT_LOG"
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
@@ -2135,8 +2155,7 @@ sleep 8
 # Cold remount to bypass any client-side size cache.
 fusermount -u "$MOUNT" 2>/dev/null || true
 sleep 0.3
-kill $CLIENT_PID2 2>/dev/null || true
-sleep 1
+kill_client_and_wait "$CLIENT_PID2"
 T30_CLIENT_LOG="$LOG/client_t30.log"
 RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
     --log-file "$T30_CLIENT_LOG" --allow-other --log-level debug &
@@ -2929,10 +2948,19 @@ echo "=== T41: SIGTERM mid-write must drain buffers (no clean unmount) ==="
 T41_FILE="$MOUNT/t41_sigterm.bin"
 dd if=/dev/urandom of="$T/t41_ref.bin" bs=1M count=1 2>/dev/null
 
-# Find whichever dfs-client is currently serving the mount — don't assume
-# CLIENT_PID vs CLIENT_PID2, since this test may run alone (T41 only) before
-# any remount test has set CLIENT_PID2.
-T41_CLIENT_PID=$(pgrep -f "dfs-client mount $MOUNT" | head -1)
+# Find whichever dfs-client is currently serving the mount. Prefer the
+# tracked $CLIENT_PID2/$CLIENT_PID bash variable over pgrep when available —
+# pgrep | head -1 picks whichever matching PID happens to sort first, which
+# is wrong (an old orphan, not the live one) if more than one dfs-client
+# process matching this mount is still around. That used to be a real risk:
+# every earlier remount's kill was fire-and-forget with a fixed sleep, not a
+# wait for actual exit (see kill_client_and_wait's doc comment for the T41
+# flake this caused) — fixed now, but keep the tracked-PID preference as
+# defense in depth rather than relying solely on no future remount
+# reintroducing an orphan. Fall back to pgrep only when this test runs alone
+# (T41 only) before any remount test has set either variable.
+T41_CLIENT_PID="${CLIENT_PID2:-$CLIENT_PID}"
+[ -z "$T41_CLIENT_PID" ] && T41_CLIENT_PID=$(pgrep -f "dfs-client mount $MOUNT" | head -1)
 
 # Open, write, and hold the fd open in the background — release()'s flush
 # must not run, since we want the data to still be sitting unflushed when we

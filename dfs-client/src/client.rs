@@ -2230,7 +2230,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 addr, cid, offset_in_chunk as u64, len_in_chunk as u64, ws,
                             ).await {
                                 Ok(data) => {
-                                    info!("Range fetch: chunk {} off={} len={} → {} bytes",
+                                    // Per-range-read trace — fires on every single successful
+                                    // fetch (tens of thousands under a random-read workload like
+                                    // kdiskmark), dominating the log by volume with no decision
+                                    // or state-transition content. debug! only.
+                                    debug!("Range fetch: chunk {} off={} len={} → {} bytes",
                                           cid, offset_in_chunk, len_in_chunk, data.len());
                                     client.node_inflight_dec(primary);
                                     return Ok((idx, chunk_start, offset_in_chunk, data));
@@ -6572,12 +6576,18 @@ leader_addr: Arc::new(RwLock::new(None)),
             match leader_addr {
                 Some(leader) => {
                     let count = batch.len();
-                    if let Err(e) = self.send_chunk_locations_batched(leader, batch).await {
-                        warn!("flush_metadata_sync: draining {} pending chunk locations failed: {}", count, e);
+                    if let Err(e) = self.send_chunk_locations_batched(leader, batch.clone()).await {
+                        warn!("flush_metadata_sync: draining {} pending chunk locations failed: {} — re-queuing for the background worker", count, e);
+                        // Re-queue rather than drop — see start_chunk_location_batch_worker's
+                        // identical fix for the full rationale (a chunk's data write already
+                        // completed by the time it lands here; dropping the location
+                        // registration orphans real, already-durable bytes).
+                        self.pending_chunk_locations.lock().await.extend(batch);
                     }
                 }
                 None => {
-                    warn!("flush_metadata_sync: dropped {} pending chunk locations — no known leader", batch.len());
+                    warn!("flush_metadata_sync: no known leader — re-queuing {} pending chunk locations for the background worker", batch.len());
+                    self.pending_chunk_locations.lock().await.extend(batch);
                 }
             }
         }
@@ -6599,7 +6609,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let mut interval = tokio::time::interval(Duration::from_millis(10));
             loop {
                 interval.tick().await;
-                let batch = {
+                let mut batch = {
                     let mut pending = client.pending_chunk_locations.lock().await;
                     if pending.is_empty() {
                         continue;
@@ -6612,12 +6622,31 @@ leader_addr: Arc::new(RwLock::new(None)),
                 match leader_addr {
                     Some(leader) => {
                         let count = batch.len();
-                        if let Err(e) = client.send_chunk_locations_batched(leader, batch).await {
-                            warn!("chunk_location_batch_worker: batched send of {} locations to leader {} failed: {}", count, leader, e);
+                        if let Err(e) = client.send_chunk_locations_batched(leader, batch.clone()).await {
+                            warn!("chunk_location_batch_worker: batched send of {} locations to leader {} failed: {} — re-queuing for next tick", count, leader, e);
+                            // Re-queue rather than drop: a chunk's data write already
+                            // completed by the time it lands here (this batch only ever
+                            // carries post-write location registrations) — dropping this
+                            // silently orphans real, already-durable bytes with nothing
+                            // in metadata ever pointing to them again. Spliced ahead of
+                            // (not appended after) whatever accumulated during this send,
+                            // O(n) via a single swap rather than O(n^2) per-element
+                            // inserts, so this generation drains before newer ones pile
+                            // up behind it. Mirrors metadata_queue's retry-until-delivered
+                            // posture (see start_metadata_queue_worker) instead of this
+                            // worker's previous silent-drop-on-failure, confirmed as a
+                            // real cause of unreachable chunks in a 2026-07-10 incident
+                            // (a ~10s leader restart during active writes).
+                            let mut pending = client.pending_chunk_locations.lock().await;
+                            batch.extend(std::mem::take(&mut *pending));
+                            *pending = batch;
                         }
                     }
                     None => {
-                        warn!("chunk_location_batch_worker: dropped {} locations — no known leader", batch.len());
+                        warn!("chunk_location_batch_worker: no known leader — re-queuing {} locations for next tick", batch.len());
+                        let mut pending = client.pending_chunk_locations.lock().await;
+                        batch.extend(std::mem::take(&mut *pending));
+                        *pending = batch;
                     }
                 }
             }

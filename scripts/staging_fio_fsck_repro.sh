@@ -28,13 +28,25 @@
 # with zero nodes that actually have its bytes. T51 in test_local_suite.sh
 # is the local regression test for the specific leader-outage variant.
 #
-# OPEN ISSUE: after all 6 fixes were deployed, this repro started failing
-# consistently with a NEW, different signature: `fio: ENOSPC ... No space
-# left on device` during file layout (errno 28), runs ending after only
-# ~10-20s instead of the full 180s. This is NOT the old "no registered
-# location"/EIO signature from earlier in the session.
-#
-# Ruled out already (don't re-check these without new evidence):
+# RESOLVED: the `fio: ENOSPC ... No space left on device` signature chased
+# through the rest of that session was a bug in THIS SCRIPT, not DFS. The
+# fio invocation used `--directory=$LOOPMNT` with `--numjobs=4` and no
+# shared `--filename` — fio gives each job its own file in that mode, so it
+# was really asking for 4 x 6000MiB = 24000MiB inside an 8192MiB
+# filesystem. Confirmed live: the fsck output named 4 distinct per-job
+# inodes (stress.0.0..stress.3.0), 3 jobs hit ENOSPC immediately during
+# layout, the 4th got partway in before an EIO on fsync (ext4's normal way
+# of surfacing an earlier failed writeback once space ran out) — arithmetic
+# guarantees this regardless of DFS's behavior. The accompanying "FSCK FOUND
+# ERRORS" was also a red herring: `e2fsck -fn` skips journal replay, so the
+# abnormal-exit journal from that failed run looked like corruption; a
+# plain rw mount + clean umount (replays the journal) followed by `e2fsck
+# -fn` came back exit 0, fully clean. Fixed by switching to a single shared
+# `--filename` across all jobs (matches real kdiskmark/qcow2 semantics: one
+# target file, concurrent queue depth against it — not N independent
+# files), which also makes the earlier "ruled out" list below moot for this
+# signature (kept for history / in case a genuinely new ENOSPC signature
+# ever reappears):
 #   - Physical disk space: all 5 gluster nodes 18-23% used, 670-716GB free.
 #   - Physical inodes: 1% used on all 5 nodes (`df -i /mnt/gluster`).
 #   - Per-node DFS capacity tracking: `dfs-admin cluster status` reports
@@ -55,24 +67,11 @@
 #     1bd8bbb) since its own rationale is independently real and verified.
 #   - grep confirms dfs-client's own source never returns ENOSPC anywhere
 #     (only EIO/EAGAIN) — so this isn't DFS explicitly rejecting the write.
-#
-# Leading unconfirmed theory: the kernel's loop-device/page-cache layer may
-# be synthesizing ENOSPC as a downstream symptom when the pre-existing
-# WRITE_ZEROES-unsupported fallback path collides with some remaining
-# intermittent chunk-write failure (of the same general class already fixed
-# elsewhere this session), rather than propagating the original error
-# faithfully. NOT verified. Next step: before concluding anything new, grep
-# /var/log/dfs-client.log for the FIRST warning/error immediately preceding
-# an ENOSPC-signature failure (not just search for "ENOSPC" itself, which
-# won't be there) — find what DFS-level condition, if any, actually
-# preceded it in time.
-#
-# Also worth checking fresh: has staging's total accumulated chunk count
-# (`dfs-admin storage stats` if available, or count files under
-# /mnt/gluster/dfs/data/chunks on each node) grown further since last
-# night — staging has been used continuously for many hours of heavy
-# testing with no cleanup pass, and a phantom-reconciliation pass logging
-# "verifying presence for 80337 chunks" was the trigger for fix #6.
+#     This also structurally rules out server-side write rejections (fold
+#     in progress, redb compaction, connection-limit ServerBusy) ever
+#     surfacing as ENOSPC: ServerBusy is retried with backoff, and if
+#     exhausted, every write/patch error site in fuse_impl.rs maps to EIO,
+#     never ENOSPC.
 set -u
 
 MOUNT=/mnt/dfs
@@ -106,7 +105,7 @@ sync "$MOUNT"
 echo "=== Loop-mounting and running fio (kdiskmark-style) ==="
 LOOPDEV=$(losetup -f --show "$IMG")
 mount "$LOOPDEV" "$LOOPMNT"
-fio --name=stress --directory="$LOOPMNT" --size=6000M --rw=randrw --bs=4k \
+fio --name=stress --filename="$LOOPMNT/testfile" --size=6000M --rw=randrw --bs=4k \
     --iodepth=32 --numjobs=4 --runtime=180 --time_based --direct=0 --group_reporting \
     --fsync=32 > "$LOG/fio.log" 2>&1
 echo "fio done — see $LOG/fio.log"

@@ -72,7 +72,7 @@ sync "$MOUNT"
 echo "=== Loop-mounting and running fio (kdiskmark-style, ~90s) ==="
 LOOPDEV=$(losetup -f --show "$IMG")
 mount "$LOOPDEV" "$LOOPMNT"
-fio --name=stress --directory="$LOOPMNT" --size=280M --rw=randrw --bs=4k \
+fio --name=stress --filename="$LOOPMNT/testfile" --size=280M --rw=randrw --bs=4k \
     --iodepth=32 --numjobs=4 --runtime=90 --time_based --direct=0 --group_reporting \
     --fsync=32 > "$LOG/fio.log" 2>&1
 echo "fio done — see $LOG/fio.log"

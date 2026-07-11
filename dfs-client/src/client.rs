@@ -5244,10 +5244,33 @@ leader_addr: Arc::new(RwLock::new(None)),
         // the correct chunk_id) — see metadata::live_file_ids and
         // handle_replicate_chunk_locations's orphan-gate/parity fix for why a per-item
         // embedded file_id is required here, not optional.
+        // Try immediate delivery first (lower latency than waiting for the
+        // background worker's 10ms tick on the common, leader-reachable path),
+        // but re-queue on failure instead of dropping — see
+        // start_chunk_location_batch_worker's and flush_metadata_sync's
+        // identical fix for the full rationale (the chunk's data write already
+        // completed by the time it lands here; dropping the location
+        // registration orphans real, already-durable bytes with nothing in
+        // metadata ever pointing to them again). This was the one remaining
+        // unprotected call site: MultiPatch's own registration already goes
+        // through enqueue_chunk_location (the queue), but this fresh-write path
+        // delivered inline with no re-queue fallback at all — including
+        // silently dropping with no warning whatsoever when leader_addr was
+        // simply unknown at call time. Real 2026-07-10/11 incident (staging
+        // fio+fsck repro): a fresh chunk write's location never reached the
+        // leader during a ~16s leader outage, leaving the leader with zero
+        // record of a chunk that later patches kept chaining on top of.
         let leader_addr = *self.leader_addr.read().await;
-        if let Some(leader) = leader_addr {
-            if let Err(e) = self.send_chunk_locations_batched(leader, chunk_locations.clone()).await {
-                warn!("WriteChunk: batched ChunkLocations to leader {} failed: {}", leader, e);
+        match leader_addr {
+            Some(leader) => {
+                if let Err(e) = self.send_chunk_locations_batched(leader, chunk_locations.clone()).await {
+                    warn!("WriteChunk: batched ChunkLocations to leader {} failed: {} — re-queuing for the background worker", leader, e);
+                    self.pending_chunk_locations.lock().await.extend(chunk_locations.clone());
+                }
+            }
+            None => {
+                warn!("WriteChunk: no known leader — re-queuing {} chunk location(s) for the background worker", chunk_locations.len());
+                self.pending_chunk_locations.lock().await.extend(chunk_locations.clone());
             }
         }
 

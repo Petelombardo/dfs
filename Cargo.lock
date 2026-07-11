@@ -418,6 +418,7 @@ dependencies = [
  "libc",
  "lru",
  "nix",
+ "parking_lot",
  "redb",
  "rusqlite",
  "serde",

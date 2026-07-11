@@ -5950,7 +5950,25 @@ leader_addr: Arc::new(RwLock::new(None)),
         // ChunkStale retry within the loop is the same logical operation resent with
         // a corrected base, not a new one, so it must target the same sequence value.
         let new_chunk_seq = chunk_idx.map(|cidx| self.next_chunk_seq(file_id, cidx));
-        'retry: for attempt in 0u8..2 {
+        // How long to keep retrying when every replica failed via a pure connection
+        // failure (not a data error, not a ChunkStale response) — see the retry site
+        // below for the incident this closes. A compaction-triggered self-restart
+        // (redb exclusive-lock wedge -> process exit -> systemd restart) resolves in
+        // ~8-15s; 20s gives real margin without hanging a write indefinitely on a
+        // genuinely dead node (permanent failures still surface, just after riding out
+        // a transient one first).
+        const CONNECT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+        const CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(750);
+        // Original behavior preserved: a stale-base response got one immediate retry
+        // (attempt 0 -> 1) before falling through to "all replicas failed" — matches
+        // the original `0u8..2` loop bound's effective stale-retry allowance.
+        const MAX_STALE_RETRY_ATTEMPTS: u8 = 1;
+        let mut stale_retry_attempts: u8 = 0;
+        let retry_started = std::time::Instant::now();
+        // Attempt count is now just a hard safety backstop against a genuine infinite
+        // loop bug — the real gate on connection-failure retries is CONNECT_RETRY_BUDGET
+        // (wall-clock), and each such retry consumes one attempt here.
+        'retry: for _attempt in 0u32..1000 {
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
@@ -6150,8 +6168,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                     warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",
                         addr, old_chunk_id, current_chunk_id);
                     stale_ahead.push((addr, current_chunk_id));
-                    if attempt == 0 {
+                    if stale_retry.is_none() {
                         // Save corrected location; retry only if no replica succeeded.
+                        // Was gated on `attempt == 0`, but connection-failure retries
+                        // (see CONNECT_RETRY_BUDGET below) can now consume several
+                        // attempts before a stale response ever arrives — gate on
+                        // "haven't captured one yet" instead so a stale response is
+                        // captured whichever attempt it shows up on.
                         stale_retry = Some((current_chunk_id, dfs_common::ChunkLocation {
                             chunk_id: current_chunk_id,
                             nodes: current_nodes,
@@ -6191,14 +6214,23 @@ leader_addr: Arc::new(RwLock::new(None)),
         let has_any_success = replica_results.iter().any(|(_, r)| r.is_ok());
         if !has_any_success {
             if let Some((fresh_id, fresh_loc)) = stale_retry {
-                // Use current_nodes from the stale response — the server told us exactly
-                // which nodes hold the correct base hash. Broadcasting to all cluster
-                // nodes wastes bandwidth and throws away that knowledge. The deterministic
-                // sort+dual-RF selection runs again on this updated node list, so we
-                // still hit the same predictable 2 nodes.
-                old_chunk_id = fresh_id;
-                current_location = fresh_loc;
-                continue 'retry;
+                // Bounded independently of CONNECT_RETRY_BUDGET's much larger attempt
+                // cap (1000, gated by wall-clock instead of count) — a stale response
+                // recurring indefinitely would indicate a genuinely broken invariant
+                // elsewhere, not something worth hammering on with no backoff.
+                stale_retry_attempts += 1;
+                if stale_retry_attempts <= MAX_STALE_RETRY_ATTEMPTS {
+                    // Use current_nodes from the stale response — the server told us exactly
+                    // which nodes hold the correct base hash. Broadcasting to all cluster
+                    // nodes wastes bandwidth and throws away that knowledge. The deterministic
+                    // sort+dual-RF selection runs again on this updated node list, so we
+                    // still hit the same predictable 2 nodes.
+                    old_chunk_id = fresh_id;
+                    current_location = fresh_loc;
+                    continue 'retry;
+                }
+                warn!("MultiPatch: chunk {} still stale after {} retries — giving up",
+                    old_chunk_id, stale_retry_attempts);
             }
         }
 
@@ -6218,7 +6250,36 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let (authoritative_chunk_id, authoritative_size, authoritative_patch_ts) = match authoritative {
             Some(x) => x,
-            None => anyhow::bail!("MultiPatch: all replicas failed for chunk {}", old_chunk_id),
+            None => {
+                // All replicas failed. If every single failure was a connection failure
+                // (not a data/protocol error, not a ChunkStale response — those are
+                // handled separately above) this looks like a transient node outage —
+                // e.g. a compaction-triggered self-restart — rather than a permanent
+                // problem. Retry with a bounded backoff instead of failing the write
+                // outright. Root-caused 2026-07-11: a VM install hit guest-visible EIO
+                // during exactly an ~8s gluster4 self-restart window (redb exclusive-
+                // lock wedge -> process exit -> systemd restart) because this bailed on
+                // the very first attempt — has_any_success=false and stale_retry=None
+                // for a pure connection failure meant the existing attempt<2 stale-retry
+                // loop never even got a second try. A single dead-but-unreplaced node
+                // (not just a brief restart) still surfaces the same error, just after
+                // CONNECT_RETRY_BUDGET instead of instantly.
+                let all_connection_failures = !replica_results.is_empty()
+                    && replica_results.iter().all(|(_, r)| {
+                        r.as_ref().err()
+                            .map(|e| e.to_string().contains("Failed to connect"))
+                            .unwrap_or(false)
+                    });
+                if all_connection_failures && retry_started.elapsed() < CONNECT_RETRY_BUDGET {
+                    warn!("MultiPatch: all {} replica(s) unreachable for chunk {} (connection \
+                           failure, elapsed {:?}/{:?}) — retrying in {:?}",
+                        replica_results.len(), old_chunk_id, retry_started.elapsed(),
+                        CONNECT_RETRY_BUDGET, CONNECT_RETRY_BACKOFF);
+                    tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                    continue 'retry;
+                }
+                anyhow::bail!("MultiPatch: all replicas failed for chunk {}", old_chunk_id)
+            }
         };
 
         // Record only replicas that successfully applied the patch with the authoritative

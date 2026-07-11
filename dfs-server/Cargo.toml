@@ -25,6 +25,17 @@ nix = { version = "0.29", features = ["fs"] }
 libc = { workspace = true }
 dashmap = "6.1"
 lru = "0.12"
+# Fair (queue-ordered) RwLock for MetadataStore.db — std::sync::RwLock wraps
+# pthread_rwlock on Linux, which under sustained heavy reader load can starve
+# a waiting writer indefinitely (new readers keep cutting ahead of the queued
+# writer). compact_db's Phase 3 needs the exclusive write lock exactly once
+# per compaction cycle while every other metadata op takes it as a reader —
+# under a heavy sustained write burst (e.g. a VM OS install) that's exactly
+# the reader-storm-starves-writer shape. parking_lot's RwLock is fair by
+# default: once a writer is queued, new readers block behind it instead of
+# jumping the line. Root-caused 2026-07-11 (a 60s-undetected compaction wedge
+# during a VM install caused a guest-visible I/O error).
+parking_lot = "0.12"
 uuid = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tikv-jemallocator = { workspace = true }

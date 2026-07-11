@@ -7,7 +7,13 @@ use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefi
 // only lost on kernel panic/power failure. Acceptable with 5-way replication.
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+// Fair (queue-ordered) RwLock for MetadataStore.db specifically — see its field doc
+// comment for why std::sync::RwLock's pthread_rwlock-backed writer-starvation risk
+// under sustained heavy reader load matters here. Not used for Mutex above — those
+// guard small, short-held, single-owner-at-a-time state where starvation isn't a
+// concern the way a reader-vs-writer race on the whole database handle is.
+use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -177,6 +183,16 @@ pub enum PatchState {
     Folded(ChunkId),
 }
 
+/// A fully-converged shadow database, ready for compact_db_finish's exclusive-locked
+/// atomic swap. Produced by compact_db_prepare (Phases 1-2, shared-lock only) and
+/// consumed by compact_db_finish (Phase 3, exclusive lock) — see their doc comments
+/// for why they're split into separate calls.
+pub(crate) struct CompactionPrep {
+    shadow_db: Database,
+    shadow_path: PathBuf,
+    size_before: u64,
+}
+
 /// Metadata storage using redb embedded database.
 /// Replaces sled to eliminate the u8 fragment-count panic under heavy write loads.
 pub struct MetadataStore {
@@ -333,7 +349,7 @@ impl MetadataStore {
     pub fn repair_path_index(&self) -> Result<()> {
         // Pass 1: find file records whose path index entry is missing.
         let to_repair: Vec<(String, Vec<u8>)> = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             let path_table = txn.open_table(PATH_TABLE)?;
@@ -353,7 +369,7 @@ impl MetadataStore {
 
         let repaired = to_repair.len();
         if !to_repair.is_empty() {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let mut txn = _db.begin_write()?;
             txn.set_durability(self.next_write_durability());
             {
@@ -368,7 +384,7 @@ impl MetadataStore {
 
         // Pass 2: find path index entries whose file record no longer exists.
         let stale_paths: Vec<String> = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             let path_table = txn.open_table(PATH_TABLE)?;
@@ -387,7 +403,7 @@ impl MetadataStore {
 
         let stale_count = stale_paths.len();
         if !stale_paths.is_empty() {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let mut txn = _db.begin_write()?;
             txn.set_durability(self.next_write_durability());
             {
@@ -695,7 +711,7 @@ impl MetadataStore {
     pub fn put_file(&self, metadata: &FileMetadata) -> Result<PutFileResult> {
         // TEMP PROFILING (2026-07-07): see put_file_in_txn's matching comment.
         let t_put_start = std::time::Instant::now();
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let t_lock_acquired = t_put_start.elapsed();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
@@ -756,7 +772,7 @@ impl MetadataStore {
             return Ok(Vec::new());
         }
 
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
 
@@ -791,7 +807,7 @@ impl MetadataStore {
     /// Cheap existence check — avoids deserializing the full FileMetadata.
     pub fn file_exists_by_id(&self, file_id: FileId) -> Result<bool> {
         let key = format!("{}", file_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         Ok(table.get(key.as_str())?.is_some())
@@ -799,7 +815,7 @@ impl MetadataStore {
 
     pub fn get_file(&self, file_id: &FileId) -> Result<Option<FileMetadata>> {
         let key = format!("{}", file_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         match table.get(key.as_str())? {
@@ -816,7 +832,7 @@ impl MetadataStore {
     #[cfg(test)]
     pub(crate) fn put_raw_file_bytes(&self, file_id: &FileId, bytes: &[u8]) -> Result<()> {
         let key = format!("{}", file_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_write()?;
         {
             let mut file_table = txn.open_table(FILE_TABLE)?;
@@ -837,7 +853,7 @@ impl MetadataStore {
 
     /// Get file metadata by path.
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(PATH_TABLE)?;
         match table.get(path)? {
@@ -860,7 +876,7 @@ impl MetadataStore {
     pub fn delete_file(&self, file_id: &FileId) -> Result<()> {
         let file_id_str = format!("{}", file_id);
         let mut removed_path: Option<String> = None;
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -890,7 +906,7 @@ impl MetadataStore {
 
     /// Delete only the path index entry for a specific path (used during rename).
     pub fn delete_path_index(&self, path: &str) -> Result<()> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -946,7 +962,7 @@ impl MetadataStore {
     where
         F: FnMut(FileMetadata) -> Result<()>,
     {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         for item in table.range::<&str>(..)? {
@@ -967,7 +983,7 @@ impl MetadataStore {
     ) -> Result<usize> {
         // Collect stale file entries.
         let (stale_file_ids, stale_file_paths): (Vec<String>, Vec<String>) = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let table = txn.open_table(FILE_TABLE)?;
             let mut ids = Vec::new();
@@ -988,7 +1004,7 @@ impl MetadataStore {
 
         let mut removed = 0usize;
         if !stale_file_ids.is_empty() {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let mut txn = _db.begin_write()?;
             txn.set_durability(self.next_write_durability());
             {
@@ -1017,7 +1033,7 @@ impl MetadataStore {
         // Also sweep path entries independently — a path entry can exist without
         // a file entry if the file entry was removed out-of-order.
         let stale_path_keys: Vec<String> = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let table = txn.open_table(PATH_TABLE)?;
             let mut stale = Vec::new();
@@ -1033,7 +1049,7 @@ impl MetadataStore {
         };
 
         if !stale_path_keys.is_empty() {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let mut txn = _db.begin_write()?;
             txn.set_durability(self.next_write_durability());
             {
@@ -1069,7 +1085,7 @@ impl MetadataStore {
         // Upper bound = increment last char of dir_path ("/" → "0").
         let end = prefix_next(&dir_path);
 
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(PATH_TABLE)?;
         let mut files = Vec::new();
@@ -1097,7 +1113,7 @@ impl MetadataStore {
         let key = format!("{}", location.chunk_id);
         let value = bincode::serialize(location)
             .context("Failed to serialize chunk location")?;
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1121,7 +1137,7 @@ impl MetadataStore {
         if locations.is_empty() {
             return Ok(());
         }
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1141,7 +1157,7 @@ impl MetadataStore {
     /// Get chunk location information.
     pub fn get_chunk_location(&self, chunk_id: &ChunkId) -> Result<Option<ChunkLocation>> {
         let key = format!("{}", chunk_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(CHUNK_TABLE)?;
         match table.get(key.as_str())? {
@@ -1167,7 +1183,7 @@ impl MetadataStore {
     /// Delete chunk location.
     pub fn delete_chunk_location(&self, chunk_id: &ChunkId) -> Result<()> {
         let key = format!("{}", chunk_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1219,7 +1235,7 @@ impl MetadataStore {
     /// once per chunk_id, when it becomes the new value produced by a patch.
     pub fn incr_chunk_refcount(&self, chunk_id: &ChunkId) -> Result<u64> {
         let key = format!("{}", chunk_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         let new_count;
@@ -1242,7 +1258,7 @@ impl MetadataStore {
     ///   delete the chunk in this case; leave it for the deep sweep.
     pub fn decr_chunk_refcount(&self, chunk_id: &ChunkId) -> Result<Option<u64>> {
         let key = format!("{}", chunk_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         let result;
@@ -1275,7 +1291,7 @@ impl MetadataStore {
     /// simply never patched).
     pub fn get_chunk_seq(&self, file_id: FileId, chunk_idx: u64) -> Result<Option<u64>> {
         let key = format!("{}:{}", file_id, chunk_idx);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         // Lazily created (like CHUNK_REFCOUNT_TABLE) — a store that has never
         // recorded a chunk_seq yet errors on the read-side open_table.
@@ -1301,7 +1317,7 @@ impl MetadataStore {
     /// load-bearing in apply_patch/handle_multi_patch.
     pub fn put_chunk_seq(&self, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<()> {
         let key = format!("{}:{}", file_id, chunk_idx);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1338,7 +1354,7 @@ impl MetadataStore {
         let state = PatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq };
         let value = bincode::serialize(&state).context("Failed to serialize patch state")?;
 
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
 
@@ -1386,7 +1402,7 @@ impl MetadataStore {
         let token_key = format!("{}", public_token);
         let value = bincode::serialize(&PatchState::Folded(new_chunk_id))
             .context("Failed to serialize patch state")?;
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1408,7 +1424,7 @@ impl MetadataStore {
     pub fn delete_patch_state_abandoned(&self, public_token: &ChunkId, file_id: FileId, chunk_idx: u64) -> Result<()> {
         let token_key = format!("{}", public_token);
         let slot_key = format!("{}:{}", file_id, chunk_idx);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1449,7 +1465,7 @@ impl MetadataStore {
     /// as ordinary, directly-readable chunk content.
     pub fn get_patch_state(&self, public_token: &ChunkId) -> Result<Option<PatchState>> {
         let key = format!("{}", public_token);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         // Not pre-created at startup (lazy, like CHUNK_REFCOUNT_TABLE) — a store
         // that has never had a patch yet errors on the read-side open_table
@@ -1485,7 +1501,7 @@ impl MetadataStore {
     /// registered ChunkLocation from the fold itself, so it's already protected by
     /// the ordinary liveness rules with no special-casing needed.
     pub fn all_pending_patch_chunk_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = match txn.open_table(PATCH_STATE_TABLE) {
             Ok(t) => t,
@@ -1527,7 +1543,7 @@ impl MetadataStore {
     /// persisted table alone. Confirmed live (2026-07-11): 3 patches stuck
     /// Pending on a fully idle cluster with no client connected.
     pub fn all_pending_patch_slots(&self) -> Result<Vec<(FileId, u64, ChunkId)>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let slot_table = match txn.open_table(PATCH_STATE_SLOT_TABLE) {
             Ok(t) => t,
@@ -1577,7 +1593,7 @@ impl MetadataStore {
     /// (file, chunk_idx) slots ever patched), so a full scan here — once per
     /// discovery pass, not per chunk — is cheap.
     pub fn all_patch_token_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = match txn.open_table(PATCH_STATE_TABLE) {
             Ok(t) => t,
@@ -1625,7 +1641,7 @@ impl MetadataStore {
     pub fn prune_stale_folded_patch_states(&self, min_age: std::time::Duration) -> Result<usize> {
         let now = std::time::SystemTime::now();
         let candidates: Vec<(String, ChunkId)> = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let table = match txn.open_table(PATCH_STATE_TABLE) {
                 Ok(t) => t,
@@ -1677,7 +1693,7 @@ impl MetadataStore {
             return Ok(0);
         }
 
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1701,7 +1717,7 @@ impl MetadataStore {
     /// Total PATCH_STATE_TABLE row count still in the Pending state (not yet
     /// folded) — used for Response::HealingStatus's outstanding-patches gauge.
     pub fn count_pending_patch_entries(&self) -> Result<usize> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = match txn.open_table(PATCH_STATE_TABLE) {
             Ok(t) => t,
@@ -1737,7 +1753,7 @@ impl MetadataStore {
     /// write this once per detection (on first insert into the in-memory map).
     pub fn put_pending_healing(&self, chunk_id: &ChunkId, detected_at_secs: u64) -> Result<()> {
         let key = format!("{}", chunk_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1752,7 +1768,7 @@ impl MetadataStore {
     /// was purged).
     pub fn delete_pending_healing(&self, chunk_id: &ChunkId) -> Result<()> {
         let key = format!("{}", chunk_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1786,7 +1802,7 @@ impl MetadataStore {
     /// healing_delay_secs debounce reflects time elapsed before this process
     /// started, not just since this process started.
     pub fn get_pending_healing_inventory(&self) -> Result<Vec<(ChunkId, u64)>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(PENDING_HEALING_TABLE)?;
         let mut out = Vec::new();
@@ -1810,7 +1826,7 @@ impl MetadataStore {
         if puts.is_empty() && deletes.is_empty() {
             return Ok(());
         }
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -1832,7 +1848,7 @@ impl MetadataStore {
 
     /// List all chunk IDs known in metadata.
     pub fn list_all_chunk_ids(&self) -> Result<Vec<ChunkId>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(CHUNK_TABLE)?;
         let mut ids = Vec::new();
@@ -1847,7 +1863,7 @@ impl MetadataStore {
 
     /// Return all chunk location records in one scan.
     pub fn list_all_chunk_locations(&self) -> Result<Vec<ChunkLocation>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(CHUNK_TABLE)?;
         let mut locations = Vec::new();
@@ -1865,7 +1881,7 @@ impl MetadataStore {
     where
         F: FnMut(ChunkLocation) -> bool,
     {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(CHUNK_TABLE)?;
         for item in table.range::<&str>(..)? {
@@ -1881,7 +1897,7 @@ impl MetadataStore {
 
     /// Build the set of chunk IDs referenced by any live file in metadata.
     pub fn live_chunk_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         let mut live = std::collections::HashSet::new();
@@ -1900,7 +1916,7 @@ impl MetadataStore {
     pub fn rebuild_chunk_locations_from_files(&self) -> Result<(usize, usize)> {
         // Collect missing chunk records (read phase).
         let to_write: Vec<(String, Vec<u8>)> = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             let chunk_table = txn.open_table(CHUNK_TABLE)?;
@@ -1925,7 +1941,7 @@ impl MetadataStore {
 
         let written = to_write.len();
         if !to_write.is_empty() {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let mut txn = _db.begin_write()?;
             txn.set_durability(self.next_write_durability());
             {
@@ -1940,7 +1956,7 @@ impl MetadataStore {
 
         // Count already-present entries (skipped).
         let skipped = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let table = txn.open_table(CHUNK_TABLE)?;
             let total: usize = table.range::<&str>(..)?.count();
@@ -1962,7 +1978,7 @@ impl MetadataStore {
 
     /// Increment and return the next metadata sequence number (leader-only).
     pub fn next_meta_sequence(&self) -> Result<u64> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_write()?;
         let next = {
             let mut table = txn.open_table(COUNTERS_TABLE)?;
@@ -1991,7 +2007,7 @@ impl MetadataStore {
 
     /// Read current metadata sequence number.
     pub fn current_meta_sequence(&self) -> Result<u64> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(COUNTERS_TABLE)?;
         Ok(table.get("meta_seq")?.map(|v| v.value()).unwrap_or(0))
@@ -2006,7 +2022,7 @@ impl MetadataStore {
         let bytes = node_id.as_bytes();
         let hi = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let lo = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         {
             let mut table = txn.open_table(COUNTERS_TABLE)?;
@@ -2021,7 +2037,7 @@ impl MetadataStore {
     /// Read back the last-persisted leader NodeId and its leadership-episode
     /// start time (unix seconds), if any has ever been recorded.
     pub fn get_leader_state(&self) -> Result<(Option<NodeId>, Option<u64>)> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(COUNTERS_TABLE)?;
         let hi = table.get("leader_state_hi")?.map(|v| v.value());
@@ -2055,7 +2071,7 @@ impl MetadataStore {
         let file_id_hex = metadata.id.0.as_simple().to_string();
         let idx_key = format!("{}:{}", node_hex, file_id_hex);
 
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_write()?;
         {
             let mut queue_table = txn.open_table(META_QUEUE_TABLE)?;
@@ -2104,7 +2120,7 @@ impl MetadataStore {
         let prefix = format!("{}:", node_hex);
         let prefix_end = prefix_next(&prefix);
 
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(META_QUEUE_TABLE)?;
         let mut items = Vec::new();
@@ -2130,7 +2146,7 @@ impl MetadataStore {
 
         // Collect keys to remove (read phase — no mutation during iteration).
         let to_remove: Vec<(String, Option<String>)> = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let table = txn.open_table(META_QUEUE_TABLE)?;
             let mut items = Vec::new();
@@ -2152,7 +2168,7 @@ impl MetadataStore {
             return Ok(());
         }
 
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -2191,7 +2207,7 @@ impl MetadataStore {
 
         // Read all entries first.
         let entries: Vec<(String, u64, FileId)> = {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let txn = _db.begin_read()?;
             let table = txn.open_table(META_QUEUE_TABLE)?;
             let mut result = Vec::new();
@@ -2222,7 +2238,7 @@ impl MetadataStore {
         }
 
         if !to_remove.is_empty() {
-            let _db = self.db.read().unwrap();
+            let _db = self.db.read();
             let mut txn = _db.begin_write()?;
             txn.set_durability(self.next_write_durability());
             {
@@ -2238,7 +2254,7 @@ impl MetadataStore {
 
     /// Record the last sequence number received from the leader (follower-only).
     pub fn set_follower_sequence(&self, seq: u64) -> Result<()> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -2260,7 +2276,7 @@ impl MetadataStore {
 
     /// Get the last sequence number received from the leader (follower-only).
     pub fn get_follower_sequence(&self) -> Result<u64> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(COUNTERS_TABLE)?;
         Ok(table.get("follower_seq")?.map(|v| v.value()).unwrap_or(0))
@@ -2270,7 +2286,7 @@ impl MetadataStore {
     /// write_seq (not modified_at) so catchup/healing comparisons are clock-agnostic —
     /// modified_at is user-settable (setattr/utimes) and not safe for ordering.
     pub fn get_file_inventory(&self) -> Result<Vec<(FileId, u64)>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         let mut out = Vec::new();
@@ -2285,7 +2301,7 @@ impl MetadataStore {
 
     /// Fetch a batch of file records by ID. Missing IDs are silently skipped.
     pub fn get_files_batch(&self, ids: &[FileId]) -> Result<Vec<FileMetadata>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         let mut out = Vec::new();
@@ -2305,7 +2321,7 @@ impl MetadataStore {
     where
         F: FnMut(FileMetadata) -> Result<()>,
     {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(FILE_TABLE)?;
         let mut count = 0usize;
@@ -2329,7 +2345,7 @@ impl MetadataStore {
         let key = format!("del:{}", entry.file_id);
         let value = bincode::serialize(entry)
             .context("Failed to serialize DeleteQueueEntry")?;
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_write()?;
         {
             let mut table = txn.open_table(DELETE_QUEUE_TABLE)?;
@@ -2350,7 +2366,7 @@ impl MetadataStore {
     /// Remove a completed deletion from the queue (called after all nodes ack).
     pub fn dequeue_delete(&self, file_id: &FileId) -> Result<()> {
         let key = format!("del:{}", file_id);
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
@@ -2371,7 +2387,7 @@ impl MetadataStore {
 
     /// Return all pending delete queue entries.
     pub fn get_all_pending_deletes(&self) -> Result<Vec<dfs_common::DeleteQueueEntry>> {
-        let _db = self.db.read().unwrap();
+        let _db = self.db.read();
         let txn = _db.begin_read()?;
         let table = txn.open_table(DELETE_QUEUE_TABLE)?;
         let mut entries = Vec::new();
@@ -2651,7 +2667,8 @@ impl MetadataStore {
     /// Returns (before_bytes, after_bytes). Runs in the caller's thread — use
     /// spawn_blocking from async code.
     pub fn compact_db(&self) -> Result<(u64, u64)> {
-        self.compact_db_with_budget(std::time::Duration::from_secs(5), 64)
+        let prep = self.compact_db_prepare(std::time::Duration::from_secs(5), 64)?;
+        self.compact_db_finish(prep)
     }
 
     /// Same as `compact_db()`, parameterized by the Phase 2 catch-up time budget and
@@ -2660,6 +2677,20 @@ impl MetadataStore {
     /// with a tiny budget/threshold, instead of needing a huge dataset and a multi-
     /// second wait to reliably outrun the production defaults.
     fn compact_db_with_budget(&self, catchup_budget: std::time::Duration, convergence_threshold: usize) -> Result<(u64, u64)> {
+        let prep = self.compact_db_prepare(catchup_budget, convergence_threshold)?;
+        self.compact_db_finish(prep)
+    }
+
+    /// Phases 1-2: full copy + iterative catch-up, both held under only the *shared*
+    /// read lock — can legitimately take a while in wall-clock terms (Phase 1 scales
+    /// with DB size; Phase 2 has its own catchup_budget) without blocking anything else
+    /// on this node. Split out from the exclusive-locked Phase 3 (see
+    /// `compact_db_finish`) so server.rs can wrap ONLY Phase 3 in a tight wedge-
+    /// detection timeout — wrapping the whole compact_db() call in one timeout (as this
+    /// used to do) meant Phase 1/2 legitimately running long under heavy write churn
+    /// could trip the same "permanently wedged, restart the node" handling meant for a
+    /// truly stuck exclusive lock, which should complete in well under a second.
+    pub(crate) fn compact_db_prepare(&self, catchup_budget: std::time::Duration, convergence_threshold: usize) -> Result<CompactionPrep> {
         let size_before = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         info!("redb compaction starting ({:.1}MB live)", size_before as f64 / 1_048_576.0);
 
@@ -2681,7 +2712,7 @@ impl MetadataStore {
 
         // Phase 1: full copy, holding only the shared lock.
         {
-            let live = self.db.read().unwrap();
+            let live = self.db.read();
             let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase1 begin_read: {}", e))?;
             let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase1 begin_write: {}", e))?;
             Self::copy_all_tables(&src_txn, &dst_txn)?;
@@ -2700,7 +2731,7 @@ impl MetadataStore {
         let catchup_deadline = std::time::Instant::now() + catchup_budget;
         let mut converged = false;
         loop {
-            let live = self.db.read().unwrap();
+            let live = self.db.read();
             let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase2 begin_read: {}", e))?;
             let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase2 begin_write: {}", e))?;
             let changed = self.diff_all_tables_tracked(&src_txn, &dst_txn)?;
@@ -2722,14 +2753,20 @@ impl MetadataStore {
             );
         }
 
-        // Phase 3: final catch-up + atomic swap, exclusively locked — the only part
-        // that blocks other metadata operations on this node. Logged separately from
-        // "compaction starting" so the actually-locked duration can be measured on its
-        // own — Phases 1-2 above can legitimately take a while in wall-clock terms
-        // without that being a problem, since they never hold this lock.
+        Ok(CompactionPrep { shadow_db, shadow_path, size_before })
+    }
+
+    /// Phase 3 alone: final catch-up diff + atomic swap, under the *exclusive* write
+    /// lock — the only part of compaction that blocks other metadata operations on this
+    /// node. The diff here is small by construction (Phase 2 already converged it below
+    /// convergence_threshold), so this should complete in well under a second even for
+    /// a large DB. server.rs wraps only this call in a tight wedge-detection timeout —
+    /// if it doesn't return promptly, the exclusive lock is genuinely wedged.
+    pub(crate) fn compact_db_finish(&self, prep: CompactionPrep) -> Result<(u64, u64)> {
+        let CompactionPrep { shadow_db, shadow_path, size_before } = prep;
         info!("redb compaction phase3 lock acquiring");
         {
-            let mut live = self.db.write().unwrap();
+            let mut live = self.db.write();
             {
                 let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase3 begin_read: {}", e))?;
                 let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase3 begin_write: {}", e))?;
@@ -2769,7 +2806,7 @@ impl MetadataStore {
     pub fn compact_db_blocking(&self) -> Result<(u64, u64)> {
         let size_before = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         info!("redb compaction starting (blocking fallback, {:.1}MB live)", size_before as f64 / 1_048_576.0);
-        let mut db = self.db.write().unwrap();
+        let mut db = self.db.write();
 
         // redb's compact() fails if any pending_non_durable_commits exist — it counts
         // them as live_read_transactions. Durability::None commits (used on every write
@@ -2798,7 +2835,7 @@ impl MetadataStore {
     /// Same trick used by compact_db() — one empty Durability::Immediate commit promotes
     /// the entire accumulated pending_non_durable_commits list atomically.
     pub fn flush_durable(&self) -> Result<()> {
-        let mut db = self.db.write().unwrap();
+        let mut db = self.db.write();
         let txn = db.begin_write()
             .map_err(|e| anyhow::anyhow!("flush_durable begin: {}", e))?;
         txn.commit()

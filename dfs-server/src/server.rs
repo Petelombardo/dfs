@@ -5780,27 +5780,55 @@ impl Server {
                     if attempt > 0 {
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     }
+                    // Phases 1-2 (shared read lock only) can legitimately take a while
+                    // under heavy write churn without blocking anything else on this
+                    // node — no tight timeout here. A plain Err (e.g. "deferred: ...")
+                    // is handled below exactly like the old all-in-one compact_db() did.
                     let m = metadata.clone();
-                    let task = tokio::task::spawn_blocking(move || m.compact_db());
-                    // compact_db() holds MetadataStore's exclusive write lock for its
-                    // entire duration; with the periodic durability flush (see
-                    // next_write_durability()) it should complete in milliseconds even
-                    // for a large DB. If it ever takes minutes, the write lock is
-                    // permanently wedged and every metadata read on this node will
-                    // block forever too — there is no way to un-stick that lock from
-                    // here. Restart so the other replicas (HA) keep serving while a
-                    // fresh process gets a clean redb handle (compact on startup is
-                    // fast on a freshly-opened handle even for the same file).
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(60), task).await;
-                    let result = match result {
-                        Ok(r) => r,
-                        Err(_) => {
-                            error!(
-                                "redb compact_db() exceeded 60s — exclusive metadata write \
-                                 lock is permanently wedged on this node. Restarting so HA \
-                                 replicas can continue serving."
-                            );
-                            std::process::exit(1);
+                    let prep_task = tokio::task::spawn_blocking(move || m.compact_db_prepare(std::time::Duration::from_secs(5), 64));
+                    let prep_result = prep_task.await;
+
+                    let result: Result<Result<(u64, u64), anyhow::Error>, tokio::task::JoinError> = match prep_result {
+                        Err(join_err) => Err(join_err),
+                        Ok(Err(e)) => Ok(Err(e)),
+                        Ok(Ok(prep)) => {
+                            // Phase 3 alone holds MetadataStore's exclusive write lock —
+                            // a small, already-converged diff apply + commit + atomic
+                            // rename + reopen, which should complete in well under a
+                            // second even for a large DB. If it ever takes anywhere near
+                            // this long, the write lock is wedged and every metadata read
+                            // on this node blocks too — there is no way to un-stick that
+                            // lock from here. Restart so the other replicas (HA) keep
+                            // serving while a fresh process gets a clean redb handle
+                            // (compact on startup is fast on a freshly-opened handle even
+                            // for the same file).
+                            //
+                            // Split from Phases 1-2 and timeout lowered from 60s to 20s
+                            // (2026-07-11): the old all-in-one 60s timeout wrapped all
+                            // three phases together, so Phase 1-2 legitimately running
+                            // long under heavy write churn could trip the same "wedged,
+                            // restart" handling meant only for a truly stuck exclusive
+                            // lock. A real incident also showed a genuine wedge running
+                            // completely undetected for the full 60s before even firing,
+                            // then ~11s more to actually restart and rejoin — a ~71s node
+                            // outage that MultiPatch writes needing this node had to ride
+                            // out (see CONNECT_RETRY_BUDGET in client.rs, sized to match).
+                            // Now that this is isolated to just Phase 3's own work, 20s
+                            // still gives a legitimately large DB reopen real margin while
+                            // cutting the worst-case undetected-wedge window dramatically.
+                            let m2 = metadata.clone();
+                            let finish_task = tokio::task::spawn_blocking(move || m2.compact_db_finish(prep));
+                            match tokio::time::timeout(std::time::Duration::from_secs(20), finish_task).await {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    error!(
+                                        "redb compact_db Phase 3 exceeded 20s — exclusive metadata \
+                                         write lock is permanently wedged on this node. Restarting \
+                                         so HA replicas can continue serving."
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                     };
                     match result {

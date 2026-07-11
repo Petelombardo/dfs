@@ -5106,16 +5106,35 @@ impl Filesystem for DfsFilesystem {
             let offset = offset as usize;
             let size = size as usize;
 
+            // Timeout for waiting on the local write-buffer lock below, instead of
+            // falling through to a network read that risks serving stale data for
+            // a slot that's mid-flush. Unified across all file types (2026-07-11,
+            // superseding an earlier is_vm_disk-only carve-out) — two independent,
+            // confirmed-real, *legitimate* (not-a-failure) sources of multi-second
+            // delay exist in this system: redb compaction's exclusive Phase 3 lock
+            // (observed consistently 2.8-4.1s across many real occurrences) and
+            // resolve_chunk_content forcing a fold to complete before a read of a
+            // not-yet-folded chunk returns (observed 8s+). Trying to pick a
+            // shorter "probably safe" number for non-VM-disk files would need
+            // confident margin over both, and their worst-case combination isn't
+            // well bounded — not worth the risk given what a stale read here
+            // actually costs (root-caused a live Proxmox qcow2 restore corruption:
+            // "Preventing invalid write on metadata (overlaps with active L2
+            // table)" — a stale read desynced the hypervisor's own allocation
+            // tracking from what was actually persisted; the write it then
+            // refused was never the bug, an earlier stale read was).
+            const READ_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
             // Extend file_size to include buffered-but-uncommitted bytes so the EOF
             // check below doesn't gate out reads that are within the write buffer.
             // Use blocking lock (not try_lock) to wait for flush completion, ensuring
             // we see the final buffer state before falling through to network.
             let file_size = if write_buffer_enabled {
                 if let Some(state_arc) = write_buffers.get(&ino).map(|r| r.clone()) {
-                    // Use a timeout on the lock so a slow flush (e.g. node failure causing
-                    // TCP timeout) doesn't freeze all reads at the live edge for 17+ seconds.
+                    // Bounded wait — see READ_LOCK_TIMEOUT's doc comment above for
+                    // why this is 15s and not the original 500ms.
                     let buffered_end = match tokio::time::timeout(
-                        std::time::Duration::from_millis(500),
+                        READ_LOCK_TIMEOUT,
                         state_arc.lock(),
                     ).await {
                         Ok(state) => state.slots.iter()
@@ -5133,14 +5152,14 @@ impl Filesystem for DfsFilesystem {
             // Slot absent → fall through to network (committed data on server).
             // This prevents 0-byte returns during the pre-commit window that cause
             // concurrent dd readers to get offset-shifted data in READ_COPY.
-            // Use a 500ms timeout on the lock so a slow flush (node failure, TCP timeout)
-            // doesn't freeze reads at the live edge. If we can't acquire within 500ms,
-            // fall through to the network — slightly stale chunk_id risk is acceptable
-            // compared to a 17-second player freeze.
+            // Bounded wait, not an immediate fallback — see READ_LOCK_TIMEOUT's doc
+            // comment above. Only past 15s (genuinely stuck, not just a normal
+            // compaction/fold delay) do we accept the stale-read risk of falling
+            // through to the network rather than keep blocking this read.
             if write_buffer_enabled {
                 if let Some(state_arc) = write_buffers.get(&ino).map(|r| r.clone()) {
                     let lock_result = tokio::time::timeout(
-                        std::time::Duration::from_millis(500),
+                        READ_LOCK_TIMEOUT,
                         state_arc.lock(),
                     ).await;
                     if lock_result.is_err() {

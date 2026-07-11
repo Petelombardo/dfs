@@ -563,6 +563,15 @@ async fn full_rewrite_chunk(
             .max(buf.len());
         buf.resize(needed_len, 0);
 
+        // DIAGNOSTIC (2026-07-11, VM-108 qcow2 corruption investigation): the
+        // exact order and byte ranges actually applied during this fold, to
+        // cross-reference against [MERGE-TRACE]'s per-patch log — confirms
+        // whether the fold applies records in the same order they were merged.
+        {
+            let ranges: Vec<(usize, usize)> = patches.iter().map(|(off, d)| (*off, d.len())).collect();
+            info!("[FOLD-TRACE] file={} chunk_idx={} old={} applying {} record(s) ranges={:?}",
+                file_id, chunk_file_offset / (4 * 1024 * 1024), old_chunk_id, patches.len(), ranges);
+        }
         for (intra_offset, patch_data) in &patches {
             let end = *intra_offset + patch_data.len();
             buf[*intra_offset..end].copy_from_slice(patch_data);
@@ -4922,7 +4931,7 @@ impl Server {
         // Process ALL chunks in parallel for maximum throughput
         let mut chunk_tasks = Vec::new();
 
-        for (chunk_id, chunk_data) in chunks {
+        for (chunk_id, chunk_data, chunk_file_offset) in chunks {
             let cluster = self.cluster.clone();
             let storage = self.storage.clone();
             let metadata = self.metadata.clone();
@@ -5060,7 +5069,15 @@ impl Server {
                     nodes: target_nodes.clone(),
                     size: chunk_data.len(),
                     checksum: chunk_id.hash,
-                    file_offset: None,  // Server-side replication doesn't track file offsets
+                    // chunk_file_offset comes from the chunker itself (it always
+                    // knew this — see chunk_data_at's doc comment) rather than
+                    // None: without it, chunk_map_update_location_for_file's
+                    // fast path can never place this entry by chunk_idx, making
+                    // it permanently unfindable except by exact chunk_id — the
+                    // root cause of a live VM disk corruption where every
+                    // failure fell at an exact chunk boundary (the first write
+                    // to a brand-new chunk, which is exactly this function).
+                    file_offset: Some(chunk_file_offset),
                     written_at: None,
                     client_write_seq: None,
                     file_id: Some(file_id),
@@ -5170,7 +5187,7 @@ impl Server {
         // Write all chunks locally in parallel
         let mut chunk_tasks = Vec::new();
 
-        for (chunk_id, chunk_data) in chunks {
+        for (chunk_id, chunk_data, chunk_file_offset) in chunks {
             let storage = self.storage.clone();
             let metadata = self.metadata.clone();
             let cluster = self.cluster.clone();
@@ -5188,7 +5205,12 @@ impl Server {
                     nodes: vec![local_node_id],  // Only local node
                     size: chunk_data.len(),
                     checksum: chunk_id.hash,
-                    file_offset: None,  // Server-side local-only writes don't track file offsets
+                    // See chunk_data_at's doc comment / write_data's identical
+                    // fix — file_offset was None here despite the chunker
+                    // always having computed it; root cause of a live VM disk
+                    // corruption (every failure fell at an exact chunk
+                    // boundary — the first write to a brand-new chunk).
+                    file_offset: Some(chunk_file_offset),
                     written_at: None,
                     client_write_seq: None,
                     file_id: Some(file_id),
@@ -5238,7 +5260,7 @@ impl Server {
         let local_node_id = self.cluster.local_node_id();
         let mut chunk_tasks = Vec::new();
 
-        for (chunk_id, chunk_data) in chunks {
+        for (chunk_id, chunk_data, chunk_file_offset) in chunks {
             let storage = self.storage.clone();
             let metadata = self.metadata.clone();
 
@@ -5251,7 +5273,12 @@ impl Server {
                     nodes: vec![local_node_id],
                     size: chunk_data.len(),
                     checksum: chunk_id.hash,
-                    file_offset: None,
+                    // Confirmed root cause of the VM-108 qcow2 corruption: this was
+                    // None despite chunk_data_at always computing the real offset,
+                    // leaving this node's own local registration unfindable by
+                    // chunk_idx if the client's follow-up multi-node broadcast was
+                    // ever lost or delayed. See chunk_data_at's doc comment.
+                    file_offset: Some(chunk_file_offset),
                     written_at: None,
                     client_write_seq: None,
                     file_id: Some(file_id),
@@ -6913,7 +6940,7 @@ impl Server {
         let mut new_locations: Vec<ChunkLocation> = Vec::new();
         let mut current_offset = base_offset;
 
-        for (chunk_id, chunk_data) in &chunks {
+        for (chunk_id, chunk_data, _chunk_file_offset) in &chunks {
             let target_nodes = self.cluster
                 .get_nodes_with_capacity_awareness(chunk_id, self.replication_factor.load(Ordering::Relaxed))
                 .await;
@@ -7528,6 +7555,16 @@ impl Server {
         // several patches ago, hitting the ghost-chunk guard over and over.
         let chunk_map_old_id = if is_merge { chunk_id } else { base_chunk_id };
 
+        // DIAGNOSTIC (2026-07-11, VM-108 qcow2 corruption investigation): exact
+        // byte-range detail for every patch merged into this slot's accumulator,
+        // to check for a causal/arrival-order inversion under concurrent writers
+        // to the same chunk_idx (info!, not debug! — servers run at info level).
+        {
+            let ranges: Vec<(usize, usize)> = patches.iter().map(|(off, d)| (*off, d.len())).collect();
+            info!("[MERGE-TRACE] file={} chunk_idx={} is_merge={} base={} prior_delta={:?} ranges={:?}",
+                file_id, cidx, is_merge, base_chunk_id, prior_delta, ranges);
+        }
+
         // Merge: append this call's patches onto whatever's already accumulated, as
         // new records in the append-only delta format (encode_delta_record) — never
         // re-serializing or re-reading the whole accumulated delta. compose_one_patch
@@ -7628,6 +7665,8 @@ impl Server {
         let public_token = ChunkId::from_hash(*token_hasher.finalize().as_bytes());
 
         let needed_len = patches.iter().map(|(off, d)| off + d.len()).max().unwrap_or(0).max(base_size);
+        info!("[MERGE-TRACE] file={} chunk_idx={} delta={} token={} needed_len={}",
+            file_id, cidx, delta_chunk_id, public_token, needed_len);
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
 
         let retired_token = self.metadata.put_patch_state_pending_async(

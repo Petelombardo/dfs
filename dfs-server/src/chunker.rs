@@ -21,7 +21,7 @@ impl Chunker {
 
     /// Split data into chunks and return chunk IDs and data
     /// Uses streaming to avoid loading entire file into memory
-    pub fn chunk_data(&self, data: &[u8], file_id: FileId) -> Vec<(ChunkId, Vec<u8>)> {
+    pub fn chunk_data(&self, data: &[u8], file_id: FileId) -> Vec<(ChunkId, Vec<u8>, u64)> {
         self.chunk_data_at(data, 0, file_id)
     }
 
@@ -31,14 +31,28 @@ impl Chunker {
     /// deduplication from aliasing identical blocks (e.g. zero regions) at
     /// different positions within a file, or at the same position across
     /// different files.
-    pub fn chunk_data_at(&self, data: &[u8], file_offset: u64, file_id: FileId) -> Vec<(ChunkId, Vec<u8>)> {
+    ///
+    /// Returns each chunk's own file_offset alongside its id/data (added
+    /// 2026-07-11) — this was computed internally for the hash and then
+    /// discarded, forcing every caller doing a fresh/local-only write to
+    /// register its ChunkLocation with file_offset: None despite the correct
+    /// value being available the whole time. That produced an unregisterable-
+    /// by-chunk_idx entry (chunk_map_update_location_for_file's fast path
+    /// requires file_offset to place anything), root-caused via a live
+    /// Proxmox qcow2 restore repro: every single corruption fell at an exact
+    /// 4MB DFS chunk boundary — i.e. the *first* write to a brand-new chunk,
+    /// which is exactly what goes through write_data/write_data_local_only(_at)
+    /// rather than the patch/fold path (already fixed earlier the same
+    /// session for full_rewrite_chunk and apply_patch — this is the same
+    /// defect class in the fresh-write path instead of the fold path).
+    pub fn chunk_data_at(&self, data: &[u8], file_offset: u64, file_id: FileId) -> Vec<(ChunkId, Vec<u8>, u64)> {
         let mut chunks = Vec::new();
         let mut current_offset = file_offset;
 
         for chunk_data in data.chunks(self.chunk_size) {
             let hash = compute_chunk_hash_at(chunk_data, current_offset, file_id);
             let chunk_id = ChunkId::from_hash(hash);
-            chunks.push((chunk_id, chunk_data.to_vec()));
+            chunks.push((chunk_id, chunk_data.to_vec(), current_offset));
             current_offset += chunk_data.len() as u64;
         }
 
@@ -111,7 +125,7 @@ mod tests {
         assert!(chunks.len() > 1);
 
         // Verify reassembly
-        let chunk_data: Vec<Vec<u8>> = chunks.into_iter().map(|(_, data)| data).collect();
+        let chunk_data: Vec<Vec<u8>> = chunks.into_iter().map(|(_, data, _)| data).collect();
         let reassembled = chunker.reassemble_chunks(chunk_data);
         assert_eq!(reassembled, data);
     }
@@ -138,7 +152,7 @@ mod tests {
 
         let chunks = chunker.chunk_data(&data, FileId::new());
         assert_eq!(chunks.len(), 3);
-        for (_, chunk_data) in chunks {
+        for (_, chunk_data, _) in chunks {
             assert_eq!(chunk_data.len(), 10);
         }
     }

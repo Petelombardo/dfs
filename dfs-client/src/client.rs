@@ -6322,6 +6322,83 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
+        // Require at least 2 replicas whenever more than one was actually targeted —
+        // a chunk that lands on exactly 1 node is a single point of failure: if that
+        // one node dies before the healer catches up, the chunk is unrecoverably
+        // lost. Root-caused 2026-07-11: this exact sequence (a patch landed on only
+        // gluster1, which self-restarted ~15s later from an unrelated compaction
+        // wedge) permanently destroyed a real chunk of a VM disk — the other 4 nodes'
+        // metadata all agreed the chunk lived on gluster1, and gluster1 itself had
+        // no record of it after restarting. required_replicas is capped by how many
+        // nodes were actually targeted so a genuine RF=1 / single-node cluster (or
+        // dual_rf's intentional 2-target design) still writes successfully with
+        // fewer than 2 candidates to begin with.
+        let required_replicas = patch_addrs.len().min(2);
+        if patched_node_ids.len() < required_replicas {
+            let missing_addrs: Vec<SocketAddr> = patch_addrs.iter().copied()
+                .filter(|a| !addr_to_node_id_snap.get(a)
+                    .map(|nid| patched_node_ids.contains(nid))
+                    .unwrap_or(false))
+                .collect();
+            warn!("MultiPatch: chunk {} landed on only {}/{} targeted replica(s) — retrying the \
+                   missing {} before accepting the write",
+                authoritative_chunk_id, patched_node_ids.len(), required_replicas, missing_addrs.len());
+            const BACKFILL_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+            const BACKFILL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(300);
+            let backfill_started = std::time::Instant::now();
+            for addr in missing_addrs {
+                if patched_node_ids.len() >= required_replicas {
+                    break;
+                }
+                loop {
+                    let hints = per_server_hints.get(&addr).cloned();
+                    let req = Request::MultiPatch {
+                        chunk_id: old_chunk_id,
+                        file_id,
+                        chunk_idx,
+                        chunk_file_offset,
+                        patches: patches.clone(),
+                        expected_new_chunk_id,
+                        client_write_seq: patch_client_write_seq,
+                        prefetch_hints: hints,
+                        new_chunk_seq,
+                    };
+                    match self.send_request(addr, req).await {
+                        Ok(Response::MultiPatchResult { new_chunk_id: ncid, .. }) if ncid == authoritative_chunk_id => {
+                            if let Some(&nid) = addr_to_node_id_snap.get(&addr) {
+                                patched_node_ids.push(nid);
+                                info!("MultiPatch: backfilled chunk {} onto {} — now {}/{} replicas",
+                                    authoritative_chunk_id, addr, patched_node_ids.len(), required_replicas);
+                            }
+                            break;
+                        }
+                        Ok(other) => {
+                            warn!("MultiPatch: backfill to {} for chunk {} got unexpected result: {:?} — will not retry this node",
+                                addr, authoritative_chunk_id, other);
+                            break;
+                        }
+                        Err(e) => {
+                            if backfill_started.elapsed() < BACKFILL_RETRY_BUDGET {
+                                debug!("MultiPatch: backfill to {} for chunk {} failed ({}), retrying",
+                                    addr, authoritative_chunk_id, e);
+                                tokio::time::sleep(BACKFILL_RETRY_BACKOFF).await;
+                                continue;
+                            }
+                            warn!("MultiPatch: backfill to {} for chunk {} failed after retry budget: {}",
+                                addr, authoritative_chunk_id, e);
+                            break;
+                        }
+                    }
+                }
+            }
+            if patched_node_ids.len() < required_replicas {
+                warn!("MultiPatch: chunk {} still under-replicated ({}/{}) after backfill attempt — \
+                       accepting anyway to avoid blocking the write indefinitely; the healer must \
+                       treat this as urgent, not routine",
+                    authoritative_chunk_id, patched_node_ids.len(), required_replicas);
+            }
+        }
+
         let new_chunk_id = authoritative_chunk_id;
 
         // Use server's patch_ts if available — this ensures written_at is in server

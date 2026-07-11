@@ -1397,6 +1397,45 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Remove a Pending PATCH_STATE_TABLE row directly, along with its
+    /// PATCH_STATE_SLOT_TABLE pointer if that slot still points at this exact
+    /// token. For abandoning a patch whose base and/or delta chunk is
+    /// confirmed gone cluster-wide (no CHUNK_TABLE record anywhere, not just
+    /// missing on this node) — see run_single_fold's call site for the full
+    /// rationale and the safety check that gates calling this at all. Distinct
+    /// from update_patch_state_folded, which is the *normal* (successful) way
+    /// a Pending row stops being Pending; this is the abandon-on-failure path.
+    pub fn delete_patch_state_abandoned(&self, public_token: &ChunkId, file_id: FileId, chunk_idx: u64) -> Result<()> {
+        let token_key = format!("{}", public_token);
+        let slot_key = format!("{}:{}", file_id, chunk_idx);
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut state_table = txn.open_table(PATCH_STATE_TABLE)?;
+            state_table.remove(token_key.as_str())?;
+        }
+        {
+            let mut slot_table = txn.open_table(PATCH_STATE_SLOT_TABLE)?;
+            let still_current = slot_table.get(slot_key.as_str())?
+                .map(|v| v.value() == token_key.as_bytes())
+                .unwrap_or(false);
+            if still_current {
+                slot_table.remove(slot_key.as_str())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Async wrapper for delete_patch_state_abandoned — see put_chunk_location_async.
+    pub async fn delete_patch_state_abandoned_async(self: &Arc<Self>, public_token: ChunkId, file_id: FileId, chunk_idx: u64) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_patch_state_abandoned(&public_token, file_id, chunk_idx))
+            .await
+            .context("spawn_blocking panicked in delete_patch_state_abandoned_async")?
+    }
+
     /// Async wrapper for update_patch_state_folded — see put_chunk_location_async.
     pub async fn update_patch_state_folded_async(self: &Arc<Self>, public_token: ChunkId, new_chunk_id: ChunkId) -> Result<()> {
         let store = Arc::clone(self);
@@ -1507,6 +1546,102 @@ impl MetadataStore {
         tokio::task::spawn_blocking(move || store.all_patch_token_ids())
             .await
             .context("spawn_blocking panicked in all_patch_token_ids_async")?
+    }
+
+    /// Prune Folded PATCH_STATE_TABLE rows whose target chunk is either gone
+    /// (already superseded/deleted — the token is useless regardless of age)
+    /// or old enough that no realistic client cache could still reference the
+    /// retired token. NEVER touches Pending rows — those are actively in use
+    /// and are only ever removed by the normal retire-on-next-pending path in
+    /// put_patch_state_pending.
+    ///
+    /// Root cause this closes (2026-07-11): once a (file, chunk_idx) slot goes
+    /// quiet after its last patch folds, nothing ever removes its
+    /// PATCH_STATE_TABLE row — the existing retire cleanup only fires when the
+    /// *same* slot is patched again. Confirmed live: PATCH_STATE_TABLE growth
+    /// accounted for a large share of a metadata store running 5x larger than
+    /// expected after one heavy VM-install session (a 17GB file alone touches
+    /// ~4300 chunk_idx slots, and most go quiet — never patched again — well
+    /// before the file itself is deleted, if it ever is).
+    ///
+    /// Uses the target chunk's own ChunkLocation.written_at as the age proxy
+    /// rather than adding a timestamp to PatchState::Folded itself — that would
+    /// be a bincode wire-format change to an enum variant, riskier to roll out
+    /// safely than reusing a timestamp that's already there.
+    pub fn prune_stale_folded_patch_states(&self, min_age: std::time::Duration) -> Result<usize> {
+        let now = std::time::SystemTime::now();
+        let candidates: Vec<(String, ChunkId)> = {
+            let _db = self.db.read().unwrap();
+            let txn = _db.begin_read()?;
+            let table = match txn.open_table(PATCH_STATE_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+                Err(e) => return Err(e.into()),
+            };
+            let mut out = Vec::new();
+            for item in table.range::<&str>(..)? {
+                let (k, v) = item?;
+                if let Ok(PatchState::Folded(target)) = bincode::deserialize::<PatchState>(v.value()) {
+                    out.push((k.value().to_string(), target));
+                }
+            }
+            out
+        };
+
+        let mut to_remove = Vec::new();
+        for (key, target) in candidates {
+            let safe_to_remove = match self.get_chunk_location(&target)? {
+                // Target already gone (superseded/deleted) — nothing can resolve
+                // through this token correctly anymore regardless of age.
+                None => true,
+                Some(loc) => {
+                    let file_gone = match loc.file_id {
+                        Some(fid) => !self.file_exists_by_id(fid).unwrap_or(true),
+                        None => false,
+                    };
+                    if file_gone {
+                        true
+                    } else {
+                        match loc.written_at {
+                            Some(ts_ms) => {
+                                let written = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ts_ms);
+                                now.duration_since(written).unwrap_or_default() >= min_age
+                            }
+                            // No timestamp to establish age from — leave it alone
+                            // rather than guess.
+                            None => false,
+                        }
+                    }
+                }
+            };
+            if safe_to_remove {
+                to_remove.push(key);
+            }
+        }
+
+        if to_remove.is_empty() {
+            return Ok(0);
+        }
+
+        let _db = self.db.read().unwrap();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(PATCH_STATE_TABLE)?;
+            for key in &to_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        txn.commit()?;
+        Ok(to_remove.len())
+    }
+
+    /// Async wrapper for prune_stale_folded_patch_states — see get_chunk_location_async.
+    pub async fn prune_stale_folded_patch_states_async(self: &Arc<Self>, min_age: std::time::Duration) -> Result<usize> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.prune_stale_folded_patch_states(min_age))
+            .await
+            .context("spawn_blocking panicked in prune_stale_folded_patch_states_async")?
     }
 
     /// Total PATCH_STATE_TABLE row count still in the Pending state (not yet

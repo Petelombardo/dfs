@@ -312,6 +312,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     healer_runtime.spawn(healing.clone().start());
     server.set_healing_manager(healing.clone()).await;
     server.clone().start_compaction_loop();
+    server.clone().start_patch_state_gc_loop();
     server.clone().start_ops_tracker_loop();
     server.clone().start_metadata_dissemination_loop();
     server.clone().start_leader_forward_loop();

@@ -786,6 +786,51 @@ const PATCH_DEBOUNCE_MAX_WAIT: std::time::Duration = std::time::Duration::from_s
 /// expensively-but-more-often.
 
 impl OverlayForkCtx {
+    /// Abandon and clean up a Pending patch whose base or delta chunk is
+    /// confirmed gone cluster-wide — not just missing on this node's local
+    /// disk, which could still be recoverable from another replica, but
+    /// genuinely unregistered anywhere (no CHUNK_TABLE record at all). Only
+    /// called from run_single_fold's failure paths after a local read miss;
+    /// see those call sites for why the local-vs-cluster-wide distinction
+    /// matters for correctness.
+    ///
+    /// Added 2026-07-11 per a live finding: a fully idle cluster still showed
+    /// PATCH_STATE_TABLE rows stuck in Pending indefinitely, with nothing to
+    /// ever retry or clean them up — debounce_fold_slot's new retry loop keeps
+    /// such a patch alive forever if its base is truly gone, which is exactly
+    /// as wrong as never retrying at all. A patch that can provably never fold
+    /// is irrelevant and safe to discard rather than resolve to real content.
+    async fn abandon_patch_if_base_gone(
+        &self,
+        file_id: FileId,
+        chunk_idx: u64,
+        public_token: ChunkId,
+        missing_chunk_id: ChunkId,
+        which: &str,
+    ) {
+        match self.metadata.get_chunk_location_async(missing_chunk_id).await {
+            Ok(None) => {
+                warn!("single fold: {} chunk {} for file {} chunk_idx {} has no CHUNK_TABLE record anywhere \
+                       (not just locally) — abandoning unrecoverable patch {}",
+                    which, missing_chunk_id, file_id, chunk_idx, public_token);
+                self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+                if let Err(e) = self.metadata.delete_patch_state_abandoned_async(public_token, file_id, chunk_idx).await {
+                    warn!("single fold: failed to delete abandoned patch_state for {}: {}", public_token, e);
+                }
+            }
+            Ok(Some(_)) => {
+                // Registered elsewhere in the cluster — this node just doesn't
+                // have the bytes locally. Not safe to abandon; leave Pending so
+                // a later retry (possibly after the metadata/replica situation
+                // resolves) can still succeed.
+            }
+            Err(e) => {
+                warn!("single fold: failed to check cluster-wide registration for {} chunk {}: {} — leaving Pending, not abandoning on an inconclusive check",
+                    which, missing_chunk_id, e);
+            }
+        }
+    }
+
     /// Consolidate the one pending patch on (file_id, chunk_idx) into a single
     /// fresh, standalone chunk via `full_rewrite_chunk` — unchanged, the same
     /// crash-journaled read+patch+hash+rename dance PatchChunk/MultiPatch have
@@ -834,7 +879,11 @@ impl OverlayForkCtx {
         let read_result = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&delta_chunk_id)).await;
         let delta_bytes = match read_result {
             Ok(Ok(b)) => b,
-            Ok(Err(e)) => { warn!("single fold: failed to read delta chunk {}: {}", delta_chunk_id, e); return false; }
+            Ok(Err(e)) => {
+                warn!("single fold: failed to read delta chunk {}: {}", delta_chunk_id, e);
+                self.abandon_patch_if_base_gone(file_id, chunk_idx, public_token, delta_chunk_id, "delta").await;
+                return false;
+            }
             Err(e) => { warn!("single fold: spawn_blocking panicked reading delta chunk {}: {}", delta_chunk_id, e); return false; }
         };
         let patches: Vec<(usize, Vec<u8>)> = match parse_delta_records(&delta_bytes) {
@@ -866,17 +915,28 @@ impl OverlayForkCtx {
 
         let (new_chunk_id, final_size, fold_buf) = match fold_result {
             Ok(v) => v,
-            Err((msg, _code)) => {
+            Err((msg, code)) => {
                 warn!("single fold: consolidation failed for file {} chunk_idx {} (base {}): {} — \
                        leaving patch_state Pending so reads keep composing live from base+delta",
                     file_id, chunk_idx, base_chunk_id, msg);
                 // Deliberately leave patch_state Pending and pending_patch_ids
-                // untouched: base_chunk_id's file is still on disk
-                // (full_rewrite_chunk only renames on success), so
-                // resolve_chunk_content can still correctly compose base+delta on
-                // demand. The guard this task holds is dropped when it returns,
-                // letting a subsequent patch to this slot proceed — its staleness
-                // check will see patch_state still Pending and can retry the fold.
+                // untouched by default: base_chunk_id's file is still on disk
+                // for most failure modes (full_rewrite_chunk only renames on
+                // success), so resolve_chunk_content can still correctly compose
+                // base+delta on demand, and a later retry (debounce_fold_slot
+                // now retries — see its doc comment) may well succeed once
+                // whatever caused this failure clears.
+                //
+                // Exception: NotFound specifically means base_chunk_id wasn't on
+                // this node's disk at all — abandon_patch_if_base_gone below
+                // checks whether it's *registered* anywhere in the cluster
+                // (CHUNK_TABLE, not just this node's local disk) before treating
+                // it as truly, permanently gone — a local-only miss could still
+                // be recoverable from another replica, so this must not clean up
+                // on a merely-local absence.
+                if code == ErrorCode::NotFound {
+                    self.abandon_patch_if_base_gone(file_id, chunk_idx, public_token, base_chunk_id, "base").await;
+                }
                 return false;
             }
         };
@@ -1274,10 +1334,21 @@ impl OverlayForkCtx {
     ///     accumulator grow forever).
     /// Exits immediately, without folding, if the slot is gone by the time it
     /// wakes (fold_slot_now already handled it via a forced read).
+    ///
+    /// Retries on fold failure instead of giving up after one attempt (fixed
+    /// 2026-07-11): fold_slot_now's bool result used to be discarded here — a
+    /// single failed attempt (transient I/O error, metadata write conflict, any
+    /// of run_single_fold's other failure paths) permanently stranded the slot
+    /// in Pending, since nothing else re-triggers a fold for a quiet slot except
+    /// this task or a forced read of that exact chunk. Confirmed live: a fully
+    /// idle cluster (no client, no writes) still had 3 patches stuck in Pending
+    /// indefinitely. Now retries with capped backoff until it succeeds.
     async fn debounce_fold_slot(&self, file_id: FileId, chunk_idx: u64) {
         let started_at = std::time::Instant::now();
+        let mut retry_backoff = PATCH_DEBOUNCE_IDLE;
+        const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
         loop {
-            tokio::time::sleep(PATCH_DEBOUNCE_IDLE).await;
+            tokio::time::sleep(retry_backoff).await;
 
             let Some(last_patch_at) = self.dirty_patch_slots
                 .get(&(file_id, chunk_idx))
@@ -1287,8 +1358,13 @@ impl OverlayForkCtx {
             };
 
             if last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE || started_at.elapsed() >= PATCH_DEBOUNCE_MAX_WAIT {
-                self.fold_slot_now(file_id, chunk_idx).await;
-                return;
+                if self.fold_slot_now(file_id, chunk_idx).await {
+                    return;
+                }
+                warn!("debounce_fold_slot: fold failed for file={} chunk={}, retrying in {:?}",
+                    file_id, chunk_idx, retry_backoff);
+                retry_backoff = (retry_backoff * 2).min(MAX_RETRY_BACKOFF);
+                continue;
             }
             // Else: a patch landed within the last debounce window — loop and
             // sleep again rather than folding yet.
@@ -5746,14 +5822,25 @@ impl Server {
                 }
 
                 // Escalate to the old blocking in-place compact() if compact_db() has
-                // been deferring for too long (5 minutes) *and* fragmentation is still
-                // bad enough to matter. A single deferral is normal and not a problem on
-                // its own — the safe path is designed to defer rather than ever hand
-                // Phase 3 a large diff — but sustained churn (hours, not a brief burst)
-                // could otherwise mean fragmentation never gets reclaimed and the file
-                // grows unboundedly. One bounded blocking hit is better than that.
+                // been deferring for too long *and* fragmentation is still bad enough
+                // to matter. A single deferral is normal and not a problem on its own
+                // — the safe path is designed to defer rather than ever hand Phase 3 a
+                // large diff — but sustained churn could otherwise mean fragmentation
+                // never gets reclaimed and the file grows unboundedly. One bounded
+                // blocking hit is better than that.
+                //
+                // Threshold lowered from 5 minutes to 90s (2026-07-11): under a real
+                // sustained-write workload (VM OS install), compact_db() deferred on
+                // essentially every cycle and the file grew unboundedly (488MB where
+                // ~50MB was expected) because 5 minutes of continuous heavy churn was
+                // common enough that the "brief burst" assumption never held — this is
+                // exactly the scenario the escalation path exists for, it just wasn't
+                // reachable fast enough. 90s (~one retry cycle at the normal 60s
+                // interval, after compact_db()'s own up-to-5s internal catch-up
+                // attempt) still gives a genuinely brief burst a real chance to
+                // resolve on its own before paying the bounded blocking cost.
                 if let Some(first) = first_deferred_at {
-                    if first.elapsed() >= std::time::Duration::from_secs(5 * 60) && frag_ratio >= 1.20 {
+                    if first.elapsed() >= std::time::Duration::from_secs(90) && frag_ratio >= 1.20 {
                         warn!("redb compact has deferred for {:?} with fragmentation still high \
                                ({:.1}MB vs {:.1}MB baseline) — falling back to blocking compact",
                             first.elapsed(),
@@ -5790,6 +5877,31 @@ impl Server {
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+            }
+        });
+    }
+
+    /// Periodic sweep pruning stale Folded PATCH_STATE_TABLE rows — see
+    /// prune_stale_folded_patch_states's doc comment for the leak this closes.
+    /// Runs on every node independently (PATCH_STATE_TABLE is node-local, never
+    /// disseminated — same reason the compaction loop runs per-node too), on a
+    /// much slower cadence than compaction since this is pure cleanup with no
+    /// user-visible urgency. min_age is deliberately generous (hours): the only
+    /// cost of waiting longer is a bigger table in the meantime, while removing
+    /// a token too early risks a client with genuinely stale-but-still-valid
+    /// cached metadata failing to resolve it.
+    pub fn start_patch_state_gc_loop(self: Arc<Self>) {
+        let metadata = self.metadata.clone();
+        tokio::spawn(async move {
+            const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+            const MIN_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                match metadata.prune_stale_folded_patch_states_async(MIN_AGE).await {
+                    Ok(0) => {}
+                    Ok(n) => info!("patch_state GC: pruned {} stale Folded row(s)", n),
+                    Err(e) => warn!("patch_state GC: sweep failed: {}", e),
+                }
             }
         });
     }

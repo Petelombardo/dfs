@@ -356,6 +356,13 @@ struct InodeWriteState {
     /// in metadata_cache and recent_chunk_writes. This prevents the ChunkStale cascade
     /// where alternating between different node pairs creates divergent chunk versions.
     canonical_write_nodes: HashMap<u64, Vec<dfs_common::NodeId>>,
+    /// Consecutive-miss streak per (chunk_idx, node) backing canonical_write_nodes's
+    /// update site — see that call site's doc comment. A node absent from one
+    /// MultiPatch round's result (e.g. it was mid-fold on the server and slower
+    /// than its peer this one time) must not be silently and permanently dropped
+    /// from future patch targeting; this bounds how many consecutive rounds a
+    /// node gets to catch back up before it's actually dropped.
+    canonical_node_miss_streak: HashMap<(u64, dfs_common::NodeId), u32>,
     /// Chunk index of the most recent write_at call. Used to detect when the caller
     /// jumps to a different chunk, so the previous chunk's partial slot can be flushed
     /// immediately rather than waiting for the timer.
@@ -368,6 +375,7 @@ impl InodeWriteState {
             slots: HashMap::new(),
             flushed_sizes: HashMap::new(),
             canonical_write_nodes: HashMap::new(),
+            canonical_node_miss_streak: HashMap::new(),
             sync_on_fsync,
             is_truncated_session: false,
             expected_file_id: None,
@@ -1926,8 +1934,17 @@ impl FlushHandle {
             }
         };
         let slot_len = slot_data.len();
-        info!("flush_buffer_async_one: ino={} chunk={} file_offset={} existing_chunk_size={} slot_len={} gap_prefix={} real_end={} dirty_ranges={:?} meta_file_id={:?} buf_expected_id={:?}",
-            ino, chunk_idx, file_offset, existing_chunk_size, slot_len, gap_filled_prefix, real_data_end, dirty_ranges, file_id_at_flush_start, buf_expected_id);
+        // Summarized at info (range count + total covered bytes) instead of the
+        // full dirty_ranges array — a sparse write can carry hundreds of tuples
+        // in one line (seen spanning most of a 4MB chunk under kdiskmark), and
+        // the count/coverage is what's actually needed to follow the decision
+        // logic below at a glance. Full tuple-by-tuple detail (needed to
+        // investigate a race or a specific corrupted offset) stays available at
+        // debug!, same as everywhere else in this codebase.
+        let dirty_ranges_bytes: usize = dirty_ranges.iter().map(|&(s, e)| e - s).sum();
+        info!("flush_buffer_async_one: ino={} chunk={} file_offset={} existing_chunk_size={} slot_len={} gap_prefix={} real_end={} dirty_ranges={} ranges ({} bytes) meta_file_id={:?} buf_expected_id={:?}",
+            ino, chunk_idx, file_offset, existing_chunk_size, slot_len, gap_filled_prefix, real_data_end, dirty_ranges.len(), dirty_ranges_bytes, file_id_at_flush_start, buf_expected_id);
+        debug!("flush_buffer_async_one: ino={} chunk={} dirty_ranges detail={:?}", ino, chunk_idx, dirty_ranges);
         let chunk_exists = existing_chunk_size > 0;
         let is_append_extend = chunk_exists
             && slot_len > existing_chunk_size
@@ -2592,7 +2609,54 @@ impl FlushHandle {
                                 slot.consecutive_patch_failures = 0;
                             }
                             if !new_location.nodes.is_empty() {
-                                state.canonical_write_nodes.insert(chunk_idx, new_location.nodes.clone());
+                                // Union with the existing canonical set instead of replacing it
+                                // outright. new_location.nodes is only the subset that answered
+                                // THIS round (multi_patch_chunk_on_replicas_inner excludes any
+                                // replica that failed/disagreed/was stale for this one call) — a
+                                // node missing from it does not mean it stopped being a real
+                                // replica, just that it didn't answer in time this round. The
+                                // most common cause: it's mid-fold server-side (holding
+                                // chunk_patch_locks for this exact slot while its peer, already
+                                // folded, answers immediately) — a timing difference between two
+                                // replicas' background fold schedules, not a data-loss event.
+                                //
+                                // Replacing wholesale here used to permanently narrow every
+                                // future patch this session down to whichever node happened to
+                                // answer fastest on ONE round: canonical_write_nodes is
+                                // deliberately sticky (see its doc comment) and nothing else
+                                // ever adds a dropped node back, so the excluded replica was
+                                // never retried again for the rest of the session — silently
+                                // running at RF=1 for a chunk that should have been RF=2,
+                                // discovered 2026-07-10 while investigating a chunk that ended
+                                // up registered with only 1-of-2 intended replicas holding data.
+                                //
+                                // Bounded by canonical_node_miss_streak so a node that's
+                                // genuinely gone (not just momentarily slow) doesn't get retried
+                                // — and pay a timeout — on every single patch for the rest of the
+                                // session; after MISS_STREAK_DROP_THRESHOLD consecutive rounds
+                                // without answering, drop it for real and let the healer's normal
+                                // under-RF detection be the path back, same as before this fix.
+                                const MISS_STREAK_DROP_THRESHOLD: u32 = 5;
+                                let previous = state.canonical_write_nodes.get(&chunk_idx).cloned().unwrap_or_default();
+                                let mut merged = new_location.nodes.clone();
+                                for node in &previous {
+                                    if new_location.nodes.contains(node) {
+                                        state.canonical_node_miss_streak.remove(&(chunk_idx, *node));
+                                        continue;
+                                    }
+                                    let streak = state.canonical_node_miss_streak
+                                        .entry((chunk_idx, *node)).or_insert(0);
+                                    *streak += 1;
+                                    if *streak < MISS_STREAK_DROP_THRESHOLD {
+                                        merged.push(*node);
+                                    } else {
+                                        info!("canonical_write_nodes: dropping node {} for ino={} chunk={} \
+                                               after {} consecutive missed patch rounds",
+                                            node, ino, chunk_idx, streak);
+                                        state.canonical_node_miss_streak.remove(&(chunk_idx, *node));
+                                    }
+                                }
+                                state.canonical_write_nodes.insert(chunk_idx, merged);
                             }
                             let new_data_arrived = state.slots.get(&chunk_idx).map(|s| {
                                 s.data.len() > patched_len || s.last_modified > last_modified_snap
@@ -2792,8 +2856,14 @@ impl FlushHandle {
                     // nodes. Without this, canonical_write_nodes retains the pre-fallback
                     // pair while server_chunk_id has the new hash (written to different
                     // nodes), causing "chunk data missing" on every subsequent patch.
+                    // Unlike the MultiPatch success path above, a full replace (not a
+                    // union) is correct here: this is a genuine identity change (fresh
+                    // write to a fully new node set), not a same-identity patch where a
+                    // replica simply missed one round — so any miss-streak state for the
+                    // old node set is now meaningless and cleared with it.
                     if let Some(loc) = locations.first() {
                         if !loc.nodes.is_empty() {
+                            state.canonical_node_miss_streak.retain(|(cidx, _), _| *cidx != chunk_idx);
                             state.canonical_write_nodes.insert(chunk_idx, loc.nodes.clone());
                         }
                     }

@@ -1213,8 +1213,6 @@ impl HealingManager {
             }
         }
 
-        const GRACE_PERIOD_SECS: u64 = 300;
-
         // 2x the periodic full-reconciliation interval (server.rs RECONCILE_INTERVAL =
         // 300s) — that loop is the slowest *guaranteed* metadata-catchup path in the
         // system, so doubling it bounds how stale this node's live_chunk_ids() view
@@ -1242,9 +1240,7 @@ impl HealingManager {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            let mut deleted = 0usize;
             let mut kept = 0usize;
-            let mut too_recent = 0usize;
             // (chunk_id, age_secs) — still routed to us, but no live file references
             // it. Collected for the async leader-confirm/stability gate below; never
             // deleted inside this blocking closure.
@@ -1252,10 +1248,6 @@ impl HealingManager {
 
             for chunk_id in &chunks {
                 // Determine whether this local file is still our responsibility.
-                // The routing table is cluster-wide, so Ok(Some(loc)) only means
-                // the chunk exists somewhere — we must also verify this node is
-                // still listed.  A stale local copy where loc.nodes = [other, nodes]
-                // is an orphan that DeleteChunk RPCs should have cleaned up but didn't.
                 let loc_record = match metadata.get_chunk_location(chunk_id) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1264,40 +1256,22 @@ impl HealingManager {
                     }
                 };
 
-                // Ok(Some(loc)) that explicitly excludes us: the routing table is
-                // authoritative and confidently says this chunk belongs elsewhere.
-                // Safe to age-grace-delete locally without a cluster round trip.
-                if let Some(loc) = &loc_record {
-                    if !loc.nodes.contains(&local_node_id) {
-                        let age_secs = storage.get_chunk_mtime(chunk_id)
-                            .map(|mtime| now_secs.saturating_sub(mtime))
-                            .unwrap_or(u64::MAX);
-
-                        if age_secs > GRACE_PERIOD_SECS {
-                            if let Err(e) = storage.delete_chunk(chunk_id) {
-                                debug!("Disk orphan sweep: failed to delete {}: {}", chunk_id, e);
-                            } else {
-                                debug!("Disk orphan sweep: deleted local orphan {}", chunk_id);
-                                deleted += 1;
-                            }
-                        } else {
-                            too_recent += 1;
-                        }
-                        continue;
-                    }
-                }
-
-                // Either still routed to us (Some(loc) containing us), or Ok(None) —
-                // no location record at all. A bare `None` is NOT proof the chunk is
-                // dead: it just as easily means this node's local metadata hasn't
-                // caught up (e.g. after a leadership change or a metadata-replication
-                // backlog) while the chunk is still legitimately live elsewhere.
-                // Treating a bare absence as a confirmed orphan caused real data loss —
-                // a node whose metadata fell behind cannibalized its entire chunk store
-                // because every chunk looked unassigned locally. Route both cases
-                // through the same leader-confirm + cluster-stability gate used below
-                // for "no live file references this chunk", instead of deleting on
-                // local age alone.
+                // Neither a bare `None` NOR a `Some(loc)` that excludes this node is
+                // proof the chunk is safe to delete — both just as easily mean this
+                // node's own local metadata hasn't caught up (e.g. after a leadership
+                // change, a metadata-replication backlog, or — confirmed live,
+                // 2026-07-10, staging gluster3 — a ChunkLocation record whose node
+                // list is simply stale relative to the leader's) while the chunk is
+                // still legitimately live, including on THIS node. A previous version
+                // of this function fast-path-deleted the `Some(loc) not listing us`
+                // case locally, trusting its own possibly-stale record as
+                // authoritative with no leader round trip — same node-local-view-as-
+                // cluster-truth disease as bugs 6/8/9, just unaudited here. Caught
+                // deleting a real, needed 2nd-of-2 replica the leader's own record
+                // still listed this exact node as holding, dropping it to
+                // under-replicated. Route every case uniformly through the same
+                // leader-confirm + cluster-stability gate below instead of deleting
+                // on local metadata alone.
                 if loc_record.is_some() && live_chunks.contains(chunk_id) {
                     kept += 1;
                     continue;
@@ -1309,18 +1283,18 @@ impl HealingManager {
                 live_file_candidates.push((*chunk_id, age_secs));
             }
 
-            Ok::<_, anyhow::Error>((deleted, kept, too_recent, chunks.len(), live_file_candidates))
+            Ok::<_, anyhow::Error>((kept, chunks.len(), live_file_candidates))
         }).await;
 
-        let (deleted, kept, too_recent, total, live_file_candidates) = match result {
+        let (kept, total, live_file_candidates) = match result {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => { warn!("Disk orphan sweep error: {}", e); return; }
             Err(e) => { warn!("Disk orphan sweep panicked: {}", e); return; }
         };
 
-        if deleted > 0 || too_recent > 0 {
-            info!("Disk orphan sweep: {} local chunks checked — {} orphans deleted, {} kept (legitimately ours), {} too recent",
-                  total, deleted, kept, too_recent);
+        if !live_file_candidates.is_empty() {
+            info!("Disk orphan sweep: {} local chunks checked — {} kept (legitimately ours), {} candidates routed to leader-confirm gate",
+                  total, kept, live_file_candidates.len());
         } else {
             debug!("Disk orphan sweep: {} chunks checked, all accounted for", total);
         }

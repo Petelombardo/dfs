@@ -1744,6 +1744,25 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Get file metadata from cluster with optional conditional fetch
     /// Returns Ok(Some(metadata)) if found and modified, Ok(None) if not found, Err if error
     /// If if_modified_since is provided and metadata hasn't changed, returns Ok(None) with NotModified indicator
+    /// Ask the leader to restore a specific chunk's replica on a specific node,
+    /// bypassing the normal healer's capacity-aware (content-hash-seeded) target
+    /// selection — see HealChunkToNode's doc comment for why that matters here.
+    /// Fire-and-forget: callers spawn this so a slow/failed heal request never
+    /// adds latency to the write path it was triggered from. Best-effort only —
+    /// if this particular request is lost, the node stays in canonical_write_nodes'
+    /// miss-streak tracking and gets retried on the slot's next patch round anyway.
+    pub async fn heal_chunk_to_node(&self, chunk_id: ChunkId, target_node: dfs_common::NodeId, file_id: Option<FileId>) {
+        let request = Request::HealChunkToNode { chunk_id, target_node, file_id };
+        let leader = { *self.leader_addr.read().await };
+        let Some(leader_addr) = leader else {
+            warn!("heal_chunk_to_node: no known leader — cannot request restore of {} on {}", chunk_id, target_node);
+            return;
+        };
+        if let Err(e) = self.send_request(leader_addr, request).await {
+            warn!("heal_chunk_to_node: request to leader {} for chunk {} -> {} failed: {}", leader_addr, chunk_id, target_node, e);
+        }
+    }
+
     pub async fn get_file_metadata_conditional(&self, path: &str, if_modified_since: Option<u64>) -> Result<Option<FileMetadata>> {
         let request = Request::GetFileMetadataByPath {
             path: path.to_string(),

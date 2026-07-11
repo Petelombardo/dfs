@@ -325,6 +325,17 @@ impl ChunkSlot {
     }
 }
 
+/// Tracks one (chunk_idx, node) miss streak for canonical_write_nodes' time-based
+/// drop decision (see that field's doc comment). `first_missed_at` anchors the grace
+/// period; `last_heal_request_at` throttles how often a targeted restore gets
+/// re-requested for the same node while still within that window, so a hot chunk
+/// missing the same node on every round for 2 seconds doesn't fire dozens of
+/// redundant concurrent heal requests at it.
+struct MissTracker {
+    first_missed_at: std::time::Instant,
+    last_heal_request_at: Option<std::time::Instant>,
+}
+
 /// Per-inode write state: a set of chunk slots keyed by chunk index (file_offset / CHUNK_SIZE).
 /// This replaces the old linear append buffer, letting any offset land in the correct
 /// pre-determined slot without requiring sequential ordering from the kernel.
@@ -356,13 +367,21 @@ struct InodeWriteState {
     /// in metadata_cache and recent_chunk_writes. This prevents the ChunkStale cascade
     /// where alternating between different node pairs creates divergent chunk versions.
     canonical_write_nodes: HashMap<u64, Vec<dfs_common::NodeId>>,
-    /// Consecutive-miss streak per (chunk_idx, node) backing canonical_write_nodes's
-    /// update site — see that call site's doc comment. A node absent from one
-    /// MultiPatch round's result (e.g. it was mid-fold on the server and slower
-    /// than its peer this one time) must not be silently and permanently dropped
-    /// from future patch targeting; this bounds how many consecutive rounds a
-    /// node gets to catch back up before it's actually dropped.
-    canonical_node_miss_streak: HashMap<(u64, dfs_common::NodeId), u32>,
+    /// Miss tracking per (chunk_idx, node) backing canonical_write_nodes's update
+    /// site — see that call site's doc comment. A node absent from one MultiPatch
+    /// round's result (e.g. it was mid-fold on the server and slower than its peer
+    /// this one time) must not be silently and permanently dropped from future
+    /// patch targeting; this bounds how long a node gets to catch back up before
+    /// it's actually dropped.
+    ///
+    /// Time-based, not round-count-based (changed 2026-07-11 — see
+    /// MISS_STREAK_DROP_GRACE's doc comment for the incident this fixes): a hot
+    /// chunk under a rapid patch storm (e.g. qcow2 install traffic) can complete 5+
+    /// rounds in under 100ms, so a fixed consecutive-round cap gave a genuinely
+    /// healthy-but-momentarily-slower node no real time to catch up before being
+    /// permanently dropped — collapsing the chunk to RF=1 exactly when the write
+    /// load made recovering that redundancy matter most.
+    canonical_node_miss_streak: HashMap<(u64, dfs_common::NodeId), MissTracker>,
     /// Chunk index of the most recent write_at call. Used to detect when the caller
     /// jumps to a different chunk, so the previous chunk's partial slot can be flushed
     /// immediately rather than waiting for the timer.
@@ -2633,10 +2652,24 @@ impl FlushHandle {
                                 // Bounded by canonical_node_miss_streak so a node that's
                                 // genuinely gone (not just momentarily slow) doesn't get retried
                                 // — and pay a timeout — on every single patch for the rest of the
-                                // session; after MISS_STREAK_DROP_THRESHOLD consecutive rounds
-                                // without answering, drop it for real and let the healer's normal
+                                // session; after MISS_STREAK_DROP_GRACE elapses without it
+                                // answering, drop it for real and let the healer's normal
                                 // under-RF detection be the path back, same as before this fix.
-                                const MISS_STREAK_DROP_THRESHOLD: u32 = 5;
+                                //
+                                // Time-based, not a fixed round count (changed 2026-07-11): a real
+                                // incident on a hot qcow2-install chunk showed 5 consecutive rounds
+                                // completing in 78ms — nowhere near enough time for a targeted
+                                // restore's push+verify round-trip to land, let alone for a node
+                                // that's merely a few dozen ms slower to fold under load to catch
+                                // back up. A round-count cap punishes exactly the chunks under the
+                                // heaviest write load hardest, dropping a healthy node's replica
+                                // right when the RF actually mattered most, and the chunk_map's
+                                // own RCL registration never gets a second contributor again for
+                                // the rest of the session. A wall-clock grace period adapts
+                                // naturally to chunk hotness instead.
+                                const MISS_STREAK_DROP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+                                const HEAL_REQUEST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+                                let now = std::time::Instant::now();
                                 let previous = state.canonical_write_nodes.get(&chunk_idx).cloned().unwrap_or_default();
                                 let mut merged = new_location.nodes.clone();
                                 for node in &previous {
@@ -2644,15 +2677,45 @@ impl FlushHandle {
                                         state.canonical_node_miss_streak.remove(&(chunk_idx, *node));
                                         continue;
                                     }
-                                    let streak = state.canonical_node_miss_streak
-                                        .entry((chunk_idx, *node)).or_insert(0);
-                                    *streak += 1;
-                                    if *streak < MISS_STREAK_DROP_THRESHOLD {
+                                    let tracker = state.canonical_node_miss_streak
+                                        .entry((chunk_idx, *node))
+                                        .or_insert(MissTracker { first_missed_at: now, last_heal_request_at: None });
+                                    let missing_for = now.duration_since(tracker.first_missed_at);
+                                    if missing_for < MISS_STREAK_DROP_GRACE {
                                         merged.push(*node);
+                                        // Ask the leader to restore this exact node's replica of
+                                        // the CURRENT chunk_id now, rather than just hoping it
+                                        // reappears on a future round or waiting for the healer's
+                                        // own scan cycle (which can't keep pace with a hot chunk
+                                        // that's superseded every few hundred ms — see the
+                                        // RF=1-cascade investigation, 2026-07-11). Targets this
+                                        // specific node (not a re-derived candidate) so the slot's
+                                        // replica set actually converges instead of chasing a
+                                        // different node on every generation. Fire-and-forget:
+                                        // must not add latency to this patch round. Throttled to
+                                        // at most one in flight per HEAL_REQUEST_MIN_INTERVAL —
+                                        // a hot chunk can complete a dozen rounds within the grace
+                                        // window, and firing a fresh heal request on every single
+                                        // one just piles up redundant concurrent pushes racing each
+                                        // other for the same target.
+                                        let should_request = tracker.last_heal_request_at
+                                            .map(|t| now.duration_since(t) >= HEAL_REQUEST_MIN_INTERVAL)
+                                            .unwrap_or(true);
+                                        if should_request {
+                                            tracker.last_heal_request_at = Some(now);
+                                            warn!("canonical_write_nodes: node {} missing for ino={} chunk={} (missing_for={:?}) — requesting targeted restore of {} on that node",
+                                                node, ino, chunk_idx, missing_for, new_location.chunk_id);
+                                            let heal_client = self.client.clone();
+                                            let heal_node = *node;
+                                            let heal_chunk_id = new_location.chunk_id;
+                                            tokio::spawn(async move {
+                                                heal_client.heal_chunk_to_node(heal_chunk_id, heal_node, Some(effective_file_id)).await;
+                                            });
+                                        }
                                     } else {
                                         info!("canonical_write_nodes: dropping node {} for ino={} chunk={} \
-                                               after {} consecutive missed patch rounds",
-                                            node, ino, chunk_idx, streak);
+                                               after missing for {:?}",
+                                            node, ino, chunk_idx, missing_for);
                                         state.canonical_node_miss_streak.remove(&(chunk_idx, *node));
                                     }
                                 }

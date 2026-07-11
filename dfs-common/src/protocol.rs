@@ -319,6 +319,19 @@ pub enum Request {
         locations: Vec<ChunkLocation>,
     },
 
+    /// Targeted, immediate heal: copy `chunk_id` to `target_node` specifically, instead
+    /// of the normal healer's capacity-aware candidate selection (which is seeded from
+    /// the chunk's content hash and so can pick a different node on every fold
+    /// generation of the same slot). Sent by a client that already knows, from its own
+    /// `canonical_write_nodes` tracking, exactly which node a chunk_idx's replica
+    /// dropped out from — restoring to that same expected node instead of an
+    /// independently re-derived one. See handle_heal_chunk_to_node's doc comment.
+    HealChunkToNode {
+        chunk_id: ChunkId,
+        target_node: NodeId,
+        file_id: Option<FileId>,
+    },
+
     /// Broadcast a completed background fold's token→real-chunk redirect to every
     /// other online node (deferred chunk-patch consolidation — see PATCH_STATE_TABLE
     /// in metadata.rs). PATCH_STATE_TABLE is otherwise node-local and never

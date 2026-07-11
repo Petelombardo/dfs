@@ -515,17 +515,6 @@ fn parse_delta_records(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
 /// chunk_prefetch fast path) — only meaningful for a single-call apply, so folds
 /// (which always need the fully-composed base freshly assembled from the chain) pass
 /// None.
-///
-/// `loc_seed`, when Some, provides the `nodes`/`file_offset` to carry forward into
-/// the new ChunkLocation instead of looking them up from `old_chunk_id`'s own
-/// CHUNK_TABLE entry. This matters for the overlay fold: `old_chunk_id` there is
-/// `chain.original_base_chunk_id`, whose ChunkLocation was deleted the moment the
-/// *first* overlay layer superseded it (apply_patch's cheap path unconditionally
-/// deletes the chunk_id it just superseded) — by fold time, arbitrarily later, that
-/// row is long gone. The caller instead seeds this from the chain's current (still
-/// valid — nothing else can supersede it while the fold holds the per-slot lock)
-/// head's own ChunkLocation. The chunk_idx=None fallback caller passes None, since
-/// that path never has an intermediate row deleted out from under it.
 async fn full_rewrite_chunk(
     storage: Arc<ChunkStorage>,
     metadata: Arc<MetadataStore>,
@@ -535,7 +524,6 @@ async fn full_rewrite_chunk(
     old_chunk_id: ChunkId,
     patches: Vec<(usize, Vec<u8>)>,
     prefetched: Option<Arc<Vec<u8>>>,
-    loc_seed: Option<ChunkLocation>,
     local_node_id: NodeId,
 ) -> Result<(ChunkId, usize, Arc<Vec<u8>>), (String, ErrorCode)> {
     let old_path = storage.get_chunk_path(&old_chunk_id);
@@ -623,8 +611,19 @@ async fn full_rewrite_chunk(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let old_loc = metadata.get_chunk_location(&old_chunk_id).ok().flatten().or(loc_seed);
-        if let Some(old_loc) = old_loc {
+        {
+            // Register unconditionally — do NOT gate this on finding old_chunk_id's
+            // own ChunkLocation (previously via `metadata.get_chunk_location(&old_chunk_id)
+            // .ok().flatten().or(loc_seed)`, both of which can legitimately come back
+            // None: apply_patch always deletes real_base's ChunkLocation synchronously
+            // before handing off here, per this function's own doc comment above, and
+            // loc_seed isn't guaranteed on every call path). Every field new_loc needs
+            // below is already independently available — chunk_file_offset is this
+            // function's own parameter — so there's no remaining reason to skip
+            // registration when that lookup fails. Confirmed live (2026-07-11): a fold
+            // output chunk with this exact shape had zero CHUNK_TABLE records on any of
+            // 5 nodes (registration never ran at all), causing a real VM disk read EIO.
+            //
             // nodes: [local_node_id] only — NOT old_loc.nodes carried forward
             // (tried 2026-07-10, reverted same day after it caused a real T28
             // data-loss regression: appending onto whatever the prior token's
@@ -655,7 +654,21 @@ async fn full_rewrite_chunk(
                 nodes: vec![local_node_id],
                 size: final_size,
                 checksum: new_chunk_id.hash,
-                file_offset: old_loc.file_offset,
+                // Use the caller-supplied chunk_file_offset directly rather than
+                // inheriting old_loc.file_offset. old_loc's own lookup can come
+                // back with file_offset already None (e.g. it was itself a prior
+                // fold generation that hit this same gap, or loc_seed didn't carry
+                // one) — inheriting None here produces a ChunkLocation with no
+                // reliable chunk_idx, which chunk_map_update_location_for_file's
+                // index-based fast path can never find-and-replace later. It just
+                // gets pushed as an unfindable floating entry (see its "legacy
+                // path" fallback), silently orphaning this fold's real, newer
+                // content behind whatever stale entry the file's chunk_idx slot
+                // still holds. chunk_file_offset is always the correct,
+                // boundary-aligned position for this chunk — it's this function's
+                // own parameter, not a derived/optional value, so there's no
+                // reason to route through a lookup that can fail.
+                file_offset: Some(chunk_file_offset),
                 written_at: Some(now_secs),
                 client_write_seq: None,
                 file_id: Some(file_id),
@@ -829,13 +842,6 @@ impl OverlayForkCtx {
             Err(e) => { warn!("single fold: corrupt delta chunk {}: {}", delta_chunk_id, e); return false; }
         };
 
-        // base_chunk_id's own ChunkLocation was deleted the moment apply_patch
-        // registered public_token as the slot's current identity — seed
-        // nodes/file_offset from public_token's own ChunkLocation instead: it's
-        // still valid (nothing can supersede it while this fold holds the
-        // per-slot lock) and carries the same nodes/file_offset base_chunk_id did.
-        let loc_seed = self.metadata.get_chunk_location_async(public_token).await.ok().flatten();
-
         // Consult the ring before paying for a disk read: a hot slot folds
         // through a chain of chunk_ids (each fold's output becomes the next
         // accumulator's base), and the ring gets seeded with exactly this
@@ -855,7 +861,6 @@ impl OverlayForkCtx {
             base_chunk_id,
             patches,
             ring_prefetched,
-            loc_seed,
             self.cluster.local_node_id(),
         ).await;
 
@@ -1930,8 +1935,26 @@ impl Server {
                 return;
             }
         }
-        locs.push(location.clone());
-        self.chunk_to_file.insert(location.chunk_id, file_id);
+        // No file_offset and no exact chunk_id match: this entry can't be placed at
+        // any chunk_idx, and pushing it anyway would create an unfindable floating
+        // row — nothing else in this Vec is matched by chunk_id once it's in here
+        // (the fast path above requires file_offset), so it can never be
+        // found-and-replaced by a later, properly-offset update for the same slot.
+        // Confirmed live (2026-07-11, T28 investigation): full_rewrite_chunk's fold
+        // output used to reach here whenever its old_loc lookup came back without
+        // an offset, and the resulting floating entries accumulated across fold
+        // generations while the real newest content silently stopped being
+        // reachable via the chunk_idx-keyed read path — a live data-loss bug now
+        // fixed at its source (full_rewrite_chunk always supplies its own
+        // chunk_file_offset parameter instead of inheriting one that can be
+        // missing). Any offset-less location reaching here now is expected to be
+        // superseded by that chunk's next properly-offset update (client's own
+        // metadata push via chunk_map_update, or a corrected fold), matching
+        // chunk_map_update's own "drop file_offset:None before it enters chunk_map"
+        // rule — dropping here instead of pushing keeps both mutation paths into
+        // chunk_map consistent.
+        debug!("[CHUNK_MAP] file={:?} chunk_id={} dropping unplaceable file_offset=None entry (no chunk_idx, no exact chunk_id match)",
+               file_id, location.chunk_id);
     }
 
     /// Remove a file from the chunk map (on deletion).
@@ -2831,6 +2854,9 @@ impl Server {
             }
             Request::ReplicateChunkLocations { locations } => {
                 self.handle_replicate_chunk_locations(locations).await
+            }
+            Request::HealChunkToNode { chunk_id, target_node, file_id } => {
+                self.handle_heal_chunk_to_node(chunk_id, target_node, file_id).await
             }
             Request::ReplicatePatchFold { public_token, real_chunk_id, file_id, chunk_idx } => {
                 self.handle_replicate_patch_fold(public_token, real_chunk_id, file_id, chunk_idx).await
@@ -3956,6 +3982,128 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Targeted, immediate heal: copy `chunk_id` to `target_node` specifically.
+    ///
+    /// Distinct from the normal healer (queue_chunks_immediate / do_heal_chunk_inner),
+    /// which picks target nodes via get_nodes_with_capacity_awareness — seeded from the
+    /// chunk's own content hash, so it can (and does) pick a *different* node on every
+    /// fold generation of the same (file_id, chunk_idx) slot. That's fine for ordinary
+    /// under-replication, but wrong for this case: the caller (a client, via its own
+    /// canonical_write_nodes tracking) already knows exactly which specific node this
+    /// slot's replica dropped out from a moment ago, and restoring to a *different* node
+    /// each time would never let that slot's replica set stabilize during an active
+    /// patch storm — see the RF=1-cascade investigation this closes (2026-07-11).
+    ///
+    /// Deliberately minimal compared to do_heal_chunk_inner: no capacity-aware candidate
+    /// selection, no per-node concurrency throttling. This is a low-volume, targeted
+    /// repair triggered by a specific detected gap, not a bulk scan — the healer's own
+    /// machinery is built for the latter.
+    async fn handle_heal_chunk_to_node(&self, chunk_id: ChunkId, target_node: NodeId, file_id: Option<FileId>) -> Response {
+        let Ok(Some(location)) = self.metadata.get_chunk_location_async(chunk_id).await else {
+            debug!("HealChunkToNode: {} has no current location — likely already superseded, skipping", chunk_id);
+            return Response::Ok { data: None };
+        };
+        if location.nodes.contains(&target_node) {
+            debug!("HealChunkToNode: {} already lists {} — nothing to do", chunk_id, target_node);
+            return Response::Ok { data: None };
+        }
+        let Some(target_info) = self.cluster.get_node(&target_node).await else {
+            warn!("HealChunkToNode: target node {} not found in cluster registry — skipping", target_node);
+            return Response::Ok { data: None };
+        };
+        let local_id = self.cluster.local_node_id();
+        let source: Option<(NodeId, std::net::SocketAddr)> = if location.nodes.contains(&local_id) && self.storage.has_chunk(&chunk_id) {
+            self.cluster.get_node(&local_id).await.map(|info| (local_id, info.addr))
+        } else {
+            let mut picked = None;
+            for id in &location.nodes {
+                if let Some(info) = self.cluster.get_node(id).await {
+                    picked = Some((*id, info.addr));
+                    break;
+                }
+            }
+            picked
+        };
+        let Some((source_id, source_addr)) = source else {
+            warn!("HealChunkToNode: no reachable source node for {} (recorded nodes: {:?}) — cannot restore replica on {}",
+                  chunk_id, location.nodes, target_node);
+            return Response::Ok { data: None };
+        };
+
+        warn!("[RF-restore] chunk {} on file {:?}: replica missing on expected node {} — restoring from {} now",
+              chunk_id, file_id, target_node, source_id);
+
+        let push_req = Request::PushChunkTo { chunk_id, target_addr: target_info.addr, leader_id: local_id };
+        let push_ok = matches!(
+            self.client.send_message_timeout(source_addr, Message::Request(push_req), std::time::Duration::from_secs(90)).await,
+            Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
+        );
+        if !push_ok {
+            warn!("[RF-restore] chunk {} push from {} to {} ({}) failed", chunk_id, source_id, target_node, target_info.addr);
+            return Response::Ok { data: None };
+        }
+
+        let verify_req = Request::HasChunks { chunk_ids: vec![chunk_id] };
+        let confirmed = match self.client.send_message(target_info.addr, Message::Request(verify_req)).await {
+            Ok(env) => matches!(
+                env.message,
+                Message::Response(Response::BoolVec { ref values }) if values.first().copied().unwrap_or(false)
+            ),
+            Err(e) => {
+                warn!("[RF-restore] chunk {} post-push verification on {} failed: {}", chunk_id, target_node, e);
+                false
+            }
+        };
+        if !confirmed {
+            warn!("[RF-restore] chunk {} push to {} reported success but target does not confirm having it — not recording replica", chunk_id, target_node);
+            return Response::Ok { data: None };
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut updated_nodes = location.nodes.clone();
+        updated_nodes.push(target_node);
+        let updated_location = ChunkLocation { nodes: updated_nodes, written_at: Some(now_ms), ..location };
+        if let Err(e) = self.metadata.put_chunk_location_async(updated_location.clone()).await {
+            warn!("[RF-restore] chunk {} restored on {} but failed to persist updated location: {}", chunk_id, target_node, e);
+            return Response::Ok { data: None };
+        }
+        if let Some(fid) = file_id {
+            self.chunk_map_update_location_for_file(fid, &updated_location).await;
+        }
+
+        // Broadcast to every other online node, same pattern as run_single_fold's
+        // own post-registration broadcast — mirrored here rather than reusing
+        // HealingManager's broadcast_chunk_location_shared, which isn't reachable
+        // from Server.
+        {
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            let broadcast_loc = updated_location.clone();
+            tokio::spawn(async move {
+                let nodes = cluster.get_all_nodes().await;
+                let local_id = cluster.local_node_id();
+                for node in nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let request = Request::ReplicateChunkLocation {
+                        location: broadcast_loc.clone(), file_id: broadcast_loc.file_id,
+                    };
+                    if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
+                        warn!("[RF-restore] failed to broadcast restored location {} to node {}: {}", broadcast_loc.chunk_id, node.id, e);
+                    }
+                }
+            });
+        }
+
+        info!("[RF-restore] chunk {} on file {:?}: replica restored on {} (now {} node(s))",
+              chunk_id, file_id, target_node, updated_location.nodes.len());
+        Response::Ok { data: None }
     }
 
     /// Handle purge chunk location — remove an orphaned chunk: routing record.
@@ -6954,7 +7102,7 @@ impl Server {
             );
             let (new_chunk_id, size, buf) = full_rewrite_chunk(
                 self.storage.clone(), self.metadata.clone(), self.chunk_io_locks.clone(),
-                file_id, chunk_file_offset, chunk_id, patches, prefetched, None,
+                file_id, chunk_file_offset, chunk_id, patches, prefetched,
                 self.cluster.local_node_id(),
             ).await?;
             if new_chunk_id != chunk_id {
@@ -7268,7 +7416,23 @@ impl Server {
             // already registered under the previous public_token in this same
             // accumulation cycle; update_chunk_map_after_patch below still moves
             // it forward to the new token either way.
-            if let Ok(Some(old_loc)) = self.metadata.get_chunk_location_async(base_chunk_id).await {
+            {
+                // Register unconditionally — do NOT gate this on finding
+                // base_chunk_id's own ChunkLocation first. That lookup routinely
+                // comes back None by design (a prior patch generation may already
+                // have retired/deleted it, or this is the very first patch on a
+                // freshly-written chunk with no separate location record of its
+                // own yet), and skipping registration in that case leaves
+                // public_token completely unregistered anywhere — worse than the
+                // file_offset:None case below, since chunk_map_update_location_for_file
+                // never even sees an entry to drop. Confirmed live (2026-07-11):
+                // a chunk with this exact lineage shape had zero CHUNK_TABLE
+                // records on any of 5 nodes, causing a real VM disk read EIO.
+                // Every field new_loc needs is already available locally —
+                // chunk_file_offset is this function's own parameter, not
+                // something that needs to be inherited from a lookup that can
+                // fail.
+                //
                 // nodes: [local_node_id] only — see full_rewrite_chunk's identical
                 // fix for the full rationale. Carrying old_loc.nodes forward (even
                 // with the local node appended) makes the list grow monotonically
@@ -7286,7 +7450,7 @@ impl Server {
                     nodes: vec![self.cluster.local_node_id()],
                     size: needed_len,
                     checksum: public_token.hash,
-                    file_offset: old_loc.file_offset,
+                    file_offset: Some(chunk_file_offset),
                     written_at: Some(now_ms),
                     client_write_seq,
                     file_id: Some(file_id),
@@ -9145,6 +9309,25 @@ impl Server {
             // fix (see max_chunk_idx's comment above for the same root cause).
             window.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
 
+            // DIAGNOSTIC (T28 investigation): detect and dump duplicate/colliding
+            // chunk_idx entries in what's about to be served, to find the exact
+            // source of "got N chunks, total=M" where N > M.
+            {
+                use std::collections::HashMap as StdHashMap;
+                let mut by_idx: StdHashMap<u64, Vec<&dfs_common::ChunkLocation>> = StdHashMap::new();
+                for l in &window {
+                    let idx = l.file_offset.map(|o| o / CHUNK_SIZE).unwrap_or(0);
+                    by_idx.entry(idx).or_default().push(l);
+                }
+                for (idx, group) in by_idx.iter() {
+                    if group.len() > 1 {
+                        for l in group {
+                            warn!("[CHUNK_MAP dup] file={:?} idx={} chunk_id={} file_offset={:?} client_write_seq={:?} written_at={:?} size={}",
+                                  file_id, idx, l.chunk_id, l.file_offset, l.client_write_seq, l.written_at, l.size);
+                        }
+                    }
+                }
+            }
             Response::FileChunkMap {
                 file_id,
                 locations: window,
@@ -10496,7 +10679,7 @@ mod tests {
             ref_storage.write_chunk(&original_chunk_id, &original_data).unwrap();
             let (reference_chunk_id, _size, _buf) = full_rewrite_chunk(
                 ref_storage.clone(), ref_metadata.clone(), chunk_io_locks.clone(),
-                file_id, chunk_file_offset, original_chunk_id, vec![patch.clone()], None, None,
+                file_id, chunk_file_offset, original_chunk_id, vec![patch.clone()], None,
                 NodeId::new(),
             ).await.unwrap();
             let reference_bytes = ref_storage.read_chunk(&reference_chunk_id).unwrap();

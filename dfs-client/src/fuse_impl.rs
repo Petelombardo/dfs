@@ -425,20 +425,42 @@ impl InodeWriteState {
             let intra = Self::intra_offset(cur_offset);
 
             // Cross-chunk pattern change: if this write lands in a different chunk than
-            // the last one, the previous chunk's slot has been abandoned mid-fill.
+            // the last one, the previous chunk's slot MAY have been abandoned mid-fill.
             // Signal an immediate flush so its buffered data doesn't wait for the timer.
             // Also mark the slot `abandoned` — a stronger, event-driven signal than
             // pattern_changed's notify_one() wake-up alone, which only wakes the ticker
             // without giving it a way to treat this slot as eligible regardless of
             // no_active_writers. See `abandoned`'s doc comment.
+            //
+            // Guarded by concurrent_streams: last_written_chunk is a single global
+            // cursor over ALL write_at() calls for this inode, so a multi-threaded
+            // writer (e.g. pbs-restore's 4 concurrent restore threads, or qemu-img
+            // convert) that interleaves writes across several chunks at once makes
+            // *every* call look like a "jump" — even though prev_idx's own writer
+            // hasn't actually moved on and still has more real data coming. Root-caused
+            // 2026-07-11 via a live Proxmox qcow2 restore: chunk 261 was abandoned and
+            // flushed (zero-filling its still-unwritten first 458752 bytes as if they
+            // were a legitimate sparse gap) ~1ms after an unrelated write landed in
+            // chunk 262 from a different restore thread — then ~100ms later, real
+            // (non-zero) data for that exact "gap" arrived, proving it was never sparse.
+            // If any OTHER slot already has real unflushed data pending, that's a
+            // concurrent multi-region writer, not a single sequential stream moving on —
+            // fall back to the existing 50ms is_idle() ticker instead of flushing now.
             if let Some(prev_idx) = self.last_written_chunk {
                 if prev_idx != idx {
-                    if let Some(prev_slot) = self.slots.get_mut(&prev_idx) {
-                        if (prev_slot.real_data_end > 0 || prev_slot.gap_filled_prefix > 0)
-                            && !prev_slot.flushing
-                        {
-                            pattern_changed = true;
-                            prev_slot.abandoned = true;
+                    let concurrent_streams = self.slots.iter().any(|(&other_idx, s)| {
+                        other_idx != prev_idx
+                            && (s.real_data_end > 0 || s.gap_filled_prefix > 0)
+                            && !s.flushing
+                    });
+                    if !concurrent_streams {
+                        if let Some(prev_slot) = self.slots.get_mut(&prev_idx) {
+                            if (prev_slot.real_data_end > 0 || prev_slot.gap_filled_prefix > 0)
+                                && !prev_slot.flushing
+                            {
+                                pattern_changed = true;
+                                prev_slot.abandoned = true;
+                            }
                         }
                     }
                 }

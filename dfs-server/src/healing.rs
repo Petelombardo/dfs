@@ -595,7 +595,6 @@ impl HealingManager {
             disk_sweep_counter += 1;
             if disk_sweep_counter >= 2 {
                 disk_sweep_counter = 0;
-                self.wait_for_write_quiet("Disk orphan sweep").await;
                 self.run_disk_orphan_sweep().await;
             }
 
@@ -1158,53 +1157,6 @@ impl HealingManager {
         }
     }
 
-    /// Defer a heavy maintenance scan (phantom reconciliation, disk orphan
-    /// sweep) by up to MAX_WAIT if the cluster has very recent write activity.
-    /// Both scans fan out over every live/local chunk — tens of thousands on a
-    /// cluster with real data — and running one straight into a write burst
-    /// measurably degrades live write latency and correctness (RPC/lock/CPU
-    /// contention on the same nodes servicing the writes). Real 2026-07-11
-    /// incident: a scheduled phantom-reconciliation pass fired "verifying
-    /// presence for 80337 chunks" 8 seconds before a staging fio+fsck repro's
-    /// write storm started, and that repro run failed with the same class of
-    /// "no registered location"/EIO errors seen elsewhere today; a disk-orphan
-    /// sweep of 56672 chunks fired in the same window on another node.
-    /// last_cluster_write_ms was already being maintained cluster-wide for
-    /// exactly this purpose (see its own doc comment) but nothing actually
-    /// read it before this.
-    ///
-    /// Bounded, not indefinite — a genuinely continuously-busy cluster (e.g.
-    /// the DVR service's own steady recording traffic) must not starve these
-    /// scans forever; after MAX_WAIT this proceeds regardless of ongoing
-    /// writes.
-    async fn wait_for_write_quiet(&self, scan_name: &str) {
-        const QUIET_THRESHOLD: Duration = Duration::from_secs(3);
-        const POLL_INTERVAL: Duration = Duration::from_secs(1);
-        const MAX_WAIT: Duration = Duration::from_secs(30);
-
-        let deadline = std::time::Instant::now() + MAX_WAIT;
-        loop {
-            let last_write_ms = self.last_cluster_write_ms.load(std::sync::atomic::Ordering::Relaxed);
-            if last_write_ms == 0 {
-                return; // no write activity ever recorded — nothing to wait for
-            }
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let since_last_write = Duration::from_millis(now_ms.saturating_sub(last_write_ms));
-            if since_last_write >= QUIET_THRESHOLD {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                info!("{}: proceeding after {}s despite recent write activity — cluster appears \
-                       continuously busy, not deferring indefinitely", scan_name, MAX_WAIT.as_secs());
-                return;
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    }
-
     /// Background loop for run_phantom_reconciliation_pass(). Runs on a fixed
     /// interval (default 10 minutes, DFS_PHANTOM_RECONCILE_INTERVAL_SECS override)
     /// regardless of the discovery loop's own cadence.
@@ -1218,7 +1170,6 @@ impl HealingManager {
         loop {
             timer.tick().await;
             if self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                self.wait_for_write_quiet("Phantom reconciliation").await;
                 self.run_phantom_reconciliation_pass().await;
             }
         }

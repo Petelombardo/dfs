@@ -1042,16 +1042,65 @@ impl OverlayForkCtx {
                     {
                         continue;
                     }
-                    let request = Request::ReplicateChunkLocation { location: new_loc.clone(), file_id: new_loc.file_id };
-                    if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
-                        warn!("single fold: failed to broadcast new location {} to node {}: {}", new_chunk_id, node.id, e);
-                    }
-                    let fold_request = Request::ReplicatePatchFold {
-                        public_token, real_chunk_id: new_chunk_id, file_id, chunk_idx,
-                    };
-                    if let Err(e) = client.send_message(node.addr, Message::Request(fold_request)).await {
-                        warn!("single fold: failed to broadcast patch fold {} -> {} to node {}: {}", public_token, new_chunk_id, node.id, e);
-                    }
+                    // Retried/durable, not fire-and-forget: this was a single
+                    // best-effort send per node with only a warn! on failure — a
+                    // real incident (2026-07-11) found two peers stuck at 1
+                    // replica of a stable, unchanging chunk indefinitely because
+                    // this one-shot send failed to exactly those two nodes and
+                    // was never retried (confirmed via server logs: a THIRD node
+                    // received and durably merged the same broadcast fine). The
+                    // most likely cause: redb compaction can make a node's
+                    // metadata store briefly (1-2s) unavailable during heavy
+                    // write load (e.g. an OS install), which is exactly when
+                    // this broadcast is most likely to fire and most needed to
+                    // land. One spawned retry loop per node so a slow/retrying
+                    // node doesn't hold up delivery to the others — each node
+                    // was already being visited in its own loop iteration here,
+                    // this just makes that iteration's work independently retried
+                    // instead of a single unguarded attempt.
+                    let client = client.clone();
+                    let new_loc = new_loc.clone();
+                    let node_addr = node.addr;
+                    let node_id = node.id;
+                    tokio::spawn(async move {
+                        const ATTEMPTS: u8 = 4;
+                        const PER_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+                        const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+                        let mut loc_ok = false;
+                        let mut fold_ok = false;
+                        for attempt in 0..ATTEMPTS {
+                            if !loc_ok {
+                                let request = Request::ReplicateChunkLocation { location: new_loc.clone(), file_id: new_loc.file_id };
+                                loc_ok = matches!(
+                                    tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client.send_message(node_addr, Message::Request(request))).await,
+                                    Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
+                                );
+                            }
+                            if !fold_ok {
+                                let fold_request = Request::ReplicatePatchFold {
+                                    public_token, real_chunk_id: new_chunk_id, file_id, chunk_idx,
+                                };
+                                fold_ok = matches!(
+                                    tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client.send_message(node_addr, Message::Request(fold_request))).await,
+                                    Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
+                                );
+                            }
+                            if loc_ok && fold_ok {
+                                return;
+                            }
+                            if attempt + 1 < ATTEMPTS {
+                                tokio::time::sleep(RETRY_BACKOFF).await;
+                            }
+                        }
+                        if !loc_ok {
+                            warn!("single fold: failed to broadcast new location {} to node {} after {} attempts",
+                                new_chunk_id, node_id, ATTEMPTS);
+                        }
+                        if !fold_ok {
+                            warn!("single fold: failed to broadcast patch fold {} -> {} to node {} after {} attempts",
+                                public_token, new_chunk_id, node_id, ATTEMPTS);
+                        }
+                    });
                 }
             });
         } else {
@@ -4967,18 +5016,36 @@ impl Server {
                     let node_id = node.id;
                     let chunk_id_clone = chunk_id;
 
-                    // Fire-and-forget: spawn individual replication tasks
+                    // Retried/durable, not a single fire-and-forget attempt — same
+                    // fix and rationale as run_single_fold's peer broadcast
+                    // (2026-07-11): a transient failure here (e.g. redb compaction
+                    // making the receiving node's metadata store briefly
+                    // unavailable during heavy write load) previously meant that
+                    // node permanently missed this chunk's location, with only a
+                    // warn! log and no retry.
                     tokio::spawn(async move {
-                        info!("Sending chunk location {} to node {}", chunk_id_clone, node_id);
-                        let request = Request::ReplicateChunkLocation {
-                            location: location_clone,
-                            file_id: None,
-                        };
-
-                        if let Err(e) = client_clone.send_message(node_addr, Message::Request(request)).await {
-                            warn!("Failed to replicate chunk location {} to node {}: {}", chunk_id_clone, node_id, e);
-                        } else {
-                            info!("Successfully sent chunk location {} to node {}", chunk_id_clone, node_id);
+                        const ATTEMPTS: u8 = 4;
+                        const PER_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+                        const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+                        let mut ok = false;
+                        for attempt in 0..ATTEMPTS {
+                            let request = Request::ReplicateChunkLocation {
+                                location: location_clone.clone(),
+                                file_id: None,
+                            };
+                            ok = matches!(
+                                tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client_clone.send_message(node_addr, Message::Request(request))).await,
+                                Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
+                            );
+                            if ok {
+                                break;
+                            }
+                            if attempt + 1 < ATTEMPTS {
+                                tokio::time::sleep(RETRY_BACKOFF).await;
+                            }
+                        }
+                        if !ok {
+                            warn!("Failed to replicate chunk location {} to node {} after {} attempts", chunk_id_clone, node_id, ATTEMPTS);
                         }
                     });
                 }

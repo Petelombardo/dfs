@@ -3755,6 +3755,224 @@ echo "  T50: dfs-admin reports chunk 0 size=$T50_CHUNK0_SIZE (expect 4194304)"
 rm -f "$T50_FILE" "$T50_LOCAL"
 fi # should_run T50
 
+# ── Test 51: leader restart mid-patch-storm must not lose chunk data ──────────
+#
+# Repro for a real 2026-07-11 staging incident (fio+fsck repro on server3): the
+# leader (gluster1) hit "redb compact_db() exceeded 60s — exclusive metadata
+# write lock is permanently wedged" and self-restarted. For the ~16s it was
+# down, every other node logged "Failed to connect" to it, and the CLIENT's
+# concurrent MultiPatch calls to hot chunks — which target 2 replicas, one of
+# which was often the leader itself (it's an ordinary storage replica too, not
+# just a coordinator) — silently degraded to "(1 replicas, ...)" instead of
+# failing outright. The client accepted that 1-of-2 result and kept chaining
+# further patches on top of it with no verification the surviving replica
+# actually persisted durably and no attempt to restore real replication. End
+# state: a chunk_id with ZERO CHUNK_TABLE records on any of the 5 nodes —
+# including the one that supposedly "succeeded" — surfacing later as a hard
+# EIO on read (e2fsck: "Input/output error reading journal superblock").
+#
+# This test reproduces the mechanism directly: sustained concurrent patches to
+# non-overlapping slots of one hot chunk, with the current leader killed and
+# restarted partway through (same kill/relaunch shape T45 already uses for its
+# own node-restart test). Verifies both immediately after (in-memory/cache
+# could mask real loss) and after a cold client restart (the real incident's
+# corruption only surfaced on a fresh read, once cache no longer masked it).
+if should_run T51; then
+snapshot_log T51
+echo ""
+echo "=== T51: leader restart mid-patch-storm must not lose chunk data ==="
+
+T51_IMG="$MOUNT/t51_disk.img"
+T51_PATCH_SIZE=4096
+T51_DURATION=8          # seconds of sustained patch storm
+T51_CONCURRENCY=6
+
+echo "  Writing 4MB base chunk..."
+dd if=/dev/urandom of="$T/t51_base.bin" bs=4M count=1 2>/dev/null
+cp "$T/t51_base.bin" "$T51_IMG"
+dfs_sync
+
+echo "  Launching sustained patch storm (${T51_DURATION}s, $T51_CONCURRENCY concurrent workers)..."
+T51_STOP="$T/t51_stop_$$"
+rm -f "$T51_STOP"
+T51_LOGDIR="$T/t51_jobs_$$"
+mkdir -p "$T51_LOGDIR"
+
+# Each worker repeatedly patches its own dedicated non-overlapping 4KB slot
+# (65536B apart — comfortably non-overlapping) with an incrementing
+# sequence-tagged payload. After the storm, each slot must hold EXACTLY that
+# worker's *last* write — not zeros, not another worker's tag, not a
+# superseded intermediate sequence number.
+#
+# T51_WORKER_PIDS captures exactly these 6 subshell PIDs so the wait below can
+# target them specifically — a bare `wait` waits for ALL of this shell's
+# background jobs, which by the time we reach it also includes the relaunched
+# dfs-server daemon below (a long-lived process that never exits on its own),
+# hanging the test indefinitely. Real mistake made 2026-07-11 while first
+# writing this test: it ran for 15+ minutes before being caught and fixed.
+T51_WORKER_PIDS=()
+for w in $(seq 0 $((T51_CONCURRENCY-1))); do
+    (
+        seq_n=0
+        byte_off=$(( w * 65536 ))
+        while [ ! -f "$T51_STOP" ]; do
+            python3 -c "
+import os, sys
+img, byte_off, patch_size, worker, seq_n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+tag = ('T51_W%02d_S%06d_' % (worker, seq_n)).encode()
+data = (tag + bytes([worker % 256]) * (patch_size - len(tag)))[:patch_size]
+fd = os.open(img, os.O_WRONLY)
+os.lseek(fd, byte_off, 0)
+os.write(fd, data)
+os.close(fd)
+" "$T51_IMG" "$byte_off" "$T51_PATCH_SIZE" "$w" "$seq_n" 2>>"$T51_LOGDIR/err_$w" \
+                && echo "$seq_n" > "$T51_LOGDIR/last_$w"
+            seq_n=$((seq_n+1))
+            sleep 0.05
+        done
+    ) &
+    T51_WORKER_PIDS+=($!)
+done
+
+# Let the storm run for a couple seconds before disrupting the leader, so
+# there's real in-flight/steady-state traffic when it goes down — matches the
+# real incident (the leader crashed mid-fio-run, not at the very start).
+sleep 2
+
+# Kill the LEADER specifically, not just any replica. A single degraded
+# ("1 replicas") MultiPatch alone isn't enough to actually lose data — tried
+# that first, and the one surviving replica held up fine. The real incident
+# needed BOTH failures at once: the down node was an ordinary data replica
+# for the affected chunk (RF=3 in a 5-node cluster means the leader routinely
+# is one, degrading a dual-replica MultiPatch to "1 replicas") AND it was the
+# leader, the sole target for ReplicateChunkLocations delivery — so even the
+# one replica that DID succeed couldn't get its location durably confirmed
+# cluster-wide during the same outage window.
+T51_LEADER_ADDR=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json cluster status 2>/dev/null \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+online = [n for n in d.get('nodes', []) if n.get('status') == 'Online']
+online.sort(key=lambda n: n['id'])
+print(online[0]['address'] if online else '')
+" 2>/dev/null)
+T51_LEADER_PORT="${T51_LEADER_ADDR##*:}"
+T51_LEADER_NODE=$(( (T51_LEADER_PORT - 8900) + 1 ))
+echo "  Leader is node$T51_LEADER_NODE ($T51_LEADER_ADDR) — killing it mid-storm..."
+
+# SIGKILL, not the default SIGTERM: this codebase's SIGTERM handler does a
+# graceful drain (flushes pending writes before exiting — see
+# kill_client_and_wait's shutdown-drain counterpart on the server side),
+# which is exactly the safe path and would mask the bug. The real incident
+# was an ABRUPT crash — gluster1's own watchdog force-exited it after
+# detecting a wedged redb lock, with no graceful drain in its log — so a
+# clean SIGTERM restart here would not reproduce the same failure shape.
+pkill -9 -f "dfs-server start --config $BASE/node${T51_LEADER_NODE}/config.toml" 2>/dev/null || true
+
+# Stay down for a few real seconds — not an instant relaunch — so the storm
+# has a genuine window to hit in-flight writes against the dead leader
+# repeatedly, the same way the real incident's ~16s leader outage did.
+sleep 3
+
+RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node${T51_LEADER_NODE}/config.toml" \
+    >> "$LOG/server${T51_LEADER_NODE}.log" 2>&1 &
+
+# Storm keeps running through the outage and recovery — that's the whole
+# point: patches must survive a leader that's briefly completely unreachable.
+sleep $(( T51_DURATION - 2 ))
+
+touch "$T51_STOP"
+# Bounded wait on exactly the worker PIDs (not a bare `wait` — see
+# T51_WORKER_PIDS's doc comment). Well-behaved workers exit within one
+# 0.05s loop iteration of the stop file appearing; 15s is a generous safety
+# margin, with a hard kill -9 fallback so a genuinely wedged write() (e.g.
+# reproducing the underlying bug's hang shape rather than a clean EIO) can
+# never hang the suite — it shows up as a slot with no recorded last write
+# instead, which T51a already treats as a failure.
+T51_WAIT_DEADLINE=$(( $(date +%s) + 15 ))
+for pid in "${T51_WORKER_PIDS[@]}"; do
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$(date +%s)" -ge "$T51_WAIT_DEADLINE" ] && { kill -9 "$pid" 2>/dev/null; break; }
+        sleep 0.1
+    done
+done
+dfs_sync
+
+T51_MISMATCHES=0
+for w in $(seq 0 $((T51_CONCURRENCY-1))); do
+    last_seq=$(cat "$T51_LOGDIR/last_$w" 2>/dev/null || echo -1)
+    if [ "$last_seq" -lt 0 ]; then
+        echo "  worker $w: no successful patch ever recorded"
+        T51_MISMATCHES=$((T51_MISMATCHES+1))
+        continue
+    fi
+    byte_off=$(( w * 65536 ))
+    python3 -c "
+import sys
+img, byte_off, patch_size, worker, expected_seq = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+tag = ('T51_W%02d_S%06d_' % (worker, expected_seq)).encode()
+expected = (tag + bytes([worker % 256]) * (patch_size - len(tag)))[:patch_size]
+with open(img, 'rb') as f:
+    f.seek(byte_off)
+    actual = f.read(patch_size)
+sys.exit(0 if actual == expected else 1)
+" "$T51_IMG" "$byte_off" "$T51_PATCH_SIZE" "$w" "$last_seq" \
+        || { echo "  worker $w: slot content mismatch (expected seq $last_seq)"; T51_MISMATCHES=$((T51_MISMATCHES+1)); }
+done
+
+[ "$T51_MISMATCHES" -eq 0 ] \
+    && check "T51a all $T51_CONCURRENCY worker slots hold their last write after leader-restart storm" PASS \
+    || check "T51a $T51_MISMATCHES/$T51_CONCURRENCY worker slots corrupted/lost after leader-restart storm" FAIL
+
+# Cold-restart the client and re-verify — the real incident's corruption only
+# surfaced on read-back after a client restart (cache masked it beforehand).
+echo "  Restarting dfs-client (cold cache) to confirm durability, not just cache masking..."
+fusermount -u "$MOUNT" 2>/dev/null || true
+kill_client_and_wait "$CLIENT_PID2"
+T51_CLIENT_LOG="$LOG/client_t51.log"
+RUST_LOG=info "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
+    --log-file "$T51_CLIENT_LOG" --allow-other --log-level debug &
+CLIENT_PID2=$!
+CURRENT_CLIENT_LOG="$T51_CLIENT_LOG"
+sleep 2
+mountpoint -q "$MOUNT" || { check "T51b remount after leader-restart storm" FAIL; }
+
+T51_MISMATCHES2=0
+T51_IOERR=0
+for w in $(seq 0 $((T51_CONCURRENCY-1))); do
+    last_seq=$(cat "$T51_LOGDIR/last_$w" 2>/dev/null || echo -1)
+    [ "$last_seq" -lt 0 ] && continue
+    byte_off=$(( w * 65536 ))
+    python3 -c "
+import sys
+img, byte_off, patch_size, worker, expected_seq = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+tag = ('T51_W%02d_S%06d_' % (worker, expected_seq)).encode()
+expected = (tag + bytes([worker % 256]) * (patch_size - len(tag)))[:patch_size]
+try:
+    with open(img, 'rb') as f:
+        f.seek(byte_off)
+        actual = f.read(patch_size)
+except OSError as e:
+    print(f'IOERR: {e}')
+    sys.exit(2)
+sys.exit(0 if actual == expected else 1)
+" "$T51_IMG" "$byte_off" "$T51_PATCH_SIZE" "$w" "$last_seq"
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+        T51_IOERR=$((T51_IOERR+1))
+    elif [ "$rc" -ne 0 ]; then
+        T51_MISMATCHES2=$((T51_MISMATCHES2+1))
+    fi
+done
+
+[ "$T51_MISMATCHES2" -eq 0 ] && [ "$T51_IOERR" -eq 0 ] \
+    && check "T51c all worker slots intact after cold client restart (no I/O errors, no corruption)" PASS \
+    || check "T51c $T51_MISMATCHES2 corrupted + $T51_IOERR I/O-error slots after cold restart" FAIL
+
+rm -f "$T51_IMG" 2>/dev/null || true
+rm -rf "$T51_LOGDIR" "$T51_STOP" 2>/dev/null || true
+fi # should_run T51
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

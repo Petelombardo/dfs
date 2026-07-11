@@ -100,6 +100,29 @@ pub struct Server {
     /// Used by admin handlers to query status and trigger immediate heal cycles.
     healing: Arc<RwLock<Option<Arc<HealingManager>>>>,
 
+    /// Set for the duration of compaction's Phase 3 (the one phase that holds
+    /// MetadataStore's exclusive write lock) so fold, healing, and client-write
+    /// callers can briefly stand down instead of piling onto the same shared
+    /// read lock Phase 3 is queued behind. Root-caused 2026-07-11: under a VM
+    /// OS install's sustained hot-chunk churn, folds alone (each fold's
+    /// registration takes a metadata read-lock) arrive continuously enough
+    /// that Phase 3's queued writer can stay stuck behind a constantly-
+    /// refilling read queue for tens of seconds even with parking_lot's fair
+    /// RwLock — fairness stops new readers from cutting in line, it doesn't
+    /// stop a high enough arrival rate from making the line itself long. Two
+    /// real nodes self-restarted (compact_db_blocking's wedge-detection
+    /// exit(1)) during exactly this condition, and one of those restarts
+    /// destroyed the sole replica of a chunk that had just landed on it —
+    /// pausing the sources of contention is a much better trade than letting
+    /// Phase 3 wedge and forcing a restart at the worst possible moment.
+    compaction_quiescing: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Wakes everyone waiting in wait_if_compaction_quiescing() the moment
+    /// compaction_quiescing flips back to false (Phase 3 finished, one way or
+    /// another). A plain Notify, not a watch channel — waiters only care
+    /// about the transition to "not quiescing", never about historical values.
+    compaction_quiesce_notify: Arc<tokio::sync::Notify>,
+
     /// Follower-to-leader forward queue.
     /// When this node is a follower and receives a ReplicateMetadata, it enqueues
     /// the metadata here. A background task forwards each entry to the current leader
@@ -709,6 +732,30 @@ async fn full_rewrite_chunk(
     }
 }
 
+/// Shared implementation behind Server::wait_if_compaction_quiescing and
+/// OverlayForkCtx::wait_if_compaction_quiescing — both types hold the same
+/// underlying Arc<AtomicBool>/Arc<Notify> instances (see
+/// Server::compaction_quiescing's doc comment), so there's one real
+/// implementation gated on whichever pair of clones the caller has at hand.
+async fn wait_if_compaction_quiescing(
+    quiescing: &std::sync::atomic::AtomicBool,
+    notify: &tokio::sync::Notify,
+) {
+    if !quiescing.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    const QUIESCE_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+    let notified = notify.notified();
+    // Re-check after subscribing: notify_waiters() only wakes subscribers that
+    // existed at the time it fired — a check-then-subscribe race here (flag
+    // cleared between our load above and notified() registering) would
+    // otherwise wait the full budget for a notification that already happened.
+    if !quiescing.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let _ = tokio::time::timeout(QUIESCE_WAIT_BUDGET, notified).await;
+}
+
 /// Bundle of the Arc-wrapped fields a background fold needs, cloned out of a
 /// `&Server` so it can run inside a `tokio::spawn`'d task that outlives the
 /// request handler that triggered it — see Server::apply_patch.
@@ -726,6 +773,10 @@ struct OverlayForkCtx {
     cluster: Arc<ClusterManager>,
     client: Arc<NetworkClient>,
     healing: Arc<tokio::sync::RwLock<Option<Arc<HealingManager>>>>,
+    /// Same Arc instances as Server::compaction_quiescing/compaction_quiesce_notify —
+    /// see that field's doc comment. fold_slot_now waits on this before folding.
+    compaction_quiescing: Arc<std::sync::atomic::AtomicBool>,
+    compaction_quiesce_notify: Arc<tokio::sync::Notify>,
 }
 
 /// One completed fold, kept around for start_patch_fold_rebroadcast_loop to
@@ -1277,6 +1328,26 @@ impl OverlayForkCtx {
         false
     }
 
+    /// Briefly stand down while compaction's Phase 3 holds (or is queued for)
+    /// MetadataStore's exclusive write lock — see compaction_quiescing's doc
+    /// comment on the struct for why this exists. Fast path (the overwhelming
+    /// common case: compaction isn't running) is a single relaxed atomic load,
+    /// no Notify subscription and no await point at all.
+    ///
+    /// Bounded: a caller here waits at most QUIESCE_WAIT_BUDGET, then proceeds
+    /// regardless. Phase 3 has its own 20s wedge-detection timeout, so under
+    /// normal operation this returns in low milliseconds; the bound just means
+    /// a genuinely stuck Phase 3 degrades callers to "briefly delayed" rather
+    /// than risking a new indefinite hang of a different kind.
+    ///
+    /// Read callers (via fold_slot_now, forced from resolve_chunk_content) do
+    /// wait here too when a chunk they need happens to be Pending — a rare,
+    /// brief, and correct trade: the alternative is a read racing directly
+    /// into the same lock contention this exists to relieve.
+    async fn wait_if_compaction_quiescing(&self) {
+        wait_if_compaction_quiescing(&self.compaction_quiescing, &self.compaction_quiesce_notify).await
+    }
+
     /// Fold whatever is currently accumulated for (file_id, chunk_idx), if
     /// anything — the coalescing counterpart to the old per-patch
     /// tokio::spawn(run_single_fold): apply_patch no longer folds on every
@@ -1293,6 +1364,7 @@ impl OverlayForkCtx {
     /// begin with — merges in apply_patch release it immediately after writing
     /// their delta.
     async fn fold_slot_now(&self, file_id: FileId, chunk_idx: u64) -> bool {
+        self.wait_if_compaction_quiescing().await;
         let lock = self.chunk_patch_locks
             .entry((file_id, chunk_idx))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -1677,6 +1749,8 @@ impl Server {
             chunk_to_file: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashMap::new())),
             healing: Arc::new(RwLock::new(None)),
+            compaction_quiescing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            compaction_quiesce_notify: Arc::new(tokio::sync::Notify::new()),
             leader_forward_queue: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
             leader_forward_notify: Arc::new(tokio::sync::Notify::new()),
             recent_writes: Arc::new(DashMap::new()),
@@ -2176,6 +2250,20 @@ impl Server {
     /// without a restart, no separate sync path needed).
     pub fn replication_factor_handle(&self) -> Arc<AtomicUsize> {
         self.replication_factor.clone()
+    }
+
+    /// Shared compaction-quiescing flag — passed to HealingManager at construction
+    /// so both share the exact same `Arc<AtomicBool>`; see compaction_quiescing's
+    /// doc comment on the struct.
+    pub fn compaction_quiescing_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.compaction_quiescing.clone()
+    }
+
+    /// See the free function of the same name for the actual logic — this and
+    /// OverlayForkCtx::wait_if_compaction_quiescing both delegate to it, since
+    /// each type holds its own clone of the same underlying Arcs.
+    async fn wait_if_compaction_quiescing(&self) {
+        wait_if_compaction_quiescing(&self.compaction_quiescing, &self.compaction_quiesce_notify).await
     }
 
     /// Wire in the healing manager after construction.
@@ -3416,6 +3504,7 @@ impl Server {
         background: bool,
     ) -> Response {
         debug!("Handling write chunk: {} ({} bytes)", chunk_id, data.len());
+        self.wait_if_compaction_quiescing().await;
 
         // Signal write activity for adaptive heal-bandwidth control (client writes only).
         if !background {
@@ -5728,6 +5817,8 @@ impl Server {
         let storage = self.storage.clone();
         let node_byte = self.cluster.local_node_id().as_bytes()[0] as u64;
         let cluster = self.cluster.clone();
+        let compaction_quiescing = self.compaction_quiescing.clone();
+        let compaction_quiesce_notify = self.compaction_quiesce_notify.clone();
         tokio::spawn(async move {
             // Wait for the cluster to establish before computing the stagger.
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
@@ -5846,9 +5937,16 @@ impl Server {
                             // Now that this is isolated to just Phase 3's own work, 20s
                             // still gives a legitimately large DB reopen real margin while
                             // cutting the worst-case undetected-wedge window dramatically.
+                            // Quiesce fold/healing/client-write callers for the duration of
+                            // Phase 3 alone — they each briefly wait on the same shared
+                            // metadata read lock Phase 3's writer is queued behind (see
+                            // compaction_quiescing's doc comment). Cleared in every exit
+                            // path below except the wedge-timeout one, which exits the
+                            // whole process anyway.
+                            compaction_quiescing.store(true, std::sync::atomic::Ordering::Relaxed);
                             let m2 = metadata.clone();
                             let finish_task = tokio::task::spawn_blocking(move || m2.compact_db_finish(prep));
-                            match tokio::time::timeout(std::time::Duration::from_secs(20), finish_task).await {
+                            let finish_result = match tokio::time::timeout(std::time::Duration::from_secs(20), finish_task).await {
                                 Ok(r) => r,
                                 Err(_) => {
                                     error!(
@@ -5858,7 +5956,10 @@ impl Server {
                                     );
                                     std::process::exit(1);
                                 }
-                            }
+                            };
+                            compaction_quiescing.store(false, std::sync::atomic::Ordering::Relaxed);
+                            compaction_quiesce_notify.notify_waiters();
+                            finish_result
                         }
                     };
                     match result {
@@ -5931,6 +6032,10 @@ impl Server {
                             first.elapsed(),
                             current_size as f64 / 1_048_576.0,
                             last_compact_size as f64 / 1_048_576.0);
+                        // Unlike Phase 3 above, compact_db_blocking() holds the exclusive
+                        // lock for its whole (potentially much longer) duration, not just
+                        // a brief diff+swap — quiesce for the full attempt.
+                        compaction_quiescing.store(true, std::sync::atomic::Ordering::Relaxed);
                         let m = metadata.clone();
                         let task = tokio::task::spawn_blocking(move || m.compact_db_blocking());
                         match tokio::time::timeout(std::time::Duration::from_secs(60), task).await {
@@ -5958,6 +6063,8 @@ impl Server {
                                 std::process::exit(1);
                             }
                         }
+                        compaction_quiescing.store(false, std::sync::atomic::Ordering::Relaxed);
+                        compaction_quiesce_notify.notify_waiters();
                     }
                 }
 
@@ -6914,6 +7021,7 @@ impl Server {
         expected_offset: u64,
     ) -> Response {
         info!("AppendFile: file_id={} expected_offset={} data_len={}", file_id, expected_offset, new_data.len());
+        self.wait_if_compaction_quiescing().await;
 
         // --- Step 1: Fetch current metadata ---
         let mut metadata = match self.metadata.get_file(&file_id) {
@@ -7244,6 +7352,8 @@ impl Server {
             cluster: self.cluster.clone(),
             client: self.client.clone(),
             healing: self.healing.clone(),
+            compaction_quiescing: self.compaction_quiescing.clone(),
+            compaction_quiesce_notify: self.compaction_quiesce_notify.clone(),
         }
     }
 
@@ -7852,6 +7962,7 @@ impl Server {
         patch_data: Vec<u8>,
         new_chunk_seq: Option<u64>,
     ) -> Response {
+        self.wait_if_compaction_quiescing().await;
         {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -7944,6 +8055,7 @@ impl Server {
         prefetch_hints: Option<Vec<ChunkId>>,
         new_chunk_seq: Option<u64>,
     ) -> Response {
+        self.wait_if_compaction_quiescing().await;
         // Mutable so the staleness check below can rebase onto the current value
         // in place instead of bouncing ChunkStale back to the client for an external
         // round trip — see that check's doc comment for why the round trip itself

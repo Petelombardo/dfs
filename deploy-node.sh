@@ -83,7 +83,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/dfs-server start --config $DATA_DIR/config/config.toml --log-level warn
+ExecStart=/usr/bin/dfs-server start --config $DATA_DIR/config/config.toml --log-level warn --log-file $DATA_DIR/logs/dfs-server.log
 Restart=always
 RestartSec=10
 StandardOutput=journal

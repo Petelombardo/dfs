@@ -301,6 +301,14 @@ pub struct HealingManager {
     /// SELF_RESTART_GRACE_SECS's doc comment for why this exists independently of
     /// LEADER_CHANGE_GRACE_SECS's own (leader-only) tracking.
     local_started_at: Instant,
+
+    /// Same Arc instance as Server::compaction_quiescing — set for the duration of
+    /// compaction's Phase 3 (or the compact_db_blocking() fallback), so the heal
+    /// loop skips dispatching new transfers while it's set rather than adding to
+    /// the same shared metadata read-lock contention Phase 3 is queued behind.
+    /// Checked the same way as healing_enabled: skip this cycle, retry next tick —
+    /// no need for a bounded wait here since run_heal_loop already ticks every 15s.
+    compaction_quiescing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HealingManager {
@@ -322,6 +330,7 @@ impl HealingManager {
         heal_max_concurrent: usize,
         heal_max_concurrent_per_node: usize,
         heal_transfer_timeout_secs: u64,
+        compaction_quiescing: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let max_heal_per_cycle = 200;
 
@@ -403,6 +412,7 @@ impl HealingManager {
             phantom_reconcile_in_progress: std::sync::atomic::AtomicBool::new(false),
             healing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(auto_heal)),
             local_started_at: Instant::now(),
+            compaction_quiescing,
         }
     }
 
@@ -570,6 +580,12 @@ impl HealingManager {
                 continue;
             }
 
+            // See the same check in run_heal_loop — discovery's routing-table/
+            // FILE_TABLE scans are metadata-read-heavy too.
+            if self.compaction_quiescing.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+
             let is_leader = self.cluster.is_leader().await;
 
             if is_leader != was_leader {
@@ -636,6 +652,14 @@ impl HealingManager {
             tokio::time::sleep(Duration::from_secs(15)).await;
 
             if !self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+
+            // Compaction's Phase 3 (or the compact_db_blocking() fallback) is
+            // holding/queued for the exclusive metadata lock right now — skip this
+            // drain cycle rather than add to the same shared read-lock contention
+            // it's waiting behind. See Server::compaction_quiescing's doc comment.
+            if self.compaction_quiescing.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
             }
 

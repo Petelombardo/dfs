@@ -14,7 +14,7 @@ mod server;
 mod stats;
 mod storage;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dfs_common::Config;
 use std::path::PathBuf;
@@ -55,6 +55,16 @@ enum Commands {
         /// Log level (trace, debug, info, warn, error)
         #[arg(long, default_value = "info")]
         log_level: String,
+
+        /// Write logs to this file instead of stderr/journal. Recommended on
+        /// durable storage (e.g. under the same mount as data_dir/metadata_dir)
+        /// rather than relying on journald: several storage-node hosts run
+        /// journald with Storage=volatile and a small (~20MB) ring buffer,
+        /// which gets overwritten within minutes under heavy write load — real
+        /// pre-crash evidence has been lost this way. See CLAUDE.md's local
+        /// suite notes and the 2026-07-11 gluster1/gluster4 incident.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
 
     /// Show server status and statistics
@@ -82,37 +92,13 @@ async fn main() -> Result<()> {
                 .init();
             init_node(data_dir, meta_dir, config)?;
         }
-        Commands::Start { config, log_level } => {
-            // Initialize tracing with specified log level
-            let level = match log_level.to_lowercase().as_str() {
-                "trace" => Level::TRACE,
-                "debug" => Level::DEBUG,
-                "info" => Level::INFO,
-                "warn" => Level::WARN,
-                "error" => Level::ERROR,
-                _ => {
-                    eprintln!("Invalid log level '{}', using 'info'", log_level);
-                    Level::INFO
-                }
-            };
-
+        Commands::Start { config, log_level, log_file } => {
             // --log-level flag wins over RUST_LOG env var. Without this, an
             // Environment="RUST_LOG=warn" in the systemd unit silently overrides
             // the explicit CLI flag and suppresses INFO/ERROR messages.
             std::env::set_var("RUST_LOG", &log_level);
 
-            // Set up NON-BLOCKING logging to stderr/systemd journal
-            // This uses a background thread with a bounded channel (default 8192 messages)
-            // If the channel fills up, log messages are DROPPED instead of blocking the process
-            let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stderr());
-
-            tracing_subscriber::fmt()
-                .with_max_level(level)
-                .with_target(false)
-                .with_writer(non_blocking)
-                .init();
-
-            info!("Starting DFS server with log level: {} (non-blocking mode)", log_level);
+            let _guard = setup_logging(log_file.as_deref(), &log_level)?;
             start_server(config).await?;
             // _guard is dropped here, flushing remaining logs
         }
@@ -127,6 +113,65 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Set up logging to file or stderr/journal. Mirrors dfs-client's setup_logging
+/// (see dfs-client/src/main.rs) — same non-blocking-writer/WorkerGuard shape,
+/// same append-mode file open. Returns the WorkerGuard that must be kept alive
+/// for the duration of the program (dropping it flushes remaining log lines).
+fn setup_logging(
+    log_file: Option<&std::path::Path>,
+    log_level: &str,
+) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    use std::fs::OpenOptions;
+
+    let level = match log_level.to_lowercase().as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "info" => Level::INFO,
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => {
+            eprintln!("Invalid log level '{}', using 'info'", log_level);
+            Level::INFO
+        }
+    };
+
+    let Some(path) = log_file else {
+        // No file given — keep the original behavior: non-blocking stderr,
+        // which systemd captures into the journal.
+        let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
+        tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_target(false)
+            .with_writer(non_blocking)
+            .init();
+        info!("Starting DFS server with log level: {} (non-blocking mode, stderr/journal)", log_level);
+        return Ok(guard);
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create log directory: {:?}", parent))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Failed to open log file: {:?}", path))?;
+
+    // Non-blocking: a background thread with a bounded channel (default 8192
+    // messages) drains it. If the channel fills, messages are DROPPED rather
+    // than blocking the process — a full/slow disk must never freeze the server.
+    let (non_blocking, guard) = tracing_appender::non_blocking(file);
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_target(false)
+        .with_writer(non_blocking)
+        .init();
+
+    info!("Starting DFS server with log level: {} (non-blocking mode). Logging to: {:?}", log_level, path);
+    Ok(guard)
 }
 
 /// Initialize a new DFS node
@@ -308,6 +353,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config.replication.heal_max_concurrent.expect("resolved by load_or_migrate_healing_tuning"),
         config.replication.heal_max_concurrent_per_node.expect("resolved by load_or_migrate_healing_tuning"),
         config.replication.heal_transfer_timeout_secs.expect("resolved by load_or_migrate_healing_tuning"),
+        server.compaction_quiescing_handle(),
     ));
     healer_runtime.spawn(healing.clone().start());
     server.set_healing_manager(healing.clone()).await;

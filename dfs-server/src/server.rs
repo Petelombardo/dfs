@@ -960,20 +960,26 @@ impl OverlayForkCtx {
 
         // The fold just changed this (file_id, chunk_idx) slot's current identity
         // WITHOUT any client-visible RPC — nothing else in the cluster would ever
-        // learn about it otherwise. Broadcast it ourselves to every other online
-        // node, the same way HealingManager::broadcast_chunk_location_shared
-        // already does after a heal. Also broadcast the token->real_chunk_id
-        // redirect itself (ReplicatePatchFold) — PATCH_STATE_TABLE is otherwise
-        // node-local, so without this, only this node can ever resolve a read of
-        // public_token or report its true (growing) replica count; see
-        // ReplicatePatchFold's doc comment.
+        // learn about it otherwise. The leader specifically is disseminated to
+        // *synchronously* below (notify_leader_of_fold) — see its doc comment for
+        // why: the old design let this function return, and the fold be
+        // considered "done," before the leader had any record of it at all,
+        // which is exactly the mechanism behind a real 2026-07-10 incident
+        // (staging fio+fsck repro: two non-leader replicas had a
+        // Folded(dab62bfe...) redirect but neither the leader nor either of
+        // them actually had dab62bfe's bytes — the leader never got told, so
+        // nothing could arbitrate). Non-leader peers remain best-effort (below);
+        // only the leader's copy is load-bearing for correctness (it's the
+        // arbitration source of truth refresh_slot_from_leader and MultiPatch's
+        // ChunkStale handling both fall back to).
         if let Some(new_loc) = new_loc {
             // Register for periodic re-announcement unconditionally and BEFORE
-            // attempting the immediate broadcast below — start_patch_fold_rebroadcast_loop
-            // is the backstop that closes the gap for any peer the immediate pass
-            // below misses (not Online yet, or the broadcast is still in flight
-            // when this node happens to get asked); see pending_patch_fold_broadcasts's
-            // doc comment for the incident this fixes.
+            // attempting the synchronous leader push and the immediate broadcast
+            // below — start_patch_fold_rebroadcast_loop is the backstop that
+            // closes the gap for any peer (including the leader, if the
+            // synchronous push below still fails after its own retries) the
+            // immediate pass misses; see pending_patch_fold_broadcasts's doc
+            // comment for the incident this fixes.
             self.pending_patch_fold_broadcasts.insert(public_token, PendingPatchFoldBroadcast {
                 location: new_loc.clone(),
                 file_id,
@@ -982,32 +988,53 @@ impl OverlayForkCtx {
                 first_seen: std::time::Instant::now(),
             });
 
-            // Broadcast in a detached background task instead of inline: this fold
-            // has already fully committed locally by this point (file on disk,
-            // ChunkLocation registered, patch_state flipped to Folded) — nothing
-            // about *this* node's correctness depends on the broadcast landing
-            // before this function returns. Awaiting it inline used to run up to
-            // 2 sequential network round-trips per other online node while still
-            // holding chunk_patch_locks (fold_slot_now holds it for this whole
-            // call) — under any network hiccup that's several seconds with the
-            // slot's lock held, during which the *next* patch to this same slot
-            // queues up server-side. If the client's own RPC timeout is shorter
-            // than that stall, it gives up and retries — creating a second
+            // Synchronous, bounded-retry push to the leader — see
+            // notify_leader_of_fold's doc comment. This does hold
+            // chunk_patch_locks for this slot for up to ~2.2s in the worst case
+            // (leader fully unreachable), unlike the detached broadcast below —
+            // deliberately: the 2026-07-09 stall regression that motivated
+            // making broadcasts detached was effectively unbounded (looped
+            // healing-cancel RPCs), not a couple of short, timeout-guarded
+            // attempts. A few seconds of lock-hold on one hot slot during a
+            // genuine leader outage is an acceptable trade for the leader never
+            // silently missing a fold.
+            if !self.notify_leader_of_fold(public_token, new_chunk_id, file_id, chunk_idx, &new_loc).await {
+                warn!("single fold: leader unreachable/unconfirmed after retries for {} -> {} — relying on backstop rebroadcast loop",
+                    public_token, new_chunk_id);
+            }
+
+            // Broadcast to remaining (non-leader) peers in a detached background
+            // task instead of inline: this fold has already fully committed
+            // locally by this point (file on disk, ChunkLocation registered,
+            // patch_state flipped to Folded), and the leader — the one copy
+            // that's actually load-bearing — was just handled synchronously
+            // above. Nothing about *this* node's correctness depends on these
+            // remaining broadcasts landing before this function returns.
+            // Awaiting them inline used to run up to 2 sequential network
+            // round-trips per other online node while still holding
+            // chunk_patch_locks (fold_slot_now holds it for this whole call) —
+            // under any network hiccup that's several seconds with the slot's
+            // lock held, during which the *next* patch to this same slot queues
+            // up server-side. If the client's own RPC timeout is shorter than
+            // that stall, it gives up and retries — creating a second
             // outstanding request for a slot whose token is about to move out
-            // from under it the moment this fold's caller (fold_slot_now) finally
-            // releases the lock. That race is the leading suspect for a real
-            // 2026-07-09 incident (VM100/server5, kdiskmark under load) where a
-            // patch's claimed base ended up neither a real file nor a live
-            // patch_state row. The rebroadcast loop above is already the proven
-            // backstop for a broadcast that doesn't land immediately, so paying
-            // for it here synchronously was pure unnecessary lock-hold time.
+            // from under it the moment this fold's caller (fold_slot_now)
+            // finally releases the lock. That race is the leading suspect for a
+            // real 2026-07-09 incident (VM100/server5, kdiskmark under load)
+            // where a patch's claimed base ended up neither a real file nor a
+            // live patch_state row. The rebroadcast loop above is already the
+            // proven backstop for a broadcast that doesn't land immediately, so
+            // paying for it here synchronously was pure unnecessary lock-hold
+            // time — that reasoning still holds for non-leader peers.
             let cluster = self.cluster.clone();
             let client = self.client.clone();
             tokio::spawn(async move {
                 let nodes = cluster.get_all_nodes().await;
                 let local_id = cluster.local_node_id();
                 for node in nodes {
-                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online
+                        || cluster.is_leader_id(node.id).await
+                    {
                         continue;
                     }
                     let request = Request::ReplicateChunkLocation { location: new_loc.clone(), file_id: new_loc.file_id };
@@ -1036,6 +1063,95 @@ impl OverlayForkCtx {
         info!("Single fold: file {} chunk_idx {} consolidated ({} + delta -> {}, final size {})",
             file_id, chunk_idx, base_chunk_id, new_chunk_id, final_size);
         true
+    }
+
+    /// Synchronously push a completed fold's result to the leader, with a
+    /// couple of short, timeout-guarded retries, before run_single_fold
+    /// considers the fold's dissemination done.
+    ///
+    /// Historically this was purely best-effort (a detached broadcast to every
+    /// online node, backed only by a 10s/120s-TTL rebroadcast loop) — the same
+    /// "eventually, maybe" pattern that in various forms caused most of today's
+    /// EIO incidents (see feedback_dont_bypass_deferred_fold_coalescing and the
+    /// PATCH_STATE_TABLE-is-node-local pattern noted across bugs 6/8/9). The
+    /// specific incident this closes (2026-07-10, staging fio+fsck repro): two
+    /// non-leader replicas had a `Folded(dab62bfe...)` redirect (so *some*
+    /// broadcast landed) but neither the leader nor either of them actually had
+    /// dab62bfe's bytes — the leader had zero record of the fold at all, so
+    /// there was nothing that could ever arbitrate the slot back to a sane
+    /// state; every subsequent patch retried against the same unreachable
+    /// identity forever.
+    ///
+    /// Only the leader is handled here — it's the one copy that's actually
+    /// load-bearing for correctness (refresh_slot_from_leader and MultiPatch's
+    /// ChunkStale handling both fall back to it as arbitration source of
+    /// truth). Non-leader peers stay best-effort, same as before.
+    ///
+    /// Bounded (2 attempts, ~1s timeout each, both RPCs sent concurrently per
+    /// attempt — worst case ~2.2s) so this can't reproduce the unbounded-stall
+    /// shape of the 2026-07-09 healing-cancel regression. Held under
+    /// chunk_patch_locks for this one slot only, same lock scope fold_slot_now
+    /// already holds for the rest of this function — a few seconds of
+    /// lock-hold on one hot slot during a genuine leader outage is an
+    /// acceptable trade for the leader never silently missing a fold. Returns
+    /// false (not blocking further) if the leader is still unconfirmed after
+    /// retries — pending_patch_fold_broadcasts's rebroadcast loop is the
+    /// backstop for that case, same as it always was.
+    async fn notify_leader_of_fold(
+        &self,
+        public_token: ChunkId,
+        real_chunk_id: ChunkId,
+        file_id: FileId,
+        chunk_idx: u64,
+        location: &ChunkLocation,
+    ) -> bool {
+        // Already the leader — the local commits earlier in run_single_fold
+        // (update_patch_state_folded_async, put_chunk_location_async) ARE the
+        // leader's own state; no RPC needed.
+        if self.cluster.is_leader().await {
+            return true;
+        }
+
+        const ATTEMPTS: u8 = 2;
+        const PER_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+        const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+        for attempt in 0..ATTEMPTS {
+            let Some(leader_addr) = self.cluster.get_leader_addr().await else {
+                tokio::time::sleep(RETRY_BACKOFF).await;
+                continue;
+            };
+
+            let loc_req = Request::ReplicateChunkLocation {
+                location: location.clone(), file_id: location.file_id,
+            };
+            let fold_req = Request::ReplicatePatchFold {
+                public_token, real_chunk_id, file_id, chunk_idx,
+            };
+            let (loc_result, fold_result) = tokio::join!(
+                tokio::time::timeout(PER_ATTEMPT_TIMEOUT, self.client.send_message(leader_addr, Message::Request(loc_req))),
+                tokio::time::timeout(PER_ATTEMPT_TIMEOUT, self.client.send_message(leader_addr, Message::Request(fold_req))),
+            );
+            let loc_ok = matches!(
+                loc_result,
+                Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
+            );
+            let fold_ok = matches!(
+                fold_result,
+                Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
+            );
+
+            if loc_ok && fold_ok {
+                return true;
+            }
+
+            warn!("notify_leader_of_fold: attempt {}/{} incomplete for {} -> {} (loc_ok={} fold_ok={})",
+                attempt + 1, ATTEMPTS, public_token, real_chunk_id, loc_ok, fold_ok);
+            if attempt + 1 < ATTEMPTS {
+                tokio::time::sleep(RETRY_BACKOFF).await;
+            }
+        }
+        false
     }
 
     /// Fold whatever is currently accumulated for (file_id, chunk_idx), if

@@ -6320,109 +6320,30 @@ impl Filesystem for DfsFilesystem {
                         return;
                     }
 
-                    // TRUE SPARSE WRITE: large gap.
-                    // If the target offset falls within an already-committed chunk (e.g. a DVR
-                    // metadata update jumping back into the video stream), use PatchChunk so we
-                    // update the existing chunk in-place rather than creating a new tiny chunk
-                    // that corrupts the chunk map's contiguous layout.
-                    info!("Sparse write: offset {} > current_size {} (gap: {} bytes)",
+                    // Large gap beyond current_size: fall through to the unified BUFFERED
+                    // WRITE path below rather than special-casing it here. write_at() zero-
+                    // fills only *within* the target chunk's own slot (bounded by CHUNK_SIZE),
+                    // never the whole file-level gap — the earlier premise that a large gap
+                    // required bypassing write_at() to avoid materializing a giant zero buffer
+                    // was mistaken. flush_buffer_async_one already falls back to metadata_cache
+                    // for existing_chunk_size on a chunk's first flush this session, so it
+                    // correctly detects and patches an already-committed target chunk with no
+                    // help needed here.
+                    //
+                    // Root-caused 2026-07-11 via a live qcow2 preallocation=metadata corruption
+                    // investigation: this branch used to send the write directly
+                    // (write_data_with_cache/PatchChunk), registering its own ChunkLocation
+                    // completely outside write_buffers/write_at()'s tracking. QEMU's
+                    // preallocation=metadata writes non-sequentially — a jump-ahead write here
+                    // created a standalone, non-chunk-aligned ChunkLocation, and ~30ms later the
+                    // normal sequential write reached the same byte range through write_at(),
+                    // building a second, overlapping, chunk-aligned ChunkLocation with neither
+                    // path aware of the other. Confirmed directly via dfs-admin file info: two
+                    // permanent, overlapping registrations for the same bytes. Routing both
+                    // through the same write_at()/write_buffers accumulator makes them coalesce
+                    // into one chunk like any other pair of writes to the same region.
+                    info!("Sparse write: offset {} > current_size {} (gap: {} bytes) — routing through write_at",
                            offset_usize, current_size, gap);
-
-                    let target_chunk_idx = InodeWriteState::chunk_index(offset as u64);
-                    let target_intra = InodeWriteState::intra_offset(offset as u64);
-                    let meta_snap = metadata_cache.get(&ino).map(|m| m.clone());
-                    let existing_loc = meta_snap.as_ref()
-                        .and_then(|m| m.chunk_location_for_idx(target_chunk_idx).cloned());
-
-                    if let Some(old_loc) = existing_loc {
-                        // Target offset is within an existing chunk — patch it in-place.
-                        // Hold the per-chunk write lock so concurrent patches/writes to the
-                        // same chunk are serialized through the metadata_cache update.
-                        let _chunk_guard = DfsFilesystem::lock_chunk(&chunk_write_locks, ino, target_chunk_idx).await;
-                        info!("Sparse write at offset={} lands in existing chunk {} (size={}) — using PatchChunk",
-                              offset_usize, target_chunk_idx, old_loc.size);
-                        // Re-read metadata after acquiring the lock — a concurrent write may
-                        // have updated the chunk_id while we were waiting.
-                        let meta_snap = metadata_cache.get(&ino).map(|m| m.clone());
-                        let old_loc = meta_snap.as_ref()
-                            .and_then(|m| m.chunk_location_for_idx(target_chunk_idx).cloned())
-                            .unwrap_or(old_loc);
-                        let file_id = meta_snap.as_ref().map(|m| m.id).unwrap_or_else(dfs_common::FileId::new);
-                        match client.patch_chunk_on_replicas_verified(
-                            old_loc.chunk_id, file_id, target_chunk_idx, offset as u64, target_intra, data_vec.clone(), &old_loc,
-                        ).await {
-                            Ok(new_loc) => {
-                                // Record the new chunk_id/nodes so a concurrent flush_buffer_async_one
-                                // for this chunk (background ticker) doesn't resolve its base from a
-                                // metadata_cache/recent_chunk_writes snapshot taken before this patch
-                                // completed — same invariant as flush_buffer_async's patch path.
-                                client.recent_chunk_writes.insert(
-                                    (ino, target_chunk_idx),
-                                    (new_loc.chunk_id, file_id, std::time::Instant::now(), new_loc.nodes.clone()),
-                                );
-                                if let Some(state_arc) = write_buffers.get(&ino) {
-                                    let mut state = state_arc.lock().await;
-                                    if let Some(slot) = state.slots.get_mut(&target_chunk_idx) {
-                                        slot.server_chunk_id = Some(new_loc.chunk_id);
-                                    }
-                                }
-                                // Re-read metadata_cache after the network call to pick up
-                                // any updates from other chunks that completed while we waited.
-                                let mut meta = metadata_cache.get(&ino).map(|m| m.clone())
-                                    .unwrap_or_else(|| meta_snap.unwrap());
-                                let new_size = (offset_usize + data_vec.len()).max(current_size).max(meta.size as usize);
-                                if let Some(loc) = meta.chunk_location_for_idx_mut(target_chunk_idx) {
-                                    *loc = new_loc;
-                                }
-                                meta.size = new_size as u64;
-                                meta.modified_at = SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                                client.enqueue_metadata(&meta).await;
-                                client.feed_chunk_locations_to_read_engine(
-                                    ino, &meta.chunk_locations, meta.size,
-                                ).await;
-                                metadata_cache.insert(ino, meta);
-                                last_metadata_update.insert(ino, std::time::Instant::now());
-                                info!("Sparse write complete (patch): ino={}, offset={}, len={}, new_size={}",
-                                      ino, offset, data_vec.len(), new_size);
-                                reply.written(data_vec.len() as u32);
-                            }
-                            Err(e) => {
-                                error!("Sparse write PatchChunk failed for inode {}: {}", ino, e);
-                                reply.error(libc::EIO);
-                            }
-                        }
-                    } else {
-                        // Target is beyond all committed chunks — new chunk, write directly.
-                        let file_id = meta_snap.as_ref().map(|m| m.id).unwrap_or(metadata.id);
-                        match client.write_data_with_cache(&data_vec, ino, offset as u64, file_id, None).await {
-                            Ok((_, _, chunk_locations_opt)) => {
-                                let mut metadata = meta_snap.unwrap_or_else(|| metadata.clone());
-                                let new_size = (offset_usize + data_vec.len()).max(current_size).max(metadata.size as usize);
-                                if let Some(chunk_locations) = chunk_locations_opt {
-                                    Arc::make_mut(&mut metadata.chunk_locations).extend(chunk_locations);
-                                }
-                                metadata.size = new_size as u64;
-                                metadata.modified_at = SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                                client.enqueue_metadata(&metadata).await;
-                                // Update read engine immediately for SQLite read-after-write consistency
-                                client.feed_chunk_locations_to_read_engine(
-                                    ino, &metadata.chunk_locations, metadata.size,
-                                ).await;
-                                metadata_cache.insert(ino, metadata);
-                                last_metadata_update.insert(ino, std::time::Instant::now());
-                                info!("Sparse write complete: ino={}, offset={}, len={}, new_size={}",
-                                      ino, offset, data_vec.len(), new_size);
-                                reply.written(data_vec.len() as u32);
-                            }
-                            Err(e) => {
-                                error!("Sparse write failed for inode {}: {}", ino, e);
-                                reply.error(libc::EIO);
-                            }
-                        }
-                    }
-                    return;
                 }
 
                 // BUFFERED WRITE — wait for room before buffering, then reply.
@@ -8794,7 +8715,14 @@ impl Filesystem for DfsFilesystem {
             BLKDISCARD => {
                 // TRIM/discard operation — qcow2 uses this for hole punching.
                 // We don't support sparse holes yet, so just acknowledge success.
-                debug!("ioctl: BLKDISCARD for ino={} — no-op (not implemented)", ino);
+                let (from, len) = if _in_data.len() >= 16 {
+                    let from = u64::from_ne_bytes(_in_data[0..8].try_into().unwrap());
+                    let len  = u64::from_ne_bytes(_in_data[8..16].try_into().unwrap());
+                    (from, len)
+                } else {
+                    (0u64, 0u64)
+                };
+                info!("ioctl: BLKDISCARD for ino={} from={} len={} (in_data={}B) — no-op (not implemented)", ino, from, len, _in_data.len());
                 reply.ioctl(0, &[]);
             }
             BLKZEROOUT => {
@@ -8833,7 +8761,14 @@ impl Filesystem for DfsFilesystem {
                 // Secure discard — used by mkswap, cryptsetup to securely erase data.
                 // Similar to BLKDISCARD but with security guarantees. For a distributed
                 // filesystem, we don't support secure erase yet, so just acknowledge success.
-                debug!("ioctl: BLKSECDISCARD for ino={} — no-op (not implemented)", ino);
+                let (from, len) = if _in_data.len() >= 16 {
+                    let from = u64::from_ne_bytes(_in_data[0..8].try_into().unwrap());
+                    let len  = u64::from_ne_bytes(_in_data[8..16].try_into().unwrap());
+                    (from, len)
+                } else {
+                    (0u64, 0u64)
+                };
+                info!("ioctl: BLKSECDISCARD for ino={} from={} len={} (in_data={}B) — no-op (not implemented)", ino, from, len, _in_data.len());
                 reply.ioctl(0, &[]);
             }
             BLKROGET => {

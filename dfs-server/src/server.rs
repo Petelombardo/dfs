@@ -281,14 +281,15 @@ pub struct Server {
     /// for nothing in that case).
     ///
     /// Debounced, not periodic: the first patch on a fresh accumulator spawns
-    /// one debounce_fold_slot task (see its doc comment) that folds 500ms after
-    /// the *last* patch to this slot, resetting on every subsequent merge, up
-    /// to a hard PATCH_DEBOUNCE_MAX_WAIT cap so a continuously-hot chunk still
-    /// gets folded periodically rather than accumulating forever. That task
-    /// reads last_patch_at from here on every wake to decide whether to fold or
-    /// keep waiting. resolve_chunk_content also forces an immediate fold on
-    /// read (see fold_slot_now) instead of composing on the fly, so a cold read
-    /// is never stuck behind the debounce window either.
+    /// one debounce_fold_slot task (see its doc comment) that folds
+    /// PATCH_DEBOUNCE_IDLE after the *last* patch to this slot from anyone —
+    /// now purely a catch-all for a client that disappeared, since the client
+    /// itself drives the normal fold decision via an explicit ForceFold
+    /// command (see Request::ForceFold and client.rs's active-fold timer).
+    /// That task reads last_patch_at from here on every wake to decide
+    /// whether to fold or keep waiting. resolve_chunk_content also forces an
+    /// immediate fold on read (see fold_slot_now) instead of composing on the
+    /// fly, so a cold read is never stuck behind the debounce window either.
     dirty_patch_slots: Arc<DashMap<(FileId, u64), DirtyPatchSlot>>,
 
     /// Per-chunk_id read-exclusion lock for in-place patching. The in-place
@@ -815,20 +816,45 @@ struct DirtyPatchSlot {
     delta_hasher: blake3::Hasher,
 }
 
-/// How long a slot's accumulator must sit idle (no new patch) before
-/// debounce_fold_slot folds it. Chosen to comfortably coalesce a burst of
-/// rapid patches (e.g. qcow2 metadata rewrites during a VM install, which
-/// land only milliseconds apart) into one fold, without leaving a
-/// genuinely-done chunk waiting long for reads to force it.
-const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long a slot's accumulator must sit fully idle (zero patches from
+/// anyone, not just this client) before debounce_fold_slot folds it as a
+/// last-resort catch-all. This is deliberately NOT the primary fold trigger
+/// any more — see PATCH_FOLD_COUNT_THRESHOLD's removal note below for why an
+/// independent per-node timer (whether wall-clock or patch-count) can never
+/// be made safe: two replicas polling on their own schedules can observe
+/// "time to fold" at different logical points in the patch stream no matter
+/// what quantity they're polling, because the *decision* itself is taken
+/// independently on each node. The client now drives folding explicitly
+/// (multi_patch_chunk_on_replicas_inner's active-fold timer, client.rs) by
+/// sending one ForceFold request that both targeted replicas receive
+/// identically — this timer only exists to reclaim a slot if the client that
+/// was writing it disappears (crash, network partition) before ever sending
+/// that command. Long and conservative on purpose: nothing else depends on
+/// it firing promptly, and a live client's own 8s active-fold timer will
+/// almost always beat it under any real write pattern.
+const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Hard ceiling on how long a continuously-hot slot's accumulator can grow
-/// before being folded regardless of ongoing activity — resetting the debounce
-/// timer forever on a chunk that never quiesces would grow its delta (and the
-/// eventual fold's cost) unboundedly. Past this point there's no expected gain
-/// left to coalesce (the chunk is already getting full of dirty data), so cut
-/// losses and fold.
-const PATCH_DEBOUNCE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+/// Retired as a distinct constant: PATCH_DEBOUNCE_MAX_WAIT (start-relative)
+/// and PATCH_DEBOUNCE_IDLE (last-patch-relative) served slightly different
+/// purposes before, but now that PATCH_DEBOUNCE_IDLE is a slow catch-all
+/// rather than a burst-coalescing signal, having both adds nothing — a slot
+/// that's been idle for 20s has, definitionally, also had no patches since
+/// it started. debounce_fold_slot below checks only PATCH_DEBOUNCE_IDLE.
+///
+/// PATCH_FOLD_COUNT_THRESHOLD (a per-node patch-count trigger, replacing the
+/// old wall-clock MAX_WAIT) was tried and measured live 2026-07-11 via
+/// scripts/repro_replica_disagreement.sh: it made REPLICA DISAGREEMENT
+/// *worse* (0.16% -> 0.95% of patches), not better. Root cause of why: the
+/// fix shrank each individual race window (fewer patches of possible drift
+/// per fold) but did nothing to close the window itself — detection was
+/// still two independent per-node polling loops, each capable of observing
+/// "count >= threshold" at a different moment relative to an in-flight
+/// patch. Folding ~10x more often (every ~32 patches instead of every ~330)
+/// gave that same-sized-or-larger per-event race ~10x more chances to fire.
+/// Confirms the real fix has to be *who decides*, not *what triggers the
+/// decision*: only a single, externally-driven fold command — issued once
+/// and delivered identically to every replica — removes the race, which is
+/// what the client's explicit ForceFold command (client.rs) now does.
 
 /// 2026-07-10: a DFS_PATCH_FOLD_IMMEDIATE kill switch briefly lived here to
 /// A-B test folding every patch immediately instead of waiting for
@@ -1406,15 +1432,15 @@ impl OverlayForkCtx {
     }
 
     /// Spawned once by apply_patch when a slot's accumulator starts fresh
-    /// (never for a merge onto an existing one — see its call site). Polls
-    /// dirty_patch_slots every PATCH_DEBOUNCE_IDLE and folds once either:
-    ///   - the slot has gone PATCH_DEBOUNCE_IDLE since its *last* patch (a
-    ///     burst quieted down), or
-    ///   - PATCH_DEBOUNCE_MAX_WAIT has elapsed since this task started (the
-    ///     slot never quiets down — cut losses rather than let the
-    ///     accumulator grow forever).
-    /// Exits immediately, without folding, if the slot is gone by the time it
-    /// wakes (fold_slot_now already handled it via a forced read).
+    /// (never for a merge onto an existing one — see its call site). This is
+    /// now purely a catch-all for an abandoned slot (the client that was
+    /// writing it disappeared before ever sending a ForceFold) — see
+    /// PATCH_DEBOUNCE_IDLE's doc comment for why the *primary* fold decision
+    /// moved to an explicit, client-issued command instead of a per-node
+    /// timer. Polls dirty_patch_slots every PATCH_DEBOUNCE_IDLE and folds once
+    /// the slot has gone that long since its last patch from anyone. Exits
+    /// immediately, without folding, if the slot is gone by the time it wakes
+    /// (fold_slot_now, or a client ForceFold, already handled it).
     ///
     /// Retries on fold failure instead of giving up after one attempt (fixed
     /// 2026-07-11): fold_slot_now's bool result used to be discarded here — a
@@ -1425,7 +1451,6 @@ impl OverlayForkCtx {
     /// idle cluster (no client, no writes) still had 3 patches stuck in Pending
     /// indefinitely. Now retries with capped backoff until it succeeds.
     async fn debounce_fold_slot(&self, file_id: FileId, chunk_idx: u64) {
-        let started_at = std::time::Instant::now();
         let mut retry_backoff = PATCH_DEBOUNCE_IDLE;
         const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
         loop {
@@ -1438,7 +1463,7 @@ impl OverlayForkCtx {
                 return; // already folded elsewhere (e.g. a forced read) — nothing to do
             };
 
-            if last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE || started_at.elapsed() >= PATCH_DEBOUNCE_MAX_WAIT {
+            if last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE {
                 if self.fold_slot_now(file_id, chunk_idx).await {
                     return;
                 }
@@ -3142,6 +3167,9 @@ impl Server {
             Request::MultiPatch { chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq } => {
                 self.ops_tracker.inc_write();
                 self.handle_multi_patch(chunk_id, file_id, chunk_idx, chunk_file_offset, patches, expected_new_chunk_id, client_write_seq, prefetch_hints, new_chunk_seq).await
+            }
+            Request::ForceFold { file_id, chunk_idx } => {
+                self.handle_force_fold(file_id, chunk_idx).await
             }
             Request::DeleteFile { path } => {
                 self.ops_tracker.inc_meta();
@@ -6295,9 +6323,11 @@ impl Server {
     /// real healing/restart catch-up, not an ever-growing retry list.
     /// Backstop for apply_patch's per-slot debounce_fold_slot tasks (see
     /// dirty_patch_slots's doc comment for the primary mechanism). Every
-    /// accumulator is already scheduled to fold itself — 500ms after its last
-    /// patch, or PATCH_DEBOUNCE_MAX_WAIT after its first — so under normal
-    /// operation this loop finds nothing to do. It exists purely so that if a
+    /// accumulator is already scheduled to fold itself — PATCH_DEBOUNCE_IDLE
+    /// after its last patch from anyone — so under normal operation (a live
+    /// client either keeps writing, sends its own ForceFold, or eventually
+    /// goes quiet and lets this same idle timer fire first) this loop finds
+    /// nothing to do. It exists purely so that if a
     /// debounce task ever dies without folding (a panic, or a bug), the slot
     /// doesn't stay stuck forever: a long interval is fine precisely because
     /// this is a last-resort net, not the mechanism doing the real work.
@@ -6317,7 +6347,7 @@ impl Server {
                     continue;
                 }
                 let stale: Vec<(FileId, u64)> = server.dirty_patch_slots.iter()
-                    .filter(|e| e.value().last_patch_at.elapsed() >= PATCH_DEBOUNCE_MAX_WAIT)
+                    .filter(|e| e.value().last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE)
                     .map(|e| *e.key())
                     .collect();
                 if stale.is_empty() {
@@ -8308,6 +8338,41 @@ impl Server {
                 warn!("MultiPatch {}: {}", chunk_id, msg);
                 Response::Error { message: msg, code }
             }
+        }
+    }
+
+    /// Handle an explicit client-issued ForceFold — see Request::ForceFold's
+    /// doc comment for why this exists (replacing independent per-node fold
+    /// timers as the primary trigger). Reuses fold_slot_now, which already
+    /// handles "nothing pending" and "already folded by someone else" as
+    /// trivial success — this is just that plus reading back the resulting
+    /// real chunk_id/size to hand to the client.
+    ///
+    /// Reads the result from self.chunk_map rather than threading it back out
+    /// of fold_slot_now/run_single_fold's many early-return branches — safe
+    /// here specifically because this is the *same node* reading the entry
+    /// its *own* fold_slot_now call (immediately above) just wrote via
+    /// update_chunk_map_after_patch, with chunk_patch_locks held throughout —
+    /// no cross-node timing involved, unlike the "stale chunk_id from
+    /// client" mismatch this whole ForceFold mechanism exists to prevent.
+    async fn handle_force_fold(&self, file_id: dfs_common::FileId, chunk_idx: u64) -> Response {
+        self.wait_if_compaction_quiescing().await;
+        if !self.overlay_ctx().fold_slot_now(file_id, chunk_idx).await {
+            return Response::Error {
+                message: format!("ForceFold: fold failed for file {} chunk {}", file_id, chunk_idx),
+                code: ErrorCode::InternalError,
+            };
+        }
+        let loc = self.chunk_map.get(&file_id).and_then(|entry| {
+            let (locations, _) = entry.value();
+            Self::chunk_map_find_by_idx(locations, chunk_idx).map(|pos| locations[pos].clone())
+        });
+        match loc {
+            Some(loc) => Response::ForceFoldResult { real_chunk_id: loc.chunk_id, size: loc.size },
+            None => Response::Error {
+                message: format!("ForceFold: fold succeeded but no chunk_map entry found for file {} chunk {}", file_id, chunk_idx),
+                code: ErrorCode::InternalError,
+            },
         }
     }
 

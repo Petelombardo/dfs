@@ -773,6 +773,18 @@ pub struct DfsClient {
     /// GetFileChunkMap on failure — or use the cached id directly on the happy path.
     /// TTL is enforced by comparing the stored Instant against a 10s window at read time.
     pub recent_chunk_writes: Arc<DashMap<(u64, u64), (ChunkId, FileId, Instant, Vec<dfs_common::NodeId>)>>,
+
+    /// When the currently-accumulating Pending generation for (file_id, chunk_idx)
+    /// started, from this client's own point of view. Drives
+    /// multi_patch_chunk_on_replicas_inner's active-fold timer — see
+    /// Request::ForceFold's doc comment for why the client, not each server
+    /// independently, now owns the fold-timing decision. Reset whenever a
+    /// ForceFold succeeds (a new generation starts accumulating from there).
+    /// A stale leftover entry from a since-superseded file is harmless: worst
+    /// case it makes the very next patch to a reused slot trigger one spurious
+    /// (but safe — fold_slot_now treats "nothing pending" as trivial success)
+    /// early ForceFold.
+    active_fold_started_at: Arc<DashMap<(FileId, u64), Instant>>,
 }
 
 impl DfsClient {
@@ -922,6 +934,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             read_write_seq_cache: Arc::new(DashMap::new()),
             read_engines: ReadEngineMap::new(),
             recent_chunk_writes: Arc::new(DashMap::new()),
+            active_fold_started_at: Arc::new(DashMap::new()),
         })
     }
 
@@ -6340,55 +6353,72 @@ leader_addr: Arc::new(RwLock::new(None)),
                     .map(|nid| patched_node_ids.contains(nid))
                     .unwrap_or(false))
                 .collect();
-            warn!("MultiPatch: chunk {} landed on only {}/{} targeted replica(s) — retrying the \
-                   missing {} before accepting the write",
+            warn!("MultiPatch: chunk {} landed on only {}/{} targeted replica(s) — backfilling the \
+                   missing {} with a direct raw copy before accepting the write",
                 authoritative_chunk_id, patched_node_ids.len(), required_replicas, missing_addrs.len());
+
+            // Fetch the actual final bytes once and push them directly (WriteChunk, not
+            // MultiPatch) to each missing node — NOT a re-send of the original `patches`
+            // against `old_chunk_id`. On a hot chunk (exactly the VM-install workload this
+            // exists for) a missing node's real on-disk state has very often already moved
+            // past old_chunk_id by the time a retry lands (a newer patch from the same
+            // write burst got there first), so re-applying the same delta against a base
+            // that's no longer current produces a hash that legitimately disagrees with
+            // authoritative_chunk_id — confirmed live 2026-07-11: this was the ORIGINAL
+            // backfill design here, and it silently no-op'd (logged "REPLICA DISAGREEMENT"-
+            // style and gave up) on almost every hot-chunk write during a live VM install,
+            // so single-replica writes kept accumulating exactly like before this fix
+            // existed. A raw copy of the already-computed final bytes has no base to agree
+            // or disagree on — it's simply the same content everywhere.
             const BACKFILL_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
             const BACKFILL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(300);
             let backfill_started = std::time::Instant::now();
-            for addr in missing_addrs {
-                if patched_node_ids.len() >= required_replicas {
-                    break;
-                }
-                loop {
-                    let hints = per_server_hints.get(&addr).cloned();
-                    let req = Request::MultiPatch {
-                        chunk_id: old_chunk_id,
-                        file_id,
-                        chunk_idx,
-                        chunk_file_offset,
-                        patches: patches.clone(),
-                        expected_new_chunk_id,
-                        client_write_seq: patch_client_write_seq,
-                        prefetch_hints: hints,
-                        new_chunk_seq,
-                    };
-                    match self.send_request(addr, req).await {
-                        Ok(Response::MultiPatchResult { new_chunk_id: ncid, .. }) if ncid == authoritative_chunk_id => {
-                            if let Some(&nid) = addr_to_node_id_snap.get(&addr) {
-                                patched_node_ids.push(nid);
-                                info!("MultiPatch: backfilled chunk {} onto {} — now {}/{} replicas",
-                                    authoritative_chunk_id, addr, patched_node_ids.len(), required_replicas);
-                            }
+            let source_bytes = self.read_chunk_by_id(authoritative_chunk_id, &patched_node_ids).await;
+            match source_bytes {
+                Ok(data) => {
+                    let data = std::sync::Arc::new(data);
+                    for addr in missing_addrs {
+                        if patched_node_ids.len() >= required_replicas {
                             break;
                         }
-                        Ok(other) => {
-                            warn!("MultiPatch: backfill to {} for chunk {} got unexpected result: {:?} — will not retry this node",
-                                addr, authoritative_chunk_id, other);
-                            break;
-                        }
-                        Err(e) => {
-                            if backfill_started.elapsed() < BACKFILL_RETRY_BUDGET {
-                                debug!("MultiPatch: backfill to {} for chunk {} failed ({}), retrying",
-                                    addr, authoritative_chunk_id, e);
-                                tokio::time::sleep(BACKFILL_RETRY_BACKOFF).await;
-                                continue;
+                        loop {
+                            let req = Request::WriteChunk {
+                                chunk_id: authoritative_chunk_id,
+                                data: (*data).clone(),
+                                checksum: authoritative_chunk_id.hash,
+                            };
+                            match self.send_request(addr, req).await {
+                                Ok(Response::Ok { .. }) => {
+                                    if let Some(&nid) = addr_to_node_id_snap.get(&addr) {
+                                        patched_node_ids.push(nid);
+                                        info!("MultiPatch: backfilled chunk {} onto {} via raw copy — now {}/{} replicas",
+                                            authoritative_chunk_id, addr, patched_node_ids.len(), required_replicas);
+                                    }
+                                    break;
+                                }
+                                Ok(other) => {
+                                    warn!("MultiPatch: backfill copy to {} for chunk {} got unexpected result: {:?} — will not retry this node",
+                                        addr, authoritative_chunk_id, other);
+                                    break;
+                                }
+                                Err(e) => {
+                                    if backfill_started.elapsed() < BACKFILL_RETRY_BUDGET {
+                                        debug!("MultiPatch: backfill copy to {} for chunk {} failed ({}), retrying",
+                                            addr, authoritative_chunk_id, e);
+                                        tokio::time::sleep(BACKFILL_RETRY_BACKOFF).await;
+                                        continue;
+                                    }
+                                    warn!("MultiPatch: backfill copy to {} for chunk {} failed after retry budget: {}",
+                                        addr, authoritative_chunk_id, e);
+                                    break;
+                                }
                             }
-                            warn!("MultiPatch: backfill to {} for chunk {} failed after retry budget: {}",
-                                addr, authoritative_chunk_id, e);
-                            break;
                         }
                     }
+                }
+                Err(e) => {
+                    warn!("MultiPatch: could not read back chunk {} from any of {:?} for backfill — {}",
+                        authoritative_chunk_id, patched_node_ids, e);
                 }
             }
             if patched_node_ids.len() < required_replicas {
@@ -6399,7 +6429,78 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        let new_chunk_id = authoritative_chunk_id;
+        let mut new_chunk_id = authoritative_chunk_id;
+        let mut new_size = new_size;
+
+        // Active-fold timer: this client (not each server independently) now owns
+        // the decision to fold a hot slot's accumulated patches into real content.
+        // See Request::ForceFold's doc comment for the full root cause this closes
+        // (REPLICA DISAGREEMENT from two replicas' independent per-node fold timers
+        // picking different logical cut-points in an identical patch stream — fully
+        // reproduced and confirmed via scripts/repro_replica_disagreement.sh).
+        // Every ~8s of continuous active patching on a slot, send ONE ForceFold to
+        // every replica that's currently confirmed caught-up (patched_node_ids) and
+        // block here until it resolves — matches the same "wait for both before
+        // proceeding" invariant the min-2-replica gate above already enforces for
+        // ordinary patches, just applied to the fold decision itself.
+        if let Some(cidx) = chunk_idx {
+            const ACTIVE_FOLD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+            let elapsed_since_start = self.active_fold_started_at.get(&(file_id, cidx)).map(|e| e.elapsed());
+            match elapsed_since_start {
+                None => {
+                    // First patch this client has observed on this slot's current
+                    // accumulator — seed the timer, nothing to fold yet.
+                    self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
+                }
+                Some(elapsed) if elapsed >= ACTIVE_FOLD_INTERVAL => {
+                    let fold_targets: Vec<SocketAddr> = patch_addrs.iter().copied()
+                        .filter(|a| addr_to_node_id_snap.get(a)
+                            .map(|nid| patched_node_ids.contains(nid))
+                            .unwrap_or(false))
+                        .collect();
+                    let mut folded: Option<(ChunkId, usize)> = None;
+                    let mut fold_ok = !fold_targets.is_empty();
+                    for addr in fold_targets {
+                        match self.send_request(addr, Request::ForceFold { file_id, chunk_idx: cidx }).await {
+                            Ok(Response::ForceFoldResult { real_chunk_id, size }) => {
+                                match folded {
+                                    None => folded = Some((real_chunk_id, size)),
+                                    Some((prior_id, _)) if prior_id != real_chunk_id => {
+                                        warn!("ForceFold: {} disagrees with prior target on result for file {} chunk {} ({} vs {}) — skipping this fold, next patch will retry",
+                                            addr, file_id, cidx, real_chunk_id, prior_id);
+                                        fold_ok = false;
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
+                            Ok(other) => {
+                                warn!("ForceFold: {} for file {} chunk {} got unexpected result: {:?}",
+                                    addr, file_id, cidx, other);
+                                fold_ok = false;
+                            }
+                            Err(e) => {
+                                warn!("ForceFold: {} for file {} chunk {} failed: {}", addr, file_id, cidx, e);
+                                fold_ok = false;
+                            }
+                        }
+                    }
+                    if fold_ok {
+                        if let Some((real_chunk_id, size)) = folded {
+                            info!("ForceFold: file {} chunk {} folded {} -> {} after {:?} of active patching",
+                                file_id, cidx, new_chunk_id, real_chunk_id, elapsed);
+                            new_chunk_id = real_chunk_id;
+                            new_size = size;
+                        }
+                        // New generation starts accumulating from here.
+                        self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
+                    }
+                    // Else: leave the timer where it is (don't reset it to now) so
+                    // the very next patch to this slot retries the fold immediately
+                    // instead of waiting out another full interval.
+                }
+                Some(_) => {} // not due yet
+            }
+        }
 
         // Use server's patch_ts if available — this ensures written_at is in server
         // time, making guard comparisons clock-agnostic. Falls back to client time

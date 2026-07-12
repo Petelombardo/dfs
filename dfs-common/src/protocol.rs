@@ -437,6 +437,26 @@ pub enum Request {
         new_chunk_seq: Option<u64>,
     },
 
+    /// Explicitly fold a slot's accumulated Pending patches into real content
+    /// right now. Sent identically by the client to every replica it's
+    /// targeting for a slot, roughly every 8s of continuous active patching
+    /// (see multi_patch_chunk_on_replicas_inner's active-fold timer) — this
+    /// is now the *primary* fold trigger, replacing each server's own
+    /// independent per-node timer. Root-caused 2026-07-11: two replicas
+    /// polling independently (whether on wall-clock time or patch count)
+    /// can decide "fold now" at different logical points in an identical
+    /// patch stream, producing two different results for what should be the
+    /// same accumulator generation ("REPLICA DISAGREEMENT"). A single
+    /// client-issued command delivered to all replicas removes that race by
+    /// construction — every replica folds in response to the same external
+    /// event instead of its own clock. Each server's debounce_fold_slot timer
+    /// still exists as a catch-all for a client that disappears before ever
+    /// sending this.
+    ForceFold {
+        file_id: FileId,
+        chunk_idx: u64,
+    },
+
     // Admin requests
     /// Get cluster status
     GetClusterStatus,
@@ -944,6 +964,14 @@ pub enum Response {
         /// request didn't carry new_chunk_seq.
         #[serde(default)]
         chunk_seq: Option<u64>,
+    },
+
+    /// Response to ForceFold — the slot's real, folded content identity. The
+    /// client uses this directly as the base chunk_id for its next patch to
+    /// this slot, same as it would use MultiPatchResult's new_chunk_id.
+    ForceFoldResult {
+        real_chunk_id: ChunkId,
+        size: usize,
     },
 
     /// Returned when a client sends PutFileMetadata to a non-leader.

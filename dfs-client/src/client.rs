@@ -787,21 +787,25 @@ pub struct DfsClient {
     active_fold_started_at: Arc<DashMap<(FileId, u64), Instant>>,
 
     /// Bounds how many ForceFold operations this client has actively in flight
-    /// (RPC round-trip in progress, blocking a patch) at once, across every
-    /// file/slot. Root-caused 2026-07-11 night / confirmed live 2026-07-12
-    /// via kdiskmark Q32T1/Q1T1 4K random-write regression: a wide, dense
-    /// random-write pattern touches many different (file_id, chunk_idx) slots
-    /// at a similar rate, so their independent 8s active-fold timers mature in
-    /// overlapping windows — observed up to 51 ForceFold calls (each a real
-    /// 4MB read+write+fsync on the server) within a single one-second window
-    /// on server5's client log, saturating disk I/O. A permit acquire here
-    /// naturally provides both halves of the fix in one mechanism: it caps
-    /// how many can run at once (concurrency limit) and it staggers the rest
-    /// in time (each waiter only starts once an earlier fold actually
-    /// finishes, rather than everyone firing together). Small on purpose —
-    /// this is deliberately closer to serialized than pipelined, since a
-    /// handful of large sequential disk operations beats dozens of
-    /// simultaneous ones for this workload.
+    /// (RPC round-trip in progress, blocking the triggering patch) at once,
+    /// across every file/slot. Root-caused 2026-07-11 night: a wide, dense
+    /// random-write pattern (kdiskmark Q32T1/Q1T1) touches many different
+    /// (file_id, chunk_idx) slots at a similar rate, so their independent 8s
+    /// active-fold timers mature in overlapping windows — observed up to 51
+    /// ForceFold calls (each a real 4MB read+write+fsync on the server)
+    /// within a single one-second window on server5's client log, saturating
+    /// disk I/O.
+    ///
+    /// Deliberately WIDE, not narrow: a same-day attempt at a tight cap (2)
+    /// measured an ~80x Q32T1 throughput collapse (20 -> 0.25) — because the
+    /// permit is acquired *inline in the triggering write's own completion
+    /// path* (required — see the ForceFold call site's doc comment for why
+    /// that blocking is load-bearing for correctness, not optional), a narrow
+    /// global pool couples every unrelated chunk's write latency together
+    /// through it (convoy/head-of-line blocking). This must stay comfortably
+    /// above realistic burst concurrency (kdiskmark's own queue depth tops
+    /// out at 32) so the common case never actually waits on it — it's a
+    /// backstop against a genuinely pathological burst, not a routine gate.
     fold_concurrency: Arc<tokio::sync::Semaphore>,
 }
 
@@ -953,7 +957,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             read_engines: ReadEngineMap::new(),
             recent_chunk_writes: Arc::new(DashMap::new()),
             active_fold_started_at: Arc::new(DashMap::new()),
-            fold_concurrency: Arc::new(tokio::sync::Semaphore::new(2)),
+            fold_concurrency: Arc::new(tokio::sync::Semaphore::new(16)),
         })
     }
 
@@ -6462,6 +6466,20 @@ leader_addr: Arc::new(RwLock::new(None)),
         // block here until it resolves — matches the same "wait for both before
         // proceeding" invariant the min-2-replica gate above already enforces for
         // ordinary patches, just applied to the fold decision itself.
+        //
+        // Tried making this a non-blocking background dispatch (2026-07-12,
+        // same day): measured 7 REPLICA DISAGREEMENT instances in a 2395-patch
+        // repro run, versus 0 for the synchronous version. Root cause: the two
+        // ForceFold RPCs (one per replica) are sent sequentially, not in
+        // parallel, so there's a real window where one replica has already
+        // folded and the other hasn't received the request yet. Blocking here
+        // is what keeps the write-buffer's per-slot `flushing` gate held for
+        // that whole window, which is what prevents a sibling patch to this
+        // exact slot from being dispatched into that window in the first
+        // place — load-bearing, not just a courtesy. The actual throughput
+        // regression this was chasing (see fold_concurrency's doc comment) was
+        // never about blocking-vs-not; it was the semaphore being too narrow
+        // and shared across *unrelated* slots.
         if let Some(cidx) = chunk_idx {
             const ACTIVE_FOLD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
             let elapsed_since_start = self.active_fold_started_at.get(&(file_id, cidx)).map(|e| e.elapsed());
@@ -6472,12 +6490,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                     self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                 }
                 Some(elapsed) if elapsed >= ACTIVE_FOLD_INTERVAL => {
-                    // Cap + stagger fold operations across every slot on this
-                    // client — see fold_concurrency's doc comment for the
-                    // kdiskmark Q32T1/Q1T1 regression this closes (many slots'
-                    // independent 8s timers maturing in the same window under
-                    // a wide random-write pattern, bursting dozens of 4MB
-                    // read+write+fsync fold operations at once).
+                    // Cap (not eliminate) fold concurrency across every slot on
+                    // this client — see fold_concurrency's doc comment. Wide on
+                    // purpose: this must stay well above kdiskmark-style burst
+                    // concurrency (Q32T1 = 32) or unrelated chunks' writes start
+                    // queuing behind each other through this shared permit pool.
                     let _fold_permit = self.fold_concurrency.acquire().await.unwrap();
                     let fold_targets: Vec<SocketAddr> = patch_addrs.iter().copied()
                         .filter(|a| addr_to_node_id_snap.get(a)

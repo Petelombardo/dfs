@@ -785,6 +785,24 @@ pub struct DfsClient {
     /// (but safe — fold_slot_now treats "nothing pending" as trivial success)
     /// early ForceFold.
     active_fold_started_at: Arc<DashMap<(FileId, u64), Instant>>,
+
+    /// Bounds how many ForceFold operations this client has actively in flight
+    /// (RPC round-trip in progress, blocking a patch) at once, across every
+    /// file/slot. Root-caused 2026-07-11 night / confirmed live 2026-07-12
+    /// via kdiskmark Q32T1/Q1T1 4K random-write regression: a wide, dense
+    /// random-write pattern touches many different (file_id, chunk_idx) slots
+    /// at a similar rate, so their independent 8s active-fold timers mature in
+    /// overlapping windows — observed up to 51 ForceFold calls (each a real
+    /// 4MB read+write+fsync on the server) within a single one-second window
+    /// on server5's client log, saturating disk I/O. A permit acquire here
+    /// naturally provides both halves of the fix in one mechanism: it caps
+    /// how many can run at once (concurrency limit) and it staggers the rest
+    /// in time (each waiter only starts once an earlier fold actually
+    /// finishes, rather than everyone firing together). Small on purpose —
+    /// this is deliberately closer to serialized than pipelined, since a
+    /// handful of large sequential disk operations beats dozens of
+    /// simultaneous ones for this workload.
+    fold_concurrency: Arc<tokio::sync::Semaphore>,
 }
 
 impl DfsClient {
@@ -935,6 +953,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             read_engines: ReadEngineMap::new(),
             recent_chunk_writes: Arc::new(DashMap::new()),
             active_fold_started_at: Arc::new(DashMap::new()),
+            fold_concurrency: Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
 
@@ -6453,6 +6472,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                     self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                 }
                 Some(elapsed) if elapsed >= ACTIVE_FOLD_INTERVAL => {
+                    // Cap + stagger fold operations across every slot on this
+                    // client — see fold_concurrency's doc comment for the
+                    // kdiskmark Q32T1/Q1T1 regression this closes (many slots'
+                    // independent 8s timers maturing in the same window under
+                    // a wide random-write pattern, bursting dozens of 4MB
+                    // read+write+fsync fold operations at once).
+                    let _fold_permit = self.fold_concurrency.acquire().await.unwrap();
                     let fold_targets: Vec<SocketAddr> = patch_addrs.iter().copied()
                         .filter(|a| addr_to_node_id_snap.get(a)
                             .map(|nid| patched_node_ids.contains(nid))

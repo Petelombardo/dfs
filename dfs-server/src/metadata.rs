@@ -2551,10 +2551,23 @@ impl MetadataStore {
         Ok(changed)
     }
 
-    fn copy_all_tables(src: &redb::ReadTransaction, dst: &redb::WriteTransaction) -> Result<()> {
-        for def in Self::BYTES_TABLES { Self::copy_bytes_table(src, dst, def)?; }
-        for def in Self::U64_TABLES { Self::copy_u64_table(src, dst, def)?; }
-        Ok(())
+    /// Copies every table, checking `deadline` between each one — a large table's own
+    /// copy can't be interrupted mid-flight (it isn't split into resumable chunks), but
+    /// checking between tables at least bounds how much *extra* table copying happens
+    /// once Phase 1 is already over budget, rather than only detecting lateness after
+    /// every single table is done. Returns `false` (nothing committed by the caller's
+    /// dst_txn beyond what was already inserted) if the deadline hit before all tables
+    /// were copied — see compact_db_prepare's Phase 1 budget for why this matters.
+    fn copy_all_tables(src: &redb::ReadTransaction, dst: &redb::WriteTransaction, deadline: std::time::Instant) -> Result<bool> {
+        for def in Self::BYTES_TABLES {
+            if std::time::Instant::now() >= deadline { return Ok(false); }
+            Self::copy_bytes_table(src, dst, def)?;
+        }
+        for def in Self::U64_TABLES {
+            if std::time::Instant::now() >= deadline { return Ok(false); }
+            Self::copy_u64_table(src, dst, def)?;
+        }
+        Ok(true)
     }
 
     /// Reconcile `dst`'s copy of `def` against `src`'s current contents, but only for
@@ -2667,17 +2680,17 @@ impl MetadataStore {
     /// Returns (before_bytes, after_bytes). Runs in the caller's thread — use
     /// spawn_blocking from async code.
     pub fn compact_db(&self) -> Result<(u64, u64)> {
-        let prep = self.compact_db_prepare(std::time::Duration::from_secs(5), 64)?;
+        let prep = self.compact_db_prepare(std::time::Duration::from_secs(30), std::time::Duration::from_secs(5), 64)?;
         self.compact_db_finish(prep)
     }
 
-    /// Same as `compact_db()`, parameterized by the Phase 2 catch-up time budget and
-    /// convergence threshold (row-changes-per-pass below which we consider it settled).
-    /// Split out so tests can exercise the non-convergence/defer path deterministically
-    /// with a tiny budget/threshold, instead of needing a huge dataset and a multi-
-    /// second wait to reliably outrun the production defaults.
-    fn compact_db_with_budget(&self, catchup_budget: std::time::Duration, convergence_threshold: usize) -> Result<(u64, u64)> {
-        let prep = self.compact_db_prepare(catchup_budget, convergence_threshold)?;
+    /// Same as `compact_db()`, parameterized by Phase 1's copy time budget and Phase 2's
+    /// catch-up time budget / convergence threshold (row-changes-per-pass below which we
+    /// consider it settled). Split out so tests can exercise the non-convergence/defer
+    /// path deterministically with a tiny budget/threshold, instead of needing a huge
+    /// dataset and a multi-second wait to reliably outrun the production defaults.
+    fn compact_db_with_budget(&self, phase1_budget: std::time::Duration, catchup_budget: std::time::Duration, convergence_threshold: usize) -> Result<(u64, u64)> {
+        let prep = self.compact_db_prepare(phase1_budget, catchup_budget, convergence_threshold)?;
         self.compact_db_finish(prep)
     }
 
@@ -2690,7 +2703,18 @@ impl MetadataStore {
     /// used to do) meant Phase 1/2 legitimately running long under heavy write churn
     /// could trip the same "permanently wedged, restart the node" handling meant for a
     /// truly stuck exclusive lock, which should complete in well under a second.
-    pub(crate) fn compact_db_prepare(&self, catchup_budget: std::time::Duration, convergence_threshold: usize) -> Result<CompactionPrep> {
+    ///
+    /// `phase1_budget` bounds Phase 1's full-table copy the same way `catchup_budget`
+    /// already bounds Phase 2 — added 2026-07-12 after a real incident: under a sustained
+    /// heavy-write benchmark, Phase 1's copy (ordinary disk I/O competing with a flood of
+    /// concurrent write commits for the same disk) took long enough to blow past
+    /// server.rs's outer 60s wedge-detection timeout, which has no way to cancel an
+    /// in-flight spawn_blocking call and so restarted the node — exactly the "relocate the
+    /// blocking problem" failure Phase 2's own budget was already written to avoid, just
+    /// one phase earlier. Phase 1 has no equivalent self-defense before this. Checked
+    /// between whole tables (see copy_all_tables), not intra-table, mirroring Phase 2's
+    /// own between-passes (not intra-pass) granularity.
+    pub(crate) fn compact_db_prepare(&self, phase1_budget: std::time::Duration, catchup_budget: std::time::Duration, convergence_threshold: usize) -> Result<CompactionPrep> {
         let size_before = std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         info!("redb compaction starting ({:.1}MB live)", size_before as f64 / 1_048_576.0);
 
@@ -2710,40 +2734,26 @@ impl MetadataStore {
         self.dirty_files.lock().unwrap().clear();
         self.dirty_paths.lock().unwrap().clear();
 
-        // Phase 1: full copy, holding only the shared lock. Bounded the same
-        // way Phase 2 already is (2026-07-13) — previously this had NO budget
-        // at all, so under sustained heavy write churn a big-enough DB could
-        // make Phase 1 itself run long enough to trip the *outer* 60s
-        // "task never returned, must be wedged" safety net directly (see
-        // server.rs's compact_db_prepare call site), restarting the node —
-        // even though nothing was actually stuck, just legitimately slow
-        // under contention. Confirmed live: a 1GB-file test's DB grew
-        // 384MB->767.5MB in ~90s of repeated defer-and-retry before one such
-        // Phase 1 call finally exceeded 60s and forced a restart. Bailing out
-        // here with the same "deferred" error Phase 2 already produces lets
-        // the outer loop's escalation-to-compact_db_blocking() (already
-        // quiesced, already proven fast — a 767.5MB diff-apply-swap took
-        // only ~5s) kick in on the *next* cycle instead of risking the
-        // whole-node restart on this one.
-        const PHASE1_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
-        let phase1_start = std::time::Instant::now();
+        // Phase 1: full copy, holding only the shared lock. Bailing here (rather than
+        // ever entering Phase 2) is the same "try again next cycle" contract Phase 2
+        // already gives the caller — see this function's doc comment.
+        let phase1_deadline = std::time::Instant::now() + phase1_budget;
         {
             let live = self.db.read();
             let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase1 begin_read: {}", e))?;
             let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase1 begin_write: {}", e))?;
-            Self::copy_all_tables(&src_txn, &dst_txn)?;
+            let finished = Self::copy_all_tables(&src_txn, &dst_txn, phase1_deadline)?;
+            if !finished {
+                drop(dst_txn);
+                drop(shadow_db);
+                let _ = std::fs::remove_file(&shadow_path);
+                anyhow::bail!(
+                    "compaction deferred: Phase 1's full-table copy exceeded its {:?} budget \
+                     (live db under sustained I/O contention) — will retry on the next cycle",
+                    phase1_budget
+                );
+            }
             dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase1 commit: {}", e))?;
-        }
-        if phase1_start.elapsed() >= PHASE1_BUDGET {
-            warn!("redb compact phase1 took {:?} (budget {:?}) — bailing out before phase2 \
-                   instead of compounding further under contention",
-                phase1_start.elapsed(), PHASE1_BUDGET);
-            drop(shadow_db);
-            let _ = std::fs::remove_file(&shadow_path);
-            anyhow::bail!(
-                "compaction deferred: phase1 full copy exceeded its budget under sustained \
-                 write churn — will retry on the next cycle"
-            );
         }
 
         // Phase 2: iterative catch-up, still unlocked. Bounded by a time budget, not a
@@ -3378,10 +3388,11 @@ mod tests {
         // row as "changed" regardless of code path, which would hide the actual bug
         // (full-table-scan *cost* even when the *count* of real changes is tiny).
         {
-            let live = store.db.read().unwrap();
+            let live = store.db.read();
             let src_txn = live.begin_read().unwrap();
             let dst_txn = shadow_db.begin_write().unwrap();
-            MetadataStore::copy_all_tables(&src_txn, &dst_txn).unwrap();
+            let finished = MetadataStore::copy_all_tables(&src_txn, &dst_txn, std::time::Instant::now() + std::time::Duration::from_secs(60)).unwrap();
+            assert!(finished, "copy_all_tables should complete well within a 60s budget for this small test dataset");
             dst_txn.commit().unwrap();
         }
 
@@ -3397,7 +3408,7 @@ mod tests {
             store.put_file(&m).unwrap();
         }
 
-        let live = store.db.read().unwrap();
+        let live = store.db.read();
         let src_txn = live.begin_read().unwrap();
         let dst_txn = shadow_db.begin_write().unwrap();
 
@@ -3583,7 +3594,7 @@ mod tests {
             }
         });
 
-        let result = store.compact_db_with_budget(std::time::Duration::from_millis(5), 1);
+        let result = store.compact_db_with_budget(std::time::Duration::from_secs(30), std::time::Duration::from_millis(5), 1);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         storm.join().unwrap();
 
@@ -3599,6 +3610,55 @@ mod tests {
         }
 
         // A subsequent compaction, once churn has stopped, must succeed normally.
+        let (before, after) = store.compact_db().unwrap();
+        assert!(before > 0 && after > 0);
+        for i in 0..SEED_COUNT {
+            let path = format!("/seed_{}", i);
+            assert!(store.get_file_by_path(&path).unwrap().is_some(), "lost seeded file {} after successful follow-up compaction", path);
+        }
+    }
+
+    #[test]
+    fn test_compact_db_defers_when_phase1_exceeds_budget() {
+        // Repro for the 2026-07-12 gluster1 incident: Phase 1's full-table copy has no
+        // time budget of its own, unlike Phase 2's catchup_budget. Under a sustained
+        // heavy-write benchmark, Phase 1 competed with a flood of concurrent write
+        // commits for disk I/O and ran long enough to blow past server.rs's outer 60s
+        // wedge-detection timeout — which can't cancel an in-flight spawn_blocking call,
+        // so the node self-restarted. Phase 1 must instead defer cleanly (Err) the same
+        // way Phase 2 already does, well before that outer timeout.
+        //
+        // A near-zero phase1_budget deterministically exercises the bail-before-Phase-2
+        // path without needing real I/O contention or a large dataset — same rationale as
+        // test_compact_db_defers_under_sustained_churn's tiny catchup_budget/threshold.
+        let temp_dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+
+        const SEED_COUNT: usize = 200;
+        for i in 0..SEED_COUNT {
+            let mut m = FileMetadata::new(format!("/seed_{}", i), FileType::RegularFile);
+            m.size = i as u64;
+            store.put_file(&m).unwrap();
+        }
+
+        let result = store.compact_db_with_budget(
+            std::time::Duration::from_nanos(1), std::time::Duration::from_secs(5), 64,
+        );
+
+        assert!(result.is_err(), "compact_db() should defer (Err) when Phase 1 exceeds its own budget, not run unbounded");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("deferred") && msg.contains("Phase 1"), "unexpected error: {}", msg);
+
+        // No shadow file left behind, and the live db must be untouched (no swap
+        // happened) — a deferred Phase 1 must clean up after itself same as Phase 2.
+        let shadow_path = temp_dir.path().join("metadata.redb.shadow");
+        assert!(!shadow_path.exists(), "deferred Phase 1 left a shadow db file behind");
+        for i in 0..SEED_COUNT {
+            let path = format!("/seed_{}", i);
+            assert!(store.get_file_by_path(&path).unwrap().is_some(), "lost seeded file {} after Phase-1-deferred compaction", path);
+        }
+
+        // A subsequent compaction with a normal budget must succeed.
         let (before, after) = store.compact_db().unwrap();
         assert!(before > 0 && after > 0);
         for i in 0..SEED_COUNT {

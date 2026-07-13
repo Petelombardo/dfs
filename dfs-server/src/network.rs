@@ -208,10 +208,18 @@ async fn handle_connection<H: MessageHandler>(
         // Pass a prefetch callback so the network layer can kick off the chunk
         // disk read as soon as a split-frame MultiPatch envelope is decoded —
         // before the patch bytes have arrived — overlapping disk I/O with network receive.
+        let read_start = std::time::Instant::now();
         let read_result = tokio::time::timeout(
             IDLE_TIMEOUT,
             read_message(&mut stream, &mut read_buf, |cid| handler.start_prefetch_for_patch(cid)),
         ).await;
+        // NETTIMING read_wait: dominated by idle time since the last request/response
+        // on this persistent connection (client-side think-time between reuses), NOT
+        // purely this request's own transmission time — a large value here on its own
+        // doesn't mean this request was slow, only logged for completeness per "track
+        // gaps between ops too" — cross-reference against the client's own rpc timing
+        // for the same logical operation to interpret it.
+        let read_elapsed = read_start.elapsed();
 
         match read_result {
             Err(_) => {
@@ -229,6 +237,13 @@ async fn handle_connection<H: MessageHandler>(
                 // (e.g. a blocking disk read that was never moved to spawn_blocking)
                 // can't hold a semaphore permit indefinitely.
                 const HANDLER_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(120);
+                // NETTIMING: added 2026-07-12 alongside SPTIMING (in server.rs) to
+                // isolate whether a slow MultiPatch round trip (measured client-side,
+                // 233ms-1.5s+ under kdiskmark-style load, while handle_multi_patch's own
+                // SPTIMING showed 5-25ms) is spent inside process_message/handle_request
+                // (would show up here) or purely in network/connection-layer transit
+                // (this would be fast here despite the client seeing it slow).
+                let dispatch_start = std::time::Instant::now();
                 let response = match tokio::time::timeout(
                     HANDLER_TIMEOUT,
                     process_message(envelope, handler.clone()),
@@ -239,11 +254,18 @@ async fn handle_connection<H: MessageHandler>(
                         break;
                     }
                 };
+                let dispatch_elapsed = dispatch_start.elapsed();
 
                 // Send response
+                let write_start = std::time::Instant::now();
                 if let Err(e) = write_message(&mut stream, &response).await {
                     error!("Failed to send response to {}: {}", peer_addr, e);
                     break;
+                }
+                let write_elapsed = write_start.elapsed();
+                if dispatch_elapsed.as_millis() >= 5 || write_elapsed.as_millis() >= 5 {
+                    info!("NETTIMING peer={} read_wait={:?} dispatch={:?} write_response={:?}",
+                        peer_addr, read_elapsed, dispatch_elapsed, write_elapsed);
                 }
             }
             Ok(Ok(None)) => {

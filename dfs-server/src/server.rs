@@ -1743,6 +1743,33 @@ impl Drop for FoldHealingCancelGuard {
 }
 
 impl Server {
+    /// chunk_ring's capacity, scaled off total RAM the same way
+    /// ChunkStorage::calculate_cache_size scales its own cache — see that
+    /// function's doc comment for why total (not available) memory is the
+    /// right basis. Widened 2026-07-13 (flat 32 -> tiered) after a live
+    /// kdiskmark run showed folds cold-reading their base chunk almost every
+    /// time: chunk_ring only gets seeded as a side effect of a fold that
+    /// already ran on this exact slot, so a 32-entry ring can't keep more
+    /// than a handful of a real workload's ~150 concurrently-hot chunks warm
+    /// at once — most chains get evicted before their next fold. Kept
+    /// deliberately smaller than ChunkStorage's own cache at every tier: this
+    /// is additional, not instead of, that budget, and gluster's real nodes
+    /// (3.8GB, no swap) can't absorb another large fixed allocation on top of
+    /// it without risking the same memory pressure this session's earlier
+    /// compaction/fold-accumulator fixes were chasing.
+    fn calculate_ring_capacity() -> usize {
+        let total_mb = dfs_common::get_total_memory()
+            .map(|bytes| bytes / (1024 * 1024))
+            .unwrap_or(4096);
+        if total_mb <= 2048 {
+            16   // 64MB — SBC / low-memory nodes
+        } else if total_mb <= 8192 {
+            64   // 256MB — typical gluster-class nodes (3.8GB)
+        } else {
+            128  // 512MB — high-memory nodes
+        }
+    }
+
     /// Create a new server instance
     pub fn new(
         storage: Arc<ChunkStorage>,
@@ -1927,29 +1954,30 @@ impl Server {
             chunk_io_locks: Arc::new(DashMap::new()),
             chunk_prefetch: Arc::new(DashMap::new()),
             recently_patched: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))),
-            // Default (32 chunks = 128MB) is a flat constant from when chunk_ring
-            // was added (2026-07-11) to make folds cheaper via a warm base-chunk
-            // cache — never revisited since. DFS_CHUNK_RING_CAPACITY override lets
-            // this be tested against working sets bigger than 32 active chunks
-            // without a rebuild per value (see the size-dependent throughput cliff
-            // this cache's capacity is suspected to cause, 2026-07-13).
+            // Default scales off total RAM the same way ChunkStorage's own cache
+            // does (calculate_ring_capacity, 2026-07-13: 16/64/128 by RAM tier —
+            // gluster's 3.8GB nodes land on 64) instead of a flat constant.
+            // DFS_CHUNK_RING_CAPACITY still overrides it for live tuning without
+            // a rebuild (added same day, independently, during a live sizing
+            // investigation — see the size-dependent throughput cliff this
+            // cache's capacity is suspected to cause).
             chunk_ring: Arc::new(ShardedChunkRing::new(
                 std::env::var("DFS_CHUNK_RING_CAPACITY")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(32)
+                    .unwrap_or_else(Self::calculate_ring_capacity)
             )),
             chunk_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             chunk_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Split from chunk_ring (2026-07-13) — see delta_ring's field doc
             // comment. Own capacity knob so the two pools can be sized
             // independently if one class of chunk turns out to need more
-            // headroom than the other.
+            // headroom than the other. Same RAM-tiered default as chunk_ring.
             delta_ring: Arc::new(ShardedChunkRing::new(
                 std::env::var("DFS_DELTA_RING_CAPACITY")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(32)
+                    .unwrap_or_else(Self::calculate_ring_capacity)
             )),
             delta_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delta_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6123,7 +6151,16 @@ impl Server {
                     // restoring that safety margin for this now-separated part of the
                     // operation.
                     let m = metadata.clone();
-                    let prep_task = tokio::task::spawn_blocking(move || m.compact_db_prepare(std::time::Duration::from_secs(5), 64));
+                    // phase1_budget=30s: Phase 1's own defer-and-retry checkpoint (see
+                    // compact_db_prepare's doc comment) — added after a real incident where
+                    // Phase 1's full-table copy, competing with a sustained heavy-write
+                    // benchmark for disk I/O, ran unbounded and blew past this 60s outer
+                    // timeout instead of bailing cleanly the way Phase 2 already does.
+                    // 30s (phase1) + up to 5s (phase2 catchup_budget) leaves comfortable
+                    // headroom under the 60s hard limit below, which now only fires for a
+                    // genuine, non-time-bounded wedge (e.g. a real deadlock) rather than
+                    // "legitimately slow under heavy load."
+                    let prep_task = tokio::task::spawn_blocking(move || m.compact_db_prepare(std::time::Duration::from_secs(30), std::time::Duration::from_secs(5), 64));
                     let prep_result = match tokio::time::timeout(std::time::Duration::from_secs(60), prep_task).await {
                         Ok(r) => r,
                         Err(_) => {
@@ -8200,6 +8237,32 @@ impl Server {
             tokio::spawn(async move {
                 ctx.debounce_fold_slot(file_id, cidx).await;
             });
+
+            // Proactively warm chunk_ring with this generation's base chunk —
+            // added 2026-07-13 after a live kdiskmark run showed folds paying a
+            // real cold-read cost for base_chunk_id almost every time (see
+            // run_single_fold's ring-consult, which until now only ever hit on a
+            // chain-continuation fold). base_chunk_id is already known here, the
+            // instant this accumulator starts — no client hint needed, and this
+            // gives the *entire* active-patching window (until this slot's
+            // eventual fold, typically 6-10s or longer under real backlog) as
+            // lead time to read it in the background, instead of paying for that
+            // read synchronously inside the fold itself. Fire-and-forget: this
+            // is a pure latency optimization, never a correctness dependency —
+            // run_single_fold falls back to its normal disk read on a ring miss
+            // exactly as it always has.
+            let storage_for_prefetch = self.storage.clone();
+            let chunk_ring_for_prefetch = self.chunk_ring.clone();
+            tokio::spawn(async move {
+                if chunk_ring_for_prefetch.lock().unwrap().contains(&base_chunk_id) {
+                    return; // already warm — e.g. this node's own recent fold output
+                }
+                if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || {
+                    storage_for_prefetch.read_chunk_arc(&base_chunk_id)
+                }).await {
+                    chunk_ring_for_prefetch.lock().unwrap().put(base_chunk_id, bytes);
+                }
+            });
         }
         drop(patch_guard);
 
@@ -8334,6 +8397,8 @@ impl Server {
         // result lost the race — even though the OTHER patch's RPC response (and any
         // ReplicateChunkLocation derived from it) already told the client/leader
         // about its own new_chunk_id.
+        let handle_start = std::time::Instant::now();
+        let lock_wait_start = std::time::Instant::now();
         let _chunk_patch_guard = if let Some(cidx) = chunk_idx {
             let lock = self.chunk_patch_locks
                 .entry((file_id, cidx))
@@ -8343,6 +8408,7 @@ impl Server {
         } else {
             None
         };
+        let lock_wait_elapsed = lock_wait_start.elapsed();
 
         // Fast pre-check using the per-slot chunk_seq (see CHUNK_SEQ_TABLE's doc
         // comment) — now that chunk_patch_locks is held for this exact slot, so this
@@ -8478,10 +8544,12 @@ impl Server {
             None
         };
 
+        let apply_patch_start = std::time::Instant::now();
         let mut result = self.apply_patch(
             _chunk_patch_guard, chunk_id, file_id, chunk_idx, chunk_file_offset,
             patches.clone(), client_write_seq, prefetched.clone(),
         ).await;
+        let apply_patch_elapsed = apply_patch_start.elapsed();
 
         // apply_patch's ghost-chunk guard (NotFound: base/prior chunk not physically
         // present, or its ChunkLocation missing) means THIS node's local view of the
@@ -8514,6 +8582,20 @@ impl Server {
             }
         }
 
+        // SPTIMING: unconditional server-side per-op timing breakdown, added 2026-07-12
+        // to test whether chunk_patch_locks (held for this whole function, including
+        // apply_patch's disk I/O) is the actual bottleneck under kdiskmark-style
+        // concurrent random writes against a multi-GB file — a 4MB chunk granularity
+        // over e.g. a 4GB file means only ~1024 possible lock keys, so Q32-deep
+        // concurrent writes have a real chance of colliding on the same chunk_idx and
+        // queuing behind this lock (birthday-paradox math, not a bug in the lock
+        // itself). `lock_wait` isolates queuing time; `apply_patch` is the actual work
+        // once holding the lock; `other` is everything else in this handler (staleness
+        // checks, chunk_seq lookups, etc.) not otherwise measured.
+        let total_handle = handle_start.elapsed();
+        let other_handle = total_handle.saturating_sub(lock_wait_elapsed + apply_patch_elapsed);
+        info!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?}",
+            file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle);
         match result {
             Ok((new_chunk_id, final_size, patch_ts, final_buf)) => {
                 info!("MultiPatch: {} -> {} (final size={}, chunk_idx={:?}, full_rewrite={})",

@@ -786,6 +786,24 @@ pub struct DfsClient {
     /// early ForceFold.
     active_fold_started_at: Arc<DashMap<(FileId, u64), Instant>>,
 
+    /// Sum of patch payload bytes this client has sent to (file_id, chunk_idx)'s
+    /// current accumulating generation since the last fold — the size-based
+    /// counterpart to active_fold_started_at's time-based trigger. Added
+    /// 2026-07-12 after a local repro found the *only* fold trigger was the
+    /// ~6-10s timer: a hot slot under heavy concurrent write pressure (many
+    /// small patches landing faster than the timer fires) can accumulate an
+    /// unbounded server-side delta file between fold cycles — reproduced
+    /// locally as a single 73MB on-disk accumulator for one chunk of a 50MB
+    /// test file within ~15s, and separately as a sustained-write run driving
+    /// a small test disk to 100% full. This must be a client-side trigger
+    /// (not a server-side one) for the same REPLICA DISAGREEMENT reason
+    /// active_fold_started_at's doc comment explains: only a single,
+    /// externally-driven decision delivered identically to every replica is
+    /// safe — an independent per-replica size check would have the exact same
+    /// race PATCH_FOLD_COUNT_THRESHOLD was already measured to make worse.
+    /// Reset alongside active_fold_started_at wherever that resets.
+    active_fold_bytes: Arc<DashMap<(FileId, u64), usize>>,
+
     /// Bounds how many ForceFold operations this client has actively in flight
     /// (RPC round-trip in progress, blocking the triggering patch) at once,
     /// across every file/slot. Root-caused 2026-07-11 night: a wide, dense
@@ -803,9 +821,21 @@ pub struct DfsClient {
     /// that blocking is load-bearing for correctness, not optional), a narrow
     /// global pool couples every unrelated chunk's write latency together
     /// through it (convoy/head-of-line blocking). This must stay comfortably
-    /// above realistic burst concurrency (kdiskmark's own queue depth tops
-    /// out at 32) so the common case never actually waits on it — it's a
-    /// backstop against a genuinely pathological burst, not a routine gate.
+    /// above realistic burst concurrency so the common case never actually
+    /// waits on it — it's a backstop against a genuinely pathological burst,
+    /// not a routine gate.
+    ///
+    /// Widened again 2026-07-12 (16 -> 40): a real kdiskmark run against
+    /// server5's VM100 (spanning ~150 distinct hot chunks of the qcow2 disk)
+    /// measured up to 37 ForceFold maturities landing in a single one-second
+    /// window even after the active-fold interval was jittered per-slot (see
+    /// its call site) — with that many hot slots each maturing roughly every
+    /// 6-10s, steady-state average demand alone (~150/8 ≈ 19/s) already
+    /// exceeded the old 16-permit pool, not just the transient bursts. This
+    /// same semaphore also now bounds MultiPatch's min-2-replica backfill
+    /// (see that call site) — another full-chunk-copy operation of the same
+    /// cost class, sharing the pool rather than getting an uncoordinated
+    /// second one.
     fold_concurrency: Arc<tokio::sync::Semaphore>,
 }
 
@@ -957,7 +987,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             read_engines: ReadEngineMap::new(),
             recent_chunk_writes: Arc::new(DashMap::new()),
             active_fold_started_at: Arc::new(DashMap::new()),
-            fold_concurrency: Arc::new(tokio::sync::Semaphore::new(16)),
+            active_fold_bytes: Arc::new(DashMap::new()),
+            fold_concurrency: Arc::new(tokio::sync::Semaphore::new(
+                std::env::var("DFS_FOLD_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(40),
+            )),
         })
     }
 
@@ -1207,6 +1243,13 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Send and receive with a 30s timeout.  This must cover the full round-trip for large
         // write payloads (4MB+) on a slow HDD node, but should fail quickly enough that the
         // caller can fall back to a different node rather than blocking the write pipeline.
+        // CLIENTNET timing added 2026-07-12 alongside NETTIMING (server) and SPTIMING
+        // (handle_multi_patch) to find where a slow round trip (233ms-1.5s+ measured at
+        // the multi_patch_chunk_on_replicas_inner level, while server-side handling was
+        // consistently 5-25ms) is actually going: client write, network+server, or
+        // client read. write/read here are just the syscall-level client-side legs;
+        // the gap between write completing and read completing that ISN'T server-side
+        // dispatch (per NETTIMING) is genuine network transit / TCP-level delay.
         let io_future = async {
             // Coalesce the length prefix and body into one buffer so the write hits the
             // wire as a single packet instead of two — halves the packet count (and
@@ -1215,15 +1258,22 @@ leader_addr: Arc::new(RwLock::new(None)),
             let mut framed = Vec::with_capacity(4 + encoded.len());
             framed.extend_from_slice(&len.to_be_bytes());
             framed.extend_from_slice(&encoded);
+            let write_start = std::time::Instant::now();
             stream.write_all(&framed).await?;
             stream.flush().await?;
+            let write_elapsed = write_start.elapsed();
 
+            let read_start = std::time::Instant::now();
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await?;
             let len = u32::from_be_bytes(len_buf) as usize;
 
             let mut buf = vec![0u8; len];
             stream.read_exact(&mut buf).await?;
+            let read_elapsed = read_start.elapsed();
+            if write_elapsed.as_millis() >= 5 || read_elapsed.as_millis() >= 5 {
+                info!("CLIENTNET addr={} write={:?} read={:?}", addr, write_elapsed, read_elapsed);
+            }
             Ok::<Vec<u8>, std::io::Error>(buf)
         };
 
@@ -5318,8 +5368,32 @@ leader_addr: Arc::new(RwLock::new(None)),
         let leader_addr = *self.leader_addr.read().await;
         match leader_addr {
             Some(leader) => {
-                if let Err(e) = self.send_chunk_locations_batched(leader, chunk_locations.clone()).await {
-                    warn!("WriteChunk: batched ChunkLocations to leader {} failed: {} — re-queuing for the background worker", leader, e);
+                // Bound this to a short outer timeout, not send_chunk_locations_batched's
+                // own up-to-~15s internal 4-attempt retry (3s timeout x4 + backoff) — this
+                // is a latency optimization the caller never depends on (see that
+                // function's doc comment: flush_metadata_sync delivers the authoritative
+                // state regardless, and the re-queue fallback right below already exists
+                // for exactly this failure case). Awaiting the full retry here blocked
+                // this one fresh write's completion for up to ~15s whenever the leader
+                // was merely busy, not down — confirmed live 2026-07-12 via fio directly
+                // against the DFS mount: clat tail latencies up to 20s during a 4K random
+                // write test, tracing back to exactly this call.
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    self.send_chunk_locations_batched(leader, chunk_locations.clone()),
+                ).await;
+                let failed = match result {
+                    Ok(Ok(())) => false,
+                    Ok(Err(e)) => {
+                        warn!("WriteChunk: batched ChunkLocations to leader {} failed: {} — re-queuing for the background worker", leader, e);
+                        true
+                    }
+                    Err(_) => {
+                        warn!("WriteChunk: batched ChunkLocations to leader {} took >1s — re-queuing for the background worker instead of blocking this write", leader);
+                        true
+                    }
+                };
+                if failed {
                     self.pending_chunk_locations.lock().await.extend(chunk_locations.clone());
                 }
             }
@@ -5979,6 +6053,16 @@ leader_addr: Arc::new(RwLock::new(None)),
         dual_rf: bool,
         per_server_hints: Arc<HashMap<SocketAddr, Vec<ChunkId>>>,
     ) -> Result<(dfs_common::ChunkLocation, Vec<(SocketAddr, ChunkId)>)> {
+        // Timing instrumentation added 2026-07-12 to find the actual dominant cost in
+        // this function under real kdiskmark-style load — logged unconditionally (not
+        // just on a slow threshold) so a full run's timing distribution can be pulled
+        // straight from the log rather than guessed at. TIMING lines are intentionally
+        // greppable as one token.
+        let fn_start = std::time::Instant::now();
+        let mut timing_rpc = std::time::Duration::ZERO;
+        let mut timing_backfill = std::time::Duration::ZERO;
+        let mut timing_fold = std::time::Duration::ZERO;
+        let mut timing_fold_permit_wait = std::time::Duration::ZERO;
         let original_old_chunk_id = old_chunk_id;
         let mut current_location = old_location.clone();
         let mut skip_addrs: Vec<SocketAddr> = vec![];
@@ -6004,7 +6088,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Attempt count is now just a hard safety backstop against a genuine infinite
         // loop bug — the real gate on connection-failure retries is CONNECT_RETRY_BUDGET
         // (wall-clock), and each such retry consumes one attempt here.
+        let mut timing_setup = std::time::Duration::ZERO;
         'retry: for _attempt in 0u32..1000 {
+        let iteration_start = std::time::Instant::now();
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
             addr_map.iter().map(|(&addr, &id)| (id, addr)).collect()
@@ -6113,6 +6199,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         const SPLIT_FRAME_THRESHOLD: usize = 32 * 1024;
         let total_patch_data: usize = patches.iter().map(|(_, d)| d.len()).sum();
 
+        let rpc_start = std::time::Instant::now();
+        timing_setup += rpc_start.duration_since(iteration_start);
         let results = if total_patch_data >= SPLIT_FRAME_THRESHOLD {
             // Raw payload shared across all replicas: [4B len0][data0][4B len1][data1]...
             let mut raw_payload = Vec::with_capacity(
@@ -6174,6 +6262,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             }).collect();
             futures::future::join_all(futures).await
         };
+        timing_rpc += rpc_start.elapsed();
 
         // Collect per-replica results before any disagreement logic.
         // (addr, Ok(ncid, size)) for success, (addr, Err) for failure.
@@ -6395,6 +6484,17 @@ leader_addr: Arc::new(RwLock::new(None)),
             // or disagree on — it's simply the same content everywhere.
             const BACKFILL_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
             const BACKFILL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(300);
+            // Share fold_concurrency's permit pool: a backfill is the same class of
+            // expensive operation as ForceFold (a full 4MB chunk read plus one 4MB
+            // write per missing replica), so it needs the same bound. Without this,
+            // backfills under sustained hot-chunk contention have no cap at all and
+            // can compound — each backfill's own writes add load to the same nodes
+            // that are already missing acks, producing more under-replicated patches
+            // next. Measured live 2026-07-12: backfill frequency escalated from
+            // isolated singles to 5-7/sec in the last ~18s of a kdiskmark RND4K run.
+            let permit_wait_start = std::time::Instant::now();
+            let _fold_permit = self.fold_concurrency.acquire().await.unwrap();
+            timing_fold_permit_wait += permit_wait_start.elapsed();
             let backfill_started = std::time::Instant::now();
             let source_bytes = self.read_chunk_by_id(authoritative_chunk_id, &patched_node_ids).await;
             match source_bytes {
@@ -6450,6 +6550,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                        treat this as urgent, not routine",
                     authoritative_chunk_id, patched_node_ids.len(), required_replicas);
             }
+            timing_backfill += backfill_started.elapsed();
         }
 
         let mut new_chunk_id = authoritative_chunk_id;
@@ -6481,7 +6582,41 @@ leader_addr: Arc::new(RwLock::new(None)),
         // never about blocking-vs-not; it was the semaphore being too narrow
         // and shared across *unrelated* slots.
         if let Some(cidx) = chunk_idx {
-            const ACTIVE_FOLD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+            // Jittered per-slot interval, not a fixed 8s: a kdiskmark-style workload
+            // starts writing many different chunks within the same brief window, so
+            // a fixed interval means every one of them matures in lockstep waves
+            // every ~8s, forever (each generation resets its own timer to "now",
+            // re-synchronizing the next wave too). Measured live 2026-07-12: up to
+            // 37 ForceFold maturities landing in a single one-second window against
+            // fold_concurrency's 16-permit pool — real queueing, not just isolated
+            // hot-chunk cost. A deterministic per-(file_id, chunk_idx) jitter spreads
+            // different slots' maturity times across a 6-10s window instead of a
+            // single instant, breaking the resonance instead of just widening the
+            // pool to chase whatever burst size this workload happens to produce.
+            let active_fold_interval = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                (file_id, cidx).hash(&mut hasher);
+                let jitter_ms = (hasher.finish() % 4000) as u64; // 0..4000ms
+                std::time::Duration::from_secs(6) + std::time::Duration::from_millis(jitter_ms)
+            };
+            // Size-based early trigger, alongside the time-based one above — see
+            // active_fold_bytes's doc comment for why an unbounded accumulator is a
+            // real problem this closes, and why it's safe to add here (same single
+            // client-side decision-maker, same identical-to-every-replica delivery).
+            // 8MB = 2x the real 4MB chunk size: generous enough that normal write
+            // patterns still coalesce many small patches per fold (the whole point
+            // of debouncing), tight enough to bound worst-case accumulator growth to
+            // a small constant multiple of a real chunk instead of unbounded.
+            const ACTIVE_FOLD_SIZE_THRESHOLD: usize = 8 * 1024 * 1024;
+            let this_patch_bytes: usize = patches.iter().map(|(_, d)| d.len()).sum();
+            let accumulated_bytes = {
+                let mut entry = self.active_fold_bytes.entry((file_id, cidx)).or_insert(0);
+                *entry += this_patch_bytes;
+                *entry
+            };
+
             let elapsed_since_start = self.active_fold_started_at.get(&(file_id, cidx)).map(|e| e.elapsed());
             match elapsed_since_start {
                 None => {
@@ -6489,13 +6624,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // accumulator — seed the timer, nothing to fold yet.
                     self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                 }
-                Some(elapsed) if elapsed >= ACTIVE_FOLD_INTERVAL => {
+                Some(elapsed) if elapsed >= active_fold_interval || accumulated_bytes >= ACTIVE_FOLD_SIZE_THRESHOLD => {
                     // Cap (not eliminate) fold concurrency across every slot on
                     // this client — see fold_concurrency's doc comment. Wide on
                     // purpose: this must stay well above kdiskmark-style burst
                     // concurrency (Q32T1 = 32) or unrelated chunks' writes start
                     // queuing behind each other through this shared permit pool.
+                    let permit_wait_start = std::time::Instant::now();
                     let _fold_permit = self.fold_concurrency.acquire().await.unwrap();
+                    timing_fold_permit_wait += permit_wait_start.elapsed();
+                    let fold_rpc_start = std::time::Instant::now();
                     let fold_targets: Vec<SocketAddr> = patch_addrs.iter().copied()
                         .filter(|a| addr_to_node_id_snap.get(a)
                             .map(|nid| patched_node_ids.contains(nid))
@@ -6529,17 +6667,20 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                     if fold_ok {
                         if let Some((real_chunk_id, size)) = folded {
-                            info!("ForceFold: file {} chunk {} folded {} -> {} after {:?} of active patching",
-                                file_id, cidx, new_chunk_id, real_chunk_id, elapsed);
+                            info!("ForceFold: file {} chunk {} folded {} -> {} after {:?} of active patching ({} accumulated bytes)",
+                                file_id, cidx, new_chunk_id, real_chunk_id, elapsed, accumulated_bytes);
                             new_chunk_id = real_chunk_id;
                             new_size = size;
                         }
                         // New generation starts accumulating from here.
                         self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
+                        self.active_fold_bytes.insert((file_id, cidx), 0);
                     }
-                    // Else: leave the timer where it is (don't reset it to now) so
-                    // the very next patch to this slot retries the fold immediately
+                    // Else: leave the timer (and byte count) where they are (don't
+                    // reset to now/0) so the very next patch to this slot retries
+                    // the fold immediately
                     // instead of waiting out another full interval.
+                    timing_fold += fold_rpc_start.elapsed();
                 }
                 Some(_) => {} // not due yet
             }
@@ -6574,7 +6715,9 @@ leader_addr: Arc::new(RwLock::new(None)),
         // dropped for that round, same as this code's old "skip entirely if leader_addr
         // is None right now" behavior — not a new gap, flush_metadata_sync is still the
         // authoritative backstop regardless.
+        let enqueue_start = std::time::Instant::now();
         self.enqueue_chunk_location(new_location.clone()).await;
+        let timing_enqueue = enqueue_start.elapsed();
 
         // Collect skip pairs for deferred tombstone+delete after metadata commits.
         // Tombstone is NOT sent here — sending it before metadata sync creates a read
@@ -6589,6 +6732,21 @@ leader_addr: Arc::new(RwLock::new(None)),
             .collect();
 
         let n_patches = patches.len();
+        // MPTIMING: unconditional per-op timing breakdown, added 2026-07-12 to find the
+        // dominant cost under real kdiskmark-style load without guessing. `total` is
+        // wall-clock for this whole call (including any stale-base retries this
+        // iteration went through — rpc/backfill/fold accumulate across those too, via
+        // +=). `other` is total minus every phase we explicitly measured — a large
+        // `other` means time is going somewhere NOT instrumented here yet (scheduler
+        // delay, an un-timed lock, CPU-bound work in the results loop, etc.) rather than
+        // in the RPC/backfill/fold/enqueue calls themselves. Deliberately unconditional
+        // (not gated on a slow threshold) so the full distribution can be pulled from
+        // the log, per-op, not just outliers.
+        let total = fn_start.elapsed();
+        let measured = timing_setup + timing_rpc + timing_backfill + timing_fold_permit_wait + timing_fold + timing_enqueue;
+        let other = total.saturating_sub(measured);
+        info!("MPTIMING file={} chunk={:?} targets={:?} total={:?} setup={:?} rpc={:?} backfill={:?} fold_permit_wait={:?} fold_rpc={:?} enqueue={:?} other={:?}",
+            file_id, chunk_idx, patch_addrs, total, timing_setup, timing_rpc, timing_backfill, timing_fold_permit_wait, timing_fold, timing_enqueue, other);
         info!("MultiPatch: {} -> {} ({} replicas, {} patches, {} skipped)",
             old_chunk_id, new_chunk_id, patched_node_ids.len(), n_patches, skip_pairs.len());
         return Ok((new_location, skip_pairs));
@@ -6900,8 +7058,28 @@ leader_addr: Arc::new(RwLock::new(None)),
             match leader_addr {
                 Some(leader) => {
                     let count = batch.len();
-                    if let Err(e) = self.send_chunk_locations_batched(leader, batch.clone()).await {
-                        warn!("flush_metadata_sync: draining {} pending chunk locations failed: {} — re-queuing for the background worker", count, e);
+                    // Same short-timeout treatment as WriteChunk's fresh-write call site
+                    // above — this drain is a latency optimization, not a correctness
+                    // requirement (flush_metadata_sync's own PutFileMetadata call right
+                    // after this delivers the authoritative state regardless), so don't
+                    // block this flush for send_chunk_locations_batched's up-to-~15s
+                    // internal retry when the re-queue fallback already handles failure.
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        self.send_chunk_locations_batched(leader, batch.clone()),
+                    ).await;
+                    let failed = match result {
+                        Ok(Ok(())) => false,
+                        Ok(Err(e)) => {
+                            warn!("flush_metadata_sync: draining {} pending chunk locations failed: {} — re-queuing for the background worker", count, e);
+                            true
+                        }
+                        Err(_) => {
+                            warn!("flush_metadata_sync: draining {} pending chunk locations took >1s — re-queuing for the background worker instead of blocking this flush", count);
+                            true
+                        }
+                    };
+                    if failed {
                         // Re-queue rather than drop — see start_chunk_location_batch_worker's
                         // identical fix for the full rationale (a chunk's data write already
                         // completed by the time it lands here; dropping the location
@@ -7022,7 +7200,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let mut attempts = 0u32;
                     loop {
                         let result = tokio::time::timeout(
-                            Duration::from_secs(2),
+                            Duration::from_secs(5),
                             client.put_file_metadata_with_quorum(
                                 &entry.metadata, None, Some(entry.covers_from_write_seq),
                             ),
@@ -7051,9 +7229,24 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                             }
                             Err(_) => {
-                                // 5s deadline exceeded — leader is saturated or unreachable.
-                                // Clear cached leader so next attempt rediscovers via any node.
-                                *client.leader_addr.write().await = None;
+                                // 5s deadline exceeded without the inner call itself reporting
+                                // an error — put_file_metadata_with_quorum's own
+                                // send_to_leader_with_retry already has a 15s budget and already
+                                // clears/rediscovers leader_addr on genuine network errors or
+                                // NotLeader redirects, so hitting this branch means the leader
+                                // was just slow (busy under concurrent load), not gone.
+                                // Deliberately do NOT clear leader_addr here: that field is
+                                // shared by every concurrent write path (WriteChunk,
+                                // flush_metadata_sync, chunk_location_batch_worker, ...), and
+                                // clearing it on a single worker's impatience — with no evidence
+                                // the leader actually changed — forced every other in-flight
+                                // caller into a redundant "no known leader" rediscovery storm.
+                                // Measured live 2026-07-12: one such timeout produced 2428 "no
+                                // known leader" warnings over the next 23s during a kdiskmark
+                                // run, while the leader's own server log showed it never
+                                // stopped processing puts. Just retry; if the leader really is
+                                // down, the next attempt's send_to_leader_with_retry will hit a
+                                // real error and clear the cache itself.
                                 attempts += 1;
                                 let backoff_ms = (200u64 * attempts as u64).min(5000);
                                 warn!(

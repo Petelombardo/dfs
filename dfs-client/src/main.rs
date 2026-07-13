@@ -216,9 +216,24 @@ fn mount_filesystem(
     use std::sync::Arc;
     use std::thread;
 
+    // Was hardcoded to 64 worker threads regardless of the machine's actual core
+    // count — on a 4-core box (server5, gluster1-5, most SBC deployment targets)
+    // that's a 16x oversubscription of OS threads onto physical cores. This is the
+    // runtime every FUSE write/patch/fold call dispatches onto (via self.runtime.spawn),
+    // so under real concurrent load (kdiskmark-style Q32) each operation's own code
+    // measured fast in isolation (single-digit ms) while the actual end-to-end latency
+    // ballooned to hundreds of ms - multiple seconds — root-caused 2026-07-12 to
+    // exactly this oversubscription via correlated client/server timing instrumentation
+    // (MPTIMING/CLIENTNET/NETTIMING/SPTIMING) showing server-side processing
+    // consistently fast while client-observed round trips were wildly variable.
+    // available_parallelism() tracks the actual machine instead of guessing.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    info!("Main runtime: {} worker threads (available_parallelism)", worker_threads);
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(64)
+            .worker_threads(worker_threads)
             .enable_all()
             .build()?
     );

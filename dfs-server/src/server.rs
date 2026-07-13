@@ -5924,7 +5924,16 @@ impl Server {
                     // restoring that safety margin for this now-separated part of the
                     // operation.
                     let m = metadata.clone();
-                    let prep_task = tokio::task::spawn_blocking(move || m.compact_db_prepare(std::time::Duration::from_secs(5), 64));
+                    // phase1_budget=30s: Phase 1's own defer-and-retry checkpoint (see
+                    // compact_db_prepare's doc comment) — added after a real incident where
+                    // Phase 1's full-table copy, competing with a sustained heavy-write
+                    // benchmark for disk I/O, ran unbounded and blew past this 60s outer
+                    // timeout instead of bailing cleanly the way Phase 2 already does.
+                    // 30s (phase1) + up to 5s (phase2 catchup_budget) leaves comfortable
+                    // headroom under the 60s hard limit below, which now only fires for a
+                    // genuine, non-time-bounded wedge (e.g. a real deadlock) rather than
+                    // "legitimately slow under heavy load."
+                    let prep_task = tokio::task::spawn_blocking(move || m.compact_db_prepare(std::time::Duration::from_secs(30), std::time::Duration::from_secs(5), 64));
                     let prep_result = match tokio::time::timeout(std::time::Duration::from_secs(60), prep_task).await {
                         Ok(r) => r,
                         Err(_) => {
@@ -8106,6 +8115,8 @@ impl Server {
         // result lost the race — even though the OTHER patch's RPC response (and any
         // ReplicateChunkLocation derived from it) already told the client/leader
         // about its own new_chunk_id.
+        let handle_start = std::time::Instant::now();
+        let lock_wait_start = std::time::Instant::now();
         let _chunk_patch_guard = if let Some(cidx) = chunk_idx {
             let lock = self.chunk_patch_locks
                 .entry((file_id, cidx))
@@ -8115,6 +8126,7 @@ impl Server {
         } else {
             None
         };
+        let lock_wait_elapsed = lock_wait_start.elapsed();
 
         // Fast pre-check using the per-slot chunk_seq (see CHUNK_SEQ_TABLE's doc
         // comment) — now that chunk_patch_locks is held for this exact slot, so this
@@ -8245,10 +8257,12 @@ impl Server {
             None
         };
 
+        let apply_patch_start = std::time::Instant::now();
         let mut result = self.apply_patch(
             _chunk_patch_guard, chunk_id, file_id, chunk_idx, chunk_file_offset,
             patches.clone(), client_write_seq, prefetched.clone(),
         ).await;
+        let apply_patch_elapsed = apply_patch_start.elapsed();
 
         // apply_patch's ghost-chunk guard (NotFound: base/prior chunk not physically
         // present, or its ChunkLocation missing) means THIS node's local view of the
@@ -8281,6 +8295,20 @@ impl Server {
             }
         }
 
+        // SPTIMING: unconditional server-side per-op timing breakdown, added 2026-07-12
+        // to test whether chunk_patch_locks (held for this whole function, including
+        // apply_patch's disk I/O) is the actual bottleneck under kdiskmark-style
+        // concurrent random writes against a multi-GB file — a 4MB chunk granularity
+        // over e.g. a 4GB file means only ~1024 possible lock keys, so Q32-deep
+        // concurrent writes have a real chance of colliding on the same chunk_idx and
+        // queuing behind this lock (birthday-paradox math, not a bug in the lock
+        // itself). `lock_wait` isolates queuing time; `apply_patch` is the actual work
+        // once holding the lock; `other` is everything else in this handler (staleness
+        // checks, chunk_seq lookups, etc.) not otherwise measured.
+        let total_handle = handle_start.elapsed();
+        let other_handle = total_handle.saturating_sub(lock_wait_elapsed + apply_patch_elapsed);
+        info!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?}",
+            file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle);
         match result {
             Ok((new_chunk_id, final_size, patch_ts, final_buf)) => {
                 info!("MultiPatch: {} -> {} (final size={}, chunk_idx={:?}, full_rewrite={})",

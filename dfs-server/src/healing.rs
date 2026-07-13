@@ -268,6 +268,22 @@ pub struct HealingManager {
     /// The heal loop never touches this set directly.
     stalled_healing: Arc<RwLock<HashSet<ChunkId>>>,
 
+    /// Chunks whose most recent heal attempt reached ≥1 confirmed-alive source but
+    /// still failed to replicate to ANY target (source-side corruption, all targets
+    /// rejecting, etc.) — distinct from stalled_healing's "0 alive nodes" case, whose
+    /// promotion-back-to-pending check only looks at HasChunks presence, not whether
+    /// a push from that exact source has actually been *verified* to work. Without
+    /// this, a chunk whose only replica fails its own checksum on every push attempt
+    /// still answers HasChunks "yes" (the bytes are locally present, just corrupt),
+    /// so discovery immediately re-promotes and re-queues it every single cycle
+    /// forever — confirmed live 2026-07-12: one such chunk retried every ~15s for
+    /// over 10 hours straight, a real and continuous CPU/disk-I/O/network drain on
+    /// the leader (which was simultaneously the corrupted source). Maps chunk_id ->
+    /// (last_failure, consecutive_failure_count) for exponential backoff, capped —
+    /// long enough to stop the hot loop, short enough to still notice if the source
+    /// is eventually fixed/replaced. Cleared on any successful heal of that chunk.
+    heal_push_failure: Arc<DashMap<ChunkId, (Instant, u32)>>,
+
     /// Two-cycle orphan guard: chunk IDs that were absent from live_chunk_ids in the
     /// previous discovery pass. Only purged when absent in two consecutive passes.
     /// This prevents premature orphan-purge when the leader's metadata DB is temporarily
@@ -407,6 +423,7 @@ impl HealingManager {
             cancelled_heals: Arc::new(DashMap::new()),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
             stalled_healing: Arc::new(RwLock::new(HashSet::new())),
+            heal_push_failure: Arc::new(DashMap::new()),
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
             heal_transfer_timeout_secs,
             phantom_reconcile_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -608,9 +625,37 @@ impl HealingManager {
             // orphaned files when they miss DeleteChunk RPCs while offline, and also when
             // patch operations re-place a chunk on different nodes without the old node
             // receiving a DeleteChunk.  Intentionally before the is_leader gate.
+            //
+            // Disk-pressure early trigger (added 2026-07-12): the normal 2-minute
+            // schedule is fine under ordinary churn, but a local repro of sustained
+            // heavy concurrent writes (many hot chunks each folding repeatedly)
+            // drove a small test disk from having headroom to completely full in
+            // under 90 seconds — well before the first scheduled sweep at the
+            // 2-minute mark ever got a chance to run. Checking free space here is
+            // cheap (one statvfs call, no directory walk) and safe to run every
+            // cycle: unlike the fold-timing decision, this is a purely local,
+            // per-node cleanup of already-safely-identified orphans (still subject
+            // to run_disk_orphan_sweep's own grace-period checks), not something
+            // that needs cross-replica agreement — so triggering it early under
+            // local disk pressure can't cause the REPLICA DISAGREEMENT class of bug
+            // an independent per-node *fold* trigger would (see
+            // active_fold_bytes's doc comment in dfs-client for that distinction).
+            // 10% threshold scales with disk size: on real ~900GB staging nodes
+            // this essentially never fires under normal operation (would need
+            // >800GB consumed); on a small/constrained node it gives a real safety
+            // margin instead of letting the 2-minute window run to completion.
+            let disk_pressure = match self.storage.get_filesystem_stats() {
+                Ok((total, _free, available)) if total > 0 => {
+                    (available as f64) < (total as f64) * 0.10
+                }
+                _ => false,
+            };
             disk_sweep_counter += 1;
-            if disk_sweep_counter >= 2 {
+            if disk_sweep_counter >= 2 || disk_pressure {
                 disk_sweep_counter = 0;
+                if disk_pressure {
+                    warn!("Disk orphan sweep: triggering early — available space under 10% of total");
+                }
                 self.wait_for_write_quiet("Disk orphan sweep").await;
                 self.run_disk_orphan_sweep().await;
             }
@@ -740,6 +785,34 @@ impl HealingManager {
     fn is_healing_cancelled(cancelled_heals: &Arc<DashMap<ChunkId, Instant>>, chunk_id: &ChunkId) -> bool {
         cancelled_heals.get(chunk_id)
             .map(|e| e.elapsed() < Self::CANCEL_TOMBSTONE_TTL)
+            .unwrap_or(false)
+    }
+
+    /// Base and cap for heal_push_failure's exponential backoff — see that field's
+    /// doc comment. Base 60s means a freshly-failing chunk still gets a fairly
+    /// prompt second attempt (transient target-node hiccup shouldn't wait long);
+    /// doubling per consecutive failure reaches the 30-minute cap after 5 straight
+    /// failures, which is where a persistently-corrupt source lands and stays
+    /// (still auto-retries periodically — e.g. if the source disk gets replaced —
+    /// just no longer in a hot loop).
+    const HEAL_PUSH_FAILURE_BASE: Duration = Duration::from_secs(60);
+    const HEAL_PUSH_FAILURE_CAP: Duration = Duration::from_secs(1800);
+
+    /// True if a chunk's last heal attempt failed to replicate to any target despite
+    /// having a confirmed-alive source, and its backoff window hasn't elapsed yet.
+    /// See heal_push_failure's doc comment for why this check exists.
+    fn heal_push_failure_backoff_active(
+        heal_push_failure: &Arc<DashMap<ChunkId, (Instant, u32)>>,
+        chunk_id: &ChunkId,
+    ) -> bool {
+        heal_push_failure.get(chunk_id)
+            .map(|entry| {
+                let (last_failure, count) = *entry;
+                let backoff = Self::HEAL_PUSH_FAILURE_BASE
+                    .saturating_mul(1u32 << count.min(5))
+                    .min(Self::HEAL_PUSH_FAILURE_CAP);
+                last_failure.elapsed() < backoff
+            })
             .unwrap_or(false)
     }
 
@@ -2111,6 +2184,18 @@ impl HealingManager {
                         }
                     }
 
+                    // A prior heal attempt already found a confirmed-alive source but
+                    // failed to replicate to any target (source-side corruption, most
+                    // likely) — HasChunks presence alone doesn't mean the source is
+                    // actually usable, so don't let the "source available" promotion
+                    // above put this straight back on the work queue every cycle. See
+                    // heal_push_failure's doc comment for the incident this closes.
+                    if Self::heal_push_failure_backoff_active(&self.heal_push_failure, &chunk_id) {
+                        self.mark_pending(chunk_id).await;
+                        pending_count += 1;
+                        continue;
+                    }
+
                     // For chunks that were never fully replicated to RF nodes, apply a
                     // minimum delay of healing_delay_secs before healing. This prevents
                     // the healer from adding replicas to chunks that are still being
@@ -2148,6 +2233,7 @@ impl HealingManager {
                     if nodes_without_chunk.is_empty() {
                         self.clear_pending(&chunk_id).await;
                         self.stalled_healing.write().await.remove(&chunk_id);
+                        self.heal_push_failure.remove(&chunk_id);
                     }
                 }
             }
@@ -2370,6 +2456,7 @@ impl HealingManager {
                 let in_flight_healing = self.in_flight_healing.clone();
                 let cancelled_heals = self.cancelled_heals.clone();
                 let stalled_healing = self.stalled_healing.clone();
+                let heal_push_failure = self.heal_push_failure.clone();
                 let heal_semaphore = self.heal_semaphore.clone();
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
                 let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs.load(Ordering::Relaxed));
@@ -2386,7 +2473,7 @@ impl HealingManager {
                                 HealingManager::do_heal_chunk_shared(
                                     &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
                                     &pending_healing, &in_flight_healing, &cancelled_heals, replication_factor, &bandwidth_limiter,
-                                    &node_inflight, &heal_max_concurrent_per_node,
+                                    &node_inflight, &heal_max_concurrent_per_node, &heal_push_failure,
                                 ).await
                             }
                             ReplicationStatus::OverReplicated => {
@@ -2478,6 +2565,7 @@ impl HealingManager {
         bandwidth_limiter: &Arc<BandwidthLimiter>,
         node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
         heal_max_concurrent_per_node: &Arc<AtomicUsize>,
+        heal_push_failure: &Arc<DashMap<ChunkId, (Instant, u32)>>,
     ) -> Result<()> {
         // In-flight guard: prevents two concurrent tasks healing the same chunk.
         {
@@ -2491,7 +2579,7 @@ impl HealingManager {
 
         let result = Self::do_heal_chunk_inner(
             chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, pending_healing, cancelled_heals, replication_factor, bandwidth_limiter,
-            node_inflight, heal_max_concurrent_per_node,
+            node_inflight, heal_max_concurrent_per_node, heal_push_failure,
         ).await;
         in_flight_healing.write().await.remove(chunk_id);
         result
@@ -2510,6 +2598,7 @@ impl HealingManager {
         bandwidth_limiter: &Arc<BandwidthLimiter>,
         node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
         heal_max_concurrent_per_node: &Arc<AtomicUsize>,
+        heal_push_failure: &Arc<DashMap<ChunkId, (Instant, u32)>>,
     ) -> Result<()> {
         info!("Leader healing under-replicated chunk: {}", chunk_id);
 
@@ -2835,6 +2924,23 @@ impl HealingManager {
             }
 
             Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
+            heal_push_failure.remove(chunk_id);
+        } else {
+            // Every target push failed despite a confirmed-alive source (e.g. the
+            // source's own data fails its content-hash check — real corruption, not
+            // a transient network blip). Record it so the discovery pass's promotion
+            // check can back off instead of re-queuing this chunk next cycle — see
+            // heal_push_failure's doc comment. Returning Err also feeds
+            // drain_heal_queue's existing stalled_healing path.
+            let mut entry = heal_push_failure.entry(*chunk_id).or_insert((Instant::now(), 0));
+            entry.0 = Instant::now();
+            entry.1 = entry.1.saturating_add(1);
+            let count = entry.1;
+            drop(entry);
+            anyhow::bail!(
+                "chunk {} failed to replicate to any of {} target(s) from source {} (consecutive failures: {})",
+                chunk_id, targets.len(), source_id, count
+            );
         }
 
         Ok(())
@@ -3373,6 +3479,7 @@ mod tests {
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
             Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         let stats = healing.get_stats().await;
@@ -3397,6 +3504,7 @@ mod tests {
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 2, 24, true,
             Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ); // 2s delay
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"test"));
@@ -3443,6 +3551,7 @@ mod tests {
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 10, 24, true,
             Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         // 8s < 10s — not ready yet, but the persisted age must have been restored
@@ -3464,6 +3573,7 @@ mod tests {
         let healing = HealingManager::new(
             storage.clone(), metadata.clone(), cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
             Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         (storage, metadata, healing, temp_storage, temp_metadata)
     }

@@ -2601,10 +2601,20 @@ impl FlushHandle {
                     // concurrent patches for chunks 0/1/2 each read metadata_cache mid-flight
                     // and the highest-seq write wins in the queue dedup, potentially recording
                     // stale chunk_ids for chunks whose patch hadn't updated metadata_cache yet.
-                    let meta_to_persist = self.metadata_cache.get(&ino).map(|m| m.clone());
-                    if let Some(meta) = meta_to_persist {
+                    // Feed only new_location (this chunk's just-patched result), not the
+                    // whole (ever-growing) meta.chunk_locations — see
+                    // feed_chunk_locations_to_read_engine's doc comment / the fix applied
+                    // at this function's other call sites (~line 1547/1597): passing the
+                    // full list here made every single patch flush clone and rebuild a
+                    // window over the entire file's chunk history, O(n) work per flush
+                    // (O(n^2) over a large file under sustained random writes) — confirmed
+                    // live 2026-07-12 via fio directly against the DFS mount: Q32T1 4K
+                    // random write collapsed from 104MiB/s at 128 chunks to 184KiB/s at
+                    // 1024 chunks, with no other variable changed.
+                    let meta_size = self.metadata_cache.get(&ino).map(|m| m.size);
+                    if let Some(meta_size) = meta_size {
                         self.client.feed_chunk_locations_to_read_engine(
-                            ino, &meta.chunk_locations, meta.size,
+                            ino, std::slice::from_ref(&new_location), meta_size,
                         ).await;
                     }
                     // Now that read engine is updated, safe to remove slot — unless new
@@ -3057,9 +3067,13 @@ impl FlushHandle {
                     // (line ~820) both call flush_metadata_sync after ALL chunks complete — that is
                     // the correct place where metadata_cache reflects the full current state.
                     // Update read engine for immediate read-after-write visibility.
+                    // Feed only `locations` (this flush's freshly-written chunk(s)), not
+                    // the whole (ever-growing) meta.chunk_locations — see the O(n)/O(n^2)
+                    // per-flush cost this caused, described where the same fix was applied
+                    // in flush_buffer_async_one's patch branch above.
                     let current_size = meta.size;
                     self.client.feed_chunk_locations_to_read_engine(
-                        ino, &meta.chunk_locations, current_size,
+                        ino, &locations, current_size,
                     ).await;
                 }
                 // Now that read engine is updated, safe to remove slot — unless new data

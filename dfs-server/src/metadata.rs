@@ -2710,13 +2710,40 @@ impl MetadataStore {
         self.dirty_files.lock().unwrap().clear();
         self.dirty_paths.lock().unwrap().clear();
 
-        // Phase 1: full copy, holding only the shared lock.
+        // Phase 1: full copy, holding only the shared lock. Bounded the same
+        // way Phase 2 already is (2026-07-13) — previously this had NO budget
+        // at all, so under sustained heavy write churn a big-enough DB could
+        // make Phase 1 itself run long enough to trip the *outer* 60s
+        // "task never returned, must be wedged" safety net directly (see
+        // server.rs's compact_db_prepare call site), restarting the node —
+        // even though nothing was actually stuck, just legitimately slow
+        // under contention. Confirmed live: a 1GB-file test's DB grew
+        // 384MB->767.5MB in ~90s of repeated defer-and-retry before one such
+        // Phase 1 call finally exceeded 60s and forced a restart. Bailing out
+        // here with the same "deferred" error Phase 2 already produces lets
+        // the outer loop's escalation-to-compact_db_blocking() (already
+        // quiesced, already proven fast — a 767.5MB diff-apply-swap took
+        // only ~5s) kick in on the *next* cycle instead of risking the
+        // whole-node restart on this one.
+        const PHASE1_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+        let phase1_start = std::time::Instant::now();
         {
             let live = self.db.read();
             let src_txn = live.begin_read().map_err(|e| anyhow::anyhow!("compact phase1 begin_read: {}", e))?;
             let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase1 begin_write: {}", e))?;
             Self::copy_all_tables(&src_txn, &dst_txn)?;
             dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase1 commit: {}", e))?;
+        }
+        if phase1_start.elapsed() >= PHASE1_BUDGET {
+            warn!("redb compact phase1 took {:?} (budget {:?}) — bailing out before phase2 \
+                   instead of compounding further under contention",
+                phase1_start.elapsed(), PHASE1_BUDGET);
+            drop(shadow_db);
+            let _ = std::fs::remove_file(&shadow_path);
+            anyhow::bail!(
+                "compaction deferred: phase1 full copy exceeded its budget under sustained \
+                 write churn — will retry on the next cycle"
+            );
         }
 
         // Phase 2: iterative catch-up, still unlocked. Bounded by a time budget, not a

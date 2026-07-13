@@ -324,7 +324,37 @@ pub struct Server {
     /// old→new by handle_multi_patch after each successful patch. Allows consecutive
     /// patches to skip the disk read entirely — only pwrite(patch bytes) + rename touch
     /// disk, eliminating the full 4MB read that would otherwise precede every patch.
-    chunk_ring: Arc<std::sync::Mutex<lru::LruCache<ChunkId, Arc<Vec<u8>>>>>,
+    chunk_ring: Arc<ShardedChunkRing>,
+
+    /// Hit/miss counters for chunk_ring, drained and logged every 30s by
+    /// start_chunk_ring_stats_loop instead of logging per-consult (would be
+    /// one line per fold, too much chatter under real load). Added 2026-07-13
+    /// alongside DFS_CHUNK_RING_CAPACITY to see directly whether the ring's
+    /// capacity is actually the bottleneck for a given active working set,
+    /// rather than inferring it from throughput alone.
+    chunk_ring_hits: Arc<std::sync::atomic::AtomicU64>,
+    chunk_ring_misses: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Separate ring for delta/patch-accumulator chunks (prior_delta reads in
+    /// the merge path), split out from chunk_ring (2026-07-13). Before this,
+    /// chunk_ring held only real/base content (fold outputs, direct-rewrite
+    /// chunks); the merge-path ring consult added the same day started also
+    /// caching deltas in that same pool, so a burst of merges could evict a
+    /// base a fold was about to need, or vice versa — two different access
+    /// patterns cannibalizing one shared cache. Giving deltas their own pool
+    /// removes that cross-contamination; each pool now only competes with
+    /// itself.
+    delta_ring: Arc<ShardedChunkRing>,
+    delta_ring_hits: Arc<std::sync::atomic::AtomicU64>,
+    delta_ring_misses: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Number of run_single_fold calls currently in flight cluster-wide-per-
+    /// this-node, regardless of trigger (client-driven ForceFold or the idle
+    /// backstop both go through fold_slot_now, which increments/decrements
+    /// this around the actual fold). Read by debounce_fold_slot to scale its
+    /// jitter width — see PATCH_DEBOUNCE_IDLE's doc comment for why a wider
+    /// jitter is needed exactly when more folds are already outstanding.
+    active_fold_count: Arc<std::sync::atomic::AtomicU64>,
 
     /// Unix-epoch ms of the most recent client write (WriteChunk, PatchChunk, MultiPatch,
     /// or ReplicateChunkLocation) processed by any node in the cluster. Updated locally
@@ -770,7 +800,13 @@ struct OverlayForkCtx {
     pending_patch_fold_broadcasts: Arc<DashMap<ChunkId, PendingPatchFoldBroadcast>>,
     dirty_patch_slots: Arc<DashMap<(FileId, u64), DirtyPatchSlot>>,
     chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
-    chunk_ring: Arc<std::sync::Mutex<lru::LruCache<ChunkId, Arc<Vec<u8>>>>>,
+    chunk_ring: Arc<ShardedChunkRing>,
+    chunk_ring_hits: Arc<std::sync::atomic::AtomicU64>,
+    chunk_ring_misses: Arc<std::sync::atomic::AtomicU64>,
+    delta_ring: Arc<ShardedChunkRing>,
+    delta_ring_hits: Arc<std::sync::atomic::AtomicU64>,
+    delta_ring_misses: Arc<std::sync::atomic::AtomicU64>,
+    active_fold_count: Arc<std::sync::atomic::AtomicU64>,
     cluster: Arc<ClusterManager>,
     client: Arc<NetworkClient>,
     healing: Arc<tokio::sync::RwLock<Option<Arc<HealingManager>>>>,
@@ -833,6 +869,76 @@ struct DirtyPatchSlot {
 /// it firing promptly, and a live client's own 8s active-fold timer will
 /// almost always beat it under any real write pattern.
 const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Number of independent locks chunk_ring/delta_ring are split across.
+/// Added 2026-07-13: a single shared Mutex<LruCache> serializes every
+/// consult/seed across every concurrent operation touching *any* chunk, not
+/// just contending ones — under Q32T1-style concurrency (32 simultaneous
+/// operations, and prewarm now firing on every single patch) that lock itself
+/// becomes a bottleneck independent of hit rate or capacity: raising capacity
+/// 32->128 measurably improved hit rate (42%->62% at 512MB) but left Q32T1
+/// throughput flat (0.38->0.34 MB/s) while Q1T1 (no concurrency, no lock
+/// contention) improved as expected — the signature of lock contention, not
+/// a sizing problem. Sharding by chunk_id spreads concurrent operations
+/// across CHUNK_RING_SHARD_COUNT independent locks so they mostly don't wait
+/// on each other, same pattern already used client-side for
+/// ShardedByteRangeCache/ShardedZeroGapTable (client.rs).
+const CHUNK_RING_SHARD_COUNT: usize = 16;
+
+fn ring_shard_index(chunk_id: &ChunkId) -> usize {
+    (chunk_id.hash[0] as usize) % CHUNK_RING_SHARD_COUNT
+}
+
+/// Sharded chunk content cache: each shard is an independently-locked
+/// LruCache. Used for both chunk_ring (base/fold content) and delta_ring
+/// (merge-path prior_delta content) — same structure, different instances,
+/// so the two pools stay split (see delta_ring's original field doc comment)
+/// while each pool internally avoids single-lock contention too.
+struct ShardedChunkRing {
+    shards: Vec<std::sync::Mutex<lru::LruCache<ChunkId, Arc<Vec<u8>>>>>,
+}
+
+impl ShardedChunkRing {
+    fn new(total_capacity: usize) -> Self {
+        let per_shard = std::num::NonZeroUsize::new((total_capacity / CHUNK_RING_SHARD_COUNT).max(1)).unwrap();
+        Self {
+            shards: (0..CHUNK_RING_SHARD_COUNT).map(|_| std::sync::Mutex::new(lru::LruCache::new(per_shard))).collect(),
+        }
+    }
+
+    fn shard(&self, chunk_id: &ChunkId) -> &std::sync::Mutex<lru::LruCache<ChunkId, Arc<Vec<u8>>>> {
+        &self.shards[ring_shard_index(chunk_id)]
+    }
+
+    /// Total capacity across all shards, for stats reporting.
+    fn total_capacity(&self) -> usize {
+        self.shards[0].lock().unwrap().cap().get() * CHUNK_RING_SHARD_COUNT
+    }
+}
+
+/// Adds jitter to a debounce_fold_slot sleep, widening as more folds are
+/// already outstanding — see debounce_fold_slot's call site for the full
+/// rationale (breaking synchronized-timer bursts). No `rand` crate in this
+/// workspace, so pseudo-randomness is the current subsecond-nanosecond clock
+/// reading mixed with (file_id, chunk_idx) — good enough for desynchronizing
+/// timers, not meant to be cryptographically random. Capped at MAX_JITTER_MS
+/// so a large fold backlog can't push the effective debounce arbitrarily far
+/// out.
+fn jittered_debounce_sleep(base: std::time::Duration, active_fold_count: u64, file_id: FileId, chunk_idx: u64) -> std::time::Duration {
+    const JITTER_MS_PER_OUTSTANDING_FOLD: u64 = 200;
+    const MAX_JITTER_MS: u64 = 15_000;
+    let jitter_ceiling_ms = active_fold_count.saturating_mul(JITTER_MS_PER_OUTSTANDING_FOLD).min(MAX_JITTER_MS);
+    if jitter_ceiling_ms == 0 {
+        return base;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as u64;
+    let mixed = nanos ^ chunk_idx.wrapping_mul(0x9E3779B97F4A7C15) ^ (file_id.as_bytes()[0] as u64);
+    let jitter_ms = mixed % (jitter_ceiling_ms + 1);
+    base + std::time::Duration::from_millis(jitter_ms)
+}
 
 /// Retired as a distinct constant: PATCH_DEBOUNCE_MAX_WAIT (start-relative)
 /// and PATCH_DEBOUNCE_IDLE (last-patch-relative) served slightly different
@@ -985,7 +1091,12 @@ impl OverlayForkCtx {
         // just wrote a moment ago. Nothing else can have superseded base_chunk_id
         // while this fold holds the per-slot lock, so a ring hit here is always
         // correct, not just fresh-enough.
-        let ring_prefetched = self.chunk_ring.lock().unwrap().get(&base_chunk_id).cloned();
+        let ring_prefetched = self.chunk_ring.shard(&base_chunk_id).lock().unwrap().get(&base_chunk_id).cloned();
+        if ring_prefetched.is_some() {
+            self.chunk_ring_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.chunk_ring_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let fold_result = full_rewrite_chunk(
             self.storage.clone(),
@@ -1044,10 +1155,13 @@ impl OverlayForkCtx {
         // cancellation when it drops at the end of this function, exactly like
         // the early-return failure paths above.
         {
-            let mut ring = self.chunk_ring.lock().unwrap();
-            ring.pop(&base_chunk_id);
+            // base_chunk_id and new_chunk_id can land in different shards
+            // (both are hashes, no relation between them) — pop and put each
+            // against their own shard's lock rather than assuming one shared
+            // guard covers both.
+            self.chunk_ring.shard(&base_chunk_id).lock().unwrap().pop(&base_chunk_id);
             if new_chunk_id != base_chunk_id {
-                ring.put(new_chunk_id, fold_buf);
+                self.chunk_ring.shard(&new_chunk_id).lock().unwrap().put(new_chunk_id, fold_buf);
             }
         }
 
@@ -1422,9 +1536,18 @@ impl OverlayForkCtx {
         const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
         let chunk_file_offset = chunk_idx * CHUNK_SIZE_U64;
 
+        // Bracket only the actual fold execution (not fold_slot_now's earlier
+        // "nothing pending"/"already folded" fast-return paths above), so this
+        // counts genuinely in-flight folds regardless of trigger — both this
+        // function's two callers (client-driven ForceFold via
+        // handle_force_fold, and the idle backstop via debounce_fold_slot)
+        // route through here, giving debounce_fold_slot's jitter a true
+        // cluster-wide-per-node view of current fold pressure to scale against.
+        self.active_fold_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ok = self.run_single_fold(
             file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, client_write_seq,
         ).await;
+        self.active_fold_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if ok {
             self.dirty_patch_slots.remove(&(file_id, chunk_idx));
         }
@@ -1454,7 +1577,20 @@ impl OverlayForkCtx {
         let mut retry_backoff = PATCH_DEBOUNCE_IDLE;
         const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
         loop {
-            tokio::time::sleep(retry_backoff).await;
+            // Jittered, not a fixed sleep — see PATCH_DEBOUNCE_IDLE's doc
+            // comment: this task is spawned once per slot the instant it
+            // first goes dirty, so under a wide random-write pattern many
+            // slots' tasks start within the same short burst window and,
+            // with a fixed sleep, would all wake and fold at *exactly* the
+            // same instant ~20s later — a synchronized torrent, not
+            // organically staggered load. Widening the jitter as more folds
+            // are already outstanding (active_fold_count) means the
+            // desynchronization gets stronger exactly when it's needed most
+            // (a real burst in progress), while staying tight-to-zero when
+            // fold activity is already quiet.
+            let active = self.active_fold_count.load(std::sync::atomic::Ordering::Relaxed);
+            let sleep_for = jittered_debounce_sleep(retry_backoff, active, file_id, chunk_idx);
+            tokio::time::sleep(sleep_for).await;
 
             let Some(last_patch_at) = self.dirty_patch_slots
                 .get(&(file_id, chunk_idx))
@@ -1791,9 +1927,33 @@ impl Server {
             chunk_io_locks: Arc::new(DashMap::new()),
             chunk_prefetch: Arc::new(DashMap::new()),
             recently_patched: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))),
-            chunk_ring: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(32).unwrap()
-            ))),
+            // Default (32 chunks = 128MB) is a flat constant from when chunk_ring
+            // was added (2026-07-11) to make folds cheaper via a warm base-chunk
+            // cache — never revisited since. DFS_CHUNK_RING_CAPACITY override lets
+            // this be tested against working sets bigger than 32 active chunks
+            // without a rebuild per value (see the size-dependent throughput cliff
+            // this cache's capacity is suspected to cause, 2026-07-13).
+            chunk_ring: Arc::new(ShardedChunkRing::new(
+                std::env::var("DFS_CHUNK_RING_CAPACITY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(32)
+            )),
+            chunk_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            chunk_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Split from chunk_ring (2026-07-13) — see delta_ring's field doc
+            // comment. Own capacity knob so the two pools can be sized
+            // independently if one class of chunk turns out to need more
+            // headroom than the other.
+            delta_ring: Arc::new(ShardedChunkRing::new(
+                std::env::var("DFS_DELTA_RING_CAPACITY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(32)
+            )),
+            delta_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            delta_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            active_fold_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
@@ -1934,6 +2094,42 @@ impl Server {
                         ).await;
                     }
                     Err(e) => warn!("Capacity refresh: failed to get local filesystem stats: {}", e),
+                }
+            }
+        });
+    }
+
+    /// Reports chunk_ring hit/miss counts every 30s and resets them, instead of
+    /// logging every single consult (one line per fold/prefetch under real
+    /// load — too much chatter). Added 2026-07-13 alongside
+    /// DFS_CHUNK_RING_CAPACITY to see directly whether the ring is actually
+    /// thrashing (miss rate climbing as the active working set exceeds its
+    /// capacity) rather than inferring it from throughput alone.
+    pub async fn start_chunk_ring_stats_loop(self: std::sync::Arc<Self>) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tokio::spawn(async move {
+            loop {
+                tick.tick().await;
+                let hits = self.chunk_ring_hits.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let misses = self.chunk_ring_misses.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let total = hits + misses;
+                if total > 0 {
+                    let hit_pct = 100.0 * hits as f64 / total as f64;
+                    let capacity = self.chunk_ring.total_capacity();
+                    info!("chunk_ring stats (last 30s): {} hits, {} misses ({:.1}% hit rate), capacity={} chunks",
+                        hits, misses, hit_pct, capacity);
+                }
+                // delta_ring, split from chunk_ring 2026-07-13 — see its field
+                // doc comment. Reported separately so hit-rate regressions in
+                // one pool aren't masked by the other's numbers.
+                let dhits = self.delta_ring_hits.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let dmisses = self.delta_ring_misses.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let dtotal = dhits + dmisses;
+                if dtotal > 0 {
+                    let dhit_pct = 100.0 * dhits as f64 / dtotal as f64;
+                    let dcapacity = self.delta_ring.total_capacity();
+                    info!("delta_ring stats (last 30s): {} hits, {} misses ({:.1}% hit rate), capacity={} chunks",
+                        dhits, dmisses, dhit_pct, dcapacity);
                 }
             }
         });
@@ -3170,6 +3366,9 @@ impl Server {
             }
             Request::ForceFold { file_id, chunk_idx } => {
                 self.handle_force_fold(file_id, chunk_idx).await
+            }
+            Request::PrewarmFoldCache { file_id, chunk_idx } => {
+                self.handle_prewarm_fold_cache(file_id, chunk_idx).await
             }
             Request::DeleteFile { path } => {
                 self.ops_tracker.inc_meta();
@@ -7379,6 +7578,12 @@ impl Server {
             dirty_patch_slots: self.dirty_patch_slots.clone(),
             chunk_patch_locks: self.chunk_patch_locks.clone(),
             chunk_ring: self.chunk_ring.clone(),
+            chunk_ring_hits: self.chunk_ring_hits.clone(),
+            chunk_ring_misses: self.chunk_ring_misses.clone(),
+            delta_ring: self.delta_ring.clone(),
+            delta_ring_hits: self.delta_ring_hits.clone(),
+            delta_ring_misses: self.delta_ring_misses.clone(),
+            active_fold_count: self.active_fold_count.clone(),
             cluster: self.cluster.clone(),
             client: self.client.clone(),
             healing: self.healing.clone(),
@@ -7789,11 +7994,34 @@ impl Server {
                 match cached {
                     Some(h) => h,
                     None => {
-                        let storage = self.storage.clone();
-                        let prior_bytes = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&prior_delta_id))
-                            .await
-                            .map_err(|e| (format!("spawn_blocking panicked reading prior delta: {}", e), ErrorCode::InternalError))?
-                            .map_err(|e| (format!("Failed to read prior delta chunk: {}", e), ErrorCode::InternalError))?;
+                        // No local delta_hasher (this node is catching up on an
+                        // already-pending slot via replication/healing, not
+                        // building it from direct patches) — consult delta_ring
+                        // before paying for a disk read, same as run_single_fold
+                        // already does for the fold's base chunk (in its own
+                        // separate chunk_ring — see delta_ring's field doc
+                        // comment for why these two are split). Every merge on
+                        // a hot slot needs the prior delta, not just the eventual
+                        // fold, so this path was a real gap in ring coverage.
+                        let ring_hit = self.delta_ring.shard(&prior_delta_id).lock().unwrap().get(&prior_delta_id).cloned();
+                        if ring_hit.is_some() {
+                            self.delta_ring_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            self.delta_ring_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let prior_bytes = match ring_hit {
+                            Some(data) => data,
+                            None => {
+                                let storage = self.storage.clone();
+                                tokio::task::spawn_blocking(move || storage.read_chunk_arc(&prior_delta_id))
+                                    .await
+                                    .map_err(|e| (format!("spawn_blocking panicked reading prior delta: {}", e), ErrorCode::InternalError))?
+                                    .map_err(|e| (format!("Failed to read prior delta chunk: {}", e), ErrorCode::InternalError))?
+                            }
+                        };
+                        // Seed/refresh the ring so a later merge or fold on this
+                        // same delta chain doesn't cold-read again.
+                        self.delta_ring.shard(&prior_delta_id).lock().unwrap().put(prior_delta_id, prior_bytes.clone());
                         let mut h = blake3::Hasher::new();
                         h.update(file_id.as_bytes());
                         h.update(&chunk_file_offset.to_le_bytes());
@@ -8231,7 +8459,12 @@ impl Server {
         // the common (chunk_idx present) case instead of wasting a warm buffer nobody
         // will consume.
         let prefetched: Option<std::sync::Arc<Vec<u8>>> = if chunk_idx.is_none() {
-            let ring_data = self.chunk_ring.lock().unwrap().get(&chunk_id).cloned();
+            let ring_data = self.chunk_ring.shard(&chunk_id).lock().unwrap().get(&chunk_id).cloned();
+            if ring_data.is_some() {
+                self.chunk_ring_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.chunk_ring_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(data) = ring_data {
                 self.chunk_prefetch.remove(&chunk_id);
                 Some(data)
@@ -8289,10 +8522,12 @@ impl Server {
                 // Re-key ring: only meaningful when a full rewrite actually produced a
                 // buffer (fallback path) — the overlay cheap path never holds one.
                 if let Some(final_buf) = final_buf {
-                    let mut ring = self.chunk_ring.lock().unwrap();
-                    ring.pop(&chunk_id);
+                    // chunk_id and new_chunk_id can land in different shards —
+                    // see the equivalent re-key in run_single_fold for why this
+                    // uses two separate shard locks instead of one shared guard.
+                    self.chunk_ring.shard(&chunk_id).lock().unwrap().pop(&chunk_id);
                     if new_chunk_id != chunk_id {
-                        ring.put(new_chunk_id, final_buf);
+                        self.chunk_ring.shard(&new_chunk_id).lock().unwrap().put(new_chunk_id, final_buf);
                     }
                 }
 
@@ -8374,6 +8609,35 @@ impl Server {
                 code: ErrorCode::InternalError,
             },
         }
+    }
+
+    /// Handle a best-effort PrewarmFoldCache hint — see Request::PrewarmFoldCache's
+    /// doc comment. Deliberately does not take chunk_patch_locks (that's for
+    /// actual fold mutual exclusion; taking it here just to peek would
+    /// serialize against real patches/folds for no reason) — a slightly stale
+    /// read here is harmless, worst case it warms a base_chunk_id that's
+    /// already been superseded, wasting one disk read. Returns almost
+    /// immediately; the actual warming read (if needed) runs detached so this
+    /// RPC never blocks on disk I/O.
+    async fn handle_prewarm_fold_cache(&self, file_id: dfs_common::FileId, chunk_idx: u64) -> Response {
+        let Some(public_token) = self.dirty_patch_slots.get(&(file_id, chunk_idx)).map(|e| e.value().token) else {
+            return Response::Ok { data: None }; // nothing pending, nothing to warm
+        };
+        let base_chunk_id = match self.metadata.get_patch_state_async(public_token).await {
+            Ok(Some(PatchState::Pending { base_chunk_id, .. })) => base_chunk_id,
+            _ => return Response::Ok { data: None }, // already folded or gone
+        };
+        if self.chunk_ring.shard(&base_chunk_id).lock().unwrap().contains(&base_chunk_id) {
+            return Response::Ok { data: None }; // already warm
+        }
+        let storage = self.storage.clone();
+        let chunk_ring = self.chunk_ring.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok(data)) = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&base_chunk_id)).await {
+                chunk_ring.shard(&base_chunk_id).lock().unwrap().put(base_chunk_id, data);
+            }
+        });
+        Response::Ok { data: None }
     }
 
     /// Handle delete file request.
@@ -11895,7 +12159,7 @@ impl MessageHandler for Server {
         }
         // Skip if content is already in the ring — handle_multi_patch will use it
         // directly without needing a prefetch disk read.
-        if self.chunk_ring.lock().unwrap().contains(&chunk_id) {
+        if self.chunk_ring.shard(&chunk_id).lock().unwrap().contains(&chunk_id) {
             return;
         }
         // Best-effort: if the semaphore is full, skip rather than queue.
@@ -11919,7 +12183,7 @@ impl MessageHandler for Server {
             drop(permit); // release before sending so the slot opens for the next hint
             match result {
                 Ok(Some(data)) => {
-                    ring.lock().unwrap().put(chunk_id, Arc::clone(&data));
+                    ring.shard(&chunk_id).lock().unwrap().put(chunk_id, Arc::clone(&data));
                     let _ = tx.send(Some(data));
                 }
                 // On read failure or task panic: sender drops, channel closes.

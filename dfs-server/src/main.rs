@@ -284,6 +284,9 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_capacity_refresh_loop().await;
     info!("✓ Capacity refresh loop started");
 
+    server.clone().start_chunk_ring_stats_loop().await;
+    info!("✓ chunk_ring stats loop started");
+
     // Start healing manager on its own dedicated, lower-priority runtime — kept
     // separate from the main multi-threaded runtime that serves live client RPCs
     // (writes/reads/patches). Healing's PushChunkTo transfers move full 4MB chunks

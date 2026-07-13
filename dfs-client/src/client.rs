@@ -786,6 +786,12 @@ pub struct DfsClient {
     /// early ForceFold.
     active_fold_started_at: Arc<DashMap<(FileId, u64), Instant>>,
 
+    /// Patches accumulated since the current generation's timer was seeded
+    /// (paired 1:1 with active_fold_started_at, same reset points). Lets the
+    /// fold trigger fire on patch volume, not just wall-clock time — see the
+    /// ACTIVE_FOLD_PATCH_THRESHOLD doc comment at its use site.
+    active_fold_patch_count: Arc<DashMap<(FileId, u64), u64>>,
+
     /// Bounds how many ForceFold operations this client has actively in flight
     /// (RPC round-trip in progress, blocking the triggering patch) at once,
     /// across every file/slot. Root-caused 2026-07-11 night: a wide, dense
@@ -957,6 +963,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             read_engines: ReadEngineMap::new(),
             recent_chunk_writes: Arc::new(DashMap::new()),
             active_fold_started_at: Arc::new(DashMap::new()),
+            active_fold_patch_count: Arc::new(DashMap::new()),
             fold_concurrency: Arc::new(tokio::sync::Semaphore::new(16)),
         })
     }
@@ -6482,20 +6489,93 @@ leader_addr: Arc::new(RwLock::new(None)),
         // and shared across *unrelated* slots.
         if let Some(cidx) = chunk_idx {
             const ACTIVE_FOLD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+            // Fold trigger, take 2 (2026-07-13): the pure wall-clock timer fires
+            // a full 4MB read+write+fsync round trip every ~8s *regardless of how
+            // much data actually accumulated* — measured directly (FOLDWAIT) to
+            // show zero fold_concurrency contention even at the 512MB size where
+            // throughput collapses, so the bottleneck isn't queueing on that
+            // semaphore, it's the raw I/O cost of the folds themselves competing
+            // with the ordinary write path for real disk/network bandwidth. A
+            // slow/contended system produces sparser per-chunk patch arrivals,
+            // which the pure time trigger can't distinguish from "lots of data
+            // accumulated" — it fires either way. Adding a patch-count trigger
+            // ties fold frequency to actual work done instead of wall-clock
+            // time, so the fold:write overhead ratio stays roughly constant
+            // however fast or slow the system is running. This is the same
+            // "client decides once, tells every replica identically" model
+            // 29b13df already uses for the time trigger — a count-based
+            // condition here does NOT reintroduce REPLICA DISAGREEMENT the way
+            // the old *server-side* independent-per-node count trigger did,
+            // because there's still exactly one decision-maker. Kept as an OR
+            // alongside the existing time trigger (not a replacement) so a
+            // slow-trickle slot still gets folded within a bounded time for
+            // visibility, even if it never reaches the patch-count threshold.
+            // Sized against real observed per-chunk touch rate (~4/s), not
+            // overall IOPS: at 4/s, ~32 patches accumulate in the 8s time
+            // trigger's own window, so any count threshold >= ~32 means the
+            // time trigger always wins and the count path never engages at
+            // all. 20 sits below that, letting the count trigger occasionally
+            // preempt the time trigger during busier moments while still
+            // comfortably clearing the "no more than ~1 fold/sec" floor
+            // (threshold just needs to stay >= the per-chunk touch rate).
+            // No longer needs to be large to give prewarm room to land —
+            // prewarm now fires unconditionally on every patch (see below),
+            // decoupled from this threshold entirely.
+            const ACTIVE_FOLD_PATCH_THRESHOLD: u64 = 20; // was 30, then 50, 100, 500, 1000
             let elapsed_since_start = self.active_fold_started_at.get(&(file_id, cidx)).map(|e| e.elapsed());
+            let patch_count = {
+                let mut entry = self.active_fold_patch_count.entry((file_id, cidx)).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            // Prewarm hint: send on every patch, unconditionally — take 2
+            // (2026-07-13). The threshold-gated version (fire once per
+            // generation at 50% of whichever fold trigger is closer) assumed
+            // a hot, concentrated chunk would reliably cross that point
+            // before something else touched it. Real Q32T1 staging traffic
+            // spread across a wide active region instead: per-chunk patch
+            // counts almost never approached even a raised 1000-patch
+            // threshold, so the gate almost never opened and the hint almost
+            // never fired — confirmed live (lowest ring hit rate yet at
+            // threshold=1000, worse than smaller thresholds, because raising
+            // the gate just made it harder to reach without changing the
+            // access pattern that has to reach it).
+            //
+            // Sending on every patch instead removes the guesswork of
+            // picking a gate at all. It's cheap to do unconditionally
+            // because handle_prewarm_fold_cache already no-ops (no disk
+            // read) once chunk_ring.contains() is true for the slot's base —
+            // the server-side check IS the debounce. So the real cost is
+            // extra fire-and-forget RPCs, not extra disk I/O: one real read
+            // per slot-generation (the first patch that finds it cold),
+            // every subsequent patch's hint for that same generation is a
+            // cheap contains()-and-return. Still fire-and-forget: the client
+            // doesn't wait on the response and doesn't care if it's lost —
+            // this is a pure cache-warming optimization, never load-bearing
+            // (the fold itself still resolves its own base independently).
+            for &addr in patch_addrs.iter() {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let _ = this.send_request(addr, Request::PrewarmFoldCache { file_id, chunk_idx: cidx }).await;
+                });
+            }
             match elapsed_since_start {
                 None => {
                     // First patch this client has observed on this slot's current
                     // accumulator — seed the timer, nothing to fold yet.
                     self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                 }
-                Some(elapsed) if elapsed >= ACTIVE_FOLD_INTERVAL => {
+                Some(elapsed) if elapsed >= ACTIVE_FOLD_INTERVAL || patch_count >= ACTIVE_FOLD_PATCH_THRESHOLD => {
                     // Cap (not eliminate) fold concurrency across every slot on
                     // this client — see fold_concurrency's doc comment. Wide on
                     // purpose: this must stay well above kdiskmark-style burst
                     // concurrency (Q32T1 = 32) or unrelated chunks' writes start
                     // queuing behind each other through this shared permit pool.
+                    let fold_permit_wait_start = std::time::Instant::now();
                     let _fold_permit = self.fold_concurrency.acquire().await.unwrap();
+                    let fold_permit_wait = fold_permit_wait_start.elapsed();
+                    info!("FOLDWAIT: file {} chunk {} waited {:?} for fold_concurrency permit",
+                        file_id, cidx, fold_permit_wait);
                     let fold_targets: Vec<SocketAddr> = patch_addrs.iter().copied()
                         .filter(|a| addr_to_node_id_snap.get(a)
                             .map(|nid| patched_node_ids.contains(nid))
@@ -6503,8 +6583,26 @@ leader_addr: Arc::new(RwLock::new(None)),
                         .collect();
                     let mut folded: Option<(ChunkId, usize)> = None;
                     let mut fold_ok = !fold_targets.is_empty();
-                    for addr in fold_targets {
-                        match self.send_request(addr, Request::ForceFold { file_id, chunk_idx: cidx }).await {
+                    // Dispatch to every target concurrently, not one-at-a-time: a
+                    // sequential loop leaves a real window where one replica has
+                    // already advanced to the new generation (and deleted its own
+                    // copy of the old chunk as part of that) while another replica
+                    // hasn't even received the request yet — a read or a later
+                    // patch landing on the lagging replica during that window can
+                    // resolve to a chunk_id that's already gone on the replica that
+                    // raced ahead. Firing all requests together shrinks that window
+                    // to however long the RPCs actually take to process, not however
+                    // long they take to be dispatched one after another. Still
+                    // blocks here until every target resolves — same overall
+                    // synchronous-fold invariant as before, only the fan-out itself
+                    // is parallel.
+                    let fold_requests: Vec<_> = fold_targets.iter().map(|&addr| {
+                        let req = Request::ForceFold { file_id, chunk_idx: cidx };
+                        async move { (addr, self.send_request(addr, req).await) }
+                    }).collect();
+                    let fold_responses = futures::future::join_all(fold_requests).await;
+                    for (addr, response) in fold_responses {
+                        match response {
                             Ok(Response::ForceFoldResult { real_chunk_id, size }) => {
                                 match folded {
                                     None => folded = Some((real_chunk_id, size)),
@@ -6529,17 +6627,20 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                     if fold_ok {
                         if let Some((real_chunk_id, size)) = folded {
-                            info!("ForceFold: file {} chunk {} folded {} -> {} after {:?} of active patching",
-                                file_id, cidx, new_chunk_id, real_chunk_id, elapsed);
+                            let trigger = if patch_count >= ACTIVE_FOLD_PATCH_THRESHOLD { "count" } else { "time" };
+                            info!("ForceFold: file {} chunk {} folded {} -> {} after {:?} / {} patches of active patching (trigger={})",
+                                file_id, cidx, new_chunk_id, real_chunk_id, elapsed, patch_count, trigger);
                             new_chunk_id = real_chunk_id;
                             new_size = size;
                         }
                         // New generation starts accumulating from here.
                         self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
+                        self.active_fold_patch_count.insert((file_id, cidx), 0);
                     }
-                    // Else: leave the timer where it is (don't reset it to now) so
-                    // the very next patch to this slot retries the fold immediately
-                    // instead of waiting out another full interval.
+                    // Else: leave the timer and patch count where they are (don't
+                    // reset either to now/0) so the very next patch to this slot
+                    // retries the fold immediately instead of waiting out another
+                    // full interval or threshold.
                 }
                 Some(_) => {} // not due yet
             }

@@ -457,6 +457,24 @@ pub enum Request {
         chunk_idx: u64,
     },
 
+    /// Best-effort hint: this slot's fold is likely imminent (client has
+    /// crossed 80% of whichever fold trigger — patch count or elapsed time —
+    /// is closer), so warm chunk_ring for its current base chunk now instead
+    /// of waiting for the fold itself to discover it cold. Sent once per
+    /// slot-generation, fire-and-forget from the client's perspective (it
+    /// does not wait on the response, and neither the request nor its
+    /// absence affects correctness — this is purely a cache-warming
+    /// optimization, never load-bearing for the fold itself, which still
+    /// re-reads/re-checks everything it needs on its own). Added 2026-07-13
+    /// alongside chunk_ring's capacity/hit-rate instrumentation: seeding the
+    /// ring intelligently (ahead of a burst of folds, not on every single
+    /// first patch, which would warm chunks that never end up folding)
+    /// rather than just growing its capacity.
+    PrewarmFoldCache {
+        file_id: FileId,
+        chunk_idx: u64,
+    },
+
     // Admin requests
     /// Get cluster status
     GetClusterStatus,

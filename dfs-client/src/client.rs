@@ -804,6 +804,25 @@ pub struct DfsClient {
     /// Reset alongside active_fold_started_at wherever that resets.
     active_fold_bytes: Arc<DashMap<(FileId, u64), usize>>,
 
+    /// (last_failure_at, consecutive_failure_count) per slot whose most recent
+    /// ForceFold attempt failed (a replica errored/timed out, or two replicas
+    /// disagreed on the result). Added 2026-07-13 after a live kdiskmark run
+    /// under real CPU pressure showed a retry storm: on failure, the code
+    /// deliberately leaves active_fold_started_at unchanged so "the very next
+    /// patch to this slot retries the fold immediately instead of waiting out
+    /// another full interval" — correct under normal conditions, but under
+    /// sustained write pressure to a hot chunk, *every single subsequent
+    /// patch* re-attempts the full permit-acquire + dual-replica-RPC dance,
+    /// even though the last attempt just failed for the same reason (an
+    /// overloaded peer) moments ago. Confirmed live: fold_concurrency permit
+    /// waits stretching past 6 minutes for one chunk while dozens of other
+    /// chunks' patches kept re-triggering fresh attempts. This doesn't change
+    /// *whether* a failed fold retries (it still does, on the next patch) —
+    /// only adds a short per-slot cooldown so a struggling chunk isn't
+    /// hammering the shared permit pool on every single write while things
+    /// are bad. Cleared on any successful fold for that slot.
+    active_fold_failure_backoff: Arc<DashMap<(FileId, u64), (Instant, u32)>>,
+
     /// Bounds how many ForceFold operations this client has actively in flight
     /// (RPC round-trip in progress, blocking the triggering patch) at once,
     /// across every file/slot. Root-caused 2026-07-11 night: a wide, dense
@@ -988,6 +1007,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             recent_chunk_writes: Arc::new(DashMap::new()),
             active_fold_started_at: Arc::new(DashMap::new()),
             active_fold_bytes: Arc::new(DashMap::new()),
+            active_fold_failure_backoff: Arc::new(DashMap::new()),
             fold_concurrency: Arc::new(tokio::sync::Semaphore::new(
                 std::env::var("DFS_FOLD_CONCURRENCY")
                     .ok()
@@ -6625,6 +6645,27 @@ leader_addr: Arc::new(RwLock::new(None)),
                     self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                 }
                 Some(elapsed) if elapsed >= active_fold_interval || accumulated_bytes >= ACTIVE_FOLD_SIZE_THRESHOLD => {
+                    // Backoff after a recent failed attempt on this exact slot — see
+                    // active_fold_failure_backoff's doc comment for the retry storm
+                    // this closes. Skip this round entirely (no permit acquired, no
+                    // RPCs sent) while within the backoff window; a later patch to
+                    // this slot will retry once it's elapsed. Base 2s doubling per
+                    // consecutive failure, capped at 30s — short relative to
+                    // heal_push_failure's healing-scale backoff (minutes), since a
+                    // fold retry needs to stay responsive once things recover, not
+                    // just stop hot-looping while they're bad.
+                    const FOLD_FAILURE_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(2);
+                    const FOLD_FAILURE_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+                    let in_backoff = self.active_fold_failure_backoff.get(&(file_id, cidx))
+                        .map(|entry| {
+                            let (last_failure, count) = *entry;
+                            let backoff = FOLD_FAILURE_BACKOFF_BASE
+                                .saturating_mul(1u32 << count.min(4))
+                                .min(FOLD_FAILURE_BACKOFF_CAP);
+                            last_failure.elapsed() < backoff
+                        })
+                        .unwrap_or(false);
+                    if !in_backoff {
                     // Cap (not eliminate) fold concurrency across every slot on
                     // this client — see fold_concurrency's doc comment. Wide on
                     // purpose: this must stay well above kdiskmark-style burst
@@ -6675,12 +6716,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                         // New generation starts accumulating from here.
                         self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                         self.active_fold_bytes.insert((file_id, cidx), 0);
+                        self.active_fold_failure_backoff.remove(&(file_id, cidx));
+                    } else {
+                        let mut entry = self.active_fold_failure_backoff.entry((file_id, cidx)).or_insert((std::time::Instant::now(), 0));
+                        entry.0 = std::time::Instant::now();
+                        entry.1 = entry.1.saturating_add(1);
                     }
                     // Else: leave the timer (and byte count) where they are (don't
                     // reset to now/0) so the very next patch to this slot retries
                     // the fold immediately
                     // instead of waiting out another full interval.
                     timing_fold += fold_rpc_start.elapsed();
+                    }
                 }
                 Some(_) => {} // not due yet
             }

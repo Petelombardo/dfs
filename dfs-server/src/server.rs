@@ -1607,6 +1607,33 @@ impl Drop for FoldHealingCancelGuard {
 }
 
 impl Server {
+    /// chunk_ring's capacity, scaled off total RAM the same way
+    /// ChunkStorage::calculate_cache_size scales its own cache — see that
+    /// function's doc comment for why total (not available) memory is the
+    /// right basis. Widened 2026-07-13 (flat 32 -> tiered) after a live
+    /// kdiskmark run showed folds cold-reading their base chunk almost every
+    /// time: chunk_ring only gets seeded as a side effect of a fold that
+    /// already ran on this exact slot, so a 32-entry ring can't keep more
+    /// than a handful of a real workload's ~150 concurrently-hot chunks warm
+    /// at once — most chains get evicted before their next fold. Kept
+    /// deliberately smaller than ChunkStorage's own cache at every tier: this
+    /// is additional, not instead of, that budget, and gluster's real nodes
+    /// (3.8GB, no swap) can't absorb another large fixed allocation on top of
+    /// it without risking the same memory pressure this session's earlier
+    /// compaction/fold-accumulator fixes were chasing.
+    fn calculate_ring_capacity() -> usize {
+        let total_mb = dfs_common::get_total_memory()
+            .map(|bytes| bytes / (1024 * 1024))
+            .unwrap_or(4096);
+        if total_mb <= 2048 {
+            16   // 64MB — SBC / low-memory nodes
+        } else if total_mb <= 8192 {
+            64   // 256MB — typical gluster-class nodes (3.8GB)
+        } else {
+            128  // 512MB — high-memory nodes
+        }
+    }
+
     /// Create a new server instance
     pub fn new(
         storage: Arc<ChunkStorage>,
@@ -1792,7 +1819,7 @@ impl Server {
             chunk_prefetch: Arc::new(DashMap::new()),
             recently_patched: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))),
             chunk_ring: Arc::new(std::sync::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(32).unwrap()
+                std::num::NonZeroUsize::new(Self::calculate_ring_capacity()).unwrap()
             ))),
             last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ops_tracker: Arc::new(OpsTracker::new()),
@@ -7980,6 +8007,32 @@ impl Server {
             let ctx = self.overlay_ctx();
             tokio::spawn(async move {
                 ctx.debounce_fold_slot(file_id, cidx).await;
+            });
+
+            // Proactively warm chunk_ring with this generation's base chunk —
+            // added 2026-07-13 after a live kdiskmark run showed folds paying a
+            // real cold-read cost for base_chunk_id almost every time (see
+            // run_single_fold's ring-consult, which until now only ever hit on a
+            // chain-continuation fold). base_chunk_id is already known here, the
+            // instant this accumulator starts — no client hint needed, and this
+            // gives the *entire* active-patching window (until this slot's
+            // eventual fold, typically 6-10s or longer under real backlog) as
+            // lead time to read it in the background, instead of paying for that
+            // read synchronously inside the fold itself. Fire-and-forget: this
+            // is a pure latency optimization, never a correctness dependency —
+            // run_single_fold falls back to its normal disk read on a ring miss
+            // exactly as it always has.
+            let storage_for_prefetch = self.storage.clone();
+            let chunk_ring_for_prefetch = self.chunk_ring.clone();
+            tokio::spawn(async move {
+                if chunk_ring_for_prefetch.lock().unwrap().contains(&base_chunk_id) {
+                    return; // already warm — e.g. this node's own recent fold output
+                }
+                if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || {
+                    storage_for_prefetch.read_chunk_arc(&base_chunk_id)
+                }).await {
+                    chunk_ring_for_prefetch.lock().unwrap().put(base_chunk_id, bytes);
+                }
             });
         }
         drop(patch_guard);

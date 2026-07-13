@@ -484,6 +484,49 @@ impl HealingManager {
         tokio::spawn(async move {
             bw_controller.run_bandwidth_controller().await;
         });
+
+        // Emergency disk-pressure monitor: independent, fast (5s) check, separate
+        // from the 60s discovery loop's own 10%-threshold early-sweep-trigger.
+        // Added 2026-07-12 after a local repro showed the 60s cadence itself can
+        // be too coarse: 16-way concurrent hot-chunk writes drove a small test
+        // disk from 4.2GB free to under 600MB in under 50 seconds — faster than
+        // even a single 60s cycle, so the discovery loop's own check never got a
+        // chance to fire. This one skips wait_for_write_quiet's up-to-30s lull
+        // wait at the tighter (3%) threshold — a true near-ENOSPC emergency
+        // should reclaim space immediately even if it costs some I/O contention
+        // with in-flight writes, since the alternative (writes start failing
+        // outright) is strictly worse.
+        let emergency = self.clone();
+        tokio::spawn(async move {
+            emergency.run_disk_emergency_monitor().await;
+        });
+    }
+
+    /// See disk_emergency_monitor's spawn-site doc comment for why this exists
+    /// alongside (not instead of) the discovery loop's own 10%/60s check.
+    async fn run_disk_emergency_monitor(&self) {
+        const CHECK_INTERVAL: Duration = Duration::from_secs(5);
+        const EMERGENCY_THRESHOLD_PCT: f64 = 0.03;
+        loop {
+            tokio::time::sleep(CHECK_INTERVAL).await;
+            if !self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            if self.compaction_quiescing.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let critical = match self.storage.get_filesystem_stats() {
+                Ok((total, _free, available)) if total > 0 => {
+                    (available as f64) < (total as f64) * EMERGENCY_THRESHOLD_PCT
+                }
+                _ => false,
+            };
+            if critical {
+                warn!("Disk orphan sweep: EMERGENCY trigger — available space under {:.0}% of total, sweeping immediately (skipping write-quiet wait)",
+                    EMERGENCY_THRESHOLD_PCT * 100.0);
+                self.run_disk_orphan_sweep().await;
+            }
+        }
     }
 
     async fn run_bandwidth_controller(&self) {

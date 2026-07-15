@@ -992,6 +992,20 @@ impl ShutdownHandle {
 
         // Step 1: Force-flush all dirty write buffers (catches buffers not yet
         // picked up by a release task, e.g. files open when shutdown began).
+        //
+        // Bounded the same way Steps 0/2 already are (added 2026-07-15): each
+        // flush_all_pipelined() call does real network I/O to whichever nodes hold
+        // this inode's chunks, with no timeout of its own. If a peer is genuinely
+        // unreachable (e.g. mid-restart — precisely the scenario several
+        // restart-heavy local-suite tests exercise), that .await never returns,
+        // this loop never finishes, drain() never returns, and the SIGTERM handler
+        // that's supposed to let this process exit promptly hangs forever instead —
+        // confirmed live as dfs-client processes that ignored SIGTERM entirely and
+        // needed SIGKILL, sitting well past when they should have exited. A 30s
+        // cap here (same value as Steps 0/2) means a hung peer costs one bounded
+        // wait instead of an indefinite hang; whatever didn't finish flushing is
+        // simply not durable on exit, the same accepted risk an unreachable peer
+        // already poses to Steps 0/2.
         let inodes: Vec<u64> = write_buffers.iter().map(|e| *e.key()).collect();
         if !inodes.is_empty() {
             info!("shutdown drain: force-flushing {} open write buffers", inodes.len());
@@ -1004,8 +1018,9 @@ impl ShutdownHandle {
                     }
                 })
             }).collect();
-            for h in handles {
-                let _ = h.await;
+            let joined = futures::future::join_all(handles);
+            if tokio::time::timeout(tokio::time::Duration::from_secs(30), joined).await.is_err() {
+                warn!("shutdown drain: timed out waiting for force-flushed write buffers");
             }
         }
 
@@ -1037,8 +1052,22 @@ impl ShutdownHandle {
                 .collect();
             if !to_commit.is_empty() {
                 info!("shutdown drain: committing metadata for {} written inodes with chunks", to_commit.len());
+                // Bounded the same way Steps 0/1/2 are (added 2026-07-15) — see
+                // Step 1's comment for the hung-SIGTERM-handler incident this
+                // closes. flush_metadata_sync does real network I/O per call with
+                // no timeout of its own; a per-item cap plus an overall deadline
+                // means one or even several unreachable peers cost a bounded wait
+                // instead of blocking every other pending commit (and thus this
+                // whole drain, and thus process exit) indefinitely.
+                let overall_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
                 for meta in to_commit {
-                    client.flush_metadata_sync(&meta).await;
+                    if tokio::time::Instant::now() > overall_deadline {
+                        warn!("shutdown drain: timed out committing remaining written-inode metadata");
+                        break;
+                    }
+                    if tokio::time::timeout(tokio::time::Duration::from_secs(5), client.flush_metadata_sync(&meta)).await.is_err() {
+                        warn!("shutdown drain: metadata commit for {} timed out", meta.path);
+                    }
                 }
             }
         }

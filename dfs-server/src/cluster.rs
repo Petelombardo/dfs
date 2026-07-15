@@ -566,8 +566,32 @@ impl ClusterManager {
 
         tokio::time::sleep(RACE_WINDOW).await;
 
+        // Root-caused 2026-07-15 (gluster1 staging observation): compaction_intents
+        // is a HashMap<NodeId, u64> that's only ever inserted into, never pruned —
+        // record_compaction_intent overwrites a node's *own* prior entry on its next
+        // attempt, but a node that hasn't attempted a compaction in a while (or ever
+        // will again soon, e.g. it just succeeded and won't retry for another
+        // interval_secs) keeps its old, stale timestamp sitting in the map forever.
+        // Since the winner is picked by *smallest* timestamp, that stale entry —
+        // not a real concurrent contender — permanently outranks every node
+        // currently, actually racing, because "long ago" always sorts before "just
+        // now". Confirmed live: gluster1 lost "the race" on nearly every single
+        // compaction cycle for hours. This function's own doc comment already says
+        // the intent: "across every intent recorded within the last RACE_WINDOW" —
+        // the code just never actually filtered by recency to match. Only intents
+        // proposed within the current race window are real contenders.
+        // Generous relative to RACE_WINDOW: by the time we get here we've already
+        // slept for a full RACE_WINDOW since recording our own entry, plus whatever
+        // the broadcast loop above took — using RACE_WINDOW itself as the cutoff
+        // would routinely exclude our own just-recorded entry too. This only needs
+        // to be comfortably smaller than the compaction loop's own cadence (60s+
+        // between cycles) to correctly separate "the current race" from a stale
+        // leftover from an unrelated earlier cycle.
+        const STALENESS_CUTOFF_MS: u64 = RACE_WINDOW.as_millis() as u64 * 4;
+        let now_ms = dfs_common::types::current_timestamp_ms();
         let intents = self.compaction_intents.read().await;
         let winner = intents.iter()
+            .filter(|(_, ts)| now_ms.saturating_sub(**ts) <= STALENESS_CUTOFF_MS)
             .min_by_key(|(node_id, ts)| (**ts, **node_id));
         matches!(winner, Some((node_id, _)) if *node_id == self.local_node_id)
     }
@@ -1343,5 +1367,48 @@ mod tests {
 
         let elapsed = manager.time_since_became_leader().await.unwrap();
         assert!(elapsed.as_secs() >= 1000, "expected >=1000s elapsed, got {}s", elapsed.as_secs());
+    }
+
+    /// Root-caused 2026-07-15 (gluster1 staging observation): compaction_intents is
+    /// insert-only, never pruned. A peer's stale entry from long before this race
+    /// (e.g. its own last compaction attempt, hours ago) must not out-rank a node
+    /// actually, currently racing right now just because "long ago" sorts before
+    /// "just now" — only intents proposed within the current race window are real
+    /// contenders. Confirmed live: gluster1 lost this race on nearly every cycle for
+    /// hours because of exactly this.
+    #[tokio::test]
+    async fn test_compaction_intent_race_ignores_stale_peer_entry() {
+        let local_id = NodeId::new();
+        let local_addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let manager = ClusterManager::new(local_id, local_addr, 10, 30);
+
+        // A peer's intent from an hour ago — long expired, not a real contender —
+        // but with a timestamp so far in the past it would win by naive min() alone.
+        let stale_peer = NodeId::new();
+        let stale_ts = dfs_common::types::current_timestamp_ms().saturating_sub(3_600_000);
+        manager.record_compaction_intent(stale_peer, stale_ts).await;
+
+        let won = manager.propose_and_race_compaction_intent().await;
+        assert!(won, "a stale peer entry from an hour ago must never beat a node actually racing right now");
+    }
+
+    /// Contrast case: a *fresh* competing intent (recorded just before this node's
+    /// own proposal, well within the race window) with an earlier timestamp must
+    /// still correctly win — the fix must only filter by staleness, not break the
+    /// legitimate earliest-proposer-wins case this mechanism exists for.
+    #[tokio::test]
+    async fn test_compaction_intent_race_fresh_earlier_peer_still_wins() {
+        let local_id = NodeId::new();
+        let local_addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let manager = ClusterManager::new(local_id, local_addr, 10, 30);
+
+        // A peer's intent proposed 1ms ago — well within the race window, and
+        // earlier than this node's own proposal is about to be.
+        let fresh_peer = NodeId::new();
+        let fresh_ts = dfs_common::types::current_timestamp_ms().saturating_sub(1);
+        manager.record_compaction_intent(fresh_peer, fresh_ts).await;
+
+        let won = manager.propose_and_race_compaction_intent().await;
+        assert!(!won, "a genuinely earlier, fresh competing intent must still win the race");
     }
 }

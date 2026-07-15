@@ -13,6 +13,27 @@ BIN="$REPO/target/release"
 PASS=0; FAIL=0; T=/tmp/dfs-suite-tmp-$$
 CURRENT_CLIENT_LOG=""   # set once each client starts
 
+# Cap every process's memory-scaled caches to a small, fixed size instead of letting
+# each one independently compute a "reasonable" budget from system-wide available/total
+# RAM. That sizing (chunk_ring, delta_ring, client chunk_cache, write buffer) is correct
+# for its real target — one dfs-server per physical host — but this suite runs 5
+# servers + 1 client on a single box, so each one's "generous" self-sizing stacks with
+# the other 5 instead of sharing a pie: five chunk_rings alone can claim >1GB combined,
+# all computed in ignorance of each other, on a dev box with a fraction of a real node's
+# RAM. Root-caused 2026-07-15: this contention was a major contributor to a run's
+# escalating flakiness (T22-T30-ish cascade, worse the longer the box had been running
+# suites back-to-back) — high load average, timing-sensitive tests losing races they'd
+# normally win. `export` here (not per-launch-line) so every dfs-server/dfs-client
+# invocation below inherits these automatically, including T38/T45/T51's own mid-test
+# restarts. All four already exist as override env vars in the source specifically for
+# live tuning — DFS_REPLICA_CACHE_SIZE deliberately isn't touched here, it's a few
+# hundred KB even at its default max and shrinking it risks metadata query storms for
+# no memory benefit.
+export DFS_CHUNK_RING_CAPACITY=8
+export DFS_DELTA_RING_CAPACITY=8
+export DFS_MAX_CACHE_CHUNKS=8
+export DFS_WRITE_BUFFER_CAP_MB=32
+
 # If test filter args given, only run those tests (e.g. T7 T23).
 RUN_TESTS="${*:-ALL}"
 should_run() {
@@ -2870,13 +2891,25 @@ T38_UNDER_BEFORE=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 2))")
 echo "  Under-replicated chunks immediately after restart: ${T38_UNDER_BEFORE:-?}"
 
-# Trigger an immediate heal scan, then poll until the queue drains (or 2 min).
+# Tune healing_delay_secs down before triggering. Root-caused 2026-07-15: any chunk
+# that was "never fully replicated" (e.g. a late patch during this test's own slow
+# write, landing at 2/3 replicas) gets a deliberate healing_delay_secs wait before
+# should_heal() will act on it at all — production default is 300s, specifically to
+# avoid healing a chunk that's still mid-write. T38's poll loop can't wait that long,
+# and re-triggering doesn't help (it's a wall-clock check against first-detection
+# time, not a retry-count check) — so without this, the test either times out or
+# reports a false PASS (the queue-depth metric excludes gated chunks, so it can read
+# "0" while one is still deliberately untouched). 2s is enough for the write to have
+# genuinely settled by the time healing acts, without making the test wait minutes.
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing set --healing-delay-secs 2 >/dev/null 2>&1 || true
+
+# Trigger an immediate heal scan, then poll until the queue drains (or 30s).
 echo "  Triggering healer and polling for convergence..."
 "$BIN/dfs-admin" --cluster "$CLUSTER" healing file /t38_slow.bin 2>/dev/null || true
 "$BIN/dfs-admin" --cluster "$CLUSTER" healing trigger 2>/dev/null || true
-sleep 5   # let the triggered scan populate the queue before polling
+sleep 3   # let the triggered scan populate the queue before polling
 
-T38_DEADLINE=$(( $(date +%s) + 120 ))
+T38_DEADLINE=$(( $(date +%s) + 30 ))
 while true; do
     T38_STATUS=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json healing status 2>/dev/null || echo '{}')
     T38_QUEUE=$(echo "$T38_STATUS" | python3 -c "
@@ -2887,20 +2920,33 @@ print(d.get('pending_count', 0) + d.get('in_flight_count', 0))
     echo "  Heal queue: ${T38_QUEUE} (pending + in-flight)"
     [ "$T38_QUEUE" = "0" ] && break
     if [ "$(date +%s)" -ge "$T38_DEADLINE" ]; then
-        echo "  WARN: heal queue did not drain within 2 minutes"
+        echo "  WARN: heal queue did not drain within 30s"
         break
     fi
-    sleep 3
+    sleep 2
 done
 
 "$BIN/dfs-admin" --cluster "$CLUSTER" file info /t38_slow.bin
 
+# Uses < 3 (the real RF target), not the < 2 "sync-durable floor" threshold
+# T38_UNDER_BEFORE uses — a chunk sitting at exactly 2/3 replicas is expected
+# right after the write (3rd replica lands async, see T45's note on this), but
+# NOT expected here: healing has had its chance to finish the job by this point,
+# so anything still below the full target RF is a genuine convergence failure.
+# Using the same lenient <2 threshold here would have silently passed the exact
+# bug this test exists to catch (root-caused 2026-07-15: a chunk stuck at 2/3
+# replicas, gated behind healing_delay_secs).
 T38_UNDER_AFTER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t38_slow.bin 2>/dev/null \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 2))")
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 3))")
 
 [ "$T38_UNDER_AFTER" = "0" ] \
     && check "T38b all chunks reach RF=3 after healing (was ${T38_UNDER_BEFORE:-?} under-replicated)" PASS \
     || check "T38b ${T38_UNDER_AFTER:-?} chunks still under-replicated after healing (was ${T38_UNDER_BEFORE:-?})" FAIL
+
+# Restore the production default so later tests (and anyone poking at the cluster
+# after this suite finishes) see realistic healing behavior, not this test's
+# deliberately-shortened delay.
+"$BIN/dfs-admin" --cluster "$CLUSTER" healing set --healing-delay-secs 300 >/dev/null 2>&1 || true
 
 rm -f "$T38_FILE" "$T/t38_src.bin"
 fi # should_run T38

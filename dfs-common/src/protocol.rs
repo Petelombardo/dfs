@@ -700,6 +700,10 @@ pub enum Request {
         /// mid-list insertion would misalign every field after it on wire-version skew.
         #[serde(default)]
         heal_max_concurrent_per_node: Option<usize>,
+        /// Delay (seconds) before a "never fully replicated" chunk becomes eligible
+        /// for healing. Same append-only reasoning as the field above.
+        #[serde(default)]
+        healing_delay_secs: Option<u64>,
     },
 
     /// Live-update the cluster's replication factor. Applied immediately in-memory
@@ -728,6 +732,16 @@ pub enum Request {
     /// got superseded, so it's still fine, even necessary, to heal normally).
     RetractHealingCancellation {
         chunk_id: ChunkId,
+    },
+
+    /// Forward chunks to the leader for immediate (delay-bypassed) healing — sent
+    /// by `HealingManager::queue_chunks_immediate` when the calling node isn't the
+    /// leader itself, since `pending_healing` is only ever drained on the leader
+    /// (see that function's doc comment for the dead-end bug this closes). Handled
+    /// locally without an RPC when the caller already is the leader, same as
+    /// CancelHealing above.
+    QueueChunksForHealing {
+        chunk_ids: Vec<ChunkId>,
     },
 }
 
@@ -894,6 +908,11 @@ pub enum Response {
         /// fields above (live, non-persisted RPC response).
         #[serde(default)]
         pending_patches_outstanding: usize,
+        /// Configured delay (seconds) before a "never fully replicated" chunk becomes
+        /// eligible for healing — see HealingManager::should_heal's doc comment.
+        /// Appended at the end for the same bincode-positional reason as the field above.
+        #[serde(default)]
+        healing_delay_secs: u64,
     },
 
     /// File info with chunk locations

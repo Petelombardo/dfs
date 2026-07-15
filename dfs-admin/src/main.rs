@@ -123,6 +123,11 @@ enum HealingCommands {
         /// Per-transfer timeout in seconds
         #[arg(long)]
         transfer_timeout_secs: Option<u64>,
+        /// Delay (seconds) before a "never fully replicated" chunk becomes eligible
+        /// for healing — see HealingManager::should_heal. Production default is 300s;
+        /// lower this for tests that need faster convergence.
+        #[arg(long)]
+        healing_delay_secs: Option<u64>,
     },
     /// Show current healing tuning values (bandwidth ceiling, concurrency, timeout)
     Get,
@@ -675,6 +680,7 @@ async fn handle_healing_command(
                     heal_max_concurrent_per_node,
                     heal_transfer_timeout_secs,
                     pending_patches_outstanding,
+                    healing_delay_secs,
                 } => {
                     if json_output {
                         let output = serde_json::json!({
@@ -690,6 +696,7 @@ async fn handle_healing_command(
                             "heal_max_concurrent_per_node": heal_max_concurrent_per_node,
                             "heal_transfer_timeout_secs": heal_transfer_timeout_secs,
                             "pending_patches_outstanding": pending_patches_outstanding,
+                            "healing_delay_secs": healing_delay_secs,
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
@@ -703,6 +710,7 @@ async fn handle_healing_command(
                         println!("Max Concurrent: {}", heal_max_concurrent);
                         println!("Max Concurrent Per Node: {}", heal_max_concurrent_per_node);
                         println!("Transfer Timeout: {}s", heal_transfer_timeout_secs);
+                        println!("Healing Delay: {}s", healing_delay_secs);
                         println!("Last Check:    {} seconds ago", last_check);
                         println!("Pending patches outstanding: {}", pending_patches_outstanding);
                     }
@@ -845,17 +853,17 @@ async fn handle_healing_command(
                 }
             }
         }
-        HealingCommands::Set { link_bandwidth_mb, max_pct, max_concurrent, max_concurrent_per_node, transfer_timeout_secs } => {
+        HealingCommands::Set { link_bandwidth_mb, max_pct, max_concurrent, max_concurrent_per_node, transfer_timeout_secs, healing_delay_secs } => {
             if link_bandwidth_mb.is_none() && max_pct.is_none() && max_concurrent.is_none()
-                && max_concurrent_per_node.is_none() && transfer_timeout_secs.is_none() {
+                && max_concurrent_per_node.is_none() && transfer_timeout_secs.is_none() && healing_delay_secs.is_none() {
                 anyhow::bail!(
-                    "healing set requires at least one of --link-bandwidth-mb, --max-pct, --max-concurrent, --max-concurrent-per-node, --transfer-timeout-secs"
+                    "healing set requires at least one of --link-bandwidth-mb, --max-pct, --max-concurrent, --max-concurrent-per-node, --transfer-timeout-secs, --healing-delay-secs"
                 );
             }
 
             let all_addrs = discover_all_addrs(cluster_addrs).await;
             let mut failed = 0usize;
-            let mut applied: Option<(usize, f64, usize, usize, u64)> = None;
+            let mut applied: Option<(usize, f64, usize, usize, u64, u64)> = None;
             for addr in &all_addrs {
                 match send_request(*addr, Request::SetHealingTuning {
                     link_bandwidth_mb,
@@ -863,9 +871,10 @@ async fn handle_healing_command(
                     heal_max_concurrent: max_concurrent,
                     heal_max_concurrent_per_node: max_concurrent_per_node,
                     heal_transfer_timeout_secs: transfer_timeout_secs,
+                    healing_delay_secs,
                 }).await {
-                    Ok(Response::HealingStatus { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, .. }) => {
-                        applied = Some((link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs));
+                    Ok(Response::HealingStatus { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, healing_delay_secs, .. }) => {
+                        applied = Some((link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, healing_delay_secs));
                     }
                     Ok(Response::Error { message, .. }) => {
                         error!("Healing set failed on {}: {}", addr, message);
@@ -880,12 +889,13 @@ async fn handle_healing_command(
             }
             if failed == 0 {
                 println!("Healing tuning updated on all {} node(s)", all_addrs.len());
-                if let Some((bw, pct, conc, conc_per_node, timeout)) = applied {
+                if let Some((bw, pct, conc, conc_per_node, timeout, delay)) = applied {
                     println!("  link_bandwidth_mb:          {}", bw);
                     println!("  heal_max_pct:               {}", pct);
                     println!("  heal_max_concurrent:        {}", conc);
                     println!("  heal_max_concurrent_per_node: {}", conc_per_node);
                     println!("  heal_transfer_timeout_secs: {}", timeout);
+                    println!("  healing_delay_secs:         {}", delay);
                 }
             } else {
                 anyhow::bail!("Healing set failed on {}/{} node(s)", failed, all_addrs.len());
@@ -896,7 +906,7 @@ async fn handle_healing_command(
             let response = send_request(leader, Request::GetHealingStatus).await?;
 
             match response {
-                Response::HealingStatus { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, .. } => {
+                Response::HealingStatus { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, healing_delay_secs, .. } => {
                     if json_output {
                         let output = serde_json::json!({
                             "link_bandwidth_mb": link_bandwidth_mb,
@@ -904,6 +914,7 @@ async fn handle_healing_command(
                             "heal_max_concurrent": heal_max_concurrent,
                             "heal_max_concurrent_per_node": heal_max_concurrent_per_node,
                             "heal_transfer_timeout_secs": heal_transfer_timeout_secs,
+                            "healing_delay_secs": healing_delay_secs,
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
@@ -914,6 +925,7 @@ async fn handle_healing_command(
                         println!("heal_max_concurrent:        {}", heal_max_concurrent);
                         println!("heal_max_concurrent_per_node: {}", heal_max_concurrent_per_node);
                         println!("heal_transfer_timeout_secs: {}", heal_transfer_timeout_secs);
+                        println!("healing_delay_secs:         {}", healing_delay_secs);
                     }
                 }
                 Response::Error { message, .. } => {

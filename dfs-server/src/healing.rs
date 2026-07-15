@@ -167,8 +167,11 @@ pub struct HealingManager {
     /// value — is visible to both the write path and healing decisions without a restart.
     replication_factor: Arc<AtomicUsize>,
 
-    /// Delay before starting healing after node failure (seconds)
-    healing_delay_secs: u64,
+    /// Delay before starting healing after node failure (seconds). Live-tunable via
+    /// SetHealingTuning (see apply_tuning) — same pattern as heal_transfer_timeout_secs —
+    /// so tests exercising a "never fully replicated" chunk (see should_heal's gate)
+    /// don't have to wait out the full production default (300s) to converge.
+    healing_delay_secs: Arc<AtomicU64>,
 
     /// Scrubbing interval (hours)
     scrub_interval_hours: u64,
@@ -373,6 +376,7 @@ impl HealingManager {
         let heal_max_pct = Arc::new(RwLock::new((heal_max_pct_config / 100.0).clamp(0.10, 1.00)));
 
         let heal_transfer_timeout_secs = Arc::new(AtomicU64::new(heal_transfer_timeout_secs));
+        let healing_delay_secs = Arc::new(AtomicU64::new(healing_delay_secs));
 
         // Restore pending_healing first-detection times across process restarts.
         // Without this, every restart resets the whole backlog's debounce timer to
@@ -442,7 +446,7 @@ impl HealingManager {
 
         info!(
             "Starting healing manager (delay: {}s, scrub: {}h, max_per_cycle: {}, max_concurrent: {}, max_concurrent_per_node: {}, transfer_timeout: {}s, link: {}MB/s, max_pct: {}%)",
-            self.healing_delay_secs, self.scrub_interval_hours, self.max_heal_per_cycle,
+            self.healing_delay_secs.load(Ordering::Relaxed), self.scrub_interval_hours, self.max_heal_per_cycle,
             self.heal_max_concurrent.load(Ordering::Relaxed), self.heal_max_concurrent_per_node.load(Ordering::Relaxed),
             self.heal_transfer_timeout_secs.load(Ordering::Relaxed),
             self.link_bandwidth_mb.load(Ordering::Relaxed), (*self.heal_max_pct.read().await * 100.0) as u32
@@ -710,7 +714,7 @@ impl HealingManager {
             // Deep scan every healing_delay_secs (rounded to whole 60s cycles, minimum 1).
             // This ensures new under-replicated chunks are discovered within one healing delay
             // window — the same responsiveness guarantee the delay provides for known chunks.
-            let deep_every = ((self.healing_delay_secs + 59) / 60).max(1) as u32;
+            let deep_every = ((self.healing_delay_secs.load(Ordering::Relaxed) + 59) / 60).max(1) as u32;
             cycle_counter += 1;
             let deep = cycle_counter % deep_every == 1; // first cycle after becoming leader is always deep
             if let Err(e) = self.run_discovery_pass(deep).await {
@@ -950,7 +954,7 @@ impl HealingManager {
     /// Cleanup stale entries from pending_healing map
     /// Removes chunks that no longer exist or have been pending for too long
     async fn cleanup_stale_pending(&self) -> Result<()> {
-        let max_pending_time = Duration::from_secs(self.healing_delay_secs * 20); // 20x healing delay
+        let max_pending_time = Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed) * 20); // 20x healing delay
 
         let to_remove: Vec<ChunkId> = {
             let pending = self.pending_healing.read().await;
@@ -2053,13 +2057,13 @@ impl HealingManager {
 
                 let pending = self.pending_healing.read().await;
                 let delay_passed = pending.get(&chunk_id)
-                    .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs));
+                    .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed)));
                 drop(pending);
 
                 if delay_passed {
                     warn!(
                         "Chunk {} — pruning {} ghost node(s) after delay (confirmed missing for {}s+): {:?}",
-                        chunk_id, nodes_without_chunk.len(), self.healing_delay_secs, nodes_without_chunk
+                        chunk_id, nodes_without_chunk.len(), self.healing_delay_secs.load(Ordering::Relaxed), nodes_without_chunk
                     );
                     let pruned_nodes: Vec<NodeId> = location.nodes.iter()
                         .filter(|n| !nodes_without_chunk.contains(n))
@@ -2114,11 +2118,11 @@ impl HealingManager {
                     let written_age = now.saturating_sub(age_secs);
                     // Also check pending_healing as a fallback (written_at may be 0 for old records).
                     let pending_delay = pending.get(&chunk_id)
-                        .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs));
-                    (age_secs > 0 && written_age >= self.healing_delay_secs) || pending_delay
+                        .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed)));
+                    (age_secs > 0 && written_age >= self.healing_delay_secs.load(Ordering::Relaxed)) || pending_delay
                 } else {
                     pending.get(&chunk_id)
-                        .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs))
+                        .map_or(false, |t| t.elapsed() >= Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed)))
                 };
                 drop(pending);
 
@@ -2394,6 +2398,55 @@ impl HealingManager {
         sem.try_acquire_owned().ok()
     }
 
+    /// On-demand replacement for a missing alive_nodes_cache entry, scoped to one
+    /// chunk instead of a full discovery pass's all-chunks fan-out. Root-caused
+    /// 2026-07-15 (T38 local-suite repro, half-capacity resource caps): a chunk
+    /// folded *after* the one deep discovery scan a manual trigger runs never gets
+    /// a cache entry from anywhere — the only other writer is this same discovery
+    /// pass, next due 60s later, far past the local suite's ~30s test window (and,
+    /// in production, however long it takes the cluster to next scan under load).
+    /// drain_heal_queue's `None => continue` then skips it every single 15s tick
+    /// indefinitely, even though the entry sits correctly backdated past
+    /// healing_delay_secs the whole time. Confirmed live: two chunks were
+    /// re-queued via handle_replicate_patch_fold's rebroadcast sweep 36 times over
+    /// one test run and never once reached classification. This is deliberately a
+    /// single targeted HasChunks round trip (or a local check, for this node),
+    /// not a scoped rerun of the full pass — cheap enough to run inline on a
+    /// per-miss basis without turning every drain cycle into a discovery pass.
+    async fn probe_single_chunk_alive_nodes(&self, chunk_id: &ChunkId) -> Vec<NodeId> {
+        let local_id = self.cluster.local_node_id();
+        let online_nodes = self.cluster.get_all_nodes().await;
+        let mut alive = Vec::new();
+        for node in &online_nodes {
+            if node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+            let present = if node.id == local_id {
+                self.storage.has_chunk(chunk_id)
+            } else {
+                let request = Request::HasChunks { chunk_ids: vec![*chunk_id] };
+                match tokio::time::timeout(Duration::from_secs(3), self.client.send_message(node.addr, Message::Request(request))).await {
+                    Ok(Ok(envelope)) => matches!(
+                        envelope.message,
+                        Message::Response(Response::BoolVec { values }) if values.first() == Some(&true)
+                    ),
+                    Ok(Err(e)) => {
+                        debug!("probe_single_chunk_alive_nodes: HasChunks failed for node {} ({}): treating as absent this probe", node.id, e);
+                        false
+                    }
+                    Err(_) => {
+                        debug!("probe_single_chunk_alive_nodes: HasChunks timed out for node {}: treating as absent this probe", node.id);
+                        false
+                    }
+                }
+            };
+            if present {
+                alive.push(node.id);
+            }
+        }
+        alive
+    }
+
     /// Drain the heal queue — dispatches PushChunkTo / DeleteChunkReplica for all
     /// chunks in pending_healing that are ready (delay passed, source known, not
     /// in-flight, not stalled). Tasks are spawned-and-forgotten; in_flight_healing
@@ -2419,8 +2472,9 @@ impl HealingManager {
             let replication_factor = self.replication_factor.load(Ordering::Relaxed);
 
             let mut v = Vec::new();
+            let mut cache_misses = Vec::new();
             for (chunk_id, detected_at) in pending.iter() {
-                if detected_at.elapsed() < Duration::from_secs(self.healing_delay_secs) {
+                if detected_at.elapsed() < Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed)) {
                     continue;
                 }
                 // Skip already in-flight.
@@ -2434,7 +2488,14 @@ impl HealingManager {
 
                 let confirmed_alive = match cache.get(chunk_id) {
                     Some(nodes) => nodes.clone(),
-                    None => continue, // discovery hasn't run yet for this chunk
+                    None => {
+                        // No full discovery pass has classified this chunk yet (e.g. it
+                        // was folded after the last one ran). Don't just wait for the
+                        // next 60s-periodic pass — probe it directly below, once locks
+                        // are released.
+                        cache_misses.push(*chunk_id);
+                        continue;
+                    }
                 };
 
                 let status = if confirmed_alive.len() < replication_factor {
@@ -2451,6 +2512,23 @@ impl HealingManager {
             drop(cache);
             drop(in_flight);
             drop(stalled);
+
+            if !cache_misses.is_empty() {
+                let replication_factor = self.replication_factor.load(Ordering::Relaxed);
+                for chunk_id in cache_misses {
+                    let confirmed_alive = self.probe_single_chunk_alive_nodes(&chunk_id).await;
+                    self.alive_nodes_cache.write().await.insert(chunk_id, confirmed_alive.clone());
+
+                    let status = if confirmed_alive.len() < replication_factor {
+                        ReplicationStatus::UnderReplicated
+                    } else if confirmed_alive.len() > replication_factor {
+                        if destructive_allowed { ReplicationStatus::OverReplicated } else { continue }
+                    } else {
+                        continue;
+                    };
+                    v.push((chunk_id, status, confirmed_alive));
+                }
+            }
 
             // Sort oldest-first, cap to max_heal_per_cycle.
             {
@@ -2568,14 +2646,14 @@ impl HealingManager {
         match elapsed {
             Some(elapsed) => {
                 // Check if delay has passed
-                if elapsed >= Duration::from_secs(self.healing_delay_secs) {
+                if elapsed >= Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed)) {
                     true
                 } else {
                     debug!(
                         "Chunk {} waiting for healing delay ({}/{}s)",
                         chunk_id,
                         elapsed.as_secs(),
-                        self.healing_delay_secs
+                        self.healing_delay_secs.load(Ordering::Relaxed)
                     );
                     false
                 }
@@ -2585,7 +2663,7 @@ impl HealingManager {
                 self.mark_pending(*chunk_id).await;
                 debug!(
                     "Chunk {} marked for healing (delay: {}s)",
-                    chunk_id, self.healing_delay_secs
+                    chunk_id, self.healing_delay_secs.load(Ordering::Relaxed)
                 );
                 false
             }
@@ -3283,6 +3361,7 @@ impl HealingManager {
         heal_max_concurrent: Option<usize>,
         heal_max_concurrent_per_node: Option<usize>,
         heal_transfer_timeout_secs: Option<u64>,
+        healing_delay_secs: Option<u64>,
     ) -> HealingTuningSnapshot {
         if let Some(v) = link_bandwidth_mb {
             self.link_bandwidth_mb.store(v.max(1), Ordering::Relaxed);
@@ -3292,6 +3371,9 @@ impl HealingManager {
         }
         if let Some(secs) = heal_transfer_timeout_secs {
             self.heal_transfer_timeout_secs.store(secs.max(1), Ordering::Relaxed);
+        }
+        if let Some(secs) = healing_delay_secs {
+            self.healing_delay_secs.store(secs, Ordering::Relaxed);
         }
         // Apply the global cap first so a per-node value supplied in the same call is
         // clamped against the *new* global ceiling, not the stale one.
@@ -3389,7 +3471,7 @@ impl HealingManager {
         }
     }
 
-    /// Current live values of all five tuning knobs, for `dfs-admin healing get`/`status`.
+    /// Current live values of all six tuning knobs, for `dfs-admin healing get`/`status`.
     pub async fn tuning_snapshot(&self) -> HealingTuningSnapshot {
         HealingTuningSnapshot {
             link_bandwidth_mb: self.link_bandwidth_mb.load(Ordering::Relaxed),
@@ -3397,25 +3479,97 @@ impl HealingManager {
             heal_max_concurrent: self.heal_max_concurrent.load(Ordering::Relaxed),
             heal_max_concurrent_per_node: self.heal_max_concurrent_per_node.load(Ordering::Relaxed),
             heal_transfer_timeout_secs: self.heal_transfer_timeout_secs.load(Ordering::Relaxed),
+            healing_delay_secs: self.healing_delay_secs.load(Ordering::Relaxed),
         }
     }
 
-    pub async fn queue_chunks_immediate(&self, chunk_ids: Vec<ChunkId>) {
-        let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs + 1);
+    /// Backdate `chunk_ids` into this node's own `pending_healing` so the next drain
+    /// cycle treats them as already past `healing_delay_secs`, instead of a fresh
+    /// discovery having to wait it out. Only effective on the cluster leader — see
+    /// `queue_chunks_immediate`'s doc comment, which is what every caller outside
+    /// this file should use instead.
+    async fn queue_chunks_immediate_local(&self, chunk_ids: Vec<ChunkId>) {
+        let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed) + 1);
         let backdated_secs = dfs_common::types::current_timestamp()
-            .saturating_sub(self.healing_delay_secs + 1);
+            .saturating_sub(self.healing_delay_secs.load(Ordering::Relaxed) + 1);
         let mut pending = self.pending_healing.write().await;
         let mut cache  = self.alive_nodes_cache.write().await;
         for chunk_id in chunk_ids {
+            // Only invalidate the cache entry on a *genuinely new* pending entry —
+            // i.e. this chunk wasn't already queued. Root-caused 2026-07-15 (T38
+            // local-suite repro, half-capacity caches): handle_replicate_patch_fold
+            // re-fires this same queue call every time its rebroadcast sweep resends
+            // an unresolved fold pointer (every few seconds, until the gap closes or
+            // its TTL expires) — unconditionally clearing the cache on every one of
+            // those repeats raced drain_heal_queue's own `None => continue` (cache
+            // empty means "discovery hasn't run yet for this chunk", skip this
+            // cycle): the cache got wiped faster than a full discovery pass (60s
+            // periodic) could ever repopulate it, so the chunk sat in pending_healing
+            // — correctly backdated, never delay-gated — but drain_heal_queue skipped
+            // it every single cycle, indefinitely. Confirmed via full log trace: the
+            // chunk was queued repeatedly for 35+ seconds straight and never once
+            // appeared in a "Leader healing under-replicated chunk" line. Preserving
+            // the cache across repeat re-queues of an already-pending chunk still
+            // lets the original "invalidate stale data from a finished cycle" case
+            // through, since that chunk wouldn't be in `pending` yet at that point.
+            let is_new = !pending.contains_key(&chunk_id);
             pending.insert(chunk_id, backdated);
             if let Err(err) = self.metadata.put_pending_healing_async(chunk_id, backdated_secs).await {
                 warn!("Failed to persist backdated pending_healing entry for {}: {}", chunk_id, err);
             }
-            // Invalidate any stale cache entry for this chunk so drain_heal_queue
-            // doesn't classify a healthy RF=3 chunk as under-replicated based on
-            // old alive-node data from a previous healing cycle. The next discovery
-            // pass will repopulate the cache with a fresh HasChunks scan.
-            cache.remove(&chunk_id);
+            if is_new {
+                cache.remove(&chunk_id);
+            }
+        }
+    }
+
+    /// Queue chunks for immediate (delay-bypassed) healing. Safe to call from any
+    /// node, leader or not — forwards to the actual leader when this node isn't one.
+    ///
+    /// Root-caused 2026-07-15 (T38 local-suite repro): `pending_healing` is only ever
+    /// drained by `run_discovery_loop`/`run_heal_loop`, and both bail out immediately
+    /// unless `self.cluster.is_leader()` — see their own doc comments ("runs every
+    /// 60s/15s on the cluster leader"). Every existing caller of this function can
+    /// run on a non-leader node: `handle_replicate_patch_fold` fires wherever a fold
+    /// broadcast happens to land, and `handle_heal_file`/`handle_force_fold` etc. are
+    /// routed to whichever address the caller (an admin CLI, another node) happened
+    /// to target, not necessarily the leader. Before this fix, queueing on a
+    /// non-leader was a silent dead end: the entry sat in that node's own
+    /// `pending_healing` forever, un-drained, while — in the concrete repro — the
+    /// fold's origin node kept re-broadcasting every ~10s because it never saw the
+    /// gap close, each time re-discovering "not present locally" and re-queueing it
+    /// right back into the same dead end. Confirmed via full chunk-storage
+    /// inspection: the chunk was never queued on any node capable of acting on it.
+    ///
+    /// Always inserts locally too (cheap, and covers this node becoming leader
+    /// shortly after, or the forward below failing) — the forward is additive, not
+    /// a replacement.
+    pub async fn queue_chunks_immediate(&self, chunk_ids: Vec<ChunkId>) {
+        self.queue_chunks_immediate_local(chunk_ids.clone()).await;
+
+        if self.cluster.is_leader().await {
+            return;
+        }
+        let Some(leader_addr) = self.cluster.get_leader_addr().await else {
+            warn!(
+                "queue_chunks_immediate: not leader and no leader known — {} chunk(s) queued \
+                 locally only, won't be drained until this node becomes leader",
+                chunk_ids.len()
+            );
+            return;
+        };
+        const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+        let req = Request::QueueChunksForHealing { chunk_ids: chunk_ids.clone() };
+        match tokio::time::timeout(FORWARD_TIMEOUT, self.client.send_message(leader_addr, Message::Request(req))).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(
+                "queue_chunks_immediate: failed to forward {} chunk(s) to leader {}: {}",
+                chunk_ids.len(), leader_addr, e
+            ),
+            Err(_) => warn!(
+                "queue_chunks_immediate: timed out forwarding {} chunk(s) to leader {}",
+                chunk_ids.len(), leader_addr
+            ),
         }
     }
 
@@ -3435,7 +3589,7 @@ impl HealingManager {
             in_flight_healing: in_flight.len(),
             stalled_healing: stalled_count,
             auto_heal_enabled: self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed),
-            healing_delay_secs: self.healing_delay_secs,
+            healing_delay_secs: self.healing_delay_secs.load(Ordering::Relaxed),
             current_bandwidth_mb: self.heal_bandwidth_limiter_out.current_rate_mb().await,
             tuning: self.tuning_snapshot().await,
         }
@@ -3444,22 +3598,30 @@ impl HealingManager {
     /// Trigger an immediate heal cycle, bypassing the 60s interval.
     /// Runs check_and_heal directly on the calling task. Only has effect on the leader;
     /// non-leaders log and return immediately (same behaviour as the periodic loop).
+    ///
+    /// Always runs a deep scan (full routing-table walk), never the fast one.
+    ///
+    /// Root-caused 2026-07-15 (T38 local-suite repro): this used to run a fast scan
+    /// — which only rechecks chunks *already* in `pending_healing` (see
+    /// `run_discovery_pass`'s doc comment) — whenever `pending_healing` was
+    /// non-empty for *any* reason, including chunks entirely unrelated to what the
+    /// caller cares about (e.g. concurrent healing activity for a different file).
+    /// Confirmed live: the leader had full, correct, immediate knowledge that two of
+    /// a just-restarted file's chunks sat at 2/3 replicas (it was a write-pair node
+    /// for one of them itself), yet a manual trigger never scheduled either for
+    /// healing — `pending_healing` happened to be non-empty from unrelated activity
+    /// at that exact moment, so the fast-scan branch fired and neither chunk had
+    /// ever been discovered before, making them invisible to it. A manual trigger is
+    /// an explicit, infrequent, human/script-initiated request — thoroughness matters
+    /// far more here than the periodic background loop's own cost-driven fast/deep
+    /// alternation (which this doesn't touch).
     pub async fn trigger_heal_now(&self) -> Result<()> {
         if !self.cluster.is_leader().await {
             info!("TriggerHealing received on non-leader node — ignoring");
             return Ok(());
         }
-        info!("Manual heal cycle triggered");
-        // Use a deep scan if there's nothing in pending_healing — fast scan would
-        // find nothing since it only checks already-known chunks. Deep scan finds
-        // all under-replicated chunks in the routing table regardless of whether
-        // they've been seen before. Fast scan is used when pending is non-empty.
-        let pending_count = self.pending_healing.read().await.len();
-        let deep = pending_count == 0;
-        if deep {
-            info!("Manual heal cycle: pending queue empty — running deep scan to discover new under-replicated chunks");
-        }
-        self.run_discovery_pass(deep).await?;
+        info!("Manual heal cycle triggered — running deep scan");
+        self.run_discovery_pass(true).await?;
         self.drain_heal_queue().await
     }
 }
@@ -3494,6 +3656,7 @@ pub struct HealingTuningSnapshot {
     pub heal_max_concurrent: usize,
     pub heal_max_concurrent_per_node: usize,
     pub heal_transfer_timeout_secs: u64,
+    pub healing_delay_secs: u64,
 }
 
 #[cfg(test)]
@@ -3682,6 +3845,219 @@ mod tests {
         let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"d"))];
         let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
         assert!(authorized.is_empty(), "unreachable leader must defer, never authorize blindly");
+    }
+
+    /// Leader case: queue_chunks_immediate must queue locally and return promptly —
+    /// no peer to forward to, no network round trip needed. Baseline sanity check
+    /// before the non-leader tests below, which exercise the actual fix.
+    #[tokio::test]
+    async fn test_queue_chunks_immediate_leader_queues_locally() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        assert!(healing.cluster.is_leader().await, "single-node cluster must be its own leader");
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"leader-local"));
+        healing.queue_chunks_immediate(vec![chunk_id]).await;
+
+        let stats = healing.get_stats().await;
+        assert_eq!(stats.pending_healing, 1, "chunk must be queued locally on the leader");
+    }
+
+    /// Root-caused 2026-07-15 (T38 local-suite repro): queue_chunks_immediate used
+    /// to write only into *this* node's own pending_healing — a dead end on a
+    /// non-leader, since only the leader's run_discovery_loop/run_heal_loop ever
+    /// drain it (see their own doc comments). handle_replicate_patch_fold calls this
+    /// on whichever node receives a fold broadcast, which is routinely not the
+    /// leader — the chunk sat queued forever while the fold's origin node kept
+    /// re-broadcasting every ~10s, each retry re-discovering the same gap and
+    /// re-queueing it right back into the same dead end.
+    ///
+    /// This exercises the still-safe half of the fix in isolation (no live peer to
+    /// round-trip through in a unit test): a non-leader must still queue the chunk
+    /// locally as a backstop even when the forward-to-leader attempt can't succeed
+    /// (unreachable leader here), rather than silently doing nothing. The other half
+    /// — the forward actually reaching and being applied on a real leader — is
+    /// covered end-to-end by the local test suite's T38 (rolling restart + patch
+    /// fold + healing convergence).
+    #[tokio::test]
+    async fn test_queue_chunks_immediate_non_leader_still_queues_locally_as_backstop() {
+        let (id_a, id_b) = {
+            let a = NodeId::new();
+            let b = NodeId::new();
+            if a < b { (a, b) } else { (b, a) }
+        };
+        // Local node is id_b (NOT the minimum) — id_a is the leader.
+        let local_addr: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(id_b, local_addr);
+
+        let leader_addr: SocketAddr = "127.0.0.1:19997".parse().unwrap(); // unreachable
+        healing.cluster.add_node(dfs_common::NodeInfo::new(id_a, leader_addr, None)).await.unwrap();
+        assert!(!healing.cluster.is_leader().await, "local node (not min id) must not be leader");
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"non-leader-backstop"));
+        healing.queue_chunks_immediate(vec![chunk_id]).await;
+
+        let stats = healing.get_stats().await;
+        assert_eq!(
+            stats.pending_healing, 1,
+            "non-leader must still queue locally even when the forward-to-leader attempt fails — \
+             calling this must never silently do nothing"
+        );
+    }
+
+    /// Root-caused 2026-07-15 (T38 local-suite repro, half-capacity resource caps):
+    /// a chunk folded *after* the one deep-scan discovery pass a manual trigger runs
+    /// never gets an alive_nodes_cache entry from anywhere else within a short test
+    /// window (next periodic discovery is 60s out) — drain_heal_queue's old
+    /// `None => continue` would skip it forever. This proves drain_heal_queue now
+    /// probes and populates the cache itself on a miss, in the same cycle, instead
+    /// of waiting on an external discovery pass that may not come in time.
+    #[tokio::test]
+    async fn test_drain_heal_queue_probes_cache_miss_instead_of_skipping_forever() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        assert!(healing.cluster.is_leader().await, "single-node cluster must be its own leader");
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"cache-miss-probe"));
+        storage.write_chunk(&chunk_id, b"real chunk bytes").unwrap();
+
+        // Queue it (backdated, bypassing healing_delay_secs) but do NOT populate
+        // alive_nodes_cache — simulating a fold that completed after the one
+        // discovery pass that's already run.
+        healing.queue_chunks_immediate_local(vec![chunk_id]).await;
+        assert!(
+            healing.alive_nodes_cache.read().await.get(&chunk_id).is_none(),
+            "test setup: cache must start empty for this chunk"
+        );
+
+        healing.drain_heal_queue().await.unwrap();
+
+        assert!(
+            healing.alive_nodes_cache.read().await.get(&chunk_id).is_some(),
+            "drain_heal_queue must probe and populate a missing cache entry on-demand \
+             instead of silently skipping the chunk until the next external discovery pass"
+        );
+    }
+
+    /// Root-caused 2026-07-15 (T38 local-suite repro, half-capacity resource caps):
+    /// a repeat call to queue_chunks_immediate_local for a chunk that's *already*
+    /// pending must not wipe an already-populated alive_nodes_cache entry —
+    /// drain_heal_queue's `cache.get(chunk_id) == None => continue` treats a missing
+    /// entry as "discovery hasn't run yet" and skips the chunk entirely until the
+    /// next full discovery pass (60s periodic). handle_replicate_patch_fold's
+    /// rebroadcast sweep re-calls this every few seconds for as long as a fold's
+    /// pointer gap stays open — if every one of those repeats re-clears the cache,
+    /// the entry never survives long enough for drain_heal_queue's next 15s tick to
+    /// see it, and the chunk starves indefinitely even though it's correctly
+    /// backdated past healing_delay_secs the whole time. Confirmed live: the same
+    /// chunk got re-queued for 35+ seconds straight and never once appeared in a
+    /// "Leader healing under-replicated chunk" line.
+    #[tokio::test]
+    async fn test_repeat_queue_of_already_pending_chunk_preserves_alive_nodes_cache() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"repeat-queue-cache"));
+
+        // First queue: brand new — cache has nothing to preserve yet.
+        healing.queue_chunks_immediate_local(vec![chunk_id]).await;
+
+        // Simulate a discovery pass having since populated the cache with the real,
+        // confirmed-alive node set for this chunk.
+        let confirmed = vec![NodeId::new(), NodeId::new()];
+        healing.alive_nodes_cache.write().await.insert(chunk_id, confirmed.clone());
+
+        // A second, repeat queue (the rebroadcast-sweep re-notification) must NOT
+        // clear that freshly-populated entry — the chunk is already pending, so
+        // there's no "stale data from a finished cycle" to invalidate.
+        healing.queue_chunks_immediate_local(vec![chunk_id]).await;
+
+        let cache = healing.alive_nodes_cache.read().await;
+        assert_eq!(
+            cache.get(&chunk_id),
+            Some(&confirmed),
+            "repeat-queueing an already-pending chunk must not wipe its populated \
+             alive_nodes_cache entry, or drain_heal_queue will skip it forever"
+        );
+    }
+
+    /// Root-caused 2026-07-15 (T38 local-suite repro): trigger_heal_now used to run
+    /// a fast scan (only rechecks chunks already in pending_healing) whenever
+    /// pending_healing was non-empty for *any* reason — including activity entirely
+    /// unrelated to what the caller actually wants checked. This reproduces exactly
+    /// that: seed one unrelated chunk into pending_healing (simulating concurrent
+    /// healing activity elsewhere in the cluster), then create a second,
+    /// genuinely-under-replicated chunk that has never been discovered before, and
+    /// confirm a manual trigger still finds it. Before the fix (always deep), this
+    /// second chunk would be invisible — a fast scan only looks up pre-existing
+    /// pending_healing keys — so it would never be scheduled for healing until the
+    /// next periodic deep-scan tick, which can be much later than a human/script
+    /// calling `dfs-admin healing trigger` reasonably expects.
+    #[tokio::test]
+    async fn test_trigger_heal_now_always_deep_scans_even_with_unrelated_pending() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        // Remove the delay gate so discovery+drain in one trigger_heal_now() call
+        // doesn't also need a second cycle to become actionable — this test is about
+        // whether the chunk is *discovered* at all, not the separate delay gate
+        // (covered by test_should_heal_with_delay).
+        healing.healing_delay_secs.store(0, Ordering::Relaxed);
+
+        // Simulate unrelated concurrent healing activity: some other chunk, from
+        // some other file, already sitting in pending_healing.
+        let unrelated_chunk = ChunkId::from_hash(compute_chunk_hash(b"unrelated-concurrent-activity"));
+        healing.queue_chunks_immediate(vec![unrelated_chunk]).await;
+        assert_eq!(healing.pending_healing.read().await.len(), 1, "sanity: unrelated chunk seeded");
+
+        // A genuinely under-replicated chunk that has never been discovered before —
+        // present on this node (so it's not "stalled" for lack of a source) but only
+        // 1 of the 3 replication_factor's worth of nodes, and referenced by a live
+        // file record so the deep scan's live_chunk_ids() check includes it.
+        let new_chunk = ChunkId::from_hash(compute_chunk_hash(b"never-before-seen-under-replicated"));
+        storage.write_chunk(&new_chunk, b"some real chunk data").unwrap();
+        let mut file_meta = FileMetadata::new("/new_chunk_test.bin".to_string(), FileType::RegularFile);
+        file_meta.size = 21;
+        // file_id must match the FileMetadata's own copy below — do_heal_chunk_inner
+        // treats a routing-table ChunkLocation with file_id: None as "can't verify
+        // it's not an orphan quickly, defer to the orphan sweep" and clears it from
+        // pending_healing outright (not even stalled). A real fresh-write always sets
+        // this; leaving it None here was just this test's own setup gap, invisible
+        // as long as drain_heal_queue skipped the chunk before ever reaching this
+        // check (the exact cache-miss gap fixed elsewhere today).
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: new_chunk,
+            nodes: vec![node_id],
+            size: 21,
+            checksum: new_chunk.hash,
+            file_offset: Some(0),
+            written_at: Some(dfs_common::types::current_timestamp() * 1000),
+            client_write_seq: None,
+            file_id: Some(file_meta.id),
+        }).unwrap();
+        file_meta.chunk_locations = Arc::new(vec![ChunkLocation {
+            chunk_id: new_chunk,
+            nodes: vec![node_id],
+            size: 21,
+            checksum: new_chunk.hash,
+            file_offset: Some(0),
+            written_at: Some(dfs_common::types::current_timestamp() * 1000),
+            client_write_seq: None,
+            file_id: Some(file_meta.id),
+        }]);
+        metadata.put_file(&file_meta).unwrap();
+
+        healing.trigger_heal_now().await.unwrap();
+
+        assert!(
+            healing.pending_healing.read().await.contains_key(&new_chunk),
+            "a manual trigger must discover a never-before-seen under-replicated chunk \
+             even when pending_healing already has unrelated entries in it — a fast \
+             scan can never find this, only a deep one"
+        );
     }
 
     /// End-to-end: a chunk still routed to us in the local CHUNK_TABLE, but with no

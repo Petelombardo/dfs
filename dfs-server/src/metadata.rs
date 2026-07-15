@@ -2426,11 +2426,23 @@ impl MetadataStore {
 
     /// Copy every row of `def` from `src` into `dst`, overwriting whatever's there.
     /// Used for compact_db()'s initial full snapshot copy.
+    /// How many rows between deadline checks in copy_bytes_table/copy_u64_table — see
+    /// copy_all_tables' doc comment for why a per-table-only check isn't enough. Small
+    /// enough that even a slow-disk row still checks the deadline within a fraction of
+    /// a second of it passing; large enough that Instant::now() isn't called on every
+    /// single row of a multi-million-row table.
+    const COPY_DEADLINE_CHECK_INTERVAL: usize = 2048;
+
+    /// Returns `false` (and leaves `dst_table` partially populated — safe because the
+    /// caller's whole dst_txn is dropped, never committed, on that outcome) if `deadline`
+    /// passes before every row is copied. See copy_all_tables' doc comment for why this
+    /// intra-table check exists on top of copy_all_tables' own between-tables one.
     fn copy_bytes_table(
         src: &redb::ReadTransaction,
         dst: &redb::WriteTransaction,
         def: TableDefinition<&str, &[u8]>,
-    ) -> Result<()> {
+        deadline: std::time::Instant,
+    ) -> Result<bool> {
         // Some tables (e.g. chunk_refcount) aren't pre-created at startup and only come
         // into existence on their first real write — a fresh/lightly-used store may
         // never have touched one. redb's read-side open_table errors on a table that
@@ -2438,33 +2450,40 @@ impl MetadataStore {
         // "nothing to copy" rather than a real failure.
         let src_table = match src.open_table(def) {
             Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(true),
             Err(e) => return Err(e.into()),
         };
         let mut dst_table = dst.open_table(def)?;
-        for item in src_table.range::<&str>(..)? {
+        for (i, item) in src_table.range::<&str>(..)?.enumerate() {
+            if i % Self::COPY_DEADLINE_CHECK_INTERVAL == 0 && std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
             let (k, v) = item?;
             dst_table.insert(k.value(), v.value())?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn copy_u64_table(
         src: &redb::ReadTransaction,
         dst: &redb::WriteTransaction,
         def: TableDefinition<&str, u64>,
-    ) -> Result<()> {
+        deadline: std::time::Instant,
+    ) -> Result<bool> {
         let src_table = match src.open_table(def) {
             Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(true),
             Err(e) => return Err(e.into()),
         };
         let mut dst_table = dst.open_table(def)?;
-        for item in src_table.range::<&str>(..)? {
+        for (i, item) in src_table.range::<&str>(..)?.enumerate() {
+            if i % Self::COPY_DEADLINE_CHECK_INTERVAL == 0 && std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
             let (k, v) = item?;
             dst_table.insert(k.value(), v.value())?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Reconcile `dst`'s copy of `def` against `src`'s current contents: update any key
@@ -2551,21 +2570,29 @@ impl MetadataStore {
         Ok(changed)
     }
 
-    /// Copies every table, checking `deadline` between each one — a large table's own
-    /// copy can't be interrupted mid-flight (it isn't split into resumable chunks), but
-    /// checking between tables at least bounds how much *extra* table copying happens
-    /// once Phase 1 is already over budget, rather than only detecting lateness after
-    /// every single table is done. Returns `false` (nothing committed by the caller's
-    /// dst_txn beyond what was already inserted) if the deadline hit before all tables
-    /// were copied — see compact_db_prepare's Phase 1 budget for why this matters.
+    /// Copies every table, checking `deadline` both between tables and every
+    /// COPY_DEADLINE_CHECK_INTERVAL rows within one (see copy_bytes_table/
+    /// copy_u64_table). Returns `false` (nothing committed by the caller's dst_txn
+    /// beyond what was already inserted) if the deadline hit before all tables were
+    /// copied — see compact_db_prepare's Phase 1 budget for why this matters.
+    ///
+    /// Root-caused 2026-07-15 (gluster1 incident): the between-tables-only check this
+    /// used to do left a single large table's own copy entirely unbounded — under
+    /// sustained heavy write churn competing for disk I/O, one table's copy blew past
+    /// not just this budget but server.rs's outer 60s wedge-detection timeout (which
+    /// can't cancel an in-flight spawn_blocking call), forcing a node restart. The
+    /// budget existed but couldn't actually bound wall-clock time. Checking within a
+    /// table's own copy (not just between tables) closes that gap: Phase 1 now reliably
+    /// bails and defers within its stated budget regardless of table size or
+    /// contention, the same "try again next cycle" contract Phase 2 already honors.
     fn copy_all_tables(src: &redb::ReadTransaction, dst: &redb::WriteTransaction, deadline: std::time::Instant) -> Result<bool> {
         for def in Self::BYTES_TABLES {
             if std::time::Instant::now() >= deadline { return Ok(false); }
-            Self::copy_bytes_table(src, dst, def)?;
+            if !Self::copy_bytes_table(src, dst, def, deadline)? { return Ok(false); }
         }
         for def in Self::U64_TABLES {
             if std::time::Instant::now() >= deadline { return Ok(false); }
-            Self::copy_u64_table(src, dst, def)?;
+            if !Self::copy_u64_table(src, dst, def, deadline)? { return Ok(false); }
         }
         Ok(true)
     }
@@ -2892,6 +2919,35 @@ impl MetadataStore {
     pub fn db_size(&self) -> u64 {
         std::fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0)
     }
+
+    /// Real, in-use bytes (stored data + B-tree indexing overhead), as opposed to
+    /// db_size()'s raw OS file size.
+    ///
+    /// Root-caused 2026-07-15 (server5/VM111 live incident, self-sustaining
+    /// compaction loop): the compaction trigger used db_size() as a stand-in for
+    /// fragmentation, comparing raw file size against the size right after the
+    /// last compact. But redb grows its backing file geometrically (observed live:
+    /// a *tight, freshly-compacted* 257.5MB file jumped to 514.5MB — almost exactly
+    /// 2x — after only ~273 small chunk_location writes in under two minutes,
+    /// nowhere near enough real data to explain 257MB of genuine growth). db_size()
+    /// can't tell "the file grew because redb pre-allocated headroom for future
+    /// writes" apart from "the file grew because of genuine fragmented waste" —
+    /// they look identical from the outside, but only the second one is a reason
+    /// to pay for another compaction. redb's own WriteTransaction::stats() (there is
+    /// no read-only equivalent in this redb version) reports stored_bytes/
+    /// metadata_bytes/fragmented_bytes directly from its B-tree accounting, which
+    /// distinguishes them. Opens a write transaction only to read stats and
+    /// explicitly aborts it (no commit, no data touched) — same cadence as the
+    /// existing 60s compaction-check poll, not on any write's hot path.
+    pub fn redb_fragmentation_stats(&self) -> Result<(u64, u64)> {
+        let _db = self.db.read();
+        let txn = _db.begin_write()?;
+        let stats = txn.stats()?;
+        let live_bytes = stats.stored_bytes() + stats.metadata_bytes();
+        let fragmented_bytes = stats.fragmented_bytes();
+        txn.abort()?;
+        Ok((live_bytes, fragmented_bytes))
+    }
 }
 
 /// Metadata storage statistics
@@ -2920,6 +2976,53 @@ mod tests {
         let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
         assert_eq!(retrieved.path, "/test.txt");
         assert_eq!(retrieved.size, 1024);
+    }
+
+    /// Root-caused 2026-07-15 (server5/VM111 live incident): the compaction loop
+    /// used to compare raw OS file size (db_size(), a plain fs::metadata().len())
+    /// against its own post-compaction baseline to decide whether to compact. redb
+    /// grows its backing file geometrically to amortize resize cost, so a small
+    /// batch of genuinely tiny writes can make the *file* look like it doubled even
+    /// though almost none of that growth is real, reclaimable waste — confirmed
+    /// live: a freshly-compacted 257.5MB file jumped to 514.5MB after only ~273
+    /// small chunk_location writes, which is nowhere near enough data to need
+    /// 257MB of new space. redb_fragmentation_stats() must report a small
+    /// fragmented_bytes here, proving it actually distinguishes "the file grew"
+    /// from "there's real waste to reclaim" for a real (if small-scale) instance of
+    /// exactly this write pattern.
+    #[test]
+    fn test_redb_fragmentation_stats_reports_low_fragmentation_after_many_small_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let node = NodeId::new();
+
+        for i in 0..500u32 {
+            let hash = dfs_common::hash::compute_chunk_hash(format!("chunk-{}", i).as_bytes());
+            let loc = dfs_common::ChunkLocation {
+                chunk_id: ChunkId::from_hash(hash),
+                nodes: vec![node],
+                size: 4096,
+                checksum: hash,
+                file_offset: Some(0),
+                written_at: Some(1000 + i as u64),
+                client_write_seq: Some(i as u64),
+                file_id: None,
+            };
+            store.put_chunk_location(&loc).unwrap();
+        }
+
+        let (live_bytes, fragmented_bytes) = store.redb_fragmentation_stats().unwrap();
+        assert!(live_bytes > 0, "500 real chunk_location records must show up as live bytes");
+
+        let total = live_bytes + fragmented_bytes;
+        let frag_pct = fragmented_bytes as f64 / total as f64;
+        assert!(
+            frag_pct < 0.20,
+            "500 small, non-overwriting writes to a fresh DB should show low genuine \
+             fragmentation ({:.1}% observed) — if this is high, redb_fragmentation_stats \
+             isn't actually measuring reclaimable waste",
+            frag_pct * 100.0
+        );
     }
 
     /// Regression test for a real bug found via T48 under full local-suite load
@@ -3665,5 +3768,53 @@ mod tests {
             let path = format!("/seed_{}", i);
             assert!(store.get_file_by_path(&path).unwrap().is_some(), "lost seeded file {} after successful follow-up compaction", path);
         }
+    }
+
+    #[test]
+    fn test_copy_bytes_table_bails_mid_table_on_deadline() {
+        // Root-caused 2026-07-15 (gluster1 incident): copy_all_tables used to check its
+        // Phase 1 budget only *between* whole tables — a single large table's own
+        // copy_bytes_table call was entirely unbounded once started. Under sustained
+        // disk contention, one table's copy blew past not just the stated phase1_budget
+        // but server.rs's outer 60s wedge-detection timeout (which can't cancel an
+        // in-flight spawn_blocking call), forcing a node restart — the budget existed
+        // but never actually bounded wall-clock time.
+        //
+        // test_compact_db_defers_when_phase1_exceeds_budget already covers the
+        // near-zero-budget case, but that's caught by copy_all_tables' pre-existing
+        // between-tables check *before* copy_bytes_table is ever called — it never
+        // exercises the new intra-table check at all. This test proves the fix directly:
+        // a single table large enough that a full copy provably takes longer than the
+        // budget must still leave the copy partial (not 0, not all) when the deadline
+        // lands mid-copy — i.e. the bail happened during the table, not before or after.
+        let temp_dir = TempDir::new().unwrap();
+        let src_db = Database::create(temp_dir.path().join("src.redb")).unwrap();
+        const ROW_COUNT: usize = 300_000;
+        {
+            let txn = src_db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(FILE_TABLE).unwrap();
+                for i in 0..ROW_COUNT {
+                    let key = format!("/row_{:08}", i);
+                    table.insert(key.as_str(), &b"x"[..]).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+
+        let dst_db = Database::create(temp_dir.path().join("dst.redb")).unwrap();
+        let src_txn = src_db.begin_read().unwrap();
+        let dst_txn = dst_db.begin_write().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let finished = MetadataStore::copy_bytes_table(&src_txn, &dst_txn, FILE_TABLE, deadline).unwrap();
+        assert!(!finished, "copy_bytes_table should report unfinished when its deadline lands mid-copy");
+
+        let copied = {
+            let table = dst_txn.open_table(FILE_TABLE).unwrap();
+            table.len().unwrap() as usize
+        };
+        assert!(copied > 0, "copy_bytes_table bailed before copying anything — deadline check fired too early to be a mid-table bail");
+        assert!(copied < ROW_COUNT, "copy_bytes_table copied every row despite reporting unfinished — the deadline check isn't actually bounding the loop");
     }
 }

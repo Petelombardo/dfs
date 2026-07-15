@@ -2521,6 +2521,22 @@ impl Server {
         self.compaction_quiescing.clone()
     }
 
+    /// Marks every compaction_quiescing-respecting writer (fold_slot_now,
+    /// HealingManager's three check points) as "please back off" — see
+    /// compaction_quiescing's doc comment on the struct. Pairs with
+    /// end_compaction_quiesce(); callers must call that even on an early-return/error
+    /// path, the same discipline start_compaction_loop's own inline uses already follow.
+    pub fn begin_compaction_quiesce(&self) {
+        self.compaction_quiescing.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Clears the flag set by begin_compaction_quiesce() and wakes anyone parked in
+    /// wait_if_compaction_quiescing().
+    pub fn end_compaction_quiesce(&self) {
+        self.compaction_quiescing.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.compaction_quiesce_notify.notify_waiters();
+    }
+
     /// See the free function of the same name for the actual logic — this and
     /// OverlayForkCtx::wait_if_compaction_quiescing both delegate to it, since
     /// each type holds its own clone of the same underlying Arcs.
@@ -2919,17 +2935,68 @@ impl Server {
     ///
     /// Pushes all local chunk location records to the current leader whenever:
     ///   - the server starts up
-    ///   - the leader address changes or appears (new leader / None→Some)
+    ///   - the leader address changes or appears (new leader / None→Some) — always
+    ///     immediate, no cooldown (see MIN_NODE_EVENT_PUSH_INTERVAL's doc below for why)
     ///   - any peer node recovers or joins (the notify fires regardless of whether
     ///     that peer is the leader — a recovering follower should also push in case
-    ///     it was the node whose locations are missing from the stable leader)
+    ///     it was the node whose locations are missing from the stable leader) — rate
+    ///     limited, see below
     ///
     /// This fills the gap caused by the write path: each replica node stores only
     /// a single-node location record locally; the client broadcasts the full record
     /// to the leader, but if that broadcast is lost the leader ends up with no record
     /// at all even though data exists on disk.  Proactive push on every leader/node
     /// transition ensures the leader can always reconstruct the full replica picture.
+    /// Pure decision extracted from start_chunk_location_sync_loop's poll loop so it
+    /// can be unit tested without waiting on real timers. See that function's doc
+    /// comment for the incident this rate limit fixes.
+    fn should_push_chunk_locations(
+        leader_changed: bool,
+        had_node_event: bool,
+        last_push_time: Option<std::time::Instant>,
+        min_node_event_push_interval: std::time::Duration,
+    ) -> bool {
+        if !leader_changed && !had_node_event {
+            return false;
+        }
+        // A genuine leader change always pushes immediately, uncapped — only a
+        // node-event-only trigger (no leader change) is rate-limited.
+        if had_node_event && !leader_changed {
+            if let Some(last) = last_push_time {
+                if last.elapsed() < min_node_event_push_interval {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     pub fn start_chunk_location_sync_loop(self: Arc<Self>) {
+        // Root-caused 2026-07-15 (server5/VM111 live incident): every push here is a
+        // full, unconditional dump of every chunk_location and every held file's
+        // metadata this node physically holds (tens of thousands of records on a
+        // real staging node) — there was no diffing against what the leader already
+        // has, and no rate limit. node_recovered_notify fires on ANY peer's
+        // leave/rejoin, including THIS node's own rejoin after its own routine
+        // planned-offline-compaction cycle — whose data obviously hasn't changed
+        // just from restarting. That created a self-sustaining feedback loop with no
+        // real write traffic required at all: compact (DB shrinks) -> rejoin -> fires
+        // node_recovered_notify -> this loop re-pushes the full inventory,
+        // unconditionally -> the leader's redb absorbs tens of thousands of
+        // COW-page-copy transactions even for values that didn't change -> DB balloons
+        // back up (measured live: 257.5MB -> 514.5MB in about a minute) -> crosses the
+        // compaction fragmentation threshold again almost immediately -> repeat,
+        // indefinitely, independent of any real application write volume. Each of
+        // those brief offline windows is also a window where a live MultiPatch write
+        // targeting this node as a replica can genuinely fail (the real VM111 OS
+        // install I/O error this was root-caused from).
+        //
+        // A genuine leader change is NOT rate-limited below — a brand new leader may
+        // not yet have this node's holdings at all, and that gap matters immediately.
+        // Only the "some peer merely recovered" trigger (the one actually driving the
+        // loop above) is bounded to at most once per this interval.
+        const MIN_NODE_EVENT_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
         let server = self;
         tokio::spawn(async move {
             let mut prev_leader: Option<std::net::SocketAddr> = None;
@@ -2937,6 +3004,7 @@ impl Server {
 
             // First iteration triggers immediately (startup).
             let mut node_event = true;
+            let mut last_push_time: Option<std::time::Instant> = None;
 
             loop {
                 if !node_event {
@@ -2950,14 +3018,10 @@ impl Server {
                 let current_leader = server.cluster.get_leader_addr().await;
                 let leader_changed = current_leader != prev_leader;
                 prev_leader = current_leader;
-
-                // Push if leader changed/appeared, OR if a node event fired (a peer
-                // recovered or joined — that node may now need us to push our locations
-                // to the stable leader so the leader can see the full replica set).
-                let should_push = leader_changed || node_event;
+                let had_node_event = node_event;
                 node_event = false;
 
-                if !should_push {
+                if !Self::should_push_chunk_locations(leader_changed, had_node_event, last_push_time, MIN_NODE_EVENT_PUSH_INTERVAL) {
                     continue;
                 }
 
@@ -2971,6 +3035,7 @@ impl Server {
                     continue;
                 }
 
+                last_push_time = Some(std::time::Instant::now());
                 info!("chunk_location_sync: pushing local locations to leader {}", leader_addr);
                 if let Err(e) = Self::push_locations_to(&server, leader_addr).await {
                     warn!("chunk_location_sync: push failed: {}", e);
@@ -3070,7 +3135,12 @@ impl Server {
     /// Phase 2 — Push enqueue: for every follower, enqueue all files they are missing
     /// (determined by comparing our inventory against theirs after the pull merge).
     /// The dissemination loop delivers these within 5 seconds.
-    async fn run_metadata_catchup(&self) {
+    ///
+    /// Also called directly (synchronously, before resuming heartbeats) by
+    /// main.rs's run_planned_offline_compaction — see that call site's comment for
+    /// why start_metadata_dissemination_loop's own background-spawned call isn't
+    /// enough to close the gap this addresses.
+    pub(crate) async fn run_metadata_catchup(&self) {
         let nodes = self.cluster.get_all_nodes().await;
         let local_id = self.cluster.local_node_id();
 
@@ -3325,6 +3395,7 @@ impl Server {
             }
             Request::CancelHealing { chunk_id } => self.handle_cancel_healing(chunk_id).await,
             Request::RetractHealingCancellation { chunk_id } => self.handle_retract_healing_cancellation(chunk_id).await,
+            Request::QueueChunksForHealing { chunk_ids } => self.handle_queue_chunks_for_healing(chunk_ids).await,
             Request::DeleteChunkReplica { chunk_id, leader_id } => {
                 self.handle_delete_chunk_replica(chunk_id, leader_id).await
             }
@@ -3431,8 +3502,8 @@ impl Server {
             Request::TriggerScrub => self.handle_trigger_scrub().await,
             Request::EnableHealing => self.handle_enable_healing().await,
             Request::DisableHealing => self.handle_disable_healing().await,
-            Request::SetHealingTuning { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs } => {
-                self.handle_set_healing_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs).await
+            Request::SetHealingTuning { link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, healing_delay_secs } => {
+                self.handle_set_healing_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, healing_delay_secs).await
             }
             Request::SetReplicationFactor { replication_factor } => {
                 self.handle_set_replication_factor(replication_factor).await
@@ -3956,6 +4027,19 @@ impl Server {
     async fn handle_retract_healing_cancellation(&self, chunk_id: ChunkId) -> Response {
         if let Some(healing) = self.healing.read().await.as_ref() {
             healing.retract_healing_cancellation(chunk_id);
+        }
+        Response::Ok { data: None }
+    }
+
+    /// Handle a peer's forwarded QueueChunksForHealing — see
+    /// HealingManager::queue_chunks_immediate's doc comment for why a non-leader
+    /// forwards here instead of queueing locally. Safe to call queue_chunks_immediate
+    /// again on this (receiving) side: its own is_leader() check short-circuits to a
+    /// local-only insert whenever this handler is reached on the actual leader,
+    /// which is the only place this request is ever sent to.
+    async fn handle_queue_chunks_for_healing(&self, chunk_ids: Vec<ChunkId>) -> Response {
+        if let Some(healing) = self.healing.read().await.as_ref() {
+            healing.queue_chunks_immediate(chunk_ids).await;
         }
         Response::Ok { data: None }
     }
@@ -5863,6 +5947,26 @@ impl Server {
                         if *map_write_seq > metadata.write_seq {
                             metadata.write_seq = *map_write_seq;
                         }
+                        // metadata.size (below) shares the exact same staleness as
+                        // chunk_locations did before the override above: sled's committed
+                        // size can lag the synchronously-updated chunk_map by however long
+                        // the async sled write worker's queue is backed up. Unlike
+                        // chunk_locations, size was never being corrected — a client that
+                        // tears down right after a write it was told succeeded (e.g. a cold
+                        // remount immediately following `sync`) could hit a leader that
+                        // still reports the file's pre-write (even size=0, for a
+                        // just-created file) size, even though chunk_map here already has
+                        // every chunk. Only move size forward, mirroring the write_seq
+                        // guard above — a real truncate's smaller, sled-committed size must
+                        // never be overridden by a chunk_map high-water mark that predates
+                        // it.
+                        let chunk_map_derived_size = map_locs.iter()
+                            .map(|l| l.file_offset.unwrap_or(0) + l.size as u64)
+                            .max()
+                            .unwrap_or(0);
+                        if chunk_map_derived_size > metadata.size {
+                            metadata.size = chunk_map_derived_size;
+                        }
                         (true, map_locs.len(), chunk0_size)
                     } else {
                         (true, 0, None)
@@ -6109,6 +6213,15 @@ impl Server {
     /// the disk hits critical levels.  Staggered by node address so all nodes never
     /// compact simultaneously.  Retries up to 3 times on "transaction in progress" errors
     /// (a transient race during startup) before giving up for the current cycle.
+    /// Pure decision extracted from start_compaction_loop's poll loop so it can be
+    /// unit tested without a real redb instance. genuine_frag_pct must come from
+    /// redb's own stats (fragmented_bytes / (stored+metadata+fragmented bytes)),
+    /// not raw file-size comparison — see redb_fragmentation_stats's and this
+    /// function's call site's doc comments for the incident this fixes.
+    fn should_compact(genuine_frag_pct: f64, secs_since_compact: u64) -> bool {
+        genuine_frag_pct >= 0.20 || secs_since_compact >= 30 * 60
+    }
+
     pub fn start_compaction_loop(self: Arc<Self>) {
         let metadata = self.metadata.clone();
         let storage = self.storage.clone();
@@ -6133,6 +6246,17 @@ impl Server {
             // we're not currently in a deferred streak, or the last compaction (by
             // either method) succeeded. See the escalation check after the retry loop.
             let mut first_deferred_at: Option<std::time::Instant> = None;
+            // Separate from last_compact_time (which also covers the online path,
+            // which doesn't disrupt availability). Defense-in-depth alongside the
+            // chunk_location_sync rate limit above — root-caused 2026-07-15
+            // (server5/VM111 live incident): even with that fix, nothing else stops
+            // this node from winning the CompactionIntent race repeatedly in quick
+            // succession if some other source of write churn (real or a future bug)
+            // keeps pushing fragmentation back over the 20% threshold. Every offline
+            // cycle is a real, if brief, availability gap for this replica; a floor
+            // here bounds how often that gap can recur regardless of cause.
+            let mut last_offline_compact_time: Option<std::time::Instant> = None;
+            const MIN_OFFLINE_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
             loop {
                 // The fragmentation gate makes this interval cheap (just a stat()
                 // call on most iterations). Keep it at 60s so compaction triggers
@@ -6140,27 +6264,61 @@ impl Server {
                 let sleep_secs = 60u64;
 
                 let current_size = metadata.db_size();
+                // frag_ratio (raw file size vs last-compact file size) is kept only
+                // for the log line below — informative, but NOT what decides whether
+                // to compact (see genuine_frag_pct's doc comment for why).
                 let frag_ratio = if last_compact_size > 0 {
                     current_size as f64 / last_compact_size as f64
                 } else {
-                    f64::INFINITY // first run: always compact
+                    f64::INFINITY // first run
                 };
                 let secs_since_compact = last_compact_time
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(u64::MAX);
 
                 if last_compact_size > 0 && frag_ratio >= 2.0 {
-                    warn!("redb fragmentation high: {:.1}MB (last compact baseline: {:.1}MB)",
+                    warn!("redb file size high: {:.1}MB (last compact baseline: {:.1}MB) — see genuine fragmentation % below for whether this is real waste or just redb's own pre-allocated headroom",
                         current_size as f64 / 1_048_576.0,
                         last_compact_size as f64 / 1_048_576.0);
                 }
 
-                // Compact if fragmentation ≥ 20%, or 30 minutes have passed since the
-                // last compact (catches latent free pages that redb only reclaims later).
-                if frag_ratio < 1.20 && secs_since_compact < 30 * 60 {
+                // Root-caused 2026-07-15 (server5/VM111 live incident): raw file-size
+                // growth (frag_ratio above) is NOT a reliable fragmentation signal on
+                // its own. redb grows its backing file geometrically to amortize
+                // resize cost — observed live, a freshly-compacted 257.5MB file jumped
+                // to 514.5MB (almost exactly 2x) after only ~273 small chunk_location
+                // writes in under two minutes, nowhere near enough real data to
+                // explain 257MB of genuine growth. db_size() can't distinguish "grew
+                // because redb pre-allocated headroom for future writes" from "grew
+                // because of real fragmented waste" — comparing raw file size against
+                // the post-compaction baseline treated the first case as if it were
+                // the second, so compaction re-triggered almost immediately after
+                // every single compact regardless of real write volume, each cycle
+                // paying the online path's cost (or, before the offline-cooldown fix
+                // above, a real availability-affecting offline cycle). redb's own
+                // stats (metadata.redb_fragmentation_stats(), stored+metadata bytes
+                // vs fragmented bytes) distinguish genuine reclaimable waste from
+                // pre-allocated headroom directly, so use that as the actual gate.
+                let genuine_frag_pct = match metadata.redb_fragmentation_stats() {
+                    Ok((live_bytes, fragmented_bytes)) => {
+                        let total = live_bytes + fragmented_bytes;
+                        if total == 0 { 0.0 } else { fragmented_bytes as f64 / total as f64 }
+                    }
+                    Err(e) => {
+                        warn!("compaction: failed to read redb fragmentation stats ({}) — falling back to raw file-size ratio for this cycle", e);
+                        // Fall back to the old (imperfect but functional) signal rather
+                        // than never compacting at all if stats() itself errors.
+                        if frag_ratio >= 1.20 { 1.0 } else { 0.0 }
+                    }
+                };
+
+                if !Self::should_compact(genuine_frag_pct, secs_since_compact) {
                     tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                     continue;
                 }
+                info!("compaction: triggering — genuine fragmentation {:.1}% (raw file size {:.1}MB, last compact baseline {:.1}MB, {}s since last compact)",
+                    genuine_frag_pct * 100.0, current_size as f64 / 1_048_576.0,
+                    last_compact_size as f64 / 1_048_576.0, secs_since_compact);
 
                 // Prefer a planned offline compaction when every other cluster member
                 // is healthy — see LeaveReason::PlannedCompaction's doc comment. Removes
@@ -6178,7 +6336,13 @@ impl Server {
                 // confirmed; this lets the feature be disabled without a code revert while
                 // that's investigated. Unset (default): unchanged behavior.
                 let offline_disabled = std::env::var("DFS_DISABLE_PLANNED_COMPACTION").is_ok();
-                let offline_tx = if offline_disabled { None } else { self.offline_compaction_tx.read().await.clone() };
+                let offline_cooldown_remaining = last_offline_compact_time
+                    .map(|t| MIN_OFFLINE_COMPACTION_INTERVAL.saturating_sub(t.elapsed()))
+                    .filter(|d| !d.is_zero());
+                if let Some(remaining) = offline_cooldown_remaining {
+                    info!("compaction: skipping planned offline path this cycle — {}s left in this node's offline-compaction cooldown; falling back to the online path", remaining.as_secs());
+                }
+                let offline_tx = if offline_disabled || offline_cooldown_remaining.is_some() { None } else { self.offline_compaction_tx.read().await.clone() };
                 if let Some(offline_tx) = offline_tx {
                     let all_online = self.cluster.all_members_online().await;
                     if !all_online {
@@ -6206,6 +6370,7 @@ impl Server {
                             if offline_ok {
                                 last_compact_size = metadata.db_size();
                                 last_compact_time = Some(std::time::Instant::now());
+                                last_offline_compact_time = Some(std::time::Instant::now());
                                 first_deferred_at = None;
                                 tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                                 continue;
@@ -7163,6 +7328,45 @@ impl Server {
                 return;
             }
             notified.await;
+        }
+    }
+
+    /// Block until every metadata write currently queued in sled_write_tx (at the
+    /// moment this is called) has been committed to redb, or a bounded timeout
+    /// elapses. Unlike wait_for_pending_metadata_write (one file_id), this drains
+    /// the whole backlog — used by handle_list_all_files, whose bulk scan reads
+    /// straight from redb and has no per-file way to know what to wait for.
+    ///
+    /// Root-caused 2026-07-15: handle_put_file_metadata acks the client and queues
+    /// the redb commit for later (see sled_write_tx's doc comment) for any write
+    /// with write_seq > 0 — which is every write except a file's initial seq=0
+    /// create. Under sustained write load the single-threaded worker can fall
+    /// behind with zero client-visible signal (see sled_write_backlog's doc
+    /// comment). A client's startup ListAllFiles warm-up landing during that
+    /// backlog window used to see a stale snapshot — in one confirmed repro, a
+    /// file whose final write (write_seq=166, fully acked 570ms earlier) hadn't
+    /// been committed yet, so ListAllFiles returned its original seq=0/size=0
+    /// record. The client cached that and a subsequent cold read saw a 0-byte
+    /// file. A bounded (not unconditional) wait: under sustained continuous
+    /// writes this could otherwise never observe an empty backlog, and
+    /// ListAllFiles must still return something rather than hang indefinitely.
+    async fn wait_for_sled_write_backlog_to_drain(&self) {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            let notified = self.sled_write_progress.notified();
+            if self.pending_metadata_writes.is_empty() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "wait_for_sled_write_backlog_to_drain: {} file(s) still queued after {:?} — \
+                     proceeding with list_files() anyway (may return a stale snapshot for those)",
+                    self.pending_metadata_writes.len(), TIMEOUT
+                );
+                return;
+            }
+            let _ = tokio::time::timeout(deadline.saturating_duration_since(std::time::Instant::now()), notified).await;
         }
     }
 
@@ -9296,6 +9500,7 @@ impl Server {
                     heal_max_concurrent_per_node: stats.tuning.heal_max_concurrent_per_node,
                     heal_transfer_timeout_secs: stats.tuning.heal_transfer_timeout_secs,
                     pending_patches_outstanding,
+                    healing_delay_secs: stats.tuning.healing_delay_secs,
                 }
             }
             None => Response::HealingStatus {
@@ -9311,6 +9516,7 @@ impl Server {
                 heal_max_concurrent_per_node: 0,
                 heal_transfer_timeout_secs: 0,
                 pending_patches_outstanding,
+                healing_delay_secs: 0,
             },
         }
     }
@@ -9327,6 +9533,7 @@ impl Server {
         heal_max_concurrent: Option<usize>,
         heal_max_concurrent_per_node: Option<usize>,
         heal_transfer_timeout_secs: Option<u64>,
+        healing_delay_secs: Option<u64>,
     ) -> Response {
         let healing_guard = self.healing.read().await;
         let Some(healing) = healing_guard.as_ref() else {
@@ -9348,10 +9555,10 @@ impl Server {
         let heal_max_concurrent = heal_max_concurrent.map(|c| c.clamp(1, 64));
         let heal_max_concurrent_per_node = heal_max_concurrent_per_node.map(|c| c.clamp(1, 64));
 
-        healing.apply_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs).await;
+        healing.apply_tuning(link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, healing_delay_secs).await;
         info!(
-            "Healing tuning updated via admin command (link_bandwidth_mb={:?}, heal_max_pct={:?}, heal_max_concurrent={:?}, heal_max_concurrent_per_node={:?}, heal_transfer_timeout_secs={:?})",
-            link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs
+            "Healing tuning updated via admin command (link_bandwidth_mb={:?}, heal_max_pct={:?}, heal_max_concurrent={:?}, heal_max_concurrent_per_node={:?}, heal_transfer_timeout_secs={:?}, healing_delay_secs={:?})",
+            link_bandwidth_mb, heal_max_pct, heal_max_concurrent, heal_max_concurrent_per_node, heal_transfer_timeout_secs, healing_delay_secs
         );
 
         let snapshot = healing.tuning_snapshot().await;
@@ -9362,6 +9569,7 @@ impl Server {
                 config.replication.heal_max_concurrent = Some(snapshot.heal_max_concurrent);
                 config.replication.heal_max_concurrent_per_node = Some(snapshot.heal_max_concurrent_per_node);
                 config.replication.heal_transfer_timeout_secs = Some(snapshot.heal_transfer_timeout_secs);
+                config.replication.healing_delay_secs = snapshot.healing_delay_secs;
                 if let Err(e) = config.to_file(&self.config_path) {
                     warn!("Failed to persist healing tuning to config {:?}: {}", self.config_path, e);
                 }
@@ -10307,6 +10515,11 @@ impl Server {
     async fn handle_list_all_files(&self) -> Response {
         debug!("Handling list all files");
 
+        // Wait for any queued-but-not-yet-committed metadata writes to land before
+        // scanning redb directly — see wait_for_sled_write_backlog_to_drain's doc
+        // comment for the stale-snapshot bug this closes.
+        self.wait_for_sled_write_backlog_to_drain().await;
+
         let metadata = self.metadata.clone();
         let result = tokio::task::spawn_blocking(move || metadata.list_files()).await;
         let list_result = match result {
@@ -10728,6 +10941,100 @@ mod tests {
         }
     }
 
+    /// Regression tests for the chunk_location_sync self-sustaining feedback loop
+    /// root-caused live 2026-07-15 on server5/VM111: node_recovered_notify fires on
+    /// ANY peer's leave/rejoin, including this node's own rejoin after its own
+    /// routine planned-offline-compaction cycle. The loop used to unconditionally
+    /// re-push every locally-held chunk_location and file metadata record on every
+    /// single firing — tens of thousands of records on a real staging node, with no
+    /// diffing and no rate limit — which churned the leader's redb enough (COW page
+    /// copies even for unchanged values) to cross the compaction fragmentation
+    /// threshold again almost immediately, triggering another compaction, another
+    /// rejoin, another full re-push, indefinitely, independent of real write volume.
+    /// Measured live: DB size went 257.5MB -> 514.5MB in about a minute with no
+    /// meaningful application write traffic. A live MultiPatch write that landed on
+    /// the cycling node during one of its brief offline windows is the real VM111 OS
+    /// install I/O error this was root-caused from.
+    mod chunk_location_sync_rate_limit {
+        use super::*;
+
+        #[test]
+        fn no_push_when_neither_leader_changed_nor_node_event() {
+            assert!(!Server::should_push_chunk_locations(false, false, None, std::time::Duration::from_secs(300)));
+        }
+
+        #[test]
+        fn first_node_event_always_pushes() {
+            // No prior push recorded yet — must not be blocked.
+            assert!(Server::should_push_chunk_locations(false, true, None, std::time::Duration::from_secs(300)));
+        }
+
+        #[test]
+        fn repeat_node_event_within_cooldown_is_suppressed() {
+            let just_pushed = std::time::Instant::now();
+            assert!(!Server::should_push_chunk_locations(false, true, Some(just_pushed), std::time::Duration::from_secs(300)),
+                "a node-recovery event alone, moments after the last push, must not trigger another full re-push — \
+                 this is exactly the self-rejoin-after-own-compaction case that caused the live incident");
+        }
+
+        #[test]
+        fn node_event_after_cooldown_elapsed_pushes_again() {
+            let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(301);
+            assert!(Server::should_push_chunk_locations(false, true, Some(long_ago), std::time::Duration::from_secs(300)));
+        }
+
+        #[test]
+        fn leader_change_always_pushes_even_within_cooldown() {
+            // A genuine leader change must never be suppressed — a brand new leader
+            // may not have this node's holdings at all, and that gap matters
+            // immediately regardless of how recently this node last pushed.
+            let just_pushed = std::time::Instant::now();
+            assert!(Server::should_push_chunk_locations(true, false, Some(just_pushed), std::time::Duration::from_secs(300)));
+            assert!(Server::should_push_chunk_locations(true, true, Some(just_pushed), std::time::Duration::from_secs(300)));
+        }
+    }
+
+    /// Regression tests for the compaction-trigger metric fix, root-caused live
+    /// 2026-07-15 on server5/VM111 alongside the chunk_location_sync loop above:
+    /// raw file-size growth (db_size() before/after) can't distinguish redb's own
+    /// geometric pre-allocation (normal, no real waste) from genuine fragmented
+    /// waste — a freshly-compacted 257.5MB file jumped to 514.5MB after only ~273
+    /// small writes, nowhere near enough real data to justify that much growth.
+    /// should_compact must key off real fragmentation percentage instead.
+    mod compaction_trigger_metric {
+        use super::*;
+
+        #[test]
+        fn low_genuine_fragmentation_does_not_compact_even_if_file_doubled() {
+            // This is exactly the observed incident shape: file size looks like it
+            // doubled, but genuine fragmentation is low (e.g. 2% real waste) because
+            // the growth was redb pre-allocating headroom, not real garbage.
+            assert!(!Server::should_compact(0.02, 60));
+        }
+
+        #[test]
+        fn high_genuine_fragmentation_does_compact() {
+            assert!(Server::should_compact(0.25, 60));
+        }
+
+        #[test]
+        fn exactly_20_percent_compacts() {
+            assert!(Server::should_compact(0.20, 60));
+        }
+
+        #[test]
+        fn thirty_minute_safety_net_compacts_even_at_low_fragmentation() {
+            // Catches latent free pages redb only reclaims later even when the live
+            // fragmentation % looks fine right now.
+            assert!(Server::should_compact(0.02, 30 * 60));
+        }
+
+        #[test]
+        fn neither_condition_met_does_not_compact() {
+            assert!(!Server::should_compact(0.05, 60));
+        }
+    }
+
     #[tokio::test]
     async fn test_server_write_read_local() {
         let temp_storage = TempDir::new().unwrap();
@@ -10753,6 +11060,59 @@ mod tests {
         let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _, _)| *id).collect();
         let read_data = server.read_data(&chunk_ids).await.unwrap();
         assert_eq!(data.as_slice(), read_data.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_files_waits_for_pending_sled_write_backlog() {
+        // Repro for a 2026-07-15 rock5b incident: handle_put_file_metadata acks the
+        // client and queues the redb commit for later (sled_write_tx) for any write
+        // with write_seq > 0 (every write except a file's initial seq=0 create — see
+        // sled_write_tx's and pending_metadata_writes' doc comments). handle_list_all_files
+        // used to scan redb directly with no regard for that queue, so a ListAllFiles
+        // landing right after a client's write was acked could see a stale snapshot if
+        // the background worker hadn't committed yet. Confirmed live: a client's
+        // write_seq=166 write was fully acked, then invisible 570ms later — ListAllFiles
+        // returned the file's original seq=0/size=0 record, the client cached it, and a
+        // cold read of the file returned 0 bytes despite the write having fully
+        // succeeded. wait_for_sled_write_backlog_to_drain fixes this by blocking
+        // list_files() until the queue empties (bounded, so it can't hang forever).
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage, metadata, 4 * 1024 * 1024, cluster, 1,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"),
+            true,
+        );
+
+        // seq=0 create — committed synchronously per handle_put_file_metadata's own
+        // doc comment, so this alone can't reproduce the bug.
+        let mut meta = FileMetadata::new("/repro.bin".to_string(), dfs_common::FileType::RegularFile);
+        let create = meta.clone();
+        assert!(matches!(server.handle_put_file_metadata(create, 0).await, Response::Ok { .. }));
+
+        // seq>0 update — queued asynchronously via sled_write_tx, NOT necessarily
+        // committed by the time the ack (Response::Ok) returns.
+        meta.size = 999;
+        meta.write_seq = 5;
+        assert!(matches!(server.handle_put_file_metadata(meta.clone(), 5).await, Response::Ok { .. }));
+
+        // Without wait_for_sled_write_backlog_to_drain, this could race the worker
+        // thread and see the stale seq=0/size=0 record.
+        let files = match server.handle_list_all_files().await {
+            Response::FileList { files, .. } => files,
+            other => panic!("unexpected response: {:?}", other),
+        };
+        let found = files.iter().find(|f| f.id == meta.id)
+            .unwrap_or_else(|| panic!("file {} missing from ListAllFiles entirely", meta.id));
+        assert_eq!(found.size, 999, "ListAllFiles returned a stale pre-update size");
+        assert_eq!(found.write_seq, 5, "ListAllFiles returned a stale pre-update write_seq");
     }
 
     #[tokio::test]
@@ -10905,6 +11265,74 @@ mod tests {
             "chunk_map must converge on the highest client_write_seq location (G), \
              not whichever RCL happened to arrive last");
         assert_eq!(loc.client_write_seq, Some(8));
+    }
+
+    /// Reproduces T28a: metadata.size, unlike chunk_locations, was never
+    /// corrected from the synchronously-updated chunk_map — only chunk_locations
+    /// was. sled's committed FileMetadata.size can lag behind the async sled
+    /// write worker's queue; a client that tears down immediately after a write
+    /// it was told (via ack) succeeded, then a fresh client cold-remounts and
+    /// queries the same leader, could see the file's stale (even size=0, for a
+    /// just-created file) sled-committed size despite chunk_map already holding
+    /// every chunk for the real, final size.
+    #[tokio::test]
+    async fn test_get_file_metadata_by_path_uses_chunk_map_size_not_stale_sled_size() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata.clone(), 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        let path = "/t28_thick_repro.bin".to_string();
+
+        // Simulate the stale sled record: as-created, size=0, no chunks yet —
+        // exactly what a brand-new file looks like before the async sled write
+        // worker has caught up to the writer's later pushes.
+        metadata.put_file(&dfs_common::FileMetadata {
+            id: file_id,
+            path: path.clone(),
+            size: 0,
+            created_at: 1000,
+            modified_at: 1000,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            file_type: dfs_common::FileType::RegularFile,
+            chunk_locations: Arc::new(vec![]),
+            write_seq: 0,
+            symlink_target: None,
+        }).unwrap();
+
+        // But chunk_map (updated synchronously, ahead of sled) already has the
+        // real, final chunk covering the whole 200MB-analog file.
+        let real_size = 4 * 1024 * 1024usize; // one full chunk, for test brevity
+        let hash = compute_chunk_hash(b"t28-repro-chunk");
+        let loc = ChunkLocation {
+            chunk_id: ChunkId::from_hash(hash),
+            nodes: vec![],
+            size: real_size,
+            checksum: hash,
+            file_offset: Some(0),
+            written_at: Some(2000),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        };
+        server.chunk_map.insert(file_id, (vec![loc], 1));
+
+        let response = server.handle_get_file_metadata_by_path(path, None).await;
+        let Response::FileMetadata { metadata: returned } = response else {
+            panic!("expected FileMetadata response, got {:?}", response);
+        };
+        assert_eq!(returned.size, real_size as u64,
+            "size must be derived from chunk_map's current locations, not the stale sled-committed value (this is T28a's exact failure: size stuck at 0 despite chunk_map already having every chunk)");
     }
 
     /// Phase-2 batching correctness: folding several out-of-order, partially

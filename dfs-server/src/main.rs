@@ -635,8 +635,25 @@ async fn run_planned_offline_compaction(
     // there's no existing precedent to lean on for how long that takes.
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
+    // Quiesce compaction_quiescing-respecting background writers (fold_slot_now,
+    // HealingManager) for the duration of compact_db() below — without this, they
+    // keep running independently of the listener/heartbeat pause just performed above
+    // (they're driven by their own timers/backlogs, not client RPCs), so the "zero
+    // concurrent traffic" this function's whole premise rests on was never actually
+    // true for internal writers, only external ones.
+    //
+    // Root-caused 2026-07-15 (gluster1 incident): "Planned offline compaction failed:
+    // ... sustained write churn" fired repeatedly immediately after the listener was
+    // already paused — self-inflicted churn from this node's own unpaused healing and
+    // patch-fold-sweep traffic, not real external load. compact_db_prepare's Phase 2
+    // catch-up can't converge against a live db that this process itself keeps writing
+    // to. server.rs's online-path compaction already quiesces around its own Phase 3 —
+    // this path just never had the equivalent, since it calls compact_db() directly
+    // rather than going through that loop.
+    server.begin_compaction_quiesce();
     let metadata = server.metadata_store();
     let compact_result = tokio::task::spawn_blocking(move || metadata.compact_db()).await;
+    server.end_compaction_quiesce();
     let succeeded = match &compact_result {
         Ok(Ok((before, after))) => {
             info!("Planned offline compaction finished: {:.1}MB -> {:.1}MB",
@@ -656,6 +673,37 @@ async fn run_planned_offline_compaction(
             tracing::error!("Network server error (post-compaction respawn): {}", e);
         }
     });
+    // Catch up on anything that landed on the interim leader while we were paused,
+    // BEFORE resume_heartbeats() lets peers see us as Online again — is_leader() is
+    // purely min(NodeId) among Online peers (cluster.rs), recomputed instantly on
+    // every node the moment our heartbeat resumes, with no gate of its own. Without
+    // this, a lowest-NodeId node reclaims leadership (and starts being read from)
+    // before it has any idea what changed while it was gone.
+    //
+    // Root-caused 2026-07-15 (gluster1 incident): this function already paused
+    // external traffic correctly, but resumed heartbeats — and thus reclaimed
+    // leadership eligibility — with zero synchronization against the interim
+    // leader's state. A client wrote and closed a 128MB file entirely against the
+    // interim leader (10.25.1.64) while this node was paused; this node came back
+    // "Online" and was immediately treated as leader again by every node's own
+    // is_leader() computation, 6+ seconds before start_metadata_dissemination_loop's
+    // own background catch-up (spawned on its own 5s poll cadence, fire-and-forget)
+    // happened to land — during that window a client read of the just-written file
+    // returned ENOENT against this node. run_metadata_catchup already existed
+    // (pulls anything followers have that we don't, then pushes back anything they're
+    // missing) but was only ever invoked asynchronously after the fact; calling it
+    // synchronously here, before we're visible as Online, closes the gap directly
+    // instead of just narrowing the race window.
+    let catchup_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        server.run_metadata_catchup(),
+    ).await;
+    if catchup_result.is_err() {
+        warn!("Planned offline compaction: metadata catch-up timed out after 30s — \
+               resuming anyway (dissemination loop will cover remaining gaps), but a \
+               brief stale-read window is possible");
+    }
+
     server.cluster().resume_heartbeats();
     server.cluster().announce_recovery().await;
     info!("Planned offline compaction: back online");

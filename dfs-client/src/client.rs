@@ -298,6 +298,21 @@ const STRIPED_READ_ENABLED: bool = false;
 // prevents seek contention and keeps server disk queues short across successive reads.
 const MAX_BACKGROUND_PER_NODE: usize = 1;
 
+// Hot/cold fold-path classification — see hot_chunk_slots's doc comment for the
+// full scheme. A slot needs HOT_CLASSIFY_SAMPLES patches landing at more than
+// HOT_RATE_THRESHOLD_PER_SEC to earn "hot" status (and therefore fold-trigger
+// evaluation at all); it loses that status, and any in-progress classification
+// window, after HOT_INACTIVITY_RESET of quiet. 2 patches/sec sits between the
+// ~0.2/sec average measured locally for a wide-random-write workload's mostly-
+// cold chunks and the ~4/sec cited for genuinely hot chunks elsewhere in this
+// file (ACTIVE_FOLD_PATCH_THRESHOLD's doc comment) — enough margin to reject
+// coincidental clustering from many concurrent writers sharing a small chunk
+// space, while still comfortably catching real hot access before it does much
+// unfolded accumulation.
+const HOT_CLASSIFY_SAMPLES: u64 = 4;
+const HOT_RATE_THRESHOLD_PER_SEC: f64 = 2.0;
+const HOT_INACTIVITY_RESET: Duration = Duration::from_secs(2);
+
 /// Get the cap on concurrent in-flight range-fetch requests a single file may have
 /// outstanding to a single storage node. Without this, one file's random-read
 /// workload (e.g. a benchmark with a high queue depth) can open unbounded
@@ -633,6 +648,16 @@ pub struct DfsClient {
     /// their worst cases silently compound past what's actually safe.
     pub reserved_cache_bytes: usize,
 
+    /// Per-target "last op completed at" timestamp, keyed by server address —
+    /// used only to compute the idle gap since the previous chunk-write op to
+    /// that same target, logged alongside each op's own duration in WRITETIMING.
+    /// Duration alone tells you how long one transaction took; the gap tells you
+    /// how much time is being lost *between* transactions (client-side queuing/
+    /// backpressure/scheduling) rather than inside them (server/network) — sum of
+    /// both, divided into bytes sent, gives real achieved throughput per target.
+    /// Added 2026-07-14 for the offline-compaction regression investigation.
+    write_target_last_op_at: Arc<DashMap<SocketAddr, std::time::Instant>>,
+
     /// Zero-filled gap table: tracks ranges that contain zeros in sparse files.
     /// Key: (inode, chunk_offset), Value: Vec of gap ranges within that chunk.
     /// This avoids caching megabytes of zeros for qcow2 sparse writes.
@@ -813,6 +838,19 @@ pub struct DfsClient {
     /// Reset alongside active_fold_started_at wherever that resets.
     active_fold_bytes: Arc<DashMap<(FileId, u64), usize>>,
 
+    /// Chunks currently classified "hot" — only these consult the fold-trigger
+    /// logic below (active_fold_interval/bytes/count); everything else applies
+    /// patches directly and skips fold-trigger evaluation entirely, since most
+    /// chunks under a wide random-write workload (kdiskmark-style) are touched
+    /// only a couple of times and never benefit from having been folded. A
+    /// chunk earns hot status by sustaining >2 patches/sec across
+    /// HOT_CLASSIFY_SAMPLES consecutive patches (see its use site), and loses
+    /// it after HOT_INACTIVITY_RESET of quiet. Expected to hold far fewer
+    /// entries than active_fold_started_at/active_fold_patch_count (which
+    /// still track every recently-touched slot pre-classification) — see
+    /// start_hot_chunk_sweeper for why those two don't grow unbounded either.
+    hot_chunk_slots: Arc<DashSet<(FileId, u64)>>,
+
     /// (last_failure_at, consecutive_failure_count) per slot whose most recent
     /// ForceFold attempt failed (a replica errored/timed out, or two replicas
     /// disagreed on the result). Added 2026-07-13 after a live kdiskmark run
@@ -989,6 +1027,7 @@ impl DfsClient {
             byte_range_cache: Arc::new(ShardedByteRangeCache::new(byte_cache_capacity)),
             reserved_cache_bytes,
             zero_gap_table: Arc::new(ShardedZeroGapTable::new()),
+            write_target_last_op_at: Arc::new(DashMap::new()),
             connection_pool: Arc::new(DashMap::new()),
             prefetch_in_flight: Arc::new(Mutex::new(HashSet::new())),
             read_history: Arc::new(tokio::sync::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
@@ -1017,6 +1056,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             active_fold_started_at: Arc::new(DashMap::new()),
             active_fold_patch_count: Arc::new(DashMap::new()),
             active_fold_bytes: Arc::new(DashMap::new()),
+            hot_chunk_slots: Arc::new(DashSet::new()),
             active_fold_failure_backoff: Arc::new(DashMap::new()),
             fold_concurrency: Arc::new(tokio::sync::Semaphore::new(
                 std::env::var("DFS_FOLD_CONCURRENCY")
@@ -1688,7 +1728,15 @@ leader_addr: Arc::new(RwLock::new(None)),
     async fn send_split_frame_write_request(&self, addr: SocketAddr, encoded_envelope: &[u8], raw_data: &[u8]) -> Result<Response> {
         debug!("Sending split-frame write request to {} ({} bytes data)", addr, raw_data.len());
 
+        // SFWTIMING: splits this call into pool-acquire / connect / write / read-response
+        // phases so a growing WRITETIMING duration (client.rs's per-target data-phase log)
+        // can be attributed to a specific sub-step instead of staying an opaque total —
+        // e.g. distinguishing "waiting for a pool lock or a free flush_runtime worker
+        // thread" from "the actual network transfer got slower". Added 2026-07-14.
+        let sfw_start = std::time::Instant::now();
+
         // Try pooled connection first
+        let pool_acquire_start = std::time::Instant::now();
         let pooled = {
             let mutex_opt = self.connection_pool.get(&addr).map(|e| Arc::clone(&*e));
             if let Some(mutex) = mutex_opt {
@@ -1697,6 +1745,8 @@ leader_addr: Arc::new(RwLock::new(None)),
                 None
             }
         };
+        let pool_acquire_ms = pool_acquire_start.elapsed().as_secs_f64() * 1000.0;
+        let pool_hit = pooled.is_some();
 
         let mut stream = match pooled {
             Some(s) => {
@@ -1735,6 +1785,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 fresh
             }
         };
+
+        // SFWTIMING: everything before this point was pool-acquire + (if pool miss or
+        // stale) connect — everything from here to recv_start below is the actual write.
+        let connect_done_at = std::time::Instant::now();
 
         // Send using split-frame encoding (envelope with empty data + raw bytes)
         let io_future = dfs_common::protocol::write_split_frame_request(&mut stream, encoded_envelope, raw_data);
@@ -1822,6 +1876,16 @@ leader_addr: Arc::new(RwLock::new(None)),
         stream.read_exact(&mut buf).await?;
         let recv_time = recv_start.elapsed();
         debug!("Split-frame write response received in {:?}", recv_time);
+
+        // SFWTIMING: see this function's entry comment. connect_ms covers pool-miss/stale
+        // reconnect + the actual write (everything between pool-acquire finishing and
+        // the response read starting) — not split further since which of those two ran
+        // is already visible from pool_hit.
+        let connect_and_write_ms = connect_done_at.elapsed().as_secs_f64() * 1000.0 - recv_time.as_secs_f64() * 1000.0;
+        let read_ms = recv_time.as_secs_f64() * 1000.0;
+        let total_ms = sfw_start.elapsed().as_secs_f64() * 1000.0;
+        info!("SFWTIMING addr={} pool_hit={} pool_acquire_ms={:.1} connect_and_write_ms={:.1} read_ms={:.1} total_ms={:.1}",
+            addr, pool_hit, pool_acquire_ms, connect_and_write_ms, read_ms, total_ms);
 
         let response_envelope = MessageEnvelope::from_bytes(&buf)
             .context("Failed to deserialize response")?;
@@ -2104,6 +2168,15 @@ leader_addr: Arc::new(RwLock::new(None)),
         client_write_seq: Option<u64>,
     ) -> Result<Vec<u8>> {
         if size == 0 || offset >= file_size as usize {
+            // TEMP DIAGNOSTIC (2026-07-14): tracing a fast (<1ms) empty-read report on
+            // rock5b right after a client restart — need to know whether file_size is
+            // genuinely 0/stale here (a metadata convergence gap distinct from the
+            // chunk_locations-stripped-on-warmup one) or whether this path isn't even
+            // being hit and the fast return is happening somewhere else entirely.
+            if size != 0 {
+                info!("read_file: inode={} fast-empty-return offset={} size={} file_size={} (offset >= file_size)",
+                    inode, offset, size, file_size);
+            }
             return Ok(Vec::new());
         }
 
@@ -2121,6 +2194,15 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot();
 
+        // TEMP DIAGNOSTIC (2026-07-14): see the fast-empty-return log above — this
+        // pins down which of the three states (cold/synchronous-refresh,
+        // non-empty-but-stale/background-refresh, or non-empty-and-fresh/served
+        // straight from snapshot) a first read actually observes. A non-empty
+        // chunk_map here on what should be a brand-new engine (get_or_create just
+        // ran) would itself be the finding — the constructor starts genuinely empty.
+        info!("read_file: inode={} pre-refresh snapshot: chunk_map.len()={} needs_refresh={}",
+            inode, chunk_map.len(), engine.needs_refresh(file_size, current_chunk));
+
         if chunk_map.is_empty() {
             // Engine is cold. Check if this read is beyond the committed file size.
             // - If offset < file_size: data is committed on server, safe to refresh
@@ -2132,11 +2214,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                 return Ok(Vec::new());
             }
             // Either no active writer, or read is within committed size — do synchronous refresh.
-            // Force-clear refresh_in_progress in case open() already set it (open() spawned
-            // a background prefetch which may still be in flight; we override it here so we
-            // don't skip the refresh and return 0 bytes).
+            // Do NOT force-clear refresh_in_progress here (removed 2026-07-14 — see the
+            // convergence bug this caused): open() may have already spawned a background
+            // prefetch that's still in flight. Blindly clearing the flag to guarantee this
+            // caller wins the exchange raced that prefetch — two concurrent fetches both
+            // writing engine.chunk_state and both signaling the same refresh_done Notify, so
+            // a waiter could be woken by the *other* fetch's completion and snapshot before
+            // its own fetch's data was actually written, observing an empty chunk map despite
+            // "synchronous refresh" having just run. refresh_engine() below already handles
+            // "someone else is already refreshing" correctly (waits on notified(), which by
+            // construction only fires after that refresher's own update_chunk_map_window call
+            // — see refresh_engine_flagged) — just let it do that instead of racing it.
             let sync_start = std::time::Instant::now();
-            engine.refresh_in_progress.store(false, Ordering::Release);
             self.refresh_engine(&engine, file_id, file_size, current_chunk).await;
             info!("read_file: inode={} synchronous chunk map refresh took {:?}", inode, sync_start.elapsed());
             let snap = engine.snapshot();
@@ -3174,6 +3263,39 @@ leader_addr: Arc::new(RwLock::new(None)),
             loop {
                 interval.tick().await;
                 client.read_write_seq_cache.retain(|_, (_, inserted_at)| inserted_at.elapsed() < TTL);
+            }
+        });
+    }
+
+    /// Spawn the background sweeper that prunes stale pre-hot-classification
+    /// entries from active_fold_started_at/active_fold_patch_count — see
+    /// hot_chunk_slots's doc comment for the classification scheme. A slot
+    /// that accumulates 1-3 patches within HOT_INACTIVITY_RESET and then goes
+    /// permanently quiet (the common case — most chunks under a wide
+    /// random-write workload are touched a couple of times and never again)
+    /// would otherwise leave its entry in those two maps forever, since
+    /// nothing else removes it except a *future* patch to that exact slot.
+    /// Same TTL-retain pattern as start_read_write_seq_cache_sweeper, tighter
+    /// interval since the TTL itself is only 2s here (vs. 5 minutes there).
+    /// Never touches hot_chunk_slots or a slot that's actually hot — a hot
+    /// slot's active_fold_started_at is its real fold-trigger generation
+    /// timer, not classification state, and must only reset on an actual
+    /// fold (existing behavior, unchanged).
+    pub fn start_hot_chunk_sweeper(&self, runtime: &tokio::runtime::Handle) {
+        let client = self.clone();
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                client.active_fold_started_at.retain(|key, started_at| {
+                    client.hot_chunk_slots.contains(key) || started_at.elapsed() < HOT_INACTIVITY_RESET
+                });
+                // active_fold_patch_count is keyed identically and reset in lockstep
+                // with active_fold_started_at everywhere else — prune anything that
+                // no longer has a started_at entry (either just evicted above, or a
+                // hot slot that hasn't been touched by this sweep's first branch
+                // since it's protected by the hot_chunk_slots check there too).
+                client.active_fold_patch_count.retain(|key, _| client.active_fold_started_at.contains_key(key));
             }
         });
     }
@@ -5251,6 +5373,13 @@ leader_addr: Arc::new(RwLock::new(None)),
             let envelope = MessageEnvelope::new(request_id, Message::Request(request));
             let encoded = envelope.to_bytes().context("Failed to serialize write request")?;
 
+            // WRITETIMING: per-target latency for the data phase, measured from the same
+            // start point so a stall on one specific replica (e.g. a node mid-planned-
+            // compaction-pause) is directly visible instead of hidden inside an aggregate
+            // "dual-replica write complete" number. Added 2026-07-14 to spot anomalies
+            // rather than infer them from throughput alone — see this session's offline-
+            // compaction regression investigation.
+            let replica_write_start = std::time::Instant::now();
             let t1 = tokio::time::timeout(
                 tokio::time::Duration::from_secs(WRITE_TIMEOUT_SECS),
                 self.send_split_frame_write_request(n1, &encoded, data),
@@ -5260,16 +5389,28 @@ leader_addr: Arc::new(RwLock::new(None)),
                 self.send_split_frame_write_request(n2, &encoded, data),
             );
             let (r1, r2) = tokio::join!(t1, t2);
+            let n1_ms = replica_write_start.elapsed().as_secs_f64() * 1000.0;
             match r1 {
                 Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n1); successful.push((n1, resp)); }
                 Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n1, e); }
                 Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n1, WRITE_TIMEOUT_SECS); }
             }
+            let n2_ms = replica_write_start.elapsed().as_secs_f64() * 1000.0;
             match r2 {
                 Ok(Ok(resp)) => { debug!("Parallel replica write succeeded to {}", n2); successful.push((n2, resp)); }
                 Ok(Err(e))   => { warn!("Parallel replica write failed: {}: {}, will retry serially", n2, e); }
                 Err(_)       => { warn!("Parallel replica write failed: {}: timeout after {}s, will retry serially", n2, WRITE_TIMEOUT_SECS); }
             }
+            // Gap since this same target's previous op — see write_target_last_op_at's
+            // field doc comment. None (first-ever op to this target) prints as -1 so it's
+            // unambiguous in logs/scripts rather than looking like a real zero-gap.
+            let now = std::time::Instant::now();
+            let n1_gap_ms = self.write_target_last_op_at.insert(n1, now)
+                .map(|prev| now.duration_since(prev).as_secs_f64() * 1000.0).unwrap_or(-1.0);
+            let n2_gap_ms = self.write_target_last_op_at.insert(n2, now)
+                .map(|prev| now.duration_since(prev).as_secs_f64() * 1000.0).unwrap_or(-1.0);
+            info!("WRITETIMING data-phase inode={} offset={} replica1={} replica1_ms={:.1} replica1_gap_ms={:.1} replica2={} replica2_ms={:.1} replica2_gap_ms={:.1}",
+                inode, file_offset, n1, n1_ms, n1_gap_ms, n2, n2_ms, n2_gap_ms);
         }
 
         // Serial fallback for any missing replicas
@@ -5408,10 +5549,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // was merely busy, not down — confirmed live 2026-07-12 via fio directly
                 // against the DFS mount: clat tail latencies up to 20s during a 4K random
                 // write test, tracing back to exactly this call.
+                let leader_write_start = std::time::Instant::now();
                 let result = tokio::time::timeout(
                     Duration::from_secs(1),
                     self.send_chunk_locations_batched(leader, chunk_locations.clone()),
                 ).await;
+                let leader_ms = leader_write_start.elapsed().as_secs_f64() * 1000.0;
                 let failed = match result {
                     Ok(Ok(())) => false,
                     Ok(Err(e)) => {
@@ -5423,6 +5566,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                         true
                     }
                 };
+                // WRITETIMING metadata phase — see the data-phase log above's doc comment.
+                let now = std::time::Instant::now();
+                let leader_gap_ms = self.write_target_last_op_at.insert(leader, now)
+                    .map(|prev| now.duration_since(prev).as_secs_f64() * 1000.0).unwrap_or(-1.0);
+                info!("WRITETIMING metadata-phase inode={} offset={} leader={} leader_ms={:.1} leader_gap_ms={:.1} failed={}",
+                    inode, file_offset, leader, leader_ms, leader_gap_ms, failed);
                 if failed {
                     self.pending_chunk_locations.lock().await.extend(chunk_locations.clone());
                 }
@@ -6612,6 +6761,51 @@ leader_addr: Arc::new(RwLock::new(None)),
         // never about blocking-vs-not; it was the semaphore being too narrow
         // and shared across *unrelated* slots.
         if let Some(cidx) = chunk_idx {
+            // Hot/cold classification gate — see hot_chunk_slots's doc comment.
+            // Reuses active_fold_started_at/active_fold_patch_count as the
+            // classification window before a slot earns hot status (start_hot_chunk_sweeper
+            // prunes these if the window ages out without reaching hot), then hands the
+            // same two maps off to the existing fold-trigger logic below once it does —
+            // one generation-timer pair serving both purposes, reset at the hand-off.
+            if !self.hot_chunk_slots.contains(&(file_id, cidx)) {
+                let now = std::time::Instant::now();
+                let expired = self.active_fold_started_at.get(&(file_id, cidx))
+                    .map(|t| now.duration_since(*t) > HOT_INACTIVITY_RESET)
+                    .unwrap_or(false);
+                if expired {
+                    // Window aged out without reaching HOT_CLASSIFY_SAMPLES — either a
+                    // genuine gap (nothing since the last patch) or just a slow trickle
+                    // (patches kept coming, too slowly to prove "hot"). Either way, drop
+                    // it and let this patch start a fresh window below.
+                    self.active_fold_started_at.remove(&(file_id, cidx));
+                    self.active_fold_patch_count.remove(&(file_id, cidx));
+                }
+                let window_start = *self.active_fold_started_at.entry((file_id, cidx)).or_insert(now);
+                let window_count = {
+                    let mut e = self.active_fold_patch_count.entry((file_id, cidx)).or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                if window_count >= HOT_CLASSIFY_SAMPLES {
+                    let elapsed_secs = now.duration_since(window_start).as_secs_f64().max(0.001);
+                    if (window_count as f64 / elapsed_secs) > HOT_RATE_THRESHOLD_PER_SEC {
+                        self.hot_chunk_slots.insert((file_id, cidx));
+                        // Hand-off: fold-trigger generation starts fresh from here, not
+                        // from whenever the classification window happened to begin.
+                        self.active_fold_started_at.insert((file_id, cidx), now);
+                        self.active_fold_patch_count.insert((file_id, cidx), 0);
+                        self.active_fold_bytes.insert((file_id, cidx), 0);
+                    } else {
+                        // Didn't clear the bar — keep sampling from a fresh window rather
+                        // than judging this slot forever by its first HOT_CLASSIFY_SAMPLES.
+                        self.active_fold_started_at.insert((file_id, cidx), now);
+                        self.active_fold_patch_count.insert((file_id, cidx), 0);
+                    }
+                }
+            }
+        }
+        if let Some(cidx) = chunk_idx {
+          if self.hot_chunk_slots.contains(&(file_id, cidx)) {
             // Jittered per-slot interval, not a fixed 8s: a kdiskmark-style workload
             // starts writing many different chunks within the same brief window, so
             // a fixed interval means every one of them matures in lockstep waves
@@ -6629,7 +6823,21 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let mut hasher = DefaultHasher::new();
                 (file_id, cidx).hash(&mut hasher);
                 let jitter_ms = (hasher.finish() % 4000) as u64; // 0..4000ms
-                std::time::Duration::from_secs(6) + std::time::Duration::from_millis(jitter_ms)
+                // DFS_ACTIVE_FOLD_BASE_SECS: override for local experiments only —
+                // measuring how much of the size-dependent write collapse is
+                // fold-volume-driven (many lightly-patched, mostly-cold chunks
+                // each paying a full fold) vs. real write-path cost, by testing
+                // with this raised high enough that the time trigger effectively
+                // never fires within a short test window. Default (6) is
+                // unchanged production behavior.
+                static BASE_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let base_secs = *BASE_SECS.get_or_init(|| {
+                    std::env::var("DFS_ACTIVE_FOLD_BASE_SECS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(6)
+                });
+                std::time::Duration::from_secs(base_secs) + std::time::Duration::from_millis(jitter_ms)
             };
             // Size-based early trigger, alongside the time-based one above — see
             // active_fold_bytes's doc comment for why an unbounded accumulator is a
@@ -6666,37 +6874,6 @@ leader_addr: Arc::new(RwLock::new(None)),
                 *entry += 1;
                 *entry
             };
-            // Prewarm hint: send on every patch, unconditionally — take 2
-            // (2026-07-13). The threshold-gated version (fire once per
-            // generation at 50% of whichever fold trigger is closer) assumed
-            // a hot, concentrated chunk would reliably cross that point
-            // before something else touched it. Real Q32T1 staging traffic
-            // spread across a wide active region instead: per-chunk patch
-            // counts almost never approached even a raised 1000-patch
-            // threshold, so the gate almost never opened and the hint almost
-            // never fired — confirmed live (lowest ring hit rate yet at
-            // threshold=1000, worse than smaller thresholds, because raising
-            // the gate just made it harder to reach without changing the
-            // access pattern that has to reach it).
-            //
-            // Sending on every patch instead removes the guesswork of
-            // picking a gate at all. It's cheap to do unconditionally
-            // because handle_prewarm_fold_cache already no-ops (no disk
-            // read) once chunk_ring.contains() is true for the slot's base —
-            // the server-side check IS the debounce. So the real cost is
-            // extra fire-and-forget RPCs, not extra disk I/O: one real read
-            // per slot-generation (the first patch that finds it cold),
-            // every subsequent patch's hint for that same generation is a
-            // cheap contains()-and-return. Still fire-and-forget: the client
-            // doesn't wait on the response and doesn't care if it's lost —
-            // this is a pure cache-warming optimization, never load-bearing
-            // (the fold itself still resolves its own base independently).
-            for &addr in patch_addrs.iter() {
-                let this = self.clone();
-                tokio::spawn(async move {
-                    let _ = this.send_request(addr, Request::PrewarmFoldCache { file_id, chunk_idx: cidx }).await;
-                });
-            }
             match elapsed_since_start {
                 None => {
                     // First patch this client has observed on this slot's current
@@ -6814,6 +6991,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
                 Some(_) => {} // not due yet
             }
+          }
         }
 
         // Use server's patch_ts if available — this ensures written_at is in server

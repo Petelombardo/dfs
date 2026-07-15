@@ -100,6 +100,18 @@ pub struct Server {
     /// Used by admin handlers to query status and trigger immediate heal cycles.
     healing: Arc<RwLock<Option<Arc<HealingManager>>>>,
 
+    /// Channel to ask main.rs's process-lifetime select loop to run a planned
+    /// offline compaction (pause listener + heartbeats, compact with zero
+    /// concurrent traffic, resume) — set after construction via
+    /// set_offline_compaction_channel(). None on any Server that isn't wired
+    /// into that loop (e.g. test-constructed instances): start_compaction_loop
+    /// treats that as "offline path unavailable" and always falls through to
+    /// the existing online compaction path, same as if every eligibility check
+    /// failed. The oneshot in each request carries back whether the offline
+    /// compaction actually ran (false covers both "lost the race" and any
+    /// error during the pause/compact/resume sequence).
+    offline_compaction_tx: Arc<RwLock<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>>>>,
+
     /// Set for the duration of compaction's Phase 3 (the one phase that holds
     /// MetadataStore's exclusive write lock) so fold, healing, and client-write
     /// callers can briefly stand down instead of piling onto the same shared
@@ -1937,6 +1949,7 @@ impl Server {
             chunk_to_file: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashMap::new())),
             healing: Arc::new(RwLock::new(None)),
+            offline_compaction_tx: Arc::new(RwLock::new(None)),
             compaction_quiescing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_quiesce_notify: Arc::new(tokio::sync::Notify::new()),
             leader_forward_queue: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -2519,6 +2532,13 @@ impl Server {
     /// Called from main() once both Server and HealingManager are created.
     pub async fn set_healing_manager(&self, healing: Arc<HealingManager>) {
         *self.healing.write().await = Some(healing);
+    }
+
+    /// Wire in the offline-compaction request channel after construction.
+    /// Called from main() once its process-lifetime select loop can receive on
+    /// the paired receiver — see offline_compaction_tx's field doc comment.
+    pub async fn set_offline_compaction_channel(&self, tx: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>) {
+        *self.offline_compaction_tx.write().await = Some(tx);
     }
 
     /// Share the NetworkServer's connection semaphore with the Server.
@@ -3394,9 +3414,6 @@ impl Server {
             }
             Request::ForceFold { file_id, chunk_idx } => {
                 self.handle_force_fold(file_id, chunk_idx).await
-            }
-            Request::PrewarmFoldCache { file_id, chunk_idx } => {
-                self.handle_prewarm_fold_cache(file_id, chunk_idx).await
             }
             Request::DeleteFile { path } => {
                 self.ops_tracker.inc_meta();
@@ -5059,6 +5076,31 @@ impl Server {
         self.pending_patch_ids.insert(public_token, (file_id, chunk_idx));
         debug!("handle_replicate_patch_fold: recorded {} -> {} for file {} chunk_idx {}",
             public_token, real_chunk_id, file_id, chunk_idx);
+
+        // This node just learned it's supposedly a replica for real_chunk_id, purely
+        // from this pointer-only broadcast — unlike a direct ForceFold target, it
+        // never independently computed this chunk (a fold's non-write-pair replica
+        // structurally has neither base_chunk_id nor delta_chunk_id locally, so it
+        // could never have folded this itself even if reachable). If the bytes
+        // genuinely aren't here, queue an immediate heal now instead of leaving a
+        // phantom replica: chunk_map/metadata will already show this node among
+        // real_chunk_id's `nodes` once handle_replicate_chunk_location merges this
+        // same broadcast, which makes the *aggregate* under-replication check there
+        // (nodes.len() < replication_factor) blind to the gap — it'll see the
+        // "expected" node count and conclude nothing needs healing. This is the one
+        // place with the actual ground truth (this node's own disk), for exactly
+        // the case that check can't see. Root-caused 2026-07-14: a VM disk's
+        // non-write-pair replica missed a fold's direct RPC during a rolling
+        // restart, and this fire-and-forget backstop path had no fetch/verify step
+        // at all — the chunk was permanently unreadable on every replica despite
+        // metadata claiming full replication.
+        if !self.storage.has_chunk(&real_chunk_id) {
+            if let Some(healing) = self.healing.read().await.as_ref() {
+                warn!("handle_replicate_patch_fold: real_chunk_id {} not present locally on {} — queueing immediate heal",
+                    real_chunk_id, self.cluster.local_node_id());
+                healing.queue_chunks_immediate(vec![real_chunk_id]).await;
+            }
+        }
         Response::Ok { data: None }
     }
 
@@ -6118,6 +6160,58 @@ impl Server {
                 if frag_ratio < 1.20 && secs_since_compact < 30 * 60 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                     continue;
+                }
+
+                // Prefer a planned offline compaction when every other cluster member
+                // is healthy — see LeaveReason::PlannedCompaction's doc comment. Removes
+                // the entire reason the online path below needs three phases and an
+                // iterative catch-up loop in the first place (no concurrent write churn
+                // to reconcile against). Falls through unchanged to the existing online
+                // path on any ineligibility: no channel wired up (e.g. a test-constructed
+                // Server), a peer not Online, losing the CompactionIntent race, or the
+                // offline attempt itself failing partway through.
+                // Kill switch: added 2026-07-14 after a real throughput regression on
+                // staging that correlated with this feature's rollout — every node was
+                // paying propose_and_race_compaction_intent's full 1.75s RACE_WINDOW wait
+                // on every ~60s compaction cycle regardless of outcome, and most attempts
+                // were losing the race per the new skip-reason logging. Root cause not yet
+                // confirmed; this lets the feature be disabled without a code revert while
+                // that's investigated. Unset (default): unchanged behavior.
+                let offline_disabled = std::env::var("DFS_DISABLE_PLANNED_COMPACTION").is_ok();
+                let offline_tx = if offline_disabled { None } else { self.offline_compaction_tx.read().await.clone() };
+                if let Some(offline_tx) = offline_tx {
+                    let all_online = self.cluster.all_members_online().await;
+                    if !all_online {
+                        info!("compaction: skipping planned offline path this cycle — not every cluster member is Online; falling back to the online path");
+                    }
+                    let won_race = all_online && self.cluster.propose_and_race_compaction_intent().await;
+                    if all_online && !won_race {
+                        info!("compaction: skipping planned offline path this cycle — lost (or no peer acknowledged) the CompactionIntent race; falling back to the online path");
+                    }
+                    if won_race {
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if offline_tx.send(reply_tx).is_ok() {
+                            // Generous timeout: this is a real pause+compact+resume cycle
+                            // (listener rebind included), not a quick call — see main.rs's
+                            // orchestration for its own internal bounds. If main.rs's
+                            // receiver was somehow dropped without replying, treat that
+                            // the same as "offline attempt failed" rather than hanging
+                            // this loop forever.
+                            let offline_ok = tokio::time::timeout(
+                                std::time::Duration::from_secs(120), reply_rx
+                            ).await.ok().and_then(|r| r.ok()).unwrap_or(false);
+                            if !offline_ok {
+                                warn!("compaction: planned offline path was attempted but did not report success (main.rs receiver dropped, timed out, or compaction itself failed after the pause) — falling back to the online path this cycle");
+                            }
+                            if offline_ok {
+                                last_compact_size = metadata.db_size();
+                                last_compact_time = Some(std::time::Instant::now());
+                                first_deferred_at = None;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+                                continue;
+                            }
+                        }
+                    }
                 }
 
                 // Retry up to 3 times on transient "transaction in progress" errors.
@@ -8254,13 +8348,13 @@ impl Server {
             let storage_for_prefetch = self.storage.clone();
             let chunk_ring_for_prefetch = self.chunk_ring.clone();
             tokio::spawn(async move {
-                if chunk_ring_for_prefetch.lock().unwrap().contains(&base_chunk_id) {
+                if chunk_ring_for_prefetch.shard(&base_chunk_id).lock().unwrap().contains(&base_chunk_id) {
                     return; // already warm — e.g. this node's own recent fold output
                 }
                 if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || {
                     storage_for_prefetch.read_chunk_arc(&base_chunk_id)
                 }).await {
-                    chunk_ring_for_prefetch.lock().unwrap().put(base_chunk_id, bytes);
+                    chunk_ring_for_prefetch.shard(&base_chunk_id).lock().unwrap().put(base_chunk_id, bytes);
                 }
             });
         }
@@ -8693,35 +8787,6 @@ impl Server {
         }
     }
 
-    /// Handle a best-effort PrewarmFoldCache hint — see Request::PrewarmFoldCache's
-    /// doc comment. Deliberately does not take chunk_patch_locks (that's for
-    /// actual fold mutual exclusion; taking it here just to peek would
-    /// serialize against real patches/folds for no reason) — a slightly stale
-    /// read here is harmless, worst case it warms a base_chunk_id that's
-    /// already been superseded, wasting one disk read. Returns almost
-    /// immediately; the actual warming read (if needed) runs detached so this
-    /// RPC never blocks on disk I/O.
-    async fn handle_prewarm_fold_cache(&self, file_id: dfs_common::FileId, chunk_idx: u64) -> Response {
-        let Some(public_token) = self.dirty_patch_slots.get(&(file_id, chunk_idx)).map(|e| e.value().token) else {
-            return Response::Ok { data: None }; // nothing pending, nothing to warm
-        };
-        let base_chunk_id = match self.metadata.get_patch_state_async(public_token).await {
-            Ok(Some(PatchState::Pending { base_chunk_id, .. })) => base_chunk_id,
-            _ => return Response::Ok { data: None }, // already folded or gone
-        };
-        if self.chunk_ring.shard(&base_chunk_id).lock().unwrap().contains(&base_chunk_id) {
-            return Response::Ok { data: None }; // already warm
-        }
-        let storage = self.storage.clone();
-        let chunk_ring = self.chunk_ring.clone();
-        tokio::spawn(async move {
-            if let Ok(Ok(data)) = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&base_chunk_id)).await {
-                chunk_ring.shard(&base_chunk_id).lock().unwrap().put(base_chunk_id, data);
-            }
-        });
-        Response::Ok { data: None }
-    }
-
     /// Handle delete file request.
     ///
     /// The client fans out DeleteFile to the leader + 2 other nodes simultaneously
@@ -8799,6 +8864,22 @@ impl Server {
         // Step 4: in-memory chunk_map removal (tombstone already set in step 1).
         self.chunk_map_remove(&metadata.id).await;
 
+        // Step 5: purge per-slot fold/patch bookkeeping. Without this, chunk_patch_locks,
+        // dirty_patch_slots, pending_patch_ids, and pending_patch_fold_broadcasts all leak
+        // one entry per (file_id, chunk_idx) ever patched on this file, forever — none of
+        // them are otherwise pruned on file deletion, only on the *next* patch to the same
+        // slot (which never comes, since the file is gone). Confirmed root cause of the
+        // gluster3 RSS growth during repeated create/delete/recreate benchmark runs
+        // (2026-07-13).
+        for (chunk_idx, loc) in metadata.chunk_locations.iter().enumerate() {
+            let chunk_idx = chunk_idx as u64;
+            self.chunk_patch_locks.remove(&(metadata.id, chunk_idx));
+            self.dirty_patch_slots.remove(&(metadata.id, chunk_idx));
+            self.pending_patch_ids.remove(&loc.chunk_id);
+            self.pending_patch_fold_broadcasts.remove(&loc.chunk_id);
+            self.chunk_io_locks.remove(&loc.chunk_id);
+        }
+
         // Notify the drain worker that there's a new entry (leader only acts on it,
         // but the notify is harmless on followers).
         self.delete_drain_notify.notify_one();
@@ -8833,6 +8914,14 @@ impl Server {
                 // Not present locally — fine, log at debug.
                 debug!("DeleteChunksBatch: chunk {} not local: {}", chunk_id, e);
             }
+            // Partial cleanup of the same in-memory fold/patch bookkeeping purged in
+            // handle_delete_file — this RPC only carries chunk_id, not chunk_idx, so
+            // the (file_id, chunk_idx)-keyed chunk_patch_locks/dirty_patch_slots can't
+            // be targeted here without a protocol change. Those still leak on the
+            // follower-side drain path; tracked as a known follow-up.
+            self.pending_patch_ids.remove(chunk_id);
+            self.pending_patch_fold_broadcasts.remove(chunk_id);
+            self.chunk_io_locks.remove(chunk_id);
         }
 
         Response::Ok { data: None }
@@ -12471,6 +12560,10 @@ impl MessageHandler for Server {
                 ClusterMessage::GracefulLeave { node_id, addr: _, reason } => {
                     info!("Node {} is leaving gracefully (reason: {:?})", node_id, reason);
                     self.cluster.set_leaving(node_id, reason).await;
+                    Response::Ok { data: None }
+                }
+                ClusterMessage::CompactionIntent { node_id, proposed_at_ms } => {
+                    self.cluster.record_compaction_intent(node_id, proposed_at_ms).await;
                     Response::Ok { data: None }
                 }
                 _ => Response::Error {

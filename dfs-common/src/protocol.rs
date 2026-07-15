@@ -457,24 +457,6 @@ pub enum Request {
         chunk_idx: u64,
     },
 
-    /// Best-effort hint: this slot's fold is likely imminent (client has
-    /// crossed 80% of whichever fold trigger — patch count or elapsed time —
-    /// is closer), so warm chunk_ring for its current base chunk now instead
-    /// of waiting for the fold itself to discover it cold. Sent once per
-    /// slot-generation, fire-and-forget from the client's perspective (it
-    /// does not wait on the response, and neither the request nor its
-    /// absence affects correctness — this is purely a cache-warming
-    /// optimization, never load-bearing for the fold itself, which still
-    /// re-reads/re-checks everything it needs on its own). Added 2026-07-13
-    /// alongside chunk_ring's capacity/hit-rate instrumentation: seeding the
-    /// ring intelligently (ahead of a burst of folds, not on every single
-    /// first patch, which would warm chunks that never end up folding)
-    /// rather than just growing its capacity.
-    PrewarmFoldCache {
-        file_id: FileId,
-        chunk_idx: u64,
-    },
-
     // Admin requests
     /// Get cluster status
     GetClusterStatus,
@@ -1188,6 +1170,19 @@ pub enum ClusterMessage {
         node_id: NodeId,
         addr: std::net::SocketAddr,
         reason: crate::types::LeaveReason,
+    },
+
+    /// Best-effort announcement that a node intends to self-elect for a planned
+    /// offline compaction (see LeaveReason::PlannedCompaction). Every peer records
+    /// the earliest intent it's seen recently; the proposer waits briefly after
+    /// broadcasting and only proceeds if its own (node_id, proposed_at_ms) is the
+    /// winner (earliest proposed_at_ms, node_id as tiebreak) — this is what
+    /// prevents two nodes from both going offline for compaction at once, without
+    /// needing a leader-arbitrated lock (whichever node happens to be leader
+    /// needs to be able to compact too, via the same path as everyone else).
+    CompactionIntent {
+        node_id: NodeId,
+        proposed_at_ms: u64,
     },
 }
 

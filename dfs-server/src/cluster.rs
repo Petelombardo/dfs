@@ -71,6 +71,24 @@ pub struct ClusterManager {
     /// transfers off the cluster's real queue depth instead of always seeing an
     /// empty local queue and pinning themselves at the 10% floor rate.
     local_heal_bandwidth_mb: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// Most recent CompactionIntent seen from each node (including this node's
+    /// own, once it proposes one), keyed by node_id -> proposed_at_ms. Used only
+    /// to arbitrate the race-avoidance window in propose_and_race_compaction_intent
+    /// — see that function's doc comment. Entries are short-lived by construction
+    /// (only consulted a couple seconds after being written) and get overwritten
+    /// on the next proposal from the same node, so this deliberately isn't swept
+    /// — unlike pending_patch_fold_broadcasts or similar longer-lived maps
+    /// elsewhere, an unbounded number of *distinct* nodes never accumulates here
+    /// (bounded by cluster size).
+    compaction_intents: Arc<RwLock<HashMap<NodeId, u64>>>,
+
+    /// Paused while this node is offline for a self-elected planned compaction
+    /// (LeaveReason::PlannedCompaction) — checked by send_heartbeats so a node
+    /// that just announced GracefulLeave doesn't contradict itself by continuing
+    /// to heartbeat while "offline". Same AtomicBool-checked-each-tick pattern as
+    /// Server::compaction_quiescing.
+    heartbeat_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Decide the epoch (unix secs) this leadership episode "started" at.
@@ -121,6 +139,8 @@ impl ClusterManager {
             became_leader_at: Arc::new(RwLock::new(None)),
             client: Arc::new(NetworkClient::new()),
             local_heal_bandwidth_mb: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            compaction_intents: Arc::new(RwLock::new(HashMap::new())),
+            heartbeat_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -459,8 +479,106 @@ impl ClusterManager {
         // Re-add to hash ring so chunks can be placed here again.
         let mut ring = self.hash_ring.write().await;
         ring.add_node(self.local_node_id);
-        info!("Connection pressure resolved — rejoining cluster as Online");
+        info!("Rejoining cluster as Online");
         self.node_recovered_notify.notify_waiters();
+    }
+
+    /// True only if every other known cluster member is currently Online —
+    /// the precondition for self-electing a planned offline compaction (see
+    /// LeaveReason::PlannedCompaction). Deliberately strict: a peer that's
+    /// Suspected, Failed, or itself Leaving (possibly for its own compaction,
+    /// possibly genuinely down) means this node going offline too would risk
+    /// stacking two nodes' worth of reduced redundancy at once. A single-node
+    /// cluster (tests, degenerate deploys) trivially passes — nothing else to
+    /// wait on.
+    pub async fn all_members_online(&self) -> bool {
+        let nodes = self.nodes.read().await;
+        nodes.values()
+            .filter(|n| n.id != self.local_node_id)
+            .all(|n| n.status == NodeStatus::Online)
+    }
+
+    /// Record a peer's (or, when called locally before broadcasting, our own)
+    /// compaction intent. See CompactionIntent's protocol doc comment for the
+    /// race this closes. Overwrites any prior entry for that node_id — only the
+    /// most recent proposal from a given node is ever relevant.
+    pub async fn record_compaction_intent(&self, node_id: NodeId, proposed_at_ms: u64) {
+        self.compaction_intents.write().await.insert(node_id, proposed_at_ms);
+    }
+
+    /// Broadcast a CompactionIntent to every currently-Online peer, wait
+    /// RACE_WINDOW for competing intents to arrive, then decide whether this
+    /// node won. "Won" means: across every intent recorded within the last
+    /// RACE_WINDOW (including this node's own, which record_compaction_intent
+    /// also stores locally before the broadcast below), this node's
+    /// (proposed_at_ms, node_id) pair sorts first — earliest timestamp, node_id
+    /// as a tiebreak for an exact-millisecond collision.
+    ///
+    /// Deliberately best-effort/no-ack on the broadcast itself (same style as
+    /// announce_leaving): a peer that misses this message entirely just means
+    /// one extra round where two nodes could theoretically both think they won.
+    /// That's an accepted residual risk, not eliminated — see this feature's
+    /// design discussion for why a leader-arbitrated lease was rejected instead
+    /// (the leader needs to be able to compact too, which reintroduces a
+    /// self-referential arbiter-is-also-a-participant problem the decentralized
+    /// version avoids). RACE_WINDOW is sized generously relative to normal
+    /// same-datacenter RPC latency to keep that residual risk small in practice.
+    pub async fn propose_and_race_compaction_intent(&self) -> bool {
+        use dfs_common::protocol::{ClusterMessage, Message, MessageEnvelope, RequestId};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        const RACE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1750);
+
+        let proposed_at_ms = dfs_common::types::current_timestamp_ms();
+        self.record_compaction_intent(self.local_node_id, proposed_at_ms).await;
+
+        let msg = Message::Cluster(ClusterMessage::CompactionIntent {
+            node_id: self.local_node_id,
+            proposed_at_ms,
+        });
+        let envelope = MessageEnvelope::new(RequestId::new(0), msg);
+        if let Ok(encoded) = envelope.to_bytes() {
+            let peers: Vec<SocketAddr> = {
+                let nodes = self.nodes.read().await;
+                nodes.values()
+                    .filter(|n| n.id != self.local_node_id && n.status == NodeStatus::Online)
+                    .map(|n| n.addr)
+                    .collect()
+            };
+            let encoded = Arc::new(encoded);
+            let mut tasks = Vec::new();
+            for addr in peers {
+                let encoded = encoded.clone();
+                tasks.push(tokio::spawn(async move {
+                    let timeout = tokio::time::Duration::from_millis(500);
+                    if let Ok(Ok(mut stream)) = tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+                        let len = (encoded.len() as u32).to_be_bytes();
+                        let _ = stream.write_all(&len).await;
+                        let _ = stream.write_all(&encoded).await;
+                        let mut buf = [0u8; 4];
+                        let _ = tokio::time::timeout(timeout, stream.read_exact(&mut buf)).await;
+                    }
+                }));
+            }
+            for t in tasks { let _ = t.await; }
+        }
+
+        tokio::time::sleep(RACE_WINDOW).await;
+
+        let intents = self.compaction_intents.read().await;
+        let winner = intents.iter()
+            .min_by_key(|(node_id, ts)| (**ts, **node_id));
+        matches!(winner, Some((node_id, _)) if *node_id == self.local_node_id)
+    }
+
+    /// Pause/resume outgoing heartbeats — see heartbeat_paused's field doc
+    /// comment. Both are cheap no-ops if called when already in that state.
+    pub fn pause_heartbeats(&self) {
+        self.heartbeat_paused.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn resume_heartbeats(&self) {
+        self.heartbeat_paused.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get online nodes count
@@ -711,6 +829,18 @@ impl ClusterManager {
         tokio::spawn(async move {
             loop {
                 heartbeat_interval.tick().await;
+
+                // Skip while offline for a planned compaction (LeaveReason::
+                // PlannedCompaction) — continuing to heartbeat while we've just
+                // announced GracefulLeave would contradict the announcement and
+                // could flip peers' view of us back to Online (see the
+                // NodeStatus::Leaving heartbeat-recovery branch) before
+                // compaction has actually finished. resume_heartbeats() is
+                // called right before the listener comes back up.
+                if self.heartbeat_paused.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+
                 probe_counter += 1;
 
                 // Probe failed nodes every 6 intervals (~60s at default 10s heartbeat).

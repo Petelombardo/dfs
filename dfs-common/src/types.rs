@@ -125,6 +125,15 @@ pub enum LeaveReason {
     /// All TCP connection slots are exhausted and the node is stepping down from
     /// leadership until pressure drops. It will auto-recover without restarting.
     ConnectionPressure,
+    /// Node is pausing itself to run a full offline metadata compaction (no
+    /// concurrent write churn to reconcile against, unlike the normal online
+    /// path). Only self-elected when every other cluster member is confirmed
+    /// Online — see ClusterManager::all_members_online and the CompactionIntent
+    /// race-avoidance broadcast. Auto-recovers without a process restart: the
+    /// listener and heartbeat sender pause, compaction runs, then both resume
+    /// and the node's next heartbeat is picked up by the same Leaving-grace
+    /// rejoin path ConnectionPressure/Shutdown already use.
+    PlannedCompaction,
 }
 
 /// Compact node health information for gossiping
@@ -454,6 +463,15 @@ pub fn current_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// Get current Unix timestamp in milliseconds — used where second granularity
+/// would produce too many spurious ties (e.g. CompactionIntent race arbitration).
+pub fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 // Add hex dependency for ChunkId

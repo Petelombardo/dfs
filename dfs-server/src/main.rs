@@ -468,23 +468,54 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         info!("No seed nodes or peers configured - running as standalone node");
     }
 
-    // Wait for either a clean shutdown signal or unexpected network task exit.
-    // Listens for both SIGINT (Ctrl+C) and SIGTERM (systemctl stop / kill).
-    // If the network task exits (via panic or unexpected return) we exit immediately
-    // so the process manager (systemd Restart=always) can bring us back up cleanly.
-    let shutdown = {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate()
-        )?;
-        async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => "SIGINT",
-                _ = sigterm.recv() => "SIGTERM",
+    // Offline-compaction request channel — see Server::offline_compaction_tx's
+    // doc comment. start_compaction_loop sends on this (via the Server-side
+    // handle wired below) when it's won the CompactionIntent race and every
+    // peer is Online; the loop just below owns the actual pause/compact/resume
+    // sequence since it's the only place that owns server_handle's lifecycle.
+    let (offline_compaction_tx, mut offline_compaction_rx) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<bool>>();
+    server.set_offline_compaction_channel(offline_compaction_tx).await;
+
+    // Wait for either a clean shutdown signal, an unexpected network task exit, or
+    // a planned-offline-compaction request. Listens for both SIGINT (Ctrl+C) and
+    // SIGTERM (systemctl stop / kill). If the network task exits (via panic or
+    // unexpected return) we exit immediately so the process manager
+    // (systemd Restart=always) can bring us back up cleanly. A compaction request
+    // loops back afterward instead of exiting — see run_planned_offline_compaction.
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate()
+    )?;
+    let sig = loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break "SIGINT",
+            _ = sigterm.recv() => break "SIGTERM",
+            Some(reply_tx) = offline_compaction_rx.recv() => {
+                let succeeded = run_planned_offline_compaction(
+                    &server, config.node.listen_addr, &mut server_handle,
+                ).await;
+                let _ = reply_tx.send(succeeded);
+                // Loop back — keep listening for the real shutdown signals.
+            }
+            result = &mut server_handle => {
+                match result {
+                    Ok(()) => tracing::error!("Network server exited unexpectedly — listener is dead"),
+                    Err(e) if e.is_panic() => tracing::error!("Network server panicked: {:?}", e),
+                    Err(e) => tracing::error!("Network server task error: {}", e),
+                }
+                // Broadcast GracefulLeave so peers immediately elect a new leader
+                // rather than waiting for the heartbeat timeout (30-120s).
+                // Use a short timeout — if we can't reach peers we still need to exit.
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(500),
+                    server.cluster().announce_leaving(dfs_common::LeaveReason::Shutdown),
+                ).await;
+                let _ = std::fs::remove_file(&addr_file);
+                std::process::exit(1);
             }
         }
     };
-    tokio::select! {
-        sig = shutdown => {
+    {
             info!("Shutting down ({sig}) — broadcasting GracefulLeave to peers...");
             // Capture this BEFORE announce_leaving(), which marks our own node Leaving —
             // is_leader() would already read false afterward.
@@ -549,29 +580,87 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             // shutdown should never be held hostage by an unrelated stuck background
             // task once our own explicit cleanup is done.
             std::process::exit(0);
-        }
-        result = &mut server_handle => {
-            match result {
-                Ok(()) => tracing::error!("Network server exited unexpectedly — listener is dead"),
-                Err(e) if e.is_panic() => tracing::error!("Network server panicked: {:?}", e),
-                Err(e) => tracing::error!("Network server task error: {}", e),
-            }
-            // Broadcast GracefulLeave so peers immediately elect a new leader
-            // rather than waiting for the heartbeat timeout (30-120s).
-            // Use a short timeout — if we can't reach peers we still need to exit.
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_millis(500),
-                server.cluster().announce_leaving(dfs_common::LeaveReason::Shutdown),
-            ).await;
-            let _ = std::fs::remove_file(&addr_file);
-            std::process::exit(1);
+    }
+    // Every path that can reach here exits the process directly
+    // (std::process::exit), so nothing after this point ever runs — including
+    // healer_runtime's drop, which is fine: process exit doesn't run Drop glue
+    // anyway. The only loop-back path (a planned offline compaction request)
+    // stays inside the `sig = loop { ... }` above and never reaches this point.
+}
+
+/// Pause serving (listener + heartbeats), run a full offline metadata
+/// compaction with zero concurrent traffic, then resume — see
+/// LeaveReason::PlannedCompaction's doc comment for why this is safe to do
+/// routinely rather than only at deploy time. Returns whether compaction
+/// itself succeeded (the node always attempts to come back online regardless,
+/// even on failure — going offline must never turn into staying offline).
+///
+/// Takes server_handle by `&mut` rather than by value so the caller's select!
+/// loop (which also needs `&mut server_handle` for its own "network task
+/// exited" arm) doesn't have an ownership conflict — abort()/await only need a
+/// reference, and the handle is replaced in place once the new listener task
+/// is spawned.
+async fn run_planned_offline_compaction(
+    server: &std::sync::Arc<server::Server>,
+    listen_addr: std::net::SocketAddr,
+    server_handle: &mut tokio::task::JoinHandle<()>,
+) -> bool {
+    info!("Planned offline compaction: pausing to compact with no concurrent traffic...");
+    // Same reasoning as the real Shutdown path: capture before announce_leaving()
+    // flips our own status (is_leader() would already read false afterward).
+    let was_leader = server.cluster().is_leader().await;
+    server.cluster().announce_leaving(dfs_common::LeaveReason::PlannedCompaction).await;
+    server.cluster().pause_heartbeats();
+    // Brief pause so peers process the broadcast before we close connections —
+    // same 100ms as the real shutdown path's identical comment.
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    if was_leader {
+        let grace_ms = std::env::var("DFS_LEADER_HANDOFF_GRACE_MS")
+            .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        if grace_ms > 0 {
+            info!("Was leader — staying up {}ms to redirect clients to the successor before pausing", grace_ms);
+            tokio::time::sleep(tokio::time::Duration::from_millis(grace_ms)).await;
         }
     }
-    // Both select! arms above exit the process directly (std::process::exit), so
-    // nothing after this point ever runs — including healer_runtime's drop, which
-    // is fine: process exit doesn't run Drop glue anyway, and shutdown_background()
-    // existed only to avoid a would-be panic from dropping a runtime inside an
-    // async context, a case that no longer occurs now that we never fall through.
+    let _ = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        server.drain_sled_writes(),
+    ).await;
+
+    server_handle.abort();
+    let _ = (&mut *server_handle).await; // wait for the listener task to actually stop before rebinding
+
+    // Give the OS a moment to fully release the socket before rebinding — this
+    // process has never rebound its own listen_addr mid-run before today, so
+    // there's no existing precedent to lean on for how long that takes.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let metadata = server.metadata_store();
+    let compact_result = tokio::task::spawn_blocking(move || metadata.compact_db()).await;
+    let succeeded = match &compact_result {
+        Ok(Ok((before, after))) => {
+            info!("Planned offline compaction finished: {:.1}MB -> {:.1}MB",
+                *before as f64 / 1_048_576.0, *after as f64 / 1_048_576.0);
+            true
+        }
+        Ok(Err(e)) => { warn!("Planned offline compaction failed: {}", e); false }
+        Err(e) => { warn!("Planned offline compaction task panicked: {}", e); false }
+    };
+
+    // Rebind and come back online regardless of compaction's own outcome —
+    // going offline must never turn into staying offline.
+    let mut net_server = network::NetworkServer::new(listen_addr, server.clone());
+    server.set_conn_semaphore(net_server.conn_semaphore.clone()).await;
+    *server_handle = tokio::spawn(async move {
+        if let Err(e) = net_server.start().await {
+            tracing::error!("Network server error (post-compaction respawn): {}", e);
+        }
+    });
+    server.cluster().resume_heartbeats();
+    server.cluster().announce_recovery().await;
+    info!("Planned offline compaction: back online");
+
+    succeeded
 }
 
 /// Attempt to join cluster via seed nodes

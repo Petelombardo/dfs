@@ -767,20 +767,22 @@ impl MetadataStore {
     /// Scan all file records and re-create any missing path index entries.
     pub fn repair_path_index(&self) -> Result<()> {
         // Pass 1: find file records whose path index entry is missing.
-        let to_repair: Vec<(String, Vec<u8>)> = {
+        // (path, file_id_str) — see resolve_path_entry_file_id for why the
+        // repaired entry is just the id, not the full blob.
+        let to_repair: Vec<(String, String)> = {
             let _db = self.db.read();
             let txn = _db.begin_read()?;
             let file_table = txn.open_table(FILE_TABLE)?;
             let path_table = txn.open_table(PATH_TABLE)?;
             let mut repairs = Vec::new();
             for item in file_table.range::<&str>(..)? {
-                let (_, v) = item?;
+                let (k, v) = item?;
                 let m = match dfs_common::deserialize_file_metadata(v.value()) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
                 if path_table.get(m.path.as_str())?.is_none() {
-                    repairs.push((m.path.clone(), v.value().to_vec()));
+                    repairs.push((m.path.clone(), k.value().to_string()));
                 }
             }
             repairs
@@ -793,13 +795,13 @@ impl MetadataStore {
             txn.set_durability(self.next_write_durability());
             {
                 let mut path_table = txn.open_table(PATH_TABLE)?;
-                for (path, bytes) in &to_repair {
+                for (path, file_id_str) in &to_repair {
                     warn!("Repaired missing path index for: {}", path);
-                    path_table.insert(path.as_str(), bytes.as_slice())?;
+                    path_table.insert(path.as_str(), file_id_str.as_bytes())?;
                 }
             }
             txn.commit()?;
-            let payload_bytes: usize = to_repair.iter().map(|(_, b)| b.len()).sum();
+            let payload_bytes: usize = to_repair.iter().map(|(_, id)| id.len()).sum();
             self.note_txn("repair_path_index", payload_bytes);
         }
 
@@ -812,8 +814,8 @@ impl MetadataStore {
             let mut stale = Vec::new();
             for item in path_table.range::<&str>(..)? {
                 let (k, v) = item?;
-                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
-                    let fid_str = format!("{}", m.id);
+                if let Ok(file_id) = Self::resolve_path_entry_file_id(v.value()) {
+                    let fid_str = format!("{}", file_id);
                     if file_table.get(fid_str.as_str())?.is_none() {
                         stale.push(k.value().to_string());
                     }
@@ -1061,9 +1063,40 @@ impl MetadataStore {
         (cloned, is_stale)
     }
 
+    /// PATH_TABLE's value format changed 2026-07-16 from a full serialized
+    /// FileMetadata blob (an exact duplicate of what FILE_TABLE stores for the
+    /// same record, rewritten on every single put_file/put_files_batch call) to
+    /// just the pointed-to file_id string. FILE_TABLE remains the single source
+    /// of truth for file content; PATH_TABLE is purely a path -> file_id index.
+    /// Measured as the dominant metadata-DB write-volume driver during sustained
+    /// patch writes (kdiskmark RND4K: ~27MB/min of blob payload, doubled again
+    /// by this duplication) — see scratchpad_db_growth_baseline.md.
+    ///
+    /// Never migrated in bulk: existing entries stay in the old (blob) format
+    /// until the next write to that path converts them — same reasoning as
+    /// dfs_common::deserialize_file_metadata's FileMetadataLegacyV0 fallback for
+    /// FileMetadata's own struct evolution. Safe to deploy over a live database
+    /// with no migration pass and no window where a path is unreadable; the
+    /// write-volume win phases in as records get touched rather than requiring
+    /// staging to sit through a bulk rewrite. Every PATH_TABLE reader must go
+    /// through this resolver instead of deserializing the value directly.
+    fn resolve_path_entry_file_id(bytes: &[u8]) -> Result<FileId> {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+                return Ok(FileId::from_uuid(uuid));
+            }
+        }
+        // Legacy format: bytes are a full FileMetadata blob — pull the id out.
+        dfs_common::deserialize_file_metadata(bytes)
+            .map(|m| m.id)
+            .context("path index entry is neither a file_id nor a legacy FileMetadata blob")
+    }
+
     /// Third tuple element is the serialized payload byte count actually written
-    /// (file+path index insert are the same bytes, counted once) — feeds put_file/
-    /// put_files_batch's note_txn() call, see MetadataStore::note_txn.
+    /// to FILE_TABLE (feeds put_file/put_files_batch's note_txn() call, see
+    /// MetadataStore::note_txn) — PATH_TABLE's write is now just a short file_id
+    /// string, not worth tracking separately (see resolve_path_entry_file_id's
+    /// doc comment for why the two tables no longer share one payload size).
     fn put_file_in_txn(
         file_table: &mut redb::Table<&str, &[u8]>,
         path_table: &mut redb::Table<&str, &[u8]>,
@@ -1100,10 +1133,10 @@ impl MetadataStore {
         // record. Done only now (after the stale-check above can no longer bail
         // out) — see this function's doc comment for why the ordering matters.
         let old_id_str: Option<String> = match path_table.get(path_str)? {
-            Some(v) => dfs_common::deserialize_file_metadata(v.value())
+            Some(v) => Self::resolve_path_entry_file_id(v.value())
                 .ok()
-                .filter(|m| m.id != metadata.id)
-                .map(|m| format!("{}", m.id)),
+                .filter(|id| *id != metadata.id)
+                .map(|id| format!("{}", id)),
             None => None,
         };
         if let Some(old_id) = &old_id_str {
@@ -1119,7 +1152,8 @@ impl MetadataStore {
 
         file_table.insert(file_id_str.as_str(), value.as_slice())
             .context("Failed to insert file metadata")?;
-        path_table.insert(path_str, value.as_slice())
+        // Just the file_id, not the blob — see resolve_path_entry_file_id.
+        path_table.insert(path_str, file_id_str.as_bytes())
             .context("Failed to insert path index")?;
 
         let payload_bytes = value.len();
@@ -1273,6 +1307,24 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Test-only: write PATH_TABLE's value for `path` directly, bypassing
+    /// put_file_in_txn's normal file_id-only encoding. Used to simulate a
+    /// pre-2026-07-16 legacy entry (a full serialized FileMetadata blob) so the
+    /// resolve_path_entry_file_id fallback can be exercised without needing an
+    /// actual old binary — see that function's doc comment for the upgrade-path
+    /// contract this proves.
+    #[cfg(test)]
+    pub(crate) fn put_raw_path_entry(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        let _db = self.db.read();
+        let txn = _db.begin_write()?;
+        {
+            let mut path_table = txn.open_table(PATH_TABLE)?;
+            path_table.insert(path, bytes)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Async wrapper for get_file — see get_chunk_location_async for why the sync
     /// version must never be called directly from async request-handling code.
     pub async fn get_file_async(self: &Arc<Self>, file_id: FileId) -> Result<Option<FileMetadata>> {
@@ -1286,8 +1338,15 @@ impl MetadataStore {
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileMetadata>> {
         let _db = self.db.read();
         let txn = _db.begin_read()?;
-        let table = txn.open_table(PATH_TABLE)?;
-        match table.get(path)? {
+        let path_table = txn.open_table(PATH_TABLE)?;
+        let file_id = match path_table.get(path)? {
+            Some(v) => Self::resolve_path_entry_file_id(v.value())
+                .with_context(|| format!("Failed to resolve path index entry for {}", path))?,
+            None => return Ok(None),
+        };
+        let file_table = txn.open_table(FILE_TABLE)?;
+        let key = format!("{}", file_id);
+        match file_table.get(key.as_str())? {
             Some(v) => Ok(Some(dfs_common::deserialize_file_metadata(v.value())
                 .with_context(|| format!("Failed to deserialize metadata for path {}", path))?)),
             None => Ok(None),
@@ -1473,8 +1532,8 @@ impl MetadataStore {
             let mut stale = Vec::new();
             for item in table.range::<&str>(..)? {
                 let (k, v) = item?;
-                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
-                    if !live_ids.contains(&m.id) {
+                if let Ok(file_id) = Self::resolve_path_entry_file_id(v.value()) {
+                    if !live_ids.contains(&file_id) {
                         stale.push(k.value().to_string());
                     }
                 }
@@ -1522,17 +1581,30 @@ impl MetadataStore {
 
         let _db = self.db.read();
         let txn = _db.begin_read()?;
-        let table = txn.open_table(PATH_TABLE)?;
+        let path_table = txn.open_table(PATH_TABLE)?;
+        let file_table = txn.open_table(FILE_TABLE)?;
         let mut files = Vec::new();
-        for item in table.range(dir_path.as_str()..end.as_str())? {
+        for item in path_table.range(dir_path.as_str()..end.as_str())? {
             let (k, v) = item?;
             let path = k.value();
             let relative = &path[dir_path.len()..];
             // Direct child: no slash, or a lone trailing slash (directory entry).
             if !relative.is_empty() && (!relative.contains('/') || relative.ends_with('/')) {
-                match dfs_common::deserialize_file_metadata(v.value()) {
-                    Ok(m) => files.push(m),
-                    Err(_) => warn!("list_directory: could not deserialize path index for {}", path),
+                let file_id = match Self::resolve_path_entry_file_id(v.value()) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        warn!("list_directory: could not resolve path index entry for {}", path);
+                        continue;
+                    }
+                };
+                let key = format!("{}", file_id);
+                match file_table.get(key.as_str()) {
+                    Ok(Some(fv)) => match dfs_common::deserialize_file_metadata(fv.value()) {
+                        Ok(m) => files.push(m),
+                        Err(_) => warn!("list_directory: could not deserialize file record {} for path {}", file_id, path),
+                    },
+                    Ok(None) => warn!("list_directory: path index points at missing file record {} for path {}", file_id, path),
+                    Err(e) => warn!("list_directory: file_table lookup failed for {} (path {}): {}", file_id, path, e),
                 }
             }
         }
@@ -3655,6 +3727,198 @@ mod tests {
         let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
         assert_eq!(retrieved.path, "/test.txt");
         assert_eq!(retrieved.size, 1024);
+    }
+
+    /// Regression for the 2026-07-16 PATH_TABLE dedup: put_file_in_txn used to
+    /// write the ENTIRE serialized FileMetadata blob into PATH_TABLE (an exact
+    /// duplicate of what FILE_TABLE already stores for the same record) — the
+    /// dominant metadata-DB write-volume driver measured under sustained patch
+    /// writes. Confirms the new write actually is short (a file_id string), not
+    /// the old multi-hundred-byte blob.
+    #[test]
+    fn test_path_table_stores_file_id_not_blob() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut metadata = FileMetadata::new("/dedup_test.bin".to_string(), FileType::RegularFile);
+        let node = NodeId::new();
+        metadata.chunk_locations = std::sync::Arc::new(vec![dfs_common::ChunkLocation {
+            chunk_id: ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(b"x")),
+            nodes: vec![node],
+            size: 4096,
+            checksum: [0u8; 32],
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: Some(1),
+            file_id: None,
+        }]);
+        store.put_file(&metadata).unwrap();
+
+        // Read PATH_TABLE's raw value directly and confirm it round-trips through
+        // resolve_path_entry_file_id AS a plain uuid string — a full FileMetadata
+        // blob for a record with a chunk_locations entry would be well over 100
+        // bytes; a hyphenated UUID string is exactly 36.
+        let raw = {
+            let _db = store.db.read();
+            let txn = _db.begin_read().unwrap();
+            let path_table = txn.open_table(PATH_TABLE).unwrap();
+            path_table.get("/dedup_test.bin").unwrap().unwrap().value().to_vec()
+        };
+        assert_eq!(raw.len(), 36, "PATH_TABLE value should be a bare UUID string, not a FileMetadata blob (got {} bytes)", raw.len());
+        assert_eq!(MetadataStore::resolve_path_entry_file_id(&raw).unwrap(), metadata.id);
+
+        // And the normal read path still resolves correctly through the new format.
+        let retrieved = store.get_file_by_path("/dedup_test.bin").unwrap().unwrap();
+        assert_eq!(retrieved.id, metadata.id);
+        assert_eq!(retrieved.chunk_locations.len(), 1);
+    }
+
+    /// Upgrade-path regression: a PATH_TABLE entry written by pre-2026-07-16 code
+    /// (the full legacy blob format) must still resolve correctly under the new
+    /// code — no migration pass, no window where an old path is unreadable. This
+    /// is the scenario a real staging upgrade exercises: existing on-disk data in
+    /// the old format, new binary reading it.
+    #[test]
+    fn test_get_file_by_path_resolves_legacy_blob_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut metadata = FileMetadata::new("/legacy_path.bin".to_string(), FileType::RegularFile);
+        metadata.size = 777;
+        // Populate FILE_TABLE the normal way...
+        store.put_file(&metadata).unwrap();
+        // ...then overwrite PATH_TABLE's entry with the OLD full-blob format,
+        // simulating data written before the dedup change.
+        let legacy_blob = bincode::serialize(&metadata).unwrap();
+        store.put_raw_path_entry("/legacy_path.bin", &legacy_blob).unwrap();
+
+        let retrieved = store.get_file_by_path("/legacy_path.bin").unwrap().unwrap();
+        assert_eq!(retrieved.id, metadata.id);
+        assert_eq!(retrieved.size, 777);
+    }
+
+    /// Same upgrade-path guarantee for list_directory and remove_unlisted_files —
+    /// both must handle a directory/reconciliation scan that mixes legacy-blob
+    /// and new-format path entries (the realistic post-upgrade state: only paths
+    /// touched by a write since the upgrade have converted).
+    #[test]
+    fn test_list_directory_and_reconcile_handle_mixed_path_formats() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let new_fmt = FileMetadata::new("/dir/new_format.bin".to_string(), FileType::RegularFile);
+        store.put_file(&new_fmt).unwrap();
+
+        let legacy_fmt = FileMetadata::new("/dir/legacy_format.bin".to_string(), FileType::RegularFile);
+        store.put_file(&legacy_fmt).unwrap();
+        let legacy_blob = bincode::serialize(&legacy_fmt).unwrap();
+        store.put_raw_path_entry("/dir/legacy_format.bin", &legacy_blob).unwrap();
+
+        let mut listed = store.list_directory("/dir").unwrap();
+        listed.sort_by_key(|m| m.path.clone());
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].path, "/dir/legacy_format.bin");
+        assert_eq!(listed[1].path, "/dir/new_format.bin");
+
+        // remove_unlisted_files' path-table sweep must also resolve the legacy
+        // entry correctly to decide liveness, not just skip/mis-clear it.
+        let live_ids: std::collections::HashSet<FileId> = [new_fmt.id, legacy_fmt.id].into_iter().collect();
+        let removed = store.remove_unlisted_files(&live_ids).unwrap();
+        assert_eq!(removed, 0, "both entries are live and must survive reconciliation regardless of on-disk format");
+
+        let live_ids_minus_legacy: std::collections::HashSet<FileId> = [new_fmt.id].into_iter().collect();
+        let removed = store.remove_unlisted_files(&live_ids_minus_legacy).unwrap();
+        assert!(removed > 0, "the now-unlisted legacy-format entry must still be recognized and removed");
+        assert!(store.get_file_by_path("/dir/legacy_format.bin").unwrap().is_none());
+        assert!(store.get_file_by_path("/dir/new_format.bin").unwrap().is_some());
+    }
+
+    /// Regression for the PATH_TABLE dedup fix's actual on-disk effect: repeated
+    /// pushes of a file with a realistic (kdiskmark-sized, 1GB/4MB-chunk)
+    /// chunk_locations array must grow the database by roughly ONE blob's worth
+    /// of bytes per push, not two (FILE_TABLE plus a duplicate PATH_TABLE copy —
+    /// the pre-fix behavior). Live fio repros are too noisy (compaction timing)
+    /// to isolate this one variable cleanly, so this measures it directly
+    /// against a computed old-shape estimate instead of relying on a live A/B.
+    #[test]
+    fn test_path_table_dedup_reduces_total_disk_growth() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let node = NodeId::new();
+
+        let chunk_locations: Vec<_> = (0..256u32).map(|i| {
+            let hash = dfs_common::hash::compute_chunk_hash(format!("c{}", i).as_bytes());
+            dfs_common::ChunkLocation {
+                chunk_id: ChunkId::from_hash(hash),
+                nodes: vec![node],
+                size: 4 * 1024 * 1024,
+                checksum: hash,
+                file_offset: Some(i as u64 * 4 * 1024 * 1024),
+                written_at: Some(1000),
+                client_write_seq: Some(0),
+                file_id: None,
+            }
+        }).collect();
+
+        let mut metadata = FileMetadata::new("/big.bin".to_string(), FileType::RegularFile);
+        metadata.chunk_locations = std::sync::Arc::new(chunk_locations);
+        store.put_file(&metadata).unwrap();
+        let one_blob_size = bincode::serialize(&metadata).unwrap().len() as u64;
+
+        store.compact_db().unwrap();
+        let (live_before, _) = store.redb_fragmentation_stats().unwrap();
+
+        const PUSHES: u64 = 100;
+        for _ in 0..PUSHES {
+            // Re-push with a bumped write_seq/modified_at each time — same shape
+            // as a real repeated patch/background-tick push. Content doesn't
+            // need to change for this measurement, only that each is a genuine
+            // new commit (put_file's is_stale guard would otherwise skip work).
+            metadata.write_seq += 1;
+            metadata.modified_at += 1;
+            store.put_file(&metadata).unwrap();
+        }
+
+        let (live_after, fragmented_after) = store.redb_fragmentation_stats().unwrap();
+        let total_growth = (live_after + fragmented_after).saturating_sub(live_before);
+
+        // Pre-fix, every push wrote one_blob_size bytes to FILE_TABLE AND an
+        // identical one_blob_size to PATH_TABLE — roughly 2x per push. Post-fix,
+        // PATH_TABLE's write shrinks to a 36-byte file_id, so growth should be
+        // close to 1x. Assert well under the old-shape estimate rather than
+        // near-exactly 1x, since B-tree/table overhead isn't purely linear.
+        let old_shape_estimate = 2 * one_blob_size * PUSHES;
+        assert!(
+            total_growth < old_shape_estimate * 2 / 3,
+            "expected roughly half the pre-dedup growth (old-shape estimate={}B, actual={}B)",
+            old_shape_estimate, total_growth
+        );
+    }
+
+    /// repair_path_index's rebuild pass must write the NEW (short file_id) format,
+    /// not resurrect the old blob format it's ostensibly "repairing" — otherwise a
+    /// repair after this change silently reintroduces the write-volume regression
+    /// this whole change exists to fix.
+    #[test]
+    fn test_repair_path_index_rebuilds_in_new_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let metadata = FileMetadata::new("/needs_repair.bin".to_string(), FileType::RegularFile);
+        store.put_file(&metadata).unwrap();
+        store.delete_path_index("/needs_repair.bin").unwrap();
+        assert!(store.get_file_by_path("/needs_repair.bin").unwrap().is_none());
+
+        store.repair_path_index().unwrap();
+
+        let raw = {
+            let _db = store.db.read();
+            let txn = _db.begin_read().unwrap();
+            let path_table = txn.open_table(PATH_TABLE).unwrap();
+            path_table.get("/needs_repair.bin").unwrap().unwrap().value().to_vec()
+        };
+        assert_eq!(raw.len(), 36, "repair must recreate the short file_id format, not the legacy blob");
+        assert_eq!(store.get_file_by_path("/needs_repair.bin").unwrap().unwrap().id, metadata.id);
     }
 
     /// History: this test originally asserted that 500 per-record commits produce

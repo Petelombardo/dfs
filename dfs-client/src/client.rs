@@ -2194,13 +2194,17 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         let (mut chunk_map, mut chunk_offsets, mut nim) = engine.snapshot();
 
-        // TEMP DIAGNOSTIC (2026-07-14): see the fast-empty-return log above — this
-        // pins down which of the three states (cold/synchronous-refresh,
+        // Pins down which of the three states (cold/synchronous-refresh,
         // non-empty-but-stale/background-refresh, or non-empty-and-fresh/served
-        // straight from snapshot) a first read actually observes. A non-empty
-        // chunk_map here on what should be a brand-new engine (get_or_create just
-        // ran) would itself be the finding — the constructor starts genuinely empty.
-        info!("read_file: inode={} pre-refresh snapshot: chunk_map.len()={} needs_refresh={}",
+        // straight from snapshot) a read actually observes. A non-empty chunk_map on
+        // what should be a brand-new engine (get_or_create just ran) is itself a
+        // finding — the constructor starts genuinely empty.
+        //
+        // debug!, not info!: this fires on EVERY read. Beyond the log volume, the
+        // needs_refresh() call below exists only to build this message — at info level
+        // tracing skips evaluating the fields entirely, so it costs nothing on the hot
+        // read path unless someone is actually running the client at debug.
+        debug!("read_file: inode={} pre-refresh snapshot: chunk_map.len()={} needs_refresh={}",
             inode, chunk_map.len(), engine.needs_refresh(file_size, current_chunk));
 
         if chunk_map.is_empty() {

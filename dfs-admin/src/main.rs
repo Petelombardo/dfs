@@ -980,7 +980,7 @@ async fn handle_file_command(
                         let output = serde_json::json!({
                             "path": metadata.path,
                             "size": metadata.size,
-                            "chunks": metadata.chunk_locations.len(),
+                            "chunks": chunk_locations.len(),
                             "created_at": metadata.created_at,
                             "modified_at": metadata.modified_at,
                             "mode": format!("{:o}", metadata.mode),
@@ -1001,7 +1001,7 @@ async fn handle_file_command(
                         println!("==================");
                         println!("Path:       {}", metadata.path);
                         println!("Size:       {} bytes", metadata.size);
-                        println!("Chunks:     {}", metadata.chunk_locations.len());
+                        println!("Chunks:     {}", chunk_locations.len());
                         println!("Created:    {}", metadata.created_at);
                         println!("Modified:   {}", metadata.modified_at);
                         println!("Mode:       {:o}", metadata.mode);
@@ -1239,7 +1239,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
         _ => anyhow::bail!("Unexpected response"),
     };
 
-    let old_chunk_count = metadata.chunk_locations.len();
+    let old_chunk_count = existing_locations.len();
     let file_size = metadata.size;
 
     // Skip if already well-packed (average chunk size >= 2MB)
@@ -1315,7 +1315,7 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
     // Helper closure to write a buffer to 2 nodes and return ChunkLocations
     // We'll do this inline in the loop below
 
-    for (i, loc) in metadata.chunk_locations.iter().enumerate() {
+    for (i, loc) in existing_locations.iter().enumerate() {
         let chunk_id = &loc.chunk_id;
         // Pick the best node to read from
         let read_addr = chunk_node_map.get(chunk_id)

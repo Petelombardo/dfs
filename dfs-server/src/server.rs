@@ -2107,73 +2107,76 @@ impl Server {
         let metadata = self.metadata.clone();
 
         std::thread::spawn(move || {
-            let mut built = 0usize;
-            let mut total = 0usize;
-
-            let result = metadata.scan_files(|file| {
-                total += 1;
-                if !file.chunk_locations.is_empty() {
-                    const CHUNK_SIZE_REBUILD: u64 = 4 * 1024 * 1024;
-                    // Sort by file_offset before seeding: chunk_map_update_location_for_file's
-                    // partition_point binary search assumes this Vec stays sorted by chunk_idx,
-                    // an invariant it maintains itself for entries it touches but can't repair
-                    // for entries it never touches. A record persisted before
-                    // merge_file_metadata's own sort fix (or one whose chunks simply merged
-                    // out of offset order — routine under buffered/background-tick writes)
-                    // would otherwise seed chunk_map already-unsorted, and every later binary
-                    // search against it is then working over broken invariants.
-                    let mut sorted_locs = file.chunk_locations.as_ref().clone();
-                    sorted_locs.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
-
-                    // Merge into whatever's already there instead of skipping outright —
-                    // an incoming RCL that raced this scan and created the entry first
-                    // only ever reports ONE chunk_idx, not the whole file. The old
-                    // `or_insert_with` treated that lone chunk as proof the entry was
-                    // already fully up to date and left it there untouched, silently
-                    // discarding every OTHER chunk this scan would have restored —
-                    // reproduced live via an upgrade-compat test: a 3-chunk file's
-                    // chunk_map got stuck at 1 chunk after restart because a post-join
-                    // self-report RCL for chunk 0 beat this scan to the entry.
-                    // Per-chunk_idx precedence: keep whatever's already at an index
-                    // (the RCL is fresher for that one slot), only add indices this
-                    // entry doesn't have yet.
-                    chunk_map.entry(file.id)
-                        .and_modify(|(existing_locs, existing_seq)| {
-                            let mut have: std::collections::HashSet<u64> = existing_locs.iter()
-                                .filter_map(|l| l.file_offset.map(|o| o / CHUNK_SIZE_REBUILD))
-                                .collect();
-                            for loc in &sorted_locs {
-                                let idx = loc.file_offset.map(|o| o / CHUNK_SIZE_REBUILD);
-                                if idx.is_none_or(|i| !have.contains(&i)) {
-                                    if let Some(i) = idx {
-                                        have.insert(i);
-                                    }
-                                    existing_locs.push(loc.clone());
-                                }
-                            }
-                            existing_locs.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
-                            *existing_seq = (*existing_seq).max(file.write_seq);
-                        })
-                        .or_insert_with(|| (sorted_locs, file.write_seq));
-                    let inserted = chunk_map.get(&file.id).expect("just inserted or modified above");
-                    let (locs, _) = inserted.value();
-                    for loc in locs {
-                        chunk_to_file.insert(loc.chunk_id, file.id);
-                    }
-                    built += 1;
-                }
-                // Seed file_write_seqs so the bypass guard has a correct baseline
-                // on startup — prevents stale messages from a previous session
-                // (with lower write_seq) from bypassing the guard after restart.
+            // Pass 1: scan_files, unchanged — seeds file_write_seqs from each file's
+            // scalar write_seq field (untouched by the chunk_locations persistence
+            // change; put_file_in_txn never clears anything but chunk_locations). Also
+            // needed BEFORE pass 2 so fresh chunk_map inserts there have a write_seq to
+            // seed with (ChunkLocation itself carries no file-level write_seq).
+            let mut total_files = 0usize;
+            let scan1 = metadata.scan_files(|file| {
+                total_files += 1;
                 if file.write_seq > 0 {
                     file_write_seqs.insert(file.id, file.write_seq);
                 }
                 Ok(())
             });
+            if let Err(e) = scan1 {
+                warn!("Chunk map build failed during file scan: {}", e);
+                return;
+            }
 
-            match result {
-                Ok(()) => info!("Chunk map built: {} / {} files indexed", built, total),
-                Err(e) => warn!("Chunk map build failed partway through: {}", e),
+            // Pass 2: stream CHUNK_TABLE (the sole authoritative per-chunk store —
+            // chunk_locations is never persisted in FileMetadata anymore, see
+            // put_file_in_txn's doc comment) and group by each ChunkLocation's own
+            // file_id field, which every real write path has always populated.
+            //
+            // Per-chunk_idx merging goes through chunk_map_update_location_for_file_sync
+            // — the SAME logic every live write already uses — rather than a bespoke
+            // "keep whichever we saw first" merge. This matters because CHUNK_TABLE can
+            // (and, confirmed via a real-staging-data backward-compat check, routinely
+            // does) hold MULTIPLE chunk_id rows for the same (file_id, chunk_idx) slot:
+            // successive patch rotations before the orphaned old chunk_id's row gets
+            // swept. redb's iteration order for those is by chunk_id (a content hash) —
+            // effectively arbitrary relative to recency, NOT a proxy for "most recent."
+            // A naive first-wins merge silently picks stale/wrong content for any
+            // actively-patched file; only the write_seq/written_at comparison inside
+            // the shared helper can correctly pick the current one. It also correctly
+            // maintains chunk_to_file (including removing the superseded chunk_id's
+            // reverse-index entry when a fresher one wins) — this rebuild's own manual
+            // chunk_to_file.insert used to skip that removal entirely.
+            const CHUNK_SIZE_REBUILD: u64 = 4 * 1024 * 1024;
+            let mut built_chunks = 0usize;
+            let mut skipped_no_file_id = 0usize;
+            let scan2 = metadata.scan_chunk_locations(|loc| {
+                let Some(file_id) = loc.file_id else {
+                    // Legacy chunk written before file_id was added to ChunkLocation —
+                    // can't attribute it to a file here. Rare in practice (every real
+                    // write path has set this field for a long time); such a chunk
+                    // simply doesn't seed chunk_map from this pass, matching the old
+                    // per-file scan's same inability to help an unattributable entry.
+                    skipped_no_file_id += 1;
+                    return true;
+                };
+                Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, file_id, &loc);
+                // The shared helper seeds a brand-new entry's write_seq field from the
+                // CHUNK's own client_write_seq (chunk-level) — preserve this rebuild's
+                // original semantics of also folding in the FILE's scalar write_seq
+                // (from FileMetadata, seeded into file_write_seqs by pass 1 above).
+                let seed_write_seq = file_write_seqs.get(&file_id).map(|v| *v).unwrap_or(0);
+                if let Some(mut entry) = chunk_map.get_mut(&file_id) {
+                    let (_, seq) = entry.value_mut();
+                    *seq = (*seq).max(seed_write_seq);
+                }
+                built_chunks += 1;
+                true
+            });
+
+            match scan2 {
+                Ok(()) => info!(
+                    "Chunk map built: {} chunks indexed across {} files ({} chunk(s) skipped, no file_id)",
+                    built_chunks, total_files, skipped_no_file_id
+                ),
+                Err(e) => warn!("Chunk map build failed during chunk scan: {}", e),
             }
         });
     }
@@ -2391,13 +2394,41 @@ impl Server {
     /// timestamp) for legacy records that predate the client_write_seq field.
     /// Fresh writes carry client_write_seq=None so any patch (seq > 0) always wins.
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
+        Self::chunk_map_update_location_for_file_sync(&self.chunk_map, &self.chunk_to_file, file_id, location);
+    }
+
+    /// Sync core of chunk_map_update_location_for_file — extracted so
+    /// rebuild_chunk_map_from_metadata (which runs on a plain std::thread, not the
+    /// async runtime) can reuse the exact same per-chunk_idx staleness-comparison
+    /// logic instead of a hand-rolled duplicate. Contains no .await anywhere (pure
+    /// DashMap manipulation), so the split is a pure refactor — the async wrapper
+    /// above is unchanged in behavior for every existing caller.
+    ///
+    /// This is the ONLY correct way to merge multiple ChunkLocation candidates for
+    /// the same (file_id, chunk_idx) slot: a naive "keep whichever we saw first" is
+    /// wrong, because a real file can have MULTIPLE chunk_id rows in CHUNK_TABLE for
+    /// the same chunk_idx (successive patch rotations before the orphaned old
+    /// chunk_id's row gets swept) — redb's iteration order for those is by chunk_id
+    /// (a content hash), i.e. effectively arbitrary relative to recency, not a
+    /// reliable proxy for "most recent." Only the client_write_seq/written_at
+    /// comparison below can correctly pick the current one, confirmed via the
+    /// 2026-07-16 real-staging-data backward-compat check (raw per-file chunk
+    /// counts diverged sharply from the legacy embedded array for heavily-patched
+    /// files — e.g. one file showed 1 embedded chunk vs 1236 CHUNK_TABLE rows for
+    /// the same file_id, all patch history for one hot, frequently-rewritten slot).
+    fn chunk_map_update_location_for_file_sync(
+        chunk_map: &DashMap<FileId, (Vec<ChunkLocation>, u64)>,
+        chunk_to_file: &DashMap<ChunkId, FileId>,
+        file_id: FileId,
+        location: &ChunkLocation,
+    ) {
         // Use entry() to atomically create-or-get: for brand-new files that have no
         // chunk_map entry yet, this inserts an empty Vec so subsequent logic can push
         // the first chunk in. Without this, every ReplicateChunkLocation for a new file
         // was a silent no-op and chunk_map stayed empty for the entire recording session.
         // Seed the 2nd field from this location's client_write_seq (clock-agnostic) —
         // not wall-clock — since chunk_map's 2nd field is write_seq-space.
-        let mut entry = self.chunk_map.entry(file_id)
+        let mut entry = chunk_map.entry(file_id)
             .or_insert_with(|| (vec![], location.client_write_seq.unwrap_or(0)));
         let (locs, _) = entry.value_mut();
         // Match by chunk_idx (file_offset / CHUNK_SIZE), NOT exact file_offset. Two writes
@@ -2433,7 +2464,20 @@ impl Server {
                     true
                 } else {
                     match (location.client_write_seq, loc.client_write_seq) {
-                        (Some(inc), Some(ext)) => inc >= ext,
+                        (Some(inc), Some(ext)) if inc != ext => inc >= ext,
+                        (Some(_), Some(_)) => {
+                            // Equal client_write_seq: a genuine same-seq race (concurrent
+                            // writers, or a retry that reused a seq — confirmed live via a
+                            // real historical T28 race repro: two writes landed with the same
+                            // client_write_seq=11 and different written_at). write_seq alone
+                            // can't order these — fall back to written_at, the same tie-break
+                            // the legacy (None, None) arm already uses below. Without this,
+                            // arbitrary CHUNK_TABLE iteration order (rebuild_chunk_map_from_metadata,
+                            // metadata repair) picks whichever row it happens to visit last —
+                            // not the actually-newer write — silently serving stale/wrong
+                            // content (or a chunk_id absent from local disk) for that chunk_idx.
+                            location.written_at.unwrap_or(0) >= loc.written_at.unwrap_or(0)
+                        }
                         (Some(_), None)        => true,  // incoming has seq, existing is legacy → accept
                         (None, Some(_))        => false, // existing has seq, incoming is legacy → keep
                         (None, None)           => {
@@ -2443,9 +2487,9 @@ impl Server {
                     }
                 };
                 if should_update {
-                    self.chunk_to_file.remove(&loc.chunk_id);
+                    chunk_to_file.remove(&loc.chunk_id);
                     *loc = location.clone();
-                    self.chunk_to_file.insert(location.chunk_id, file_id);
+                    chunk_to_file.insert(location.chunk_id, file_id);
                 } else {
                     // Stale RCL rejected: log so we can confirm the guard is working.
                     debug!("[RCL-stale-rejected] file={:?} chunk_idx={} kept={} (seq={:?}) dropped={} (seq={:?})",
@@ -2456,7 +2500,7 @@ impl Server {
             }
             // No entry for this chunk_idx — insert at sorted position so Vec stays ordered.
             locs.insert(pos, location.clone());
-            self.chunk_to_file.insert(location.chunk_id, file_id);
+            chunk_to_file.insert(location.chunk_id, file_id);
             return;
         }
         // No file_offset (legacy path only — every real write carries one, so this is
@@ -2465,7 +2509,7 @@ impl Server {
         for loc in locs.iter_mut() {
             if loc.chunk_id == location.chunk_id {
                 *loc = location.clone();
-                self.chunk_to_file.insert(location.chunk_id, file_id);
+                chunk_to_file.insert(location.chunk_id, file_id);
                 return;
             }
         }
@@ -3126,10 +3170,23 @@ impl Server {
         let metadata = server.metadata.clone();
 
         let files: Vec<dfs_common::FileMetadata> = tokio::task::spawn_blocking(move || {
+            // Which files this node holds at least one chunk of — derived from
+            // CHUNK_TABLE (the sole authoritative per-chunk store; the embedded
+            // FileMetadata.chunk_locations array is never persisted anymore, see
+            // put_file_in_txn's doc comment), not the old embedded-array check.
+            let mut held_file_ids: std::collections::HashSet<dfs_common::FileId> = std::collections::HashSet::new();
+            let _ = metadata.scan_chunk_locations(|loc| {
+                if loc.nodes.contains(&my_node_id) {
+                    if let Some(fid) = loc.file_id {
+                        held_file_ids.insert(fid);
+                    }
+                }
+                true
+            });
+
             let mut held = Vec::new();
             let _ = metadata.scan_files(|file| {
-                // Only push files where we actually hold at least one chunk on disk.
-                if file.chunk_locations.iter().any(|loc| loc.nodes.contains(&my_node_id)) {
+                if held_file_ids.contains(&file.id) {
                     held.push(file);
                 }
                 Ok(())
@@ -7794,9 +7851,36 @@ impl Server {
     }
 
     /// Fetch full metadata for a batch of file IDs.
+    /// Used by run_metadata_catchup — a newly-elected leader pulling FILE_TABLE records
+    /// it's missing or stale on from peers, then seeding its own in-memory chunk_map from
+    /// each item's chunk_locations (see the caller's chunk_map_update call). The raw
+    /// persisted FileMetadata.chunk_locations is never populated anymore (see
+    /// put_file_in_txn's doc comment), so this enriches each item from CHUNK_TABLE —
+    /// via ONE scan bucketed by file_id, not a per-item chunk_locations_for_info call
+    /// (which would be O(batch_size * table_size) and a real cost on catchup after a
+    /// long leader outage with thousands of missing files).
     async fn handle_get_file_metadata_batch(&self, file_ids: Vec<FileId>) -> Response {
         let metadata = self.metadata.clone();
-        match tokio::task::spawn_blocking(move || metadata.get_files_batch(&file_ids)).await {
+        let wanted: std::collections::HashSet<FileId> = file_ids.iter().copied().collect();
+        match tokio::task::spawn_blocking(move || -> Result<Vec<FileMetadata>, anyhow::Error> {
+            let mut items = metadata.get_files_batch(&file_ids)?;
+            let mut by_file: std::collections::HashMap<FileId, Vec<ChunkLocation>> = std::collections::HashMap::new();
+            metadata.scan_chunk_locations(|loc| {
+                if let Some(fid) = loc.file_id {
+                    if wanted.contains(&fid) {
+                        by_file.entry(fid).or_default().push(loc);
+                    }
+                }
+                true
+            })?;
+            for item in items.iter_mut() {
+                if let Some(mut locs) = by_file.remove(&item.id) {
+                    locs.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+                    item.chunk_locations = std::sync::Arc::new(locs);
+                }
+            }
+            Ok(items)
+        }).await {
             Ok(Ok(items)) => Response::FileMetadataBatch { items },
             Ok(Err(e)) => {
                 warn!("get_file_metadata_batch failed: {}", e);
@@ -7848,17 +7932,67 @@ impl Server {
         let chunk_size = self.chunker.chunk_size() as u64;
         let partial_bytes = metadata.size % chunk_size;
 
-        let (write_data, drop_last_chunk, actual_partial_bytes) = if partial_bytes > 0 {
-            // File ends mid-chunk — read back the partial last chunk and prepend it
-            let last_loc = match metadata.chunk_locations.last() {
-                Some(loc) => loc.clone(),
+        // drop_last_chunk (the middle tuple field) is unused: chunk_map_update_location_for_file's
+        // per-chunk_idx replace naturally supersedes the old partial-tail entry once the
+        // re-chunked data's first new location lands at the same chunk_idx — no separate
+        // "drop" step needed (see the loop below). Kept in the tuple for symmetry with the
+        // two branches below rather than restructuring both arms' return shape.
+        let (write_data, _drop_last_chunk, actual_partial_bytes) = if partial_bytes > 0 {
+            // File ends mid-chunk — read back the partial last chunk and prepend it.
+            //
+            // Source: chunk_map (in-memory, kept current incrementally by every write
+            // path including this one — see the per-chunk chunk_map_update_location_for_file
+            // call below), NOT the persisted FileMetadata.chunk_locations. That field is
+            // deliberately never populated on disk (see put_file_in_txn's doc comment) —
+            // CHUNK_TABLE/chunk_map are the sole source of truth for per-chunk routing,
+            // avoiding the O(chunks-in-file) rewrite this handler used to pay on every
+            // append by round-tripping the whole array through redb just for this one
+            // lookup. Falls back to a direct CHUNK_TABLE scan only in the cold case
+            // (chunk_map has no entry yet for this file — e.g. the first append right
+            // after a restart, before rebuild_chunk_map_from_metadata finishes).
+            let last_loc = match self.chunk_map.get(&file_id).and_then(|entry| entry.value().0.last().cloned()) {
+                Some(loc) => loc,
                 None => {
-                    // chunk_locations empty but file has data — try legacy chunks
-                    warn!("AppendFile: file {} has size {} but no chunk_locations, falling back", file_id, metadata.size);
-                    return Response::Error {
-                        message: "File metadata has no chunk locations".to_string(),
-                        code: ErrorCode::InternalError,
-                    };
+                    // Cold fallback: chunk_map has no entry for this file yet (e.g. first
+                    // append right after a restart, before rebuild_chunk_map_from_metadata
+                    // finishes). CHUNK_TABLE is unconditionally complete and authoritative
+                    // for every chunk regardless of when it was written — scan it directly,
+                    // filtered to this file, and keep the highest-offset entry.
+                    let metadata_store = self.metadata.clone();
+                    let scan_result = tokio::task::spawn_blocking(move || {
+                        let mut best: Option<ChunkLocation> = None;
+                        metadata_store.scan_chunk_locations(|loc| {
+                            if loc.file_id == Some(file_id)
+                                && best.as_ref().map_or(true, |b| loc.file_offset > b.file_offset)
+                            {
+                                best = Some(loc);
+                            }
+                            true
+                        })?;
+                        Ok::<_, anyhow::Error>(best)
+                    }).await;
+                    match scan_result {
+                        Ok(Ok(Some(loc))) => loc,
+                        Ok(Ok(None)) => {
+                            warn!("AppendFile: file {} has size {} but no chunk locations found in CHUNK_TABLE", file_id, metadata.size);
+                            return Response::Error {
+                                message: "File metadata has no chunk locations".to_string(),
+                                code: ErrorCode::InternalError,
+                            };
+                        }
+                        Ok(Err(e)) => {
+                            return Response::Error {
+                                message: format!("Failed to scan chunk locations: {}", e),
+                                code: ErrorCode::InternalError,
+                            };
+                        }
+                        Err(e) => {
+                            return Response::Error {
+                                message: format!("Chunk location scan panicked: {}", e),
+                                code: ErrorCode::InternalError,
+                            };
+                        }
+                    }
                 }
             };
 
@@ -7996,6 +8130,17 @@ impl Server {
             // Persist chunk location locally
             let _ = self.metadata.put_chunk_location_async(location.clone()).await;
 
+            // Keep chunk_map current incrementally, per chunk, exactly like every other
+            // write path (handle_replicate_chunk_location, etc.) — this is what makes the
+            // last_loc lookup above (and any subsequent AppendFile call for this file)
+            // correct without needing to round-trip the full chunk_locations array through
+            // redb. Binary-search-by-chunk_idx replace: when this new chunk's offset lands
+            // at the same chunk_idx as the old partial-tail chunk (the common case — the
+            // re-chunked combined data starts at the same base_offset the old tail did),
+            // this naturally supersedes/replaces that stale entry — no separate "drop the
+            // old tail" step needed.
+            self.chunk_map_update_location_for_file(file_id, &location).await;
+
             // Broadcast chunk location to remaining nodes fire-and-forget
             {
                 let all_nodes = self.cluster.get_all_nodes().await;
@@ -8017,13 +8162,11 @@ impl Server {
             new_locations.push(location);
         }
 
-        // --- Step 7: Splice metadata ---
-        if drop_last_chunk {
-            Arc::make_mut(&mut metadata.chunk_locations).pop();
-        }
-        for loc in &new_locations {
-            Arc::make_mut(&mut metadata.chunk_locations).push(loc.clone());
-        }
+        // Step 7 (splicing new_locations into metadata.chunk_locations before persisting)
+        // is gone: put_file_in_txn never persists chunk_locations regardless of what's
+        // here (see its doc comment), and chunk_map is already correctly current via the
+        // per-chunk chunk_map_update_location_for_file calls in the loop above — nothing
+        // downstream needs a spliced copy of new_locations on `metadata` anymore.
 
         // --- Step 8: Update metadata size and timestamp ---
         // Use actual_partial_bytes (from disk) not partial_bytes (from metadata) so
@@ -8042,11 +8185,33 @@ impl Server {
             };
         }
 
-        // Update in-memory chunk map
-        self.chunk_map_update(&metadata).await;
+        // chunk_map is already correctly current — updated per-chunk via
+        // chunk_map_update_location_for_file in the write loop above. The bulk
+        // chunk_map_update(&metadata) call that used to run here relied on `metadata`
+        // carrying the full spliced chunk_locations array (now removed, step 7) and would
+        // be a no-op today regardless (chunk_map_update skips empty chunk_locations) —
+        // removed rather than left as dead code. chunk_map_update also does a full
+        // REPLACE (not merge) of the file's chunk_map entry when called, which would have
+        // been actively wrong here even with a non-empty array unless it were the
+        // complete history, not just this call's delta.
 
         // --- Step 10: Enqueue metadata for follower dissemination (leader-only). ---
-        self.enqueue_metadata_for_followers(&metadata).await;
+        // enqueue_metadata_for_followers feeds the durable per-follower catch-up queue
+        // for OFFLINE followers — handle_disseminate_metadata's receiving side reconciles
+        // and seeds ITS OWN chunk_map straight from this wire payload's chunk_locations
+        // (see chunk_map_update there), since an offline follower never saw the live
+        // per-chunk ReplicateChunkLocation fire-and-forget broadcasts above. Build a
+        // wire-only populated copy from chunk_map (already correct) for this call —
+        // put_file_in_txn strips chunk_locations before persisting regardless (step 9,
+        // already done), so this doesn't reintroduce the O(n) persistence cost.
+        let metadata_for_dissemination = {
+            let mut m = metadata.clone();
+            if let Some(entry) = self.chunk_map.get(&file_id) {
+                m.chunk_locations = std::sync::Arc::new(entry.value().0.clone());
+            }
+            m
+        };
+        self.enqueue_metadata_for_followers(&metadata_for_dissemination).await;
 
         // Tell the client how many bytes remain before this chunk seals.
         // When remaining_in_chunk == 0 the chunk is exactly full and the client
@@ -9258,7 +9423,22 @@ impl Server {
             }
         };
 
-        let chunk_ids: Vec<ChunkId> = metadata.chunk_locations.iter()
+        // metadata.chunk_locations is never persisted anymore (see put_file_in_txn's
+        // doc comment) — derive the real chunk list from CHUNK_TABLE. This drives
+        // actual on-disk chunk deletion below (DeleteQueueEntry) and CHUNK_TABLE
+        // cleanup — reading an empty array here would silently leak every deleted
+        // file's chunk data and CHUNK_TABLE rows forever.
+        let file_chunk_locs = match self.chunk_locations_for_info(metadata.id) {
+            Ok(locs) => locs,
+            Err(e) => {
+                warn!("Failed to resolve chunk locations for delete of {}: {}", path, e);
+                return Response::Error {
+                    message: format!("Failed to resolve chunk locations: {}", e),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        };
+        let chunk_ids: Vec<ChunkId> = file_chunk_locs.iter()
             .map(|loc| loc.chunk_id)
             .collect();
 
@@ -9311,8 +9491,12 @@ impl Server {
         // slot (which never comes, since the file is gone). Confirmed root cause of the
         // gluster3 RSS growth during repeated create/delete/recreate benchmark runs
         // (2026-07-13).
-        for (chunk_idx, loc) in metadata.chunk_locations.iter().enumerate() {
-            let chunk_idx = chunk_idx as u64;
+        const CHUNK_SIZE_DELETE: u64 = 4 * 1024 * 1024;
+        for loc in file_chunk_locs.iter() {
+            // Computed from file_offset, not vector position: chunk_locations_for_info
+            // doesn't dedupe un-swept patch-rotation duplicates at the same offset, so
+            // enumerate() position would drift from the true chunk_idx once any exist.
+            let chunk_idx = loc.file_offset.unwrap_or(0) / CHUNK_SIZE_DELETE;
             self.chunk_patch_locks.remove(&(metadata.id, chunk_idx));
             self.dirty_patch_slots.remove(&(metadata.id, chunk_idx));
             self.pending_patch_ids.remove(&loc.chunk_id);
@@ -9922,6 +10106,8 @@ impl Server {
     async fn handle_trigger_metadata_repair(&self) -> Response {
         let metadata = self.metadata.clone();
         let chunk_map = self.chunk_map.clone();
+        let chunk_to_file = self.chunk_to_file.clone();
+        let file_write_seqs = self.file_write_seqs.clone();
         let cluster = self.cluster.clone();
         let client = self.network_client();
         let local_id = self.cluster.local_node_id();
@@ -9940,18 +10126,39 @@ impl Server {
                             info!("Metadata repair: path index repair complete");
                         }
 
-                        // Rebuild in-memory chunk map.
-                        let mut built = 0usize;
+                        // Rebuild in-memory chunk map from CHUNK_TABLE (the sole
+                        // authoritative per-chunk store — chunk_locations is never
+                        // persisted in FileMetadata anymore, see put_file_in_txn's doc
+                        // comment). Mirrors rebuild_chunk_map_from_metadata's pass 1+2
+                        // exactly: seed file_write_seqs from scalar fields first, then
+                        // merge CHUNK_TABLE per-chunk_idx via the shared staleness-aware
+                        // helper — NOT a blind per-file overwrite, since CHUNK_TABLE can
+                        // hold multiple chunk_id rows for the same (file_id, chunk_idx)
+                        // slot from patch rotation, in arbitrary (hash) iteration order.
                         let mut total = 0usize;
                         let _ = metadata.scan_files(|file| {
                             total += 1;
-                            if !file.chunk_locations.is_empty() {
-                                chunk_map.insert(file.id, (file.chunk_locations.as_ref().clone(), file.write_seq));
-                                built += 1;
+                            if file.write_seq > 0 {
+                                file_write_seqs.insert(file.id, file.write_seq);
                             }
                             Ok(())
                         });
-                        info!("Metadata repair: chunk map rebuilt: {}/{} files", built, total);
+                        let mut built = 0usize;
+                        let scan2 = metadata.scan_chunk_locations(|loc| {
+                            let Some(file_id) = loc.file_id else { return true; };
+                            Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, file_id, &loc);
+                            let seed_write_seq = file_write_seqs.get(&file_id).map(|v| *v).unwrap_or(0);
+                            if let Some(mut entry) = chunk_map.get_mut(&file_id) {
+                                let (_, seq) = entry.value_mut();
+                                *seq = (*seq).max(seed_write_seq);
+                            }
+                            built += 1;
+                            true
+                        });
+                        if let Err(e) = scan2 {
+                            warn!("Metadata repair: chunk map rebuild failed during chunk scan: {}", e);
+                        }
+                        info!("Metadata repair: chunk map rebuilt: {} chunks across {} files", built, total);
 
                         // Rebuild missing chunk: routing table entries.
                         info!("Metadata repair: rebuilding missing chunk location records");
@@ -9964,24 +10171,21 @@ impl Server {
                                 warn!("Metadata repair: chunk location rebuild failed: {}", e),
                         }
 
-                        // Collect files needing size verification (deferred — quorum query
-                        // happens after the blocking task, on the async side).
-                        let files_to_check: Vec<dfs_common::FileMetadata> = {
-                            let mut v = Vec::new();
-                            let _ = metadata.scan_files(|file| {
-                                if !file.chunk_locations.is_empty() {
-                                    v.push(file.clone());
-                                }
-                                Ok(())
-                            });
-                            v
-                        };
-
-                        // Collect the authoritative live file ID set from this node's
-                        // now-repaired file: records. Sent to followers for reconciliation.
+                        // Collect every live file for size verification (deferred — quorum
+                        // query happens after the blocking task, on the async side) and
+                        // the authoritative live file ID set for follower reconciliation,
+                        // in one pass. Previously filtered on `!file.chunk_locations.is_empty()`
+                        // to skip files with no chunks yet — but chunk_locations is never
+                        // persisted anymore (see put_file_in_txn), so that filter would now
+                        // silently drop every file touched since Phase 4 deployed from size
+                        // verification. Files with genuinely zero chunks are naturally
+                        // skipped downstream instead: node_ids_for_file/all_chunk_ids come
+                        // up empty, no node responds, and the per-file loop `continue`s.
+                        let mut files_to_check: Vec<dfs_common::FileMetadata> = Vec::new();
                         let mut ids = Vec::new();
                         let _ = metadata.scan_files(|file| {
                             ids.push(file.id);
+                            files_to_check.push(file.clone());
                             Ok(())
                         });
                         info!("Metadata repair: collected {} live file IDs for follower reconciliation", ids.len());
@@ -10027,17 +10231,44 @@ impl Server {
             // We'll populate this lazily as we process each file.
 
             for file in &files_to_check {
+                // Real chunk list for this file: chunk_map first (already rebuilt above
+                // by Step 1 and kept current by every live write), falling back to a
+                // CHUNK_TABLE scan for the rare case chunk_map has no entry yet.
+                // file.chunk_locations is never populated anymore (see put_file_in_txn's
+                // doc comment) — must not read it here.
+                let chunk_locs: Vec<ChunkLocation> = match chunk_map.get(&file.id) {
+                    Some(entry) if !entry.value().0.is_empty() => entry.value().0.clone(),
+                    _ => {
+                        let metadata = metadata.clone();
+                        let file_id = file.id;
+                        tokio::task::spawn_blocking(move || {
+                            let mut v = Vec::new();
+                            let _ = metadata.scan_chunk_locations(|loc| {
+                                if loc.file_id == Some(file_id) {
+                                    v.push(loc);
+                                }
+                                true
+                            });
+                            v
+                        }).await.unwrap_or_default()
+                    }
+                };
+
+                if chunk_locs.is_empty() {
+                    continue;
+                }
+
                 // Collect all unique node IDs referenced by this file's chunks.
                 let mut node_ids_for_file: std::collections::HashSet<dfs_common::NodeId> =
                     std::collections::HashSet::new();
-                for loc in file.chunk_locations.iter() {
+                for loc in chunk_locs.iter() {
                     for &nid in &loc.nodes {
                         node_ids_for_file.insert(nid);
                     }
                 }
 
                 let all_chunk_ids: Vec<dfs_common::ChunkId> =
-                    file.chunk_locations.iter().map(|l| l.chunk_id).collect();
+                    chunk_locs.iter().map(|l| l.chunk_id).collect();
 
                 // Query each node that holds chunks of this file once,
                 // getting physical sizes for all chunks in the file in one RPC.
@@ -10084,7 +10315,7 @@ impl Server {
                 let mut authoritative_file_size: u64 = 0;
                 let mut any_chunk_ambiguous = false;
 
-                for (chunk_idx, loc) in file.chunk_locations.iter().enumerate() {
+                for (chunk_idx, loc) in chunk_locs.iter().enumerate() {
                     let chunk_offset = loc.file_offset.unwrap_or(chunk_idx as u64 * CHUNK_SIZE_FOR_REPAIR);
 
                     // Collect physical sizes from nodes listed as holding this chunk.
@@ -10260,7 +10491,15 @@ impl Server {
         };
         drop(healing_guard);
 
-        let chunk_ids: Vec<ChunkId> = file_meta.chunk_locations.iter().map(|l| l.chunk_id).collect();
+        // file_meta.chunk_locations is never persisted anymore (see put_file_in_txn's
+        // doc comment) — derive the real chunk list from CHUNK_TABLE instead.
+        let chunk_ids: Vec<ChunkId> = match self.chunk_locations_for_info(file_meta.id) {
+            Ok(locs) => locs.iter().map(|l| l.chunk_id).collect(),
+            Err(e) => return Response::Error {
+                message: format!("Failed to resolve chunk locations: {}", e),
+                code: ErrorCode::InternalError,
+            },
+        };
         let count = chunk_ids.len();
         healing.queue_chunks_immediate(chunk_ids).await;
 
@@ -10343,7 +10582,16 @@ impl Server {
             grace_elapsed
         };
 
-        let total_chunks = file_meta.chunk_locations.len();
+        // file_meta.chunk_locations is never persisted anymore (see put_file_in_txn's
+        // doc comment) — derive the real chunk list from CHUNK_TABLE instead.
+        let file_chunk_locs = match self.chunk_locations_for_info(file_meta.id) {
+            Ok(locs) => locs,
+            Err(e) => return Response::Error {
+                message: format!("Failed to resolve chunk locations: {}", e),
+                code: ErrorCode::InternalError,
+            },
+        };
+        let total_chunks = file_chunk_locs.len();
         let file_path = file_meta.path.clone();
 
         // Clone everything the background task needs.
@@ -10360,7 +10608,7 @@ impl Server {
             let mut corrupt_removed = 0usize;
             let mut heal_queued = 0usize;
 
-            for chunk_loc in file_meta.chunk_locations.iter() {
+            for chunk_loc in file_chunk_locs.iter() {
                 let chunk_id = chunk_loc.chunk_id;
                 let file_offset = match chunk_loc.file_offset {
                     Some(o) => o,
@@ -10583,14 +10831,40 @@ impl Server {
         }
     }
 
+    /// Derive a file's chunk_locations for admin display (`dfs-admin file info`) from
+    /// CHUNK_TABLE rather than the (now permanently empty, see put_file_in_txn's doc
+    /// comment) embedded array. Each entry still goes through
+    /// resolve_chunk_location_for_info — cheap, and preserves its patch-token-fold
+    /// resolution unconditionally rather than reasoning about whether it's still needed
+    /// now that the source scan is already CHUNK_TABLE-live (the nodes cross-check part
+    /// of that function is redundant with a live-sourced entry, but harmless).
+    fn chunk_locations_for_info(&self, file_id: dfs_common::FileId) -> Result<Vec<ChunkLocation>, anyhow::Error> {
+        let mut locations = Vec::new();
+        self.metadata.scan_chunk_locations(|loc| {
+            if loc.file_id == Some(file_id) {
+                locations.push(self.resolve_chunk_location_for_info(&loc));
+            }
+            true
+        })?;
+        locations.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+        Ok(locations)
+    }
+
     async fn handle_get_file_info(&self, path: String) -> Response {
         debug!("Handling get file info: {}", path);
 
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                let chunk_locations: Vec<ChunkLocation> = metadata.chunk_locations.iter()
-                    .map(|inline| self.resolve_chunk_location_for_info(inline))
-                    .collect();
+                let chunk_locations = match self.chunk_locations_for_info(metadata.id) {
+                    Ok(locs) => locs,
+                    Err(e) => {
+                        warn!("Failed to resolve chunk locations for {}: {}", path, e);
+                        return Response::Error {
+                            message: format!("Failed to resolve chunk locations: {}", e),
+                            code: ErrorCode::InternalError,
+                        };
+                    }
+                };
 
                 Response::FileInfo {
                     metadata,
@@ -10617,9 +10891,16 @@ impl Server {
 
         match self.metadata.get_file(&file_id) {
             Ok(Some(metadata)) => {
-                let chunk_locations: Vec<ChunkLocation> = metadata.chunk_locations.iter()
-                    .map(|inline| self.resolve_chunk_location_for_info(inline))
-                    .collect();
+                let chunk_locations = match self.chunk_locations_for_info(file_id) {
+                    Ok(locs) => locs,
+                    Err(e) => {
+                        warn!("Failed to resolve chunk locations for {}: {}", file_id, e);
+                        return Response::Error {
+                            message: format!("Failed to resolve chunk locations: {}", e),
+                            code: ErrorCode::InternalError,
+                        };
+                    }
+                };
 
                 Response::FileInfo {
                     metadata,
@@ -10730,15 +11011,34 @@ impl Server {
             return slice_response(locations, *write_seq);
         }
 
-        // Cache miss — fall back to sled (chunk map may still be rebuilding after restart,
-        // or the file was written via a path that skipped chunk_map_update).
+        // Cache miss — fall back to CHUNK_TABLE (chunk map may still be rebuilding after
+        // restart, or the file was written via a path that skipped chunk_map_update).
+        // FileMetadata.chunk_locations is never persisted anymore (see put_file_in_txn's
+        // doc comment) — CHUNK_TABLE is the sole authoritative per-chunk store, so derive
+        // the file's chunk list from a scan filtered to this file_id rather than reading
+        // the (now permanently empty) embedded array. write_seq still comes from the
+        // FileMetadata scalar field, which persistence never touches.
         let metadata_store = self.metadata.clone();
-        let result = tokio::task::spawn_blocking(move || metadata_store.get_file(&file_id)).await;
+        let result = tokio::task::spawn_blocking(move || {
+            let file = metadata_store.get_file(&file_id)?;
+            let write_seq = match &file {
+                Some(f) => f.write_seq,
+                None => return Ok::<_, anyhow::Error>(None),
+            };
+            let mut locations: Vec<ChunkLocation> = Vec::new();
+            metadata_store.scan_chunk_locations(|loc| {
+                if loc.file_id == Some(file_id) {
+                    locations.push(loc);
+                }
+                true
+            })?;
+            Ok(Some((locations, write_seq)))
+        }).await;
         match result {
-            Ok(Ok(Some(metadata))) if !metadata.chunk_locations.is_empty() => {
+            Ok(Ok(Some((locations, write_seq)))) if !locations.is_empty() => {
                 // Populate cache for future lookups.
-                self.chunk_map.insert(file_id, (metadata.chunk_locations.as_ref().clone(), metadata.write_seq));
-                slice_response(&metadata.chunk_locations, metadata.write_seq)
+                self.chunk_map.insert(file_id, (locations.clone(), write_seq));
+                slice_response(&locations, write_seq)
             }
             _ => Response::Error {
                 message: format!("No chunk map entry for file {}", file_id),
@@ -11122,6 +11422,106 @@ mod tests {
     use super::*;
     use dfs_common::hash::compute_chunk_hash;
     use tempfile::TempDir;
+
+    /// Regression for the 2026-07-16 rebuild dedup fix: chunk_map_update_location_for_file_sync
+    /// must correctly arbitrate when multiple ChunkLocation rows exist for the same
+    /// (file_id, chunk_idx) slot (real, confirmed-live scenario: successive patch
+    /// chunk_id rotations whose old row hasn't been swept yet). A naive "keep
+    /// whichever arrived first" merge — which is what a raw CHUNK_TABLE scan sees in
+    /// redb's chunk_id-hash iteration order, i.e. arbitrary relative to recency —
+    /// would silently pick stale content.
+    #[test]
+    fn chunk_map_update_location_for_file_sync_resolves_conflicting_chunk_idx_by_recency() {
+        let chunk_map: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
+        let chunk_to_file: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
+        let file_id = dfs_common::FileId::new();
+        let node = dfs_common::NodeId::new();
+
+        let make_loc = |tag: &str, seq: u64| {
+            let hash = compute_chunk_hash(tag.as_bytes());
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash(hash),
+                nodes: vec![node],
+                size: 4096,
+                checksum: hash,
+                file_offset: Some(0), // same chunk_idx (0) for every candidate
+                written_at: Some(1000 + seq),
+                client_write_seq: Some(seq),
+                file_id: Some(file_id),
+            }
+        };
+
+        // Feed three "historical" candidates for the SAME chunk_idx, deliberately
+        // OUT of recency order — exactly what an arbitrary (chunk_id-hash-ordered)
+        // CHUNK_TABLE scan would produce.
+        let old = make_loc("old-patch", 5);
+        let newest = make_loc("newest-patch", 42);
+        let middle = make_loc("middle-patch", 20);
+
+        for loc in [&old, &newest, &middle] {
+            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, file_id, loc);
+        }
+
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        assert_eq!(locs.len(), 1, "all three candidates share one chunk_idx — must collapse to exactly one entry, not accumulate");
+        assert_eq!(locs[0].chunk_id, newest.chunk_id, "must keep the highest client_write_seq candidate regardless of arrival order");
+
+        // chunk_to_file must point ONLY at the winning chunk_id — the superseded
+        // candidates' reverse-index entries must not linger.
+        assert_eq!(chunk_to_file.get(&newest.chunk_id).map(|e| *e.value()), Some(file_id));
+        assert!(chunk_to_file.get(&old.chunk_id).is_none(), "superseded chunk_id must not remain in chunk_to_file");
+        assert!(chunk_to_file.get(&middle.chunk_id).is_none(), "superseded chunk_id must not remain in chunk_to_file");
+    }
+
+    /// Regression for the 2026-07-16 equal-write_seq tie-break fix, found via a real
+    /// 5-node soak test against pulled staging data: race_test_claude.bin (named for
+    /// the T28 concurrent-write investigation) has two CHUNK_TABLE rows for chunk_idx 0
+    /// with the SAME client_write_seq=11 but different written_at (a genuine same-seq
+    /// race — two writers, or a retry that reused a seq). Before this fix, `inc >= ext`
+    /// on equal seqs always returned true, so whichever row an arbitrary CHUNK_TABLE
+    /// scan visited LAST won — not the actually-newer write. That produced an I/O error
+    /// reading the file (chunk_map pointed at a chunk_id whose data was never replicated
+    /// to the nodes it claimed) after rebuild_chunk_map_from_metadata ran in redb's
+    /// arbitrary chunk_id-hash order.
+    #[test]
+    fn chunk_map_update_location_for_file_sync_breaks_equal_write_seq_ties_by_written_at() {
+        let chunk_map: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
+        let chunk_to_file: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
+        let file_id = dfs_common::FileId::new();
+        let node = dfs_common::NodeId::new();
+
+        let make_loc = |tag: &str, seq: u64, written_at: u64| {
+            let hash = compute_chunk_hash(tag.as_bytes());
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash(hash),
+                nodes: vec![node],
+                size: 4194304,
+                checksum: hash,
+                file_offset: Some(0),
+                written_at: Some(written_at),
+                client_write_seq: Some(seq),
+                file_id: Some(file_id),
+            }
+        };
+
+        // Same client_write_seq (11) — only written_at distinguishes which write is
+        // genuinely newer. Feed the earlier one SECOND (worst case for a naive
+        // "last-in-iteration-order wins" bug).
+        let earlier = make_loc("racing-write-A", 11, 601505);
+        let later = make_loc("racing-write-B", 11, 602084);
+
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, file_id, &later);
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, file_id, &earlier);
+
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].chunk_id, later.chunk_id,
+            "equal client_write_seq must be tie-broken by written_at, not by scan/arrival order");
+        assert!(chunk_to_file.get(&earlier.chunk_id).is_none(),
+            "superseded same-seq candidate must not remain in chunk_to_file");
+    }
 
     /// Regression tests for the write_seq gap-detection defense-in-depth added
     /// alongside the 4-layer chunk_locations drop fix (2026-07-07, commit 08a6201).
@@ -11633,23 +12033,33 @@ mod tests {
         // Arrival order intentionally does not match write_seq order.
         let batch: Vec<FileMetadata> = vec![item_c.clone(), item_a.clone(), item_d.clone(), item_b.clone()];
 
-        // Reference: apply the exact same items, in the exact same arrival order,
-        // one at a time via put_file — this is what the pre-batching worker did.
-        let reference_dir = TempDir::new().unwrap();
-        let reference_store = MetadataStore::new(reference_dir.path().to_path_buf()).unwrap();
+        // Reference: fold the exact same items, in the exact same arrival order, one at
+        // a time via merge_file_metadata directly — the pure-function equivalent of what
+        // serial put_file calls used to do. A round-trip through put_file+get_file can no
+        // longer observe this: put_file_in_txn's own on-disk existing_opt read is always
+        // chunk_locations-empty now (see put_file_in_txn's doc comment), so persisting each
+        // item serially and re-fetching would just echo back the last item's own chunk,
+        // not the true serial-merge result — comparing two independently-broken round
+        // trips would prove nothing.
+        let mut reference_result: Option<FileMetadata> = None;
         for item in &batch {
-            reference_store.put_file(item).unwrap();
+            reference_result = Some(match &reference_result {
+                Some(existing) => MetadataStore::merge_file_metadata(Some(existing), item).0,
+                None => item.clone(),
+            });
         }
-        let reference_result = reference_store.get_file(&file_id).unwrap().unwrap();
+        let reference_result = reference_result.unwrap();
 
-        // Under test: fold the batch in memory, then apply the single folded record
-        // via put_files_batch — this is what the batching worker does now.
+        // Under test: fold the batch in memory via fold_metadata_batch (also pure,
+        // built on the same merge_file_metadata), then confirm put_files_batch at least
+        // executes without error against the folded record (real code path exercised,
+        // even though its persisted chunk_locations is intentionally stripped).
         let folded_dir = TempDir::new().unwrap();
         let folded_store = MetadataStore::new(folded_dir.path().to_path_buf()).unwrap();
         let folded = fold_metadata_batch(batch);
         assert_eq!(folded.len(), 1, "all 4 items share one file_id — fold must produce exactly one record");
         folded_store.put_files_batch(&folded).unwrap();
-        let folded_result = folded_store.get_file(&file_id).unwrap().unwrap();
+        let folded_result = &folded[0];
 
         assert_eq!(folded_result.write_seq, reference_result.write_seq,
             "scalar fields must converge to the highest-write_seq item (C, seq=4), matching serial application");
@@ -11662,8 +12072,8 @@ mod tests {
         ref_locs.sort_by_key(|(o, _)| *o);
         folded_locs.sort_by_key(|(o, _)| *o);
         assert_eq!(folded_locs, ref_locs,
-            "folding a batch in memory before one put_files_batch call must produce byte-identical \
-             chunk_locations to applying the same items serially through put_file, one at a time");
+            "folding a batch in memory via fold_metadata_batch must produce byte-identical \
+             chunk_locations to applying the same items serially through merge_file_metadata, one at a time");
 
         // Sanity-check the specific expected winner at the contended offset, not just
         // that the two paths agree with each other (both could agree on a wrong answer).
@@ -12049,15 +12459,22 @@ mod tests {
             );
         }
 
-        // The file's own metadata record must also reflect the new chunk_ids — this is
-        // the sled-patch parity check (DisseminateMetadata reads from here).
-        let updated_file = server.metadata.get_file(&file_id).unwrap().unwrap();
+        // CHUNK_TABLE — the sole authoritative persisted store since chunk_locations is
+        // never written to FileMetadata anymore (see put_file_in_txn's doc comment) —
+        // must also reflect the new chunk_ids at the right offsets.
+        let mut persisted_locs = Vec::new();
+        server.metadata.scan_chunk_locations(|loc| {
+            if loc.file_id == Some(file_id) {
+                persisted_locs.push(loc);
+            }
+            true
+        }).unwrap();
         for new_loc in &new_locations {
-            let matching = updated_file.chunk_locations.iter()
+            let matching = persisted_locs.iter()
                 .find(|l| l.file_offset == new_loc.file_offset);
             assert_eq!(
                 matching.map(|l| l.chunk_id), Some(new_loc.chunk_id),
-                "file record not patched with new chunk_id at offset {:?} (sled-patch step skipped by batch handler)",
+                "CHUNK_TABLE not patched with new chunk_id at offset {:?} (batch handler skipped persistence)",
                 new_loc.file_offset
             );
         }

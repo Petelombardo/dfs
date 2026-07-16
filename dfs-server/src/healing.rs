@@ -948,15 +948,44 @@ impl HealingManager {
             });
         }
         match self.metadata.get_file(&file_id) {
-            Ok(Some(file_meta)) => {
+            Ok(Some(_file_meta)) => {
                 // If the active chunk at this file position is a different
                 // chunk_id, we were patched away — this is not data loss.
-                let current = file_meta.chunk_locations.iter()
-                    .find(|loc| loc.file_offset == Some(file_offset));
-                Some(match current {
-                    Some(cur) => cur.chunk_id != chunk_id,
-                    None => true, // position removed — chunk is orphaned
-                })
+                //
+                // Source: CHUNK_TABLE (scan_chunk_locations), not the persisted
+                // FileMetadata.chunk_locations field — that's never populated on
+                // disk anymore (see put_file_in_txn's doc comment). This branch
+                // only runs when chunk_map ALSO has no entry for this file (the
+                // check above already returned if it did) — i.e. exactly the cold
+                // window (e.g. right after a restart, before
+                // rebuild_chunk_map_from_metadata finishes) this function's own
+                // doc comment is about not getting wrong: reading an always-empty
+                // field here would make every zero-replica chunk in that window
+                // silently classify as "superseded, not data loss" regardless of
+                // whether it actually was — the exact failure shape (a real loss
+                // getting waved through) this function exists to prevent.
+                let mut current: Option<ChunkLocation> = None;
+                let scan_result = self.metadata.scan_chunk_locations(|loc| {
+                    if loc.file_id == Some(file_id) && loc.file_offset == Some(file_offset) {
+                        current = Some(loc);
+                        false // found it, stop scanning
+                    } else {
+                        true
+                    }
+                });
+                match scan_result {
+                    Ok(()) => Some(match &current {
+                        Some(cur) => cur.chunk_id != chunk_id,
+                        None => true, // position removed — chunk is orphaned
+                    }),
+                    Err(e) => {
+                        warn!(
+                            "Chunk {} has 0 accessible replicas but scanning CHUNK_TABLE for file {} failed ({}) — cannot confirm superseded-vs-lost, deferring purge decision to next cycle",
+                            chunk_id, file_id, e
+                        );
+                        None
+                    }
+                }
             }
             Ok(None) => Some(true), // file deleted — chunk is orphaned
             Err(e) => {
@@ -4467,7 +4496,7 @@ mod tests {
 
         let mut file_meta = FileMetadata::new("/lost-file".to_string(), FileType::RegularFile);
         let file_id = file_meta.id;
-        file_meta.chunk_locations = Arc::new(vec![ChunkLocation {
+        let location = ChunkLocation {
             chunk_id,
             nodes: vec![node_id],
             size: 4096,
@@ -4476,10 +4505,14 @@ mod tests {
             written_at: None,
             client_write_seq: None,
             file_id: Some(file_id),
-        }]);
+        };
+        file_meta.chunk_locations = Arc::new(vec![location.clone()]);
         metadata.put_file(&file_meta).unwrap();
-
-        let location = file_meta.chunk_locations[0].clone();
+        // CHUNK_TABLE — not the embedded array, which put_file_in_txn never persists
+        // (see its doc comment) — is what classify_zero_replica_chunk's cold-window
+        // fallback actually reads. Every real chunk write goes through this regardless
+        // of the embedded array, so a test chunk must too to stay representative.
+        metadata.put_chunk_location(&location).unwrap();
 
         assert_eq!(
             healing.classify_zero_replica_chunk(chunk_id, &location),

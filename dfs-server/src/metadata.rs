@@ -1121,6 +1121,33 @@ impl MetadataStore {
 
         let (metadata_to_store, is_stale) = Self::merge_file_metadata(existing_opt.as_ref(), metadata);
 
+        // Never persist the full chunk_locations array — CHUNK_TABLE (via put_chunk_location)
+        // is the sole authoritative per-chunk store, updated O(1) per touch. Before this fix,
+        // every single push here re-serialized and rewrote the ENTIRE array regardless of delta
+        // size — O(chunks in the file) per push, confirmed live as the dominant metadata-DB
+        // growth driver for large/growing files (a DVR recording at write_seq=5126, ~161 chunks
+        // and climbing, was generating enough genuine fragmentation to trigger compaction every
+        // 60-90s without ever shrinking db_size). merge_file_metadata's union above still runs
+        // (needed to correctly resolve every OTHER field), its result is just never written for
+        // this one field. Every reader that needs a file's full chunk list now derives it fresh
+        // from CHUNK_TABLE/chunk_map instead (see handle_append_file, rebuild_chunk_map_from_metadata,
+        // handle_get_file_chunk_map's cache-miss fallback, handle_get_file_info,
+        // push_held_file_metadata_to) — all of which were already either cold paths or, in
+        // handle_append_file's case, fixed alongside this change to stop depending on it.
+        // Fully backward compatible: old records already on disk keep their embedded array
+        // (nothing ever reads it again after this deploys), no migration needed.
+        //
+        // Strip only the copy that gets serialized — `metadata_to_store` itself keeps the
+        // real merged chunk_locations for the PutFileResult::Stale(_) return value below.
+        // handle_disseminate_metadata forwards that value's chunk_locations to the leader
+        // as a correction; emptying it there too would silently drop real chunk info from
+        // that correction instead of just skipping a redundant disk write (cheap: Arc-clone
+        // of every other field, not a deep copy).
+        let for_disk = FileMetadata {
+            chunk_locations: std::sync::Arc::new(Vec::new()),
+            ..metadata_to_store.clone()
+        };
+
         let merge_elapsed = t_merge_start.elapsed();
         if merge_elapsed.as_millis() > 5 {
             debug!(
@@ -1147,7 +1174,7 @@ impl MetadataStore {
             }
         }
 
-        let value = bincode::serialize(&metadata_to_store)
+        let value = bincode::serialize(&for_disk)
             .context("Failed to serialize file metadata")?;
 
         file_table.insert(file_id_str.as_str(), value.as_slice())
@@ -2625,16 +2652,41 @@ impl MetadataStore {
     }
 
     /// Build the set of chunk IDs referenced by any live file in metadata.
+    ///
+    /// Used by orphan/heal-scan callers (healing.rs) to decide whether a chunk is
+    /// still needed — a chunk this wrongly omits looks orphaned and can be purged,
+    /// so this must never silently under-report. Derives from CHUNK_TABLE (each
+    /// ChunkLocation's own `file_id` field) cross-referenced against the set of
+    /// currently-existing file_ids, NOT FileMetadata.chunk_locations — that's never
+    /// populated on disk anymore (see put_file_in_txn's doc comment); reading it
+    /// here would make every chunk in the cluster look orphaned regardless of
+    /// whether its file is actually live. Cross-referencing against live file_ids
+    /// (rather than "any chunk with a file_id tag") matters because CHUNK_TABLE
+    /// isn't pruned the instant a file is deleted — that's exactly what the orphan
+    /// sweep this feeds is for; a stale file_id tag on an otherwise-orphaned chunk
+    /// must not count as "live".
     pub fn live_chunk_ids(&self) -> Result<std::collections::HashSet<ChunkId>> {
         let _db = self.db.read();
         let txn = _db.begin_read()?;
-        let table = txn.open_table(FILE_TABLE)?;
+        let mut live_file_ids: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+        {
+            let table = txn.open_table(FILE_TABLE)?;
+            for item in table.range::<&str>(..)? {
+                let (_, v) = item?;
+                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
+                    live_file_ids.insert(m.id);
+                }
+            }
+        }
         let mut live = std::collections::HashSet::new();
-        for item in table.range::<&str>(..)? {
-            let (_, v) = item?;
-            if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
-                for loc in m.chunk_locations.iter() {
-                    live.insert(loc.chunk_id);
+        {
+            let table = txn.open_table(CHUNK_TABLE)?;
+            for item in table.range::<&str>(..)? {
+                let (_, v) = item?;
+                if let Ok(loc) = bincode::deserialize::<ChunkLocation>(v.value()) {
+                    if loc.file_id.is_some_and(|fid| live_file_ids.contains(&fid)) {
+                        live.insert(loc.chunk_id);
+                    }
                 }
             }
         }
@@ -3768,9 +3820,12 @@ mod tests {
         assert_eq!(MetadataStore::resolve_path_entry_file_id(&raw).unwrap(), metadata.id);
 
         // And the normal read path still resolves correctly through the new format.
+        // chunk_locations is empty on the raw MetadataStore-level read — put_file_in_txn
+        // never persists it (see its doc comment); CHUNK_TABLE is the authoritative
+        // source, enriched by Server::chunk_locations_for_info for callers that need it.
         let retrieved = store.get_file_by_path("/dedup_test.bin").unwrap().unwrap();
         assert_eq!(retrieved.id, metadata.id);
-        assert_eq!(retrieved.chunk_locations.len(), 1);
+        assert_eq!(retrieved.chunk_locations.len(), 0);
     }
 
     /// Upgrade-path regression: a PATH_TABLE entry written by pre-2026-07-16 code
@@ -4086,22 +4141,40 @@ mod tests {
             file_id: Some(metadata.id),
         };
         update.chunk_locations = Arc::new(vec![loc1.clone()]);
+
+        // Exercise merge_file_metadata directly against the in-memory `metadata` (which
+        // still carries loc0) rather than a round-trip through store.get_file() — the
+        // persisted record never carries chunk_locations anymore (see put_file_in_txn's
+        // doc comment), so a re-fetch would hand merge_file_metadata an empty "existing"
+        // and defeat the point of this test. merge_file_metadata's union logic is still a
+        // real, correct pure function (put_file_in_txn still calls it, and its Stale(_)
+        // return value carries the merged result to callers like handle_disseminate_metadata's
+        // correction-forwarding) — it's just that put_file_in_txn's own on-disk existing_opt
+        // is always empty in production now, so the actual chunk-preservation work happens
+        // one layer up, via each caller's own reconcile-against-chunk_map step.
+        let (merged, _is_stale) = MetadataStore::merge_file_metadata(Some(&metadata), &update);
         store.put_file(&update).unwrap();
 
-        let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
-        let offsets: std::collections::HashSet<Option<u64>> = retrieved.chunk_locations
+        let offsets: std::collections::HashSet<Option<u64>> = merged.chunk_locations
             .iter().map(|l| l.file_offset).collect();
         assert!(offsets.contains(&loc0.file_offset), "chunk from the earlier push must survive a later partial update");
         assert!(offsets.contains(&loc1.file_offset), "chunk from the later partial update must be present");
-        assert_eq!(retrieved.chunk_locations.len(), 2, "must be a union, not just the incoming payload");
+        assert_eq!(merged.chunk_locations.len(), 2, "must be a union, not just the incoming payload");
     }
 
     /// Regression test for the fourth and deepest layer of the T48 background-tick
     /// chunk-loss bug (2026-07-07): a push that arrives OUT OF ORDER with a lower
-    /// write_seq than what's already persisted must still have its chunk_locations
-    /// unioned in, not be dropped wholesale as "stale". Under the per-cycle-delta
-    /// push model, an out-of-order push can carry a genuinely new chunk offset that
-    /// the newer-write_seq record never mentioned.
+    /// write_seq than what's already persisted must not lose either write's chunk
+    /// data. Updated 2026-07-16 for Phase 4: put_file_in_txn's own merge can no
+    /// longer recover a chunk from an EARLIER separate put_file call — its on-disk
+    /// `existing_opt` read is always chunk_locations-empty now (see put_file_in_txn's
+    /// doc comment), so a merge fed only the stale push's own incoming chunk can only
+    /// ever echo that one chunk back, not reunite it with an earlier call's chunk.
+    /// That's expected, not a regression: every real chunk write ALSO calls
+    /// put_chunk_location independently of the metadata push (see e.g.
+    /// handle_put_file_metadata), so CHUNK_TABLE — not this FILE_TABLE merge — is
+    /// what actually guarantees no chunk from either write is lost. This test now
+    /// verifies that guarantee where it actually lives.
     #[test]
     fn test_put_file_unions_chunks_from_an_out_of_order_stale_push() {
         let temp_dir = TempDir::new().unwrap();
@@ -4122,6 +4195,7 @@ mod tests {
         };
         metadata.chunk_locations = Arc::new(vec![loc1.clone()]);
         store.put_file(&metadata).unwrap();
+        store.put_chunk_location(&loc1).unwrap();
 
         // A delayed push for the SAME file arrives after, but describes an EARLIER
         // write (write_seq=1 < stored 2) — e.g. two background-tick pushes raced on
@@ -4141,15 +4215,23 @@ mod tests {
         };
         stale_push.chunk_locations = Arc::new(vec![loc0.clone()]);
         let result = store.put_file(&stale_push).unwrap();
+        store.put_chunk_location(&loc0).unwrap();
         assert!(matches!(result, PutFileResult::Stale(_)), "lower write_seq than stored must still report Stale");
+        if let PutFileResult::Stale(merged) = result {
+            assert_eq!(merged.write_seq, 2, "scalar fields must come from the newer (existing) side, not the stale push");
+        }
 
-        let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
-        assert_eq!(retrieved.write_seq, 2, "scalar fields must come from the newer (existing) side, not the stale push");
-        let offsets: std::collections::HashSet<Option<u64>> = retrieved.chunk_locations
-            .iter().map(|l| l.file_offset).collect();
-        assert!(offsets.contains(&loc0.file_offset), "chunk from the out-of-order stale push must survive, not be silently dropped");
-        assert!(offsets.contains(&loc1.file_offset), "chunk from the newer record must still be present");
-        assert_eq!(retrieved.chunk_locations.len(), 2, "must be a union, not a wholesale discard of the stale push");
+        // Both chunks must be discoverable via CHUNK_TABLE regardless of which side
+        // "won" the metadata race — this is the real, current safety net.
+        let mut found_offsets: std::collections::HashSet<Option<u64>> = std::collections::HashSet::new();
+        store.scan_chunk_locations(|loc| {
+            if loc.file_id == Some(metadata.id) {
+                found_offsets.insert(loc.file_offset);
+            }
+            true
+        }).unwrap();
+        assert!(found_offsets.contains(&loc0.file_offset), "chunk from the out-of-order stale push must survive, not be silently dropped");
+        assert!(found_offsets.contains(&loc1.file_offset), "chunk from the newer record must still be present");
     }
 
     /// Regression test for a real bug found live via T48/T22 under full local-suite
@@ -4200,14 +4282,20 @@ mod tests {
             ..real_chunk0.clone()
         };
         stray_push.chunk_locations = Arc::new(vec![stray_entry]);
+
+        // Exercise merge_file_metadata directly against the in-memory `metadata` (which
+        // still carries real_chunk0) — stray_push.write_seq=2 makes this a Stored result,
+        // which carries no data, and the persisted record never carries chunk_locations
+        // anymore (see put_file_in_txn's doc comment), so neither the return value nor a
+        // get_file() round-trip can observe the merge result for this case.
+        let (merged, _is_stale) = MetadataStore::merge_file_metadata(Some(&metadata), &stray_push);
         store.put_file(&stray_push).unwrap();
 
-        let retrieved = store.get_file(&metadata.id).unwrap().unwrap();
-        assert_eq!(retrieved.chunk_locations.len(), 1,
+        assert_eq!(merged.chunk_locations.len(), 1,
             "the None-offset duplicate must be dropped, not appended as a second entry");
-        assert_eq!(retrieved.chunk_locations[0].file_offset, Some(0),
+        assert_eq!(merged.chunk_locations[0].file_offset, Some(0),
             "chunk 0's real position must survive — the None-offset entry must never clobber it");
-        assert_eq!(retrieved.chunk_locations[0].chunk_id, shared_chunk_id);
+        assert_eq!(merged.chunk_locations[0].chunk_id, shared_chunk_id);
     }
 
     #[test]

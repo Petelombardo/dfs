@@ -652,7 +652,21 @@ async fn run_planned_offline_compaction(
     // rather than going through that loop.
     server.begin_compaction_quiesce();
     let metadata = server.metadata_store();
-    let compact_result = tokio::task::spawn_blocking(move || metadata.compact_db()).await;
+    // compact_db_blocking (redb's own compact()), NOT compact_db (the shadow-copy
+    // rebuild). The shadow copy exists solely so the ONLINE path can compact without
+    // blocking live writers — it copies every table into a fresh db under a shared
+    // lock and swaps it in. None of that applies here: this node has already left the
+    // cluster, paused its listener, drained its writes and quiesced its internal
+    // writers, so it can simply take the exclusive lock and let redb do it properly.
+    //
+    // And redb does do it better. Measured 2026-07-16
+    // (fragmented_bytes_stays_high_even_at_redbs_own_compaction_floor): on the same
+    // churned db, the shadow copy got 14.51MB -> 4.53MB, and redb's compact() then
+    // took that same file a further 22% down to 3.52MB — space the shadow rebuild
+    // left on the floor, because building a B-tree by insertion re-fragments it as
+    // pages split, whereas compact() relocates live pages and truncates. It also
+    // converges (a second pass is a no-op), so there's no iteration to manage.
+    let compact_result = tokio::task::spawn_blocking(move || metadata.compact_db_blocking()).await;
     server.end_compaction_quiesce();
     let succeeded = match &compact_result {
         Ok(Ok((before, after))) => {

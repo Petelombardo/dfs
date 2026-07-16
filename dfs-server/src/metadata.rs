@@ -3766,6 +3766,105 @@ mod tests {
     use dfs_common::{ChunkId, FileType, NodeId};
     use tempfile::TempDir;
 
+    /// redb's `fragmented_bytes` is NOT reclaimable waste, and must never be used as
+    /// a compaction trigger. Measured 2026-07-16 with this exact workload:
+    ///
+    ///   after churn            file=14.51MB live=1.22MB frag= 7.32MB  frag%=50.4%
+    ///   shadow-copy compact -> file= 4.53MB live=1.42MB frag= 2.59MB  frag%=57.1%
+    ///   redb compact()      -> file= 3.52MB live=0.91MB frag= 2.10MB  frag%=59.5%
+    ///   redb compact() again-> file= 3.52MB (no-op, converged)         frag%=59.5%
+    ///
+    /// The file shrank 76% overall, and frag% went UP the whole way. At redb's own
+    /// converged floor — compact() twice, the second a proven no-op — it still reports
+    /// ~60% fragmented. There is no state any compaction can reach where this drops
+    /// under 20%, so a `frag_pct >= 0.20` gate is a constant `true`, not a threshold.
+    /// That gate ran on staging every 60s for ~20s a cycle reclaiming zero bytes.
+    ///
+    /// This replaces test_redb_fragmentation_stats_reports_low_fragmentation_after_
+    /// many_small_writes, which asserted the opposite (<20% on a fresh DB), failed
+    /// against reality at 91.7%, and was deleted in 84b6f8e instead of being believed.
+    /// Compaction triggers must key off FILE GROWTH past the post-compaction baseline
+    /// — the only quantity here that actually tracks reclaimable space.
+    #[test]
+    fn fragmented_bytes_stays_high_even_at_redbs_own_compaction_floor() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+        let node = NodeId::new();
+
+        // Build a realistically-churned DB: many small per-record commits, plus
+        // chunk-ID rotation (write then delete) to leave real dead pages behind.
+        for i in 0..8000u64 {
+            let hash = dfs_common::hash::compute_chunk_hash(format!("chunk-{}", i).as_bytes());
+            let chunk_id = ChunkId::from_hash(hash);
+            let loc = ChunkLocation {
+                chunk_id,
+                nodes: vec![node],
+                size: 4 * 1024 * 1024,
+                checksum: hash,
+                file_offset: Some((i % 256) * 4 * 1024 * 1024),
+                written_at: Some(1000 + i),
+                client_write_seq: Some(i),
+                file_id: Some(FileId::new()),
+            };
+            store.put_chunk_location(&loc).unwrap();
+            // Rotate: every other chunk is superseded and removed, like real patching.
+            if i % 2 == 1 {
+                let old = ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(format!("chunk-{}", i - 1).as_bytes()));
+                store.delete_chunk_location(&old).unwrap();
+            }
+        }
+
+        let report = |label: &str, store: &MetadataStore| {
+            let size = store.db_size();
+            let (live, frag) = store.redb_fragmentation_stats().unwrap();
+            println!(
+                "{:<28} file={:>8.2}MB  live={:>8.2}MB  frag={:>8.2}MB  frag%={:>5.1}%  file/live={:>4.2}x",
+                label,
+                size as f64 / 1_048_576.0,
+                live as f64 / 1_048_576.0,
+                frag as f64 / 1_048_576.0,
+                100.0 * frag as f64 / size.max(1) as f64,
+                size as f64 / live.max(1) as f64,
+            );
+        };
+
+        println!();
+        report("0. after churn", &store);
+
+        let (_, after_shadow) = store.compact_db().unwrap();
+        report("1. after shadow-copy", &store);
+
+        // redb's own compact() on the ALREADY shadow-compacted db — whatever it
+        // reclaims here is space the shadow copy left behind.
+        let (_, after_redb) = store.compact_db_blocking().unwrap();
+        report("2. after redb compact()", &store);
+        assert!(
+            after_redb < after_shadow,
+            "redb's compact() must reclaim what the shadow-copy rebuild leaves behind \
+             (shadow left {}B, redb got it to {}B) — this is why the OFFLINE path, which \
+             already has exclusive access, should not pay for the shadow copy",
+            after_shadow, after_redb
+        );
+
+        // Idempotent: a second pass has nothing left to do. This is the floor.
+        let (_, after_redb2) = store.compact_db_blocking().unwrap();
+        report("3. after redb compact x2", &store);
+        assert_eq!(after_redb2, after_redb, "redb compact() should converge, not oscillate");
+
+        // THE POINT: at that floor, fragmentation is still way over any sane trigger.
+        let (live, frag) = store.redb_fragmentation_stats().unwrap();
+        let frag_pct = frag as f64 / after_redb2.max(1) as f64;
+        assert!(
+            frag_pct >= 0.20,
+            "expected fragmented_bytes to remain >=20% even at redb's own compaction \
+             floor (got {:.1}%, live={}B frag={}B file={}B). If this ever fails, redb's \
+             accounting changed and Server::should_compact could legitimately use frag% \
+             again — until then it must gate on file growth instead.",
+            frag_pct * 100.0, live, frag, after_redb2
+        );
+        println!();
+    }
+
     #[test]
     fn test_store_and_retrieve_file() {
         let temp_dir = TempDir::new().unwrap();

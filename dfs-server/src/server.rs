@@ -6447,51 +6447,67 @@ impl Server {
     /// the disk hits critical levels.  Staggered by node address so all nodes never
     /// compact simultaneously.  Retries up to 3 times on "transaction in progress" errors
     /// (a transient race during startup) before giving up for the current cycle.
-    /// Pure decision extracted from start_compaction_loop's poll loop so it can be
-    /// unit tested without a real redb instance. genuine_frag_pct must come from
-    /// redb's own stats (fragmented_bytes / (stored+metadata+fragmented bytes)),
-    /// not raw file-size comparison — see redb_fragmentation_stats's and this
-    /// function's call site's doc comments for the incident this fixes.
-    /// Minimum genuinely-reclaimable bytes before ratio-based compaction fires.
-    /// The fragmentation RATIO is scale-free: a near-empty database (a few hundred
-    /// KB live) sits above 20% permanently just from fixed table overhead plus a
-    /// handful of commits, which made the loop below attempt compaction every
-    /// 60s poll, defer under routine churn, and escalate into planned OFFLINE
-    /// compactions (a real availability pause per node, every 1-3 minutes,
-    /// "reclaiming" a 0.7MB file into a 3.5MB one — observed 2026-07-16 during
-    /// the persist-worker root-cause session). Pausing a node is only worth
-    /// paying for when there are real megabytes to get back; the 30-minute
-    /// periodic online compact below still covers slow accumulation on small DBs.
+    /// Minimum bytes we must expect to get back before spending a compaction (~20s
+    /// plus the Phase 3 exclusive lock, and on the offline path a real availability
+    /// pause for this replica). Not worth pausing a node to reclaim a few MB; the
+    /// 30-minute periodic still covers slow accumulation.
     const COMPACT_MIN_RECLAIMABLE_BYTES: u64 = 32 * 1024 * 1024;
 
-    /// `frag_reclaim_known_futile`: the last compaction returned the file at exactly
-    /// the size it started, and the file hasn't grown since. Without this term the
-    /// fragmentation trigger is a perpetual-motion machine — observed live on
-    /// gluster1 2026-07-16, compacting every 60s for ~20s a cycle (including the
-    /// Phase 3 lock) and reclaiming ZERO bytes each time, because it re-tested the
-    /// same unchanged numbers and got the same answer:
+    /// The file must be at least this much bigger than its post-compaction baseline
+    /// before the growth trigger fires. Staging's observed reclaim case was 2.0x
+    /// (514.5MB against a 257.5MB baseline), so 1.5x catches it comfortably while
+    /// still refusing to re-fire at 1.0x, which reclaimed zero every time.
+    const COMPACT_GROWTH_NUMER: u64 = 3;
+    const COMPACT_GROWTH_DENOM: u64 = 2;
+
+    /// Compact only when the file has actually GROWN past what the last compaction
+    /// left behind. Deliberately does not look at redb's fragmentation percentage.
     ///
-    ///   19:01:37  db=257.5MB frag=57.7% → compact → 257.5MB (nothing)
-    ///   19:03:01  db=257.5MB frag=55.9% → compact → 257.5MB (nothing)
-    ///   19:04:22  db=257.5MB frag=56.1% → compact → 257.5MB (nothing)
+    /// frag% was the previous gate and it is unusable, measured three ways
+    /// (fragmented_bytes_stays_high_even_at_redbs_own_compaction_floor):
+    ///   1. It never goes low. At redb's OWN converged floor — its compact() run
+    ///      twice, the second a proven no-op — this workload still reports ~60%
+    ///      fragmented. A `>= 20%` gate is therefore a constant `true`, not a
+    ///      threshold, which is exactly what ran on gluster1 every 60s for ~20s a
+    ///      cycle reclaiming zero bytes:
+    ///        19:01:37  db=257.5MB frag=57.7% → compact → 257.5MB (nothing)
+    ///        19:03:01  db=257.5MB frag=55.9% → compact → 257.5MB (nothing)
+    ///        19:04:22  db=257.5MB frag=56.1% → compact → 257.5MB (nothing)
+    ///   2. It is not even monotonic with waste. A churned DB bloated to 11.87x its
+    ///      live data measured 50.4% fragmented — LOWER than the 59.5% of the same
+    ///      data fully compacted. A relative frag% trigger would fire least on the
+    ///      file that needs it most.
+    ///   3. `live` itself drifts (1.22 → 1.42 → 0.91MB across compactions of
+    ///      identical data), so it is not a trustworthy denominator either.
+    /// The bytes DO behave (7.32 → 2.59 → 2.10MB), and once measured relative to the
+    /// post-compaction baseline that is simply file growth — which is cheap (a stat)
+    /// and needs no exclusive write lock, unlike redb_fragmentation_stats().
     ///
-    /// genuine_frag_pct counts free pages INSIDE the file. redb will happily reuse
-    /// those for new writes, but it won't hand the extent back to the OS, so at a
-    /// freshly-compacted size there is nothing for compaction to return and the
-    /// percentage cannot improve no matter how many times it runs. It only reclaims
-    /// once the file has grown past that baseline (redb undoing a doubling —
-    /// 514.5MB→257.5MB in the same log). So: measure-then-act is fine, but only
-    /// re-act once the input has actually changed. The 30-minute periodic below is
-    /// deliberately NOT gated on this — it's the safety net for free pages redb only
-    /// becomes willing to release later.
+    /// Self-correcting for genuine data growth: compact once, last_compact_size
+    /// becomes the new higher baseline, and this goes quiet — so no fragmentation
+    /// signal is needed to tell "grew from real data" from "grew from garbage".
+    ///
+    /// `last_compact_size == 0` means no baseline yet (first run) — compact
+    /// unconditionally to establish one.
+    ///
+    /// `frag_reclaim_known_futile`: belt-and-braces for the case where the file DID
+    /// grow but compaction still returned it unchanged — see the caller. The
+    /// 30-minute periodic is deliberately NOT gated on any of this: it's the safety
+    /// net for pages redb only becomes willing to release later.
     fn should_compact(
-        genuine_frag_pct: f64,
-        fragmented_bytes: u64,
+        current_size: u64,
+        last_compact_size: u64,
         secs_since_compact: u64,
         frag_reclaim_known_futile: bool,
     ) -> bool {
-        (genuine_frag_pct >= 0.20
-            && fragmented_bytes >= Self::COMPACT_MIN_RECLAIMABLE_BYTES
+        if last_compact_size == 0 {
+            return true; // no baseline yet
+        }
+        let reclaimable_estimate = current_size.saturating_sub(last_compact_size);
+        let grown_enough = current_size
+            >= last_compact_size.saturating_mul(Self::COMPACT_GROWTH_NUMER) / Self::COMPACT_GROWTH_DENOM;
+        (reclaimable_estimate >= Self::COMPACT_MIN_RECLAIMABLE_BYTES
+            && grown_enough
             && !frag_reclaim_known_futile)
             || secs_since_compact >= 30 * 60
     }
@@ -6551,59 +6567,24 @@ impl Server {
                 let sleep_secs = 60u64;
 
                 let current_size = metadata.db_size();
-                // frag_ratio (raw file size vs last-compact file size) is kept only
-                // for the log line below — informative, but NOT what decides whether
-                // to compact (see genuine_frag_pct's doc comment for why).
-                let frag_ratio = if last_compact_size > 0 {
+                let growth_ratio = if last_compact_size > 0 {
                     current_size as f64 / last_compact_size as f64
                 } else {
-                    f64::INFINITY // first run
+                    f64::INFINITY // first run — no baseline yet
                 };
                 let secs_since_compact = last_compact_time
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or(u64::MAX);
 
-                if last_compact_size > 0 && frag_ratio >= 2.0 {
-                    warn!("redb file size high: {:.1}MB (last compact baseline: {:.1}MB) — see genuine fragmentation % below for whether this is real waste or just redb's own pre-allocated headroom",
-                        current_size as f64 / 1_048_576.0,
-                        last_compact_size as f64 / 1_048_576.0);
-                }
-
-                // Root-caused 2026-07-15 (server5/VM111 live incident): raw file-size
-                // growth (frag_ratio above) is NOT a reliable fragmentation signal on
-                // its own. redb grows its backing file geometrically to amortize
-                // resize cost — observed live, a freshly-compacted 257.5MB file jumped
-                // to 514.5MB (almost exactly 2x) after only ~273 small chunk_location
-                // writes in under two minutes, nowhere near enough real data to
-                // explain 257MB of genuine growth. db_size() can't distinguish "grew
-                // because redb pre-allocated headroom for future writes" from "grew
-                // because of real fragmented waste" — comparing raw file size against
-                // the post-compaction baseline treated the first case as if it were
-                // the second, so compaction re-triggered almost immediately after
-                // every single compact regardless of real write volume, each cycle
-                // paying the online path's cost (or, before the offline-cooldown fix
-                // above, a real availability-affecting offline cycle). redb's own
-                // stats (metadata.redb_fragmentation_stats(), stored+metadata bytes
-                // vs fragmented bytes) distinguish genuine reclaimable waste from
-                // pre-allocated headroom directly, so use that as the actual gate.
-                // frag_stats carries (live_bytes, fragmented_bytes) alongside the
-                // percentage so the [META TXN] log below can reuse them without a
-                // second redb_fragmentation_stats() call — None on the fallback-error
-                // path, in which case the log line just reports 0 for both.
-                let (genuine_frag_pct, frag_stats) = match metadata.redb_fragmentation_stats() {
-                    Ok((live_bytes, fragmented_bytes)) => {
-                        let total = live_bytes + fragmented_bytes;
-                        let pct = if total == 0 { 0.0 } else { fragmented_bytes as f64 / total as f64 };
-                        (pct, Some((live_bytes, fragmented_bytes)))
-                    }
-                    Err(e) => {
-                        warn!("compaction: failed to read redb fragmentation stats ({}) — falling back to raw file-size ratio for this cycle", e);
-                        // Fall back to the old (imperfect but functional) signal rather
-                        // than never compacting at all if stats() itself errors.
-                        let pct = if frag_ratio >= 1.20 { 1.0 } else { 0.0 };
-                        (pct, None)
-                    }
-                };
+                // DIAGNOSTIC ONLY — redb's fragmentation stats decide nothing here
+                // anymore (see should_compact: frag% is ~60% even at redb's own
+                // compaction floor, and is anti-correlated with waste besides). Kept
+                // solely to populate [META TXN]'s live=/frag= fields, which are how we
+                // attribute growth to call sites. Note redb_fragmentation_stats()
+                // takes an exclusive write txn just to read stats, so this is not free
+                // — it stays because 60s of diagnostic value is worth it, but nothing
+                // may depend on it for correctness.
+                let frag_stats = metadata.redb_fragmentation_stats().ok();
 
                 // [META TXN]: per-call-site write-transaction attribution (Phase 0 of the
                 // metadata DB growth investigation — see MetadataStore::note_txn). Computes
@@ -6638,29 +6619,29 @@ impl Server {
                     }
                 }
 
-                // frag_stats None means redb's stats() itself errored and pct is the
-                // raw-ratio fallback — pass MAX so the bytes floor never suppresses
-                // that (already rare, already imprecise) path's behavior.
-                let fragmented_bytes = frag_stats.map(|(_, f)| f).unwrap_or(u64::MAX);
                 // Futile only while the file is still no bigger than what the last
                 // (zero-reclaim) compaction left behind. Any real growth past that
-                // baseline means there's a doubling to undo again, so re-arm.
+                // baseline means there may be something to undo again, so re-arm.
                 let frag_reclaim_known_futile =
                     last_compact_reclaimed_nothing && current_size <= last_compact_size;
                 if !Self::should_compact(
-                    genuine_frag_pct, fragmented_bytes, secs_since_compact, frag_reclaim_known_futile,
+                    current_size, last_compact_size, secs_since_compact, frag_reclaim_known_futile,
                 ) {
-                    if frag_reclaim_known_futile && genuine_frag_pct >= 0.20 {
-                        debug!("compaction: suppressing trigger — genuine fragmentation {:.1}% ({:.1}MB) but the last compaction reclaimed nothing and the file has not grown past {:.1}MB since; waiting for real growth or the 30min periodic",
-                            genuine_frag_pct * 100.0, fragmented_bytes as f64 / 1_048_576.0,
-                            last_compact_size as f64 / 1_048_576.0);
-                    }
                     tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                     continue;
                 }
-                info!("compaction: triggering — genuine fragmentation {:.1}% (raw file size {:.1}MB, last compact baseline {:.1}MB, {}s since last compact)",
-                    genuine_frag_pct * 100.0, current_size as f64 / 1_048_576.0,
-                    last_compact_size as f64 / 1_048_576.0, secs_since_compact);
+                // Don't print "infx ... 18446744073709551615s since" on the first run —
+                // these lines get read during incidents, so say what actually happened.
+                if last_compact_size == 0 {
+                    info!("compaction: triggering — first compaction since startup ({:.1}MB), establishing a baseline",
+                        current_size as f64 / 1_048_576.0);
+                } else {
+                    info!("compaction: triggering — file {:.1}MB is {:.2}x its post-compaction baseline {:.1}MB (est. {:.1}MB reclaimable, {}s since last compact)",
+                        current_size as f64 / 1_048_576.0, growth_ratio,
+                        last_compact_size as f64 / 1_048_576.0,
+                        current_size.saturating_sub(last_compact_size) as f64 / 1_048_576.0,
+                        secs_since_compact);
+                }
 
                 // Prefer a planned offline compaction when every other cluster member
                 // is healthy — see LeaveReason::PlannedCompaction's doc comment. Removes
@@ -6896,8 +6877,8 @@ impl Server {
                 // attempt) still gives a genuinely brief burst a real chance to
                 // resolve on its own before paying the bounded blocking cost.
                 if let Some(first) = first_deferred_at {
-                    if first.elapsed() >= std::time::Duration::from_secs(90) && frag_ratio >= 1.20 {
-                        warn!("redb compact has deferred for {:?} with fragmentation still high \
+                    if first.elapsed() >= std::time::Duration::from_secs(90) && growth_ratio >= 1.20 {
+                        warn!("redb compact has deferred for {:?} with the file still well above baseline \
                                ({:.1}MB vs {:.1}MB baseline) — falling back to blocking compact",
                             first.elapsed(),
                             current_size as f64 / 1_048_576.0,
@@ -11797,67 +11778,86 @@ mod tests {
     mod compaction_trigger_metric {
         use super::*;
 
-        // Comfortably above COMPACT_MIN_RECLAIMABLE_BYTES so these tests exercise
-        // only the ratio/time conditions they're each about.
-        const BIG_WASTE: u64 = 256 * 1024 * 1024;
+        const MB: u64 = 1024 * 1024;
+        // The two states gluster1 actually cycled between, 2026-07-16.
+        const BASELINE: u64 = 257 * MB + 512 * 1024; // 257.5MB, a post-compaction floor
+        const DOUBLED: u64 = 514 * MB + 512 * 1024;  // 514.5MB, what it grew to
 
+        /// THE bug: at its post-compaction size the file is unchanged, so there is
+        /// nothing to reclaim — compaction proved that three times in five minutes,
+        /// each costing ~20s and the Phase 3 lock to return the same 257.5MB. The old
+        /// gate re-fired anyway because it asked about frag% (~56%, permanently).
         #[test]
-        fn low_genuine_fragmentation_does_not_compact_even_if_file_doubled() {
-            // This is exactly the observed incident shape: file size looks like it
-            // doubled, but genuine fragmentation is low (e.g. 2% real waste) because
-            // the growth was redb pre-allocating headroom, not real garbage.
-            assert!(!Server::should_compact(0.02, BIG_WASTE, 60, false));
+        fn at_the_post_compaction_baseline_does_not_compact() {
+            assert!(!Server::should_compact(BASELINE, BASELINE, 60, false));
         }
 
+        /// ...and the case that DID reclaim: 514.5MB against a 257.5MB baseline,
+        /// which returned 257MB every single time it ran.
         #[test]
-        fn high_genuine_fragmentation_does_compact() {
-            assert!(Server::should_compact(0.25, BIG_WASTE, 60, false));
+        fn doubled_past_the_baseline_compacts() {
+            assert!(Server::should_compact(DOUBLED, BASELINE, 60, false));
         }
 
+        /// 1.5x is the gate, so just under it must not fire...
         #[test]
-        fn exactly_20_percent_compacts() {
-            assert!(Server::should_compact(0.20, BIG_WASTE, 60, false));
+        fn just_under_the_growth_ratio_does_not_compact() {
+            let current = BASELINE + BASELINE / 2 - MB; // ~1.49x
+            assert!(!Server::should_compact(current, BASELINE, 60, false));
         }
 
+        /// ...and just over it must.
         #[test]
-        fn thirty_minute_safety_net_compacts_even_at_low_fragmentation() {
-            // Catches latent free pages redb only reclaims later even when the live
-            // fragmentation % looks fine right now.
-            assert!(Server::should_compact(0.02, 0, 30 * 60, false));
+        fn just_over_the_growth_ratio_compacts() {
+            let current = BASELINE + BASELINE / 2 + MB; // ~1.51x
+            assert!(Server::should_compact(current, BASELINE, 60, false));
         }
 
+        /// Regression for the 2026-07-16 escalation misfire: a near-empty DB used to
+        /// sit above the frag% gate permanently and escalate into availability-pausing
+        /// offline compactions every 1-3 minutes, "reclaiming" a 0.7MB file into a
+        /// 3.5MB one. Growth ratio alone would still fire here (5x!), so the 32MB
+        /// floor is what actually stops it: pausing a node is not worth 2.8MB.
         #[test]
-        fn neither_condition_met_does_not_compact() {
-            assert!(!Server::should_compact(0.05, BIG_WASTE, 60, false));
+        fn tiny_db_past_the_ratio_but_under_the_byte_floor_does_not_compact() {
+            let baseline = 700 * 1024;      // 0.7MB
+            let current = 3 * MB + 500 * 1024; // 3.5MB — over 4x the baseline
+            assert!(current >= baseline * 3 / 2, "test setup: ratio gate must pass");
+            assert!(!Server::should_compact(current, baseline, 60, false));
         }
 
-        /// Regression for the 2026-07-16 pointless-compaction loop: on gluster1 the
-        /// fragmentation trigger fired every 60s at db=257.5MB, ran ~20s including
-        /// the Phase 3 lock, reclaimed zero bytes, and then re-tested the identical
-        /// numbers and fired again — indefinitely. Once a compaction has proven it
-        /// can't reclaim at this size, high fragmentation alone must not re-trigger.
+        /// The 30-minute periodic is the backstop for anything the growth signal
+        /// can't see (e.g. pages redb only becomes willing to release later), and is
+        /// deliberately gated on nothing else.
         #[test]
-        fn futile_reclaim_suppresses_the_fragmentation_trigger() {
-            assert!(!Server::should_compact(0.56, 139 * 1024 * 1024, 60, true));
+        fn thirty_minute_safety_net_compacts_regardless_of_growth() {
+            assert!(Server::should_compact(BASELINE, BASELINE, 30 * 60, false));
         }
 
-        /// ...but the periodic safety net is deliberately NOT suppressed: redb can
-        /// become willing to release free pages later, and that's exactly what this
-        /// 30-minute path exists to pick up.
+        /// No baseline yet (first run since startup) — compact to establish one.
+        #[test]
+        fn first_run_with_no_baseline_compacts() {
+            assert!(Server::should_compact(BASELINE, 0, 60, false));
+        }
+
+        /// Belt-and-braces: if a compaction DID run on real growth and still returned
+        /// the file unchanged, don't keep re-trying on that same unchanged size.
+        #[test]
+        fn futile_reclaim_suppresses_the_growth_trigger() {
+            assert!(!Server::should_compact(DOUBLED, BASELINE, 60, true));
+        }
+
+        /// ...but never suppresses the periodic.
         #[test]
         fn futile_reclaim_still_allows_the_thirty_minute_periodic() {
-            assert!(Server::should_compact(0.56, 139 * 1024 * 1024, 30 * 60, true));
+            assert!(Server::should_compact(DOUBLED, BASELINE, 30 * 60, true));
         }
 
-        /// Regression for the 2026-07-16 escalation misfire: the fragmentation
-        /// RATIO is scale-free, so a near-empty DB (a few hundred KB live, fixed
-        /// table overhead) sits above 20% permanently — that must NOT count as
-        /// compaction-worthy waste, or the loop attempts every poll, defers under
-        /// churn, and escalates into availability-pausing offline compactions
-        /// ("reclaiming" a 0.7MB file into a 3.5MB one, every 1-3 minutes).
+        /// A file SMALLER than the baseline (e.g. someone deleted a lot) has nothing
+        /// to reclaim and must not underflow into compacting.
         #[test]
-        fn high_ratio_on_tiny_db_does_not_compact() {
-            assert!(!Server::should_compact(0.90, 3 * 1024 * 1024, 60, false));
+        fn shrunk_below_the_baseline_does_not_compact() {
+            assert!(!Server::should_compact(BASELINE / 2, BASELINE, 60, false));
         }
     }
 

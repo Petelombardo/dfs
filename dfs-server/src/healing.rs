@@ -949,43 +949,35 @@ impl HealingManager {
         }
         match self.metadata.get_file(&file_id) {
             Ok(Some(_file_meta)) => {
-                // If the active chunk at this file position is a different
-                // chunk_id, we were patched away — this is not data loss.
+                // chunk_map has no entry for this file, so we cannot answer "what is
+                // the live chunk at this position?" — DEFER (None), don't purge.
                 //
-                // Source: CHUNK_TABLE (scan_chunk_locations), not the persisted
-                // FileMetadata.chunk_locations field — that's never populated on
-                // disk anymore (see put_file_in_txn's doc comment). This branch
-                // only runs when chunk_map ALSO has no entry for this file (the
-                // check above already returned if it did) — i.e. exactly the cold
-                // window (e.g. right after a restart, before
-                // rebuild_chunk_map_from_metadata finishes) this function's own
-                // doc comment is about not getting wrong: reading an always-empty
-                // field here would make every zero-replica chunk in that window
-                // silently classify as "superseded, not data loss" regardless of
-                // whether it actually was — the exact failure shape (a real loss
-                // getting waved through) this function exists to prevent.
-                let mut current: Option<ChunkLocation> = None;
-                let scan_result = self.metadata.scan_chunk_locations(|loc| {
-                    if loc.file_id == Some(file_id) && loc.file_offset == Some(file_offset) {
-                        current = Some(loc);
-                        false // found it, stop scanning
-                    } else {
-                        true
-                    }
-                });
-                match scan_result {
-                    Ok(()) => Some(match &current {
-                        Some(cur) => cur.chunk_id != chunk_id,
-                        None => true, // position removed — chunk is orphaned
-                    }),
-                    Err(e) => {
-                        warn!(
-                            "Chunk {} has 0 accessible replicas but scanning CHUNK_TABLE for file {} failed ({}) — cannot confirm superseded-vs-lost, deferring purge decision to next cycle",
-                            chunk_id, file_id, e
-                        );
-                        None
-                    }
-                }
+                // This branch used to consult FileMetadata.chunk_locations, which
+                // Phase 4 made permanently empty; the 2026-07-16 replacement scanned
+                // CHUNK_TABLE instead, which was a serious mistake on two counts:
+                //   1. scan_chunk_locations walks and bincode-deserializes the ENTIRE
+                //      table (~400k rows on staging) — and this is a SYNC fn called
+                //      from the async discovery loop, once per zero-replica chunk. On
+                //      a cold chunk_map (exactly when this branch runs — right after a
+                //      restart, before rebuild_chunk_map_from_metadata finishes) that
+                //      is a full blocking scan per chunk on a Tokio worker thread.
+                //      Confirmed live 2026-07-16: gluster2/gluster3 stopped answering
+                //      every request, including heartbeats, until restarted — the
+                //      process was fine, its runtime was wedged.
+                //   2. It was answering a question it has no business answering yet.
+                //      A cold chunk_map IS the "cannot confirm" case this function's
+                //      doc comment is about, identical in kind to the read-error arms
+                //      below. Deferring costs one healing cycle; guessing risks either
+                //      purging a live chunk or waving through a real loss.
+                //
+                // rebuild_chunk_map_from_metadata populates chunk_map from CHUNK_TABLE
+                // on startup anyway — so the answer arrives on its own, correctly and
+                // exactly once, instead of being recomputed per chunk at O(table).
+                debug!(
+                    "Chunk {} has 0 accessible replicas but chunk_map has no entry for file {} yet (cold window) — deferring purge decision to next cycle",
+                    chunk_id, file_id
+                );
+                None
             }
             Ok(None) => Some(true), // file deleted — chunk is orphaned
             Err(e) => {
@@ -4480,7 +4472,7 @@ mod tests {
 
         let mut file_meta = FileMetadata::new("/patched-file".to_string(), FileType::RegularFile);
         let file_id = file_meta.id;
-        file_meta.chunk_locations = Arc::new(vec![ChunkLocation {
+        let new_location = ChunkLocation {
             chunk_id: new_chunk_id,
             nodes: vec![node_id],
             size: 4096,
@@ -4489,8 +4481,12 @@ mod tests {
             written_at: None,
             client_write_seq: None,
             file_id: Some(file_id),
-        }]);
+        };
+        file_meta.chunk_locations = Arc::new(vec![new_location.clone()]);
         metadata.put_file(&file_meta).unwrap();
+        metadata.put_chunk_location(&new_location).unwrap();
+        // chunk_map holds the post-patch view — the only thing classify consults.
+        healing.chunk_map.insert(file_id, (vec![new_location], 1));
 
         // location still points at the OLD (patched-away) chunk_id.
         let old_location = ChunkLocation {
@@ -4507,7 +4503,7 @@ mod tests {
         assert_eq!(
             healing.classify_zero_replica_chunk(old_chunk_id, &old_location),
             Some(true),
-            "file metadata now points at a different chunk at this offset — superseded, not data loss"
+            "chunk_map now points at a different chunk at this offset — superseded, not data loss"
         );
     }
 
@@ -4535,16 +4531,53 @@ mod tests {
         };
         file_meta.chunk_locations = Arc::new(vec![location.clone()]);
         metadata.put_file(&file_meta).unwrap();
-        // CHUNK_TABLE — not the embedded array, which put_file_in_txn never persists
-        // (see its doc comment) — is what classify_zero_replica_chunk's cold-window
-        // fallback actually reads. Every real chunk write goes through this regardless
-        // of the embedded array, so a test chunk must too to stay representative.
         metadata.put_chunk_location(&location).unwrap();
+        // chunk_map is the ONLY source classify_zero_replica_chunk consults for the
+        // live chunk at a file position — a miss means "cold, can't know yet" and
+        // defers (see its doc comment). Seed it, as every real write path does
+        // synchronously, or this tests the defer path rather than the classification.
+        healing.chunk_map.insert(file_id, (vec![location.clone()], 1));
 
         assert_eq!(
             healing.classify_zero_replica_chunk(chunk_id, &location),
             Some(false),
-            "file metadata still points at this exact chunk_id — genuine, permanent data loss"
+            "chunk_map still points at this exact chunk_id — genuine, permanent data loss"
+        );
+    }
+
+    /// The cold-chunk_map case must DEFER, never guess. Regression for the
+    /// 2026-07-16 staging hang: this branch used to answer by scanning all of
+    /// CHUNK_TABLE, which both wedged the Tokio runtime (sync full scan per chunk
+    /// from the async discovery loop) and answered a question it cannot yet answer.
+    #[tokio::test]
+    async fn test_classify_zero_replica_chunk_defers_when_chunk_map_is_cold() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (_storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"cold-window-chunk"));
+        let mut file_meta = FileMetadata::new("/cold-file".to_string(), FileType::RegularFile);
+        let file_id = file_meta.id;
+        let location = ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: 4096,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        };
+        file_meta.chunk_locations = Arc::new(vec![location.clone()]);
+        metadata.put_file(&file_meta).unwrap();
+        metadata.put_chunk_location(&location).unwrap();
+        // Deliberately NO chunk_map entry — the post-restart window before
+        // rebuild_chunk_map_from_metadata has finished.
+
+        assert_eq!(
+            healing.classify_zero_replica_chunk(chunk_id, &location),
+            None,
+            "a cold chunk_map cannot distinguish superseded from lost — must defer, not guess"
         );
     }
 }

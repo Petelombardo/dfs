@@ -9486,7 +9486,7 @@ impl Server {
         // all_* (undeduped), NOT chunk_locations_for_info: every superseded
         // generation's chunk_id must be erased too, not just the current one per
         // slot. See all_chunk_locations_for_file's doc comment.
-        let file_chunk_locs = match self.all_chunk_locations_for_file(metadata.id) {
+        let file_chunk_locs = match self.all_chunk_locations_for_file_async(metadata.id).await {
             Ok(locs) => locs,
             Err(e) => {
                 warn!("Failed to resolve chunk locations for delete of {}: {}", path, e);
@@ -10551,7 +10551,7 @@ impl Server {
 
         // file_meta.chunk_locations is never persisted anymore (see put_file_in_txn's
         // doc comment) — derive the real chunk list from CHUNK_TABLE instead.
-        let chunk_ids: Vec<ChunkId> = match self.chunk_locations_for_info(file_meta.id) {
+        let chunk_ids: Vec<ChunkId> = match self.chunk_locations_for_info_async(file_meta.id).await {
             Ok(locs) => locs.iter().map(|l| l.chunk_id).collect(),
             Err(e) => return Response::Error {
                 message: format!("Failed to resolve chunk locations: {}", e),
@@ -10642,7 +10642,7 @@ impl Server {
 
         // file_meta.chunk_locations is never persisted anymore (see put_file_in_txn's
         // doc comment) — derive the real chunk list from CHUNK_TABLE instead.
-        let file_chunk_locs = match self.chunk_locations_for_info(file_meta.id) {
+        let file_chunk_locs = match self.chunk_locations_for_info_async(file_meta.id).await {
             Ok(locs) => locs,
             Err(e) => return Response::Error {
                 message: format!("Failed to resolve chunk locations: {}", e),
@@ -10877,13 +10877,15 @@ impl Server {
     /// `real_chunk_id`. Report that live node list instead. Every node can now
     /// answer this correctly, not just the one that ran the fold — see
     /// ReplicatePatchFold's doc comment for why that dissemination was needed.
-    fn resolve_chunk_location_for_info(&self, inline: &ChunkLocation) -> ChunkLocation {
-        if let Ok(Some(PatchState::Folded(real_chunk_id))) = self.metadata.get_patch_state(&inline.chunk_id) {
-            if let Ok(Some(real_loc)) = self.metadata.get_chunk_location(&real_chunk_id) {
+    /// Static so the whole chunk_locations_for_info pipeline can run inside one
+    /// spawn_blocking with just a cloned Arc<MetadataStore> — see that function.
+    fn resolve_chunk_location_for_info(metadata: &MetadataStore, inline: &ChunkLocation) -> ChunkLocation {
+        if let Ok(Some(PatchState::Folded(real_chunk_id))) = metadata.get_patch_state(&inline.chunk_id) {
+            if let Ok(Some(real_loc)) = metadata.get_chunk_location(&real_chunk_id) {
                 return ChunkLocation { nodes: real_loc.nodes, ..inline.clone() };
             }
         }
-        match self.metadata.get_chunk_location(&inline.chunk_id) {
+        match metadata.get_chunk_location(&inline.chunk_id) {
             Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(inline, sled_loc),
             _ => inline.clone(),
         }
@@ -10915,10 +10917,17 @@ impl Server {
     ///
     /// Deletion is the one caller that must NOT use this — see
     /// all_chunk_locations_for_file.
-    fn chunk_locations_for_info(&self, file_id: dfs_common::FileId) -> Result<Vec<ChunkLocation>, anyhow::Error> {
+    ///
+    /// BLOCKING and O(CHUNK_TABLE): walks and bincode-deserializes every row (~400k
+    /// on staging). Async callers MUST use chunk_locations_for_info_async — calling
+    /// this on a Tokio worker wedges the whole runtime (see that function).
+    fn chunk_locations_for_info(
+        metadata: &MetadataStore,
+        file_id: dfs_common::FileId,
+    ) -> Result<Vec<ChunkLocation>, anyhow::Error> {
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
         let mut by_idx: std::collections::HashMap<u64, ChunkLocation> = std::collections::HashMap::new();
-        self.metadata.scan_chunk_locations(|loc| {
+        metadata.scan_chunk_locations(|loc| {
             if loc.file_id == Some(file_id) {
                 let idx = loc.file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE);
                 match by_idx.entry(idx) {
@@ -10934,10 +10943,30 @@ impl Server {
         })?;
         let mut locations: Vec<ChunkLocation> = by_idx
             .into_values()
-            .map(|loc| self.resolve_chunk_location_for_info(&loc))
+            .map(|loc| Self::resolve_chunk_location_for_info(metadata, &loc))
             .collect();
         locations.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
         Ok(locations)
+    }
+
+    /// Offloaded chunk_locations_for_info. Every async caller must use this.
+    ///
+    /// The sync version walks all of CHUNK_TABLE. Phase 4 introduced it into five
+    /// async handlers — including handle_delete_file, hit on every delete — with no
+    /// spawn_blocking, which took staging down twice on 2026-07-16: gluster2 and
+    /// gluster3 each stopped answering every request (heartbeats included, so the
+    /// cluster marked them failed) while the OS stayed healthy and the process kept
+    /// running. The runtime was wedged, not the box. These nodes have few cores, so
+    /// a handful of concurrent deletes is enough to occupy every Tokio worker in a
+    /// multi-second bincode loop.
+    async fn chunk_locations_for_info_async(
+        &self,
+        file_id: dfs_common::FileId,
+    ) -> Result<Vec<ChunkLocation>, anyhow::Error> {
+        let metadata = self.metadata.clone();
+        tokio::task::spawn_blocking(move || Self::chunk_locations_for_info(&metadata, file_id))
+            .await
+            .context("spawn_blocking panicked in chunk_locations_for_info_async")?
     }
 
     /// EVERY CHUNK_TABLE row for this file — including superseded patch/rotation
@@ -10949,9 +10978,14 @@ impl Server {
     /// erase the file from the namespace while silently orphaning every older
     /// generation's chunks forever — a leak with no later sweep to catch it, since
     /// the sweeps key off live files and this file is gone.
-    fn all_chunk_locations_for_file(&self, file_id: dfs_common::FileId) -> Result<Vec<ChunkLocation>, anyhow::Error> {
+    ///
+    /// BLOCKING and O(CHUNK_TABLE) — async callers must use the _async wrapper.
+    fn all_chunk_locations_for_file(
+        metadata: &MetadataStore,
+        file_id: dfs_common::FileId,
+    ) -> Result<Vec<ChunkLocation>, anyhow::Error> {
         let mut locations = Vec::new();
-        self.metadata.scan_chunk_locations(|loc| {
+        metadata.scan_chunk_locations(|loc| {
             if loc.file_id == Some(file_id) {
                 locations.push(loc);
             }
@@ -10961,12 +10995,24 @@ impl Server {
         Ok(locations)
     }
 
+    /// Offloaded all_chunk_locations_for_file — see chunk_locations_for_info_async
+    /// for why every async caller must go through a wrapper like this one.
+    async fn all_chunk_locations_for_file_async(
+        &self,
+        file_id: dfs_common::FileId,
+    ) -> Result<Vec<ChunkLocation>, anyhow::Error> {
+        let metadata = self.metadata.clone();
+        tokio::task::spawn_blocking(move || Self::all_chunk_locations_for_file(&metadata, file_id))
+            .await
+            .context("spawn_blocking panicked in all_chunk_locations_for_file_async")?
+    }
+
     async fn handle_get_file_info(&self, path: String) -> Response {
         debug!("Handling get file info: {}", path);
 
         match self.metadata.get_file_by_path(&path) {
             Ok(Some(metadata)) => {
-                let chunk_locations = match self.chunk_locations_for_info(metadata.id) {
+                let chunk_locations = match self.chunk_locations_for_info_async(metadata.id).await {
                     Ok(locs) => locs,
                     Err(e) => {
                         warn!("Failed to resolve chunk locations for {}: {}", path, e);
@@ -11002,7 +11048,7 @@ impl Server {
 
         match self.metadata.get_file(&file_id) {
             Ok(Some(metadata)) => {
-                let chunk_locations = match self.chunk_locations_for_info(file_id) {
+                let chunk_locations = match self.chunk_locations_for_info_async(file_id).await {
                     Ok(locs) => locs,
                     Err(e) => {
                         warn!("Failed to resolve chunk locations for {}: {}", file_id, e);

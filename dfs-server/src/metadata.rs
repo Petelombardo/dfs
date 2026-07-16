@@ -3785,6 +3785,100 @@ mod tests {
     /// against reality at 91.7%, and was deleted in 84b6f8e instead of being believed.
     /// Compaction triggers must key off FILE GROWTH past the post-compaction baseline
     /// — the only quantity here that actually tracks reclaimable space.
+    /// Build a realistically-churned DB: many small per-record commits, plus
+    /// chunk-ID rotation (write then delete) to leave real dead pages behind.
+    #[cfg(test)]
+    fn churn_for_compaction_test(store: &MetadataStore) {
+        let node = NodeId::new();
+        for i in 0..8000u64 {
+            let hash = dfs_common::hash::compute_chunk_hash(format!("chunk-{}", i).as_bytes());
+            let chunk_id = ChunkId::from_hash(hash);
+            let loc = ChunkLocation {
+                chunk_id,
+                nodes: vec![node],
+                size: 4 * 1024 * 1024,
+                checksum: hash,
+                file_offset: Some((i % 256) * 4 * 1024 * 1024),
+                written_at: Some(1000 + i),
+                client_write_seq: Some(i),
+                file_id: Some(FileId::new()),
+            };
+            store.put_chunk_location(&loc).unwrap();
+            if i % 2 == 1 {
+                let old = ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(format!("chunk-{}", i - 1).as_bytes()));
+                store.delete_chunk_location(&old).unwrap();
+            }
+        }
+    }
+
+    /// HEAD-TO-HEAD from the SAME churned starting point — the comparison the first
+    /// version of this experiment failed to make (it ran redb's compact() on the
+    /// already-shadow-compacted file, so it could only ever show redb's *incremental*
+    /// gain, and was misread as "redb alone beats shadow alone").
+    ///
+    /// Measured 2026-07-16 (8000 churned records):
+    ///   churned start          : 14.51MB
+    ///   A: shadow-copy only    :  4.53MB
+    ///   B: redb compact() only :  2.74MB   <- best here
+    ///   C: shadow, then redb   :  3.52MB
+    ///
+    /// DO NOT read B as "always use redb's compact()". Staging, on a real ~500MB DB,
+    /// went the other way: redb's compact() alone reached 514.5MB->351.5MB where the
+    /// shadow copy had always reached 257.5MB. The reconciling fact (per the user, from
+    /// operating this system): redb's compact() is ITERATIVE — repeated passes reclaim
+    /// more — and we deliberately call it ONCE. At this test's scale one pass already
+    /// converges; at staging's scale it does not.
+    ///
+    /// That single pass is a deliberate speed-and-value trade, not an oversight: take
+    /// the cheap majority and let the 30-minute periodic pick up the rest, rather than
+    /// sit in an exclusive lock chasing the last megabytes. This test therefore asserts
+    /// only that all three methods substantially shrink the file — NOT a ranking between
+    /// them, because the ranking is scale-dependent and this fixture cannot see it.
+    #[test]
+    fn compare_compaction_methods_from_the_same_starting_point() {
+        let size_of = |store: &MetadataStore| store.db_size() as f64 / 1_048_576.0;
+
+        // Arm A: shadow-copy rebuild only (the online path).
+        let dir_a = TempDir::new().unwrap();
+        let store_a = MetadataStore::new(dir_a.path().to_path_buf()).unwrap();
+        churn_for_compaction_test(&store_a);
+        let churned = size_of(&store_a);
+        store_a.compact_db().unwrap();
+        let shadow_only = size_of(&store_a);
+
+        // Arm B: redb's own compact() only (what the offline path now does).
+        let dir_b = TempDir::new().unwrap();
+        let store_b = MetadataStore::new(dir_b.path().to_path_buf()).unwrap();
+        churn_for_compaction_test(&store_b);
+        store_b.compact_db_blocking().unwrap();
+        let redb_only = size_of(&store_b);
+
+        // Arm C: shadow copy, then redb compact() — what the original experiment
+        // actually measured end-to-end.
+        let dir_c = TempDir::new().unwrap();
+        let store_c = MetadataStore::new(dir_c.path().to_path_buf()).unwrap();
+        churn_for_compaction_test(&store_c);
+        store_c.compact_db().unwrap();
+        store_c.compact_db_blocking().unwrap();
+        let both = size_of(&store_c);
+
+        println!();
+        println!("  churned start          : {:>7.2}MB", churned);
+        println!("  A: shadow-copy only    : {:>7.2}MB", shadow_only);
+        println!("  B: redb compact() only : {:>7.2}MB", redb_only);
+        println!("  C: shadow, then redb   : {:>7.2}MB", both);
+        println!();
+
+        // Deliberately NOT a ranking assertion — see the doc comment. Only that each
+        // method does substantial work, so a regression that silently stops reclaiming
+        // still fails here.
+        for (label, after) in [("shadow-only", shadow_only), ("redb-only", redb_only), ("both", both)] {
+            assert!(after < churned / 2.0,
+                "{} should reclaim at least half the churned file ({:.2}MB -> {:.2}MB)",
+                label, churned, after);
+        }
+    }
+
     #[test]
     fn fragmented_bytes_stays_high_even_at_redbs_own_compaction_floor() {
         let temp_dir = TempDir::new().unwrap();

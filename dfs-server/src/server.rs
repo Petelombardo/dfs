@@ -6528,9 +6528,28 @@ impl Server {
             let stagger_secs = (node_byte % node_count) * (interval_secs / node_count);
             tokio::time::sleep(tokio::time::Duration::from_secs(stagger_secs)).await;
             // Tracks the DB size immediately after the last successful compact.
-            // Zero means no baseline yet — compact unconditionally on first run.
-            let mut last_compact_size: u64 = 0;
-            let mut last_compact_time: Option<std::time::Instant> = None;
+            //
+            // Seeded from the CURRENT size rather than 0, because MetadataStore::new
+            // already ran redb's compact() during Database::open — so this size IS a
+            // post-compaction size, and treating it as "no baseline, compact
+            // unconditionally" made every node take an availability hit on every
+            // restart to reclaim nothing. Observed live 2026-07-16, seconds apart:
+            //   22:09:08  redb compacted: 257.5MB → 257.5MB      (startup, at floor)
+            //   22:09:38  compaction: triggering — first compaction since startup
+            //   22:09:40  Planned offline compaction: pausing... (leaves the cluster)
+            //   22:09:42  Planned offline compaction finished: 257.5MB -> 257.5MB
+            // Four nodes did that inside two minutes during a rolling deploy. The
+            // 30-minute periodic still covers the case where startup's compact was
+            // skipped or fell short.
+            let mut last_compact_size: u64 = metadata.db_size();
+            // Seeded for the same reason as last_compact_size: startup already
+            // compacted. Left as None, secs_since_compact is u64::MAX on the first
+            // poll, so the 30-minute periodic below fires immediately — and unlike the
+            // growth gate it is deliberately not size-gated, so it fired even on a
+            // 1.4MB test DB and "compacted" it to 3.5MB. That re-created the very
+            // first-run offline compaction the size seeding above was meant to stop,
+            // just via the other branch.
+            let mut last_compact_time: Option<std::time::Instant> = Some(std::time::Instant::now());
             // Set when a compaction completed but returned the file at exactly the
             // size it started. Combined with "the file hasn't grown past that size
             // since", this suppresses the fragmentation trigger — see

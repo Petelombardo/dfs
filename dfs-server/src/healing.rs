@@ -1000,6 +1000,15 @@ impl HealingManager {
 
     /// Remove a batch of chunks from pending_healing — called when files are deleted
     /// so their chunks don't inflate the pending count indefinitely.
+    ///
+    /// ONE transaction for the whole set, not one per chunk. Deleting a large file
+    /// hands this every chunk it owned at once; per-chunk commits made that N
+    /// single-record redb transactions, each COW-rewriting the B-tree leaf→root for
+    /// a key removal carrying no payload. Measured live on gluster1 2026-07-16:
+    /// op:delete_pending_healing=+17949tx in one 60s window moving +0.0MB, in the
+    /// same window the metadata DB doubled 257.5MB→514.5MB and drove the ~60s
+    /// compaction cycle. The put side has been batched since Phase 1
+    /// (put_pending_healing_batch); this is the delete side finally matching it.
     pub async fn clear_pending_for_deleted_chunks(&self, chunk_ids: &[ChunkId]) {
         let mut pending = self.pending_healing.write().await;
         let mut to_delete = Vec::new();
@@ -1009,8 +1018,11 @@ impl HealingManager {
             }
         }
         drop(pending);
-        for chunk_id in to_delete {
-            let _ = self.metadata.delete_pending_healing_async(chunk_id).await;
+        if let Err(e) = self.metadata
+            .batch_update_chunk_locations_async(Vec::new(), Vec::new(), to_delete)
+            .await
+        {
+            warn!("Failed to batch-clear pending_healing for deleted chunks: {}", e);
         }
     }
 
@@ -1059,12 +1071,27 @@ impl HealingManager {
                 .collect()
         };
 
-        let removed_count = to_remove.len();
-        for chunk_id in to_remove {
-            self.clear_pending(&chunk_id).await;
-        }
-
+        // One transaction for the whole prune, not one per entry — see
+        // clear_pending_for_deleted_chunks' doc comment for the measured churn this
+        // avoids. This is the same set of entries removed at the same time as before
+        // (the 100min = healing_delay_secs*20 prune policy is unchanged); only the
+        // commit shape differs. Mirrors clear_pending_static's rule of clearing the
+        // persisted row only for entries actually removed from the in-memory map, so
+        // a racing clear_pending elsewhere can't make us delete a row it re-added.
+        let removed: Vec<ChunkId> = {
+            let mut pending = self.pending_healing.write().await;
+            to_remove.into_iter()
+                .filter(|chunk_id| pending.remove(chunk_id).is_some())
+                .collect()
+        };
+        let removed_count = removed.len();
         if removed_count > 0 {
+            if let Err(e) = self.metadata
+                .batch_update_chunk_locations_async(Vec::new(), Vec::new(), removed)
+                .await
+            {
+                warn!("Failed to batch-clear {} stale pending_healing entries: {}", removed_count, e);
+            }
             info!("Cleaned up {} stale pending healing entries", removed_count);
         }
 

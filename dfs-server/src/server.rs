@@ -2243,6 +2243,34 @@ impl Server {
         });
     }
 
+    /// Does `incoming` describe a newer write than `existing` for the same chunk_idx?
+    ///
+    /// The single source of truth for "which of two competing ChunkLocations at one
+    /// file position wins". CHUNK_TABLE legitimately holds several chunk_id rows per
+    /// (file_id, chunk_idx) — successive patch/rotation generations whose superseded
+    /// rows haven't been swept yet — and redb iterates them in chunk_id-hash order,
+    /// which is arbitrary relative to recency. Anything reducing those rows to one
+    /// answer per slot MUST apply this rule rather than trusting arrival/scan order.
+    ///
+    /// Ties on client_write_seq fall through to written_at: equal seqs are a real
+    /// occurrence (concurrent writers, or a retry reusing a seq — confirmed from real
+    /// staging data, two rows at cws=11 written 579ms apart), and seq alone cannot
+    /// order them.
+    ///
+    /// Returns true on a full tie, i.e. "incoming is at least as new" — callers use
+    /// this to accept the later-seen of two indistinguishable rows.
+    fn location_supersedes(incoming: &ChunkLocation, existing: &ChunkLocation) -> bool {
+        match (incoming.client_write_seq, existing.client_write_seq) {
+            (Some(inc), Some(ext)) if inc != ext => inc >= ext,
+            // Equal seq → written_at, same as the legacy arm below.
+            (Some(_), Some(_)) => incoming.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0),
+            (Some(_), None) => true,  // incoming has a seq, existing is legacy → accept
+            (None, Some(_)) => false, // existing has a seq, incoming is legacy → keep
+            // Both predate client_write_seq → written_at is all we have.
+            (None, None) => incoming.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0),
+        }
+    }
+
     /// Binary search the chunk_map Vec (sorted by chunk_idx) for a given chunk_idx.
     /// Returns the slice index of the matching entry, or None.
     fn chunk_map_find_by_idx(locs: &[ChunkLocation], chunk_idx: u64) -> Option<usize> {
@@ -2460,32 +2488,8 @@ impl Server {
                 // genuinely changed (e.g. a patch produced a new hash), which is the one
                 // case that legitimately needs the client_write_seq ordering guard below to
                 // arbitrate between two competing versions.
-                let should_update = if loc.chunk_id == location.chunk_id {
-                    true
-                } else {
-                    match (location.client_write_seq, loc.client_write_seq) {
-                        (Some(inc), Some(ext)) if inc != ext => inc >= ext,
-                        (Some(_), Some(_)) => {
-                            // Equal client_write_seq: a genuine same-seq race (concurrent
-                            // writers, or a retry that reused a seq — confirmed live via a
-                            // real historical T28 race repro: two writes landed with the same
-                            // client_write_seq=11 and different written_at). write_seq alone
-                            // can't order these — fall back to written_at, the same tie-break
-                            // the legacy (None, None) arm already uses below. Without this,
-                            // arbitrary CHUNK_TABLE iteration order (rebuild_chunk_map_from_metadata,
-                            // metadata repair) picks whichever row it happens to visit last —
-                            // not the actually-newer write — silently serving stale/wrong
-                            // content (or a chunk_id absent from local disk) for that chunk_idx.
-                            location.written_at.unwrap_or(0) >= loc.written_at.unwrap_or(0)
-                        }
-                        (Some(_), None)        => true,  // incoming has seq, existing is legacy → accept
-                        (None, Some(_))        => false, // existing has seq, incoming is legacy → keep
-                        (None, None)           => {
-                            // Legacy path: both records predate client_write_seq → use written_at
-                            location.written_at.unwrap_or(0) >= loc.written_at.unwrap_or(0)
-                        }
-                    }
-                };
+                let should_update = loc.chunk_id == location.chunk_id
+                    || Self::location_supersedes(location, loc);
                 if should_update {
                     chunk_to_file.remove(&loc.chunk_id);
                     *loc = location.clone();
@@ -6460,8 +6464,35 @@ impl Server {
     /// periodic online compact below still covers slow accumulation on small DBs.
     const COMPACT_MIN_RECLAIMABLE_BYTES: u64 = 32 * 1024 * 1024;
 
-    fn should_compact(genuine_frag_pct: f64, fragmented_bytes: u64, secs_since_compact: u64) -> bool {
-        (genuine_frag_pct >= 0.20 && fragmented_bytes >= Self::COMPACT_MIN_RECLAIMABLE_BYTES)
+    /// `frag_reclaim_known_futile`: the last compaction returned the file at exactly
+    /// the size it started, and the file hasn't grown since. Without this term the
+    /// fragmentation trigger is a perpetual-motion machine — observed live on
+    /// gluster1 2026-07-16, compacting every 60s for ~20s a cycle (including the
+    /// Phase 3 lock) and reclaiming ZERO bytes each time, because it re-tested the
+    /// same unchanged numbers and got the same answer:
+    ///
+    ///   19:01:37  db=257.5MB frag=57.7% → compact → 257.5MB (nothing)
+    ///   19:03:01  db=257.5MB frag=55.9% → compact → 257.5MB (nothing)
+    ///   19:04:22  db=257.5MB frag=56.1% → compact → 257.5MB (nothing)
+    ///
+    /// genuine_frag_pct counts free pages INSIDE the file. redb will happily reuse
+    /// those for new writes, but it won't hand the extent back to the OS, so at a
+    /// freshly-compacted size there is nothing for compaction to return and the
+    /// percentage cannot improve no matter how many times it runs. It only reclaims
+    /// once the file has grown past that baseline (redb undoing a doubling —
+    /// 514.5MB→257.5MB in the same log). So: measure-then-act is fine, but only
+    /// re-act once the input has actually changed. The 30-minute periodic below is
+    /// deliberately NOT gated on this — it's the safety net for free pages redb only
+    /// becomes willing to release later.
+    fn should_compact(
+        genuine_frag_pct: f64,
+        fragmented_bytes: u64,
+        secs_since_compact: u64,
+        frag_reclaim_known_futile: bool,
+    ) -> bool {
+        (genuine_frag_pct >= 0.20
+            && fragmented_bytes >= Self::COMPACT_MIN_RECLAIMABLE_BYTES
+            && !frag_reclaim_known_futile)
             || secs_since_compact >= 30 * 60
     }
 
@@ -6484,6 +6515,12 @@ impl Server {
             // Zero means no baseline yet — compact unconditionally on first run.
             let mut last_compact_size: u64 = 0;
             let mut last_compact_time: Option<std::time::Instant> = None;
+            // Set when a compaction completed but returned the file at exactly the
+            // size it started. Combined with "the file hasn't grown past that size
+            // since", this suppresses the fragmentation trigger — see
+            // should_compact's `frag_reclaim_known_futile` doc comment. Cleared as
+            // soon as a compaction does reclaim something.
+            let mut last_compact_reclaimed_nothing = false;
             // When compact_db() first started deferring (returning Err rather than risk
             // a long Phase 3 lock) while fragmentation was still bad. None means either
             // we're not currently in a deferred streak, or the last compaction (by
@@ -6605,7 +6642,19 @@ impl Server {
                 // raw-ratio fallback — pass MAX so the bytes floor never suppresses
                 // that (already rare, already imprecise) path's behavior.
                 let fragmented_bytes = frag_stats.map(|(_, f)| f).unwrap_or(u64::MAX);
-                if !Self::should_compact(genuine_frag_pct, fragmented_bytes, secs_since_compact) {
+                // Futile only while the file is still no bigger than what the last
+                // (zero-reclaim) compaction left behind. Any real growth past that
+                // baseline means there's a doubling to undo again, so re-arm.
+                let frag_reclaim_known_futile =
+                    last_compact_reclaimed_nothing && current_size <= last_compact_size;
+                if !Self::should_compact(
+                    genuine_frag_pct, fragmented_bytes, secs_since_compact, frag_reclaim_known_futile,
+                ) {
+                    if frag_reclaim_known_futile && genuine_frag_pct >= 0.20 {
+                        debug!("compaction: suppressing trigger — genuine fragmentation {:.1}% ({:.1}MB) but the last compaction reclaimed nothing and the file has not grown past {:.1}MB since; waiting for real growth or the 30min periodic",
+                            genuine_frag_pct * 100.0, fragmented_bytes as f64 / 1_048_576.0,
+                            last_compact_size as f64 / 1_048_576.0);
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                     continue;
                 }
@@ -6784,7 +6833,12 @@ impl Server {
                                 info!("redb compacted: {:.1}MB → {:.1}MB",
                                     before as f64 / 1_048_576.0,
                                     after  as f64 / 1_048_576.0);
+                            } else {
+                                info!("redb compaction reclaimed nothing ({:.1}MB unchanged) — suppressing the fragmentation trigger until the file grows past this size",
+                                    after as f64 / 1_048_576.0);
                             }
+                            // Feeds should_compact's frag_reclaim_known_futile — see there.
+                            last_compact_reclaimed_nothing = before == after;
                             last_compact_size = after; // update baseline only on success
                             last_compact_time = Some(std::time::Instant::now());
                             first_deferred_at = None; // churn subsided — clear any deferred streak
@@ -9428,7 +9482,11 @@ impl Server {
         // actual on-disk chunk deletion below (DeleteQueueEntry) and CHUNK_TABLE
         // cleanup — reading an empty array here would silently leak every deleted
         // file's chunk data and CHUNK_TABLE rows forever.
-        let file_chunk_locs = match self.chunk_locations_for_info(metadata.id) {
+        //
+        // all_* (undeduped), NOT chunk_locations_for_info: every superseded
+        // generation's chunk_id must be erased too, not just the current one per
+        // slot. See all_chunk_locations_for_file's doc comment.
+        let file_chunk_locs = match self.all_chunk_locations_for_file(metadata.id) {
             Ok(locs) => locs,
             Err(e) => {
                 warn!("Failed to resolve chunk locations for delete of {}: {}", path, e);
@@ -10838,11 +10896,64 @@ impl Server {
     /// resolution unconditionally rather than reasoning about whether it's still needed
     /// now that the source scan is already CHUNK_TABLE-live (the nodes cross-check part
     /// of that function is redundant with a live-sourced entry, but harmless).
+    /// Exactly ONE entry per chunk_idx, newest wins (Server::location_supersedes).
+    ///
+    /// A raw CHUNK_TABLE scan is NOT one row per slot — superseded patch/rotation
+    /// generations linger until swept, so a file can have several rows at the same
+    /// file_offset. The embedded array this replaced was already deduped (by
+    /// merge_file_metadata), so every caller here is written expecting one row per
+    /// slot, and handing them raw rows breaks them in ways that are not obviously
+    /// about chunk_locations at all (2026-07-16, all three observed live in one T38
+    /// run against a 12-chunk file with 3 rows at chunk_idx 5):
+    ///   - handle_heal_file queued the stale 209715-byte generation for healing —
+    ///     it can never converge (it's superseded, so the orphan sweep evicts it and
+    ///     discovery re-queues it), which is what made T38b's heal queue oscillate
+    ///     5→2→3→5 and never drain.
+    ///   - dfs-admin file info's gap detector walks entries in offset order tracking
+    ///     expected_offset; a stale partial row at an already-covered offset made it
+    ///     report a 3984589-byte GAP in a file whose md5 was verified intact.
+    ///
+    /// Deletion is the one caller that must NOT use this — see
+    /// all_chunk_locations_for_file.
     fn chunk_locations_for_info(&self, file_id: dfs_common::FileId) -> Result<Vec<ChunkLocation>, anyhow::Error> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let mut by_idx: std::collections::HashMap<u64, ChunkLocation> = std::collections::HashMap::new();
+        self.metadata.scan_chunk_locations(|loc| {
+            if loc.file_id == Some(file_id) {
+                let idx = loc.file_offset.map_or(u64::MAX, |o| o / CHUNK_SIZE);
+                match by_idx.entry(idx) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if Self::location_supersedes(&loc, e.get()) {
+                            e.insert(loc);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => { e.insert(loc); }
+                }
+            }
+            true
+        })?;
+        let mut locations: Vec<ChunkLocation> = by_idx
+            .into_values()
+            .map(|loc| self.resolve_chunk_location_for_info(&loc))
+            .collect();
+        locations.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+        Ok(locations)
+    }
+
+    /// EVERY CHUNK_TABLE row for this file — including superseded patch/rotation
+    /// generations at an already-covered chunk_idx. The deliberate opposite of
+    /// chunk_locations_for_info's one-row-per-slot dedup.
+    ///
+    /// Only deletion wants this, and it genuinely does: a superseded row still has
+    /// real bytes on real disks and a real CHUNK_TABLE entry. Deduping here would
+    /// erase the file from the namespace while silently orphaning every older
+    /// generation's chunks forever — a leak with no later sweep to catch it, since
+    /// the sweeps key off live files and this file is gone.
+    fn all_chunk_locations_for_file(&self, file_id: dfs_common::FileId) -> Result<Vec<ChunkLocation>, anyhow::Error> {
         let mut locations = Vec::new();
         self.metadata.scan_chunk_locations(|loc| {
             if loc.file_id == Some(file_id) {
-                locations.push(self.resolve_chunk_location_for_info(&loc));
+                locations.push(loc);
             }
             true
         })?;
@@ -11649,29 +11760,47 @@ mod tests {
             // This is exactly the observed incident shape: file size looks like it
             // doubled, but genuine fragmentation is low (e.g. 2% real waste) because
             // the growth was redb pre-allocating headroom, not real garbage.
-            assert!(!Server::should_compact(0.02, BIG_WASTE, 60));
+            assert!(!Server::should_compact(0.02, BIG_WASTE, 60, false));
         }
 
         #[test]
         fn high_genuine_fragmentation_does_compact() {
-            assert!(Server::should_compact(0.25, BIG_WASTE, 60));
+            assert!(Server::should_compact(0.25, BIG_WASTE, 60, false));
         }
 
         #[test]
         fn exactly_20_percent_compacts() {
-            assert!(Server::should_compact(0.20, BIG_WASTE, 60));
+            assert!(Server::should_compact(0.20, BIG_WASTE, 60, false));
         }
 
         #[test]
         fn thirty_minute_safety_net_compacts_even_at_low_fragmentation() {
             // Catches latent free pages redb only reclaims later even when the live
             // fragmentation % looks fine right now.
-            assert!(Server::should_compact(0.02, 0, 30 * 60));
+            assert!(Server::should_compact(0.02, 0, 30 * 60, false));
         }
 
         #[test]
         fn neither_condition_met_does_not_compact() {
-            assert!(!Server::should_compact(0.05, BIG_WASTE, 60));
+            assert!(!Server::should_compact(0.05, BIG_WASTE, 60, false));
+        }
+
+        /// Regression for the 2026-07-16 pointless-compaction loop: on gluster1 the
+        /// fragmentation trigger fired every 60s at db=257.5MB, ran ~20s including
+        /// the Phase 3 lock, reclaimed zero bytes, and then re-tested the identical
+        /// numbers and fired again — indefinitely. Once a compaction has proven it
+        /// can't reclaim at this size, high fragmentation alone must not re-trigger.
+        #[test]
+        fn futile_reclaim_suppresses_the_fragmentation_trigger() {
+            assert!(!Server::should_compact(0.56, 139 * 1024 * 1024, 60, true));
+        }
+
+        /// ...but the periodic safety net is deliberately NOT suppressed: redb can
+        /// become willing to release free pages later, and that's exactly what this
+        /// 30-minute path exists to pick up.
+        #[test]
+        fn futile_reclaim_still_allows_the_thirty_minute_periodic() {
+            assert!(Server::should_compact(0.56, 139 * 1024 * 1024, 30 * 60, true));
         }
 
         /// Regression for the 2026-07-16 escalation misfire: the fragmentation
@@ -11682,7 +11811,7 @@ mod tests {
         /// ("reclaiming" a 0.7MB file into a 3.5MB one, every 1-3 minutes).
         #[test]
         fn high_ratio_on_tiny_db_does_not_compact() {
-            assert!(!Server::should_compact(0.90, 3 * 1024 * 1024, 60));
+            assert!(!Server::should_compact(0.90, 3 * 1024 * 1024, 60, false));
         }
     }
 

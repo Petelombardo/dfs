@@ -9459,23 +9459,44 @@ impl Server {
         };
 
         // metadata.chunk_locations is never persisted anymore (see put_file_in_txn's
-        // doc comment) — derive the real chunk list from CHUNK_TABLE. This drives
-        // actual on-disk chunk deletion below (DeleteQueueEntry) and CHUNK_TABLE
-        // cleanup — reading an empty array here would silently leak every deleted
-        // file's chunk data and CHUNK_TABLE rows forever.
+        // doc comment) — derive the chunk list from chunk_map, the same in-memory
+        // structure the read path trusts, falling back to a CHUNK_TABLE scan only
+        // when it has no entry for this file.
         //
-        // all_* (undeduped), NOT chunk_locations_for_info: every superseded
-        // generation's chunk_id must be erased too, not just the current one per
-        // slot. See all_chunk_locations_for_file's doc comment.
-        let file_chunk_locs = match self.all_chunk_locations_for_file_async(metadata.id).await {
-            Ok(locs) => locs,
-            Err(e) => {
-                warn!("Failed to resolve chunk locations for delete of {}: {}", path, e);
-                return Response::Error {
-                    message: format!("Failed to resolve chunk locations: {}", e),
-                    code: ErrorCode::InternalError,
-                };
-            }
+        // chunk_map first is what makes deletes fast. The scan is O(CHUNK_TABLE) —
+        // it walks and bincode-deserializes every row (~400k on staging) — so doing
+        // it per delete made deleting a handful of files visibly slow (reported live
+        // 2026-07-16: "deleted some larger files and it was definitely not peppy").
+        // Pre-Phase-4 this read metadata.chunk_locations, which was an O(1) field
+        // access; chunk_map restores that.
+        //
+        // chunk_map is DEDUPED (one entry per chunk_idx), so superseded patch/rotation
+        // generations are not in this list and their chunk files survive this delete.
+        // That is correct and is exactly what pre-Phase-4 did — the embedded array was
+        // deduped by merge_file_metadata too. Those chunks become orphans the moment
+        // the file record goes away, and the sweeps collect them: live_chunk_ids()
+        // only counts a chunk live if its file_id resolves to a file still in
+        // FILE_TABLE, and the disk orphan sweep deletes local chunks that no live file
+        // references. Enumerating every generation here instead (the 2026-07-16
+        // all_chunk_locations_for_file attempt) bought nothing the sweep wasn't already
+        // doing, and cost a full table scan on every delete.
+        //
+        // A chunk_map miss means either a genuinely chunkless file or the cold window
+        // after a restart, and we can't tell which — so fall back to the scan and be
+        // slow-but-correct rather than skip chunks. Same shape as
+        // handle_get_file_chunk_map's fallback.
+        let file_chunk_locs: Vec<ChunkLocation> = match self.chunk_map.get(&metadata.id) {
+            Some(entry) if !entry.value().0.is_empty() => entry.value().0.clone(),
+            _ => match self.all_chunk_locations_for_file_async(metadata.id).await {
+                Ok(locs) => locs,
+                Err(e) => {
+                    warn!("Failed to resolve chunk locations for delete of {}: {}", path, e);
+                    return Response::Error {
+                        message: format!("Failed to resolve chunk locations: {}", e),
+                        code: ErrorCode::InternalError,
+                    };
+                }
+            },
         };
         let chunk_ids: Vec<ChunkId> = file_chunk_locs.iter()
             .map(|loc| loc.chunk_id)
@@ -10954,11 +10975,19 @@ impl Server {
     /// generations at an already-covered chunk_idx. The deliberate opposite of
     /// chunk_locations_for_info's one-row-per-slot dedup.
     ///
-    /// Only deletion wants this, and it genuinely does: a superseded row still has
-    /// real bytes on real disks and a real CHUNK_TABLE entry. Deduping here would
-    /// erase the file from the namespace while silently orphaning every older
-    /// generation's chunks forever — a leak with no later sweep to catch it, since
-    /// the sweeps key off live files and this file is gone.
+    /// Used ONLY as handle_delete_file's cold-window fallback, for when chunk_map has
+    /// no entry to delete from. Undeduped purely because there is no chunk_map view to
+    /// be consistent with in that case, so it errs toward erasing more.
+    ///
+    /// An earlier version of this comment claimed deletion MUST enumerate every
+    /// generation, or they'd be orphaned "forever — a leak with no later sweep to
+    /// catch it, since the sweeps key off live files and this file is gone". That was
+    /// wrong, and worth spelling out because it cost real production performance:
+    /// live_chunk_ids() counts a chunk live only if its file_id still resolves to a
+    /// row in FILE_TABLE, and the disk orphan sweep deletes local chunks that no live
+    /// file references — so a deleted file's superseded generations get collected on
+    /// their own. Acting on that false premise put a full table scan (~400k rows
+    /// deserialized) on every delete, which was visibly slow on staging.
     ///
     /// BLOCKING and O(CHUNK_TABLE) — async callers must use the _async wrapper.
     fn all_chunk_locations_for_file(

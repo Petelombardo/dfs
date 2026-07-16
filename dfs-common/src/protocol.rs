@@ -743,6 +743,26 @@ pub enum Request {
     QueueChunksForHealing {
         chunk_ids: Vec<ChunkId>,
     },
+
+    /// Batch, authoritative chunk-location replication — the healer's completion
+    /// path uses this instead of one `ReplicateChunkLocation` per chunk per peer.
+    /// "Authoritative" means: apply the SAME merge rules as the single-item
+    /// `ReplicateChunkLocation` (fresh-write timestamp stamping, under-RF union,
+    /// ts-guarded expansion, stale-early-write ignore, ts-guarded trim/same-count
+    /// acceptance) — see `Server::merge_replicated_chunk_location`. Deliberately
+    /// NOT routed through the existing `ReplicateChunkLocations` batch handler,
+    /// which has weaker self-report merge rules (ignores same-count updates and
+    /// trims when existing >= RF) tuned for a follower's periodic self-push of its
+    /// own locally-held records — those weaker rules would silently drop an
+    /// authoritative heal result (e.g. ghost-node replacement {A,B,dead} →
+    /// {A,B,D}, same node count, which self-report rules reject as "stale").
+    /// Appended at the end of the enum, not inserted mid-list — see
+    /// TriggerPhantomReconciliation's doc comment for why (bincode is positional;
+    /// a mid-list insertion breaks wire compatibility with any peer running a
+    /// binary built before the insertion).
+    ReplicateChunkLocationsV2 {
+        locations: Vec<ChunkLocation>,
+    },
 }
 
 /// Response types

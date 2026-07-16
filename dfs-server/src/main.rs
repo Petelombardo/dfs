@@ -664,6 +664,13 @@ async fn run_planned_offline_compaction(
         Err(e) => { warn!("Planned offline compaction task panicked: {}", e); false }
     };
 
+    // The drain above permanently stopped the metadata persist worker (that's what
+    // a drain IS — see drain_sled_writes) — respawn it BEFORE anything can accept
+    // or generate new metadata writes. Without this, every PutFileMetadata after a
+    // planned offline compaction was acked and silently never persisted (2026-07-16
+    // root cause; see Server::restart_sled_writes' doc comment for the fallout).
+    server.restart_sled_writes();
+
     // Rebind and come back online regardless of compaction's own outcome —
     // going offline must never turn into staying offline.
     let mut net_server = network::NetworkServer::new(listen_addr, server.clone());

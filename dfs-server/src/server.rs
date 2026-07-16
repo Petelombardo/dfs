@@ -186,7 +186,16 @@ pub struct Server {
     /// spawn_blocking calls all contending on sled's internal write lock.
     /// Wrapped in Mutex<Option<...>> so drain_sled_writes() can close the channel
     /// by dropping the sender, then wait for the worker thread to drain completely.
+    /// After a drain the worker is GONE — any path that resumes serving afterwards
+    /// (planned offline compaction) MUST call restart_sled_writes(), or every
+    /// subsequent PutFileMetadata is acked and silently never persisted (see
+    /// restart_sled_writes' doc comment for the 2026-07-16 incident).
     sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>>,
+
+    /// Whether the sled-write worker folds its batch into one transaction (see
+    /// spawn_sled_write_worker). Stored so restart_sled_writes() can respawn the
+    /// worker with the same behavior new() configured.
+    metadata_batch_drain_enabled: bool,
 
     /// TEMP PROFILING (2026-07-07): approximate backlog depth of the sled_write_tx
     /// channel (incremented on send, decremented after put_file returns) — tests
@@ -1782,40 +1791,24 @@ impl Server {
         }
     }
 
-    /// Create a new server instance
-    pub fn new(
-        storage: Arc<ChunkStorage>,
-        metadata: Arc<MetadataStore>,
-        chunk_size: usize,
-        cluster: Arc<ClusterManager>,
-        replication_factor: usize,
-        metadata_dir: PathBuf,
-        config_path: PathBuf,
+    /// Spawn the metadata persist worker ("sled worker", historically): a dedicated
+    /// thread that drains queued FileMetadata writes and commits them via
+    /// put_files_batch, so concurrent PutFileMetadata handlers never contend on
+    /// redb's write lock directly. Returns the sender half; the worker drains and
+    /// exits when the sender is dropped (see drain_sled_writes). Extracted from
+    /// new() so restart_sled_writes() can respawn it after a planned offline
+    /// compaction — the drain there is a pause, not a shutdown.
+    fn spawn_sled_write_worker(
+        meta_bg: Arc<MetadataStore>,
+        tombstones_for_worker: Arc<DashMap<FileId, std::time::Instant>>,
+        done_notify: Arc<tokio::sync::Notify>,
+        backlog_for_worker: Arc<std::sync::atomic::AtomicUsize>,
+        pending_for_worker: Arc<dashmap::DashSet<FileId>>,
+        progress_for_worker: Arc<tokio::sync::Notify>,
         metadata_batch_drain_enabled: bool,
-    ) -> Self {
-        let replication_factor = Arc::new(AtomicUsize::new(replication_factor));
-        // Create tombstones before the struct so the sled_write_tx worker can
-        // capture a clone and guard against writing metadata for deleted files.
-        let delete_tombstones: Arc<DashMap<FileId, std::time::Instant>> = Arc::new(DashMap::new());
-        let tombstones_for_worker = delete_tombstones.clone();
-
-        // Build sled worker channel and done-notify before the struct literal so the
-        // thread captures the correct Arc clones (struct fields can't cross-reference
-        // each other within a single literal).
-        let sled_write_done: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
-        let sled_write_backlog: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pending_metadata_writes: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
-        let sled_write_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
-        let pending_renames: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
-        let rename_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
-        let sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>> = {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
-            let meta_bg = metadata.clone();
-            let done_notify = sled_write_done.clone();
-            let backlog_for_worker = sled_write_backlog.clone();
-            let pending_for_worker = pending_metadata_writes.clone();
-            let progress_for_worker = sled_write_progress.clone();
-            std::thread::spawn(move || {
+    ) -> tokio::sync::mpsc::UnboundedSender<FileMetadata> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FileMetadata>();
+        std::thread::spawn(move || {
                 // Batch/fold pending writes into one redb transaction per drain cycle
                 // instead of one begin_write() per item — the measured bottleneck
                 // under sustained concurrent writes was time blocked acquiring redb's
@@ -1920,12 +1913,50 @@ impl Server {
                 // All pending items have been committed — signal drain_sled_writes().
                 done_notify.notify_waiters();
             });
-            Arc::new(std::sync::Mutex::new(Some(tx)))
-        };
+        tx
+    }
+
+    /// Create a new server instance
+    pub fn new(
+        storage: Arc<ChunkStorage>,
+        metadata: Arc<MetadataStore>,
+        chunk_size: usize,
+        cluster: Arc<ClusterManager>,
+        replication_factor: usize,
+        metadata_dir: PathBuf,
+        config_path: PathBuf,
+        metadata_batch_drain_enabled: bool,
+    ) -> Self {
+        let replication_factor = Arc::new(AtomicUsize::new(replication_factor));
+        // Create tombstones before the struct so the sled_write_tx worker can
+        // capture a clone and guard against writing metadata for deleted files.
+        let delete_tombstones: Arc<DashMap<FileId, std::time::Instant>> = Arc::new(DashMap::new());
+        let tombstones_for_worker = delete_tombstones.clone();
+
+        // Build sled worker channel and done-notify before the struct literal so the
+        // thread captures the correct Arc clones (struct fields can't cross-reference
+        // each other within a single literal).
+        let sled_write_done: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let sled_write_backlog: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pending_metadata_writes: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
+        let sled_write_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let pending_renames: Arc<dashmap::DashSet<FileId>> = Arc::new(dashmap::DashSet::new());
+        let rename_progress: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+        let sled_write_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileMetadata>>>> =
+            Arc::new(std::sync::Mutex::new(Some(Self::spawn_sled_write_worker(
+                metadata.clone(),
+                tombstones_for_worker,
+                sled_write_done.clone(),
+                sled_write_backlog.clone(),
+                pending_metadata_writes.clone(),
+                sled_write_progress.clone(),
+                metadata_batch_drain_enabled,
+            ))));
 
         let server = Self {
             storage,
             metadata: metadata.clone(),
+            metadata_batch_drain_enabled,
             chunker: Arc::new(Chunker::new(chunk_size)),
             cluster,
             client: Arc::new(NetworkClient::new()),
@@ -2012,6 +2043,39 @@ impl Server {
 
     pub fn metadata_store(&self) -> Arc<MetadataStore> {
         self.metadata.clone()
+    }
+
+    /// Re-create the metadata persist worker after drain_sled_writes() shut it down.
+    ///
+    /// Root-caused 2026-07-16 (local repro scripts/repro_persisted_chunklocs_loss.sh,
+    /// iter 16, plus four full-suite failure clusters): run_planned_offline_compaction
+    /// drains the worker (correct — the compaction needs a quiet db) and then RESUMES
+    /// SERVING, but nothing ever recreated the worker. From that moment every
+    /// handle_put_file_metadata took the `if let Some(tx)` branch as None: the client
+    /// was acked, chunk_map was updated (so everything WORKED while the process
+    /// lived), and the FILE/PATH record was silently never written again — cold
+    /// reads, dfs-admin queries, restarts and follower reconciliation all then saw
+    /// permanently stale records (empty chunk_locations / size 0 / files missing),
+    /// and periodic ReconcileMetadata even propagated the resulting stale inventory
+    /// as deletions cluster-wide. Pre-existing on HEAD since the planned-offline-
+    /// compaction feature landed (cfefdb6); exposed by anything that fires that
+    /// compaction mid-workload.
+    pub fn restart_sled_writes(&self) {
+        let mut guard = self.sled_write_tx.lock().unwrap();
+        if guard.is_some() {
+            warn!("restart_sled_writes: worker already running — leaving it in place");
+            return;
+        }
+        *guard = Some(Self::spawn_sled_write_worker(
+            self.metadata.clone(),
+            self.delete_tombstones.clone(),
+            self.sled_write_done.clone(),
+            self.sled_write_backlog.clone(),
+            self.pending_metadata_writes.clone(),
+            self.sled_write_progress.clone(),
+            self.metadata_batch_drain_enabled,
+        ));
+        info!("restart_sled_writes: metadata persist worker respawned");
     }
 
     /// Close the sled-write channel and wait for the worker thread to commit all
@@ -3417,6 +3481,9 @@ impl Server {
             Request::ReplicateChunkLocations { locations } => {
                 self.handle_replicate_chunk_locations(locations).await
             }
+            Request::ReplicateChunkLocationsV2 { locations } => {
+                self.handle_replicate_chunk_locations_v2(locations).await
+            }
             Request::HealChunkToNode { chunk_id, target_node, file_id } => {
                 self.handle_heal_chunk_to_node(chunk_id, target_node, file_id).await
             }
@@ -4364,6 +4431,131 @@ impl Server {
     }
 
     /// Handle replicate chunk location (internal cluster operation)
+    /// Authoritative merge of an incoming replicated chunk-location record against
+    /// the existing local record. Returns `None` when the incoming record is a
+    /// stale early-write broadcast that must be ignored entirely (no persist, no
+    /// chunk_map update); otherwise the merged record to persist.
+    ///
+    /// Shared by handle_replicate_chunk_location (single) and
+    /// handle_replicate_chunk_locations_v2 (the healer's batch form) so the rules
+    /// can never drift apart. Deliberately NOT used by
+    /// handle_replicate_chunk_locations, whose weaker self-report rules (ignore
+    /// same-count updates and trims when existing >= RF) exist because its callers
+    /// push one node's local view, not an authoritative post-heal record — see the
+    /// comments inside that handler.
+    ///
+    /// Merge strategy: take the larger node set, preserving the existing record's
+    /// file_offset and written_at if the incoming doesn't carry them.
+    ///
+    /// Chunks are content-addressed — same chunk_id always means same bytes, so
+    /// any node listed in either record genuinely holds (or held) the data.  The
+    /// healer's DeleteChunkReplica path explicitly removes nodes *and then*
+    /// broadcasts the trimmed set; that trim broadcast will always have fewer nodes
+    /// than the current record, so we need to accept it.
+    ///
+    /// Rule: if incoming.nodes.len() > existing.nodes.len(), take incoming (expansion).
+    ///       if incoming.nodes.len() <= existing.nodes.len() AND incoming.nodes.len() < RF,
+    ///         this is a stale early-write broadcast arriving after healing — ignore it.
+    ///       if incoming.nodes.len() <= existing.nodes.len() AND incoming.nodes.len() >= RF,
+    ///         this is a legitimate healer trim or same-size update — accept it.
+    ///
+    /// This prevents the cycle: write broadcasts {A,B} → healer heals to {A,B,C} →
+    /// stale write broadcast arrives, replaces with {A,B} → healer heals to {A,B,D}
+    /// → accumulate nodes D,E,... = over-replication.
+    fn merge_replicated_chunk_location(
+        location: ChunkLocation,
+        existing: Option<ChunkLocation>,
+        rf: usize,
+    ) -> Option<ChunkLocation> {
+        // Assign server-side timestamp to fresh-write locations (written_at=None).
+        // Same reason as in handle_put_file_metadata: T_now on the leader is always
+        // greater than any previous patch timestamp, so fresh writes win the guard.
+        let location = if location.written_at.is_none() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            ChunkLocation { written_at: Some(now_ms), ..location }
+        } else {
+            location
+        };
+
+        let existing = match existing {
+            Some(existing) => existing,
+            None => {
+                debug!("Creating new chunk location for {}", location.chunk_id);
+                return Some(location);
+            }
+        };
+
+        let incoming_count = location.nodes.len();
+        let existing_count = existing.nodes.len();
+        let nodes = if incoming_count < rf && existing_count < rf {
+            // Both sides are under-RF — union the node sets.  This handles the
+            // startup-sync case where followers each push their single-node record
+            // and we need to accumulate them rather than overwrite.
+            let mut merged: Vec<_> = existing.nodes.clone();
+            for n in &location.nodes {
+                if !merged.contains(n) {
+                    merged.push(*n);
+                }
+            }
+            if merged.len() > existing_count {
+                debug!("Merging chunk location for {} ({} + {} → {} nodes)",
+                       location.chunk_id, existing_count, incoming_count, merged.len());
+            }
+            merged
+        } else if incoming_count > existing_count {
+            // Expansion — only accept if the incoming record is at least as fresh
+            // as the existing one.  A re-joining node's stale sled data can have
+            // a larger node count than the healed record (it predates the ghost
+            // prune), and accepting it blindly creates new ghost replicas.
+            let ts_ok = location.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0);
+            if ts_ok {
+                debug!("Expanding chunk location for {} ({} → {} nodes)",
+                       location.chunk_id, existing_count, incoming_count);
+                location.nodes.clone()
+            } else {
+                debug!("Stale expansion for {} ({} → {} nodes, ts {} < {}) — keeping existing",
+                       location.chunk_id, existing_count, incoming_count,
+                       location.written_at.unwrap_or(0), existing.written_at.unwrap_or(0));
+                existing.nodes.clone()
+            }
+        } else if incoming_count < rf && existing_count >= rf {
+            // Stale early-write broadcast arriving after healing — ignore.
+            debug!("Ignoring stale chunk location broadcast for {} ({} nodes incoming, existing has {}, RF={})",
+                   location.chunk_id, incoming_count, existing_count, rf);
+            return None;
+        } else {
+            // Healer trim or same-size update — accept only if the incoming
+            // record is at least as fresh as the existing one.  A stale follower
+            // sync pushing a same-count but different-nodes record (e.g. the old
+            // set before a ghost was pruned) would otherwise revert the healer's
+            // work every 30 seconds.
+            let ts_ok = location.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0);
+            if ts_ok {
+                debug!("Updating chunk location for {} ({} → {} nodes)",
+                       location.chunk_id, existing_count, incoming_count);
+                location.nodes.clone()
+            } else {
+                debug!("Stale same-count update for {} ({} nodes, ts {} < {}) — keeping existing",
+                       location.chunk_id, existing_count,
+                       location.written_at.unwrap_or(0), existing.written_at.unwrap_or(0));
+                existing.nodes.clone()
+            }
+        };
+        Some(ChunkLocation {
+            chunk_id: location.chunk_id,
+            nodes,
+            size: location.size,
+            checksum: location.checksum,
+            file_offset: location.file_offset.or(existing.file_offset),
+            written_at: existing.written_at.or(location.written_at),
+            client_write_seq: location.client_write_seq.or(existing.client_write_seq),
+            file_id: location.file_id.or(existing.file_id),
+        })
+    }
+
     async fn handle_replicate_chunk_location(&self, location: ChunkLocation, file_id: Option<FileId>) -> Response {
         info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
 
@@ -4378,115 +4570,20 @@ impl Server {
             self.last_cluster_write_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Assign server-side timestamp to fresh-write locations (written_at=None).
-        // Same reason as in handle_put_file_metadata: T_now on the leader is always
-        // greater than any previous patch timestamp, so fresh writes win the guard.
-        let location = if location.written_at.is_none() {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            ChunkLocation { written_at: Some(now_ms), ..location }
-        } else {
-            location
-        };
-
-        // Merge strategy: take the larger node set, preserving the existing record's
-        // file_offset and written_at if the incoming doesn't carry them.
-        //
-        // Chunks are content-addressed — same chunk_id always means same bytes, so
-        // any node listed in either record genuinely holds (or held) the data.  The
-        // healer's DeleteChunkReplica path explicitly removes nodes *and then*
-        // broadcasts the trimmed set; that trim broadcast will always have fewer nodes
-        // than the current record, so we need to accept it.
-        //
-        // Rule: if incoming.nodes.len() > existing.nodes.len(), take incoming (expansion).
-        //       if incoming.nodes.len() <= existing.nodes.len() AND incoming.nodes.len() < RF,
-        //         this is a stale early-write broadcast arriving after healing — ignore it.
-        //       if incoming.nodes.len() <= existing.nodes.len() AND incoming.nodes.len() >= RF,
-        //         this is a legitimate healer trim or same-size update — accept it.
-        //
-        // This prevents the cycle: write broadcasts {A,B} → healer heals to {A,B,C} →
-        // stale write broadcast arrives, replaces with {A,B} → healer heals to {A,B,D}
-        // → accumulate nodes D,E,... = over-replication.
+        // Merge rules live in merge_replicated_chunk_location, shared with the
+        // healer's batch path (handle_replicate_chunk_locations_v2).
         let rf = self.replication_factor.load(Ordering::Relaxed);
-        let merged_location = match self.metadata.get_chunk_location_async(location.chunk_id).await {
-            Ok(Some(existing)) => {
-                let incoming_count = location.nodes.len();
-                let existing_count = existing.nodes.len();
-                let nodes = if incoming_count < rf && existing_count < rf {
-                    // Both sides are under-RF — union the node sets.  This handles the
-                    // startup-sync case where followers each push their single-node record
-                    // and we need to accumulate them rather than overwrite.
-                    let mut merged: Vec<_> = existing.nodes.clone();
-                    for n in &location.nodes {
-                        if !merged.contains(n) {
-                            merged.push(*n);
-                        }
-                    }
-                    if merged.len() > existing_count {
-                        debug!("Merging chunk location for {} ({} + {} → {} nodes)",
-                               location.chunk_id, existing_count, incoming_count, merged.len());
-                    }
-                    merged
-                } else if incoming_count > existing_count {
-                    // Expansion — only accept if the incoming record is at least as fresh
-                    // as the existing one.  A re-joining node's stale sled data can have
-                    // a larger node count than the healed record (it predates the ghost
-                    // prune), and accepting it blindly creates new ghost replicas.
-                    let ts_ok = location.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0);
-                    if ts_ok {
-                        debug!("Expanding chunk location for {} ({} → {} nodes)",
-                               location.chunk_id, existing_count, incoming_count);
-                        location.nodes.clone()
-                    } else {
-                        debug!("Stale expansion for {} ({} → {} nodes, ts {} < {}) — keeping existing",
-                               location.chunk_id, existing_count, incoming_count,
-                               location.written_at.unwrap_or(0), existing.written_at.unwrap_or(0));
-                        existing.nodes.clone()
-                    }
-                } else if incoming_count < rf && existing_count >= rf {
-                    // Stale early-write broadcast arriving after healing — ignore.
-                    debug!("Ignoring stale chunk location broadcast for {} ({} nodes incoming, existing has {}, RF={})",
-                           location.chunk_id, incoming_count, existing_count, rf);
-                    return Response::Ok { data: None };
-                } else {
-                    // Healer trim or same-size update — accept only if the incoming
-                    // record is at least as fresh as the existing one.  A stale follower
-                    // sync pushing a same-count but different-nodes record (e.g. the old
-                    // set before a ghost was pruned) would otherwise revert the healer's
-                    // work every 30 seconds.
-                    let ts_ok = location.written_at.unwrap_or(0) >= existing.written_at.unwrap_or(0);
-                    if ts_ok {
-                        debug!("Updating chunk location for {} ({} → {} nodes)",
-                               location.chunk_id, existing_count, incoming_count);
-                        location.nodes.clone()
-                    } else {
-                        debug!("Stale same-count update for {} ({} nodes, ts {} < {}) — keeping existing",
-                               location.chunk_id, existing_count,
-                               location.written_at.unwrap_or(0), existing.written_at.unwrap_or(0));
-                        existing.nodes.clone()
-                    }
-                };
-                ChunkLocation {
-                    chunk_id: location.chunk_id,
-                    nodes,
-                    size: location.size,
-                    checksum: location.checksum,
-                    file_offset: location.file_offset.or(existing.file_offset),
-                    written_at: existing.written_at.or(location.written_at),
-                    client_write_seq: location.client_write_seq.or(existing.client_write_seq),
-                    file_id: location.file_id.or(existing.file_id),
-                }
-            }
-            Ok(None) => {
-                debug!("Creating new chunk location for {}", location.chunk_id);
-                location.clone()
-            }
+        let existing = match self.metadata.get_chunk_location_async(location.chunk_id).await {
+            Ok(existing) => existing,
             Err(e) => {
                 warn!("Failed to get existing chunk location: {}, using new location", e);
-                location.clone()
+                None
             }
+        };
+        let merged_location = match Self::merge_replicated_chunk_location(location, existing, rf) {
+            Some(merged) => merged,
+            // Stale early-write broadcast arriving after healing — ignore.
+            None => return Response::Ok { data: None },
         };
 
         // Store merged location
@@ -5135,6 +5232,82 @@ impl Server {
             Response::Error {
                 message: format!("Failed to replicate {}/{} chunk locations", failed, locations.len()),
                 code: ErrorCode::InternalError,
+            }
+        }
+    }
+
+    /// Batch, authoritative chunk-location replication — the healer's completion
+    /// path sends one of these per peer per flush batch instead of one
+    /// ReplicateChunkLocation connection per healed chunk (see
+    /// HealingManager::flush_heal_outcomes and Request::ReplicateChunkLocationsV2's
+    /// doc comment for why this can't reuse handle_replicate_chunk_locations'
+    /// weaker self-report merge rules).
+    ///
+    /// Per location this applies exactly what the single-item handler applies —
+    /// the shared merge_replicated_chunk_location rules, then the in-memory
+    /// chunk_map update — but persists the whole batch in ONE transaction.
+    /// A batch-local pending map makes a later occurrence of the same chunk_id in
+    /// one batch merge against the earlier occurrence's result, not stale on-disk
+    /// data (same technique as handle_replicate_chunk_locations).
+    ///
+    /// Deliberately NOT mirrored from the single handler: its below-RF
+    /// queue_chunks_immediate call. The sender here is the healer's own completion
+    /// flush — every location in it was just actively healed (or is a deliberate
+    /// reconcile/trim result); re-queueing sub-RF entries from it would have the
+    /// healer feed itself on records it already owns the lifecycle of.
+    async fn handle_replicate_chunk_locations_v2(&self, locations: Vec<ChunkLocation>) -> Response {
+        debug!("Handling authoritative batch replicate of {} chunk locations", locations.len());
+
+        // Heal completions are cluster write activity for the adaptive bandwidth
+        // controller, same as the single handler — stamped once per batch.
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.last_cluster_write_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let rf = self.replication_factor.load(Ordering::Relaxed);
+        let mut pending: std::collections::HashMap<ChunkId, ChunkLocation> = std::collections::HashMap::new();
+        for location in locations {
+            let existing = match pending.get(&location.chunk_id) {
+                Some(p) => Some(p.clone()),
+                None => match self.metadata.get_chunk_location_async(location.chunk_id).await {
+                    Ok(existing) => existing,
+                    Err(e) => {
+                        warn!("Failed to get existing chunk location: {}, using new location", e);
+                        None
+                    }
+                },
+            };
+            if let Some(merged) = Self::merge_replicated_chunk_location(location, existing, rf) {
+                pending.insert(merged.chunk_id, merged);
+            }
+        }
+
+        if pending.is_empty() {
+            return Response::Ok { data: None };
+        }
+        let to_commit: Vec<ChunkLocation> = pending.into_values().collect();
+        let attempted = to_commit.len();
+        match self.metadata.put_chunk_locations_batch_async(to_commit.clone()).await {
+            Ok(()) => {
+                for location in &to_commit {
+                    if let Some(fid) = location.file_id {
+                        self.chunk_map_update_location_for_file(fid, location).await;
+                    } else {
+                        self.chunk_map_update_location(location).await;
+                    }
+                }
+                Response::Ok { data: None }
+            }
+            Err(e) => {
+                warn!("handle_replicate_chunk_locations_v2: batch commit of {} locations failed: {}", attempted, e);
+                Response::Error {
+                    message: format!("Failed to replicate {} chunk locations", attempted),
+                    code: ErrorCode::InternalError,
+                }
             }
         }
     }
@@ -6218,8 +6391,21 @@ impl Server {
     /// redb's own stats (fragmented_bytes / (stored+metadata+fragmented bytes)),
     /// not raw file-size comparison — see redb_fragmentation_stats's and this
     /// function's call site's doc comments for the incident this fixes.
-    fn should_compact(genuine_frag_pct: f64, secs_since_compact: u64) -> bool {
-        genuine_frag_pct >= 0.20 || secs_since_compact >= 30 * 60
+    /// Minimum genuinely-reclaimable bytes before ratio-based compaction fires.
+    /// The fragmentation RATIO is scale-free: a near-empty database (a few hundred
+    /// KB live) sits above 20% permanently just from fixed table overhead plus a
+    /// handful of commits, which made the loop below attempt compaction every
+    /// 60s poll, defer under routine churn, and escalate into planned OFFLINE
+    /// compactions (a real availability pause per node, every 1-3 minutes,
+    /// "reclaiming" a 0.7MB file into a 3.5MB one — observed 2026-07-16 during
+    /// the persist-worker root-cause session). Pausing a node is only worth
+    /// paying for when there are real megabytes to get back; the 30-minute
+    /// periodic online compact below still covers slow accumulation on small DBs.
+    const COMPACT_MIN_RECLAIMABLE_BYTES: u64 = 32 * 1024 * 1024;
+
+    fn should_compact(genuine_frag_pct: f64, fragmented_bytes: u64, secs_since_compact: u64) -> bool {
+        (genuine_frag_pct >= 0.20 && fragmented_bytes >= Self::COMPACT_MIN_RECLAIMABLE_BYTES)
+            || secs_since_compact >= 30 * 60
     }
 
     pub fn start_compaction_loop(self: Arc<Self>) {
@@ -6257,6 +6443,13 @@ impl Server {
             // here bounds how often that gap can recur regardless of cause.
             let mut last_offline_compact_time: Option<std::time::Instant> = None;
             const MIN_OFFLINE_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+            // Previous iteration's metadata.txn_stats_snapshot(), keyed by site — lets
+            // the [META TXN] log below (Phase 0 growth-attribution instrumentation)
+            // report per-cycle deltas instead of the cumulative-since-process-start
+            // totals txn_stats_snapshot() itself returns. Empty on the first iteration,
+            // so that cycle's "delta" is really the cumulative total since startup —
+            // expected and harmless, not worth special-casing.
+            let mut prev_txn_stats: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
             loop {
                 // The fragmentation gate makes this interval cheap (just a stat()
                 // call on most iterations). Keep it at 60s so compaction triggers
@@ -6299,20 +6492,63 @@ impl Server {
                 // stats (metadata.redb_fragmentation_stats(), stored+metadata bytes
                 // vs fragmented bytes) distinguish genuine reclaimable waste from
                 // pre-allocated headroom directly, so use that as the actual gate.
-                let genuine_frag_pct = match metadata.redb_fragmentation_stats() {
+                // frag_stats carries (live_bytes, fragmented_bytes) alongside the
+                // percentage so the [META TXN] log below can reuse them without a
+                // second redb_fragmentation_stats() call — None on the fallback-error
+                // path, in which case the log line just reports 0 for both.
+                let (genuine_frag_pct, frag_stats) = match metadata.redb_fragmentation_stats() {
                     Ok((live_bytes, fragmented_bytes)) => {
                         let total = live_bytes + fragmented_bytes;
-                        if total == 0 { 0.0 } else { fragmented_bytes as f64 / total as f64 }
+                        let pct = if total == 0 { 0.0 } else { fragmented_bytes as f64 / total as f64 };
+                        (pct, Some((live_bytes, fragmented_bytes)))
                     }
                     Err(e) => {
                         warn!("compaction: failed to read redb fragmentation stats ({}) — falling back to raw file-size ratio for this cycle", e);
                         // Fall back to the old (imperfect but functional) signal rather
                         // than never compacting at all if stats() itself errors.
-                        if frag_ratio >= 1.20 { 1.0 } else { 0.0 }
+                        let pct = if frag_ratio >= 1.20 { 1.0 } else { 0.0 };
+                        (pct, None)
                     }
                 };
 
-                if !Self::should_compact(genuine_frag_pct, secs_since_compact) {
+                // [META TXN]: per-call-site write-transaction attribution (Phase 0 of the
+                // metadata DB growth investigation — see MetadataStore::note_txn). Computes
+                // this cycle's delta against prev_txn_stats (a plain cumulative-since-start
+                // snapshot on its own wouldn't show which sites are *currently* hot) and
+                // logs only when something actually changed, so a quiet node doesn't spam
+                // an empty line every 60s.
+                {
+                    let snapshot = metadata.txn_stats_snapshot();
+                    let mut deltas: Vec<(String, u64, u64)> = Vec::with_capacity(snapshot.len());
+                    for (site, count, bytes) in &snapshot {
+                        let (prev_count, prev_bytes) = prev_txn_stats.get(site).copied().unwrap_or((0, 0));
+                        let dcount = count.saturating_sub(prev_count);
+                        let dbytes = bytes.saturating_sub(prev_bytes);
+                        if dcount > 0 {
+                            deltas.push((site.clone(), dcount, dbytes));
+                        }
+                    }
+                    prev_txn_stats = snapshot.into_iter().map(|(site, c, b)| (site, (c, b))).collect();
+
+                    if !deltas.is_empty() {
+                        deltas.sort_by(|a, b| b.1.cmp(&a.1));
+                        let top = deltas.iter().take(8)
+                            .map(|(site, dcount, dbytes)| format!("{}=+{}tx/+{:.1}MB", site, dcount, *dbytes as f64 / 1_048_576.0))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let (live_mb, frag_mb) = frag_stats
+                            .map(|(l, f)| (l as f64 / 1_048_576.0, f as f64 / 1_048_576.0))
+                            .unwrap_or((0.0, 0.0));
+                        info!("[META TXN] db={:.1}MB live={:.1}MB frag={:.1}MB | {}",
+                            current_size as f64 / 1_048_576.0, live_mb, frag_mb, top);
+                    }
+                }
+
+                // frag_stats None means redb's stats() itself errored and pct is the
+                // raw-ratio fallback — pass MAX so the bytes floor never suppresses
+                // that (already rare, already imprecise) path's behavior.
+                let fragmented_bytes = frag_stats.map(|(_, f)| f).unwrap_or(u64::MAX);
+                if !Self::should_compact(genuine_frag_pct, fragmented_bytes, secs_since_compact) {
                     tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                     continue;
                 }
@@ -11004,34 +11240,49 @@ mod tests {
     mod compaction_trigger_metric {
         use super::*;
 
+        // Comfortably above COMPACT_MIN_RECLAIMABLE_BYTES so these tests exercise
+        // only the ratio/time conditions they're each about.
+        const BIG_WASTE: u64 = 256 * 1024 * 1024;
+
         #[test]
         fn low_genuine_fragmentation_does_not_compact_even_if_file_doubled() {
             // This is exactly the observed incident shape: file size looks like it
             // doubled, but genuine fragmentation is low (e.g. 2% real waste) because
             // the growth was redb pre-allocating headroom, not real garbage.
-            assert!(!Server::should_compact(0.02, 60));
+            assert!(!Server::should_compact(0.02, BIG_WASTE, 60));
         }
 
         #[test]
         fn high_genuine_fragmentation_does_compact() {
-            assert!(Server::should_compact(0.25, 60));
+            assert!(Server::should_compact(0.25, BIG_WASTE, 60));
         }
 
         #[test]
         fn exactly_20_percent_compacts() {
-            assert!(Server::should_compact(0.20, 60));
+            assert!(Server::should_compact(0.20, BIG_WASTE, 60));
         }
 
         #[test]
         fn thirty_minute_safety_net_compacts_even_at_low_fragmentation() {
             // Catches latent free pages redb only reclaims later even when the live
             // fragmentation % looks fine right now.
-            assert!(Server::should_compact(0.02, 30 * 60));
+            assert!(Server::should_compact(0.02, 0, 30 * 60));
         }
 
         #[test]
         fn neither_condition_met_does_not_compact() {
-            assert!(!Server::should_compact(0.05, 60));
+            assert!(!Server::should_compact(0.05, BIG_WASTE, 60));
+        }
+
+        /// Regression for the 2026-07-16 escalation misfire: the fragmentation
+        /// RATIO is scale-free, so a near-empty DB (a few hundred KB live, fixed
+        /// table overhead) sits above 20% permanently — that must NOT count as
+        /// compaction-worthy waste, or the loop attempts every poll, defers under
+        /// churn, and escalates into availability-pausing offline compactions
+        /// ("reclaiming" a 0.7MB file into a 3.5MB one, every 1-3 minutes).
+        #[test]
+        fn high_ratio_on_tiny_db_does_not_compact() {
+            assert!(!Server::should_compact(0.90, 3 * 1024 * 1024, 60));
         }
     }
 

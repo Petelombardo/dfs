@@ -330,6 +330,37 @@ pub struct HealingManager {
     compaction_quiescing: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Deferred commit intent produced by one heal task. do_heal_chunk_inner used to
+/// commit each of these itself the moment the chunk finished healing: one
+/// single-record put/delete transaction, one delete_pending_healing transaction
+/// (via clear_pending_static), and one ReplicateChunkLocation connection per peer
+/// — per chunk. Under a backlog drain that's hundreds of tiny redb commits per
+/// minute, each one COW-rewriting the B-tree path to the root (measured 2026-07-15:
+/// leader DB ballooned to 56.5MB with 0.7MB live during a 500-chunk drain).
+/// drain_heal_queue now collects these and flushes them in batches — one
+/// transaction and one per-peer ReplicateChunkLocationsV2 message per batch; see
+/// flush_heal_outcomes.
+struct HealOutcome {
+    chunk_id: ChunkId,
+    /// Updated routing record to persist (and broadcast when `broadcast`).
+    location_put: Option<ChunkLocation>,
+    /// Routing record to delete (orphaned chunk / chunk lost from its source).
+    location_delete: Option<ChunkId>,
+    /// Remove chunk_id from pending_healing — both the in-memory map and its
+    /// PENDING_HEALING_TABLE row (what clear_pending_static used to do inline).
+    clear_pending: bool,
+    /// Broadcast location_put to all online peers after the local commit.
+    broadcast: bool,
+}
+
+impl HealOutcome {
+    /// Outcome that only clears the pending_healing entry (orphan deferrals,
+    /// cancelled heals, stale-source discards, already-at-RF chunks).
+    fn clear_only(chunk_id: ChunkId) -> Self {
+        Self { chunk_id, location_put: None, location_delete: None, clear_pending: true, broadcast: false }
+    }
+}
+
 impl HealingManager {
     /// Create a new healing manager
     #[allow(clippy::too_many_arguments)]
@@ -784,6 +815,24 @@ impl HealingManager {
             if let Err(err) = self.metadata.put_pending_healing_async(chunk_id, dfs_common::types::current_timestamp()).await {
                 warn!("Failed to persist pending_healing entry for {}: {}", chunk_id, err);
             }
+        }
+    }
+
+    /// Deferred-persistence variant of mark_pending for per-chunk classification
+    /// loops: the in-memory Vacant insert happens immediately (dedup and
+    /// delay-tracking semantics identical to mark_pending), but instead of paying
+    /// a single-record write transaction per chunk, the persist pair is pushed
+    /// onto `deferred` for the caller to flush in ONE put_pending_healing_batch
+    /// transaction after its loop — see put_chunk_locations_batch's doc comment
+    /// for why N single-record transactions cost far more than one N-record one
+    /// (measured: put_pending_healing was the #1 txn site, +1032tx/min, during
+    /// the 2026-07-15 heal-backlog baseline).
+    async fn mark_pending_deferred(&self, chunk_id: ChunkId, deferred: &mut Vec<(ChunkId, u64)>) {
+        let mut pending = self.pending_healing.write().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = pending.entry(chunk_id) {
+            e.insert(Instant::now());
+            drop(pending);
+            deferred.push((chunk_id, dfs_common::types::current_timestamp()));
         }
     }
 
@@ -1277,7 +1326,7 @@ impl HealingManager {
             let metadata = Arc::clone(&self.metadata);
             let puts = db_puts;
             let result = tokio::task::spawn_blocking(move || {
-                metadata.batch_update_chunk_locations(&puts, &[])
+                metadata.batch_update_chunk_locations(&puts, &[], &[])
             }).await;
             match result {
                 Ok(Ok(())) => {}
@@ -1832,6 +1881,11 @@ impl HealingManager {
         // end up blocked on the mutex, freezing the entire async runtime.
         let mut db_puts: Vec<ChunkLocation> = Vec::new();
         let mut db_deletes: Vec<ChunkId> = Vec::new();
+        // Deferred PENDING_HEALING_TABLE writes from the classification loop below —
+        // new detections (mark_pending_deferred) and cleared entries — flushed as
+        // batches alongside db_puts/db_deletes instead of one transaction per chunk.
+        let mut deferred_pending_marks: Vec<(ChunkId, u64)> = Vec::new();
+        let mut deferred_pending_clears: Vec<ChunkId> = Vec::new();
 
         // Orphan detection/purging used to live here (leader-only, gated on
         // destructive_allowed + a 30-minute age grace + two-pass confirmation). It now
@@ -2218,7 +2272,7 @@ impl HealingManager {
                         self.stalled_healing.write().await.insert(chunk_id);
                         // Keep first_detected timestamp in pending so we know how long
                         // it has been under-replicated, but mark it explicitly stalled.
-                        self.mark_pending(chunk_id).await;
+                        self.mark_pending_deferred(chunk_id, &mut deferred_pending_marks).await;
                         pending_count += 1;
                         continue;
                     }
@@ -2238,7 +2292,7 @@ impl HealingManager {
                     // above put this straight back on the work queue every cycle. See
                     // heal_push_failure's doc comment for the incident this closes.
                     if Self::heal_push_failure_backoff_active(&self.heal_push_failure, &chunk_id) {
-                        self.mark_pending(chunk_id).await;
+                        self.mark_pending_deferred(chunk_id, &mut deferred_pending_marks).await;
                         pending_count += 1;
                         continue;
                     }
@@ -2250,13 +2304,13 @@ impl HealingManager {
                     // and the healer must wait for the file to be fully written before
                     // it can know the correct final replica set.
                     let never_fully_replicated = metadata_node_count < replication_factor;
-                    if self.should_heal(&chunk_id).await {
+                    if self.should_heal(&chunk_id, &mut deferred_pending_marks).await {
                         work.push((chunk_id, ReplicationStatus::UnderReplicated, confirmed_alive_nodes.clone()));
                     } else {
                         if never_fully_replicated {
                             // Ensure pending_healing entry exists so should_heal() starts
                             // tracking the delay from first discovery.
-                            self.mark_pending(chunk_id).await;
+                            self.mark_pending_deferred(chunk_id, &mut deferred_pending_marks).await;
                         }
                         pending_count += 1;
                     }
@@ -2267,7 +2321,7 @@ impl HealingManager {
                         // normal healing_delay_secs wait applies before trimming.
                         // This gives the VerifyChunkIntegrity pass (in do_cleanup_excess_shared)
                         // time to run after the cluster has settled.
-                        self.mark_pending(chunk_id).await;
+                        self.mark_pending_deferred(chunk_id, &mut deferred_pending_marks).await;
                         work.push((chunk_id, ReplicationStatus::OverReplicated, confirmed_alive_nodes.clone()));
                     } else {
                         debug!("Skipping over-replication cleanup for {} — cluster degraded", chunk_id);
@@ -2278,7 +2332,11 @@ impl HealingManager {
                     // If nodes_without_chunk is non-empty we need the pending_healing
                     // entry to persist as the ghost-pruning delay timer.
                     if nodes_without_chunk.is_empty() {
-                        self.clear_pending(&chunk_id).await;
+                        // Same two effects as clear_pending, but the PENDING_HEALING_TABLE
+                        // delete is deferred into the batched flush below instead of
+                        // paying one transaction per now-healthy chunk.
+                        self.pending_healing.write().await.remove(&chunk_id);
+                        deferred_pending_clears.push(chunk_id);
                         self.stalled_healing.write().await.remove(&chunk_id);
                         self.heal_push_failure.remove(&chunk_id);
                     }
@@ -2292,16 +2350,24 @@ impl HealingManager {
         // storm (many concurrent tasks) blocks all Tokio worker threads, freezing
         // the runtime. One batched spawn_blocking keeps the OS thread off the
         // async executor and reduces total lock contention to a single acquisition.
-        if !db_puts.is_empty() || !db_deletes.is_empty() {
+        if !db_puts.is_empty() || !db_deletes.is_empty() || !deferred_pending_clears.is_empty() {
             let metadata = Arc::clone(&self.metadata);
             let result = tokio::task::spawn_blocking(move || {
-                metadata.batch_update_chunk_locations(&db_puts, &db_deletes)?;
+                metadata.batch_update_chunk_locations(&db_puts, &db_deletes, &deferred_pending_clears)?;
                 Ok::<_, anyhow::Error>(())
             }).await;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!("Batch metadata update failed: {}", e),
                 Err(e) => warn!("Batch metadata update spawn_blocking panicked: {}", e),
+            }
+        }
+
+        // New detections from this pass (mark_pending_deferred) — one batch insert
+        // instead of one transaction per newly-pending chunk.
+        if !deferred_pending_marks.is_empty() {
+            if let Err(e) = self.metadata.put_pending_healing_batch_async(deferred_pending_marks).await {
+                warn!("Batch pending_healing persist failed: {}", e);
             }
         }
 
@@ -2561,8 +2627,24 @@ impl HealingManager {
         // whichever node ends up being the transfer's source (and heal_bandwidth_limiter_in
         // on whichever node ends up being the target).
         let max_live = self.heal_max_concurrent.load(Ordering::Relaxed).max(1);
-        let mut set: JoinSet<()> = JoinSet::new();
+        let mut set: JoinSet<Option<HealOutcome>> = JoinSet::new();
         let mut iter = work.into_iter();
+
+        // Commit intents collected from finished heal tasks, flushed in batches —
+        // see HealOutcome's doc comment for why tasks no longer commit individually.
+        // Flushing happens after EVERY completion, batching only outcomes that have
+        // ALREADY finished (the try_join_next scoop below) — group-commit style:
+        // zero added commit latency when completions trickle in, real batching when
+        // a burst of concurrent heals lands together. An earlier version flushed
+        // only at >=32 outcomes or end-of-drain; with fewer than 32 chunks in a
+        // cycle that deferred every commit behind the SLOWEST heal in the cycle
+        // (up to the transfer timeout), during which discovery saw stale
+        // CHUNK_TABLE state and concurrent folds cancelled the still-uncommitted
+        // heals — measured as a T38b convergence failure (6 heals discarded in one
+        // end-of-drain flush, 2026-07-16). 32 per flush still bounds the redb
+        // write-lock hold per batch.
+        const HEAL_FLUSH_BATCH: usize = 32;
+        let mut outcomes: Vec<HealOutcome> = Vec::new();
 
         loop {
             // Fill up to max_live concurrent tasks.
@@ -2573,7 +2655,6 @@ impl HealingManager {
                 let metadata = self.metadata.clone();
                 let cluster = self.cluster.clone();
                 let client = self.client.clone();
-                let pending_healing = self.pending_healing.clone();
                 let in_flight_healing = self.in_flight_healing.clone();
                 let cancelled_heals = self.cancelled_heals.clone();
                 let stalled_healing = self.stalled_healing.clone();
@@ -2593,7 +2674,7 @@ impl HealingManager {
                             ReplicationStatus::UnderReplicated => {
                                 HealingManager::do_heal_chunk_shared(
                                     &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client,
-                                    &pending_healing, &in_flight_healing, &cancelled_heals, replication_factor, &bandwidth_limiter,
+                                    &in_flight_healing, &cancelled_heals, replication_factor, &bandwidth_limiter,
                                     &node_inflight, &heal_max_concurrent_per_node, &heal_push_failure,
                                 ).await
                             }
@@ -2601,23 +2682,25 @@ impl HealingManager {
                                 HealingManager::do_cleanup_excess_shared(
                                     &chunk_id, confirmed_alive, &storage, &metadata, &cluster, &client, replication_factor,
                                     &in_flight_healing,
-                                ).await
+                                ).await.map(|()| None)
                             }
-                            ReplicationStatus::Ok => Ok(()),
+                            ReplicationStatus::Ok => Ok(None),
                         }
                     }).await;
 
                     match result {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(outcome)) => outcome,
                         Ok(Err(e)) => {
                             warn!("Heal failed for chunk {}: {} — stalling until next discovery", chunk_id, e);
                             in_flight_healing.write().await.remove(&chunk_id);
                             stalled_healing.write().await.insert(chunk_id);
+                            None
                         }
                         Err(_) => {
                             warn!("Heal timed out for chunk {} after {}s — stalling until next discovery", chunk_id, transfer_timeout.as_secs());
                             in_flight_healing.write().await.remove(&chunk_id);
                             stalled_healing.write().await.insert(chunk_id);
+                            None
                         }
                     }
                     // _permit drops here, releasing semaphore budget
@@ -2629,15 +2712,131 @@ impl HealingManager {
             }
 
             // Wait for any one task to finish, then loop to fill the slot.
-            set.join_next().await;
+            match set.join_next().await {
+                Some(Ok(Some(outcome))) => outcomes.push(outcome),
+                Some(Ok(None)) => {}
+                Some(Err(e)) => warn!("Heal task panicked: {}", e),
+                None => {}
+            }
+            // Scoop up any OTHER tasks that have already finished — they batch into
+            // this flush for free, without waiting on anything still in flight.
+            while outcomes.len() < HEAL_FLUSH_BATCH {
+                match set.try_join_next() {
+                    Some(Ok(Some(outcome))) => outcomes.push(outcome),
+                    Some(Ok(None)) => {}
+                    Some(Err(e)) => warn!("Heal task panicked: {}", e),
+                    None => break,
+                }
+            }
+            self.flush_heal_outcomes(&mut outcomes).await;
         }
+
+        // Final flush — the JoinSet is fully drained, so this leaves nothing behind.
+        self.flush_heal_outcomes(&mut outcomes).await;
 
         debug!("Heal queue drain: processed {} tasks (max_live={})", total, max_live);
         Ok(())
     }
 
-    /// Check if a chunk should be healed (delay has passed)
-    async fn should_heal(&self, chunk_id: &ChunkId) -> bool {
+    /// Flush a batch of heal-task commit intents: ONE write transaction covering
+    /// every routing-table put/delete and pending-healing clear in the batch (via
+    /// batch_update_chunk_locations), then ONE ReplicateChunkLocationsV2 message
+    /// per online peer for everything that needs broadcasting — instead of the
+    /// 2 transactions + N-peer connection fan-out PER CHUNK this replaced (see
+    /// HealOutcome).
+    ///
+    /// Re-checks the fold-cancellation tombstone per chunk at flush time: the
+    /// commit now happens up to a batch-window later than the task's own check
+    /// inside do_heal_chunk_inner, and a fold may have started retiring a chunk_id
+    /// in that window — cancel_healing's tombstone must win regardless of when it
+    /// was set (same rationale as the pre-commit check it backstops; cheap DashMap
+    /// lookup).
+    async fn flush_heal_outcomes(&self, outcomes: &mut Vec<HealOutcome>) {
+        if outcomes.is_empty() {
+            return;
+        }
+        let batch: Vec<HealOutcome> = outcomes.drain(..).collect();
+
+        let mut puts: Vec<ChunkLocation> = Vec::new();
+        let mut deletes: Vec<ChunkId> = Vec::new();
+        let mut pending_clears: Vec<ChunkId> = Vec::new();
+        let mut broadcasts: Vec<ChunkLocation> = Vec::new();
+
+        for outcome in batch {
+            if outcome.location_put.is_some()
+                && Self::is_healing_cancelled(&self.cancelled_heals, &outcome.chunk_id)
+            {
+                info!("Healer: chunk {} healing was cancelled by a concurrent fold — discarding healed replica at flush", outcome.chunk_id);
+                if outcome.clear_pending {
+                    pending_clears.push(outcome.chunk_id);
+                }
+                continue;
+            }
+            if let Some(location) = outcome.location_put {
+                if outcome.broadcast {
+                    broadcasts.push(location.clone());
+                }
+                puts.push(location);
+            }
+            if let Some(chunk_id) = outcome.location_delete {
+                deletes.push(chunk_id);
+            }
+            if outcome.clear_pending {
+                pending_clears.push(outcome.chunk_id);
+            }
+        }
+
+        let commit_ok = match self.metadata
+            .batch_update_chunk_locations_async(puts, deletes, pending_clears.clone())
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to commit heal-outcome batch: {}", e);
+                false
+            }
+        };
+
+        // In-memory pending_healing clear happens regardless of commit success,
+        // matching the old per-chunk behavior (clear_pending_static ran even when
+        // put_chunk_location failed). On commit failure the PENDING_HEALING_TABLE
+        // rows survive, so a restart re-detects these chunks — safe, not lossy.
+        if !pending_clears.is_empty() {
+            let mut pending = self.pending_healing.write().await;
+            for chunk_id in &pending_clears {
+                pending.remove(chunk_id);
+            }
+        }
+
+        // Broadcast only what was actually committed (the batch txn is atomic), and
+        // only after the local commit — same ordering the per-chunk path enforced.
+        // One V2 message per peer; its handler applies the single-item merge rules
+        // per location and commits the whole batch in one transaction on its side.
+        if commit_ok && !broadcasts.is_empty() {
+            let cluster = self.cluster.clone();
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let local_id = cluster.local_node_id();
+                let nodes = cluster.get_all_nodes().await;
+                for node in nodes {
+                    if node.id == local_id || node.status != dfs_common::NodeStatus::Online {
+                        continue;
+                    }
+                    let request = Request::ReplicateChunkLocationsV2 { locations: broadcasts.clone() };
+                    if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
+                        warn!("Failed to broadcast {} healed chunk locations to node {}: {}",
+                              broadcasts.len(), node.id, e);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Check if a chunk should be healed (delay has passed). First-time detections
+    /// are marked pending via `deferred` (see mark_pending_deferred) — the caller
+    /// (the discovery classification loop, this function's only caller) flushes
+    /// them in one batch transaction after its loop.
+    async fn should_heal(&self, chunk_id: &ChunkId, deferred: &mut Vec<(ChunkId, u64)>) -> bool {
         let elapsed = {
             let pending = self.pending_healing.read().await;
             pending.get(chunk_id).map(|detected_at| detected_at.elapsed())
@@ -2660,7 +2859,7 @@ impl HealingManager {
             }
             None => {
                 // First time detecting under-replication
-                self.mark_pending(*chunk_id).await;
+                self.mark_pending_deferred(*chunk_id, deferred).await;
                 debug!(
                     "Chunk {} marked for healing (delay: {}s)",
                     chunk_id, self.healing_delay_secs.load(Ordering::Relaxed)
@@ -2679,7 +2878,6 @@ impl HealingManager {
         metadata: &Arc<MetadataStore>,
         cluster: &Arc<ClusterManager>,
         client: &Arc<NetworkClient>,
-        pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
         in_flight_healing: &Arc<RwLock<HashSet<ChunkId>>>,
         cancelled_heals: &Arc<DashMap<ChunkId, Instant>>,
         replication_factor: usize,
@@ -2687,19 +2885,19 @@ impl HealingManager {
         node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
         heal_max_concurrent_per_node: &Arc<AtomicUsize>,
         heal_push_failure: &Arc<DashMap<ChunkId, (Instant, u32)>>,
-    ) -> Result<()> {
+    ) -> Result<Option<HealOutcome>> {
         // In-flight guard: prevents two concurrent tasks healing the same chunk.
         {
             let mut in_flight = in_flight_healing.write().await;
             if in_flight.contains(chunk_id) {
                 debug!("Chunk {} heal already in-flight, skipping", chunk_id);
-                return Ok(());
+                return Ok(None);
             }
             in_flight.insert(*chunk_id);
         }
 
         let result = Self::do_heal_chunk_inner(
-            chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, pending_healing, cancelled_heals, replication_factor, bandwidth_limiter,
+            chunk_id, confirmed_alive_nodes, storage, metadata, cluster, client, cancelled_heals, replication_factor, bandwidth_limiter,
             node_inflight, heal_max_concurrent_per_node, heal_push_failure,
         ).await;
         in_flight_healing.write().await.remove(chunk_id);
@@ -2713,14 +2911,13 @@ impl HealingManager {
         metadata: &Arc<MetadataStore>,
         cluster: &Arc<ClusterManager>,
         client: &Arc<NetworkClient>,
-        pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
         cancelled_heals: &Arc<DashMap<ChunkId, Instant>>,
         replication_factor: usize,
         bandwidth_limiter: &Arc<BandwidthLimiter>,
         node_inflight: &Arc<DashMap<NodeId, Arc<Semaphore>>>,
         heal_max_concurrent_per_node: &Arc<AtomicUsize>,
         heal_push_failure: &Arc<DashMap<ChunkId, (Instant, u32)>>,
-    ) -> Result<()> {
+    ) -> Result<Option<HealOutcome>> {
         info!("Leader healing under-replicated chunk: {}", chunk_id);
 
         let location = metadata
@@ -2736,15 +2933,18 @@ impl HealingManager {
                 // No file_id recorded — we can't verify quickly. Stall for now and let
                 // the deep scan handle it rather than burning 120s on a speculative heal.
                 warn!("Chunk {} has no file_id in routing table — deferring to orphan sweep", chunk_id);
-                Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
-                return Ok(());
+                return Ok(Some(HealOutcome::clear_only(*chunk_id)));
             }
         };
         if is_orphan {
             warn!("Chunk {}: file {:?} no longer exists — removing orphan chunk from routing table", chunk_id, location.file_id);
-            let _ = metadata.delete_chunk_location_async(*chunk_id).await;
-            Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
-            return Ok(());
+            return Ok(Some(HealOutcome {
+                chunk_id: *chunk_id,
+                location_put: None,
+                location_delete: Some(*chunk_id),
+                clear_pending: true,
+                broadcast: false,
+            }));
         }
 
         // Build alive list from confirmed_alive_nodes passed in from the bulk scan.
@@ -2797,7 +2997,10 @@ impl HealingManager {
                 // None) — see the identical fix/rationale below this function's main
                 // healed-replica commit. Also gated on !is_healing_cancelled for the
                 // same reason as that commit: a fold may have started retiring this
-                // exact chunk_id while this reconcile was in flight.
+                // exact chunk_id while this reconcile was in flight. (The commit
+                // itself now happens in flush_heal_outcomes, which re-checks the
+                // cancellation tombstone at flush time — this early check just avoids
+                // building an outcome that would be discarded anyway.)
                 let updated_location = ChunkLocation {
                     chunk_id: *chunk_id,
                     nodes: base_nodes,
@@ -2808,18 +3011,15 @@ impl HealingManager {
                     client_write_seq: location.client_write_seq,
                     file_id: location.file_id,
                 };
-                let meta = Arc::clone(metadata);
-                let loc = updated_location.clone();
-                match tokio::task::spawn_blocking(move || meta.put_chunk_location(&loc)).await {
-                    Ok(Ok(())) => {
-                        Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
-                    }
-                    Ok(Err(e)) => warn!("Failed to reconcile chunk location for {}: {}", chunk_id, e),
-                    Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
-                }
+                return Ok(Some(HealOutcome {
+                    chunk_id: *chunk_id,
+                    location_put: Some(updated_location),
+                    location_delete: None,
+                    clear_pending: true,
+                    broadcast: true,
+                }));
             }
-            Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
-            return Ok(());
+            return Ok(Some(HealOutcome::clear_only(*chunk_id)));
         }
 
         // Select target nodes: capacity-aware candidates that don't already hold the chunk.
@@ -2842,7 +3042,7 @@ impl HealingManager {
                 "No suitable target nodes for healing chunk {} (alive={:?} replica_count={} needed={})",
                 chunk_id, alive_ids, replica_count, needed
             );
-            return Ok(());
+            return Ok(None);
         }
         debug!(
             "Healing chunk {}: alive={:?} replica_count={} needed={} targets={:?}",
@@ -2941,9 +3141,13 @@ impl HealingManager {
                         }
                         Ok(envelope) if matches!(envelope.message, Message::Response(Response::Error { code: dfs_common::ErrorCode::NotFound, .. })) => {
                             warn!("Chunk {} not found on source {} — removing from heal queue", chunk_id, source_id);
-                            let _ = metadata.delete_chunk_location_async(*chunk_id).await;
-                            Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
-                            return Ok(());
+                            return Ok(Some(HealOutcome {
+                                chunk_id: *chunk_id,
+                                location_put: None,
+                                location_delete: Some(*chunk_id),
+                                clear_pending: true,
+                                broadcast: false,
+                            }));
                         }
                         Ok(envelope) => {
                             warn!("Chunk {} push from {} to {} failed: {:?}", chunk_id, source_id, target_id, envelope.message);
@@ -2972,8 +3176,7 @@ impl HealingManager {
             // how far this heal has already gotten.
             if Self::is_healing_cancelled(cancelled_heals, chunk_id) {
                 info!("Healer: chunk {} healing was cancelled by a concurrent fold — discarding healed replica", chunk_id);
-                Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
-                return Ok(());
+                return Ok(Some(HealOutcome::clear_only(*chunk_id)));
             }
 
             // CAS-style freshness check: verify the source node still holds the chunk
@@ -3004,8 +3207,7 @@ impl HealingManager {
 
             if !source_still_valid {
                 info!("Healer: chunk {} no longer on source {} (superseded by a newer write) — discarding healed replica", chunk_id, source_addr);
-                Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
-                return Ok(());
+                return Ok(Some(HealOutcome::clear_only(*chunk_id)));
             }
 
             let mut updated_nodes = base_nodes;
@@ -3033,19 +3235,14 @@ impl HealingManager {
                 file_id: location.file_id,
             };
 
-            let meta = Arc::clone(metadata);
-            let loc = updated_location.clone();
-            let store_result = tokio::task::spawn_blocking(move || meta.put_chunk_location(&loc)).await;
-            match store_result {
-                Ok(Ok(())) => {
-                    Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
-                }
-                Ok(Err(e)) => warn!("Failed to update chunk location after healing {}: {}", chunk_id, e),
-                Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
-            }
-
-            Self::clear_pending_static(pending_healing, metadata, chunk_id).await;
             heal_push_failure.remove(chunk_id);
+            Ok(Some(HealOutcome {
+                chunk_id: *chunk_id,
+                location_put: Some(updated_location),
+                location_delete: None,
+                clear_pending: true,
+                broadcast: true,
+            }))
         } else {
             // Every target push failed despite a confirmed-alive source (e.g. the
             // source's own data fails its content-hash check — real corruption, not
@@ -3063,13 +3260,6 @@ impl HealingManager {
                 chunk_id, targets.len(), source_id, count
             );
         }
-
-        Ok(())
-    }
-
-    /// Broadcast an updated chunk location to all online peers.
-    async fn broadcast_chunk_location(&self, location: &ChunkLocation) {
-        Self::broadcast_chunk_location_shared(location, &self.cluster, &self.client).await;
     }
 
     async fn broadcast_chunk_location_shared(
@@ -3492,6 +3682,7 @@ impl HealingManager {
         let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed) + 1);
         let backdated_secs = dfs_common::types::current_timestamp()
             .saturating_sub(self.healing_delay_secs.load(Ordering::Relaxed) + 1);
+        let mut to_persist: Vec<(ChunkId, u64)> = Vec::with_capacity(chunk_ids.len());
         let mut pending = self.pending_healing.write().await;
         let mut cache  = self.alive_nodes_cache.write().await;
         for chunk_id in chunk_ids {
@@ -3514,12 +3705,19 @@ impl HealingManager {
             // through, since that chunk wouldn't be in `pending` yet at that point.
             let is_new = !pending.contains_key(&chunk_id);
             pending.insert(chunk_id, backdated);
-            if let Err(err) = self.metadata.put_pending_healing_async(chunk_id, backdated_secs).await {
-                warn!("Failed to persist backdated pending_healing entry for {}: {}", chunk_id, err);
-            }
+            to_persist.push((chunk_id, backdated_secs));
             if is_new {
                 cache.remove(&chunk_id);
             }
+        }
+        drop(cache);
+        drop(pending);
+        // One batch transaction for the whole call instead of one per chunk — and
+        // no longer awaiting a metadata write while holding the pending/cache write
+        // locks above (the old per-chunk put_pending_healing_async did exactly that,
+        // serializing every other pending_healing reader behind disk I/O).
+        if let Err(err) = self.metadata.put_pending_healing_batch_async(to_persist).await {
+            warn!("Failed to persist backdated pending_healing entries: {}", err);
         }
     }
 
@@ -3714,18 +3912,23 @@ mod tests {
         ); // 2s delay
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"test"));
+        // Persistence of first-detection times is deferred to the caller's batch
+        // flush (see mark_pending_deferred) — collect it like the discovery loop does.
+        let mut deferred: Vec<(ChunkId, u64)> = Vec::new();
 
         // First check - should return false and mark for healing
-        assert!(!healing.should_heal(&chunk_id).await);
+        assert!(!healing.should_heal(&chunk_id, &mut deferred).await);
+        assert_eq!(deferred.len(), 1, "first detection must be queued for batch persistence");
 
-        // Still within delay
-        assert!(!healing.should_heal(&chunk_id).await);
+        // Still within delay — and no duplicate deferred entry for a known chunk
+        assert!(!healing.should_heal(&chunk_id, &mut deferred).await);
+        assert_eq!(deferred.len(), 1);
 
         // Wait for delay
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Now should heal
-        assert!(healing.should_heal(&chunk_id).await);
+        assert!(healing.should_heal(&chunk_id, &mut deferred).await);
     }
 
     /// A chunk's pending-healing "first detected" time must survive a process
@@ -3762,11 +3965,13 @@ mod tests {
 
         // 8s < 10s — not ready yet, but the persisted age must have been restored
         // (not reset to 0s on restart).
-        assert!(!healing.should_heal(&chunk_id).await);
+        let mut deferred: Vec<(ChunkId, u64)> = Vec::new();
+        assert!(!healing.should_heal(&chunk_id, &mut deferred).await);
+        assert!(deferred.is_empty(), "restored entry must not be re-queued for persistence");
 
         // 8s (carried over) + 3s (elapsed since restart) = 11s >= 10s.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(healing.should_heal(&chunk_id).await);
+        assert!(healing.should_heal(&chunk_id, &mut deferred).await);
     }
 
     fn make_healing(node_id: NodeId, addr: SocketAddr) -> (Arc<ChunkStorage>, Arc<MetadataStore>, HealingManager, TempDir, TempDir) {

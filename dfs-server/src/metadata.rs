@@ -7,7 +7,7 @@ use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefi
 // only lost on kernel panic/power failure. Acceptable with 5-way replication.
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 // Fair (queue-ordered) RwLock for MetadataStore.db specifically — see its field doc
 // comment for why std::sync::RwLock's pthread_rwlock-backed writer-starvation risk
 // under sustained heavy reader load matters here. Not used for Mutex above — those
@@ -193,6 +193,107 @@ pub(crate) struct CompactionPrep {
     size_before: u64,
 }
 
+/// One queued write for the group-commit committer thread — see
+/// MetadataStore::committer_tx. Each variant carries exactly the arguments of the
+/// single-record write function it replaces, plus a oneshot reply the committer
+/// resolves once the batch containing this op has committed (or failed). The op
+/// set is deliberately only the *hot single-record* paths: per-chunk-write and
+/// per-heal record updates measured as the dominant transaction sites in the
+/// 2026-07-15 DB-growth baselines (put/delete_chunk_location, put_chunk_seq, and
+/// the patch-state trio each fired >1000 single-record commits/min under RND4K
+/// load). Bulk paths (put_files_batch, batch_update_chunk_locations, meta queue)
+/// already amortize their own transactions and stay on their direct path.
+enum MetaWriteOp {
+    PutChunkLocation {
+        location: ChunkLocation,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    DeleteChunkLocation {
+        chunk_id: ChunkId,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    PutChunkSeq {
+        file_id: FileId,
+        chunk_idx: u64,
+        seq: u64,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    PutPatchStatePending {
+        file_id: FileId,
+        chunk_idx: u64,
+        public_token: ChunkId,
+        base_chunk_id: ChunkId,
+        delta_chunk_id: ChunkId,
+        size: usize,
+        written_at: u64,
+        client_write_seq: Option<u64>,
+        reply: tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>,
+    },
+    UpdatePatchStateFolded {
+        public_token: ChunkId,
+        new_chunk_id: ChunkId,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    DeletePatchStateAbandoned {
+        public_token: ChunkId,
+        file_id: FileId,
+        chunk_idx: u64,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    PutPendingHealing {
+        chunk_id: ChunkId,
+        detected_at_secs: u64,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    DeletePendingHealing {
+        chunk_id: ChunkId,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Multi-record CHUNK_TABLE/PENDING_HEALING update (the batch_update /
+    /// put_chunk_locations_batch async paths). These need grouping every bit as
+    /// much as the single-record ops: the live write path calls
+    /// put_chunk_locations_batch_async with a single-chunk "batch" per confirmed
+    /// write, and queue_chunks_immediate does the same for pending-healing marks —
+    /// measured 2026-07-16 (post-Phase-1 heal repro): +500 batch-of-1
+    /// put_chunk_locations_batch txns and +504 batch-of-1 put_pending_healing_batch
+    /// txns per minute on the leader during ingest, ballooning it to 56.5MB with
+    /// 0.6MB live exactly like the single-record storms this file already fixed.
+    UpdateChunkLocationsBatch {
+        puts: Vec<ChunkLocation>,
+        deletes: Vec<ChunkId>,
+        pending_healing_deletes: Vec<ChunkId>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    PutPendingHealingBatch {
+        entries: Vec<(ChunkId, u64)>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+}
+
+impl MetaWriteOp {
+    /// Logical write count for durability accounting — a batch op carries as many
+    /// writes as it has records, and next_write_durability_n counts writes (not
+    /// commits, not queue items) so the durable-flush cadence is load-proportional.
+    fn weight(&self) -> u64 {
+        match self {
+            MetaWriteOp::UpdateChunkLocationsBatch { puts, deletes, pending_healing_deletes, .. } => {
+                (puts.len() + deletes.len() + pending_healing_deletes.len()).max(1) as u64
+            }
+            MetaWriteOp::PutPendingHealingBatch { entries, .. } => entries.len().max(1) as u64,
+            _ => 1,
+        }
+    }
+}
+
+/// A reply the committer owes once the current batch's commit outcome is known —
+/// the per-op apply result is held here until commit() succeeds (send it as-is)
+/// or fails (replace tentative Ok with the commit error; a per-op apply error is
+/// authoritative either way, that op wrote nothing).
+enum PendingReply {
+    Unit(tokio::sync::oneshot::Sender<Result<()>>, Result<()>),
+    RetiredToken(tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>, Result<Option<ChunkId>>),
+}
+
 /// Metadata storage using redb embedded database.
 /// Replaces sled to eliminate the u8 fragment-count panic under heavy write loads.
 pub struct MetadataStore {
@@ -211,6 +312,19 @@ pub struct MetadataStore {
     dirty_files: Mutex<std::collections::HashSet<String>>,
     /// PATH_TABLE keys (path strings), same tracking discipline as dirty_files.
     dirty_paths: Mutex<std::collections::HashSet<String>>,
+    /// Per-call-site write-transaction attribution: site (function name) -> (txn_count,
+    /// payload_bytes). Populated by note_txn() immediately after every successful
+    /// write-transaction commit in this file, to answer "which call site is actually
+    /// responsible for DB growth" (see the Phase 0 attribution work this exists for).
+    /// Never reset by production code — server.rs's periodic [META TXN] logger keeps
+    /// its own previous snapshot and computes deltas itself. Same Mutex-guarded-small-
+    /// state discipline as dirty_files/dirty_paths above.
+    txn_stats: Mutex<std::collections::HashMap<&'static str, (u64, u64)>>,
+    /// Group-commit queue for the hot single-record write paths — lazily started
+    /// on first use (needs an Arc<Self>, which new() doesn't have). See
+    /// committer_tx()/commit_worker_loop() for the design and the invariant that
+    /// nothing may submit an op and wait on its reply while holding db.write().
+    committer: OnceLock<tokio::sync::mpsc::Sender<MetaWriteOp>>,
 }
 
 impl MetadataStore {
@@ -313,7 +427,301 @@ impl MetadataStore {
             non_durable_commits: AtomicU64::new(0),
             dirty_files: Mutex::new(std::collections::HashSet::new()),
             dirty_paths: Mutex::new(std::collections::HashSet::new()),
+            txn_stats: Mutex::new(std::collections::HashMap::new()),
+            committer: OnceLock::new(),
         })
+    }
+
+    /// Record one committed write transaction attributed to `site` (the function
+    /// name — pass a string literal so it's `&'static str`, no allocation per call).
+    /// `payload_bytes` is the serialized value size actually written where that's
+    /// cheaply available (already computed for the insert), 0 otherwise (pure
+    /// deletes, counter bumps, or multi-row txns where tracking an exact sum isn't
+    /// worth the bookkeeping). Call immediately after a successful `txn.commit()?` —
+    /// never before, so a failed commit is never counted as growth. Cheap: one
+    /// Mutex lock + HashMap entry bump, no behavior change to the write path.
+    fn note_txn(&self, site: &'static str, payload_bytes: usize) {
+        let mut stats = self.txn_stats.lock().unwrap();
+        let entry = stats.entry(site).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += payload_bytes as u64;
+    }
+
+    /// Snapshot of (site, txn_count, payload_bytes) for every site note_txn has
+    /// recorded so far, sorted by txn_count descending. Does NOT reset the
+    /// underlying counters — callers (the [META TXN] periodic logger in server.rs)
+    /// keep their own previous snapshot and compute deltas themselves, so this can
+    /// be called concurrently (e.g. from an admin RPC) without perturbing anything.
+    pub fn txn_stats_snapshot(&self) -> Vec<(String, u64, u64)> {
+        let stats = self.txn_stats.lock().unwrap();
+        let mut out: Vec<(String, u64, u64)> = stats.iter()
+            .map(|(site, (count, bytes))| (site.to_string(), *count, *bytes))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out
+    }
+
+    /// Upper bound on ops folded into one group-commit transaction. Bounds the
+    /// redb write-lock hold per batch (an unbounded batch under sustained load
+    /// would hold the single writer slot indefinitely — same failure shape as the
+    /// unbounded Phase 1-2 compaction that hung a restart on 2026-07-11).
+    const GROUP_COMMIT_MAX_OPS: usize = 256;
+
+    /// Queue capacity for the group committer. Full queue = callers await in
+    /// send() — natural backpressure, bounded memory.
+    const GROUP_COMMIT_QUEUE: usize = 4096;
+
+    /// Emergency/bisection kill switch: DFS_DISABLE_GROUP_COMMIT=1 makes every
+    /// *_async wrapper fall back to its pre-2026-07-15 spawn_blocking
+    /// one-transaction-per-call path instead of the group committer. Read once —
+    /// flipping it requires a restart, deliberately (a mid-flight mix of both
+    /// paths is exactly the kind of ordering ambiguity this switch exists to
+    /// rule out when debugging).
+    fn group_commit_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let disabled = std::env::var_os("DFS_DISABLE_GROUP_COMMIT").is_some();
+            if disabled {
+                warn!("group commit DISABLED via DFS_DISABLE_GROUP_COMMIT — using one transaction per write op");
+            }
+            !disabled
+        })
+    }
+
+    /// Get (lazily starting) the group-commit queue.
+    ///
+    /// Design: all hot single-record write paths (see MetaWriteOp) submit ops to
+    /// one dedicated committer thread, which drains whatever is queued (up to
+    /// GROUP_COMMIT_MAX_OPS) and applies it in ONE redb write transaction, then
+    /// resolves every op's oneshot with its result. Callers therefore keep
+    /// exactly the semantics the old spawn_blocking wrappers had — the await
+    /// returns only after the write is committed (read-your-writes preserved, no
+    /// write-behind visibility window, durability cadence preserved via
+    /// next_write_durability_n) — but a burst of concurrent single-record writes
+    /// now costs ~1 transaction per batch instead of 1 per record. Under light
+    /// load a batch naturally contains a single op, identical to the old path;
+    /// batching kicks in exactly when contention does (classic group commit).
+    /// Measured motivation: RND4K baseline 2026-07-15 showed ~5,800 single-record
+    /// commits/min/node from these paths ballooning the DB file 10-50x its live
+    /// content.
+    ///
+    /// INVARIANT: nothing may submit an op and block on its reply while holding
+    /// db.write() (the compaction Phase-3 exclusive lock) — the committer needs
+    /// db.read() to make progress, so that would deadlock. Compaction and every
+    /// other exclusive-lock holder use direct transactions, never these wrappers.
+    fn committer_tx(self: &Arc<Self>) -> tokio::sync::mpsc::Sender<MetaWriteOp> {
+        self.committer.get_or_init(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel(Self::GROUP_COMMIT_QUEUE);
+            let weak = Arc::downgrade(self);
+            std::thread::Builder::new()
+                .name("meta-committer".into())
+                .spawn(move || Self::commit_worker_loop(weak, rx))
+                .expect("failed to spawn metadata group-commit thread");
+            tx
+        }).clone()
+    }
+
+    /// Committer thread body. Holds only a Weak ref between batches so dropping
+    /// the store (tests) tears everything down: senders drop with the store →
+    /// blocking_recv returns None → thread exits.
+    fn commit_worker_loop(store: Weak<MetadataStore>, mut rx: tokio::sync::mpsc::Receiver<MetaWriteOp>) {
+        loop {
+            let first = match rx.blocking_recv() {
+                Some(op) => op,
+                None => return, // all senders gone — store dropped
+            };
+            let mut ops = vec![first];
+            while ops.len() < Self::GROUP_COMMIT_MAX_OPS {
+                match rx.try_recv() {
+                    Ok(op) => ops.push(op),
+                    Err(_) => break,
+                }
+            }
+            let Some(store) = store.upgrade() else { return };
+            store.apply_ops_group(ops);
+        }
+    }
+
+    /// Apply one batch of queued write ops in a single transaction and resolve
+    /// every op's reply. A per-op apply error (serialization, table open) fails
+    /// only that op; a commit error fails every op whose apply had succeeded —
+    /// the same all-or-nothing outcome each op's own single-record transaction
+    /// would have reported for itself.
+    fn apply_ops_group(&self, ops: Vec<MetaWriteOp>) {
+        let op_count: u64 = ops.iter().map(|op| op.weight()).sum();
+
+        // Any failure to even open the transaction fails the whole batch.
+        let _db = self.db.read();
+        let mut txn = match _db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                let msg = format!("group commit begin_write failed: {}", e);
+                warn!("{}", msg);
+                for op in ops {
+                    Self::fail_op(op, &msg);
+                }
+                return;
+            }
+        };
+        txn.set_durability(self.next_write_durability_n(op_count));
+
+        let mut replies: Vec<PendingReply> = Vec::with_capacity(ops.len());
+        let mut payload_bytes: usize = 0;
+        for op in ops {
+            match op {
+                MetaWriteOp::PutChunkLocation { location, reply } => {
+                    let result = (|| -> Result<()> {
+                        let key = format!("{}", location.chunk_id);
+                        let value = bincode::serialize(&location)
+                            .context("Failed to serialize chunk location")?;
+                        payload_bytes += value.len();
+                        let mut table = txn.open_table(CHUNK_TABLE)?;
+                        table.insert(key.as_str(), value.as_slice())?;
+                        Ok(())
+                    })();
+                    self.note_txn("op:put_chunk_location", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+                MetaWriteOp::DeleteChunkLocation { chunk_id, reply } => {
+                    let result = (|| -> Result<()> {
+                        let key = format!("{}", chunk_id);
+                        let mut table = txn.open_table(CHUNK_TABLE)?;
+                        table.remove(key.as_str())?;
+                        Ok(())
+                    })();
+                    self.note_txn("op:delete_chunk_location", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+                MetaWriteOp::PutChunkSeq { file_id, chunk_idx, seq, reply } => {
+                    let result = (|| -> Result<()> {
+                        let key = format!("{}:{}", file_id, chunk_idx);
+                        let mut table = txn.open_table(CHUNK_SEQ_TABLE)?;
+                        table.insert(key.as_str(), seq)?;
+                        Ok(())
+                    })();
+                    self.note_txn("op:put_chunk_seq", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+                MetaWriteOp::PutPatchStatePending {
+                    file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
+                    size, written_at, client_write_seq, reply,
+                } => {
+                    let result = Self::put_patch_state_pending_in_txn(
+                        &txn, file_id, chunk_idx, &public_token, base_chunk_id,
+                        delta_chunk_id, size, written_at, client_write_seq,
+                    ).map(|(retired, bytes)| {
+                        payload_bytes += bytes;
+                        retired
+                    });
+                    self.note_txn("op:put_patch_state_pending", 0);
+                    replies.push(PendingReply::RetiredToken(reply, result));
+                }
+                MetaWriteOp::UpdatePatchStateFolded { public_token, new_chunk_id, reply } => {
+                    let result = (|| -> Result<()> {
+                        let token_key = format!("{}", public_token);
+                        let value = bincode::serialize(&PatchState::Folded(new_chunk_id))
+                            .context("Failed to serialize patch state")?;
+                        payload_bytes += value.len();
+                        let mut table = txn.open_table(PATCH_STATE_TABLE)?;
+                        table.insert(token_key.as_str(), value.as_slice())?;
+                        Ok(())
+                    })();
+                    self.note_txn("op:update_patch_state_folded", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+                MetaWriteOp::DeletePatchStateAbandoned { public_token, file_id, chunk_idx, reply } => {
+                    let result = Self::delete_patch_state_abandoned_in_txn(&txn, &public_token, file_id, chunk_idx);
+                    self.note_txn("op:delete_patch_state_abandoned", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+                MetaWriteOp::PutPendingHealing { chunk_id, detected_at_secs, reply } => {
+                    let result = (|| -> Result<()> {
+                        let key = format!("{}", chunk_id);
+                        let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
+                        table.insert(key.as_str(), detected_at_secs)?;
+                        Ok(())
+                    })();
+                    self.note_txn("op:put_pending_healing", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+                MetaWriteOp::DeletePendingHealing { chunk_id, reply } => {
+                    let result = (|| -> Result<()> {
+                        let key = format!("{}", chunk_id);
+                        let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
+                        table.remove(key.as_str())?;
+                        Ok(())
+                    })();
+                    self.note_txn("op:delete_pending_healing", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+                MetaWriteOp::UpdateChunkLocationsBatch { puts, deletes, pending_healing_deletes, reply } => {
+                    let result = Self::apply_chunk_location_updates_in_txn(
+                        &txn, &puts, &deletes, &pending_healing_deletes,
+                    ).map(|bytes| { payload_bytes += bytes; });
+                    self.note_txn("op:update_chunk_locations_batch", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+                MetaWriteOp::PutPendingHealingBatch { entries, reply } => {
+                    let result = Self::put_pending_healing_batch_in_txn(&txn, &entries);
+                    self.note_txn("op:put_pending_healing_batch", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
+            }
+        }
+
+        let commit_error: Option<String> = match txn.commit() {
+            Ok(()) => {
+                self.note_txn("group_commit", payload_bytes);
+                None
+            }
+            Err(e) => Some(format!("group commit of {} ops failed: {}", op_count, e)),
+        };
+        if let Some(msg) = &commit_error {
+            warn!("{}", msg);
+        }
+
+        for pending in replies {
+            match pending {
+                PendingReply::Unit(reply, result) => {
+                    let final_result = match (&commit_error, result) {
+                        // Apply errors are authoritative — that op wrote nothing either way.
+                        (_, Err(e)) => Err(e),
+                        (Some(msg), Ok(())) => Err(anyhow::anyhow!("{}", msg)),
+                        (None, Ok(())) => Ok(()),
+                    };
+                    let _ = reply.send(final_result);
+                }
+                PendingReply::RetiredToken(reply, result) => {
+                    let final_result = match (&commit_error, result) {
+                        (_, Err(e)) => Err(e),
+                        (Some(msg), Ok(_)) => Err(anyhow::anyhow!("{}", msg)),
+                        (None, Ok(retired)) => Ok(retired),
+                    };
+                    let _ = reply.send(final_result);
+                }
+            }
+        }
+    }
+
+    /// Resolve an op's reply with an error without applying it (used when the
+    /// batch's transaction couldn't even be opened).
+    fn fail_op(op: MetaWriteOp, msg: &str) {
+        match op {
+            MetaWriteOp::PutChunkLocation { reply, .. }
+            | MetaWriteOp::DeleteChunkLocation { reply, .. }
+            | MetaWriteOp::PutChunkSeq { reply, .. }
+            | MetaWriteOp::UpdatePatchStateFolded { reply, .. }
+            | MetaWriteOp::DeletePatchStateAbandoned { reply, .. }
+            | MetaWriteOp::PutPendingHealing { reply, .. }
+            | MetaWriteOp::DeletePendingHealing { reply, .. }
+            | MetaWriteOp::UpdateChunkLocationsBatch { reply, .. }
+            | MetaWriteOp::PutPendingHealingBatch { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+            }
+            MetaWriteOp::PutPatchStatePending { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+            }
+        }
     }
 
     /// Every Nth Durability::None write is instead committed with
@@ -332,8 +740,19 @@ impl MetadataStore {
     const DURABILITY_FLUSH_INTERVAL: u64 = 200;
 
     fn next_write_durability(&self) -> Durability {
-        let n = self.non_durable_commits.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % Self::DURABILITY_FLUSH_INTERVAL == 0 {
+        self.next_write_durability_n(1)
+    }
+
+    /// next_write_durability for a transaction that carries `ops` logical writes
+    /// (a group commit). Counting ops instead of commits keeps the durable-flush
+    /// cadence — and therefore both the crash-loss window and the
+    /// pending_non_durable_commits drain frequency — expressed in the same unit
+    /// the single-op path always used. Counting group commits as 1 would stretch
+    /// "every 200" to "every 200 batches" (up to ~256x more unflushed writes).
+    fn next_write_durability_n(&self, ops: u64) -> Durability {
+        let start = self.non_durable_commits.fetch_add(ops, Ordering::Relaxed);
+        let end = start + ops;
+        if start / Self::DURABILITY_FLUSH_INTERVAL != end / Self::DURABILITY_FLUSH_INTERVAL {
             Durability::Immediate
         } else {
             Durability::None
@@ -380,6 +799,8 @@ impl MetadataStore {
                 }
             }
             txn.commit()?;
+            let payload_bytes: usize = to_repair.iter().map(|(_, b)| b.len()).sum();
+            self.note_txn("repair_path_index", payload_bytes);
         }
 
         // Pass 2: find path index entries whose file record no longer exists.
@@ -414,6 +835,7 @@ impl MetadataStore {
                 }
             }
             txn.commit()?;
+            self.note_txn("repair_path_index", 0);
         }
 
         if repaired > 0 || stale_count > 0 {
@@ -639,11 +1061,14 @@ impl MetadataStore {
         (cloned, is_stale)
     }
 
+    /// Third tuple element is the serialized payload byte count actually written
+    /// (file+path index insert are the same bytes, counted once) — feeds put_file/
+    /// put_files_batch's note_txn() call, see MetadataStore::note_txn.
     fn put_file_in_txn(
         file_table: &mut redb::Table<&str, &[u8]>,
         path_table: &mut redb::Table<&str, &[u8]>,
         metadata: &FileMetadata,
-    ) -> Result<(PutFileResult, Option<String>)> {
+    ) -> Result<(PutFileResult, Option<String>, usize)> {
         let file_id_str = format!("{}", metadata.id);
         let path_str = metadata.path.as_str();
 
@@ -697,13 +1122,14 @@ impl MetadataStore {
         path_table.insert(path_str, value.as_slice())
             .context("Failed to insert path index")?;
 
+        let payload_bytes = value.len();
         if is_stale {
             // Still report Stale so the caller knows incoming's scalar fields lost
             // and can converge whoever sent it — but the persisted record (returned
             // here) now includes the union, not just existing's original chunks.
-            Ok((PutFileResult::Stale(metadata_to_store), old_id_str))
+            Ok((PutFileResult::Stale(metadata_to_store), old_id_str, payload_bytes))
         } else {
-            Ok((PutFileResult::Stored, old_id_str))
+            Ok((PutFileResult::Stored, old_id_str, payload_bytes))
         }
     }
 
@@ -717,7 +1143,7 @@ impl MetadataStore {
         txn.set_durability(self.next_write_durability());
         let t_txn_begun = t_put_start.elapsed();
 
-        let (result, old_id_str) = {
+        let (result, old_id_str, payload_bytes) = {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut path_table = txn.open_table(PATH_TABLE)?;
             Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?
@@ -728,6 +1154,7 @@ impl MetadataStore {
         // unions incoming's chunk_locations into existing's before returning Stale, so
         // this transaction must always commit or that merge is silently rolled back.
         txn.commit()?;
+        self.note_txn("put_file", payload_bytes);
         let t_committed = t_put_start.elapsed();
         if t_committed.as_millis() > 5 {
             debug!(
@@ -779,11 +1206,12 @@ impl MetadataStore {
         let mut results = Vec::with_capacity(items.len());
         let mut touched_file_ids: Vec<String> = Vec::new();
         let mut touched_paths: Vec<String> = Vec::new();
+        let mut payload_bytes: usize = 0;
         {
             let mut file_table = txn.open_table(FILE_TABLE)?;
             let mut path_table = txn.open_table(PATH_TABLE)?;
             for metadata in items {
-                let (result, old_id_str) = Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?;
+                let (result, old_id_str, item_bytes) = Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?;
                 // Stale results still mutate (chunk_locations union — see put_file_in_txn),
                 // so they must be marked dirty too, same as Stored.
                 touched_file_ids.push(format!("{}", metadata.id));
@@ -791,10 +1219,12 @@ impl MetadataStore {
                 if let Some(old_id) = old_id_str {
                     touched_file_ids.push(old_id);
                 }
+                payload_bytes += item_bytes;
                 results.push(result);
             }
         }
         txn.commit()?;
+        self.note_txn("put_files_batch", payload_bytes);
 
         // See put_file's matching comment: must happen while `_db` is still held.
         self.dirty_files.lock().unwrap().extend(touched_file_ids);
@@ -839,6 +1269,7 @@ impl MetadataStore {
             file_table.insert(key.as_str(), bytes)?;
         }
         txn.commit()?;
+        self.note_txn("put_raw_file_bytes", bytes.len());
         Ok(())
     }
 
@@ -893,6 +1324,7 @@ impl MetadataStore {
             file_table.remove(file_id_str.as_str())?;
         }
         txn.commit()?;
+        self.note_txn("delete_file", 0);
 
         // See put_file's matching comment: must happen while `_db` is still held.
         self.dirty_files.lock().unwrap().insert(file_id_str.clone());
@@ -914,6 +1346,7 @@ impl MetadataStore {
             table.remove(path)?;
         }
         txn.commit()?;
+        self.note_txn("delete_path_index", 0);
 
         // See put_file's matching comment: must happen while `_db` is still held.
         self.dirty_paths.lock().unwrap().insert(path.to_string());
@@ -1018,6 +1451,7 @@ impl MetadataStore {
                 }
             }
             txn.commit()?;
+            self.note_txn("remove_unlisted_files", 0);
 
             // See put_file's matching comment: must happen while `_db` is still held.
             {
@@ -1061,6 +1495,7 @@ impl MetadataStore {
                 }
             }
             txn.commit()?;
+            self.note_txn("remove_unlisted_files", 0);
 
             // See put_file's matching comment: must happen while `_db` is still held.
             let mut dirty_paths = self.dirty_paths.lock().unwrap();
@@ -1121,6 +1556,7 @@ impl MetadataStore {
             table.insert(key.as_str(), value.as_slice())?;
         }
         txn.commit()?;
+        self.note_txn("put_chunk_location", value.len());
         debug!("Stored location for chunk: {}", location.chunk_id);
         Ok(())
     }
@@ -1140,16 +1576,19 @@ impl MetadataStore {
         let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
+        let mut payload_bytes: usize = 0;
         {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             for location in locations {
                 let key = format!("{}", location.chunk_id);
                 let value = bincode::serialize(location)
                     .context("Failed to serialize chunk location")?;
+                payload_bytes += value.len();
                 table.insert(key.as_str(), value.as_slice())?;
             }
         }
         txn.commit()?;
+        self.note_txn("put_chunk_locations_batch", payload_bytes);
         debug!("Stored {} chunk locations in one batch transaction", locations.len());
         Ok(())
     }
@@ -1191,6 +1630,7 @@ impl MetadataStore {
             table.remove(key.as_str())?;
         }
         txn.commit()?;
+        self.note_txn("delete_chunk_location", 0);
         Ok(())
     }
 
@@ -1202,29 +1642,60 @@ impl MetadataStore {
     /// lock, starving the whole runtime — this is what froze gluster1 in staging
     /// on 2026-06-19 (see metadata::tests::test_put_chunk_location_does_not_starve_runtime_under_concurrency).
     /// Always call this instead of put_chunk_location from request-handling code.
+    ///
+    /// Since 2026-07-15 this submits to the group committer instead of running its
+    /// own single-record transaction via spawn_blocking — same commit-before-return
+    /// semantics, ~1 transaction per concurrent burst instead of 1 per record. See
+    /// committer_tx.
     pub async fn put_chunk_location_async(self: &Arc<Self>, location: ChunkLocation) -> Result<()> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.put_chunk_location(&location))
-            .await
-            .context("spawn_blocking panicked in put_chunk_location_async")?
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.put_chunk_location(&location))
+                .await
+                .context("spawn_blocking panicked in put_chunk_location_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::PutChunkLocation { location, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
-    /// Async wrapper for put_chunk_locations_batch — see put_chunk_location_async for
-    /// why this must go through spawn_blocking rather than calling the sync method
-    /// directly from request-handling code.
+    /// Async wrapper for put_chunk_locations_batch — see put_chunk_location_async.
+    /// Group-committed since 2026-07-15: the live write path sends single-chunk
+    /// "batches" through here once per confirmed write, so concurrent callers need
+    /// coalescing exactly like the single-record ops (see
+    /// MetaWriteOp::UpdateChunkLocationsBatch for the measurement).
     pub async fn put_chunk_locations_batch_async(self: &Arc<Self>, locations: Vec<ChunkLocation>) -> Result<()> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.put_chunk_locations_batch(&locations))
-            .await
-            .context("spawn_blocking panicked in put_chunk_locations_batch_async")?
+        if locations.is_empty() {
+            return Ok(());
+        }
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.put_chunk_locations_batch(&locations))
+                .await
+                .context("spawn_blocking panicked in put_chunk_locations_batch_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::UpdateChunkLocationsBatch {
+            puts: locations, deletes: Vec::new(), pending_healing_deletes: Vec::new(), reply,
+        }).await.map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
-    /// Async wrapper for delete_chunk_location — see put_chunk_location_async.
+    /// Async wrapper for delete_chunk_location — see put_chunk_location_async
+    /// (group-committed since 2026-07-15; as hot as puts under patch load, the
+    /// chunk-ID rotation deletes the old identity on every fold).
     pub async fn delete_chunk_location_async(self: &Arc<Self>, chunk_id: ChunkId) -> Result<()> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.delete_chunk_location(&chunk_id))
-            .await
-            .context("spawn_blocking panicked in delete_chunk_location_async")?
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.delete_chunk_location(&chunk_id))
+                .await
+                .context("spawn_blocking panicked in delete_chunk_location_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::DeleteChunkLocation { chunk_id, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
     // -------------------------------------------------------------------------
@@ -1246,6 +1717,7 @@ impl MetadataStore {
             table.insert(key.as_str(), new_count)?;
         }
         txn.commit()?;
+        self.note_txn("incr_chunk_refcount", 0);
         Ok(new_count)
     }
 
@@ -1279,6 +1751,7 @@ impl MetadataStore {
             }
         }
         txn.commit()?;
+        self.note_txn("decr_chunk_refcount", 0);
         Ok(result)
     }
 
@@ -1325,15 +1798,23 @@ impl MetadataStore {
             table.insert(key.as_str(), seq)?;
         }
         txn.commit()?;
+        self.note_txn("put_chunk_seq", 0);
         Ok(())
     }
 
-    /// Async wrapper for put_chunk_seq — see put_chunk_location_async.
+    /// Async wrapper for put_chunk_seq — see put_chunk_location_async
+    /// (group-committed since 2026-07-15; fires once per client chunk write).
     pub async fn put_chunk_seq_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<()> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.put_chunk_seq(file_id, chunk_idx, seq))
-            .await
-            .context("spawn_blocking panicked in put_chunk_seq_async")?
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.put_chunk_seq(file_id, chunk_idx, seq))
+                .await
+                .context("spawn_blocking panicked in put_chunk_seq_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::PutChunkSeq { file_id, chunk_idx, seq, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
     // -------------------------------------------------------------------------
@@ -1349,14 +1830,32 @@ impl MetadataStore {
         base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
         written_at: u64, client_write_seq: Option<u64>,
     ) -> Result<Option<ChunkId>> {
+        let _db = self.db.read();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        let (retired, payload_bytes) = Self::put_patch_state_pending_in_txn(
+            &txn, file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
+            size, written_at, client_write_seq,
+        )?;
+        txn.commit()?;
+        self.note_txn("put_patch_state_pending", payload_bytes);
+        Ok(retired)
+    }
+
+    /// Body of put_patch_state_pending against an already-open write transaction —
+    /// shared by the standalone function above and the group-commit committer
+    /// (apply_ops_group) so the slot-retirement logic can never drift between the
+    /// two paths. Returns (retired token, serialized payload bytes).
+    #[allow(clippy::too_many_arguments)]
+    fn put_patch_state_pending_in_txn(
+        txn: &redb::WriteTransaction, file_id: FileId, chunk_idx: u64, public_token: &ChunkId,
+        base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
+        written_at: u64, client_write_seq: Option<u64>,
+    ) -> Result<(Option<ChunkId>, usize)> {
         let slot_key = format!("{}:{}", file_id, chunk_idx);
         let token_key = format!("{}", public_token);
         let state = PatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq };
         let value = bincode::serialize(&state).context("Failed to serialize patch state")?;
-
-        let _db = self.db.read();
-        let mut txn = _db.begin_write()?;
-        txn.set_durability(self.next_write_durability());
 
         let retired = {
             let mut slot_table = txn.open_table(PATCH_STATE_SLOT_TABLE)?;
@@ -1375,23 +1874,31 @@ impl MetadataStore {
             }
             state_table.insert(token_key.as_str(), value.as_slice())?;
         }
-        txn.commit()?;
-
-        Ok(retired.and_then(|hex| decode_hex_32(&hex)).map(ChunkId::from_hash))
+        let payload_bytes = value.len();
+        Ok((retired.and_then(|hex| decode_hex_32(&hex)).map(ChunkId::from_hash), payload_bytes))
     }
 
     /// Async wrapper for put_patch_state_pending — patches are a normal-volume
-    /// client write path; see put_chunk_location_async for why this matters.
+    /// client write path; see put_chunk_location_async for why this matters
+    /// (group-committed since 2026-07-15; fires once per 4K patch under RND4K load).
     #[allow(clippy::too_many_arguments)]
     pub async fn put_patch_state_pending_async(
         self: &Arc<Self>, file_id: FileId, chunk_idx: u64, public_token: ChunkId,
         base_chunk_id: ChunkId, delta_chunk_id: ChunkId, size: usize,
         written_at: u64, client_write_seq: Option<u64>,
     ) -> Result<Option<ChunkId>> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.put_patch_state_pending(
-            file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id, size, written_at, client_write_seq,
-        )).await.context("spawn_blocking panicked in put_patch_state_pending_async")?
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.put_patch_state_pending(
+                file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id, size, written_at, client_write_seq,
+            )).await.context("spawn_blocking panicked in put_patch_state_pending_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::PutPatchStatePending {
+            file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
+            size, written_at, client_write_seq, reply,
+        }).await.map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
     /// Flip an existing patch_state row from Pending to Folded once the
@@ -1410,6 +1917,7 @@ impl MetadataStore {
             table.insert(token_key.as_str(), value.as_slice())?;
         }
         txn.commit()?;
+        self.note_txn("update_patch_state_folded", value.len());
         Ok(())
     }
 
@@ -1422,11 +1930,23 @@ impl MetadataStore {
     /// from update_patch_state_folded, which is the *normal* (successful) way
     /// a Pending row stops being Pending; this is the abandon-on-failure path.
     pub fn delete_patch_state_abandoned(&self, public_token: &ChunkId, file_id: FileId, chunk_idx: u64) -> Result<()> {
-        let token_key = format!("{}", public_token);
-        let slot_key = format!("{}:{}", file_id, chunk_idx);
         let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
+        Self::delete_patch_state_abandoned_in_txn(&txn, public_token, file_id, chunk_idx)?;
+        txn.commit()?;
+        self.note_txn("delete_patch_state_abandoned", 0);
+        Ok(())
+    }
+
+    /// Body of delete_patch_state_abandoned against an already-open write
+    /// transaction — shared with the group-commit committer, same rationale as
+    /// put_patch_state_pending_in_txn.
+    fn delete_patch_state_abandoned_in_txn(
+        txn: &redb::WriteTransaction, public_token: &ChunkId, file_id: FileId, chunk_idx: u64,
+    ) -> Result<()> {
+        let token_key = format!("{}", public_token);
+        let slot_key = format!("{}:{}", file_id, chunk_idx);
         {
             let mut state_table = txn.open_table(PATCH_STATE_TABLE)?;
             state_table.remove(token_key.as_str())?;
@@ -1440,24 +1960,37 @@ impl MetadataStore {
                 slot_table.remove(slot_key.as_str())?;
             }
         }
-        txn.commit()?;
         Ok(())
     }
 
-    /// Async wrapper for delete_patch_state_abandoned — see put_chunk_location_async.
+    /// Async wrapper for delete_patch_state_abandoned — see put_chunk_location_async
+    /// (group-committed since 2026-07-15).
     pub async fn delete_patch_state_abandoned_async(self: &Arc<Self>, public_token: ChunkId, file_id: FileId, chunk_idx: u64) -> Result<()> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.delete_patch_state_abandoned(&public_token, file_id, chunk_idx))
-            .await
-            .context("spawn_blocking panicked in delete_patch_state_abandoned_async")?
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.delete_patch_state_abandoned(&public_token, file_id, chunk_idx))
+                .await
+                .context("spawn_blocking panicked in delete_patch_state_abandoned_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::DeletePatchStateAbandoned { public_token, file_id, chunk_idx, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
-    /// Async wrapper for update_patch_state_folded — see put_chunk_location_async.
+    /// Async wrapper for update_patch_state_folded — see put_chunk_location_async
+    /// (group-committed since 2026-07-15; fires once per completed fold).
     pub async fn update_patch_state_folded_async(self: &Arc<Self>, public_token: ChunkId, new_chunk_id: ChunkId) -> Result<()> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.update_patch_state_folded(&public_token, new_chunk_id))
-            .await
-            .context("spawn_blocking panicked in update_patch_state_folded_async")?
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.update_patch_state_folded(&public_token, new_chunk_id))
+                .await
+                .context("spawn_blocking panicked in update_patch_state_folded_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::UpdatePatchStateFolded { public_token, new_chunk_id, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
     /// Look up a patch_state row by its public token. `None` means `chunk_id` is
@@ -1703,6 +2236,7 @@ impl MetadataStore {
             }
         }
         txn.commit()?;
+        self.note_txn("prune_stale_folded_patch_states", 0);
         Ok(to_remove.len())
     }
 
@@ -1761,6 +2295,7 @@ impl MetadataStore {
             table.insert(key.as_str(), detected_at_secs)?;
         }
         txn.commit()?;
+        self.note_txn("put_pending_healing", 0);
         Ok(())
     }
 
@@ -1776,6 +2311,7 @@ impl MetadataStore {
             table.remove(key.as_str())?;
         }
         txn.commit()?;
+        self.note_txn("delete_pending_healing", 0);
         Ok(())
     }
 
@@ -1783,18 +2319,81 @@ impl MetadataStore {
     /// of a heal storm, exactly the burst scenario that starved gluster1; see
     /// put_chunk_location_async.
     pub async fn put_pending_healing_async(self: &Arc<Self>, chunk_id: ChunkId, detected_at_secs: u64) -> Result<()> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.put_pending_healing(&chunk_id, detected_at_secs))
-            .await
-            .context("spawn_blocking panicked in put_pending_healing_async")?
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.put_pending_healing(&chunk_id, detected_at_secs))
+                .await
+                .context("spawn_blocking panicked in put_pending_healing_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::PutPendingHealing { chunk_id, detected_at_secs, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
+    }
+
+    /// Record first-detection times for multiple chunks in one write transaction.
+    /// Same idempotency contract as `put_pending_healing` per entry — callers should
+    /// only include (chunk_id, detected_at_secs) pairs they intend to write, this
+    /// function doesn't check for existing entries. Use this instead of looping
+    /// `put_pending_healing`/`put_pending_healing_async` any time more than one
+    /// chunk needs marking at once (discovery-pass classification, immediate-heal
+    /// backdating) — see `put_chunk_locations_batch`'s doc comment for why N
+    /// single-record transactions cost far more than one N-record transaction.
+    pub fn put_pending_healing_batch(&self, entries: &[(ChunkId, u64)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let _db = self.db.read();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        Self::put_pending_healing_batch_in_txn(&txn, entries)?;
+        txn.commit()?;
+        self.note_txn("put_pending_healing_batch", 0);
+        Ok(())
+    }
+
+    /// Body of put_pending_healing_batch against an already-open write
+    /// transaction — shared with the group-commit committer.
+    fn put_pending_healing_batch_in_txn(txn: &redb::WriteTransaction, entries: &[(ChunkId, u64)]) -> Result<()> {
+        let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
+        for (chunk_id, detected_at_secs) in entries {
+            let key = format!("{}", chunk_id);
+            table.insert(key.as_str(), *detected_at_secs)?;
+        }
+        Ok(())
+    }
+
+    /// Async wrapper for put_pending_healing_batch — see put_chunk_location_async
+    /// (group-committed since 2026-07-15: queue_chunks_immediate submits
+    /// single-entry batches once per below-RF write, so these coalesce too).
+    pub async fn put_pending_healing_batch_async(self: &Arc<Self>, entries: Vec<(ChunkId, u64)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.put_pending_healing_batch(&entries))
+                .await
+                .context("spawn_blocking panicked in put_pending_healing_batch_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::PutPendingHealingBatch { entries, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
     /// Async wrapper for delete_pending_healing — see put_chunk_location_async.
     pub async fn delete_pending_healing_async(self: &Arc<Self>, chunk_id: ChunkId) -> Result<()> {
-        let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.delete_pending_healing(&chunk_id))
-            .await
-            .context("spawn_blocking panicked in delete_pending_healing_async")?
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || store.delete_pending_healing(&chunk_id))
+                .await
+                .context("spawn_blocking panicked in delete_pending_healing_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::DeletePendingHealing { chunk_id, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
     /// Read all persisted (chunk_id, first_detected_at_secs) entries. Used at
@@ -1815,26 +2414,51 @@ impl MetadataStore {
         Ok(out)
     }
 
-    /// Batch apply chunk location updates — all puts and deletes in one write transaction.
-    /// Use this from async code via `spawn_blocking` to avoid blocking Tokio worker threads
-    /// on redb's exclusive write lock.
+    /// Batch apply chunk location updates — all puts, deletes, AND pending-healing
+    /// clears in one write transaction. Use this from async code via `spawn_blocking`
+    /// to avoid blocking Tokio worker threads on redb's exclusive write lock.
+    ///
+    /// `pending_healing_deletes` folds in what used to be a separate per-chunk
+    /// `delete_pending_healing` transaction (called from `clear_pending_static` once
+    /// per healed chunk) into this same commit — heal completion, the routing-table
+    /// update, and the debounce-timer clear are one atomic unit of work, not three.
+    /// Same key format as `delete_pending_healing`/`put_pending_healing`
+    /// (`format!("{}", chunk_id)`), same table (PENDING_HEALING_TABLE).
     pub fn batch_update_chunk_locations(
         &self,
         puts: &[ChunkLocation],
         deletes: &[ChunkId],
+        pending_healing_deletes: &[ChunkId],
     ) -> Result<()> {
-        if puts.is_empty() && deletes.is_empty() {
+        if puts.is_empty() && deletes.is_empty() && pending_healing_deletes.is_empty() {
             return Ok(());
         }
         let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
-        {
+        let payload_bytes = Self::apply_chunk_location_updates_in_txn(&txn, puts, deletes, pending_healing_deletes)?;
+        txn.commit()?;
+        self.note_txn("batch_update_chunk_locations", payload_bytes);
+        Ok(())
+    }
+
+    /// Body of batch_update_chunk_locations against an already-open write
+    /// transaction — shared by the standalone functions and the group-commit
+    /// committer (apply_ops_group). Returns serialized payload bytes written.
+    fn apply_chunk_location_updates_in_txn(
+        txn: &redb::WriteTransaction,
+        puts: &[ChunkLocation],
+        deletes: &[ChunkId],
+        pending_healing_deletes: &[ChunkId],
+    ) -> Result<usize> {
+        let mut payload_bytes: usize = 0;
+        if !puts.is_empty() || !deletes.is_empty() {
             let mut table = txn.open_table(CHUNK_TABLE)?;
             for location in puts {
                 let key = format!("{}", location.chunk_id);
                 let value = bincode::serialize(location)
                     .context("Failed to serialize chunk location")?;
+                payload_bytes += value.len();
                 table.insert(key.as_str(), value.as_slice())?;
             }
             for chunk_id in deletes {
@@ -1842,8 +2466,41 @@ impl MetadataStore {
                 table.remove(key.as_str())?;
             }
         }
-        txn.commit()?;
-        Ok(())
+        if !pending_healing_deletes.is_empty() {
+            let mut table = txn.open_table(PENDING_HEALING_TABLE)?;
+            for chunk_id in pending_healing_deletes {
+                let key = format!("{}", chunk_id);
+                table.remove(key.as_str())?;
+            }
+        }
+        Ok(payload_bytes)
+    }
+
+    /// Async wrapper for batch_update_chunk_locations — see put_chunk_location_async
+    /// (group-committed since 2026-07-15, same coalescing rationale as
+    /// put_chunk_locations_batch_async).
+    pub async fn batch_update_chunk_locations_async(
+        self: &Arc<Self>,
+        puts: Vec<ChunkLocation>,
+        deletes: Vec<ChunkId>,
+        pending_healing_deletes: Vec<ChunkId>,
+    ) -> Result<()> {
+        if puts.is_empty() && deletes.is_empty() && pending_healing_deletes.is_empty() {
+            return Ok(());
+        }
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || {
+                store.batch_update_chunk_locations(&puts, &deletes, &pending_healing_deletes)
+            })
+                .await
+                .context("spawn_blocking panicked in batch_update_chunk_locations_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::UpdateChunkLocationsBatch {
+            puts, deletes, pending_healing_deletes, reply,
+        }).await.map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
     /// List all chunk IDs known in metadata.
@@ -1952,6 +2609,8 @@ impl MetadataStore {
                 }
             }
             txn.commit()?;
+            let payload_bytes: usize = to_write.iter().map(|(_, b)| b.len()).sum();
+            self.note_txn("rebuild_chunk_locations_from_files", payload_bytes);
         }
 
         // Count already-present entries (skipped).
@@ -1988,6 +2647,7 @@ impl MetadataStore {
             next
         };
         txn.commit()?;
+        self.note_txn("next_meta_sequence", 0);
         Ok(next)
     }
 
@@ -2031,6 +2691,7 @@ impl MetadataStore {
             table.insert("leader_state_since_secs", since_secs)?;
         }
         txn.commit()?;
+        self.note_txn("put_leader_state", 0);
         Ok(())
     }
 
@@ -2073,6 +2734,7 @@ impl MetadataStore {
 
         let _db = self.db.read();
         let txn = _db.begin_write()?;
+        let payload_bytes;
         {
             let mut queue_table = txn.open_table(META_QUEUE_TABLE)?;
             let mut idx_table = txn.open_table(META_QUEUE_IDX)?;
@@ -2091,10 +2753,12 @@ impl MetadataStore {
             let queue_key = format!("{}:{:016x}", node_hex, sequence);
             let value = bincode::serialize(metadata)
                 .context("Failed to serialize metadata for queue")?;
+            payload_bytes = value.len();
             queue_table.insert(queue_key.as_str(), value.as_slice())?;
             idx_table.insert(idx_key.as_str(), sequence.to_be_bytes().as_slice())?;
         }
         txn.commit()?;
+        self.note_txn("enqueue_meta_for_node", payload_bytes);
         Ok(())
     }
 
@@ -2196,6 +2860,7 @@ impl MetadataStore {
             }
         }
         txn.commit()?;
+        self.note_txn("ack_meta_queue_for_node", 0);
         Ok(())
     }
 
@@ -2248,6 +2913,7 @@ impl MetadataStore {
                 }
             }
             txn.commit()?;
+            self.note_txn("compact_meta_queue_for_node", 0);
         }
         Ok(())
     }
@@ -2262,6 +2928,7 @@ impl MetadataStore {
             table.insert("follower_seq", seq)?;
         }
         txn.commit()?;
+        self.note_txn("set_follower_sequence", 0);
         Ok(())
     }
 
@@ -2352,6 +3019,7 @@ impl MetadataStore {
             table.insert(key.as_str(), value.as_slice())?;
         }
         txn.commit()?;
+        self.note_txn("enqueue_delete", value.len());
         Ok(())
     }
 
@@ -2374,6 +3042,7 @@ impl MetadataStore {
             table.remove(key.as_str())?;
         }
         txn.commit()?;
+        self.note_txn("dequeue_delete", 0);
         Ok(())
     }
 
@@ -2781,6 +3450,12 @@ impl MetadataStore {
                 );
             }
             dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase1 commit: {}", e))?;
+            // Payload = size_before: this phase's commit rewrites the whole live DB into
+            // the shadow file, not a proportional per-record write — attributing
+            // size_before bytes here (rather than 0) keeps it from being mistaken for a
+            // "free" transaction when comparing to real per-record growth sites, while
+            // clearly flagging it (via the site name) as a bulk full-copy, not organic growth.
+            self.note_txn("compact_db_prepare_phase1", size_before as usize);
         }
 
         // Phase 2: iterative catch-up, still unlocked. Bounded by a time budget, not a
@@ -2800,6 +3475,7 @@ impl MetadataStore {
             let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase2 begin_write: {}", e))?;
             let changed = self.diff_all_tables_tracked(&src_txn, &dst_txn)?;
             dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase2 commit: {}", e))?;
+            self.note_txn("compact_db_prepare_phase2", 0);
             if changed <= convergence_threshold {
                 converged = true;
                 break;
@@ -2836,6 +3512,7 @@ impl MetadataStore {
                 let dst_txn = shadow_db.begin_write().map_err(|e| anyhow::anyhow!("compact phase3 begin_write: {}", e))?;
                 self.diff_all_tables_tracked(&src_txn, &dst_txn)?;
                 dst_txn.commit().map_err(|e| anyhow::anyhow!("compact phase3 commit: {}", e))?;
+                self.note_txn("compact_db_finish_phase3", 0);
             }
             drop(shadow_db);
             std::fs::rename(&shadow_path, &self.db_path)
@@ -2882,6 +3559,7 @@ impl MetadataStore {
                 .map_err(|e| anyhow::anyhow!("compact pre-flush begin: {}", e))?;
             txn.commit()
                 .map_err(|e| anyhow::anyhow!("compact pre-flush commit: {}", e))?;
+            self.note_txn("compact_db_blocking", 0);
         }
 
         db.compact().map_err(|e| anyhow::anyhow!("redb compact: {}", e))?;
@@ -2904,6 +3582,7 @@ impl MetadataStore {
             .map_err(|e| anyhow::anyhow!("flush_durable begin: {}", e))?;
         txn.commit()
             .map_err(|e| anyhow::anyhow!("flush_durable commit: {}", e))?;
+        self.note_txn("flush_durable", 0);
         Ok(())
     }
 
@@ -2978,27 +3657,27 @@ mod tests {
         assert_eq!(retrieved.size, 1024);
     }
 
-    /// Root-caused 2026-07-15 (server5/VM111 live incident): the compaction loop
-    /// used to compare raw OS file size (db_size(), a plain fs::metadata().len())
-    /// against its own post-compaction baseline to decide whether to compact. redb
-    /// grows its backing file geometrically to amortize resize cost, so a small
-    /// batch of genuinely tiny writes can make the *file* look like it doubled even
-    /// though almost none of that growth is real, reclaimable waste — confirmed
-    /// live: a freshly-compacted 257.5MB file jumped to 514.5MB after only ~273
-    /// small chunk_location writes, which is nowhere near enough data to need
-    /// 257MB of new space. redb_fragmentation_stats() must report a small
-    /// fragmented_bytes here, proving it actually distinguishes "the file grew"
-    /// from "there's real waste to reclaim" for a real (if small-scale) instance of
-    /// exactly this write pattern.
+    /// History: this test originally asserted that 500 per-record commits produce
+    /// LOW genuine fragmentation, under the 2026-07-15 theory that the observed
+    /// 257.5MB→514.5MB live jump was redb's geometric file pre-allocation, not real
+    /// waste. That assertion was wrong and the test failed from day one: 500
+    /// sequential single-record commits measure ~90% fragmented_bytes even on a
+    /// fresh DB — every commit COW-rewrites the touched leaf and its ancestors, and
+    /// with Durability::None those freed pages aren't reusable until the next
+    /// durable flush. That per-record-commit churn IS the growth mechanism (both
+    /// 2026-07-15 baselines: live <1MB inside 10-56MB files), and the group
+    /// committer exists to fix it.
+    ///
+    /// So the meaningful regression assertion is comparative: the same 500 records
+    /// written as one batch transaction must fragment FAR less than 500 per-record
+    /// transactions. If this ever fails, batching stopped amortizing the COW churn
+    /// — the whole point of the 2026-07-15/16 DB-growth fixes.
     #[test]
-    fn test_redb_fragmentation_stats_reports_low_fragmentation_after_many_small_writes() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = MetadataStore::new(temp_dir.path().to_path_buf()).unwrap();
+    fn test_batched_writes_fragment_far_less_than_per_record_commits() {
         let node = NodeId::new();
-
-        for i in 0..500u32 {
+        let make_loc = |i: u32| {
             let hash = dfs_common::hash::compute_chunk_hash(format!("chunk-{}", i).as_bytes());
-            let loc = dfs_common::ChunkLocation {
+            dfs_common::ChunkLocation {
                 chunk_id: ChunkId::from_hash(hash),
                 nodes: vec![node],
                 size: 4096,
@@ -3007,21 +3686,91 @@ mod tests {
                 written_at: Some(1000 + i as u64),
                 client_write_seq: Some(i as u64),
                 file_id: None,
-            };
-            store.put_chunk_location(&loc).unwrap();
+            }
+        };
+
+        // Store A: 500 single-record transactions (the pre-fix hot-path shape).
+        let temp_a = TempDir::new().unwrap();
+        let store_a = MetadataStore::new(temp_a.path().to_path_buf()).unwrap();
+        for i in 0..500u32 {
+            store_a.put_chunk_location(&make_loc(i)).unwrap();
+        }
+        let (live_a, frag_a) = store_a.redb_fragmentation_stats().unwrap();
+        assert!(live_a > 0);
+        let frag_pct_a = frag_a as f64 / (live_a + frag_a) as f64;
+
+        // Store B: the same 500 records in one batch transaction (what the group
+        // committer produces for a concurrent burst).
+        let temp_b = TempDir::new().unwrap();
+        let store_b = MetadataStore::new(temp_b.path().to_path_buf()).unwrap();
+        let locations: Vec<_> = (0..500u32).map(make_loc).collect();
+        store_b.put_chunk_locations_batch(&locations).unwrap();
+        let (live_b, frag_b) = store_b.redb_fragmentation_stats().unwrap();
+        assert!(live_b > 0);
+        let frag_pct_b = frag_b as f64 / (live_b + frag_b) as f64;
+
+        // Compare absolute fragmented BYTES, not ratios: both stores hold the same
+        // live records, but on a nearly-empty DB the ratio is dominated by fixed
+        // table-creation overhead (measured: one 500-record txn still reads ~51%
+        // by ratio while being ~10x smaller in bytes than the per-record store's
+        // 91.7%). Bytes isolate the per-commit COW churn this test is about.
+        assert!(
+            frag_b * 3 < frag_a,
+            "batched writes should fragment far less than per-record commits \
+             (per-record: {}B / {:.1}%, batched: {}B / {:.1}%)",
+            frag_a, frag_pct_a * 100.0, frag_b, frag_pct_b * 100.0
+        );
+    }
+
+    /// Group-commit regression test (2026-07-15/16 DB-growth fix): N concurrent
+    /// single-record *_async calls must coalesce into far fewer transactions than
+    /// N, while every record is still individually readable once its own await
+    /// returns (commit-before-return semantics preserved — no write-behind window).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_group_commit_coalesces_concurrent_single_record_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+        let node = NodeId::new();
+
+        const N: usize = 200;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let store = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let hash = dfs_common::hash::compute_chunk_hash(format!("gc-{}", i).as_bytes());
+                let loc = dfs_common::ChunkLocation {
+                    chunk_id: ChunkId::from_hash(hash),
+                    nodes: vec![node],
+                    size: 4096,
+                    checksum: hash,
+                    file_offset: Some(0),
+                    written_at: Some(1000 + i as u64),
+                    client_write_seq: Some(i as u64),
+                    file_id: None,
+                };
+                store.put_chunk_location_async(loc.clone()).await.unwrap();
+                // Read-your-writes: our await returned, so our record is committed.
+                let read_back = store.get_chunk_location(&loc.chunk_id).unwrap();
+                assert_eq!(read_back.map(|l| l.chunk_id), Some(loc.chunk_id));
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
         }
 
-        let (live_bytes, fragmented_bytes) = store.redb_fragmentation_stats().unwrap();
-        assert!(live_bytes > 0, "500 real chunk_location records must show up as live bytes");
-
-        let total = live_bytes + fragmented_bytes;
-        let frag_pct = fragmented_bytes as f64 / total as f64;
+        let stats = store.txn_stats_snapshot();
+        let count_of = |site: &str| stats.iter()
+            .find(|(s, _, _)| s == site)
+            .map(|(_, count, _)| *count)
+            .unwrap_or(0);
+        assert_eq!(count_of("op:put_chunk_location"), N as u64, "every op must be applied exactly once");
+        let commits = count_of("group_commit");
+        assert!(commits >= 1, "at least one commit must have happened");
         assert!(
-            frag_pct < 0.20,
-            "500 small, non-overwriting writes to a fresh DB should show low genuine \
-             fragmentation ({:.1}% observed) — if this is high, redb_fragmentation_stats \
-             isn't actually measuring reclaimable waste",
-            frag_pct * 100.0
+            commits < (N as u64) * 3 / 4,
+            "{} concurrent single-record writes should group-commit into fewer \
+             transactions ({} observed) — if this is ~N, coalescing is broken",
+            N, commits
         );
     }
 

@@ -6684,7 +6684,34 @@ impl Server {
                 if let Some(remaining) = offline_cooldown_remaining {
                     info!("compaction: skipping planned offline path this cycle — {}s left in this node's offline-compaction cooldown; falling back to the online path", remaining.as_secs());
                 }
-                let offline_tx = if offline_disabled || offline_cooldown_remaining.is_some() { None } else { self.offline_compaction_tx.read().await.clone() };
+
+                // The offline path pulls this node OUT OF THE CLUSTER. Only spend that
+                // when we actually expect bytes back — i.e. when the growth gate is what
+                // fired, not the 30-minute periodic.
+                //
+                // The periodic is deliberately ungated (it exists on the theory that
+                // redb releases more on a later pass), so it fires even when the file
+                // has not grown a single byte since the last compaction. Wiring a
+                // SPECULATIVE trigger to a CERTAIN availability cost is what produced
+                // this, live during a kdiskmark run 2026-07-16:
+                //   23:49:29 compaction: triggering — file 351.5MB is 1.00x its
+                //            post-compaction baseline 351.5MB (est. 0.0MB reclaimable,
+                //            1801s since last compact)
+                //   23:49:31 Planned offline compaction: pausing...   (leaves cluster)
+                //   23:49:34 Planned offline compaction finished: 351.5MB -> 351.5MB
+                // It said "est. 0.0MB reclaimable" and went offline anyway. The periodic
+                // still runs — just via the online path, which costs no availability, so
+                // its speculative upside is kept and its certain downside is not.
+                let nothing_to_reclaim = current_size <= last_compact_size;
+                if nothing_to_reclaim && !offline_disabled && offline_cooldown_remaining.is_none() {
+                    debug!("compaction: periodic cycle with nothing to reclaim (file {:.1}MB == baseline) — using the online path rather than taking this node offline",
+                        current_size as f64 / 1_048_576.0);
+                }
+                let offline_tx = if offline_disabled || offline_cooldown_remaining.is_some() || nothing_to_reclaim {
+                    None
+                } else {
+                    self.offline_compaction_tx.read().await.clone()
+                };
                 if let Some(offline_tx) = offline_tx {
                     let all_online = self.cluster.all_members_online().await;
                     if !all_online {

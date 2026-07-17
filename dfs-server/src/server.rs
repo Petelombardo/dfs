@@ -5413,10 +5413,36 @@ impl Server {
         // at all — the chunk was permanently unreadable on every replica despite
         // metadata claiming full replication.
         if !self.storage.has_chunk(&real_chunk_id) {
-            if let Some(healing) = self.healing.read().await.as_ref() {
-                warn!("handle_replicate_patch_fold: real_chunk_id {} not present locally on {} — queueing immediate heal",
+            // Receiving this broadcast does NOT mean this node is one of the file's
+            // intended replicas — ReplicatePatchFold is deliberately sent to every
+            // online node so any of them can resolve the token for routing (see this
+            // request's doc comment), independent of who actually holds the bytes.
+            // Root-caused 2026-07-17: treating "got the broadcast" as "must be a
+            // replica" made every non-replica node in the cluster queue a heal for
+            // every fold of every actively-patched file, forever — on a hot file
+            // (e.g. a continuously-appended log) this fires on every fold cycle, on
+            // every node that was never assigned to hold it, and never resolves
+            // since it's not a real gap. Only queue when chunk_map already knows the
+            // real replica set AND this node is in it; an unknown/not-yet-populated
+            // entry falls back to the old behavior (queue) to preserve the
+            // 2026-07-14 guarantee this backstop exists for.
+            let should_heal = self.chunk_map.get(&file_id)
+                .and_then(|entry| {
+                    let (locs, _) = entry.value();
+                    Self::chunk_map_find_by_idx(locs, chunk_idx)
+                        .map(|i| locs[i].nodes.contains(&self.cluster.local_node_id()))
+                })
+                .unwrap_or(true);
+            if should_heal {
+                if let Some(healing) = self.healing.read().await.as_ref() {
+                    warn!("handle_replicate_patch_fold: real_chunk_id {} not present locally on {} — queueing immediate heal",
+                        real_chunk_id, self.cluster.local_node_id());
+                    healing.queue_chunks_immediate(vec![real_chunk_id]).await;
+                }
+            } else {
+                debug!("handle_replicate_patch_fold: real_chunk_id {} not present locally on {}, but this node \
+                    isn't in the file's known replica set — skipping phantom heal",
                     real_chunk_id, self.cluster.local_node_id());
-                healing.queue_chunks_immediate(vec![real_chunk_id]).await;
             }
         }
         Response::Ok { data: None }
@@ -11961,6 +11987,79 @@ mod tests {
         let chunk_ids: Vec<ChunkId> = chunk_ids_with_sizes.iter().map(|(id, _, _)| *id).collect();
         let read_data = server.read_data(&chunk_ids).await.unwrap();
         assert_eq!(data.as_slice(), read_data.as_slice());
+    }
+
+    /// Root-caused 2026-07-17 (staging: sustained 67-99% CPU on all 5 nodes, ~100k/day
+    /// "queueing immediate heal" warnings per node, degraded read throughput during a
+    /// live VM install). ReplicatePatchFold is deliberately broadcast to *every* online
+    /// node (see its doc comment) so any node can resolve the token for routing, even
+    /// one that isn't a data replica for the file. handle_replicate_patch_fold's
+    /// heal-trigger conflated "received this broadcast" with "is an intended replica" —
+    /// it queued an immediate heal for ANY node missing the bytes locally, regardless of
+    /// whether that node was ever supposed to hold them. On a hot, actively-patched file
+    /// (e.g. the DVR's continuously-appended recording log), this fires on every fold
+    /// cycle, on every non-replica node in the cluster, forever — pure wasted heal churn
+    /// that scales with cluster-wide write activity, not the file's own replication
+    /// factor. Must not queue when chunk_map already knows the real (small) replica set
+    /// and this node isn't in it.
+    #[tokio::test]
+    async fn test_handle_replicate_patch_fold_skips_phantom_heal_for_non_replica_node() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let client = Arc::new(NetworkClient::new());
+        let healing = Arc::new(HealingManager::new(
+            storage.clone(), metadata.clone(), cluster.clone(), client,
+            Arc::new(std::sync::atomic::AtomicUsize::new(3)), 300, 24, true,
+            Arc::new(DashMap::new()), Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            100, 60.0, 8, 3, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        server.set_healing_manager(healing.clone()).await;
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let real_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"phantom-fold-content"));
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"phantom-fold-token"));
+
+        // chunk_map already knows this file's real (small) replica set — and this
+        // node (node_id) isn't in it. Simulates the fold-pointer broadcast landing on
+        // a node outside the file's intended replicas.
+        let other_node = dfs_common::NodeId::new();
+        let loc = ChunkLocation {
+            chunk_id: real_chunk_id,
+            nodes: vec![other_node],
+            size: 42,
+            checksum: [0u8; 32],
+            file_offset: Some(0),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        };
+        server.chunk_map_ref().insert(file_id, (vec![loc], 1));
+
+        // real_chunk_id genuinely doesn't exist on this node's disk.
+        server.handle_replicate_patch_fold(public_token, real_chunk_id, file_id, chunk_idx).await;
+
+        let stats = healing.get_stats().await;
+        assert_eq!(
+            stats.pending_healing, 0,
+            "this node is not in the chunk's real replica set per chunk_map — must not \
+             queue a phantom heal for a chunk it was never assigned to hold"
+        );
     }
 
     #[tokio::test]

@@ -912,6 +912,32 @@ impl HealingManager {
             .unwrap_or(false)
     }
 
+    /// May this cycle declare a 0-replica chunk permanently lost and purge it?
+    ///
+    /// BOTH conditions are required, and they are not redundant:
+    /// - `destructive_allowed`: cluster healthy enough for destructive ops. Tolerates
+    ///   `nodes_down <= 1`, which is right for RF=3 replica math.
+    /// - `patch_token_view_complete`: EVERY node contributed its patch-token set this
+    ///   cycle. A patch token has no file on disk until its fold lands, so "absent on
+    ///   every replica" — the sole evidence a DATA LOSS purge acts on — is trivially
+    ///   true of any token. If even one node's tokens are invisible, an unfolded token
+    ///   from that node is indistinguishable from a genuinely lost chunk.
+    ///
+    /// The second is exactly the case the first waves through: at `nodes_down == 1`
+    /// destructive ops stay allowed, but that one absent node's ENTIRE token set is
+    /// invisible — a total blind spot, not a 1-in-3 one. PATCH_STATE_TABLE is
+    /// node-local and only FOLDS are disseminated (Request::ReplicatePatchFold); there
+    /// is no equivalent for pending tokens, so the GetPatchTokenIds union is the only
+    /// way to see them, and a node that is away contributes nothing to it.
+    ///
+    /// Confirmed data loss twice before this gate existed — 2026-07-15 (vm-108
+    /// chunk_idx 230) and 2026-07-17 06:09 on an IDLE cluster with no writes since a
+    /// clean fsck. A `PlannedCompaction` leave is enough to open the window, and those
+    /// happen constantly.
+    fn may_declare_data_loss(destructive_allowed: bool, patch_token_view_complete: bool) -> bool {
+        destructive_allowed && patch_token_view_complete
+    }
+
     /// Classify a chunk_id that has 0 accessible replicas: is it safe to purge
     /// (superseded by a newer write at the same file position, or its file no
     /// longer exists) or is it a genuine, permanent loss? Returns:
@@ -2038,7 +2064,43 @@ impl HealingManager {
         // reports it absent everywhere — a token is never a real on-disk file —
         // which can stall its reported replica count forever or, worse, walk it
         // into the DATA LOSS purge path below.
-        let mut patch_token_ids = self.metadata.all_patch_token_ids_async().await.unwrap_or_default();
+        // Tracks whether EVERY node in the cluster contributed its token set this
+        // cycle. A token is invisible to us unless its originating node answered, and
+        // an invisible token is indistinguishable from an ordinary chunk that is
+        // absent everywhere — i.e. it walks straight into the DATA LOSS purge below.
+        //
+        // CONFIRMED DATA LOSS, twice (2026-07-15 vm-108 chunk_idx 230; 2026-07-17
+        // 06:09 on a completely IDLE cluster with no writes since a clean fsck):
+        //   DATA LOSS: Chunk <token> is permanently unrecoverable
+        //       (N metadata nodes, all confirmed empty) — purging stale metadata
+        // "all confirmed empty" is trivially true of a patch token: it has no file on
+        // disk by design until its fold lands. The union below exists precisely to
+        // stop that, but it only ever queried ONLINE nodes and merely warned on RPC
+        // failure — so any node that was briefly away (a PlannedCompaction leave is
+        // enough, and those happen constantly) took 100% of its tokens out of view
+        // while destructive_allowed stayed true, since that gate tolerates
+        // `nodes_down <= 1` — correct for RF=3 replica math, catastrophically wrong
+        // for token visibility, where one node down is a total blind spot, not a
+        // 1-in-3 one.
+        //
+        // So completeness is now tracked explicitly and the purge defers without it.
+        // Same contract classify_zero_replica_chunk already documents for itself:
+        // when you cannot confirm, DEFER — never guess. Deferring costs one cycle;
+        // guessing deleted a live VM disk chunk.
+        let all_node_count = self.cluster.get_all_nodes().await.len();
+        let mut patch_token_view_complete = online_nodes.len() >= all_node_count;
+        if !patch_token_view_complete {
+            warn!("Patch-token view incomplete: {}/{} nodes online — offline nodes' tokens are invisible this cycle, deferring any DATA LOSS purge",
+                online_nodes.len(), all_node_count);
+        }
+        let mut patch_token_ids = match self.metadata.all_patch_token_ids_async().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!("Failed to read local patch tokens ({}) — deferring any DATA LOSS purge this cycle", e);
+                patch_token_view_complete = false;
+                Default::default()
+            }
+        };
         for node_info in &online_nodes {
             if node_info.id == local_id {
                 continue;
@@ -2052,11 +2114,13 @@ impl HealingManager {
                     if let Message::Response(Response::PatchTokenIds { ids }) = envelope.message {
                         patch_token_ids.extend(ids);
                     } else {
-                        warn!("Unexpected response to GetPatchTokenIds from node {}", node_info.id);
+                        warn!("Unexpected response to GetPatchTokenIds from node {} — its patch tokens are invisible this cycle, deferring any DATA LOSS purge", node_info.id);
+                        patch_token_view_complete = false;
                     }
                 }
                 Err(e) => {
-                    warn!("GetPatchTokenIds RPC failed for node {} ({}): its patch tokens are invisible this cycle", node_info.id, e);
+                    warn!("GetPatchTokenIds RPC failed for node {} ({}): its patch tokens are invisible this cycle, deferring any DATA LOSS purge", node_info.id, e);
+                    patch_token_view_complete = false;
                 }
             }
         }
@@ -2233,6 +2297,20 @@ impl HealingManager {
                         warn!(
                             "Chunk {} has 0 accessible replicas and delay passed, but skipping DATA LOSS purge — cluster degraded ({} node(s) down or in grace period)",
                             chunk_id, nodes_down
+                        );
+                    } else if !Self::may_declare_data_loss(destructive_allowed, patch_token_view_complete) {
+                        // We could not enumerate every node's patch tokens this cycle,
+                        // so we cannot rule out that this chunk_id IS a token — and a
+                        // token is absent-everywhere by design, which is exactly the
+                        // evidence we would otherwise purge on. See
+                        // patch_token_view_complete's doc comment for the two confirmed
+                        // data-loss incidents this prevents. Deliberately separate from
+                        // destructive_allowed: that gate tolerates nodes_down <= 1 for
+                        // replica math, which is precisely the case where a node's
+                        // entire token set is invisible.
+                        warn!(
+                            "Chunk {} has 0 accessible replicas and delay passed, but skipping DATA LOSS purge — patch-token view is incomplete this cycle, so this chunk_id cannot be ruled out as an unfolded patch token",
+                            chunk_id
                         );
                     } else {
                         // Before declaring DATA LOSS, check whether this chunk_id was
@@ -4543,6 +4621,37 @@ mod tests {
             Some(false),
             "chunk_map still points at this exact chunk_id — genuine, permanent data loss"
         );
+    }
+
+    /// Regression for two CONFIRMED data-loss incidents (2026-07-15 vm-108 chunk_idx
+    /// 230; 2026-07-17 06:09 on an idle cluster, no writes since a clean fsck): the
+    /// healer purged unfolded PATCH TOKENS as "permanently unrecoverable (N metadata
+    /// nodes, all confirmed empty)". A token has no file on disk by design, so that
+    /// evidence is trivially true of one — the only thing standing between a token
+    /// and the purge is knowing it IS a token, and PATCH_STATE_TABLE is node-local
+    /// (only folds are disseminated). One node briefly away — a PlannedCompaction
+    /// leave suffices — hides its whole token set, while destructive_allowed happily
+    /// stays true at nodes_down <= 1.
+    mod data_loss_gate {
+        use super::*;
+
+        #[test]
+        fn healthy_cluster_with_a_complete_token_view_may_purge() {
+            assert!(HealingManager::may_declare_data_loss(true, true));
+        }
+
+        /// THE BUG: cluster looks healthy (nodes_down <= 1 is tolerated), but that one
+        /// absent node took 100% of its patch tokens out of view. Must NOT purge.
+        #[test]
+        fn healthy_cluster_with_an_incomplete_token_view_must_not_purge() {
+            assert!(!HealingManager::may_declare_data_loss(true, false));
+        }
+
+        #[test]
+        fn degraded_cluster_never_purges_regardless_of_token_view() {
+            assert!(!HealingManager::may_declare_data_loss(false, true));
+            assert!(!HealingManager::may_declare_data_loss(false, false));
+        }
     }
 
     /// The cold-chunk_map case must DEFER, never guess. Regression for the

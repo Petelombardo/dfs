@@ -2639,6 +2639,22 @@ impl HealingManager {
         alive
     }
 
+    /// Sort key for drain_heal_queue's per-cycle ordering — see that function's sort
+    /// comment for the incident this closes. Pure and independently testable: severity
+    /// (UnderReplicated before OverReplicated) ranks first, then ascending alive-replica
+    /// count within UnderReplicated (1-of-N before 2-of-3), then oldest-first as the
+    /// final tie-break. Lower tuples sort first.
+    fn heal_queue_sort_key(
+        status: ReplicationStatus, alive_count: usize, age: Duration,
+    ) -> (u8, usize, std::cmp::Reverse<Duration>) {
+        let severity_rank = match status {
+            ReplicationStatus::UnderReplicated => 0,
+            ReplicationStatus::Ok => 1,
+            ReplicationStatus::OverReplicated => 2,
+        };
+        (severity_rank, alive_count, std::cmp::Reverse(age))
+    }
+
     /// Drain the heal queue — dispatches PushChunkTo / DeleteChunkReplica for all
     /// chunks in pending_healing that are ready (delay passed, source known, not
     /// in-flight, not stalled). Tasks are spawned-and-forgotten; in_flight_healing
@@ -2722,13 +2738,22 @@ impl HealingManager {
                 }
             }
 
-            // Sort oldest-first, cap to max_heal_per_cycle.
+            // Sort by severity first, then oldest-first within equal severity, cap to
+            // max_heal_per_cycle. Root-caused 2026-07-17: previously oldest-first only,
+            // so a chunk at 1-of-3 replicas got no priority over one merely at 2-of-3 —
+            // under a sustained backlog, max_heal_per_cycle's truncation below could
+            // defer the most severe gap behind less urgent ones indefinitely.
+            // confirmed_alive.len() is already computed per entry above; no new data
+            // needed. UnderReplicated always outranks OverReplicated (restoring
+            // durability outranks trimming excess copies), and within UnderReplicated,
+            // fewer alive replicas sorts first (1-of-N before 2-of-3).
             {
                 let pending = self.pending_healing.read().await;
-                v.sort_by_cached_key(|(chunk_id, _, _)| {
-                    pending.get(chunk_id)
-                        .map(|t| std::cmp::Reverse(t.elapsed()))
-                        .unwrap_or(std::cmp::Reverse(Duration::ZERO))
+                v.sort_by_cached_key(|(chunk_id, status, confirmed_alive)| {
+                    let age = pending.get(chunk_id)
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    Self::heal_queue_sort_key(*status, confirmed_alive.len(), age)
                 });
             }
             let skipped = v.len().saturating_sub(self.max_heal_per_cycle);
@@ -4016,6 +4041,51 @@ mod tests {
         assert_eq!(stats.pending_healing, 0);
         assert!(stats.auto_heal_enabled);
         assert_eq!(stats.healing_delay_secs, 300);
+    }
+
+    /// Root-caused 2026-07-17: drain_heal_queue used to sort oldest-first only, so a
+    /// chunk at 1-of-3 replicas got no priority over one at 2-of-3 under a sustained
+    /// backlog — max_heal_per_cycle's truncation could defer the most severe gap
+    /// behind less urgent ones. A chunk with fewer alive replicas must always sort
+    /// before one with more, regardless of relative age.
+    #[test]
+    fn heal_queue_sort_key_prioritizes_fewer_alive_replicas_over_age() {
+        let severely_under = HealingManager::heal_queue_sort_key(
+            ReplicationStatus::UnderReplicated, 1, Duration::from_secs(10),
+        );
+        let mildly_under_but_older = HealingManager::heal_queue_sort_key(
+            ReplicationStatus::UnderReplicated, 2, Duration::from_secs(9999),
+        );
+        assert!(severely_under < mildly_under_but_older,
+            "1-of-N must sort before 2-of-3 even when the 2-of-3 chunk is far older");
+    }
+
+    /// UnderReplicated must always outrank OverReplicated — restoring durability
+    /// matters more than trimming excess copies, regardless of alive count or age.
+    #[test]
+    fn heal_queue_sort_key_prioritizes_under_replicated_over_over_replicated() {
+        let under = HealingManager::heal_queue_sort_key(
+            ReplicationStatus::UnderReplicated, 2, Duration::from_secs(1),
+        );
+        let over = HealingManager::heal_queue_sort_key(
+            ReplicationStatus::OverReplicated, 5, Duration::from_secs(9999),
+        );
+        assert!(under < over,
+            "UnderReplicated must sort before OverReplicated regardless of alive count or age");
+    }
+
+    /// Within equal severity and equal alive count, the existing oldest-first
+    /// tie-break must still hold — this is the pre-existing behavior, must not
+    /// regress.
+    #[test]
+    fn heal_queue_sort_key_falls_back_to_oldest_first_within_equal_severity() {
+        let older = HealingManager::heal_queue_sort_key(
+            ReplicationStatus::UnderReplicated, 2, Duration::from_secs(100),
+        );
+        let newer = HealingManager::heal_queue_sort_key(
+            ReplicationStatus::UnderReplicated, 2, Duration::from_secs(1),
+        );
+        assert!(older < newer, "older entry must still sort first when severity and alive count are equal");
     }
 
     #[tokio::test]

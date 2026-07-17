@@ -860,6 +860,34 @@ pub struct DfsClient {
     /// RESYNC_DEBOUNCE, not one per background-tick (2s).
     pub(crate) last_resync_sent_at: Arc<DashMap<FileId, std::time::Instant>>,
 
+    /// Counts every time multi_patch_chunk_on_replicas_inner's backfill had to reach
+    /// beyond the chunk's originally-targeted nodes to a genuinely new cluster
+    /// candidate (compute_required_replicas' doc comment) — i.e. an original target was
+    /// unreachable and a different node had to take over as the second replica. Not
+    /// itself a problem (this is exactly the robustness fix for a compaction pause or
+    /// restart racing a patch), but a sustained rise means it's worth checking why
+    /// (see single_replica_emergency_count for the more serious tier) — full-chunk
+    /// re-replication to a new node isn't free.
+    pub(crate) backfill_new_candidate_count: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Counts every URGENT_SINGLE_REPLICA event — a patch write that still couldn't
+    /// reach required_replicas after exhausting every reachable candidate (original
+    /// targets AND health-sorted cluster fallbacks). This should stay at zero in normal
+    /// operation; any nonzero value means the cluster was, even briefly, unable to
+    /// place a second replica anywhere.
+    pub(crate) single_replica_emergency_count: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Counts every time the bounded follow-up watchdog (spawned alongside
+    /// urgent_heal on a single_replica_emergency_count event) ran its full
+    /// SINGLE_REPLICA_FOLLOWUP_DEADLINE without the chunk ever reaching
+    /// required_replicas — see multi_patch_chunk_on_replicas_inner's emergency
+    /// fallback. This should stay at zero even more strictly than
+    /// single_replica_emergency_count itself: reaching this means the cluster
+    /// couldn't achieve durability for a specific chunk even with the healer's own
+    /// priority queue actively working on it for the full deadline — a "dead disk"
+    /// -grade signal, not routine degradation.
+    pub(crate) single_replica_followup_exhausted_count: Arc<std::sync::atomic::AtomicU64>,
+
     /// Pending per-chunk ReplicateChunkLocation notifications, coalesced into batched
     /// ReplicateChunkLocations RPCs by a background drain task instead of each patch
     /// sending its own individual RPC. Safe to batch/delay: no caller depends on this
@@ -1153,6 +1181,9 @@ leader_addr: Arc::new(RwLock::new(None)),
             metadata_queue: MetadataQueue::new(),
             pending_resync: Arc::new(dashmap::DashSet::new()),
             last_resync_sent_at: Arc::new(DashMap::new()),
+            backfill_new_candidate_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            single_replica_emergency_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            single_replica_followup_exhausted_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             write_seq: Arc::new(DashMap::new()),
             chunk_seq: Arc::new(DashMap::new()),
@@ -6736,25 +6767,59 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        // Require at least 2 replicas whenever more than one was actually targeted —
-        // a chunk that lands on exactly 1 node is a single point of failure: if that
-        // one node dies before the healer catches up, the chunk is unrecoverably
-        // lost. Root-caused 2026-07-11: this exact sequence (a patch landed on only
-        // gluster1, which self-restarted ~15s later from an unrelated compaction
-        // wedge) permanently destroyed a real chunk of a VM disk — the other 4 nodes'
-        // metadata all agreed the chunk lived on gluster1, and gluster1 itself had
-        // no record of it after restarting. required_replicas is capped by how many
-        // nodes were actually targeted so a genuine RF=1 / single-node cluster (or
-        // dual_rf's intentional 2-target design) still writes successfully with
-        // fewer than 2 candidates to begin with.
-        let required_replicas = patch_addrs.len().min(2);
+        // Require at least 2 replicas whenever configured replication_factor >= 2 — a
+        // chunk that lands on exactly 1 node is a single point of failure: if that one
+        // node dies before the healer catches up, the chunk is unrecoverably lost.
+        // Root-caused 2026-07-11: this exact sequence (a patch landed on only gluster1,
+        // which self-restarted ~15s later from an unrelated compaction wedge)
+        // permanently destroyed a real chunk of a VM disk. That incident's fix pinned
+        // required_replicas to patch_addrs.len().min(2) — but patch_addrs is built from
+        // the chunk's CURRENT known node list, so once a chunk was already down to 1
+        // replica, required_replicas silently shrank to 1 too and was trivially
+        // satisfied — no backfill even attempted on every subsequent patch. Confirmed
+        // live 2026-07-17: this self-reinforcing trap caused a second, real,
+        // unrecoverable data loss (chunk af931c98..., VM 111 disk install) — a patch
+        // landed on the chunk's one known replica right as that node hit another
+        // compaction-wedge restart, and neither listed node ended up with the bytes.
+        // compute_required_replicas pins the target to configured RF instead (see its
+        // doc comment), independent of how many nodes the chunk currently happens to
+        // be on — a genuine RF<2 single-node cluster, or dual_rf's intentional 2-target
+        // design, both still resolve to the right floor (1 or 2 respectively).
+        let configured_rf = self.replication_factor.load(Ordering::Relaxed);
+        let required_replicas = Self::compute_required_replicas(configured_rf);
         if patched_node_ids.len() < required_replicas {
-            let missing_addrs: Vec<SocketAddr> = patch_addrs.iter().copied()
+            let mut missing_addrs: Vec<SocketAddr> = patch_addrs.iter().copied()
                 .filter(|a| !addr_to_node_id_snap.get(a)
                     .map(|nid| patched_node_ids.contains(nid))
                     .unwrap_or(false))
                 .collect();
-            warn!("MultiPatch: chunk {} landed on only {}/{} targeted replica(s) — backfilling the \
+            // Always queue at least one genuinely new candidate alongside the
+            // originally-targeted node(s) — not just when patch_addrs itself was too
+            // small (the af931c98 case), but on every backfill. Root-caused
+            // 2026-07-17 via T52 (SIGKILL a replica mid-patch-storm, poll replica
+            // count live): with only the originally-targeted node in missing_addrs,
+            // the retry loop below has nothing else to try if that ONE node is
+            // genuinely down — it just waits out the full BACKFILL_RETRY_BUDGET
+            // hoping the same node comes back, exactly the "wait for it" behavior the
+            // user explicitly said not to do ("skip that node and patch a different
+            // node with the full bytes that they need"). A fresh candidate costs
+            // nothing extra to have queued if it turns out not to be needed (the
+          // round-robin loop below only uses as many as required_replicas actually
+            // needs) — health-sorted, excluding anyone already targeted, reusing the
+            // same ordering write_chunk_to_replicas uses for its own candidate
+            // fallback (client.rs:5457).
+            {
+                let exclude: std::collections::HashSet<SocketAddr> =
+                    patch_addrs.iter().copied().chain(missing_addrs.iter().copied()).collect();
+                let needed = required_replicas.saturating_sub(patched_node_ids.len()).max(1);
+                let extra_candidates = self.node_health.sort_by_health(
+                    &all_cluster_nodes.iter().copied()
+                        .filter(|a| !exclude.contains(a))
+                        .collect::<Vec<_>>()
+                ).await;
+                missing_addrs.extend(extra_candidates.into_iter().take(needed));
+            }
+            warn!("MultiPatch: chunk {} landed on only {}/{} required replica(s) — backfilling the \
                    missing {} with a direct raw copy before accepting the write",
                 authoritative_chunk_id, patched_node_ids.len(), required_replicas, missing_addrs.len());
 
@@ -6789,11 +6854,22 @@ leader_addr: Arc::new(RwLock::new(None)),
             match source_bytes {
                 Ok(data) => {
                     let data = std::sync::Arc::new(data);
-                    for addr in missing_addrs {
-                        if patched_node_ids.len() >= required_replicas {
-                            break;
-                        }
-                        loop {
+                    // Round-robin across ALL remaining candidates each pass, instead of
+                    // exhausting the whole retry budget on one address before ever
+                    // trying the next — a genuinely dead node must never starve a live
+                    // candidate of a chance. See this block's doc comment above
+                    // (2026-07-17, T52) for the incident this fixes: a killed replica
+                    // happened to recover within the old budget and masked this, but a
+                    // node that stayed down would have exhausted the full 5s against it
+                    // alone with a live candidate sitting untried.
+                    let mut remaining = missing_addrs;
+                    while patched_node_ids.len() < required_replicas && !remaining.is_empty() {
+                        let mut still_missing = Vec::new();
+                        for addr in remaining {
+                            if patched_node_ids.len() >= required_replicas {
+                                still_missing.push(addr);
+                                continue;
+                            }
                             let req = Request::WriteChunk {
                                 chunk_id: authoritative_chunk_id,
                                 data: (*data).clone(),
@@ -6802,29 +6878,33 @@ leader_addr: Arc::new(RwLock::new(None)),
                             match self.send_request(addr, req).await {
                                 Ok(Response::Ok { .. }) => {
                                     if let Some(&nid) = addr_to_node_id_snap.get(&addr) {
+                                        if !patch_addrs.contains(&addr) {
+                                            self.backfill_new_candidate_count.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         patched_node_ids.push(nid);
                                         info!("MultiPatch: backfilled chunk {} onto {} via raw copy — now {}/{} replicas",
                                             authoritative_chunk_id, addr, patched_node_ids.len(), required_replicas);
                                     }
-                                    break;
                                 }
                                 Ok(other) => {
                                     warn!("MultiPatch: backfill copy to {} for chunk {} got unexpected result: {:?} — will not retry this node",
                                         addr, authoritative_chunk_id, other);
-                                    break;
                                 }
                                 Err(e) => {
-                                    if backfill_started.elapsed() < BACKFILL_RETRY_BUDGET {
-                                        debug!("MultiPatch: backfill copy to {} for chunk {} failed ({}), retrying",
-                                            addr, authoritative_chunk_id, e);
-                                        tokio::time::sleep(BACKFILL_RETRY_BACKOFF).await;
-                                        continue;
-                                    }
-                                    warn!("MultiPatch: backfill copy to {} for chunk {} failed after retry budget: {}",
+                                    debug!("MultiPatch: backfill copy to {} for chunk {} failed ({}) — trying other candidates before retrying it",
                                         addr, authoritative_chunk_id, e);
-                                    break;
+                                    still_missing.push(addr);
                                 }
                             }
+                        }
+                        remaining = still_missing;
+                        if !remaining.is_empty() && patched_node_ids.len() < required_replicas {
+                            if backfill_started.elapsed() >= BACKFILL_RETRY_BUDGET {
+                                warn!("MultiPatch: backfill for chunk {} exhausted retry budget with {} candidate(s) still unreachable: {:?}",
+                                    authoritative_chunk_id, remaining.len(), remaining);
+                                break;
+                            }
+                            tokio::time::sleep(BACKFILL_RETRY_BACKOFF).await;
                         }
                     }
                 }
@@ -6834,10 +6914,25 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
             }
             if patched_node_ids.len() < required_replicas {
-                warn!("MultiPatch: chunk {} still under-replicated ({}/{}) after backfill attempt — \
-                       accepting anyway to avoid blocking the write indefinitely; the healer must \
-                       treat this as urgent, not routine",
+                // Reaching here means every originally-targeted node AND every
+                // health-sorted cluster candidate was tried and still came up short —
+                // a genuine cluster-health emergency (fewer than required_replicas
+                // nodes reachable at all), not a routine occurrence now that the
+                // candidate pool above isn't limited to the chunk's shrunk node list.
+                // Still accept the write (refusing would strand the client with no way
+                // to persist durable data during a real outage) but make this loud and
+                // immediately actionable rather than silently routine.
+                self.single_replica_emergency_count.fetch_add(1, Ordering::Relaxed);
+                error!("URGENT_SINGLE_REPLICA: chunk {} landed on only {}/{} replica(s) after \
+                        exhausting all reachable candidates — cluster degraded, queuing urgent heal",
                     authoritative_chunk_id, patched_node_ids.len(), required_replicas);
+                self.urgent_heal(authoritative_chunk_id).await;
+                // urgent_heal alone is fire-and-forget with no confirmation it actually
+                // lands — spawn a bounded background watchdog (does not delay this
+                // write's own return) that keeps checking/nudging until the chunk
+                // actually reaches required_replicas or a "declare it dead" deadline
+                // passes. See spawn_single_replica_followup's doc comment for why 30s.
+                self.spawn_single_replica_followup(authoritative_chunk_id, required_replicas);
             }
             timing_backfill += backfill_started.elapsed();
         }
@@ -7353,6 +7448,118 @@ leader_addr: Arc::new(RwLock::new(None)),
             Some(t) => now.duration_since(t) >= debounce,
             None => true,
         }
+    }
+
+    /// The minimum replica count a patch write must reach before being accepted, given
+    /// the cluster's CONFIGURED replication_factor — never derived from how many
+    /// replicas a chunk currently happens to have. Root-caused 2026-07-17: the previous
+    /// `patch_addrs.len().min(2)` used the chunk's CURRENT (possibly already-shrunk)
+    /// known node count as the ceiling, so a chunk already down to 1 replica silently
+    /// satisfied "required_replicas=1" on every subsequent patch — a self-reinforcing
+    /// trap where a chunk that lost a replica never got it back. This directly caused
+    /// real, confirmed, unrecoverable data loss on a live VM disk install (chunk
+    /// af931c98..., 2026-07-17): a patch landed on the chunk's one known replica right
+    /// as that node hit a compaction-wedge restart, and neither listed node ended up
+    /// with the bytes on disk. Pinning the target to configured RF (floored at 2, unless
+    /// RF itself is below 2) means every patch always tries to reach 2 replicas
+    /// regardless of the chunk's current state.
+    fn compute_required_replicas(configured_rf: usize) -> usize {
+        if configured_rf >= 2 { 2 } else { configured_rf.max(1) }
+    }
+
+    /// Ask the leader to heal `chunk_id` immediately, bypassing healing_delay_secs —
+    /// the backstop for when a patch write genuinely can't reach required_replicas
+    /// even after exhausting every reachable candidate (see
+    /// multi_patch_chunk_on_replicas_inner's "still under-replicated" fallback). Reuses
+    /// the existing Request::QueueChunksForHealing -> HealingManager::queue_chunks_immediate
+    /// path (already used for this exact purpose elsewhere) — no new server-side code.
+    /// Fire-and-forget: never blocks or fails the caller's write on this, since the
+    /// write itself already has to proceed (refusing to acknowledge a durable patch
+    /// during a genuine cluster-health emergency would strand the client entirely).
+    async fn urgent_heal(&self, chunk_id: ChunkId) {
+        const URGENT_HEAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        let target = { *self.leader_addr.read().await }
+            .or_else(|| self.cluster_nodes.try_read().ok().and_then(|n| n.first().copied()));
+        let Some(target) = target else {
+            warn!("urgent_heal: no known node to forward chunk {} to — will only be caught by the normal (delayed) discovery pass", chunk_id);
+            return;
+        };
+        let req = Request::QueueChunksForHealing { chunk_ids: vec![chunk_id] };
+        match tokio::time::timeout(URGENT_HEAL_TIMEOUT, self.send_request(target, req)).await {
+            Ok(Ok(Response::Ok { .. })) => {
+                info!("urgent_heal: chunk {} queued for immediate healing via {}", chunk_id, target);
+            }
+            Ok(Ok(other)) => {
+                warn!("urgent_heal: unexpected response queuing chunk {} via {}: {:?}", chunk_id, target, other);
+            }
+            Ok(Err(e)) => {
+                warn!("urgent_heal: failed to queue chunk {} via {}: {}", chunk_id, target, e);
+            }
+            Err(_) => {
+                warn!("urgent_heal: timed out queuing chunk {} via {} after {:?}", chunk_id, target, URGENT_HEAL_TIMEOUT);
+            }
+        }
+    }
+
+    /// Ground-truth current replica count for `chunk_id`, queried directly from the
+    /// leader's CHUNK_TABLE (DebugGetRawChunkLocation — the same query dfs-admin's
+    /// `file raw-location` uses) rather than a merged/cached view, since this is
+    /// specifically checking whether a real backfill actually landed. Returns 0 (not
+    /// an error) if the leader is unreachable or has no record — callers are polling
+    /// in a loop and should just treat that as "not yet", not distinguish it from a
+    /// genuine zero.
+    async fn current_replica_count(&self, chunk_id: ChunkId) -> usize {
+        const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        let Some(target) = *self.leader_addr.read().await else { return 0; };
+        let req = Request::DebugGetRawChunkLocation { chunk_id };
+        match tokio::time::timeout(QUERY_TIMEOUT, self.send_request(target, req)).await {
+            Ok(Ok(Response::DebugRawChunkLocation { location: Some(loc) })) => loc.nodes.len(),
+            _ => 0,
+        }
+    }
+
+    /// Bounded end-to-end follow-up for the true emergency case (multi_patch's
+    /// backfill exhausted every reachable candidate within its own 5s
+    /// BACKFILL_RETRY_BUDGET and still came up short of required_replicas).
+    /// urgent_heal alone is fire-and-forget — it hands the chunk to the leader's
+    /// (now priority-sorted, per drain_heal_queue's severity ordering) healer with no
+    /// confirmation it actually lands. Spawned as a background task so it never
+    /// blocks or delays the write's own return; the write already had to proceed
+    /// with whatever replica count it achieved (see this fallback's call site).
+    ///
+    /// SINGLE_REPLICA_FOLLOWUP_DEADLINE=30s deliberately mirrors the classic OS/
+    /// kernel block-layer "declare a disk dead" command-timeout convention (e.g.
+    /// the Linux SCSI layer's default) — user's explicit framing when this was
+    /// added 2026-07-17: this is exactly the same class of question ("how long
+    /// before we stop hoping and call it actually broken"), so borrowing an
+    /// already-battle-tested value beats picking an arbitrary one.
+    fn spawn_single_replica_followup(&self, chunk_id: ChunkId, required_replicas: usize) {
+        const FOLLOWUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        const FOLLOWUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+        let client = self.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(FOLLOWUP_POLL_INTERVAL).await;
+                let current = client.current_replica_count(chunk_id).await;
+                if current >= required_replicas {
+                    info!("urgent_heal: chunk {} reached {}/{} replicas via background healing after {:.1}s follow-up",
+                        chunk_id, current, required_replicas, start.elapsed().as_secs_f64());
+                    return;
+                }
+                if start.elapsed() >= FOLLOWUP_DEADLINE {
+                    client.single_replica_followup_exhausted_count.fetch_add(1, Ordering::Relaxed);
+                    error!("URGENT_SINGLE_REPLICA_FOLLOWUP_EXHAUSTED: chunk {} still only {}/{} replicas after \
+                            the full {:.0}s follow-up window — cluster-health emergency did not self-resolve, \
+                            needs operator attention",
+                        chunk_id, current, required_replicas, FOLLOWUP_DEADLINE.as_secs_f64());
+                    return;
+                }
+                // Nudge again in case the first request never landed (leader change,
+                // transient network failure) — queue_chunks_immediate is idempotent.
+                client.urgent_heal(chunk_id).await;
+            }
+        });
     }
 
     /// Enqueue a metadata update for async delivery to the leader.
@@ -8298,6 +8505,29 @@ mod tests {
         let old = now - Duration::from_secs(31);
         assert!(DfsClient::should_send_resync_snapshot(Some(old), now, debounce),
             "cooldown fully elapsed — must send again");
+    }
+
+    /// Root-caused 2026-07-17: the previous required_replicas = patch_addrs.len().min(2)
+    /// derived the target from the chunk's CURRENT (possibly already-shrunk) known node
+    /// count, so a chunk already down to 1 replica silently satisfied
+    /// required_replicas=1 forever after — self-reinforcing, never recovered. This
+    /// caused two confirmed real data-loss incidents (2026-07-11, 2026-07-17).
+    /// compute_required_replicas must always target 2 once configured RF is 2 or more,
+    /// independent of any chunk's current state.
+    #[test]
+    fn test_compute_required_replicas_floors_at_two_when_rf_at_least_two() {
+        assert_eq!(DfsClient::compute_required_replicas(2), 2);
+        assert_eq!(DfsClient::compute_required_replicas(3), 2);
+        assert_eq!(DfsClient::compute_required_replicas(5), 2);
+    }
+
+    /// "Not unless replica < 2 in the config" — a genuine RF<2 cluster (or a
+    /// single-node deployment) must not be forced to find a second replica that
+    /// can't exist.
+    #[test]
+    fn test_compute_required_replicas_respects_rf_below_two() {
+        assert_eq!(DfsClient::compute_required_replicas(1), 1);
+        assert_eq!(DfsClient::compute_required_replicas(0), 1, "RF=0 is degenerate — floor at 1, not 0");
     }
 
     /// A deleted file's write_seq bookkeeping must not linger forever — file_ids are

@@ -3072,14 +3072,21 @@ impl HealingManager {
         info!("Leader healing under-replicated chunk: {}", chunk_id);
 
         let location = metadata
-            .get_chunk_location(chunk_id)?
+            .get_chunk_location_async(*chunk_id).await?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
         // Fast orphan guard: if no file claims this chunk, don't waste a heal slot on
         // it. The deep-scan orphan sweep runs every ~6 min and will delete the routing
         // table entry; we just don't want to block a 120s heal transfer on a ghost chunk.
+        //
+        // Both metadata reads here use the _async (spawn_blocking) variants, NOT the
+        // sync ones: do_heal_chunk_inner is spawned up to heal_max_concurrent times at
+        // once onto tokio worker threads by drain_heal_queue's JoinSet. The sync getters
+        // block the worker on the parking_lot `db` read lock; enough concurrent heals
+        // blocking at once starves the whole runtime (the mechanism that turned a single
+        // slow metadata lock into gluster1's 33-minute node-wide wedge, 2026-07-17).
         let is_orphan = match location.file_id {
-            Some(file_id) => !metadata.file_exists_by_id(file_id).unwrap_or(true),
+            Some(file_id) => !metadata.file_exists_by_id_async(file_id).await.unwrap_or(true),
             None => {
                 // No file_id recorded — we can't verify quickly. Stall for now and let
                 // the deep scan handle it rather than burning 120s on a speculative heal.
@@ -3484,8 +3491,12 @@ impl HealingManager {
         client: &Arc<NetworkClient>,
         replication_factor: usize,
     ) -> Result<()> {
+        // _async (spawn_blocking) getter — do_cleanup_excess_inner is spawned
+        // concurrently on tokio workers by drain_heal_queue's JoinSet, same as
+        // do_heal_chunk_inner; the sync getter would block the worker on the
+        // parking_lot db lock. See do_heal_chunk_inner for the wedge this avoids.
         let location = metadata
-            .get_chunk_location(chunk_id)?
+            .get_chunk_location_async(*chunk_id).await?
             .ok_or_else(|| anyhow::anyhow!("Chunk location not found"))?;
 
         // Resolve confirmed-alive nodes to addresses.

@@ -1304,6 +1304,18 @@ impl MetadataStore {
         Ok(table.get(key.as_str())?.is_some())
     }
 
+    /// Async wrapper for file_exists_by_id — see get_chunk_location_async. Must be
+    /// used from any code running on a tokio worker thread (e.g. the concurrently-
+    /// spawned heal tasks in drain_heal_queue's JoinSet): the sync variant blocks
+    /// the worker on the parking_lot `db` read lock, and many concurrent blocking
+    /// reads starve the runtime — the second half of the 2026-07-17 gluster1 wedge.
+    pub async fn file_exists_by_id_async(self: &Arc<Self>, file_id: FileId) -> Result<bool> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.file_exists_by_id(file_id))
+            .await
+            .context("spawn_blocking panicked in file_exists_by_id_async")?
+    }
+
     pub fn get_file(&self, file_id: &FileId) -> Result<Option<FileMetadata>> {
         let key = format!("{}", file_id);
         let _db = self.db.read();
@@ -3700,8 +3712,23 @@ impl MetadataStore {
     /// Force all pending Durability::None commits to physical disk via a single fdatasync.
     /// Same trick used by compact_db() — one empty Durability::Immediate commit promotes
     /// the entire accumulated pending_non_durable_commits list atomically.
+    ///
+    /// Takes the SHARED (`db.read()`) lock, NOT `db.write()`. This only opens an
+    /// empty redb write transaction and commits it — the identical operation
+    /// apply_ops_group performs under `db.read()` (redb serializes its own single
+    /// writer internally; the parking_lot exclusive lock is ONLY needed by
+    /// compaction, which swaps the Database handle via `&mut`). Using `db.write()`
+    /// here was a latent node-wide-wedge bug: it set parking_lot's writer-intent,
+    /// which (anti-starvation) blocks EVERY subsequent metadata read on the node.
+    /// Because flush_durable is called synchronously from the offline-compaction /
+    /// shutdown drain (drain_sled_writes) on a runtime thread — inside a `timeout()`
+    /// that cannot interrupt a synchronous blocking lock — a single slow reader was
+    /// enough to hang the whole node behind wait_for_readers(). Confirmed live
+    /// 2026-07-17 (gluster1, gdb: ~90 threads parked in lock_shared_slow behind this
+    /// one lock_exclusive_slow). The shared lock coexists with all readers and can
+    /// never set writer-intent, so that wedge vector is gone.
     pub fn flush_durable(&self) -> Result<()> {
-        let mut db = self.db.write();
+        let db = self.db.read();
         let txn = db.begin_write()
             .map_err(|e| anyhow::anyhow!("flush_durable begin: {}", e))?;
         txn.commit()

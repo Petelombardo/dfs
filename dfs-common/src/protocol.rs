@@ -1096,6 +1096,22 @@ pub enum Response {
     DebugRawChunkLocation {
         location: Option<ChunkLocation>,
     },
+
+    /// The leader's detect_metadata_write_seq_gap found a genuine write_seq gap for this
+    /// file (see PutFileMetadata's covers_from_write_seq doc comment) — some prior push
+    /// never reached any leader (client crash before delivery, or a queue bug), so this
+    /// leader's chunk_locations for the file may be incomplete. The incoming push that
+    /// triggered this was still accepted and persisted as normal; this is purely an
+    /// additional signal on top of that Ok. Client should follow up by sending a full
+    /// authoritative chunk_locations snapshot for this file (covers_from_write_seq=0, so
+    /// this same detector never re-flags the resync push itself) — the existing
+    /// union-only chunk_map merge (merge_file_metadata, see 08a6201) makes this safe to
+    /// send at any time: it can only fill in what the leader is missing, never delete.
+    /// APPENDED at end to preserve wire compatibility — see ChunkStale's doc comment on
+    /// this rule.
+    ResyncMetadataRequested {
+        file_id: FileId,
+    },
 }
 
 /// A pending file deletion entry — stored in each node's sled delete queue.

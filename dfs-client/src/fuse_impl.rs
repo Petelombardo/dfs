@@ -1777,10 +1777,36 @@ impl FlushHandle {
                 if should_push {
                     self.last_bg_metadata_push.insert(ino, std::time::Instant::now());
                     self.last_metadata_update.insert(ino, std::time::Instant::now());
-                    let mut meta_for_network = meta.clone();
-                    meta_for_network.chunk_locations = Arc::new(all_locations.clone());
-                    let stamped = self.client.stamp_write_seq_pub(&meta_for_network);
-                    self.client.metadata_queue.push(stamped).await;
+                    // The leader flagged a genuine write_seq gap for this file
+                    // (Response::ResyncMetadataRequested — see DfsClient::pending_resync's
+                    // doc comment). Send the full cumulative metadata_cache snapshot
+                    // instead of just this cycle's delta so the leader's chunk_locations
+                    // converge — it already has everything this delta would have carried,
+                    // plus whatever it was missing. Debounced independently of
+                    // BG_METADATA_PUSH_INTERVAL — see last_resync_sent_at's doc comment:
+                    // a full snapshot's cost scales with the file's total chunk count, not
+                    // a delta's, so repeated false-positive gap flags must not each pay
+                    // that cost. Doesn't clear pending_resync when debounced, so it's
+                    // retried once the cooldown passes; the normal delta push below still
+                    // goes out this tick either way, so writes keep progressing.
+                    const RESYNC_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(30);
+                    let now = std::time::Instant::now();
+                    let resync_ready = self.client.pending_resync.contains(&meta.id)
+                        && DfsClient::should_send_resync_snapshot(
+                            self.client.last_resync_sent_at.get(&meta.id).map(|t| *t),
+                            now, RESYNC_DEBOUNCE,
+                        );
+                    if resync_ready {
+                        self.client.pending_resync.remove(&meta.id);
+                        self.client.last_resync_sent_at.insert(meta.id, now);
+                        let stamped = self.client.stamp_write_seq_pub(&meta);
+                        self.client.metadata_queue.push_full_snapshot(stamped).await;
+                    } else {
+                        let mut meta_for_network = meta.clone();
+                        meta_for_network.chunk_locations = Arc::new(all_locations.clone());
+                        let stamped = self.client.stamp_write_seq_pub(&meta_for_network);
+                        self.client.metadata_queue.push(stamped).await;
+                    }
                 }
                 // For background flushes, update read engine immediately (not queued)
                 // so reads see fresh chunk_map before slots are removed below. Always runs,

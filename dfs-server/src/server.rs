@@ -6538,6 +6538,26 @@ impl Server {
             || secs_since_compact >= 30 * 60
     }
 
+    /// Root-caused 2026-07-17: the periodic no-reclaim compaction cycle is pure
+    /// speculation (nothing real to reclaim) yet always takes the online path, whose
+    /// Phase 1-2 can wedge and force a self-restart under sustained write churn — see
+    /// the call site's doc comment for the full incident. Gates that cycle on
+    /// currently-observed write/meta activity so Phase 1-2 never even starts during a
+    /// busy window; real growth/fragmentation-triggered compactions don't call this at
+    /// all and always fire regardless of load.
+    ///
+    /// Requires BOTH an absolute floor (so a quiet cluster's near-zero avg_load can't
+    /// make trivial live activity look infinitely "high" by ratio alone) and a
+    /// multiple of the recent average (so a cluster with a naturally high sustained
+    /// baseline isn't judged "high" against itself). Staging's observed idle avg_1h is
+    /// ~1-6 ops/sec with real write-storm peaks of 50+; 20 sits clearly above the
+    /// former and comfortably below the latter.
+    fn should_skip_periodic_compaction_under_load(live_load: u64, avg_load: u64) -> bool {
+        const HIGH_ACTIVITY_FLOOR: u64 = 20;
+        const HIGH_ACTIVITY_MULTIPLIER: u64 = 3;
+        live_load > HIGH_ACTIVITY_FLOOR && live_load > avg_load.saturating_mul(HIGH_ACTIVITY_MULTIPLIER)
+    }
+
     pub fn start_compaction_loop(self: Arc<Self>) {
         let metadata = self.metadata.clone();
         let storage = self.storage.clone();
@@ -6729,6 +6749,40 @@ impl Server {
                 // still runs — just via the online path, which costs no availability, so
                 // its speculative upside is kept and its certain downside is not.
                 let nothing_to_reclaim = current_size <= last_compact_size;
+
+                // Root-caused 2026-07-17 (VM 111 install on staging): the periodic
+                // no-reclaim cycle is purely speculative (see this block's comment
+                // above) — zero benefit, nothing to weigh against risk — yet it always
+                // takes the online path since nothing_to_reclaim forces offline_tx to
+                // None below. Under sustained write churn, online compaction's Phase
+                // 1-2 (shared read lock, competing with concurrent writers) can
+                // genuinely wedge rather than just run slow, tripping its 60s timeout
+                // and forcing this node to self-restart — the same mechanism that
+                // caused real permanent chunk loss on 2026-07-11. That day: 6
+                // wedge-restarts across the cluster in ~2 hours, every one traceable
+                // 60s back to exactly this trigger line, leaving 384 of VM 111's 1326
+                // chunks stuck at 1 replica with the healer unable to keep up.
+                //
+                // Check load BEFORE Phase 1-2 gets a chance to wedge, not after — a
+                // single non-blocking read of ops_tracker's existing atomics (no lock
+                // on redb, no await that could itself stall), so this costs nothing
+                // even on a quiet node. Skip this cycle outright under high activity;
+                // the next 60s check retries — no different from the existing
+                // should_compact()==false skip a few lines up. Real
+                // growth/fragmentation-triggered compactions (nothing_to_reclaim ==
+                // false) are untouched and still fire immediately regardless of load —
+                // those have real bytes to reclaim, so the trade is worth it.
+                if nothing_to_reclaim {
+                    let snap = self.ops_tracker.get_stats();
+                    let live_load = snap.writes_live + snap.meta_live;
+                    let avg_load = snap.writes_avg_1h + snap.meta_avg_1h;
+                    if Self::should_skip_periodic_compaction_under_load(live_load, avg_load) {
+                        info!("compaction: skipping periodic no-reclaim cycle — {} write+meta op(s)/sec live (vs {}/sec avg) indicates high activity; deferring to next cycle rather than risking the online path's Phase 1-2 wedge under write churn",
+                            live_load, avg_load);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+                        continue;
+                    }
+                }
                 if nothing_to_reclaim && !offline_disabled && offline_cooldown_remaining.is_none() {
                     debug!("compaction: periodic cycle with nothing to reclaim (file {:.1}MB == baseline) — using the online path rather than taking this node offline",
                         current_size as f64 / 1_048_576.0);
@@ -7569,7 +7623,10 @@ impl Server {
             self.file_write_seqs.insert(metadata.id, incoming_write_seq);
         }
         // Gap detection — see detect_metadata_write_seq_gap's doc comment for the
-        // reasoning (legitimate coalescing vs. genuine loss).
+        // reasoning (legitimate coalescing vs. genuine loss). resync_requested_for
+        // captured now (metadata.id is Copy) since metadata itself is moved into the
+        // sled_write_tx path below before this function returns.
+        let mut resync_requested_for: Option<FileId> = None;
         if let Some((missing_from, missing_to)) = Self::detect_metadata_write_seq_gap(
             stored_write_seq, covers_from_write_seq, incoming_write_seq,
         ) {
@@ -7577,10 +7634,11 @@ impl Server {
                 "[META GAP] path={} id={} stored_write_seq={} covers_from_write_seq={} \
                  incoming_write_seq={} — write_seq {}..{} was never represented in any \
                  push that reached this leader (client crash before delivery, or a bug \
-                 in queue coalescing/delivery)",
+                 in queue coalescing/delivery) — requesting a full-snapshot resync",
                 metadata.path, metadata.id, stored_write_seq, covers_from_write_seq,
                 incoming_write_seq, missing_from, missing_to
             );
+            resync_requested_for = Some(metadata.id);
         }
         // The leader's chunk_map is updated by ReplicateChunkLocation (RCL) after each
         // confirmed write. When RCL succeeds, chunk_map is authoritative and newer than
@@ -7714,7 +7772,10 @@ impl Server {
                 let _ = tx.send(metadata);
             }
         }
-        Response::Ok { data: None }
+        match resync_requested_for {
+            Some(file_id) => Response::ResyncMetadataRequested { file_id },
+            None => Response::Ok { data: None },
+        }
     }
 
     /// Block until any metadata write for `file_id` currently queued in
@@ -11962,6 +12023,50 @@ mod tests {
         }
     }
 
+    /// Root-caused 2026-07-17: the periodic no-reclaim compaction cycle must not
+    /// attempt the online path (Phase 1-2 wedge risk) while write/meta activity is
+    /// high — see should_skip_periodic_compaction_under_load's doc comment.
+    mod periodic_compaction_load_gate {
+        use super::*;
+
+        /// Staging idle baseline observed: avg_1h ~1-6 ops/sec, no live spike.
+        #[test]
+        fn quiet_cluster_does_not_skip() {
+            assert!(!Server::should_skip_periodic_compaction_under_load(2, 1));
+        }
+
+        /// A real write storm (VM install, kdiskmark) observed peaking 50+ ops/sec —
+        /// must skip even against a near-zero recent average (a burst starting from
+        /// idle), which is exactly when the absolute floor alone must catch it.
+        #[test]
+        fn write_storm_from_idle_baseline_skips() {
+            assert!(Server::should_skip_periodic_compaction_under_load(55, 1));
+        }
+
+        /// A small, brief tick above zero on an otherwise idle node must not trip the
+        /// floor — this is normal background traffic, not a storm.
+        #[test]
+        fn small_blip_does_not_skip() {
+            assert!(!Server::should_skip_periodic_compaction_under_load(10, 2));
+        }
+
+        /// A cluster with a naturally high sustained baseline (avg already busy) must
+        /// be judged relative to itself, not just the absolute floor — current load
+        /// merely matching its own recent average is not a "spike" worth deferring for.
+        #[test]
+        fn high_but_steady_load_relative_to_own_baseline_does_not_skip() {
+            assert!(!Server::should_skip_periodic_compaction_under_load(40, 30));
+        }
+
+        /// Exactly at the floor must not skip (strictly greater-than, matching
+        /// should_compact's style of erring toward action at boundaries elsewhere) —
+        /// pins the boundary so a future edit can't silently flip it.
+        #[test]
+        fn exactly_at_floor_does_not_skip() {
+            assert!(!Server::should_skip_periodic_compaction_under_load(20, 0));
+        }
+    }
+
     #[tokio::test]
     async fn test_server_write_read_local() {
         let temp_storage = TempDir::new().unwrap();
@@ -12062,6 +12167,80 @@ mod tests {
         );
     }
 
+    /// Root-caused 2026-07-17 alongside the client-side false-positive fix
+    /// (MetadataQueue::push_inner's covers_from_write_seq accounting): once that fix
+    /// makes [META GAP] a trustworthy signal, a genuine gap should no longer be
+    /// silently logged-only — the leader tells the client to resync so its
+    /// chunk_locations for the file can converge (see Response::ResyncMetadataRequested's
+    /// doc comment).
+    #[tokio::test]
+    async fn test_handle_put_file_metadata_requests_resync_on_genuine_gap() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata_store = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata_store.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        server.file_write_seqs.insert(file_id, 5); // stored_write_seq = 5
+
+        let mut meta = FileMetadata::new("/resync_test.bin".to_string(), dfs_common::FileType::RegularFile);
+        meta.id = file_id;
+        meta.write_seq = 8;
+
+        // covers_from_write_seq=8 with stored=5: write_seq 6..7 never represented in
+        // any push this leader has seen — a genuine gap, not benign coalescing.
+        let response = server.handle_put_file_metadata(meta, 8).await;
+        match response {
+            Response::ResyncMetadataRequested { file_id: got } => assert_eq!(got, file_id),
+            other => panic!("expected ResyncMetadataRequested for a genuine gap, got {:?}", other),
+        }
+    }
+
+    /// Companion to the above: covers_from_write_seq == stored_write_seq + 1 is the
+    /// normal, no-gap case (standalone push or benign coalesce) — must still just be Ok.
+    #[tokio::test]
+    async fn test_handle_put_file_metadata_no_resync_without_a_gap() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata_store = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata_store.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        server.file_write_seqs.insert(file_id, 5); // stored_write_seq = 5
+
+        let mut meta = FileMetadata::new("/no_gap_test.bin".to_string(), dfs_common::FileType::RegularFile);
+        meta.id = file_id;
+        meta.write_seq = 6;
+
+        let response = server.handle_put_file_metadata(meta, 6).await;
+        match response {
+            Response::Ok { .. } => {}
+            other => panic!("expected plain Ok with no gap, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn test_list_all_files_waits_for_pending_sled_write_backlog() {
         // Repro for a 2026-07-15 rock5b incident: handle_put_file_metadata acks the
@@ -12098,10 +12277,15 @@ mod tests {
         assert!(matches!(server.handle_put_file_metadata(create, 0).await, Response::Ok { .. }));
 
         // seq>0 update — queued asynchronously via sled_write_tx, NOT necessarily
-        // committed by the time the ack (Response::Ok) returns.
+        // committed by the time the ack (Response::Ok) returns. write_seq=1 (not some
+        // arbitrary later value): the create above left stored_write_seq at 0 (write_seq
+        // 0 is the "unsequenced" sentinel, never recorded — see
+        // detect_metadata_write_seq_gap's doc comment), so jumping straight to a higher
+        // write_seq here would itself look like a genuine gap and return
+        // ResyncMetadataRequested instead of Ok — irrelevant to what this test exercises.
         meta.size = 999;
-        meta.write_seq = 5;
-        assert!(matches!(server.handle_put_file_metadata(meta.clone(), 5).await, Response::Ok { .. }));
+        meta.write_seq = 1;
+        assert!(matches!(server.handle_put_file_metadata(meta.clone(), 1).await, Response::Ok { .. }));
 
         // Without wait_for_sled_write_backlog_to_drain, this could race the worker
         // thread and see the stale seq=0/size=0 record.
@@ -12112,7 +12296,7 @@ mod tests {
         let found = files.iter().find(|f| f.id == meta.id)
             .unwrap_or_else(|| panic!("file {} missing from ListAllFiles entirely", meta.id));
         assert_eq!(found.size, 999, "ListAllFiles returned a stale pre-update size");
-        assert_eq!(found.write_seq, 5, "ListAllFiles returned a stale pre-update write_seq");
+        assert_eq!(found.write_seq, 1, "ListAllFiles returned a stale pre-update write_seq");
     }
 
     #[tokio::test]

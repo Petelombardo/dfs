@@ -366,6 +366,23 @@ pub struct MetadataQueue {
     /// a stale metadata update — resurrecting the file on the server.
     /// Each FileId is a UUID: never reused, so no false-positive blocking.
     deleted_ids: DashSet<FileId>,
+
+    /// Highest write_seq per file confirmed delivered (a leader returned
+    /// Ok/ResyncMetadataRequested — either way, that push's own write_seq was
+    /// genuinely persisted somewhere). Root-caused 2026-07-17 alongside the
+    /// covers_from_write_seq accounting fix: that fix only derives coverage from
+    /// data present in the CURRENT push (its own chunk_locations, or entries still
+    /// sitting in this queue to coalesce with) — it has no memory that an earlier
+    /// push for this file was already dequeued and successfully delivered moments
+    /// ago. A rapid sequence of near-empty pushes (e.g. two closely-spaced
+    /// open()/create() pushes) then looked like a gap purely because the earlier one
+    /// had already left the queue by the time the later one's covers_from was
+    /// computed. Folded into covers_from_write_seq (push_inner) as an additional
+    /// floor: `delivered_write_seq + 1` is always safe to claim as covered, since we
+    /// have concrete evidence a leader accepted it — this is orthogonal to (and must
+    /// not be confused with) a NEW leader's own dissemination catch-up lag, which is
+    /// a different, already-handled concern.
+    delivered_write_seq: DashMap<FileId, u64>,
 }
 
 struct MetadataEntry {
@@ -389,7 +406,18 @@ impl MetadataQueue {
             notify: Notify::new(),
             max_age: Duration::from_secs(24),
             deleted_ids: DashSet::new(),
+            delivered_write_seq: DashMap::new(),
         })
+    }
+
+    /// Record that `write_seq` for `file_id` was confirmed delivered to a leader —
+    /// see delivered_write_seq's doc comment. Called by the queue worker after every
+    /// successful PutFileMetadata response (Ok or ResyncMetadataRequested — both mean
+    /// the push was persisted).
+    fn mark_delivered(&self, file_id: FileId, write_seq: u64) {
+        self.delivered_write_seq.entry(file_id)
+            .and_modify(|v| *v = (*v).max(write_seq))
+            .or_insert(write_seq);
     }
 
     /// Enqueue an async metadata update (fire-and-forget, no confirmation).
@@ -397,7 +425,17 @@ impl MetadataQueue {
     /// timestamp. Does NOT implement back-pressure directly — callers that need
     /// back-pressure (enqueue_metadata) check age and rescue before calling this.
     pub async fn push(&self, metadata: FileMetadata) {
-        self.push_inner(metadata, None).await;
+        self.push_inner(metadata, None, false).await;
+    }
+
+    /// Enqueue a full authoritative metadata snapshot (complete chunk_locations, not
+    /// just a delta) in response to Response::ResyncMetadataRequested — see
+    /// DfsClient::pending_resync's doc comment. Forces covers_from_write_seq to 0 so
+    /// detect_metadata_write_seq_gap never re-flags this push itself (0 can never
+    /// exceed stored_write_seq + 1); relies on the existing union-only chunk_map merge
+    /// (merge_file_metadata, 08a6201) to only ever fill in what the leader is missing.
+    pub async fn push_full_snapshot(&self, metadata: FileMetadata) {
+        self.push_inner(metadata, None, true).await;
     }
 
     /// Return the age of the front entry, if any.
@@ -427,7 +465,7 @@ impl MetadataQueue {
     pub async fn push_and_wait(&self, metadata: FileMetadata) {
         let path = metadata.path.clone();
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
-        self.push_inner(metadata, Some(tx)).await;
+        self.push_inner(metadata, Some(tx), false).await;
         // Await confirmation from the worker. Log every 5s so stalls are visible;
         // never give up — the data is safely replicated, we just need metadata to land.
         let start = std::time::Instant::now();
@@ -449,6 +487,7 @@ impl MetadataQueue {
         &self,
         metadata: FileMetadata,
         done_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        force_full_snapshot: bool,
     ) {
         // Block metadata writes for deleted files. cancel() adds the file_id here to
         // prevent a race where the release task's chunk write completes after the unlink
@@ -484,8 +523,21 @@ impl MetadataQueue {
                 // recorded a write to it) prefers the scalar-comparison winner's version.
                 // This coalesce is absorbing incoming's write_seq into entry — entry's
                 // covers_from must widen to include it, regardless of which side wins
-                // the scalar comparison below.
-                entry.covers_from_write_seq = entry.covers_from_write_seq.min(metadata.write_seq);
+                // the scalar comparison below. Also widen against incoming's own
+                // chunk_locations' client_write_seq — see the "new entry" branch below
+                // for why (patch-only write_seq numbers never separately touch this
+                // queue, but their resulting locations do end up in this delta).
+                entry.covers_from_write_seq = if force_full_snapshot {
+                    0
+                } else {
+                    let derived = metadata.chunk_locations.iter()
+                        .filter_map(|l| l.client_write_seq)
+                        .fold(entry.covers_from_write_seq.min(metadata.write_seq), u64::min);
+                    match self.delivered_write_seq.get(&metadata.id) {
+                        Some(w) => derived.min(*w + 1),
+                        None => derived,
+                    }
+                };
 
                 let winner_is_incoming = metadata.write_seq >= entry.metadata.write_seq;
                 let (base_locs, other_locs) = if winner_is_incoming {
@@ -549,7 +601,34 @@ impl MetadataQueue {
         );
         let pos = q.len();
         idx.insert(metadata.id, pos);
-        let covers_from_write_seq = metadata.write_seq;
+        // write_seq is a single per-file counter shared by metadata-queue pushes AND
+        // per-patch RCL ordering (next_write_seq, consumed by every MultiPatch rotation
+        // — e.g. qcow2 preallocation bursts). A patch never separately enqueues a
+        // metadata push, but its resulting ChunkLocation (carrying that patch's own
+        // client_write_seq) DOES end up in the very push that follows. Defaulting
+        // covers_from_write_seq to just this push's own write_seq stamp ignored those
+        // earlier patch-only write_seq numbers even though they're already fully
+        // represented here — a structural false positive on the leader's
+        // detect_metadata_write_seq_gap (root-caused 2026-07-17: thousands of
+        // false-positive [META GAP] warnings during the VM 111 install, one for
+        // essentially every push that followed a patch burst). Fold in the minimum
+        // client_write_seq actually present in this push's chunk_locations.
+        let covers_from_write_seq = if force_full_snapshot {
+            0
+        } else {
+            let derived = metadata.chunk_locations.iter()
+                .filter_map(|l| l.client_write_seq)
+                .fold(metadata.write_seq, u64::min);
+            // Also fold in delivered_write_seq's watermark — see its doc comment.
+            // Closes a second false-positive class: an earlier push for this file may
+            // have already been dequeued and delivered before this one was built, so
+            // there's nothing left in this queue to coalesce with, yet nothing was
+            // actually lost.
+            match self.delivered_write_seq.get(&metadata.id) {
+                Some(w) => derived.min(*w + 1),
+                None => derived,
+            }
+        };
         q.push_back(MetadataEntry { metadata, enqueued_at: Instant::now(), done_tx, covers_from_write_seq });
         drop(q);
         drop(idx);
@@ -581,6 +660,10 @@ impl MetadataQueue {
     pub async fn cancel(&self, file_id: FileId) {
         // Mark as deleted first so any concurrent push_inner sees it immediately.
         self.deleted_ids.insert(file_id);
+        // This file's write_seq bookkeeping is now moot — it's a UUID, never reused,
+        // so nothing will ever need this entry again. Same lifecycle event as
+        // deleted_ids; see delivered_write_seq's doc comment for what it tracks.
+        self.delivered_write_seq.remove(&file_id);
 
         let mut q = self.inner.lock().await;
         let mut idx = self.index.lock().await;
@@ -755,6 +838,27 @@ pub struct DfsClient {
     /// drains to leader with redirect/retry. Release path bypasses this and sends
     /// synchronously via flush_metadata_sync().
     pub(crate) metadata_queue: Arc<MetadataQueue>,
+
+    /// Files the leader has flagged via Response::ResyncMetadataRequested — a genuine
+    /// write_seq gap (detect_metadata_write_seq_gap) that this leader can't self-heal.
+    /// flush_buffer_async's background-tick branch checks this on every tick for the
+    /// inode it's about to push and, if present, sends a full metadata_cache snapshot
+    /// instead of the usual delta, then clears the entry. Not persisted: a file with no
+    /// open inode simply waits here until next opened for write, same as today's
+    /// do-nothing outcome for that case, just self-healing once writes resume.
+    pub(crate) pending_resync: Arc<dashmap::DashSet<FileId>>,
+
+    /// Per-file cooldown backstop on push_full_snapshot, independent of how accurate
+    /// covers_from_write_seq accounting turns out to be. A full snapshot's cost scales
+    /// with the file's TOTAL chunk count, not a delta's — the exact cost profile that
+    /// caused a real regression on large files (see flush_buffer_async's background-tick
+    /// branch doc comment, 2026-07-07: ~1.5ms to ~40-49ms per push past ~1300 chunk
+    /// entries). Root-caused 2026-07-17: even after two rounds of closing
+    /// covers_from_write_seq false-positive classes, 81 resync requests still fired
+    /// during a single local suite run — bounding the worst case here means a third,
+    /// undiscovered false-positive source can only cost one full snapshot per file per
+    /// RESYNC_DEBOUNCE, not one per background-tick (2s).
+    pub(crate) last_resync_sent_at: Arc<DashMap<FileId, std::time::Instant>>,
 
     /// Pending per-chunk ReplicateChunkLocation notifications, coalesced into batched
     /// ReplicateChunkLocations RPCs by a background drain task instead of each patch
@@ -1047,6 +1151,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             node_health: NodeHealthTracker::new(),
             replication_factor: Arc::new(AtomicUsize::new(2)),
             metadata_queue: MetadataQueue::new(),
+            pending_resync: Arc::new(dashmap::DashSet::new()),
+            last_resync_sent_at: Arc::new(DashMap::new()),
             pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             write_seq: Arc::new(DashMap::new()),
             chunk_seq: Arc::new(DashMap::new()),
@@ -7136,6 +7242,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         };
         match self.send_to_leader_with_retry(req).await? {
             Response::Ok { .. } => {}
+            // The push itself was accepted and persisted — this is purely an
+            // additional signal that the leader is also missing earlier state for
+            // this file. Mark it; flush_buffer_async's background tick sends a full
+            // snapshot on its next cycle for this file. See pending_resync's doc
+            // comment and Response::ResyncMetadataRequested's.
+            Response::ResyncMetadataRequested { file_id } => {
+                self.pending_resync.insert(file_id);
+            }
             Response::Error { message, .. } => anyhow::bail!("PutFileMetadata: {}", message),
             other => anyhow::bail!("PutFileMetadata: unexpected response: {:?}", other),
         }
@@ -7226,6 +7340,19 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Public alias for stamp_write_seq — used by fuse_impl's FlushHandle.
     pub fn stamp_write_seq_pub(&self, metadata: &FileMetadata) -> FileMetadata {
         self.stamp_write_seq(metadata)
+    }
+
+    /// Per-file cooldown on push_full_snapshot — see last_resync_sent_at's doc comment.
+    /// Pure decision, no I/O: `last_sent` is this file's last_resync_sent_at entry (if
+    /// any), `now` and `debounce` are passed in for testability rather than read
+    /// directly from Instant::now()/a hardcoded constant.
+    pub(crate) fn should_send_resync_snapshot(
+        last_sent: Option<std::time::Instant>, now: std::time::Instant, debounce: Duration,
+    ) -> bool {
+        match last_sent {
+            Some(t) => now.duration_since(t) >= debounce,
+            None => true,
+        }
     }
 
     /// Enqueue a metadata update for async delivery to the leader.
@@ -7524,6 +7651,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     entry.metadata.path, entry.metadata.id,
                                     entry.metadata.write_seq, entry.metadata.size
                                 );
+                                client.metadata_queue.mark_delivered(entry.metadata.id, entry.metadata.write_seq);
                                 // Signal the release waiter if present.
                                 if let Some(tx) = entry.done_tx {
                                     let _ = tx.send(());
@@ -7583,6 +7711,10 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Must be called after a successful delete so the queue worker can't resurrect the file.
     pub async fn cancel_metadata(&self, file_id: dfs_common::FileId) {
         self.metadata_queue.cancel(file_id).await;
+        // Same lifecycle event as metadata_queue's own delivered_write_seq cleanup —
+        // this file_id is a UUID, never reused, so these entries are now dead weight.
+        self.pending_resync.remove(&file_id);
+        self.last_resync_sent_at.remove(&file_id);
     }
 
     /// Delete file
@@ -8039,6 +8171,169 @@ mod tests {
         assert!(offsets.contains(&loc_b.file_offset), "chunk from the winning second push must be present");
         assert_eq!(entry.metadata.chunk_locations.len(), 2, "must be a union, not just the winner's own locations");
         assert_eq!(entry.metadata.size, 8 * 1024 * 1024, "scalar fields must come from the write_seq-winning push");
+    }
+
+    /// Root-caused 2026-07-17 (staging: thousands of false-positive [META GAP] warnings
+    /// on the leader during the VM 111 install). write_seq is a single per-file counter
+    /// shared by two unrelated consumers: metadata-queue pushes (stamp_write_seq) and
+    /// per-patch RCL ordering (patch_client_write_seq, consumed by every MultiPatch
+    /// rotation — e.g. qcow2 preallocation bursts). Patches never separately enqueue a
+    /// metadata push, but their resulting ChunkLocations (each carrying client_write_seq)
+    /// DO end up in the very push that follows. Before this fix, covers_from_write_seq
+    /// only ever reflected the push's own freshly-stamped write_seq — ignoring earlier
+    /// patch-only write_seq numbers already represented in its own chunk_locations — so
+    /// the leader's detect_metadata_write_seq_gap flagged a "gap" for every patch burst
+    /// between two pushes, even though nothing was actually lost.
+    #[tokio::test]
+    async fn test_metadata_queue_covers_from_write_seq_accounts_for_patch_only_seqs() {
+        let queue = MetadataQueue::new();
+        let file_id = FileId::new();
+
+        let mut meta = FileMetadata::new("/covers_from_test.bin".to_string(), dfs_common::FileType::RegularFile);
+        meta.id = file_id;
+        meta.write_seq = 16; // this push's own freshly-stamped write_seq
+        meta.size = 4 * 1024 * 1024;
+        // Chunk patched at write_seq 11 (consumed via next_write_seq for RCL ordering,
+        // never separately pushed to the metadata queue) is represented in this delta.
+        let mut loc = loc_with_nodes(chunk_id_with_hash0(1), vec![]);
+        loc.client_write_seq = Some(11);
+        meta.chunk_locations = Arc::new(vec![loc]);
+
+        queue.push(meta).await;
+        let entry = queue.pop().await.expect("entry must be present");
+        assert_eq!(entry.covers_from_write_seq, 11,
+            "covers_from_write_seq must account for the earliest client_write_seq actually \
+             represented in this push's chunk_locations, not just the push's own write_seq stamp");
+    }
+
+    /// Same false positive, but through the coalesce path (push_inner's "existing entry"
+    /// branch, line ~488) rather than the "new entry" branch — coalescing two queued
+    /// pushes must widen covers_from_write_seq against BOTH sides' chunk_locations'
+    /// client_write_seq, not just each push's own write_seq stamp.
+    #[tokio::test]
+    async fn test_metadata_queue_coalesce_covers_from_write_seq_accounts_for_patch_only_seqs() {
+        let queue = MetadataQueue::new();
+        let file_id = FileId::new();
+
+        let mut first = FileMetadata::new("/coalesce_covers_from.bin".to_string(), dfs_common::FileType::RegularFile);
+        first.id = file_id;
+        first.write_seq = 16;
+        first.size = 4 * 1024 * 1024;
+        let mut loc_a = loc_with_nodes(chunk_id_with_hash0(1), vec![]);
+        loc_a.client_write_seq = Some(11);
+        first.chunk_locations = Arc::new(vec![loc_a]);
+
+        let mut second = FileMetadata::new("/coalesce_covers_from.bin".to_string(), dfs_common::FileType::RegularFile);
+        second.id = file_id;
+        second.write_seq = 41;
+        second.size = 8 * 1024 * 1024;
+        let mut loc_b = loc_with_nodes(chunk_id_with_hash0(2), vec![]);
+        loc_b.file_offset = Some(4 * 1024 * 1024);
+        loc_b.client_write_seq = Some(17);
+        second.chunk_locations = Arc::new(vec![loc_b]);
+
+        queue.push(first).await;
+        queue.push(second).await;
+
+        let entry = queue.pop().await.expect("coalesced entry must be present");
+        assert_eq!(entry.covers_from_write_seq, 11,
+            "coalesced covers_from_write_seq must still reflect the earliest client_write_seq \
+             across BOTH sides' chunk_locations, not just each push's own write_seq stamp");
+    }
+
+    /// Root-caused 2026-07-17, second false-positive class found after the first fix
+    /// above: a live suite run still logged 81 [META GAP] false positives (down from
+    /// thousands/day), concentrated in rapid-write scenarios (T22b, T42 flood, T51). A
+    /// concrete example: two near-empty pushes for the same file in quick succession
+    /// (e.g. create() then an immediate update) — by the time the second push's
+    /// covers_from_write_seq is computed, the first has ALREADY been dequeued and
+    /// delivered, so there's nothing left in this queue to coalesce with (the fix
+    /// above only ever looks at what's still queued or in the current push's own
+    /// chunk_locations). Nothing was actually lost — the first push really was
+    /// delivered — but the detector had no way to know that. mark_delivered / the
+    /// delivered_write_seq watermark closes this: any push whose write_seq is at or
+    /// below a confirmed-delivered watermark for this file never needs independent
+    /// evidence to be considered covered.
+    #[tokio::test]
+    async fn test_metadata_queue_covers_from_write_seq_accounts_for_prior_delivered_push() {
+        let queue = MetadataQueue::new();
+        let file_id = FileId::new();
+
+        // First push (e.g. a file create) — write_seq=1, no chunk_locations.
+        let mut first = FileMetadata::new("/delivered_watermark_test.bin".to_string(), dfs_common::FileType::RegularFile);
+        first.id = file_id;
+        first.write_seq = 1;
+        queue.push(first).await;
+        let entry = queue.pop().await.expect("first entry must be present");
+        assert_eq!(entry.covers_from_write_seq, 1);
+        // Simulate the queue worker confirming delivery of this push.
+        queue.mark_delivered(file_id, entry.metadata.write_seq);
+
+        // Second push — write_seq=2, arrives after the first was already dequeued
+        // (nothing left in the queue to coalesce with), also with no chunk_locations
+        // of its own to derive coverage from.
+        let mut second = FileMetadata::new("/delivered_watermark_test.bin".to_string(), dfs_common::FileType::RegularFile);
+        second.id = file_id;
+        second.write_seq = 2;
+        queue.push(second).await;
+        let entry2 = queue.pop().await.expect("second entry must be present");
+        assert_eq!(entry2.covers_from_write_seq, 2,
+            "must account for write_seq=1 already being confirmed delivered by a prior, \
+             already-dequeued push — not just this push's own write_seq stamp");
+    }
+
+    /// Backstop independent of covers_from_write_seq accuracy — see
+    /// DfsClient::last_resync_sent_at's doc comment: a full snapshot's cost scales with
+    /// total chunk count, so repeated false-positive resync requests for the same file
+    /// must be bounded regardless of how many gap-detection classes remain unfixed.
+    #[test]
+    fn test_should_send_resync_snapshot_respects_debounce() {
+        let now = std::time::Instant::now();
+        let debounce = Duration::from_secs(30);
+        assert!(DfsClient::should_send_resync_snapshot(None, now, debounce),
+            "no prior resync send for this file — must send");
+        let recent = now - Duration::from_secs(5);
+        assert!(!DfsClient::should_send_resync_snapshot(Some(recent), now, debounce),
+            "within the cooldown window — must wait, not resend");
+        let old = now - Duration::from_secs(31);
+        assert!(DfsClient::should_send_resync_snapshot(Some(old), now, debounce),
+            "cooldown fully elapsed — must send again");
+    }
+
+    /// A deleted file's write_seq bookkeeping must not linger forever — file_ids are
+    /// UUIDs, never reused, so a long-running client that creates and deletes many
+    /// files (e.g. DVR recording rotation) would otherwise grow delivered_write_seq
+    /// unboundedly. cancel() is the natural lifecycle hook: same event that already
+    /// cleans up deleted_ids.
+    #[tokio::test]
+    async fn test_metadata_queue_cancel_clears_delivered_write_seq() {
+        let queue = MetadataQueue::new();
+        let file_id = FileId::new();
+        queue.mark_delivered(file_id, 5);
+        assert!(queue.delivered_write_seq.contains_key(&file_id));
+
+        queue.cancel(file_id).await;
+        assert!(!queue.delivered_write_seq.contains_key(&file_id),
+            "delivered_write_seq must be cleared on delete, not retained forever");
+    }
+
+    /// Same lifecycle cleanup, at the DfsClient level — pending_resync and
+    /// last_resync_sent_at must not linger for a deleted file either.
+    #[tokio::test]
+    async fn test_cancel_metadata_clears_resync_bookkeeping() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let client = DfsClient::new(vec![addr]).unwrap();
+        let file_id = FileId::new();
+
+        client.pending_resync.insert(file_id);
+        client.last_resync_sent_at.insert(file_id, std::time::Instant::now());
+
+        client.cancel_metadata(file_id).await;
+
+        assert!(!client.pending_resync.contains(&file_id),
+            "pending_resync must be cleared on delete");
+        assert!(!client.last_resync_sent_at.contains_key(&file_id),
+            "last_resync_sent_at must be cleared on delete");
     }
 
     /// With equal load (the common case), different chunks on the same 2-replica

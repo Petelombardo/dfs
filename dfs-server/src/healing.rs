@@ -1533,7 +1533,16 @@ impl HealingManager {
         // 300s) — that loop is the slowest *guaranteed* metadata-catchup path in the
         // system, so doubling it bounds how stale this node's live_chunk_ids() view
         // could legitimately still be for a routine (non-degraded) cluster.
-        const LIVE_FILE_GRACE_SECS: u64 = 600;
+        //
+        // DFS_LIVE_FILE_ORPHAN_GRACE_SECS override: testing only, so a repro doesn't
+        // have to wait 10 real minutes per candidate — added 2026-07-18 investigating
+        // the VM-111 post-install data-loss incident (~900MB of chunk_locations gone
+        // after a leader ran this sweep under sustained write load + severe memory
+        // pressure). Unset in production.
+        let live_file_grace_secs: u64 = std::env::var("DFS_LIVE_FILE_ORPHAN_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(600);
 
         let storage = self.storage.clone();
         let metadata = self.metadata.clone();
@@ -1615,7 +1624,7 @@ impl HealingManager {
             debug!("Disk orphan sweep: {} chunks checked, all accounted for", total);
         }
 
-        self.reconcile_live_file_candidates(live_file_candidates, LIVE_FILE_GRACE_SECS).await;
+        self.reconcile_live_file_candidates(live_file_candidates, live_file_grace_secs).await;
     }
 
     /// Two-pass + age-gate + leader-confirm/stability check for category-2 candidates

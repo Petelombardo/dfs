@@ -871,6 +871,21 @@ struct DirtyPatchSlot {
     token: ChunkId,
     last_patch_at: std::time::Instant,
     delta_hasher: blake3::Hasher,
+    /// Consecutive fold attempts (via fold_slot_now) that returned false for
+    /// this exact accumulator generation. Reset to 0 whenever a new patch
+    /// replaces this slot's DirtyPatchSlot entirely (apply_patch's insert) —
+    /// a slot getting fresh writes is presumptively alive and deserves a
+    /// fresh chance, not accumulated history from a prior generation's
+    /// struggles. See MAX_FOLD_FAILURES_BEFORE_ESCALATION's doc comment for
+    /// why this exists: a slot with NO new activity that just keeps failing
+    /// to fold is the "stuck forever" case this counter is meant to catch.
+    fold_failures: u32,
+    /// When record_fold_failure last ran for this slot (i.e. the most recent
+    /// failed fold attempt). Lets start_patch_fold_sweep_loop's backstop
+    /// throttle its own retry cadence for an escalated slot down to
+    /// FOLD_ESCALATED_RETRY_INTERVAL instead of re-attempting it on every
+    /// 60s sweep — see MAX_FOLD_FAILURES_BEFORE_ESCALATION's doc comment.
+    last_fold_attempt_at: std::time::Instant,
 }
 
 /// How long a slot's accumulator must sit fully idle (zero patches from
@@ -890,6 +905,39 @@ struct DirtyPatchSlot {
 /// it firing promptly, and a live client's own 8s active-fold timer will
 /// almost always beat it under any real write pattern.
 const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Consecutive fold_slot_now failures (same DirtyPatchSlot generation) before
+/// a slot is treated as stuck rather than transiently failing.
+///
+/// Root-caused 2026-07-18: neither retry path that can drive a fold —
+/// debounce_fold_slot's own loop, or start_patch_fold_sweep_loop's backstop
+/// (the only thing retrying a slot resumed from a restart, since the resume
+/// sweep itself only ever makes one attempt) — had any cap. A fold that fails
+/// for a persistent reason (not a transient I/O blip) retried forever: every
+/// ≤60s from debounce_fold_slot, every 60s from the backstop, with only a
+/// WARN each time and no escalation. Confirmed live on staging: one token
+/// stuck in this state for 3+ hours, surviving multiple node restarts and a
+/// full cluster power-cycle, still being silently retried and periodically
+/// re-disseminated (its ChunkLocation is real and un-orphaned-looking, so
+/// routine chunk_location_sync pushes keep re-encountering it) with no
+/// visible error anywhere pointing at the actual stuck slot.
+///
+/// Crossing this threshold does NOT stop retrying (the underlying delta/base
+/// data is still valid and may yet fold successfully — see the DATA LOSS
+/// purge path elsewhere for how carefully deletion decisions are guarded
+/// here) and does NOT touch dirty_patch_slots, chunk_location, or
+/// patch_state. It only: (1) logs one loud, findable ERROR the moment the
+/// threshold is crossed (site-specific, not lost among thousands of routine
+/// WARN lines), so a genuinely stuck slot becomes visible instead of silent,
+/// and (2) backs the retry cadence off to FOLD_ESCALATED_RETRY_INTERVAL
+/// (from ≤60s to 30 minutes) once escalated, so a persistently-failing slot
+/// stops burning a retry attempt (lock acquisition, a patch_state read, a
+/// full run_single_fold attempt) every cycle forever.
+const MAX_FOLD_FAILURES_BEFORE_ESCALATION: u32 = 10;
+
+/// Retry interval for a slot once it has crossed MAX_FOLD_FAILURES_BEFORE_ESCALATION.
+/// See that constant's doc comment.
+const FOLD_ESCALATED_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Number of independent locks chunk_ring/delta_ring are split across.
 /// Added 2026-07-13: a single shared Mutex<LruCache> serializes every
@@ -1520,6 +1568,32 @@ impl OverlayForkCtx {
     /// "make this slot's current state real right now," which is exactly what
     /// this does.
     ///
+    /// Record one failed fold attempt for (file_id, chunk_idx) and, the moment
+    /// the count crosses MAX_FOLD_FAILURES_BEFORE_ESCALATION, log a single
+    /// loud ERROR identifying the stuck slot. See that constant's doc comment.
+    /// A no-op if the slot's DirtyPatchSlot entry is already gone (a racing
+    /// caller folded or superseded it between this attempt starting and
+    /// finishing) — nothing to escalate for a slot that's no longer dirty.
+    fn record_fold_failure(&self, file_id: FileId, chunk_idx: u64, public_token: ChunkId) {
+        let mut new_count = 0u32;
+        self.dirty_patch_slots.entry((file_id, chunk_idx)).and_modify(|slot| {
+            slot.fold_failures = slot.fold_failures.saturating_add(1);
+            slot.last_fold_attempt_at = std::time::Instant::now();
+            new_count = slot.fold_failures;
+        });
+        if new_count == MAX_FOLD_FAILURES_BEFORE_ESCALATION {
+            error!(
+                "fold_slot_now: file={} chunk={} token={} has failed to fold {} consecutive \
+                 times — escalating. This slot's data is still intact (not deleted, not \
+                 abandoned) and will keep retrying every {:?}, but a fold failing this many \
+                 times in a row is not a transient blip; investigate why (check this node's \
+                 logs around each retry, and this token's patch_state) rather than assuming \
+                 it will resolve itself.",
+                file_id, chunk_idx, public_token, new_count, FOLD_ESCALATED_RETRY_INTERVAL,
+            );
+        }
+    }
+
     /// Acquires chunk_patch_locks itself (unlike run_single_fold, which expects
     /// an already-held guard handed to it) since callers here never held it to
     /// begin with — merges in apply_patch release it immediately after writing
@@ -1550,6 +1624,7 @@ impl OverlayForkCtx {
             }
             Err(e) => {
                 warn!("fold_slot_now: failed to resolve patch state for {}: {}", public_token, e);
+                self.record_fold_failure(file_id, chunk_idx, public_token);
                 return false;
             }
         };
@@ -1571,6 +1646,8 @@ impl OverlayForkCtx {
         self.active_fold_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if ok {
             self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+        } else {
+            self.record_fold_failure(file_id, chunk_idx, public_token);
         }
         ok
     }
@@ -1624,9 +1701,25 @@ impl OverlayForkCtx {
                 if self.fold_slot_now(file_id, chunk_idx).await {
                     return;
                 }
-                warn!("debounce_fold_slot: fold failed for file={} chunk={}, retrying in {:?}",
-                    file_id, chunk_idx, retry_backoff);
-                retry_backoff = (retry_backoff * 2).min(MAX_RETRY_BACKOFF);
+                // fold_slot_now already recorded this failure (and logs its own
+                // one-time ERROR on crossing MAX_FOLD_FAILURES_BEFORE_ESCALATION)
+                // — read the updated count back to decide this task's own next
+                // sleep. Once escalated, stop doubling toward the tight 60s cap
+                // and fall back to the long escalated interval instead: see
+                // MAX_FOLD_FAILURES_BEFORE_ESCALATION's doc comment for why
+                // retrying a persistently-failing fold every ≤60s forever is
+                // exactly the waste this is meant to stop.
+                let failures = self.dirty_patch_slots
+                    .get(&(file_id, chunk_idx))
+                    .map(|e| e.value().fold_failures)
+                    .unwrap_or(0);
+                retry_backoff = if failures >= MAX_FOLD_FAILURES_BEFORE_ESCALATION {
+                    FOLD_ESCALATED_RETRY_INTERVAL
+                } else {
+                    (retry_backoff * 2).min(MAX_RETRY_BACKOFF)
+                };
+                warn!("debounce_fold_slot: fold failed for file={} chunk={} ({} consecutive failure(s)), retrying in {:?}",
+                    file_id, chunk_idx, failures, retry_backoff);
                 continue;
             }
             // Else: a patch landed within the last debounce window — loop and
@@ -2243,6 +2336,60 @@ impl Server {
         });
     }
 
+    /// Reports the size of every unbounded/long-lived in-memory tracking map every
+    /// 60s. Added 2026-07-18 after a live staging incident (gluster1 nearly OOM'd,
+    /// gluster2 was actually OOM-killed, anon-rss confirmed via dmesg — genuine heap
+    /// growth, not mmap'd redb pages) that took hours of live gdb archaeology to even
+    /// localize, because nothing exposed which of these structures was actually
+    /// growing. One of them (chunk_to_file) turned out to be leaking unboundedly
+    /// (fixed same day) — this log line would have named it directly within the
+    /// first 60s of the incident instead of requiring a thread-dump investigation.
+    /// Logged at INFO unconditionally (not just when something looks wrong) so a
+    /// baseline is always on record for comparison — a map that looks fine today is
+    /// exactly the reference point needed to recognize it looking wrong next time.
+    pub async fn start_memory_diag_loop(self: std::sync::Arc<Self>) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        tokio::spawn(async move {
+            loop {
+                tick.tick().await;
+                info!(
+                    "[MEM DIAG] chunk_map={} chunk_to_file={} dirty_patch_slots={} \
+                     pending_patch_ids={} pending_patch_fold_broadcasts={} \
+                     chunk_patch_locks={} chunk_io_locks={} chunk_prefetch={} \
+                     recent_writes={} pending_broadcasts={} file_write_seqs={} \
+                     delete_tombstones={} | rss_kb={}",
+                    self.chunk_map.len(),
+                    self.chunk_to_file.len(),
+                    self.dirty_patch_slots.len(),
+                    self.pending_patch_ids.len(),
+                    self.pending_patch_fold_broadcasts.len(),
+                    self.chunk_patch_locks.len(),
+                    self.chunk_io_locks.len(),
+                    self.chunk_prefetch.len(),
+                    self.recent_writes.len(),
+                    self.pending_broadcasts.len(),
+                    self.file_write_seqs.len(),
+                    self.delete_tombstones.len(),
+                    Self::current_rss_kb().unwrap_or(0),
+                );
+            }
+        });
+    }
+
+    /// Best-effort current process RSS in KB, read directly from /proc/self/status —
+    /// no crate dependency, and consistent with what `ps`/`free` report (VmRSS), so
+    /// [MEM DIAG] lines can be correlated directly against the same numbers an
+    /// operator sees running those tools by hand during an incident.
+    fn current_rss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                return rest.trim().split_whitespace().next()?.parse().ok();
+            }
+        }
+        None
+    }
+
     /// Does `incoming` describe a newer write than `existing` for the same chunk_idx?
     ///
     /// The single source of truth for "which of two competing ChunkLocations at one
@@ -2293,6 +2440,23 @@ impl Server {
             // the ones with pre-guards (handle_replicate_metadata[_batch]). The disk-existence
             // check is kept for the diagnostic warning but the BLOCK is timestamp-only so it
             // applies even when neither file exists locally (e.g., on non-replica nodes).
+            // Chunk_ids superseded by THIS update (an old chunk_id at a chunk_idx that
+            // the loop below replaces with a different one) — see the removal loop
+            // after new_locs is finalized for why this is tracked. Filled inside the
+            // existing per-incoming-chunk loop below, NOT by pre-collecting every
+            // existing_locs entry up front: metadata.chunk_locations only ever carries
+            // the chunks that actually changed in this update (not a full-file
+            // snapshot), so with N incoming entries against a potentially
+            // much-larger M-chunk file, an upfront O(M) HashSet build repeated on
+            // every single metadata push is the exact O(total-writes × current-size)
+            // blowup this codebase has hit and fixed before for other O(n) hot-path
+            // costs (see the large-file write-slowdown fix). Confirmed live
+            // 2026-07-18: introduced this regression in the same commit as the
+            // chunk_to_file leak fix, caught immediately after via a live restore
+            // that was measurably slower than before the fix. O(N log M) here (N
+            // incoming lookups, each an existing binary search) instead of O(M) is
+            // the same complexity chunk_map_update already had before either fix.
+            let mut superseded_chunk_ids: Vec<ChunkId> = Vec::new();
             let new_locs: Vec<ChunkLocation> = if let Some(existing_entry) = self.chunk_map.get(&metadata.id) {
                 let (existing_locs, _) = existing_entry.value();
                 const CHUNK_SIZE_4M: u64 = 4 * 1024 * 1024;
@@ -2335,7 +2499,19 @@ impl Server {
                                     old_loc.chunk_id, old_loc.client_write_seq,
                                     loc.chunk_id, loc.client_write_seq);
                             }
+                            // Nothing to track here: *loc reverts to old_loc, so
+                            // old_loc.chunk_id survives into new_locs unchanged — not
+                            // superseded. The rejected incoming chunk_id was never
+                            // adopted (never inserted into chunk_to_file by this
+                            // function), so there's nothing of ITS to remove either —
+                            // and it must NOT be pushed here: if this exact chunk_id
+                            // was legitimately adopted by an earlier call (e.g. this
+                            // is a stale resend of metadata already applied once),
+                            // removing it now would incorrectly evict a still-valid
+                            // mapping out from under that earlier, correct insert.
                             *loc = old_loc.clone();
+                        } else {
+                            superseded_chunk_ids.push(old_loc.chunk_id);
                         }
                     }
                 }
@@ -2352,6 +2528,30 @@ impl Server {
             let new_locs: Vec<ChunkLocation> = new_locs.into_iter().filter(|l| l.file_offset.is_some()).collect();
             for loc in new_locs.iter() {
                 self.chunk_to_file.insert(loc.chunk_id, metadata.id);
+            }
+            // Root-caused 2026-07-18: every chunk_id in superseded_chunk_ids was the
+            // previous occupant of a chunk_idx position that this update just gave a
+            // different chunk_id — retired by a later patch/fold generation, a heal,
+            // or a stale-broadcast guard. This function is called after every
+            // metadata write or heal (its own doc comment), so under sustained
+            // patch/fold churn (a VM install, a qcow2 restore with many gap-driven
+            // generations) it fires constantly — and until this fix, it only ever
+            // ADDED to chunk_to_file, never removing the chunk_id being superseded at
+            // each call. That's an unbounded leak proportional to total write/fold
+            // churn over the process's lifetime, not to the live dataset size, which
+            // is exactly why it surfaced as steadily climbing RSS under heavy
+            // sustained writes (2+ nodes: a near-OOM and a real OOM-kill, confirmed
+            // via dmesg as 100% anon-rss, 0% file-rss — genuine heap growth, not
+            // mmap'd redb pages) while a single large sequential write or a repeated
+            // whole-file write+delete loop (neither generates anywhere near as many
+            // superseded chunk_id generations per logical byte) did not reproduce it.
+            // Safe to remove unconditionally: chunk_ids are content-addressed and
+            // file-scoped (see chunk_hashing_file_scoped) and each entry here is a
+            // specific position's previous occupant, certain to not also be this
+            // same update's new occupant anywhere else — no cross-check against
+            // new_locs needed (see superseded_chunk_ids' own doc comment).
+            for old_id in superseded_chunk_ids {
+                self.chunk_to_file.remove(&old_id);
             }
             self.chunk_map.insert(metadata.id, (new_locs, metadata.write_seq));
         } else if metadata.size == 0 {
@@ -6583,13 +6783,31 @@ impl Server {
     /// unconditionally to establish one.
     ///
     /// `frag_reclaim_known_futile`: belt-and-braces for the case where the file DID
-    /// grow but compaction still returned it unchanged — see the caller. The
-    /// 30-minute periodic is deliberately NOT gated on any of this: it's the safety
-    /// net for pages redb only becomes willing to release later.
+    /// grow but compaction still returned it unchanged — see the caller.
+    ///
+    /// There is deliberately NO time-based periodic fallback anymore. One used to
+    /// fire unconditionally every 30 minutes on the theory that "redb might release
+    /// more on a later pass" — removed 2026-07-18 after it repeatedly proved that
+    /// theory false in practice (three consecutive real compactions on gluster1,
+    /// 2026-07-16, each reclaiming exactly 0 bytes: 257.5MB→257.5MB) while carrying
+    /// a real cost: it always took the online path (nothing_to_reclaim forces
+    /// offline_tx to None), and online Phase 1-2's shared read lock can genuinely
+    /// wedge under sustained write churn rather than just run slow. A load-based
+    /// skip gate (5fb0be7, 2026-07-17) tried to guard just that firing, but it
+    /// compares live activity to a 1h trailing average — under an hours-long
+    /// sustained-load event (a real VM install), the average itself rises to meet
+    /// the live rate, so the ratio stops tripping even though absolute load is still
+    /// dangerous. Confirmed live 2026-07-18: the gate fired correctly twice the
+    /// night before (49 vs 2 avg, 46 vs 3 avg) but never again, and the very next
+    /// periodic zero-reclaim cycle wedged Phase 1-2 on 3 of 5 nodes within about 70
+    /// seconds of each other (gluster2/3/5, VM 111 install), forcing 3 simultaneous
+    /// self-restarts. A speculative trigger with proven zero average payoff isn't
+    /// worth a load-detection heuristic that can silently stop working; growth- and
+    /// fragmentation-driven compactions (the ones with real bytes to reclaim) are
+    /// untouched by this and still fire immediately regardless of load.
     fn should_compact(
         current_size: u64,
         last_compact_size: u64,
-        secs_since_compact: u64,
         frag_reclaim_known_futile: bool,
     ) -> bool {
         if last_compact_size == 0 {
@@ -6598,10 +6816,9 @@ impl Server {
         let reclaimable_estimate = current_size.saturating_sub(last_compact_size);
         let grown_enough = current_size
             >= last_compact_size.saturating_mul(Self::COMPACT_GROWTH_NUMER) / Self::COMPACT_GROWTH_DENOM;
-        (reclaimable_estimate >= Self::COMPACT_MIN_RECLAIMABLE_BYTES
+        reclaimable_estimate >= Self::COMPACT_MIN_RECLAIMABLE_BYTES
             && grown_enough
-            && !frag_reclaim_known_futile)
-            || secs_since_compact >= 30 * 60
+            && !frag_reclaim_known_futile
     }
 
     /// Root-caused 2026-07-17: the periodic no-reclaim compaction cycle is pure
@@ -6650,17 +6867,12 @@ impl Server {
             //   22:09:38  compaction: triggering — first compaction since startup
             //   22:09:40  Planned offline compaction: pausing... (leaves the cluster)
             //   22:09:42  Planned offline compaction finished: 257.5MB -> 257.5MB
-            // Four nodes did that inside two minutes during a rolling deploy. The
-            // 30-minute periodic still covers the case where startup's compact was
-            // skipped or fell short.
+            // Four nodes did that inside two minutes during a rolling deploy.
             let mut last_compact_size: u64 = metadata.db_size();
             // Seeded for the same reason as last_compact_size: startup already
-            // compacted. Left as None, secs_since_compact is u64::MAX on the first
-            // poll, so the 30-minute periodic below fires immediately — and unlike the
-            // growth gate it is deliberately not size-gated, so it fired even on a
-            // 1.4MB test DB and "compacted" it to 3.5MB. That re-created the very
-            // first-run offline compaction the size seeding above was meant to stop,
-            // just via the other branch.
+            // compacted. secs_since_compact is used only for the trigger log line now
+            // (see should_compact's doc comment — the time-based periodic fallback
+            // that used to read this was removed 2026-07-18).
             let mut last_compact_time: Option<std::time::Instant> = Some(std::time::Instant::now());
             // Set when a compaction completed but returned the file at exactly the
             // size it started. Combined with "the file hasn't grown past that size
@@ -6756,7 +6968,7 @@ impl Server {
                 let frag_reclaim_known_futile =
                     last_compact_reclaimed_nothing && current_size <= last_compact_size;
                 if !Self::should_compact(
-                    current_size, last_compact_size, secs_since_compact, frag_reclaim_known_futile,
+                    current_size, last_compact_size, frag_reclaim_known_futile,
                 ) {
                     tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                     continue;
@@ -6798,46 +7010,17 @@ impl Server {
                 }
 
                 // The offline path pulls this node OUT OF THE CLUSTER. Only spend that
-                // when we actually expect bytes back — i.e. when the growth gate is what
-                // fired, not the 30-minute periodic.
+                // when we actually expect bytes back.
                 //
-                // The periodic is deliberately ungated (it exists on the theory that
-                // redb releases more on a later pass), so it fires even when the file
-                // has not grown a single byte since the last compaction. Wiring a
-                // SPECULATIVE trigger to a CERTAIN availability cost is what produced
-                // this, live during a kdiskmark run 2026-07-16:
-                //   23:49:29 compaction: triggering — file 351.5MB is 1.00x its
-                //            post-compaction baseline 351.5MB (est. 0.0MB reclaimable,
-                //            1801s since last compact)
-                //   23:49:31 Planned offline compaction: pausing...   (leaves cluster)
-                //   23:49:34 Planned offline compaction finished: 351.5MB -> 351.5MB
-                // It said "est. 0.0MB reclaimable" and went offline anyway. The periodic
-                // still runs — just via the online path, which costs no availability, so
-                // its speculative upside is kept and its certain downside is not.
+                // nothing_to_reclaim should now be structurally unreachable in
+                // practice: should_compact() (see its doc comment) no longer has a
+                // speculative time-based fallback, so reaching this point already
+                // implies current_size is at least COMPACT_MIN_RECLAIMABLE_BYTES past
+                // last_compact_size. Kept as a defensive check (and the
+                // load-gated skip below kept as a defense-in-depth belt-and-braces)
+                // rather than removed outright — see TODO_DEAD_CODE.md.
                 let nothing_to_reclaim = current_size <= last_compact_size;
 
-                // Root-caused 2026-07-17 (VM 111 install on staging): the periodic
-                // no-reclaim cycle is purely speculative (see this block's comment
-                // above) — zero benefit, nothing to weigh against risk — yet it always
-                // takes the online path since nothing_to_reclaim forces offline_tx to
-                // None below. Under sustained write churn, online compaction's Phase
-                // 1-2 (shared read lock, competing with concurrent writers) can
-                // genuinely wedge rather than just run slow, tripping its 60s timeout
-                // and forcing this node to self-restart — the same mechanism that
-                // caused real permanent chunk loss on 2026-07-11. That day: 6
-                // wedge-restarts across the cluster in ~2 hours, every one traceable
-                // 60s back to exactly this trigger line, leaving 384 of VM 111's 1326
-                // chunks stuck at 1 replica with the healer unable to keep up.
-                //
-                // Check load BEFORE Phase 1-2 gets a chance to wedge, not after — a
-                // single non-blocking read of ops_tracker's existing atomics (no lock
-                // on redb, no await that could itself stall), so this costs nothing
-                // even on a quiet node. Skip this cycle outright under high activity;
-                // the next 60s check retries — no different from the existing
-                // should_compact()==false skip a few lines up. Real
-                // growth/fragmentation-triggered compactions (nothing_to_reclaim ==
-                // false) are untouched and still fire immediately regardless of load —
-                // those have real bytes to reclaim, so the trade is worth it.
                 if nothing_to_reclaim {
                     let snap = self.ops_tracker.get_stats();
                     let live_load = snap.writes_live + snap.meta_live;
@@ -7361,8 +7544,20 @@ impl Server {
                 if server.dirty_patch_slots.is_empty() {
                     continue;
                 }
+                // Escalated slots (see MAX_FOLD_FAILURES_BEFORE_ESCALATION) are
+                // throttled to FOLD_ESCALATED_RETRY_INTERVAL here too — this loop
+                // is the ONLY thing retrying a slot resumed from a restart (the
+                // resume sweep makes exactly one attempt, no debounce_fold_slot
+                // task), so without this check an escalated-but-resumed slot
+                // would still get hammered every SWEEP_INTERVAL forever, which is
+                // exactly the waste this whole mechanism exists to stop.
                 let stale: Vec<(FileId, u64)> = server.dirty_patch_slots.iter()
-                    .filter(|e| e.value().last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE)
+                    .filter(|e| {
+                        let slot = e.value();
+                        slot.last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE
+                            && (slot.fold_failures < MAX_FOLD_FAILURES_BEFORE_ESCALATION
+                                || slot.last_fold_attempt_at.elapsed() >= FOLD_ESCALATED_RETRY_INTERVAL)
+                    })
                     .map(|e| *e.key())
                     .collect();
                 if stale.is_empty() {
@@ -7419,6 +7614,8 @@ impl Server {
                     token,
                     last_patch_at: std::time::Instant::now(),
                     delta_hasher: blake3::Hasher::new(),
+                    fold_failures: 0,
+                    last_fold_attempt_at: std::time::Instant::now(),
                 });
                 // Restore the in-memory pending_patch_ids entry too. It is
                 // populated only by apply_patch (this process's own writes) and
@@ -9171,6 +9368,8 @@ impl Server {
             token: public_token,
             last_patch_at: std::time::Instant::now(),
             delta_hasher: hasher,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
         });
         if !is_merge {
             // Fresh accumulator: this is the one patch in this cycle responsible
@@ -12029,28 +12228,28 @@ mod tests {
         /// gate re-fired anyway because it asked about frag% (~56%, permanently).
         #[test]
         fn at_the_post_compaction_baseline_does_not_compact() {
-            assert!(!Server::should_compact(BASELINE, BASELINE, 60, false));
+            assert!(!Server::should_compact(BASELINE, BASELINE, false));
         }
 
         /// ...and the case that DID reclaim: 514.5MB against a 257.5MB baseline,
         /// which returned 257MB every single time it ran.
         #[test]
         fn doubled_past_the_baseline_compacts() {
-            assert!(Server::should_compact(DOUBLED, BASELINE, 60, false));
+            assert!(Server::should_compact(DOUBLED, BASELINE, false));
         }
 
         /// 1.5x is the gate, so just under it must not fire...
         #[test]
         fn just_under_the_growth_ratio_does_not_compact() {
             let current = BASELINE + BASELINE / 2 - MB; // ~1.49x
-            assert!(!Server::should_compact(current, BASELINE, 60, false));
+            assert!(!Server::should_compact(current, BASELINE, false));
         }
 
         /// ...and just over it must.
         #[test]
         fn just_over_the_growth_ratio_compacts() {
             let current = BASELINE + BASELINE / 2 + MB; // ~1.51x
-            assert!(Server::should_compact(current, BASELINE, 60, false));
+            assert!(Server::should_compact(current, BASELINE, false));
         }
 
         /// Regression for the 2026-07-16 escalation misfire: a near-empty DB used to
@@ -12063,41 +12262,40 @@ mod tests {
             let baseline = 700 * 1024;      // 0.7MB
             let current = 3 * MB + 500 * 1024; // 3.5MB — over 4x the baseline
             assert!(current >= baseline * 3 / 2, "test setup: ratio gate must pass");
-            assert!(!Server::should_compact(current, baseline, 60, false));
+            assert!(!Server::should_compact(current, baseline, false));
         }
 
-        /// The 30-minute periodic is the backstop for anything the growth signal
-        /// can't see (e.g. pages redb only becomes willing to release later), and is
-        /// deliberately gated on nothing else.
+        /// Regression for the 2026-07-18 triple-wedge: a 30-minute time-based
+        /// fallback used to fire unconditionally regardless of growth, on the theory
+        /// that "redb might release more on a later pass" — it never did in practice
+        /// (three real compactions in a row reclaimed exactly 0 bytes), and its only
+        /// real effect was speculatively taking the online path's Phase 1-2, which
+        /// wedged and force-restarted 3 of 5 staging nodes within ~70s of each other
+        /// during a VM install. There must be no time-based override of the growth
+        /// gate anymore, at any elapsed duration.
         #[test]
-        fn thirty_minute_safety_net_compacts_regardless_of_growth() {
-            assert!(Server::should_compact(BASELINE, BASELINE, 30 * 60, false));
+        fn no_growth_never_compacts_no_matter_how_long_since_last_compact() {
+            assert!(!Server::should_compact(BASELINE, BASELINE, false));
         }
 
         /// No baseline yet (first run since startup) — compact to establish one.
         #[test]
         fn first_run_with_no_baseline_compacts() {
-            assert!(Server::should_compact(BASELINE, 0, 60, false));
+            assert!(Server::should_compact(BASELINE, 0, false));
         }
 
         /// Belt-and-braces: if a compaction DID run on real growth and still returned
         /// the file unchanged, don't keep re-trying on that same unchanged size.
         #[test]
         fn futile_reclaim_suppresses_the_growth_trigger() {
-            assert!(!Server::should_compact(DOUBLED, BASELINE, 60, true));
-        }
-
-        /// ...but never suppresses the periodic.
-        #[test]
-        fn futile_reclaim_still_allows_the_thirty_minute_periodic() {
-            assert!(Server::should_compact(DOUBLED, BASELINE, 30 * 60, true));
+            assert!(!Server::should_compact(DOUBLED, BASELINE, true));
         }
 
         /// A file SMALLER than the baseline (e.g. someone deleted a lot) has nothing
         /// to reclaim and must not underflow into compacting.
         #[test]
         fn shrunk_below_the_baseline_does_not_compact() {
-            assert!(!Server::should_compact(BASELINE / 2, BASELINE, 60, false));
+            assert!(!Server::should_compact(BASELINE / 2, BASELINE, false));
         }
     }
 
@@ -13564,6 +13762,56 @@ mod tests {
                  a mismatch here means a fold generation lost or corrupted data from an earlier generation");
         }
 
+        /// Regression for the 2026-07-18 unbounded chunk_to_file leak: chunk_map_update
+        /// is called after every metadata write or heal (its own doc comment) and,
+        /// until this fix, only ever ADDED to chunk_to_file — never removing the
+        /// chunk_id a newer generation superseded at the same chunk_idx. Under
+        /// sustained patch/fold churn (a VM install, a qcow2 restore) that's one
+        /// leaked entry per generation, unbounded by dataset size — confirmed live on
+        /// staging as steadily climbing RSS (one node OOM-killed, dmesg confirming
+        /// 100% anon-rss / 0% file-rss, i.e. genuine heap growth, not mmap'd redb
+        /// pages) that did not recover even after the write load stopped. Simulates
+        /// what a client's periodic PutFileMetadata push actually does during a long
+        /// patch session: repeatedly report a NEW chunk_id for the SAME (file,
+        /// chunk_idx=0) as it evolves through many generations. Calls
+        /// chunk_map_update directly rather than through the full RPC/leadership
+        /// path — a targeted unit test of that one function, not an integration test.
+        #[tokio::test]
+        async fn chunk_map_update_does_not_leak_superseded_chunk_ids() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            const NUM_GENERATIONS: usize = 50;
+
+            let mut last_chunk_id = None;
+            for gen in 0..NUM_GENERATIONS {
+                let data = vec![gen as u8; 128];
+                let hash = compute_chunk_hash(&data);
+                let chunk_id = ChunkId::from_hash(hash);
+                h.storage.write_chunk(&chunk_id, &data).unwrap();
+                let loc = ChunkLocation {
+                    chunk_id, nodes: vec![], size: data.len(), checksum: hash,
+                    file_offset: Some(0), written_at: Some(1000 + gen as u64),
+                    client_write_seq: Some(gen as u64 + 1), file_id: Some(file_id),
+                };
+                let mut metadata = dfs_common::FileMetadata::new(
+                    "/chunk_to_file_leak_test.bin".to_string(), dfs_common::FileType::RegularFile);
+                metadata.id = file_id;
+                metadata.size = data.len() as u64;
+                metadata.write_seq = gen as u64 + 1;
+                metadata.chunk_locations = std::sync::Arc::new(vec![loc]);
+                h.server.chunk_map_update(&metadata).await;
+                last_chunk_id = Some(chunk_id);
+            }
+
+            assert_eq!(h.server.chunk_to_file.len(), 1,
+                "chunk_to_file must only ever hold the CURRENT chunk_id for this slot, not \
+                 one leaked entry per superseded generation — {} generations were written \
+                 but only the latest should remain mapped", NUM_GENERATIONS);
+            let current = last_chunk_id.unwrap();
+            assert_eq!(h.server.chunk_to_file.get(&current).map(|e| *e.value()), Some(file_id),
+                "the current (latest) chunk_id must still resolve to this file");
+        }
+
         /// Real bug found via the T22 storm, root-caused all the way through: even
         /// with the client_write_seq fix above, the client's own buffered
         /// PutFileMetadata push is refreshed on ITS OWN schedule and has no way to
@@ -13858,6 +14106,8 @@ mod tests {
                 token: public_token,
                 last_patch_at: std::time::Instant::now(),
                 delta_hasher: blake3::Hasher::new(),
+                fold_failures: 0,
+                last_fold_attempt_at: std::time::Instant::now(),
             });
 
             // Now actually run the fold to completion and confirm it succeeds cleanly

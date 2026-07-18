@@ -65,3 +65,20 @@ of losing track of them. Add an entry whenever you find one; remove the entry wh
   `chunk_locations` field off `Response::FileInfo`); `list`/`find-chunk` were not, since they
   go through a different response type (`FileList`) that never carried per-file chunk info to
   begin with.
+
+## Found 2026-07-18 (triple-node compaction-wedge fix)
+
+- **`dfs-server/src/server.rs` — `nothing_to_reclaim` branch in `start_compaction_loop`**
+  (~line 6825 onward, including the `should_skip_periodic_compaction_under_load` call site
+  and its skip-log). `should_compact` no longer has a time-based fallback (removed same
+  session — see its doc comment): every path that reaches this point now implies
+  `current_size` is at least `COMPACT_MIN_RECLAIMABLE_BYTES` past `last_compact_size`, so
+  `nothing_to_reclaim` (`current_size <= last_compact_size`) should be structurally
+  unreachable except a same-tick race between the `current_size` read and a since-last-tick
+  compaction elsewhere — not proven impossible, so left in place as a defensive check rather
+  than deleted. `should_skip_periodic_compaction_under_load` itself and its unit tests
+  (`periodic_compaction_load_gate` module) are still meaningful as a defense-in-depth guard
+  should `nothing_to_reclaim` ever actually fire, so kept rather than removed too. Candidate
+  for a follow-up pass: confirm via a live counter (add a debug! or metric if this branch
+  ever actually executes) that it's truly dead, then delete it and the load-gate scaffolding
+  together.

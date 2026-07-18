@@ -32,6 +32,12 @@ pub struct ChunkStorage {
 
     /// Cache configuration
     cache_capacity_chunks: usize,
+
+    /// Live-maintained index for list_chunks() — see that method's doc comment.
+    /// None until the first list_chunks() call populates it via a real directory
+    /// walk; Some(set) thereafter, kept correct incrementally by write_chunk /
+    /// delete_chunk rather than ever being invalidated wholesale.
+    list_chunks_cache: Mutex<Option<std::collections::HashSet<ChunkId>>>,
 }
 
 impl ChunkStorage {
@@ -58,6 +64,7 @@ impl ChunkStorage {
             data_dir,
             cache,
             cache_capacity_chunks,
+            list_chunks_cache: Mutex::new(None),
         })
     }
 
@@ -161,6 +168,16 @@ impl ChunkStorage {
         let total_time = start.elapsed();
         debug!("Wrote chunk {} ({} bytes) in {:?} - checksum: {:?}, mkdir: {:?}, sync: {:?}, rename: {:?}",
                chunk_id, data.len(), total_time, checksum_time, mkdir_time, sync_time, rename_time);
+
+        // Keep list_chunks()'s live index correct — see that method's doc comment.
+        // A no-op if the index hasn't been built yet (None); once it exists, this
+        // chunk must be visible to the very next list_chunks() call (e.g. a peer's
+        // HasChunks check right after this write completes as part of a heal), so
+        // it's inserted directly rather than invalidating the whole index (which,
+        // under sustained write load, would defeat it almost as fast as it's built).
+        if let Some(index) = self.list_chunks_cache.lock().unwrap().as_mut() {
+            index.insert(*chunk_id);
+        }
 
         Ok(())
     }
@@ -370,6 +387,13 @@ impl ChunkStorage {
         // Invalidate cache regardless of file presence — a previous PatchChunk may have
         // left stale bytes here.
         self.invalidate_cache(chunk_id);
+        // Keep list_chunks()'s live index correct — see write_chunk's matching
+        // update and list_chunks' doc comment for why this is an incremental
+        // remove, not a wholesale invalidation. Also a no-op if the index isn't
+        // built yet, and harmless if chunk_id was never in it (path didn't exist).
+        if let Some(index) = self.list_chunks_cache.lock().unwrap().as_mut() {
+            index.remove(chunk_id);
+        }
 
         Ok(())
     }
@@ -437,16 +461,48 @@ impl ChunkStorage {
         Ok(())
     }
 
-    /// List all chunk IDs in storage (useful for scrubbing/recovery)
+    /// List all chunk IDs in storage (useful for scrubbing/recovery).
+    ///
+    /// Root-caused 2026-07-18 via a live gdb thread dump on staging: this used to be a
+    /// full recursive directory walk over every locally-stored chunk (60-70K+ files on
+    /// a loaded gluster-class node) on EVERY call, and every one of its 6 call sites
+    /// (handle_has_chunks — peer-triggered, no rate limit — plus 4 periodic scans in
+    /// healing.rs) ran it with no coordination between callers. Under load, that let
+    /// 24 of 38 threads on one node pile up simultaneously in getdents64, all
+    /// independently re-walking the SAME directory tree at once — a real, measured
+    /// disk-I/O storm (the same node that later showed ~99% disk utilization
+    /// dominated by reads), not just wasted CPU.
+    ///
+    /// A first attempt at this fix (same day) cached the result with a short TTL,
+    /// invalidated wholesale on every write_chunk/delete_chunk. That was correct but
+    /// self-defeating: under sustained write load (a VM restore) writes land far more
+    /// often than the TTL, so the cache was invalidated almost as fast as it was
+    /// populated — never surviving long enough to help during exactly the load that
+    /// motivated the fix.
+    ///
+    /// Now a live-maintained index instead of a cache: scanned from disk once (lazily,
+    /// on first call after startup — this function still blocks concurrent callers
+    /// behind that one scan the same way the TTL version did, via the same
+    /// std::sync::Mutex), then kept correct incrementally by write_chunk/delete_chunk
+    /// inserting/removing exactly the one chunk_id that changed. No TTL, so it's never
+    /// stale; no periodic rescans after the first, so none of the 6 call sites ever
+    /// pays the full directory-walk cost again for the life of the process.
     pub fn list_chunks(&self) -> Result<Vec<ChunkId>> {
+        let mut guard = self.list_chunks_cache.lock().unwrap();
+        if let Some(index) = guard.as_ref() {
+            return Ok(index.iter().copied().collect());
+        }
+
         let mut chunk_ids = Vec::new();
         let chunks_dir = self.data_dir.join("chunks");
-
         if chunks_dir.exists() {
             Self::collect_chunks_recursive(&chunks_dir, &mut chunk_ids)?;
         }
 
-        Ok(chunk_ids)
+        let index: std::collections::HashSet<ChunkId> = chunk_ids.iter().copied().collect();
+        let result = chunk_ids;
+        *guard = Some(index);
+        Ok(result)
     }
 
     /// Get cache statistics for flow control

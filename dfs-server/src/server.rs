@@ -7575,6 +7575,59 @@ impl Server {
         });
     }
 
+    /// Prunes chunk_patch_locks of entries nobody currently references.
+    ///
+    /// Root-caused 2026-07-18, live on staging: every one of chunk_patch_locks' 4
+    /// acquisition sites does `.entry((file_id, chunk_idx)).or_insert_with(...)`, but
+    /// nothing removes the DashMap entry itself once a caller is done with it (only
+    /// the underlying tokio Mutex gets unlocked) — the file-deletion path (see
+    /// handle_delete_file's "Step 5") is the ONLY place that ever prunes it, so a
+    /// live file that's never deleted accumulates one permanent entry per distinct
+    /// chunk_idx ever patched, forever. A single large sequential write or the
+    /// earlier VM-restore repro didn't surface this badly (relatively few distinct
+    /// chunk_idx positions touched relative to total bytes moved), but kdiskmark's
+    /// highly random I/O pattern — many small operations scattered across many
+    /// distinct chunk positions — mints far more of these permanent entries per unit
+    /// of traffic and made it clearly visible in [MEM DIAG] (climbing in lockstep
+    /// with chunk_prefetch, another entry-per-distinct-chunk_id structure fixed the
+    /// same day).
+    ///
+    /// Fixed here rather than at the 4 acquisition sites: chunk_patch_locks guards
+    /// the core patch/fold mutual-exclusion path, and one of its 4 call sites hands
+    /// the OwnedMutexGuard by value into apply_patch rather than holding it locally —
+    /// restructuring every site for RAII-on-drop cleanup under time pressure risked
+    /// getting the guard lifetime subtly wrong in exactly the code that guarantees
+    /// two concurrent patches to the same slot can't race each other, which would be
+    /// a correctness regression far worse than the leak it fixes. A periodic sweep
+    /// (matching this codebase's existing pattern — see patch_fold_sweep and
+    /// cleanup_stale_pending above) needs zero changes to any acquisition site:
+    /// Arc::strong_count(v) == 1 for a given entry means only the DashMap's own
+    /// stored Arc remains — no live guard, no other task's `.entry().clone()` still
+    /// in scope — so removing it is safe by construction. DashMap::retain locks each
+    /// shard while evaluating its predicate, so there's no window for a concurrent
+    /// acquirer to observe the entry gone without also getting a freshly-inserted
+    /// replacement — retain's removal and or_insert_with's insertion can't interleave
+    /// mid-shard.
+    pub fn start_chunk_patch_locks_sweep_loop(self: Arc<Self>) {
+        let server = self;
+        tokio::spawn(async move {
+            const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                let before = server.chunk_patch_locks.len();
+                if before == 0 {
+                    continue;
+                }
+                server.chunk_patch_locks.retain(|_, v| Arc::strong_count(v) > 1);
+                let removed = before - server.chunk_patch_locks.len();
+                if removed > 0 {
+                    debug!("chunk_patch_locks sweep: pruned {} uncontended entries ({} -> {})",
+                        removed, before, server.chunk_patch_locks.len());
+                }
+            }
+        });
+    }
+
     /// One-shot startup sweep: re-discover every Pending PATCH_STATE_TABLE row
     /// directly from disk and resume folding it.
     ///
@@ -13812,6 +13865,41 @@ mod tests {
                 "the current (latest) chunk_id must still resolve to this file");
         }
 
+        /// Regression for the 2026-07-18 chunk_patch_locks leak: nothing removes a
+        /// slot's DashMap entry once acquired (only the file-deletion path does, and
+        /// only for files that actually get deleted) — kdiskmark's highly random I/O
+        /// pattern touches many distinct chunk_idx positions and made this climb
+        /// visibly in [MEM DIAG]. Fixed via a periodic sweep (start_chunk_patch_locks_
+        /// sweep_loop) rather than touching any of the 4 acquisition sites, on the
+        /// theory that Arc::strong_count(v) == 1 for an entry means only the DashMap's
+        /// own stored Arc remains — safe to remove. This test verifies that theory
+        /// directly against the exact predicate the sweep loop uses, both ways: an
+        /// entry with an outstanding clone (simulating an in-flight guard or a
+        /// concurrent acquirer) must survive, and one with none must not.
+        #[test]
+        fn chunk_patch_locks_sweep_predicate_is_safe() {
+            let map: dashmap::DashMap<(dfs_common::FileId, u64), Arc<tokio::sync::Mutex<()>>> =
+                dashmap::DashMap::new();
+            let file_id = dfs_common::FileId::new();
+
+            // Idle entry: only the map holds it (as if a guard was already dropped).
+            map.insert((file_id, 0), Arc::new(tokio::sync::Mutex::new(())));
+            // Contended entry: an extra clone outstanding (as if a guard is still
+            // held, or another task is between .entry() and finishing its own use).
+            let held = Arc::new(tokio::sync::Mutex::new(()));
+            map.insert((file_id, 1), held.clone());
+
+            map.retain(|_, v| Arc::strong_count(v) > 1);
+
+            assert!(map.get(&(file_id, 0)).is_none(),
+                "an idle entry (strong_count==1, only the map holds it) must be pruned");
+            assert!(map.get(&(file_id, 1)).is_some(),
+                "an entry with an outstanding clone (strong_count>1) must survive the sweep — \
+                 removing it here would let a concurrent acquirer create a SECOND, separate \
+                 Mutex for the same logical slot, breaking mutual exclusion");
+            drop(held);
+        }
+
         /// Real bug found via the T22 storm, root-caused all the way through: even
         /// with the client_write_seq fix above, the client's own buffered
         /// PutFileMetadata push is refreshed on ITS OWN schedule and has no way to
@@ -14397,6 +14485,20 @@ impl MessageHandler for Server {
                 Ok(Some(data)) => {
                     ring.shard(&chunk_id).lock().unwrap().put(chunk_id, Arc::clone(&data));
                     let _ = tx.send(Some(data));
+                    // Root-caused 2026-07-18 (live staging, kdiskmark's highly random
+                    // I/O pattern): this success arm never removed its own entry —
+                    // only the failure arm below did — so chunk_prefetch leaked one
+                    // permanent entry per distinct chunk_id ever successfully
+                    // prefetched. Safe to remove now: any caller that already cloned
+                    // `rx` out of the map before this point keeps working fine (a
+                    // tokio watch::Receiver is independent of the map entry once
+                    // cloned — removing the map entry doesn't affect its ability to
+                    // read the value just sent), and start_prefetch_for_patch's own
+                    // contains_key guard means a chunk_id already fully prefetched
+                    // and removed here will simply just start a fresh (redundant but
+                    // correct) prefetch if asked again, identical to the existing
+                    // failure-path behavior this mirrors.
+                    prefetch_map.remove(&chunk_id);
                 }
                 // On read failure or task panic: sender drops, channel closes.
                 // handle_multi_patch detects the closed channel and falls back

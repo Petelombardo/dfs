@@ -1389,6 +1389,28 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// per-(file, node) cap (e.g. range_fetch_permit_for) must acquire it themselves
     /// before calling this.
     async fn send_request(&self, addr: SocketAddr, request: Request) -> Result<Response> {
+        // Fail instantly against a node already known to be bad, instead of paying a
+        // full connect-attempt + retry-connect-attempt + timeout cycle on every single
+        // request to it. NodeHealthTracker already records every failure from this
+        // function (record_failure below, and its many other call sites) and computes
+        // is_penalized() from that — a real circuit breaker already existed, it just
+        // wasn't being read here. Root-caused 2026-07-18 live on staging: gluster5 had
+        // ~2960 kernel-level ghost CLOSE_WAIT sockets (a real OS-level issue, not an
+        // application bug) and every write that happened to target it as a replica paid
+        // the full retry-then-3s-timeout tax on EVERY call, serialized behind the
+        // dispatch's join_all — one bad node was measured stalling a single MultiPatch
+        // chunk write over 12s (6s primary + 6.6s sequential backfill) instead of
+        // failing over to the two healthy replicas quickly. is_penalized() only trips
+        // after PENALTY_THRESHOLD (5) consecutive failures with real backoff (30-120s),
+        // so this can't fire on a single blip — by the time it's true, the node has
+        // already proven itself bad multiple times in a row.
+        if self.node_health.is_penalized(addr).await {
+            return Err(anyhow::anyhow!(
+                "Node {} is penalized (recent repeated failures) — skipping without attempting a connection",
+                addr
+            ));
+        }
+
         debug!("Sending request to {}: {:?}", addr, request);
 
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
@@ -1863,6 +1885,16 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// Send a write request using split-frame encoding to avoid bincode serialization overhead.
     /// The envelope contains an empty data field; raw bytes are sent separately.
     async fn send_split_frame_write_request(&self, addr: SocketAddr, encoded_envelope: &[u8], raw_data: &[u8]) -> Result<Response> {
+        // See send_request's matching check for why: fail instantly against a node
+        // already known bad instead of paying a full connect+retry+timeout cycle on
+        // every call to it while the multi-replica dispatch (join_all) waits on it.
+        if self.node_health.is_penalized(addr).await {
+            return Err(anyhow::anyhow!(
+                "Node {} is penalized (recent repeated failures) — skipping without attempting a connection",
+                addr
+            ));
+        }
+
         debug!("Sending split-frame write request to {} ({} bytes data)", addr, raw_data.len());
 
         // SFWTIMING: splits this call into pool-acquire / connect / write / read-response

@@ -61,9 +61,26 @@ impl NodeHealth {
 /// Tracks per-node health across reads and writes.
 ///
 /// Thread-safe; cheaply cloneable via Arc.
+///
+/// A DashMap, not a single Mutex<HashMap<..>> (root-caused 2026-07-18, live on
+/// staging): is_penalized() used to be called from only 2 sites; the same-day
+/// circuit-breaker fix (send_request/send_split_frame_write_request checking it
+/// up front on every RPC) made it a per-request check on the hot path. With a
+/// single global mutex, that serialized is_penalized(node_A) against
+/// record_failure(node_B) — two calls about completely unrelated nodes — behind
+/// one lock, on every one of potentially dozens of concurrently in-flight
+/// operations (kdiskmark QD32 = up to 32 outstanding at once). Measured
+/// alongside this fix: random-write throughput sat a few percent under its
+/// prior peak while sequential throughput exceeded its own peak — consistent
+/// with a shared-lock tax that shows up more per-byte on many small concurrent
+/// operations than on fewer, larger sequential ones. DashMap shards internally
+/// (this codebase's established pattern everywhere else this shape of problem
+/// occurs — chunk_map, chunk_to_file, dirty_patch_slots, etc.), so two calls
+/// about different SocketAddrs no longer contend at all, and even same-address
+/// calls only block other same-address calls, not the other 4 nodes' entries.
 #[derive(Clone, Debug)]
 pub struct NodeHealthTracker {
-    inner: Arc<Mutex<HashMap<SocketAddr, NodeHealth>>>,
+    inner: Arc<DashMap<SocketAddr, NodeHealth>>,
 }
 
 impl NodeHealthTracker {
@@ -75,13 +92,14 @@ impl NodeHealthTracker {
     const MAX_PROBE_SECS: u64 = 120;
 
     fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+        Self { inner: Arc::new(DashMap::new()) }
     }
 
     /// Record a successful response from `addr`.  Clears all penalty state.
+    /// Still `async fn` (no `.await` inside — DashMap's API is synchronous) to
+    /// avoid touching the 20+ existing call sites across the client.
     pub async fn record_success(&self, addr: SocketAddr) {
-        let mut map = self.inner.lock().await;
-        if let Some(h) = map.get_mut(&addr) {
+        if let Some(mut h) = self.inner.get_mut(&addr) {
             if h.consecutive_failures > 0 || h.penalized_until.is_some() {
                 info!("Node {} health recovered (was {} consecutive failures)", addr, h.consecutive_failures);
             }
@@ -94,8 +112,7 @@ impl NodeHealthTracker {
     /// Record a timeout or connection error from `addr`.
     /// Penalizes the node when the failure count crosses the threshold.
     pub async fn record_failure(&self, addr: SocketAddr) {
-        let mut map = self.inner.lock().await;
-        let h = map.entry(addr).or_insert_with(NodeHealth::new);
+        let mut h = self.inner.entry(addr).or_insert_with(NodeHealth::new);
         h.consecutive_failures += 1;
 
         if h.consecutive_failures >= Self::PENALTY_THRESHOLD {
@@ -105,17 +122,21 @@ impl NodeHealthTracker {
             if h.backoff_level < 8 {
                 h.backoff_level += 1;
             }
+            let consecutive_failures = h.consecutive_failures;
+            // Drop the shard guard before logging — tracing's own machinery
+            // shouldn't run while holding a DashMap shard lock, even though
+            // it's normally fast; no reason to extend the hold time for it.
+            drop(h);
             warn!(
                 "Node {} penalized for {}s after {} consecutive failures",
-                addr, secs, h.consecutive_failures
+                addr, secs, consecutive_failures
             );
         }
     }
 
     /// Returns true if `addr` is currently in a penalty period.
     pub async fn is_penalized(&self, addr: SocketAddr) -> bool {
-        let mut map = self.inner.lock().await;
-        if let Some(h) = map.get_mut(&addr) {
+        if let Some(mut h) = self.inner.get_mut(&addr) {
             h.maybe_clear_expired_penalty();
             h.is_penalized()
         } else {
@@ -128,11 +149,16 @@ impl NodeHealthTracker {
     /// Also clears any penalties whose timer has expired, so nodes self-recover without needing
     /// an explicit success call after the probe interval passes.
     pub async fn sort_by_health(&self, addrs: &[SocketAddr]) -> Vec<SocketAddr> {
-        let mut map = self.inner.lock().await;
+        // Per-address shard lookups, not one lock held across the whole loop
+        // (there was no async work inside the loop even before this, so the old
+        // single-mutex version never blocked on I/O while holding it — but it did
+        // serialize every OTHER concurrent NodeHealthTracker call, for any node,
+        // behind this one call's full duration). Each iteration below now only
+        // ever touches (and briefly locks) that one address's own DashMap shard.
         let mut healthy = Vec::new();
         let mut penalized = Vec::new();
         for &addr in addrs {
-            let is_pen = if let Some(h) = map.get_mut(&addr) {
+            let is_pen = if let Some(mut h) = self.inner.get_mut(&addr) {
                 h.maybe_clear_expired_penalty();
                 h.is_penalized()
             } else {

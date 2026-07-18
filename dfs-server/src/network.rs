@@ -647,19 +647,28 @@ impl NetworkClient {
         // If the pool is full, set SO_LINGER(0) before dropping so the kernel sends
         // RST instead of going through TIME_WAIT — prevents orphaned socket accumulation
         // under heavy healing load where many short-lived connections are created.
-        {
+        //
+        // IMPORTANT: the DashMap `entry` guard holds that shard's exclusive lock, and
+        // DashMap shards are shared across multiple target addresses. `shutdown().await`
+        // can block for a while against a slow/dead peer, so it must run only after the
+        // guard is dropped — otherwise one stuck shutdown call jams `.entry()` for every
+        // other target hashing to the same shard, which starves the whole node's tokio
+        // worker pool once enough concurrent callers pile up on it (root cause of the
+        // 2026-07-18 gluster2/gluster3 wedge during post-power-failure mass healing).
+        let stream_to_close = {
             let entry = self.pool
                 .entry(target)
                 .or_insert_with(|| Mutex::new(VecDeque::new()));
             let mut queue = entry.lock().await;
             if queue.len() < 8 {
                 queue.push_back(stream);
+                None
             } else {
-                // Pool full — explicitly shut down before dropping so the kernel
-                // completes the TCP close handshake promptly rather than leaving
-                // the socket in TIME_WAIT as an orphan.
-                let _ = stream.shutdown().await;
+                Some(stream)
             }
+        };
+        if let Some(mut stream) = stream_to_close {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), stream.shutdown()).await;
         }
 
         Ok(response)

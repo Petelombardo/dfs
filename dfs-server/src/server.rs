@@ -77,6 +77,21 @@ pub struct Server {
     /// or exhaust the broadcast_semaphore and stall heartbeat-adjacent operations.
     delete_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// Bounds how many fold_slot_now tasks start_patch_fold_sweep_loop's backstop
+    /// may run at once. Root-caused 2026-07-18, live on staging: that loop spawns
+    /// one unbounded tokio::spawn per stale dirty-patch-slot with no concurrency
+    /// cap at all — unlike every other fan-out point in this file, which all use
+    /// a Semaphore. A large backlog (109 dirty slots, left over from gluster2/
+    /// gluster3 being unreachable during an outage) all going stale past
+    /// PATCH_DEBOUNCE_IDLE at once meant 100+ concurrent folds firing in the same
+    /// tick, each pushing to 2 of only 4 possible replica targets — a thundering
+    /// herd against send_message_inner's per-target connection-pool DashMap that
+    /// starved every tokio worker thread on the leader (confirmed via two
+    /// identical gdb thread dumps — a real stall, not just slow draining).
+    /// Sized like broadcast_semaphore: enough parallelism to drain a backlog
+    /// promptly without re-creating the herd.
+    fold_sweep_semaphore: Arc<tokio::sync::Semaphore>,
+
     /// Leader-maintained in-memory chunk map: FileId -> Vec<ChunkLocation>.
     /// Only the leader serves GetFileChunkMap requests from this map.
     /// All nodes keep it up-to-date so leadership transitions are seamless.
@@ -2069,6 +2084,7 @@ impl Server {
             // well within the 65536 fd limit even under heavy delete/heal load.
             broadcast_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
             delete_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            fold_sweep_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             chunk_map: Arc::new(DashMap::new()),
             chunk_to_file: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -7567,7 +7583,9 @@ impl Server {
                        a debounce_fold_slot task may have died; folding as a backstop", stale.len());
                 for (file_id, chunk_idx) in stale {
                     let ctx = server.overlay_ctx();
+                    let sem = server.fold_sweep_semaphore.clone();
                     tokio::spawn(async move {
+                        let _permit = sem.acquire().await.ok();
                         ctx.fold_slot_now(file_id, chunk_idx).await;
                     });
                 }

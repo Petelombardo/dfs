@@ -3756,12 +3756,62 @@ impl Server {
     /// MUST NOT be used for chunk *replication* (ReplicateChunk / healing transfers) —
     /// those need `chunk_id`'s own honest, standalone bytes exactly as stored, never
     /// the composed logical view. Use `storage.read_chunk_arc` directly there.
+    /// Last-resort read resolution for a `chunk_id` whose in-memory
+    /// `pending_patch_ids` entry is absent AND whose bytes a fast raw read
+    /// couldn't find on disk. Consults the DURABLE patch_state (PATCH_STATE_TABLE)
+    /// so an overlay token stays readable even when the in-memory bookkeeping was
+    /// lost — the token may have been wiped by a process restart before the resume
+    /// sweep re-tracked it (Fix A), or never re-tracked at all on an older binary.
+    ///
+    /// Root cause this closes (2026-07-17 VM-111 install EIO): a hot-chunk Pending
+    /// overlay token (`20763c5f…`) became a raw-file-open-that-fails after gluster2
+    /// self-restarted mid-install. The bytes were never lost — patch_state still
+    /// described the token as Pending{base, delta}, and its base was a materialised
+    /// real file — but no read path ever consulted patch_state once the in-memory
+    /// gate missed.
+    ///
+    /// Returns Ok(None) when patch_state has no row for `chunk_id` (genuinely a
+    /// plain, missing chunk — the caller keeps its original NotFound). Only ever
+    /// called AFTER a raw read has already failed, so the hot path pays nothing.
+    async fn resolve_via_durable_patch_state(&self, chunk_id: ChunkId) -> Result<Option<Arc<Vec<u8>>>> {
+        match self.metadata.get_patch_state_async(chunk_id).await
+            .context("resolve_via_durable_patch_state: patch_state lookup failed")?
+        {
+            Some(PatchState::Folded(real_chunk_id)) => {
+                let storage = self.storage.clone();
+                let arc = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&real_chunk_id))
+                    .await
+                    .context("spawn_blocking panicked in resolve_via_durable_patch_state")??;
+                self.storage.cache_put(chunk_id, arc.clone());
+                Ok(Some(arc))
+            }
+            Some(PatchState::Pending { base_chunk_id, delta_chunk_id, .. }) => {
+                // The base was materialised to a real file when the next patch built
+                // on it (apply_patch's ghost guard requires base present), and the
+                // delta is a real chunk file — both durable, both survive a restart.
+                Ok(Some(self.compose_one_patch(base_chunk_id, delta_chunk_id).await?))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn resolve_chunk_content(&self, chunk_id: ChunkId) -> Result<Arc<Vec<u8>>> {
         let Some(slot) = self.pending_patch_ids.get(&chunk_id).map(|e| *e) else {
             let storage = self.storage.clone();
-            return tokio::task::spawn_blocking(move || storage.read_chunk_arc(&chunk_id))
+            let raw = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&chunk_id))
                 .await
                 .context("spawn_blocking panicked in resolve_chunk_content")?;
+            return match raw {
+                Ok(arc) => Ok(arc),
+                // Fast in-memory gate missed AND the raw file isn't here. Before
+                // failing, consult durable patch_state: chunk_id may be an overlay
+                // token whose pending_patch_ids entry was lost (restart) — see
+                // resolve_via_durable_patch_state for the incident this closes.
+                Err(raw_err) => match self.resolve_via_durable_patch_state(chunk_id).await {
+                    Ok(Some(arc)) => Ok(arc),
+                    _ => Err(raw_err),
+                },
+            };
         };
 
         match self.metadata.get_patch_state_async(chunk_id).await
@@ -3934,10 +3984,26 @@ impl Server {
             })
         } else {
             let storage = self.storage.clone();
-            tokio::task::spawn_blocking(move || {
+            let raw = tokio::task::spawn_blocking(move || {
                 storage.read_chunk_range_partial(&chunk_id, offset as usize, length as usize)
             }).await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("read_chunk_range_partial panicked: {e}")))
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("read_chunk_range_partial panicked: {e}")));
+            match raw {
+                Ok(d) => Ok(d),
+                // Fast partial read missed — chunk_id may be an overlay token whose
+                // in-memory pending_patch_ids entry was lost (restart before the
+                // resume sweep re-tracked it). Resolve the full content from durable
+                // patch_state and slice out the requested range rather than EIO-ing
+                // the guest. See resolve_via_durable_patch_state.
+                Err(raw_err) => match self.resolve_via_durable_patch_state(chunk_id).await {
+                    Ok(Some(arc)) => {
+                        let start = (offset as usize).min(arc.len());
+                        let end = (start + length as usize).min(arc.len());
+                        Ok(arc[start..end].to_vec())
+                    }
+                    _ => Err(raw_err),
+                },
+            }
         };
         match range_result {
             Ok(data) => {
@@ -7354,6 +7420,18 @@ impl Server {
                     last_patch_at: std::time::Instant::now(),
                     delta_hasher: blake3::Hasher::new(),
                 });
+                // Restore the in-memory pending_patch_ids entry too. It is
+                // populated only by apply_patch (this process's own writes) and
+                // wiped on restart — a resumed Pending token that we DON'T re-track
+                // here is invisible to resolve_chunk_content's fast in-memory gate,
+                // so a read for it (chunk_map still points at the token) falls
+                // through to a raw file open that fails → EIO. This was the missing
+                // half of the 2026-07-17 VM-111 data-loss: gluster2 self-restarted
+                // mid-install (compaction lock wedge), the resume sweep re-tracked
+                // the fold in dirty_patch_slots but not here, and the token became
+                // unreadable. or_insert so live traffic that already re-tracked this
+                // slot with a newer token wins.
+                server.pending_patch_ids.entry(token).or_insert((file_id, chunk_idx));
                 let ctx = server.overlay_ctx();
                 tokio::spawn(async move {
                     if !ctx.fold_slot_now(file_id, chunk_idx).await {
@@ -13134,6 +13212,90 @@ mod tests {
                     panic!("patch_state for {} never reached Folded within {}ms", public_token, timeout_ms);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Root-cause regression for the 2026-07-17 VM-111 install EIO (chunk
+        /// 20763c5f…): a Pending overlay token must stay READABLE from durable
+        /// patch_state even when its in-memory pending_patch_ids entry is absent —
+        /// e.g. wiped by a process restart (gluster2 self-restarted mid-install on a
+        /// compaction lock wedge) before the resume sweep re-tracked it. Before the
+        /// fix, the read fell through to a raw file open of the token id — which
+        /// never exists as a file — and returned NotFound → guest EIO → ext4
+        /// remounted read-only. Fix B: on a raw-read miss, consult durable
+        /// patch_state and compose base+delta.
+        #[tokio::test]
+        async fn pending_token_read_resolves_from_durable_state_when_in_memory_tracking_lost() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let chunk_idx = 0u64;
+
+            // Base chunk: a real, materialised file on disk — exactly as it would be
+            // after the previous patch folded it to become this token's base.
+            let base_data = vec![1u8; 4096];
+            let base_id = ChunkId::from_hash(compute_chunk_hash(&base_data));
+            h.storage.write_chunk(&base_id, &base_data).unwrap();
+
+            // Delta chunk: patch bytes [100..108) := 0xAB, append-only delta format.
+            let patch_off = 100usize;
+            let patch_bytes = vec![0xABu8; 8];
+            let delta_bytes = encode_delta_record(patch_off, &patch_bytes);
+            let delta_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
+            h.storage.write_chunk(&delta_id, &delta_bytes).unwrap();
+
+            // The public token: a distinct id that is NOT a real file on disk.
+            let token = ChunkId::from_hash(compute_chunk_hash(b"pending-token-slot-2304"));
+            h.metadata.put_patch_state_pending(
+                file_id, chunk_idx, &token, base_id, delta_id, base_data.len(), 0, Some(1),
+            ).unwrap();
+
+            // The lost-bookkeeping condition: in-memory pending_patch_ids does NOT
+            // contain the token (a fresh process never had it), and no real file
+            // named for the token exists — the exact post-restart state.
+            assert!(!h.server.pending_patch_ids.contains_key(&token),
+                "precondition: token absent from in-memory tracking");
+            assert!(!h.storage.has_chunk(&token),
+                "precondition: token is not a real file on disk");
+
+            // Whole-chunk read must resolve via durable patch_state → compose.
+            let mut expected = base_data.clone();
+            expected[patch_off..patch_off + patch_bytes.len()].copy_from_slice(&patch_bytes);
+            match h.server.handle_read_chunk(token, None).await {
+                Response::ChunkData { arc_data: Some(arc), .. } =>
+                    assert_eq!(&**arc, &expected, "composed content must match base+delta"),
+                other => panic!("read of a Pending token with lost in-memory tracking must \
+                    resolve from durable patch_state, got {:?}", other),
+            }
+
+            // Range read must resolve identically (its own fast-path/fallback).
+            match h.server.handle_read_chunk_range(token, patch_off as u64, patch_bytes.len() as u64, None).await {
+                Response::ChunkData { data, .. } =>
+                    assert_eq!(data, patch_bytes, "range read must return the patched bytes"),
+                other => panic!("range read of a Pending token with lost tracking must resolve, got {:?}", other),
+            }
+        }
+
+        /// Companion to the above for the Folded branch: after a token folds to a
+        /// distinct real id, a client still holding the (stale) token id must resolve
+        /// to the folded content via durable patch_state even with no in-memory entry.
+        #[tokio::test]
+        async fn folded_token_read_resolves_from_durable_state_when_in_memory_tracking_lost() {
+            let h = make_overlay_test_harness();
+
+            let real_data = vec![7u8; 4096];
+            let real_id = ChunkId::from_hash(compute_chunk_hash(&real_data));
+            h.storage.write_chunk(&real_id, &real_data).unwrap();
+
+            let token = ChunkId::from_hash(compute_chunk_hash(b"folded-token-slot-99"));
+            h.metadata.update_patch_state_folded(&token, real_id).unwrap();
+
+            assert!(!h.server.pending_patch_ids.contains_key(&token));
+            assert!(!h.storage.has_chunk(&token));
+
+            match h.server.handle_read_chunk(token, None).await {
+                Response::ChunkData { arc_data: Some(arc), .. } =>
+                    assert_eq!(&**arc, &real_data, "must resolve to the folded real chunk"),
+                other => panic!("read of a stale Folded token with lost tracking must resolve, got {:?}", other),
             }
         }
 

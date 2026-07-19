@@ -9592,7 +9592,23 @@ impl Server {
             }
             Err((msg, code)) => {
                 warn!("PatchChunk {}: {}", chunk_id, msg);
-                Response::Error { message: msg, code }
+                // B (2026-07-19): ghost/unreachable base → retriable ChunkStale, not a
+                // fatal Error that EIOs the guest. Same rationale as handle_multi_patch's
+                // Err arm (client bounds ChunkStale retries, so no infinite loop).
+                let stale = if code == ErrorCode::NotFound {
+                    chunk_idx.and_then(|cidx| {
+                        self.chunk_map.get(&file_id).and_then(|e| {
+                            let (locs, _) = e.value();
+                            Self::chunk_map_find_by_idx(locs, cidx).map(|i| Response::ChunkStale {
+                                current_chunk_id: locs[i].chunk_id,
+                                current_nodes: locs[i].nodes.clone(),
+                            })
+                        })
+                    })
+                } else {
+                    None
+                };
+                stale.unwrap_or(Response::Error { message: msg, code })
             }
         }
     }
@@ -9886,7 +9902,31 @@ impl Server {
             }
             Err((msg, code)) => {
                 warn!("MultiPatch {}: {}", chunk_id, msg);
-                Response::Error { message: msg, code }
+                // B (2026-07-19): a ghost/unreachable base surfaces as NotFound. Rather
+                // than a fatal Error — which the client turns into a guest EIO and an
+                // ext4 read-only remount (the VM-111 install death) — return a RETRIABLE
+                // ChunkStale pointing at the slot's current chunk_id. The client
+                // re-resolves and retries, giving cluster convergence a chance to heal a
+                // transient ghost. The client BOUNDS ChunkStale retries (one auto-retry
+                // + per-chunk backoff, then EIO), so this can't infinite-loop; a
+                // genuinely-gone chunk still EIOs after that bounded retry. Only for
+                // slot-keyed patches (chunk_idx present) where "the slot's current" is a
+                // meaningful thing to hand back. With L1/L3 stopping ghosts from forming
+                // cluster-wide, this is a last-resort net for a transient local ghost.
+                let stale = if code == ErrorCode::NotFound {
+                    chunk_idx.and_then(|cidx| {
+                        self.chunk_map.get(&file_id).and_then(|e| {
+                            let (locs, _) = e.value();
+                            Self::chunk_map_find_by_idx(locs, cidx).map(|i| Response::ChunkStale {
+                                current_chunk_id: locs[i].chunk_id,
+                                current_nodes: locs[i].nodes.clone(),
+                            })
+                        })
+                    })
+                } else {
+                    None
+                };
+                stale.unwrap_or(Response::Error { message: msg, code })
             }
         }
     }
@@ -13901,7 +13941,6 @@ mod tests {
         /// a *retriable* ChunkStale ("not yet — re-resolve and back off"), never a
         /// hard IOError. This test forces exactly those conditions.
         #[tokio::test]
-        #[ignore = "pending B-fix: read-time ghost base must return retriable ChunkStale, not NotFound"]
         async fn chunk_seq_gap_onto_ghost_base_is_retriable_not_hard_eio() {
             let h = make_overlay_test_harness();
             let file_id = dfs_common::FileId::new();

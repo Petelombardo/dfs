@@ -3686,6 +3686,11 @@ impl Server {
     /// Handle an incoming request message
     pub async fn handle_request(&self, request: Request) -> Response {
         match request {
+            // Liveness probe — answered before touching any lock, map, or disk, so
+            // it stays accurate as a "still processing?" signal even if some
+            // subsystem is contended. A node that can't reach this arm (all workers
+            // parked, as in the 2026-07-19 gluster3 wedge) is a genuine black hole.
+            Request::Ping => Response::Pong,
             Request::ReadChunk { chunk_id, sequential_hint, client_write_seq } => {
                 self.ops_tracker.inc_read();
                 if let Some((idx, total)) = sequential_hint {

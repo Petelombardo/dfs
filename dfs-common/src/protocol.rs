@@ -90,6 +90,14 @@ fn default_true() -> bool { true }
 /// Request types sent between nodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
+    /// Liveness probe. Deliberately payload-free and answered at the very top of
+    /// the request dispatch, before any lock or map access, so it is the cheapest
+    /// possible "are you actually processing requests?" check. Used by the
+    /// black-hole tripwire (a normal request outstanding past ~5s fires a Ping on
+    /// a fresh connection): a healthy-but-slow node still answers Pong instantly,
+    /// a wedged node — every worker parked, port still LISTENing — cannot, which
+    /// is what distinguishes "slow" from "hung" without guessing from a timeout.
+    Ping,
     /// Read a chunk
     ReadChunk {
         chunk_id: ChunkId,
@@ -768,6 +776,8 @@ pub enum Request {
 /// Response types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
+    /// Reply to a Ping liveness probe. Payload-free — its mere arrival is the signal.
+    Pong,
     /// Success with optional data
     Ok {
         data: Option<Vec<u8>>,

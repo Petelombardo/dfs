@@ -33,11 +33,14 @@ struct NodeHealth {
     /// Exponential back-off level (capped).  Each new failure while already
     /// penalized doubles the probe interval up to MAX_PROBE_SECS.
     backoff_level: u32,
+    /// Last time a liveness probe (Ping) was launched for this node — single-flights
+    /// the probe so concurrent failing requests don't each fire one.
+    last_probe_at: Option<std::time::Instant>,
 }
 
 impl NodeHealth {
     fn new() -> Self {
-        Self { consecutive_failures: 0, penalized_until: None, backoff_level: 0 }
+        Self { consecutive_failures: 0, penalized_until: None, backoff_level: 0, last_probe_at: None }
     }
 
     fn is_penalized(&self) -> bool {
@@ -132,6 +135,47 @@ impl NodeHealthTracker {
                 addr, secs, consecutive_failures
             );
         }
+    }
+
+    /// Consecutive failures that make a node "suspicious" enough to spend a
+    /// liveness probe on. Deliberately above 1 so a single blip never probes, and
+    /// well below PENALTY_THRESHOLD so a confirmed black hole is shed long before
+    /// the 5-failure blind breaker would trip.
+    const PROBE_AFTER_FAILURES: u32 = 2;
+
+    /// Single-flight gate: returns true (and records the attempt) if `addr` is
+    /// suspicious enough to warrant a liveness probe and none was launched
+    /// recently. Marking `last_probe_at` here — under the shard lock — is what
+    /// stops N concurrent failing requests from each firing their own probe.
+    pub async fn claim_probe(&self, addr: SocketAddr) -> bool {
+        let mut h = self.inner.entry(addr).or_insert_with(NodeHealth::new);
+        if h.consecutive_failures < Self::PROBE_AFTER_FAILURES || h.is_penalized() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if let Some(t) = h.last_probe_at {
+            if now.duration_since(t) < Duration::from_secs(2) {
+                return false;
+            }
+        }
+        h.last_probe_at = Some(now);
+        true
+    }
+
+    /// A liveness probe confirmed `addr` is unreachable (a black hole: TCP up but
+    /// not answering even a Ping). Penalize immediately instead of waiting for
+    /// PENALTY_THRESHOLD blind timeouts, so replica selection sheds it now and the
+    /// write path's candidate-widening reroutes around it within seconds.
+    pub async fn hard_penalize(&self, addr: SocketAddr) {
+        let mut h = self.inner.entry(addr).or_insert_with(NodeHealth::new);
+        h.consecutive_failures = h.consecutive_failures.max(Self::PENALTY_THRESHOLD);
+        let secs = (Self::BASE_PROBE_SECS << h.backoff_level).min(Self::MAX_PROBE_SECS);
+        h.penalized_until = Some(std::time::Instant::now() + Duration::from_secs(secs));
+        if h.backoff_level < 8 {
+            h.backoff_level += 1;
+        }
+        drop(h);
+        warn!("Node {} hard-penalized for {}s (liveness probe failed — confirmed unreachable)", addr, secs);
     }
 
     /// Returns true if `addr` is currently in a penalty period.
@@ -1414,6 +1458,50 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// No concurrency limiting happens here — callers needing a per-node or
     /// per-(file, node) cap (e.g. range_fetch_permit_for) must acquire it themselves
     /// before calling this.
+    /// Single-flight liveness probe: if `addr` is suspicious (>= PROBE_AFTER_FAILURES
+    /// consecutive failures) and none was launched recently, open a FRESH connection
+    /// and send a Ping with a tight budget. On failure, hard-penalize immediately so
+    /// the node is shed at once instead of after PENALTY_THRESHOLD blind timeouts;
+    /// on success, leave the soft failure state alone (the node is slow, not hung).
+    ///
+    /// A fresh connection on purpose — the pooled one may be stuck behind the very
+    /// request that just timed out. Handshake, not a duration guess: a healthy-but-
+    /// loaded node still answers Pong in ~1s, a wedged node (all workers parked, port
+    /// still LISTENing — the 2026-07-19 gluster3 black hole) cannot.
+    async fn confirm_liveness_or_penalize(&self, addr: SocketAddr) {
+        if !self.node_health.claim_probe(addr).await {
+            return;
+        }
+        let alive = {
+            let probe = async {
+                let mut s = TcpStream::connect(addr).await.ok()?;
+                let _ = s.set_nodelay(true);
+                let env = MessageEnvelope::new(
+                    RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst)),
+                    Message::Request(Request::Ping),
+                );
+                let encoded = env.to_bytes().ok()?;
+                let len = encoded.len() as u32;
+                s.write_all(&len.to_be_bytes()).await.ok()?;
+                s.write_all(&encoded).await.ok()?;
+                s.flush().await.ok()?;
+                let mut len_buf = [0u8; 4];
+                s.read_exact(&mut len_buf).await.ok()?;
+                let rlen = u32::from_be_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; rlen];
+                s.read_exact(&mut buf).await.ok()?;
+                let resp = MessageEnvelope::from_bytes(&buf).ok()?;
+                Some(matches!(resp.message, Message::Response(Response::Pong)))
+            };
+            matches!(tokio::time::timeout(Duration::from_secs(1), probe).await, Ok(Some(true)))
+        };
+        if alive {
+            debug!("Liveness probe to {} OK — slow but alive, not penalizing", addr);
+        } else {
+            self.node_health.hard_penalize(addr).await;
+        }
+    }
+
     async fn send_request(&self, addr: SocketAddr, request: Request) -> Result<Response> {
         // Fail instantly against a node already known to be bad, instead of paying a
         // full connect-attempt + retry-connect-attempt + timeout cycle on every single
@@ -1581,6 +1669,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                     Err(_) => {
                         self.node_health.record_failure(addr).await;
+                        // Read timed out after the connection succeeded — the exact
+                        // black-hole signature. Confirm with a Ping and shed the node
+                        // fast if it's genuinely hung (single-flight, only if suspicious).
+                        self.confirm_liveness_or_penalize(addr).await;
                         return Err(anyhow::anyhow!("Timeout reading chunk from {}", addr));
                     }
                 }
@@ -1630,6 +1722,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                     }
                     Err(_) => {
                         self.node_health.record_failure(addr).await;
+                        // Read timed out after the connection succeeded — the exact
+                        // black-hole signature. Confirm with a Ping and shed the node
+                        // fast if it's genuinely hung (single-flight, only if suspicious).
+                        self.confirm_liveness_or_penalize(addr).await;
                         return Err(anyhow::anyhow!("Timeout reading chunk from {}", addr));
                     }
                 }

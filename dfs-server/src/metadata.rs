@@ -325,6 +325,31 @@ pub struct MetadataStore {
     /// committer_tx()/commit_worker_loop() for the design and the invariant that
     /// nothing may submit an op and wait on its reply while holding db.write().
     committer: OnceLock<tokio::sync::mpsc::Sender<MetaWriteOp>>,
+    /// Accumulated group-commit queue-depth/commit-duration stats since the last
+    /// [META COMMITTER] log line — see CommitterStats and commit_worker_loop.
+    /// Added 2026-07-19 while chasing a write-latency trend (client-observed
+    /// per-write latency climbing 2-3x over a single sustained-write session)
+    /// that couldn't be explained by any in-memory structure's size (chunk_map,
+    /// pending_patch_ids etc. are all O(1) DashMap point access; PATCH_STATE
+    /// tables are O(log n) redb B-tree ops) — the one place left that could show
+    /// genuine queueing-delay growth under sustained concurrent load (this
+    /// install + healing + fold completions all funnel through one committer
+    /// thread) had no visibility at all. This makes that visible directly instead
+    /// of inferring it from client-side write timing.
+    committer_stats: Mutex<CommitterStats>,
+}
+
+/// See MetadataStore::committer_stats' doc comment. Reset to defaults every time
+/// commit_worker_loop flushes a [META COMMITTER] log line (period-based, not
+/// count-based, so the log stays useful under both light and heavy load).
+#[derive(Default)]
+struct CommitterStats {
+    batches: u64,
+    ops: u64,
+    max_queue_depth: usize,
+    total_commit_ms: f64,
+    max_commit_ms: f64,
+    last_log: Option<std::time::Instant>,
 }
 
 impl MetadataStore {
@@ -429,6 +454,7 @@ impl MetadataStore {
             dirty_paths: Mutex::new(std::collections::HashSet::new()),
             txn_stats: Mutex::new(std::collections::HashMap::new()),
             committer: OnceLock::new(),
+            committer_stats: Mutex::new(CommitterStats::default()),
         })
     }
 
@@ -537,8 +563,42 @@ impl MetadataStore {
                     Err(_) => break,
                 }
             }
+            // Depth of what's still queued behind this batch, captured before
+            // apply_ops_group runs — see committer_stats' doc comment for why.
+            let queue_depth = rx.len();
+            let batch_size = ops.len();
             let Some(store) = store.upgrade() else { return };
+            let commit_start = std::time::Instant::now();
             store.apply_ops_group(ops);
+            let commit_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
+            store.record_committer_stats(batch_size, queue_depth, commit_ms);
+        }
+    }
+
+    /// Accumulate one batch's stats and flush a [META COMMITTER] summary line
+    /// every ~5s (period-based, not per-batch — a busy committer can process
+    /// hundreds of batches/sec, and per-batch logging is exactly the "log file
+    /// grew to 1GB in 3 hours" mistake this project already made once with
+    /// per-op PUT logging). See committer_stats' doc comment for why this exists.
+    fn record_committer_stats(&self, batch_size: usize, queue_depth: usize, commit_ms: f64) {
+        const LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut stats = self.committer_stats.lock().unwrap();
+        stats.batches += 1;
+        stats.ops += batch_size as u64;
+        stats.max_queue_depth = stats.max_queue_depth.max(queue_depth);
+        stats.total_commit_ms += commit_ms;
+        stats.max_commit_ms = stats.max_commit_ms.max(commit_ms);
+
+        let now = std::time::Instant::now();
+        let last = *stats.last_log.get_or_insert(now);
+        if now.duration_since(last) >= LOG_INTERVAL {
+            let avg_batch = stats.ops as f64 / stats.batches as f64;
+            let avg_commit_ms = stats.total_commit_ms / stats.batches as f64;
+            info!(
+                "[META COMMITTER] batches={} ops={} avg_batch_size={:.1} max_queue_depth={} avg_commit_ms={:.2} max_commit_ms={:.2}",
+                stats.batches, stats.ops, avg_batch, stats.max_queue_depth, avg_commit_ms, stats.max_commit_ms,
+            );
+            *stats = CommitterStats { last_log: Some(now), ..Default::default() };
         }
     }
 

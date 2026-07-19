@@ -4,9 +4,12 @@ use lru::LruCache;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Per-process counter for unique temp file names — avoids races when
@@ -17,6 +20,114 @@ static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// that need a unique temp file name in the same directory as a chunk.
 pub fn next_write_seq() -> u64 {
     WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Group-commit for chunk-data durability, enabled by `DFS_DURABILITY_COALESCE`.
+///
+/// Background (2026-07-19, VM-111 install profiling): the storage NVMe on the
+/// gluster nodes has a volatile write cache with no power-loss protection, so a
+/// single `fdatasync`/`syncfs` costs ~21ms (a full drive cache-flush to NAND) —
+/// measured identically on a busy replica and an idle node, i.e. it's the raw
+/// device floor, ~48 durable-flushes/sec. Every chunk write did its *own*
+/// `File::sync_all` (write_chunk) or `sync_data` (patch-delta append), so a
+/// fsync-heavy workload (a Debian install issues ~45 guest fsync/sec, fully
+/// serialized) plus the node's concurrent healing / fold / replica / metadata
+/// durability all issued *independent* flushes and saturated that ~48/sec budget,
+/// inflating client-observed flush latency 2-3x under load.
+///
+/// The physical fact this exploits: one `syncfs()` makes *all* dirty data on the
+/// filesystem durable at once — so issuing more than one flush per ~21ms window
+/// on the same device is pure waste. This coalescer routes every durability
+/// consumer through a single per-device flush worker: a lone waiter flushes
+/// immediately (no added latency vs. a direct fsync), and under load one `syncfs`
+/// satisfies the whole accumulated batch. Durability is identical-or-stronger —
+/// `syncfs` also persists the chunk `rename` (directory entry), which the old
+/// per-file `sync_all`/`sync_data`-then-rename left in the page cache.
+///
+/// Mirrors the existing metadata group-committer (see metadata.rs
+/// commit_worker_loop): a blocking mpsc of per-waiter reply channels, drained and
+/// batched by one worker. Kept blocking (a dedicated OS thread, std mpsc) rather
+/// than async because every call site is already inside `spawn_blocking` doing
+/// synchronous file I/O.
+pub struct DurabilityCoalescer {
+    tx: mpsc::Sender<mpsc::Sender<Result<(), String>>>,
+}
+
+impl DurabilityCoalescer {
+    /// Open a long-lived fd on `data_dir` (any fd on the target filesystem works
+    /// for `syncfs`) and spawn the flush worker.
+    pub fn new(data_dir: &Path) -> std::io::Result<Arc<Self>> {
+        let dir = fs::File::open(data_dir)?;
+        let (tx, rx) = mpsc::channel::<mpsc::Sender<Result<(), String>>>();
+        std::thread::Builder::new()
+            .name("durability-coalescer".into())
+            .spawn(move || {
+                let fd = dir.as_raw_fd(); // `dir` is kept alive by this closure for the fd's lifetime
+                let mut stat_batches: u64 = 0;
+                let mut stat_waiters: u64 = 0;
+                let mut stat_total_ms: f64 = 0.0;
+                let mut stat_max_ms: f64 = 0.0;
+                let mut last_log = Instant::now();
+                loop {
+                    // Block until at least one waiter arrives, then drain everything
+                    // already queued so a single syncfs covers the whole batch. A lone
+                    // waiter (serial / low load) proceeds immediately — no batching
+                    // delay; coalescing only kicks in when writes are already piled up.
+                    let first = match rx.recv() {
+                        Ok(w) => w,
+                        Err(_) => break, // all senders dropped — shutting down
+                    };
+                    let mut batch = vec![first];
+                    while let Ok(w) = rx.try_recv() {
+                        batch.push(w);
+                    }
+                    let flush_start = Instant::now();
+                    let rc = unsafe { libc::syncfs(fd) };
+                    let ms = flush_start.elapsed().as_secs_f64() * 1000.0;
+                    let result = if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!("syncfs failed: {}", std::io::Error::last_os_error()))
+                    };
+                    stat_batches += 1;
+                    stat_waiters += batch.len() as u64;
+                    stat_total_ms += ms;
+                    stat_max_ms = stat_max_ms.max(ms);
+                    for w in batch {
+                        let _ = w.send(result.clone());
+                    }
+                    // Period-based summary (not per-batch — a saturated worker runs
+                    // ~48 batches/sec), same discipline as [META COMMITTER].
+                    if last_log.elapsed().as_secs() >= 5 {
+                        info!(
+                            "[DURABILITY] syncfs_batches={} waiters={} avg_batch={:.1} avg_syncfs_ms={:.1} max_syncfs_ms={:.1}",
+                            stat_batches, stat_waiters,
+                            stat_waiters as f64 / stat_batches as f64,
+                            stat_total_ms / stat_batches as f64,
+                            stat_max_ms,
+                        );
+                        stat_batches = 0;
+                        stat_waiters = 0;
+                        stat_total_ms = 0.0;
+                        stat_max_ms = 0.0;
+                        last_log = Instant::now();
+                    }
+                }
+            })?;
+        Ok(Arc::new(Self { tx }))
+    }
+
+    /// Block until the caller's already-written data is durable on stable storage.
+    /// Must be called *after* the file write/append (and rename) so the pages are
+    /// dirty before the worker's syncfs runs.
+    pub fn sync_durable(&self) -> Result<(), String> {
+        let (dtx, drx) = mpsc::channel();
+        self.tx
+            .send(dtx)
+            .map_err(|_| "durability coalescer worker gone".to_string())?;
+        drx.recv()
+            .map_err(|_| "durability coalescer dropped reply".to_string())?
+    }
 }
 
 /// Local chunk storage manager
@@ -38,6 +149,11 @@ pub struct ChunkStorage {
     /// walk; Some(set) thereafter, kept correct incrementally by write_chunk /
     /// delete_chunk rather than ever being invalidated wholesale.
     list_chunks_cache: Mutex<Option<std::collections::HashSet<ChunkId>>>,
+
+    /// Present only when `DFS_DURABILITY_COALESCE` is set: routes every durable
+    /// chunk write through one per-device syncfs worker instead of a per-write
+    /// fsync. See DurabilityCoalescer. None = legacy per-file sync behavior.
+    coalescer: Option<Arc<DurabilityCoalescer>>,
 }
 
 impl ChunkStorage {
@@ -60,12 +176,51 @@ impl ChunkStorage {
             cache_capacity_chunks
         );
 
+        // Opt-in group-commit for chunk durability. Falls back to legacy per-file
+        // sync if the flag is unset or the coalescer can't open the data dir.
+        let coalescer = if std::env::var("DFS_DURABILITY_COALESCE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            match DurabilityCoalescer::new(&data_dir) {
+                Ok(c) => {
+                    info!("Durability coalescing ENABLED (per-device syncfs group-commit)");
+                    Some(c)
+                }
+                Err(e) => {
+                    warn!("DFS_DURABILITY_COALESCE set but coalescer init failed ({}); using per-file sync", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             data_dir,
             cache,
             cache_capacity_chunks,
             list_chunks_cache: Mutex::new(None),
+            coalescer,
         })
+    }
+
+    /// True when chunk writes route durability through the shared syncfs worker
+    /// (see DurabilityCoalescer) rather than doing their own per-file fsync.
+    pub fn coalescing_enabled(&self) -> bool {
+        self.coalescer.is_some()
+    }
+
+    /// Make all pending chunk writes on this device durable via the shared syncfs
+    /// worker. Callers that wrote+renamed a chunk file *outside* write_chunk (e.g.
+    /// the patch-delta append path) call this in place of their own fsync. A no-op
+    /// error-free return when coalescing is disabled — those callers keep doing
+    /// their own sync in that case, so this should only be reached when enabled.
+    pub fn sync_durable(&self) -> Result<()> {
+        match &self.coalescer {
+            Some(c) => c.sync_durable().map_err(|e| anyhow::anyhow!(e)),
+            None => Ok(()),
+        }
     }
 
     /// Calculate optimal cache size based on the shared server cache budget.
@@ -139,14 +294,31 @@ impl ChunkStorage {
             .context("Failed to write chunk data")?;
 
         let sync_start = std::time::Instant::now();
-        file.sync_all().context("Failed to sync chunk data")?;
-        let sync_time = sync_start.elapsed();
-
-        // Atomic rename
-        let rename_start = std::time::Instant::now();
-        fs::rename(&temp_path, &path)
-            .with_context(|| format!("Failed to rename chunk file: {:?}", path))?;
-        let rename_time = rename_start.elapsed();
+        let (sync_time, rename_time) = match &self.coalescer {
+            // Legacy path: sync this file's data, then rename. Unchanged behavior.
+            None => {
+                file.sync_all().context("Failed to sync chunk data")?;
+                let sync_time = sync_start.elapsed();
+                let rename_start = std::time::Instant::now();
+                fs::rename(&temp_path, &path)
+                    .with_context(|| format!("Failed to rename chunk file: {:?}", path))?;
+                (sync_time, rename_start.elapsed())
+            }
+            // Coalesced path: rename first, then a single shared syncfs makes both
+            // the data and the rename durable together (see DurabilityCoalescer).
+            // We don't return to the caller as "durable" until that flush completes.
+            Some(coalescer) => {
+                drop(file);
+                let rename_start = std::time::Instant::now();
+                fs::rename(&temp_path, &path)
+                    .with_context(|| format!("Failed to rename chunk file: {:?}", path))?;
+                let rename_time = rename_start.elapsed();
+                let flush_start = std::time::Instant::now();
+                coalescer.sync_durable().map_err(|e| anyhow::anyhow!(e))
+                    .context("Failed to sync chunk data (coalesced)")?;
+                (flush_start.elapsed(), rename_time)
+            }
+        };
 
         let total_time = start.elapsed();
         debug!("Wrote chunk {} ({} bytes) in {:?} - checksum: {:?}, mkdir: {:?}, sync: {:?}, rename: {:?}",

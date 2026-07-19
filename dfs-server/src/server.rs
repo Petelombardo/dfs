@@ -9309,13 +9309,21 @@ impl Server {
                     let mut f = std::fs::OpenOptions::new().append(true).open(&prior_path)
                         .map_err(|e| format!("Failed to open prior delta for append: {}", e))?;
                     f.write_all(&append_bytes).map_err(|e| format!("Failed to append patch delta: {}", e))?;
-                    f.sync_data().map_err(|e| format!("Failed to sync appended delta: {}", e))?;
+                    // Legacy path syncs this file before rename; coalesced path renames
+                    // first and lets one shared syncfs persist both the appended data
+                    // and the rename together (see DurabilityCoalescer / write_chunk).
+                    if !storage.coalescing_enabled() {
+                        f.sync_data().map_err(|e| format!("Failed to sync appended delta: {}", e))?;
+                    }
                     drop(f);
                     let new_path = storage.get_chunk_path(&delta_chunk_id);
                     if let Some(parent) = new_path.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create chunk directory: {}", e))?;
                     }
                     std::fs::rename(&prior_path, &new_path).map_err(|e| format!("Failed to rename appended delta: {}", e))?;
+                    if storage.coalescing_enabled() {
+                        storage.sync_durable().map_err(|e| format!("Failed to sync appended delta (coalesced): {}", e))?;
+                    }
                     Ok(())
                 }).await
                     .map_err(|e| (format!("spawn_blocking panicked appending patch delta: {}", e), ErrorCode::InternalError))?

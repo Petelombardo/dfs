@@ -4301,7 +4301,11 @@ impl Server {
                 #[cfg(target_os = "linux")]
                 unsafe { libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, (2i64 << 13) | 7i64); }
 
-                let result = storage.write_chunk(&chunk_id, &data);
+                // Background heal write: linger to batch this syncfs with other heal
+                // writes (and ride client foreground flushes for free). This is the
+                // authoritative heal path — `background` is set by the healer's
+                // ReplicateChunk/PushChunkTo, never by a client write. See DurabilityClass.
+                let result = storage.write_chunk_prio(&chunk_id, &data, DurabilityClass::Background);
 
                 #[cfg(target_os = "linux")]
                 unsafe { libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, old_prio); }
@@ -8955,14 +8959,11 @@ impl Server {
             }
             let storage = self.storage.clone();
             let data_for_write = data.clone();
-            // Background durability: this is healer repair, not a client-facing write.
-            // write_chunk_prio(Background) lingers to batch its syncfs with other heal
-            // writes, then blocks until that flush is *confirmed* — so a failed flush
-            // makes write_ok false and the chunk is re-healed rather than silently
-            // declared restored. The peer fetch above (send_message) has already
-            // returned its connection to the pool, so this wait holds only a background
-            // worker thread, never a connection. See DurabilityClass.
-            let write_ok = tokio::task::spawn_blocking(move || storage.write_chunk_prio(&chunk_id, &data_for_write, DurabilityClass::Background))
+            // Foreground durability: this self-heal is reached from apply_patch (a
+            // client patch that needs a locally-missing base chunk), so a client is
+            // blocked on it — it must NOT linger. The authoritative background heal
+            // path is handle_write_chunk's `background` branch, not this one.
+            let write_ok = tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data_for_write))
                 .await
                 .map(|r| r.is_ok())
                 .unwrap_or(false);

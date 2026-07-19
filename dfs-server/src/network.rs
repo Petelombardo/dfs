@@ -503,8 +503,20 @@ async fn process_message<H: MessageHandler>(
 pub struct NetworkClient {
     /// Request ID counter
     next_request_id: Arc<AtomicU64>,
-    /// Idle connection pool: per-peer queue of reusable TcpStreams (cap 8 per peer)
-    pool: Arc<DashMap<SocketAddr, Mutex<VecDeque<TcpStream>>>>,
+    /// Idle connection pool: per-peer queue of reusable TcpStreams (cap 8 per peer).
+    ///
+    /// The per-peer `Mutex<VecDeque>` is `Arc`-wrapped so callers can clone the Arc
+    /// out and DROP the DashMap shard guard (`get`/`entry` Ref) *before* awaiting
+    /// `.lock()`. Holding a DashMap guard across an `.await` is what wedged
+    /// gluster3 on 2026-07-19: a shard guard held across `entry.lock().await` while
+    /// a peer was a black hole (TCP up, never replies) parked the holder, every
+    /// other `send_message_inner` piled onto that shard's `lock_exclusive_slow`,
+    /// and the whole tokio worker pool drained (0% CPU, all threads futex_wait) —
+    /// which then froze both FUSE clients. DashMap shards are shared across many
+    /// peer addresses, so one stuck peer jams every peer hashing to its shard.
+    /// (68c3bee moved the slow `shutdown().await` out of the guard but left the
+    /// `entry.lock().await` under it; Arc-ing the inner Mutex closes both paths.)
+    pool: Arc<DashMap<SocketAddr, Arc<Mutex<VecDeque<TcpStream>>>>>,
 }
 
 impl NetworkClient {
@@ -548,10 +560,13 @@ impl NetworkClient {
 
         // Try a pooled connection first; fall back to a fresh one if the pool is empty
         // or the connection has gone stale (detected by write/read failure).
-        let stream = if let Some(entry) = self.pool.get(&target) {
-            entry.lock().await.pop_front()
-        } else {
-            None
+        // Clone the Arc<Mutex> out and drop the DashMap shard guard BEFORE awaiting
+        // `.lock()` — never hold a DashMap guard across an `.await` (see the `pool`
+        // field's doc comment for the black-hole wedge this prevents).
+        let pool_slot = self.pool.get(&target).map(|entry| entry.value().clone());
+        let stream = match pool_slot {
+            Some(slot) => slot.lock().await.pop_front(),
+            None => None,
         };
 
         let mut stream = match stream {
@@ -655,11 +670,15 @@ impl NetworkClient {
         // other target hashing to the same shard, which starves the whole node's tokio
         // worker pool once enough concurrent callers pile up on it (root cause of the
         // 2026-07-18 gluster2/gluster3 wedge during post-power-failure mass healing).
+        // Clone the Arc<Mutex> out and drop the DashMap shard guard BEFORE awaiting
+        // `.lock()` — same rule as the acquisition path above (see `pool` doc).
+        let slot = self.pool
+            .entry(target)
+            .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
+            .value()
+            .clone();
         let stream_to_close = {
-            let entry = self.pool
-                .entry(target)
-                .or_insert_with(|| Mutex::new(VecDeque::new()));
-            let mut queue = entry.lock().await;
+            let mut queue = slot.lock().await;
             if queue.len() < 8 {
                 queue.push_back(stream);
                 None

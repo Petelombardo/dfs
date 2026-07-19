@@ -117,7 +117,7 @@ deploy_dfs_client() {
 
 # ─── all: stop clients first so old binary never talks to a mixed-version cluster
 if [ "$1" == "all" ]; then
-	for i in nanopir3 rock5b; do
+	for i in nanopir3 rock5b 10.25.1.80; do
 		echo "--- Stopping $i ---"
 		mp=$(get_dfs_mountpoint "$i")
 		containers=$(get_dfs_containers "$i" "$mp")

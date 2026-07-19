@@ -115,15 +115,26 @@ deploy_dfs_client() {
 	fi
 }
 
+# Client hosts, defined once so the stop phase (below) and the deploy phase
+# (further down) can never drift out of sync — an earlier version listed
+# 10.25.1.80 in the stop loop but not the deploy loop, which would stop that
+# node and never bring it back up on an `all` run.
+CLIENT_HOSTS="nanopir3 rock5b 10.25.1.80"
+
+# sanitize_varname <host> — hostnames/IPs used as shell variable names must
+# contain only [A-Za-z0-9_]. Replace both '.' (IPs) and '-' (hostnames) with '_'.
+# ${i//-/_} alone left the dots in an IP, producing an invalid name.
+sanitize_varname() { echo "containers_${1//[.-]/_}"; }
+
 # ─── all: stop clients first so old binary never talks to a mixed-version cluster
 if [ "$1" == "all" ]; then
-	for i in nanopir3 rock5b 10.25.1.80; do
+	for i in $CLIENT_HOSTS; do
 		echo "--- Stopping $i ---"
 		mp=$(get_dfs_mountpoint "$i")
 		containers=$(get_dfs_containers "$i" "$mp")
 		stop_dfs_client "$i" "$containers"
 		# Stash container list in a per-host variable for the restart phase.
-		eval "containers_${i//-/_}='$containers'"
+		eval "$(sanitize_varname "$i")='$containers'"
 		echo ""
 	done
 	echo ""
@@ -156,7 +167,7 @@ fi
 
 # ─── client update ────────────────────────────────────────────────────────────
 if [ "$1" == "all" ] || [ "$1" == "client" ]; then
-	for i in nanopir3 rock5b; do
+	for i in $CLIENT_HOSTS; do
 		echo "=== Deploying client to $i ==="
 
 		if [ "$1" == "client" ]; then
@@ -167,7 +178,7 @@ if [ "$1" == "all" ] || [ "$1" == "client" ]; then
 			sleep 1
 		else
 			# all mode: containers already stopped above; retrieve stashed list.
-			varname="containers_${i//-/_}"
+			varname="$(sanitize_varname "$i")"
 			containers="${!varname}"
 			sleep 1
 		fi

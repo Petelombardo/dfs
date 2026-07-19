@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Per-process counter for unique temp file names — avoids races when
@@ -49,8 +49,44 @@ pub fn next_write_seq() -> u64 {
 /// batched by one worker. Kept blocking (a dedicated OS thread, std mpsc) rather
 /// than async because every call site is already inside `spawn_blocking` doing
 /// synchronous file I/O.
+///
+/// Two durability classes (2026-07-19 refinement — see DurabilityClass). Both
+/// block for a real durability confirmation (Ok/Err from the actual syncfs); the
+/// class controls only *when* the worker flushes:
+/// * `Foreground` (client-facing writes) flush *immediately* — a lone client
+///   flush never waits for a car-pool, because the workload that produces them
+///   (a serial guest install) issues write N+1 only after N is durable, so
+///   there's never a second foreground waiter to batch with anyway.
+/// * `Background` (healer repair writes) hold up to `linger` to gather a batch of
+///   other background writers into one shared syncfs, but any foreground arrival
+///   "calls the bus" and flushes everyone at once. The caller still blocks until
+///   that syncfs confirms — so a failed flush is surfaced and the heal retried,
+///   never silently dropped. This costs only a bounded background worker thread,
+///   *not* a network connection: the healer's peer fetch completes and returns
+///   its connection to the pool before the write begins (see pull_chunk_from_peers),
+///   so blocking here holds nothing that could cause network congestion. Because
+///   `syncfs` persists the whole filesystem, a foreground flush also makes pending
+///   background writes durable for free — heal work car-pools onto client flushes
+///   under load, and the linger only actually elapses when the cluster is idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurabilityClass {
+    /// Client-facing write: flush immediately, block until durable.
+    Foreground,
+    /// Background repair (healer): linger to batch, block until durable.
+    Background,
+}
+
+/// One durability request handed to the coalescer worker. Both classes block on
+/// `reply` for a real durability confirmation; `class` controls only *when* the
+/// worker flushes (Foreground immediately, Background after a short linger to
+/// batch with other background writers).
+struct FlushReq {
+    class: DurabilityClass,
+    reply: mpsc::Sender<Result<(), String>>,
+}
+
 pub struct DurabilityCoalescer {
-    tx: mpsc::Sender<mpsc::Sender<Result<(), String>>>,
+    tx: mpsc::Sender<FlushReq>,
 }
 
 impl DurabilityCoalescer {
@@ -58,29 +94,72 @@ impl DurabilityCoalescer {
     /// for `syncfs`) and spawn the flush worker.
     pub fn new(data_dir: &Path) -> std::io::Result<Arc<Self>> {
         let dir = fs::File::open(data_dir)?;
-        let (tx, rx) = mpsc::channel::<mpsc::Sender<Result<(), String>>>();
+        let (tx, rx) = mpsc::channel::<FlushReq>();
+        // How long a *background-only* batch waits to gather more writers before
+        // flushing. Only ever applies when no foreground write is present (a
+        // foreground arrival flushes immediately), and never delays the caller —
+        // background writes are fire-and-forget. So this bounds only how stale a
+        // healer write can be before its syncfs, when the cluster is otherwise
+        // idle; under real load, foreground flushes sweep background work far
+        // sooner. Tunable via DFS_DURABILITY_LINGER_MS.
+        let linger = Duration::from_millis(
+            std::env::var("DFS_DURABILITY_LINGER_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(1000),
+        );
         std::thread::Builder::new()
             .name("durability-coalescer".into())
             .spawn(move || {
                 let fd = dir.as_raw_fd(); // `dir` is kept alive by this closure for the fd's lifetime
                 let mut stat_batches: u64 = 0;
-                let mut stat_waiters: u64 = 0;
+                let mut stat_fg: u64 = 0;
+                let mut stat_bg: u64 = 0;
                 let mut stat_total_ms: f64 = 0.0;
                 let mut stat_max_ms: f64 = 0.0;
                 let mut last_log = Instant::now();
                 loop {
-                    // Block until at least one waiter arrives, then drain everything
-                    // already queued so a single syncfs covers the whole batch. A lone
-                    // waiter (serial / low load) proceeds immediately — no batching
-                    // delay; coalescing only kicks in when writes are already piled up.
+                    // Block until at least one request arrives.
                     let first = match rx.recv() {
-                        Ok(w) => w,
+                        Ok(r) => r,
                         Err(_) => break, // all senders dropped — shutting down
                     };
+                    let mut had_foreground = first.class == DurabilityClass::Foreground;
                     let mut batch = vec![first];
-                    while let Ok(w) = rx.try_recv() {
-                        batch.push(w);
+
+                    // Foreground "calls the bus" — flush immediately. A background-only
+                    // batch instead lingers up to `linger` to gather a car-pool, but a
+                    // foreground arrival during that window ends the wait at once (and
+                    // rides the same syncfs). No caller is blocked by this wait: the
+                    // foreground writer that would block hasn't arrived, and background
+                    // writers are fire-and-forget.
+                    if !had_foreground {
+                        let deadline = Instant::now() + linger;
+                        loop {
+                            let now = Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            match rx.recv_timeout(deadline - now) {
+                                Ok(r) => {
+                                    let is_fg = r.class == DurabilityClass::Foreground;
+                                    batch.push(r);
+                                    if is_fg {
+                                        had_foreground = true;
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
                     }
+
+                    // Sweep anything else already queued into the same flush.
+                    while let Ok(r) = rx.try_recv() {
+                        batch.push(r);
+                    }
+
                     let flush_start = Instant::now();
                     let rc = unsafe { libc::syncfs(fd) };
                     let ms = flush_start.elapsed().as_secs_f64() * 1000.0;
@@ -89,25 +168,35 @@ impl DurabilityCoalescer {
                     } else {
                         Err(format!("syncfs failed: {}", std::io::Error::last_os_error()))
                     };
+                    let (mut fg, mut bg) = (0u64, 0u64);
+                    for req in batch {
+                        match req.class {
+                            DurabilityClass::Foreground => fg += 1,
+                            DurabilityClass::Background => bg += 1,
+                        }
+                        let _ = req.reply.send(result.clone());
+                    }
                     stat_batches += 1;
-                    stat_waiters += batch.len() as u64;
+                    stat_fg += fg;
+                    stat_bg += bg;
                     stat_total_ms += ms;
                     stat_max_ms = stat_max_ms.max(ms);
-                    for w in batch {
-                        let _ = w.send(result.clone());
-                    }
                     // Period-based summary (not per-batch — a saturated worker runs
-                    // ~48 batches/sec), same discipline as [META COMMITTER].
+                    // ~48 batches/sec), same discipline as [META COMMITTER]. fg/bg split
+                    // shows whether coalescing is riding foreground flushes (fg-heavy) or
+                    // batching idle heal work (bg-heavy).
                     if last_log.elapsed().as_secs() >= 5 {
+                        let waiters = stat_fg + stat_bg;
                         info!(
-                            "[DURABILITY] syncfs_batches={} waiters={} avg_batch={:.1} avg_syncfs_ms={:.1} max_syncfs_ms={:.1}",
-                            stat_batches, stat_waiters,
-                            stat_waiters as f64 / stat_batches as f64,
+                            "[DURABILITY] syncfs_batches={} waiters={} fg={} bg={} avg_batch={:.1} avg_syncfs_ms={:.1} max_syncfs_ms={:.1}",
+                            stat_batches, waiters, stat_fg, stat_bg,
+                            waiters as f64 / stat_batches as f64,
                             stat_total_ms / stat_batches as f64,
                             stat_max_ms,
                         );
                         stat_batches = 0;
-                        stat_waiters = 0;
+                        stat_fg = 0;
+                        stat_bg = 0;
                         stat_total_ms = 0.0;
                         stat_max_ms = 0.0;
                         last_log = Instant::now();
@@ -117,13 +206,16 @@ impl DurabilityCoalescer {
         Ok(Arc::new(Self { tx }))
     }
 
-    /// Block until the caller's already-written data is durable on stable storage.
-    /// Must be called *after* the file write/append (and rename) so the pages are
-    /// dirty before the worker's syncfs runs.
-    pub fn sync_durable(&self) -> Result<(), String> {
+    /// Make the caller's already-written data durable on stable storage and block
+    /// until the shared syncfs confirms it. Must be called *after* the file
+    /// write/append (and rename) so the pages are dirty before the worker's syncfs
+    /// runs. Both classes get a real Ok/Err — `class` only changes flush *timing*
+    /// (see DurabilityClass): Foreground flushes now; Background lingers briefly to
+    /// batch with peers, then both block on the same confirmed flush.
+    pub fn sync_durable(&self, class: DurabilityClass) -> Result<(), String> {
         let (dtx, drx) = mpsc::channel();
         self.tx
-            .send(dtx)
+            .send(FlushReq { class, reply: dtx })
             .map_err(|_| "durability coalescer worker gone".to_string())?;
         drx.recv()
             .map_err(|_| "durability coalescer dropped reply".to_string())?
@@ -216,9 +308,9 @@ impl ChunkStorage {
     /// the patch-delta append path) call this in place of their own fsync. A no-op
     /// error-free return when coalescing is disabled — those callers keep doing
     /// their own sync in that case, so this should only be reached when enabled.
-    pub fn sync_durable(&self) -> Result<()> {
+    pub fn sync_durable(&self, class: DurabilityClass) -> Result<()> {
         match &self.coalescer {
-            Some(c) => c.sync_durable().map_err(|e| anyhow::anyhow!(e)),
+            Some(c) => c.sync_durable(class).map_err(|e| anyhow::anyhow!(e)),
             None => Ok(()),
         }
     }
@@ -260,8 +352,18 @@ impl ChunkStorage {
         final_cache
     }
 
-    /// Write a chunk to local storage
+    /// Write a chunk to local storage. Foreground durability (client-facing):
+    /// blocks until the write is durable. Background repair callers (the healer)
+    /// use `write_chunk_prio(..., DurabilityClass::Background)` instead.
     pub fn write_chunk(&self, chunk_id: &ChunkId, data: &[u8]) -> Result<()> {
+        self.write_chunk_prio(chunk_id, data, DurabilityClass::Foreground)
+    }
+
+    /// Write a chunk with an explicit durability class. See DurabilityClass: both
+    /// block until the write is confirmed durable; `Background` first lingers to
+    /// batch its syncfs with other background writers (and never holds a network
+    /// connection while doing so — the healer's fetch is already done by then).
+    pub fn write_chunk_prio(&self, chunk_id: &ChunkId, data: &[u8], class: DurabilityClass) -> Result<()> {
         let start = std::time::Instant::now();
         // Note: chunk_id.hash is now compute_chunk_hash_at(data, file_offset) — a
         // position-aware hash — so we cannot re-derive it here without knowing the
@@ -314,7 +416,7 @@ impl ChunkStorage {
                     .with_context(|| format!("Failed to rename chunk file: {:?}", path))?;
                 let rename_time = rename_start.elapsed();
                 let flush_start = std::time::Instant::now();
-                coalescer.sync_durable().map_err(|e| anyhow::anyhow!(e))
+                coalescer.sync_durable(class).map_err(|e| anyhow::anyhow!(e))
                     .context("Failed to sync chunk data (coalesced)")?;
                 (flush_start.elapsed(), rename_time)
             }

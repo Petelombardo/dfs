@@ -4,7 +4,7 @@ use crate::healing::HealingManager;
 use crate::metadata::{MetadataStore, PatchState, PutFileResult};
 use crate::network::{MessageHandler, NetworkClient};
 use crate::stats::OpsTracker;
-use crate::storage::ChunkStorage;
+use crate::storage::{ChunkStorage, DurabilityClass};
 use anyhow::{Context, Result};
 use dfs_common::{
     ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
@@ -8955,7 +8955,14 @@ impl Server {
             }
             let storage = self.storage.clone();
             let data_for_write = data.clone();
-            let write_ok = tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data_for_write))
+            // Background durability: this is healer repair, not a client-facing write.
+            // write_chunk_prio(Background) lingers to batch its syncfs with other heal
+            // writes, then blocks until that flush is *confirmed* — so a failed flush
+            // makes write_ok false and the chunk is re-healed rather than silently
+            // declared restored. The peer fetch above (send_message) has already
+            // returned its connection to the pool, so this wait holds only a background
+            // worker thread, never a connection. See DurabilityClass.
+            let write_ok = tokio::task::spawn_blocking(move || storage.write_chunk_prio(&chunk_id, &data_for_write, DurabilityClass::Background))
                 .await
                 .map(|r| r.is_ok())
                 .unwrap_or(false);
@@ -9322,7 +9329,8 @@ impl Server {
                     }
                     std::fs::rename(&prior_path, &new_path).map_err(|e| format!("Failed to rename appended delta: {}", e))?;
                     if storage.coalescing_enabled() {
-                        storage.sync_durable().map_err(|e| format!("Failed to sync appended delta (coalesced): {}", e))?;
+                        // Client-facing patch write — block for durability.
+                        storage.sync_durable(DurabilityClass::Foreground).map_err(|e| format!("Failed to sync appended delta (coalesced): {}", e))?;
                     }
                     Ok(())
                 }).await

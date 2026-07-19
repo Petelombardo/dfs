@@ -12140,6 +12140,110 @@ mod tests {
         assert!(chunk_to_file.get(&middle.chunk_id).is_none(), "superseded chunk_id must not remain in chunk_to_file");
     }
 
+    /// L1 invariant (2026-07-19 ghost-clobber fix): once the healer preserves the
+    /// healed chunk's real seq instead of registering `None` (see healing.rs L1
+    /// edits), a *current* chunk always carries its seq — so a stale broadcast of an
+    /// older, already-folded chunk_id (lower seq) loses the precedence contest cleanly
+    /// via the `(Some,Some) => inc >= ext` arm and can never revert the slot to a
+    /// ghost. Before L1 the current could be `None` and lose to the stale `Some` (the
+    /// VM-111 install EIO). This asserts the end-state L1 guarantees, in BOTH arrival
+    /// orders. Pairs with chunk_map_precedence_is_order_independent_across_arrival_permutations.
+    #[test]
+    fn seqd_current_survives_stale_seqd_broadcast_either_order() {
+        let node = dfs_common::NodeId::new();
+        let current_hash = compute_chunk_hash(b"current-chunk-seq150-content");
+        let stale_hash = compute_chunk_hash(b"stale-old-chunk-seq104-ghost");
+        let current = ChunkLocation {
+            chunk_id: ChunkId::from_hash(current_hash), nodes: vec![node], size: 4096,
+            checksum: current_hash, file_offset: Some(0),
+            // L1: heal carries the chunk's REAL seq (was None before the fix).
+            written_at: Some(1_000_150), client_write_seq: Some(150), file_id: None,
+        };
+        let stale = ChunkLocation {
+            chunk_id: ChunkId::from_hash(stale_hash), nodes: vec![node], size: 4096,
+            checksum: stale_hash, file_offset: Some(0),
+            written_at: Some(1_000_104), client_write_seq: Some(104), file_id: None,
+        };
+        // Whichever order they arrive in, the seq-150 current must win.
+        for order in [[&current, &stale], [&stale, &current]] {
+            let chunk_map: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
+            let chunk_to_file: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
+            let file_id = dfs_common::FileId::new();
+            for loc in order {
+                let mut l = (*loc).clone();
+                l.file_id = Some(file_id);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, file_id, &l);
+            }
+            let entry = chunk_map.get(&file_id).unwrap();
+            let (locs, _) = entry.value();
+            assert_eq!(locs.len(), 1, "same chunk_idx — must stay one entry");
+            assert_eq!(locs[0].chunk_id, current.chunk_id,
+                "seq-150 current must survive a stale seq-104 broadcast regardless of arrival order \
+                 — L1 keeps the current seq'd so it wins cleanly instead of reverting to a ghost");
+        }
+    }
+
+    /// Order-independence property test (2026-07-19): the winning chunk_id for a slot
+    /// must NOT depend on the order updates arrive in — otherwise a stale broadcast
+    /// can win purely by landing last (or first). This requires the supersedes
+    /// relation to be a TOTAL ORDER (transitive); a mix of comparison keys (seq for
+    /// some pairs, written_at for others) can form a cycle A>C>B>A, making the winner
+    /// arrival-order-dependent. Feeds a deliberately cycle-prone mix of seq'd and
+    /// unsequenced (heal-style) candidates in all 6 permutations and asserts one
+    /// invariant winner.
+    #[test]
+    fn chunk_map_precedence_is_order_independent_across_arrival_permutations() {
+        let node = dfs_common::NodeId::new();
+        let mk = |tag: &str, seq: Option<u64>, wt: u64| {
+            let hash = compute_chunk_hash(tag.as_bytes());
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash(hash), nodes: vec![node], size: 4096,
+                checksum: hash, file_offset: Some(0),
+                written_at: Some(wt), client_write_seq: seq, file_id: None,
+            }
+        };
+        // Cycle-prone triple: seq says A>C, but written_at says C>B>A.
+        let candidates = [mk("A", Some(10), 100), mk("B", None, 200), mk("C", Some(5), 300)];
+        let perms = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+        let mut winners = Vec::new();
+        for perm in perms {
+            let chunk_map: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
+            let chunk_to_file: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
+            let file_id = dfs_common::FileId::new();
+            for &i in &perm {
+                let mut loc = candidates[i].clone();
+                loc.file_id = Some(file_id);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, file_id, &loc);
+            }
+            let entry = chunk_map.get(&file_id).unwrap();
+            winners.push((perm, entry.value().0[0].chunk_id));
+        }
+        let first = winners[0].1;
+        assert!(winners.iter().all(|(_, w)| *w == first),
+            "chunk_map winner depends on arrival order (non-transitive precedence → cycle): {:?}",
+            winners.iter().map(|(p, w)| (p, &w.hash[..2])).collect::<Vec<_>>());
+    }
+
+    /// L3 monotonic-chunk_seq guard (2026-07-19): a stale or out-of-order push must
+    /// NOT roll the per-slot generation backward. Before the fix, put_chunk_seq was
+    /// unconditional, so a late seq-104 write landing after seq-150 reset the recorded
+    /// value to 104 — reopening the chunk_seq "gap" (client 151 vs server 104) that
+    /// made the server treat a current chunk as old. Guards metadata only; drops no
+    /// patch data (a seq-based data drop caused the T28 regression).
+    #[test]
+    fn put_chunk_seq_is_monotonic_never_rolls_backward() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let md = crate::metadata::MetadataStore::new(temp.path().to_path_buf()).unwrap();
+        let file_id = dfs_common::FileId::new();
+        md.put_chunk_seq(file_id, 0, 150).unwrap();
+        md.put_chunk_seq(file_id, 0, 104).unwrap(); // stale / out-of-order
+        assert_eq!(md.get_chunk_seq(file_id, 0).unwrap(), Some(150),
+            "a lower seq must NOT roll chunk_seq backward (L3 monotonic guard)");
+        md.put_chunk_seq(file_id, 0, 200).unwrap(); // legitimate advance
+        assert_eq!(md.get_chunk_seq(file_id, 0).unwrap(), Some(200),
+            "a higher seq must still advance");
+    }
+
     /// Regression for the 2026-07-16 equal-write_seq tie-break fix, found via a real
     /// 5-node soak test against pulled staging data: race_test_claude.bin (named for
     /// the T28 concurrent-write investigation) has two CHUNK_TABLE rows for chunk_idx 0
@@ -13781,6 +13885,69 @@ mod tests {
             assert_eq!(persisted.client_write_seq, Some(2),
                 "fold must seed client_write_seq from the patch's own seq, not leave it at None — \
                  otherwise it can never win against the client's own RCL for the pre-fold identity");
+        }
+
+        /// Repro for the 2026-07-19 VM-111 install EIO (file 2abc8ad2 chunk 2876):
+        /// a hot slot whose recorded chunk_seq fell far behind the client's (~47 lost
+        /// metadata pushes: client at seq 151, server frozen at 104) AND whose
+        /// chunk_map was left pointing at a GHOST chunk_id — one that is neither a
+        /// file on disk nor a patch_state row, because a later fold generation retired
+        /// it and the server never caught up. The chunk_seq-gap path calls
+        /// refresh_slot_from_leader, but the node can't close the gap by itself (its
+        /// own current value is the ghost, and the client's base is a different, also-
+        /// folded-away ghost), so it falls through to apply_patch's ghost guard and
+        /// hard-fails — which the client turns into a guest EIO → ext4 read-only
+        /// remount → dead install. A gap the node cannot close itself must degrade to
+        /// a *retriable* ChunkStale ("not yet — re-resolve and back off"), never a
+        /// hard IOError. This test forces exactly those conditions.
+        #[tokio::test]
+        #[ignore = "pending B-fix: read-time ghost base must return retriable ChunkStale, not NotFound"]
+        async fn chunk_seq_gap_onto_ghost_base_is_retriable_not_hard_eio() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let cidx = 0u64;
+
+            // Server's recorded per-slot chunk_seq is far behind the client's — the
+            // signature of a run of lost metadata pushes for this hot chunk.
+            h.metadata.put_chunk_seq_async(file_id, cidx, 104).await.unwrap();
+
+            // chunk_map points at a GHOST: registered in chunk_map/metadata but never
+            // materialised as a file and with no patch_state row (folded away by a
+            // later generation the server never caught up to).
+            let ghost_id = ChunkId::from_hash(compute_chunk_hash(b"ghost-current-seq104"));
+            let ghost_loc = ChunkLocation {
+                chunk_id: ghost_id, nodes: vec![h.server.cluster.local_node_id()],
+                size: 4096, checksum: compute_chunk_hash(b"ghost-current-seq104"),
+                file_offset: Some(0), written_at: Some(104), client_write_seq: Some(104),
+                file_id: Some(file_id),
+            };
+            h.server.chunk_map.insert(file_id, (vec![ghost_loc.clone()], 104));
+            h.server.metadata.put_chunk_location(&ghost_loc).unwrap();
+
+            // Precondition: the "current" base is genuinely unreachable.
+            assert!(!h.storage.has_chunk(&ghost_id), "ghost must not be a file on disk");
+            assert!(matches!(h.metadata.get_patch_state(&ghost_id), Ok(None)),
+                "ghost must not have a patch_state row");
+
+            // Client patches with a *different* stale base (its own 8fbf88-equivalent,
+            // also long folded away) and a seq far ahead of the server's 104.
+            let client_stale_id = ChunkId::from_hash(compute_chunk_hash(b"client-stale-seq151"));
+            let resp = h.server.handle_multi_patch(
+                client_stale_id, file_id, Some(cidx), 0,
+                vec![(0usize, vec![0xABu8; 8])],
+                None, Some(151), None, Some(151),
+            ).await;
+
+            // GRACEFUL contract: a gap the node can't close itself must be retriable,
+            // never a hard IOError that becomes a guest EIO / read-only remount.
+            match resp {
+                Response::ChunkStale { .. } => { /* ok: "not yet" — client re-resolves and backs off */ }
+                Response::MultiPatchResult { .. } => { /* also ok: node recovered the current base and applied */ }
+                Response::Error { code, message } => panic!(
+                    "chunk_seq gap onto a ghost base hard-failed (code={:?}, msg={:?}) — this is the \
+                     install-killing EIO; it must be a retriable ChunkStale instead", code, message),
+                other => panic!("expected retriable ChunkStale (or recovered MultiPatchResult), got {:?}", other),
+            }
         }
 
         /// Simulates the DVR streaming write pattern that motivated this feature:

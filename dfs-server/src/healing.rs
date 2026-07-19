@@ -1382,7 +1382,9 @@ impl HealingManager {
                 checksum: loc.checksum,
                 file_offset: loc.file_offset,
                 written_at: Some(Self::now_ms()),
-                client_write_seq: None,
+                // L1: preserve the healed chunk's real seq (identity), don't blank it — see
+                // the node-prune sites' comment for the ghost-clobber this prevents.
+                client_write_seq: loc.client_write_seq,
                 file_id: loc.file_id,
             };
 
@@ -2212,7 +2214,11 @@ impl HealingManager {
                     checksum: location.checksum,
                     file_offset: location.file_offset,
                     written_at: location.written_at,
-                    client_write_seq: None,
+                    // L1 (2026-07-19 ghost-clobber): preserve the chunk's real seq. A
+                    // node-list reconciliation must not blank identity to None — a None
+                    // entry loses the precedence contest to any stale seq'd broadcast of an
+                    // already-folded chunk_id, reverting the slot to a ghost that EIO'd a VM.
+                    client_write_seq: location.client_write_seq,
                     file_id: location.file_id,
                 };
                 db_puts.push(updated_location.clone());
@@ -2251,7 +2257,8 @@ impl HealingManager {
                         checksum: location.checksum,
                         file_offset: location.file_offset,
                         written_at: Some(Self::now_ms()),
-                        client_write_seq: None,
+                        // L1: preserve the chunk's real seq (see node-prune comment above).
+                        client_write_seq: location.client_write_seq,
                         file_id: location.file_id,
                     };
                     db_puts.push(updated_location.clone());
@@ -2379,7 +2386,11 @@ impl HealingManager {
                     checksum: location.checksum,
                     file_offset: location.file_offset,
                     written_at: location.written_at,
-                    client_write_seq: None,
+                    // L1 (2026-07-19 ghost-clobber): preserve the chunk's real seq. A
+                    // node-list reconciliation must not blank identity to None — a None
+                    // entry loses the precedence contest to any stale seq'd broadcast of an
+                    // already-folded chunk_id, reverting the slot to a ghost that EIO'd a VM.
+                    client_write_seq: location.client_write_seq,
                     file_id: location.file_id,
                 };
                 db_puts.push(updated_location.clone());
@@ -3603,7 +3614,8 @@ impl HealingManager {
                 checksum: location.checksum,
                 file_offset: location.file_offset,
                 written_at: Some(heal_ts),
-                client_write_seq: None,
+                // L1: preserve the chunk's real seq (see node-prune comment above).
+                client_write_seq: location.client_write_seq,
                 file_id: location.file_id,
             };
             let meta = Arc::clone(metadata);

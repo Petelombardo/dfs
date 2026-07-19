@@ -656,7 +656,16 @@ impl MetadataStore {
                     let result = (|| -> Result<()> {
                         let key = format!("{}:{}", file_id, chunk_idx);
                         let mut table = txn.open_table(CHUNK_SEQ_TABLE)?;
-                        table.insert(key.as_str(), seq)?;
+                        // Monotonic (L3, 2026-07-19): never roll the per-slot generation
+                        // backward. A stale/out-of-order push must not lower chunk_seq —
+                        // that reopens the "gap" that made the server treat a current chunk
+                        // as old and let a ghost win (VM-111 install EIO). Guards the
+                        // METADATA counter only; drops no patch data (a seq-based data drop
+                        // caused the T28 regression — see handle_multi_patch).
+                        let current = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
+                        if seq > current {
+                            table.insert(key.as_str(), seq)?;
+                        }
                         Ok(())
                     })();
                     self.note_txn("op:put_chunk_seq", 0);
@@ -1966,7 +1975,12 @@ impl MetadataStore {
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(CHUNK_SEQ_TABLE)?;
-            table.insert(key.as_str(), seq)?;
+            // Monotonic (L3, 2026-07-19) — see the committer path's PutChunkSeq arm for
+            // why: a stale/out-of-order push must never lower the per-slot generation.
+            let current = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
+            if seq > current {
+                table.insert(key.as_str(), seq)?;
+            }
         }
         txn.commit()?;
         self.note_txn("put_chunk_seq", 0);

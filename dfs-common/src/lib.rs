@@ -16,5 +16,5 @@ pub use protocol::{
     Request, RequestId, Response,
 };
 pub use hash::{compute_chunk_hash, compute_chunk_hash_at, verify_chunk_hash, ConsistentHashRing};
-pub use memory::{calculate_cache_capacity, get_available_memory, get_total_memory};
+pub use memory::{calculate_cache_capacity, calculate_server_cache_budget_mb, get_available_memory, get_total_memory};
 pub use storage_stats::calculate_usable_capacity;

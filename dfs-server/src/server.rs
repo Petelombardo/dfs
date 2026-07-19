@@ -1872,31 +1872,27 @@ impl Drop for FoldHealingCancelGuard {
 }
 
 impl Server {
-    /// chunk_ring's capacity, scaled off total RAM the same way
-    /// ChunkStorage::calculate_cache_size scales its own cache — see that
-    /// function's doc comment for why total (not available) memory is the
-    /// right basis. Widened 2026-07-13 (flat 32 -> tiered) after a live
-    /// kdiskmark run showed folds cold-reading their base chunk almost every
-    /// time: chunk_ring only gets seeded as a side effect of a fold that
-    /// already ran on this exact slot, so a 32-entry ring can't keep more
-    /// than a handful of a real workload's ~150 concurrently-hot chunks warm
-    /// at once — most chains get evicted before their next fold. Kept
-    /// deliberately smaller than ChunkStorage's own cache at every tier: this
-    /// is additional, not instead of, that budget, and gluster's real nodes
-    /// (3.8GB, no swap) can't absorb another large fixed allocation on top of
-    /// it without risking the same memory pressure this session's earlier
-    /// compaction/fold-accumulator fixes were chasing.
+    /// chunk_ring's (and delta_ring's — same function, called once per pool)
+    /// capacity: 25% each of `dfs_common::calculate_server_cache_budget_mb()`,
+    /// so the two rings together take the other 50% not claimed by
+    /// ChunkStorage::calculate_cache_size's chunk cache. See that shared budget
+    /// function's doc comment for why this moved off an independent per-cache RAM
+    /// tier (2026-07-19): nothing enforced a combined ceiling across the three
+    /// pools, which is how a 3.8GB gluster node ended up committing ~1GB (27%) to
+    /// caches before any real workload data existed.
+    ///
+    /// Widened 2026-07-13 (flat 32 -> tiered) after a live kdiskmark run showed
+    /// folds cold-reading their base chunk almost every time: chunk_ring only
+    /// gets seeded as a side effect of a fold that already ran on this exact
+    /// slot, so a too-small ring can't keep more than a handful of a real
+    /// workload's ~150 concurrently-hot chunks warm at once — most chains get
+    /// evicted before their next fold. Still kept smaller than ChunkStorage's own
+    /// cache (25% vs 50% of the shared budget): this is additional, not instead
+    /// of, that budget.
     fn calculate_ring_capacity() -> usize {
-        let total_mb = dfs_common::get_total_memory()
-            .map(|bytes| bytes / (1024 * 1024))
-            .unwrap_or(4096);
-        if total_mb <= 2048 {
-            16   // 64MB — SBC / low-memory nodes
-        } else if total_mb <= 8192 {
-            64   // 256MB — typical gluster-class nodes (3.8GB)
-        } else {
-            128  // 512MB — high-memory nodes
-        }
+        const CHUNK_SIZE_MB: u64 = 4;
+        let mb = dfs_common::calculate_server_cache_budget_mb() / 4;
+        ((mb / CHUNK_SIZE_MB).max(1)) as usize
     }
 
     /// Spawn the metadata persist worker ("sled worker", historically): a dedicated

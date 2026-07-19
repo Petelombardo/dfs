@@ -68,55 +68,38 @@ impl ChunkStorage {
         })
     }
 
-    /// Calculate optimal cache size based on available system RAM.
+    /// Calculate optimal cache size based on the shared server cache budget.
     ///
     /// The server-side chunk cache is used primarily for healing reads (a chunk
     /// that was just written is likely to be re-read by the healer shortly after).
     /// The client maintains its own much larger LRU for read serving, so the server
     /// cache does not need to be large.
     ///
-    /// Sizing is conservative and based on *total* RAM rather than *available* RAM
-    /// at startup. Available RAM is an unreliable signal: it doesn't account for the
-    /// process's own working memory (chunk_map, metadata DB, sled cache, OS slab)
-    /// which all grow after startup, and can be transiently high before those
-    /// structures are populated.
+    /// Takes 50% of `dfs_common::calculate_server_cache_budget_mb()` — chunk_ring
+    /// and delta_ring (server.rs's `calculate_ring_capacity`) split the other 50%
+    /// between them. See that budget function's doc comment for why this is now a
+    /// shared pool rather than its own independent RAM tier: this cache, chunk_ring,
+    /// and delta_ring used to each pick a tier off *total* RAM with nothing enforcing
+    /// a combined ceiling, which is how a 3.8GB gluster node ended up committing
+    /// ~1GB (27%) to caches before any real workload data existed (2026-07-19
+    /// near-OOM investigation — gluster1 plateaued at ~77MB `MemAvailable`).
     ///
-    /// Budget per node (4GB class):
-    ///   chunk cache:     128 MB  (32 chunks × 4MB)
-    ///   sled metadata:   128 MB  (configured separately)
-    ///   chunk_map/RSS:   ~200 MB (working set, grows with file count)
-    ///   OS slab:         ~300 MB (dentry/inode/page cache under DVR load)
-    ///   headroom:        ~200 MB (kernel OOM reserve via min_free_kbytes)
-    ///   ─────────────────────────
-    ///   total:           ~956 MB  ← well within 4 GB
+    /// `DFS_CHUNK_CACHE_CAPACITY_MB` overrides this cache's share directly (same
+    /// pattern as `DFS_CHUNK_RING_CAPACITY`/`DFS_DELTA_RING_CAPACITY` for the other
+    /// two — see their call sites in server.rs).
     fn calculate_cache_size() -> usize {
         const CHUNK_SIZE_MB: u64 = 4;
 
-        // Get total RAM (stable, unlike MemAvailable which fluctuates)
-        let total_mb = dfs_common::get_total_memory()
-            .map(|bytes| bytes / (1024 * 1024))
-            .unwrap_or(4096);
+        let cache_mb: u64 = std::env::var("DFS_CHUNK_CACHE_CAPACITY_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| dfs_common::calculate_server_cache_budget_mb() / 2);
 
-        // Scale off total RAM (~12% target):
-        //   ≤ 2 GB  →  32 chunks (128 MB)  — SBC / low-memory nodes
-        //   ≤ 8 GB  → 128 chunks (512 MB)  — typical 4-8 GB server nodes
-        //   > 8 GB  → 256 chunks (  1 GB)  — high-memory nodes
-        //
-        // Previous tiers (64/128 chunks) were too small for concurrent DVR+ISO+VM
-        // workloads: nodes hit 100% cache pressure and began throttling reads.
-        let cache_mb: u64 = if total_mb <= 2048 {
-            128
-        } else if total_mb <= 8192 {
-            512
-        } else {
-            1024
-        };
-
-        let final_cache = (cache_mb / CHUNK_SIZE_MB) as usize;
+        let final_cache = (cache_mb / CHUNK_SIZE_MB).max(1) as usize;
 
         info!(
-            "Cache sizing: total_ram={}MB, chunk_cache={}MB ({} chunks)",
-            total_mb, cache_mb, final_cache,
+            "Cache sizing: chunk_cache={}MB ({} chunks)",
+            cache_mb, final_cache,
         );
 
         final_cache

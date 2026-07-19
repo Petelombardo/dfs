@@ -35,6 +35,47 @@ fn read_meminfo_field(field: &str) -> Result<u64> {
     anyhow::bail!("{} not found in /proc/meminfo", field)
 }
 
+/// Total RAM (MB) that dfs-server's chunk caches — the main chunk cache
+/// (storage.rs's ChunkStorage) plus chunk_ring and delta_ring (server.rs) — may
+/// collectively consume. A single shared budget instead of three independently
+/// sized tables, added 2026-07-19 after gluster1 plateaued with only ~77MB
+/// `MemAvailable` on a 3.8GB node: the three caches had been sized off total RAM
+/// independently (each picking its own MB tier), so nothing enforced a combined
+/// ceiling — a 3.8GB node ended up committing ~1GB (27%) to caches before any
+/// real workload data existed. Callers split this three ways (see
+/// storage.rs::calculate_cache_size and server.rs::calculate_ring_capacity);
+/// each may still be overridden individually via its own env var for manual
+/// tuning, but the *default* now comes from one number.
+///
+/// Uses total RAM, not `MemAvailable` — same reasoning as `get_total_memory`'s
+/// doc comment: stable across the process lifetime, the right basis for sizing
+/// caches that populate gradually after startup rather than reacting to a
+/// snapshot that will have shifted by the time the cache actually fills.
+///
+/// `DFS_SERVER_CACHE_BUDGET_PERCENT` overrides the default (18%). Bounded to
+/// [64, 2048] MB so a misconfigured percentage can't zero out caching entirely
+/// on a tiny box or claim unbounded RAM on a huge one.
+pub fn calculate_server_cache_budget_mb() -> u64 {
+    let total_mb = get_total_memory()
+        .map(|bytes| bytes / (1024 * 1024))
+        .unwrap_or(4096);
+
+    let percent: f64 = std::env::var("DFS_SERVER_CACHE_BUDGET_PERCENT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(18.0);
+
+    let budget_mb = (total_mb as f64 * (percent / 100.0)) as u64;
+    let bounded = budget_mb.clamp(64, 2048);
+
+    tracing::info!(
+        "Server cache budget: total_ram={}MB, target {}%, budget={}MB (chunk_cache gets 50%, chunk_ring+delta_ring split the rest)",
+        total_mb, percent, bounded
+    );
+
+    bounded
+}
+
 /// Calculate optimal LRU cache capacity based on available system memory
 ///
 /// # Arguments

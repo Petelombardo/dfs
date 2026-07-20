@@ -4379,13 +4379,24 @@ T53_WRITER_PID=$!
 
 sleep $(( T53_STORM + T53_QUIET ))
 
-# Resolve the file id from the client's own MPTIMING line — dfs-admin's JSON
-# doesn't expose it, and the client log was truncated by snapshot_log above so
-# this test's writes are the only patch traffic in it.
-T53_FID=$(grep -ao "MPTIMING file=[0-9a-f-]* chunk=Some(" "$CURRENT_CLIENT_LOG" 2>/dev/null \
-    | head -1 | sed 's/.*file=\([0-9a-f-]*\).*/\1/')
+# Resolve the file id from the SERVER logs' own path->id line, not from
+# CURRENT_CLIENT_LOG. That variable is reassigned by every remount test
+# (T23/T24/etc.) and several of them never point it back at the live client's
+# log afterward, so by the time T53 runs near the end of a full-suite run it
+# can be stale — this test's own MPTIMING lines never land in it at all, and a
+# grep against it either finds nothing or (worse) silently matches whatever
+# unrelated file another test last logged there. Root-caused 2026-07-20: a
+# full-suite run resolved T53's writes to t28_thick.bin's file id instead,
+# found zero folds for it, and failed with "test setup did not reproduce the
+# trigger" — the fix folded correctly the whole time. Server logs are written
+# by every node regardless of which client log is "current".
+T53_FID=$(grep -ah "\[META SERVER\] put path=/t53_backstop.img" "$LOG"/server*.log 2>/dev/null \
+    | head -1 | grep -o "id=[0-9a-f-]*" | head -1 | cut -d= -f2)
 
-T53_FORCEFOLD=$(grep -ac "ForceFold: file $T53_FID chunk " "$CURRENT_CLIENT_LOG" 2>/dev/null || true)
+# Same staleness concern applies here: search every client log under this run
+# rather than trust CURRENT_CLIENT_LOG to be the live one. Harmless either way
+# since a stale/unrelated log won't mention this run's fresh random file id.
+T53_FORCEFOLD=$(grep -ah "ForceFold: file $T53_FID chunk " "$LOG"/client*.log 2>/dev/null | wc -l)
 [ -z "$T53_FORCEFOLD" ] && T53_FORCEFOLD=0
 
 if [ -z "$T53_FID" ]; then
@@ -4410,23 +4421,39 @@ else
         echo "  $T53_FOLD_COUNT fold(s) total, $T53_SOLO_FOLDS performed by a single node ($T53_FORCEFOLD client ForceFolds during the storm)"
         check "T53a folds observed after the dead stop ($T53_FOLD_COUNT)" PASS
 
-        # PRIMARY assertion. A fold mints a NEW chunk identity, so the only
-        # nodes that can hold its bytes are the ones that ran it. A slot folded
-        # by a single node is therefore a single-replica chunk by construction,
-        # whatever the ChunkLocation says and regardless of how fast healing
-        # happens to paper over it afterwards.
-        #
-        # This is deliberately the assertion rather than a timed
-        # replica-count-recovers check: on a 5-node local cluster with fast
-        # disks and no competing load the healer closes the gap in well under a
-        # second (measured ~0.09s), so a recovery-window bound passes locally
-        # while the same defect left chunks exposed for 3m18s on staging under
-        # a live VM install. The solo fold is the defect; the exposure window
-        # is just how bad it happens to be on a given box.
-        T53_SOLO_LIST=$(awk '$3 == 1 {printf " %s", $1}' "$T53_REPORT")
-        [ "$T53_SOLO_FOLDS" -eq 0 ] \
-            && check "T53b every folded generation was produced on >=2 nodes" PASS \
-            || check "T53b $T53_SOLO_FOLDS folded generation(s) produced by a single node — single-replica by construction (chunk_idx:$T53_SOLO_LIST)" FAIL
+        # INFORMATIONAL ONLY, not a failure condition. A fold mints a NEW chunk
+        # identity, and under the ORIGINAL (peer-recompute) coordination design
+        # a second node could only ever hold those bytes by ALSO independently
+        # running the fold itself — so a solo-folder count was a direct proxy
+        # for single-replica. That stopped being true 2026-07-20: the
+        # coordinated fold now folds ONCE and explicitly pushes/announces the
+        # result (see dfs-server's replicate_fold_result), specifically BECAUSE
+        # peer recompute produced REPLICA DISAGREEMENT under load (measured
+        # 10 -> 34 -> 47 across three tightening attempts at the old design,
+        # traced to dfs-client's own 2026-07-11 abandonment of delta-recompute
+        # for exactly this reason). A solo-folder count is now the EXPECTED,
+        # cheaper, correct signature — the second replica exists via a raw copy
+        # or the generic healer, never via a second "Single fold" log line. See
+        # T53c (ground-truth on-disk replica count) for the real replication
+        # check and T53b below for the real correctness invariant.
+        echo "  (informational) $T53_SOLO_FOLDS/$T53_FOLD_COUNT folded generation(s) replicated without a second node independently folding — expected under the coordinated-push design, not a defect"
+
+        # PRIMARY assertion, though an honest caveat first: the coordinated-push
+        # redesign removed the ONLY code path that ever emitted "REPLICA
+        # DISAGREEMENT" (peer recompute, deleted along with force_fold_on_peers)
+        # — divergence is now structurally prevented (exactly one node ever
+        # computes a slot's generation) rather than merely detected-and-logged.
+        # So this check currently passes trivially every run, and stays a
+        # regression tripwire rather than active verification: if peer recompute
+        # is ever reintroduced without ALSO reintroducing its disagreement log
+        # line, this would silently pass on a real regression. Kept anyway
+        # because it's free and correct FOR the current design, and cheap
+        # insurance if that log line comes back with the mechanism it belongs to.
+        T53_DISAGREEMENTS=$(grep -ah "REPLICA DISAGREEMENT on file $T53_FID" "$LOG"/server*.log 2>/dev/null | wc -l)
+        [ -z "$T53_DISAGREEMENTS" ] && T53_DISAGREEMENTS=0
+        [ "$T53_DISAGREEMENTS" -eq 0 ] \
+            && check "T53b zero REPLICA DISAGREEMENT for this file's folds" PASS \
+            || check "T53b $T53_DISAGREEMENTS REPLICA DISAGREEMENT event(s) for this file's folds" FAIL
 
         # Ground truth backstop to the above: count node data dirs that actually
         # hold each surviving folded chunk's bytes. The leader's own

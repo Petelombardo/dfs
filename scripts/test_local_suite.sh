@@ -4290,6 +4290,195 @@ rm -f "$T52_IMG" "$T52_SAMPLES" 2>/dev/null || true
 rm -rf "$T52_LOGDIR" "$T52_STOP" "$T52_POLL_STOP" 2>/dev/null || true
 fi # should_run T52
 
+# ── T53: a server-side backstop fold must not create a single-replica chunk ───
+#
+# The client's ForceFold (client.rs's active-fold timer) only ever fires from
+# *inside* a MultiPatch — i.e. on the next patch to that slot. A slot that is
+# patched a few times and then goes quiet is therefore never folded by the
+# client at all. dfs-server's debounce_fold_slot backstop (PATCH_DEBOUNCE_IDLE,
+# 20s) picks it up instead — but it runs independently on each node, so
+# whichever node's jittered timer fires first folds ALONE, mints a brand-new
+# chunk identity that exists on exactly one node, and broadcasts that as the
+# authoritative ChunkLocation with nodes:[itself].
+#
+# Confirmed live on staging 2026-07-20 during a VM-111 install (file
+# d159a6c7…, chunk_idx 1791): gluster1 logged
+#   "Single fold: chunk_idx 1791 consolidated (baa7075c + delta -> a0808f41…)"
+# at 10:52:20 with no corresponding client ForceFold anywhere in the client
+# log, and every node then reported "total nodes: 1" for that chunk every 10s
+# until healing finally landed at 10:55:38 — a 3m18s single-replica window on
+# a fully healthy 5-node cluster. The client itself was blameless over the
+# whole install: 144079 MultiPatch at 2 replicas, 26 at 3, zero at 1.
+#
+# Contrast the client-driven fold on the SAME slot 28s earlier: it reached
+# both write-pair replicas, each folded independently to the same
+# deterministic chunk id, each broadcast nodes:[self], and the merge unioned
+# them to "total nodes: 2". So ForceFold's design is fine; the per-node
+# backstop is what breaks the invariant.
+#
+# Compounding it, handle_replicate_patch_fold's self-heal backstop is disabled
+# in exactly this case: the peer that receives the pointer-only fold broadcast
+# checks "am I in this chunk's known node list?" against the single-node list
+# the fold just published, concludes it isn't a replica, and skips the heal —
+# so the one node already holding base+delta stands down.
+#
+# This test reproduces the mechanism directly and deliberately does NOT kill
+# anything: a healthy cluster, a live client, one slot patched and then left
+# alone. That is the ordinary random-write pattern of a VM install, which is
+# what makes the staging exposure continuous rather than incidental.
+if should_run T53; then
+snapshot_log T53
+echo ""
+echo "=== T53: server-side backstop fold must not leave a single-replica chunk ==="
+
+T53_IMG="$MOUNT/t53_backstop.img"
+T53_CHUNKS=64           # slot pool — see storm/dead-stop note below
+# debounce_fold_slot's task is spawned on the slot's FIRST patch and re-sleeps
+# a whole fresh PATCH_DEBOUNCE_IDLE (20s, plus jitter) whenever it wakes to
+# find the slot was touched inside the window. With patches spread over a few
+# seconds that puts the actual fold up to ~40s after the last patch, not 20s —
+# a 35s quiet period missed it entirely on the first run of this test.
+T53_STORM=40            # sustained patch storm before the dead stop
+T53_QUIET=60
+T53_RECOVERY_BOUND=5.0  # seconds a backstop-folded chunk may sit below 2 replicas
+
+# A sustained storm that then STOPS is the load-bearing part of this repro,
+# not incidental scale. While the storm runs, the client's own active-fold
+# timer drives ForceFold to both replicas and everything stays healthy. What
+# matters is what is left behind at the dead stop: slots whose newest
+# generation nobody folded, which only dfs-server's per-node
+# debounce_fold_slot backstop will pick up.
+#
+# That backstop re-sleeps a whole fresh PATCH_DEBOUNCE_IDLE (20s) whenever it
+# wakes to find the slot was touched inside the window, so a sub-second
+# difference in when a generation started on each replica turns into a ~20s
+# difference in when each one fires. Whichever fires first folds ALONE and
+# broadcasts ReplicatePatchFold; the peer's fold_slot_now then finds
+# PatchState::Folded, drops the dirty slot and returns WITHOUT folding — so
+# exactly one node ends up holding the new chunk identity, and the
+# ChunkLocation it publishes names only itself.
+#
+# A single synchronized burst does NOT reproduce this — both replicas land on
+# the same side of the 20s boundary, fold to the same deterministic chunk id,
+# and the locations union to 2. Two earlier versions of this test did exactly
+# that and passed against the broken build.
+echo "  Writing ${T53_CHUNKS}x4MB base file..."
+dd if=/dev/urandom of="$T/t53_base.bin" bs=4M count=$T53_CHUNKS 2>/dev/null
+cp "$T/t53_base.bin" "$T53_IMG"
+dfs_sync
+
+# One small patch per chunk, so every slot gets its own delta accumulator and
+# its own debounce task. Kept far under every client-side ForceFold trigger
+# (8s window / 20 patches / size threshold) so the client never folds any of
+# these itself — the backstop is the only thing that can. The file is held
+# open across the quiet period, matching a VM disk image that stays open while
+# the guest writes elsewhere.
+echo "  Patch storm across $T53_CHUNKS chunks for ${T53_STORM}s, then quiet for ${T53_QUIET}s..."
+python3 "$REPO/scripts/t53_patch_writer.py" "$T53_IMG" "$T53_CHUNKS" "$T53_QUIET" "$T53_STORM" &
+T53_WRITER_PID=$!
+
+sleep $(( T53_STORM + T53_QUIET ))
+
+# Resolve the file id from the client's own MPTIMING line — dfs-admin's JSON
+# doesn't expose it, and the client log was truncated by snapshot_log above so
+# this test's writes are the only patch traffic in it.
+T53_FID=$(grep -ao "MPTIMING file=[0-9a-f-]* chunk=Some(" "$CURRENT_CLIENT_LOG" 2>/dev/null \
+    | head -1 | sed 's/.*file=\([0-9a-f-]*\).*/\1/')
+
+T53_FORCEFOLD=$(grep -ac "ForceFold: file $T53_FID chunk " "$CURRENT_CLIENT_LOG" 2>/dev/null || true)
+[ -z "$T53_FORCEFOLD" ] && T53_FORCEFOLD=0
+
+if [ -z "$T53_FID" ]; then
+    check "T53a could not resolve file id from client log — no MultiPatch reached the file" FAIL
+else
+    # Every backstop fold this run produced, with how many distinct nodes folded
+    # each slot. A slot folded by only ONE node is the bug's signature: that
+    # node is then the sole holder of the new chunk identity.
+    T53_REPORT="$T/t53_folds_$$"
+    python3 "$REPO/scripts/t53_collect_folds.py" "$T53_FID" "$LOG" > "$T53_REPORT"
+
+    T53_FOLD_COUNT=$(wc -l < "$T53_REPORT")
+    T53_SOLO_FOLDS=$(awk '$3 == 1' "$T53_REPORT" | wc -l)
+
+    if [ "$T53_FOLD_COUNT" -eq 0 ]; then
+        check "T53a no backstop fold observed after ${T53_QUIET}s idle — test setup did not reproduce the trigger" FAIL
+    else
+        # Client ForceFolds during the storm are expected and healthy — they are
+        # what leaves a final unfolded generation behind at the dead stop. The
+        # backstop folds counted here are the ones that happened AFTER it, with
+        # no client involvement at all.
+        echo "  $T53_FOLD_COUNT fold(s) total, $T53_SOLO_FOLDS performed by a single node ($T53_FORCEFOLD client ForceFolds during the storm)"
+        check "T53a folds observed after the dead stop ($T53_FOLD_COUNT)" PASS
+
+        # PRIMARY assertion. A fold mints a NEW chunk identity, so the only
+        # nodes that can hold its bytes are the ones that ran it. A slot folded
+        # by a single node is therefore a single-replica chunk by construction,
+        # whatever the ChunkLocation says and regardless of how fast healing
+        # happens to paper over it afterwards.
+        #
+        # This is deliberately the assertion rather than a timed
+        # replica-count-recovers check: on a 5-node local cluster with fast
+        # disks and no competing load the healer closes the gap in well under a
+        # second (measured ~0.09s), so a recovery-window bound passes locally
+        # while the same defect left chunks exposed for 3m18s on staging under
+        # a live VM install. The solo fold is the defect; the exposure window
+        # is just how bad it happens to be on a given box.
+        T53_SOLO_LIST=$(awk '$3 == 1 {printf " %s", $1}' "$T53_REPORT")
+        [ "$T53_SOLO_FOLDS" -eq 0 ] \
+            && check "T53b every folded generation was produced on >=2 nodes" PASS \
+            || check "T53b $T53_SOLO_FOLDS folded generation(s) produced by a single node — single-replica by construction (chunk_idx:$T53_SOLO_LIST)" FAIL
+
+        # Ground truth backstop to the above: count node data dirs that actually
+        # hold each surviving folded chunk's bytes. The leader's own
+        # ChunkLocation is checked separately below — a location claiming
+        # replicas it does not have is precisely the failure mode here, so it
+        # cannot be the evidence.
+        t53_disk_replicas() {
+            local hex="$1" n=0 i
+            for i in 1 2 3 4 5; do
+                [ -f "$BASE/node$i/data/chunks/${hex:0:2}/${hex:2:2}/$hex" ] && n=$((n+1))
+            done
+            echo "$n"
+        }
+
+        T53_START=$(date +%s.%N)
+        T53_UNDER=""
+        while :; do
+            T53_UNDER=""
+            while read -r idx hex nodes; do
+                [ "$(t53_disk_replicas "$hex")" -lt 2 ] && T53_UNDER="$T53_UNDER $idx"
+            done < "$T53_REPORT"
+            [ -z "$T53_UNDER" ] && break
+            python3 -c "import sys; sys.exit(0 if $(date +%s.%N) - $T53_START > $T53_RECOVERY_BOUND else 1)" && break
+            sleep 0.2
+        done
+        T53_ELAPSED=$(python3 -c "print(f'{$(date +%s.%N) - $T53_START:.2f}')")
+        T53_UNDER_COUNT=$(echo $T53_UNDER | wc -w)
+
+        [ "$T53_UNDER_COUNT" -eq 0 ] \
+            && check "T53c every folded chunk has >=2 on-disk replicas (settled in ${T53_ELAPSED}s)" PASS \
+            || check "T53c $T53_UNDER_COUNT folded chunk(s) still single-replica after ${T53_RECOVERY_BOUND}s (chunk_idx:$T53_UNDER)" FAIL
+
+        # The published locations must agree too. A fold that broadcasts
+        # nodes:[self] makes the whole cluster believe the chunk is
+        # single-replica even when another node does hold the bytes — and
+        # handle_replicate_patch_fold's self-heal backstop then reads that same
+        # single-node list, concludes the real second replica "isn't a replica",
+        # and skips the heal that would have fixed it.
+        T53_MIN_LOC=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t53_backstop.img 2>/dev/null \
+            | python3 "$REPO/scripts/t53_min_loc_nodes.py")
+        [ -z "$T53_MIN_LOC" ] && T53_MIN_LOC=0
+        [ "$T53_MIN_LOC" -ge 2 ] \
+            && check "T53d every ChunkLocation the leader reports lists >=2 nodes (min $T53_MIN_LOC)" PASS \
+            || check "T53d leader reports a ChunkLocation with only $T53_MIN_LOC node(s)" FAIL
+    fi
+    rm -f "$T53_REPORT" 2>/dev/null || true
+fi
+
+wait "$T53_WRITER_PID" 2>/dev/null || true
+rm -f "$T53_IMG" "$T/t53_base.bin" 2>/dev/null || true
+fi # should_run T53
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

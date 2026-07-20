@@ -921,6 +921,23 @@ struct DirtyPatchSlot {
 /// almost always beat it under any real write pattern.
 const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How hard a locally-initiated fold waits for its output's second replica.
+/// See OverlayForkCtx::fold_slot_coordinated for why this lives in the fold
+/// rather than in each of its five call sites.
+#[derive(Clone, Copy, Debug)]
+enum FoldCoordination {
+    /// Fold every replica together and block until >=2 confirmed hold the
+    /// result. Write and durability paths, where lock-step is the whole point.
+    Wave,
+    /// Fold locally, return immediately, coordinate in the background. Read path
+    /// only: the bytes are already local, so making the read wait on a peer
+    /// round trip buys nothing the healer can't cover.
+    Async,
+    /// Fold here only. Serving another node's ForceFold, which is already
+    /// coordinated by whoever sent it — and what stops peer→peer recursion.
+    Local,
+}
+
 /// Consecutive fold_slot_now failures (same DirtyPatchSlot generation) before
 /// a slot is treated as stuck rather than transiently failing.
 ///
@@ -1105,6 +1122,394 @@ impl OverlayForkCtx {
                     which, missing_chunk_id, e);
             }
         }
+    }
+
+    /// The other nodes that currently hold this slot, from chunk_map — i.e. the
+    /// slot's replica set as it stands *before* any fold retires the current
+    /// identity. This is the set the backstop must fold alongside itself, and
+    /// it is deliberately read before folding: once a fold publishes its own
+    /// `nodes:[self]` location, the pre-fold replica set is no longer
+    /// recoverable from chunk_map.
+    ///
+    /// Only online peers are returned. A node that is down cannot fold, and the
+    /// caller's raw-copy fallback handles the resulting shortfall.
+    async fn slot_replica_peers(&self, file_id: FileId, chunk_idx: u64) -> Vec<(NodeId, SocketAddr)> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let local_id = self.cluster.local_node_id();
+        let holder_ids: Vec<NodeId> = self.chunk_map
+            .get(&file_id)
+            .map(|entry| {
+                let (locations, _) = entry.value();
+                locations
+                    .iter()
+                    .find(|loc| loc.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx))
+                    .map(|loc| loc.nodes.clone())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        let mut peers = Vec::new();
+        for node_id in holder_ids {
+            if node_id == local_id {
+                continue;
+            }
+            if let Some(info) = self.cluster.get_node(&node_id).await {
+                if info.status == dfs_common::NodeStatus::Online {
+                    peers.push((node_id, info.addr));
+                }
+            }
+        }
+        peers
+    }
+
+    /// Drive `ForceFold` on every peer that holds this slot and wait for all of
+    /// them, returning the ones that confirmed the SAME resulting chunk id.
+    ///
+    /// Called by debounce_fold_slot *before* it folds locally, and that ordering
+    /// is the entire point. A fold mints a new chunk identity, so only the nodes
+    /// that actually run it can hold those bytes. When the local fold goes first
+    /// it broadcasts ReplicatePatchFold, and each peer's own fold_slot_now then
+    /// sees `PatchState::Folded`, drops the dirty slot and returns WITHOUT
+    /// folding — leaving exactly one holder. Folding the peers first means there
+    /// is no Folded state in flight to short-circuit them, so the outcome does
+    /// not depend on which node's debounce timer happened to fire first.
+    ///
+    /// A peer returning a different chunk id is NOT counted: that is a genuine
+    /// replica disagreement (its accumulator differed), and counting it would
+    /// claim a replica for bytes that node does not have — the same rule
+    /// dfs-client's MultiPatch applies to its own fold fan-out.
+    async fn force_fold_on_peers(
+        &self,
+        peers: &[(NodeId, SocketAddr)],
+        file_id: FileId,
+        chunk_idx: u64,
+    ) -> Vec<(NodeId, ChunkId)> {
+        const PEER_FOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        // Dispatched together, not one after another: a slow peer must not delay
+        // the others, and every peer's fold needs to be underway before the
+        // local fold below can publish anything that would short-circuit them.
+        let tasks: Vec<_> = peers.iter().map(|&(node_id, addr)| {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let req = Request::ForceFold { file_id, chunk_idx };
+                let result = tokio::time::timeout(
+                    PEER_FOLD_TIMEOUT,
+                    client.send_message(addr, Message::Request(req)),
+                )
+                .await;
+                (node_id, addr, result)
+            })
+        }).collect();
+
+        let mut results = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok(r) => results.push(r),
+                Err(e) => warn!("backstop fold: peer ForceFold task panicked for file {} chunk {}: {}",
+                    file_id, chunk_idx, e),
+            }
+        }
+
+        let mut confirmed = Vec::new();
+        for (node_id, addr, result) in results {
+            match result {
+                Ok(Ok(envelope)) => match envelope.message {
+                    Message::Response(Response::ForceFoldResult { real_chunk_id, .. }) => {
+                        confirmed.push((node_id, real_chunk_id));
+                    }
+                    Message::Response(Response::Error { message, .. }) => {
+                        warn!("backstop fold: peer {} could not fold file {} chunk {}: {}",
+                            addr, file_id, chunk_idx, message);
+                    }
+                    other => {
+                        warn!("backstop fold: peer {} gave an unexpected response for file {} chunk {}: {:?}",
+                            addr, file_id, chunk_idx, other);
+                    }
+                },
+                Ok(Err(e)) => warn!("backstop fold: ForceFold to peer {} failed for file {} chunk {}: {}",
+                    addr, file_id, chunk_idx, e),
+                Err(_) => warn!("backstop fold: ForceFold to peer {} timed out after {:?} for file {} chunk {}",
+                    addr, PEER_FOLD_TIMEOUT, file_id, chunk_idx),
+            }
+        }
+        confirmed
+    }
+
+    /// Fold a slot and guarantee its output lands on at least two nodes.
+    ///
+    /// This is the entry point every locally-initiated fold must use.
+    /// `fold_slot_now` alone folds only on *this* node, and a fold mints a NEW
+    /// chunk identity — so whoever runs it alone is the sole holder of those
+    /// bytes, and the ChunkLocation it publishes names only itself. Putting the
+    /// replication guarantee in each caller was the original mistake: there are
+    /// five locally-initiated fold sites (debounce backstop, disk sweep, resume
+    /// sweep, read path, heal push-target), the first fix covered only one, and
+    /// the other four kept minting single-replica chunks exactly as before —
+    /// measured 2026-07-20, three solo folds in a full-suite run with no
+    /// `backstop fold:` line against any of them because none went through the
+    /// path that had been fixed. The invariant belongs here, once, so no future
+    /// caller can forget it.
+    ///
+    /// `mode` picks how hard we wait for the second replica:
+    ///   * `Wave` — dispatch the peers' folds and this node's together and block
+    ///     until the result is confirmed on >=2 nodes. For write and durability
+    ///     paths, where lock-step is the point.
+    ///   * `Async` — fold locally, return, and coordinate in the background. For
+    ///     the read path only: making a cold read wait on a peer round trip to
+    ///     serve bytes we already have locally is the wrong trade, and the
+    ///     healer is an acceptable backstop for that one case.
+    ///   * `Local` — fold only here, no fan-out. For serving another node's
+    ///     ForceFold, which is already being coordinated by whoever sent it;
+    ///     this is what stops peer→peer recursion.
+    async fn fold_slot_coordinated(
+        &self,
+        file_id: FileId,
+        chunk_idx: u64,
+        mode: FoldCoordination,
+    ) -> bool {
+        if matches!(mode, FoldCoordination::Local) {
+            return self.fold_slot_now(file_id, chunk_idx).await;
+        }
+
+        // Both captured BEFORE folding: fold_slot_now removes the
+        // dirty_patch_slots entry on success, and a fold's own broadcast
+        // rewrites chunk_map's node list for this slot to name only the folder —
+        // so neither the peer set nor the token is recoverable afterwards.
+        let peers = self.slot_replica_peers(file_id, chunk_idx).await;
+        let slot_token = self.dirty_patch_slots
+            .get(&(file_id, chunk_idx))
+            .map(|e| e.value().token);
+
+        if matches!(mode, FoldCoordination::Async) {
+            let folded_ok = self.fold_slot_now(file_id, chunk_idx).await;
+            if folded_ok {
+                let ctx = self.clone();
+                tokio::spawn(async move {
+                    let peer_folds = ctx.force_fold_on_peers(&peers, file_id, chunk_idx).await;
+                    ctx.verify_fold_replication(file_id, chunk_idx, slot_token, &peers, &peer_folds).await;
+                });
+            }
+            return folded_ok;
+        }
+
+        // Wave: every replica's fold starts at the same moment. Folding the
+        // peers first and awaiting them before folding locally also avoids the
+        // short-circuit, but leaves a window a whole fold duration plus a round
+        // trip wide — any patch landing in it gives the two nodes different cut
+        // points in the same stream, so they fold to different chunk ids and end
+        // up disagreeing on the slot's identity, which is worse than the
+        // under-replication being fixed. The wave narrows that to RPC processing
+        // time.
+        //
+        // Safe only because fold_slot_now no longer treats "already Folded" as
+        // "and therefore I need nothing" — see its PatchState::Folded arm.
+        let (peer_folds, folded_ok) = tokio::join!(
+            self.force_fold_on_peers(&peers, file_id, chunk_idx),
+            self.fold_slot_now(file_id, chunk_idx),
+        );
+        if folded_ok {
+            self.verify_fold_replication(file_id, chunk_idx, slot_token, &peers, &peer_folds).await;
+        }
+        folded_ok
+    }
+
+    /// Confirm a completed fold's output really is on >=2 nodes, and put it
+    /// there if it isn't. Shared by both coordinating modes.
+    async fn verify_fold_replication(
+        &self,
+        file_id: FileId,
+        chunk_idx: u64,
+        slot_token: Option<ChunkId>,
+        peers: &[(NodeId, SocketAddr)],
+        peer_folds: &[(NodeId, ChunkId)],
+    ) {
+        let Some(folded_id) = self.folded_chunk_id_for_slot(file_id, chunk_idx, slot_token).await else {
+            warn!("fold coordination: file {} chunk {} folded but its resulting chunk id could not be resolved \
+                   from chunk_map or patch_state — cannot verify replication",
+                file_id, chunk_idx);
+            return;
+        };
+
+        // Surface genuine divergence: a peer that folded the same base+delta to
+        // a DIFFERENT id picked a different cut point in the patch stream.
+        for (nid, peer_id) in peer_folds {
+            if *peer_id != folded_id {
+                warn!("fold coordination: REPLICA DISAGREEMENT on file {} chunk {} — peer {} folded to {} \
+                       but this node folded to {}",
+                    file_id, chunk_idx, nid, peer_id, folded_id);
+            }
+        }
+
+        // Ground truth, not metadata and not the peers' own replies: a peer that
+        // was short-circuited answers ForceFold with the right chunk id while
+        // holding none of its bytes, so trusting the reply would confirm exactly
+        // the fiction this check exists to catch.
+        let holders = self.confirm_chunk_holders(folded_id).await;
+        info!("fold coordination: file {} chunk {} -> {} ({} peer(s) asked, {} holder(s) confirmed)",
+            file_id, chunk_idx, &folded_id.to_hex()[..16], peers.len(), holders.len());
+
+        if holders.len() >= 2 {
+            return;
+        }
+
+        // A slot whose file was deleted out from under it is not an
+        // under-replication event — the chunk is garbage either way. Checking
+        // avoids drowning the real signal: a full-suite run logged 1179
+        // "no longer exists" lines, which is what the first version of this
+        // counted as urgent single-replica events.
+        if matches!(self.metadata.get_file(&file_id), Ok(None)) {
+            debug!("fold coordination: file {} was deleted — not replicating folded chunk {}",
+                file_id, folded_id);
+            return;
+        }
+
+        if self.backfill_folded_chunk(folded_id, &holders).await.is_none() {
+            error!("URGENT_SINGLE_REPLICA: fold of file {} chunk {} left {} on {} node(s) — no peer folded it \
+                    and no candidate accepted a raw copy",
+                file_id, chunk_idx, folded_id, holders.len());
+            if let Some(healing) = self.healing.read().await.as_ref() {
+                healing.queue_chunks_immediate(vec![folded_id]).await;
+            }
+        }
+    }
+
+    /// What a slot actually resolved to after a fold, from chunk_map with the
+    /// slot's own patch_state as fallback.
+    ///
+    /// The fallback is load-bearing, not defensive padding: reading chunk_map
+    /// alone returned None often enough on a busy node that the caller's
+    /// replication check silently did nothing, which was one of the two ways a
+    /// single-replica backstop fold still slipped through after the first
+    /// version of this fix (measured: 1-2 slots per 64-slot run). `token` is the
+    /// slot's public token captured *before* folding, since fold_slot_now
+    /// removes the dirty_patch_slots entry on success.
+    async fn folded_chunk_id_for_slot(
+        &self,
+        file_id: FileId,
+        chunk_idx: u64,
+        token: Option<ChunkId>,
+    ) -> Option<ChunkId> {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let from_map = self.chunk_map.get(&file_id).and_then(|entry| {
+            let (locations, _) = entry.value();
+            locations
+                .iter()
+                .find(|loc| loc.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx))
+                .map(|loc| loc.chunk_id)
+        });
+        if from_map.is_some() {
+            return from_map;
+        }
+        match token {
+            Some(token) => match self.metadata.get_patch_state_async(token).await {
+                Ok(Some(PatchState::Folded(real_chunk_id))) => Some(real_chunk_id),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    /// Which nodes actually hold `chunk_id` on disk, right now.
+    ///
+    /// Deliberately ground truth rather than anything metadata says. The whole
+    /// class of bug this exists for is a ChunkLocation that names replicas which
+    /// do not have the bytes, so a replication check built on chunk_map — or on
+    /// a peer's own ForceFold reply, which a short-circuited peer answers
+    /// correctly while holding nothing — would confirm exactly the fiction it is
+    /// meant to catch.
+    async fn confirm_chunk_holders(&self, chunk_id: ChunkId) -> Vec<NodeId> {
+        let local_id = self.cluster.local_node_id();
+        let mut holders = Vec::new();
+        if self.storage.has_chunk(&chunk_id) {
+            holders.push(local_id);
+        }
+
+        const HAS_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let tasks: Vec<_> = self.cluster.get_all_nodes().await
+            .into_iter()
+            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+            .map(|node| {
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let req = Request::HasChunks { chunk_ids: vec![chunk_id] };
+                    let result = tokio::time::timeout(
+                        HAS_CHUNK_TIMEOUT,
+                        client.send_message(node.addr, Message::Request(req)),
+                    ).await;
+                    let present = matches!(
+                        result,
+                        Ok(Ok(envelope))
+                            if matches!(&envelope.message,
+                                Message::Response(Response::BoolVec { values })
+                                    if values.first().copied().unwrap_or(false))
+                    );
+                    (node.id, present)
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            if let Ok((node_id, true)) = task.await {
+                holders.push(node_id);
+            }
+        }
+        holders
+    }
+
+    /// Last-resort guarantee that a just-folded chunk exists on a second node.
+    ///
+    /// Reached only when folding the peers first did not produce a second holder
+    /// of this exact chunk id — a peer was down, errored, or disagreed on the
+    /// result. Pushes the folded bytes verbatim (WriteChunk, not a re-fold) to
+    /// health-ordered candidates until one accepts. A raw copy has no base to
+    /// agree or disagree on, which is why dfs-client's MultiPatch backfill uses
+    /// the same shape for the same problem.
+    ///
+    /// Returns the node that accepted the copy, if any.
+    async fn backfill_folded_chunk(
+        &self,
+        new_chunk_id: ChunkId,
+        exclude: &[NodeId],
+    ) -> Option<NodeId> {
+        let storage = self.storage.clone();
+        let bytes = match tokio::task::spawn_blocking(move || storage.read_chunk(&new_chunk_id)).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                warn!("backstop fold: cannot read back freshly-folded {} to backfill it: {}", new_chunk_id, e);
+                return None;
+            }
+            Err(e) => {
+                warn!("backstop fold: spawn_blocking panicked reading {} for backfill: {}", new_chunk_id, e);
+                return None;
+            }
+        };
+
+        let local_id = self.cluster.local_node_id();
+        for node in self.cluster.get_all_nodes().await {
+            if node.id == local_id
+                || node.status != dfs_common::NodeStatus::Online
+                || exclude.contains(&node.id)
+            {
+                continue;
+            }
+            let req = Request::WriteChunk {
+                chunk_id: new_chunk_id,
+                data: bytes.clone(),
+                checksum: new_chunk_id.hash,
+            };
+            match self.client.send_message(node.addr, Message::Request(req)).await {
+                Ok(envelope) if matches!(envelope.message, Message::Response(Response::Ok { .. })) => {
+                    info!("backstop fold: backfilled {} onto {} via raw copy", new_chunk_id, node.id);
+                    return Some(node.id);
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    debug!("backstop fold: backfill copy of {} to {} failed: {}", new_chunk_id, node.addr, e);
+                }
+            }
+        }
+        None
     }
 
     /// Consolidate the one pending patch on (file_id, chunk_idx) into a single
@@ -1631,9 +2036,35 @@ impl OverlayForkCtx {
             Ok(Some(PatchState::Pending { base_chunk_id, delta_chunk_id, client_write_seq, .. })) => {
                 (base_chunk_id, delta_chunk_id, client_write_seq)
             }
-            Ok(Some(PatchState::Folded(_))) | Ok(None) => {
-                // Already folded (another caller beat us to it) or the slot moved
-                // on to a newer token since we read dirty_patch_slots above.
+            Ok(Some(PatchState::Folded(real_chunk_id))) => {
+                // Another caller folded this slot first. That used to return a
+                // bare "trivially successful" — but "someone else folded it" is
+                // NOT the same as "this node has the result", and conflating the
+                // two is what let a short-circuited replica report success while
+                // holding none of the folded bytes.
+                //
+                // A fold mints a new chunk identity, so losing this race means
+                // this node has no copy of it at all. Under the backstop's
+                // simultaneous wave that race is expected and normal — it is
+                // precisely how the peer that loses gets here — so the fold
+                // being done elsewhere has to imply fetching the result, not
+                // silently skipping it. Without this, the wave would hand back
+                // false confirmations and reintroduce the single-replica bug it
+                // exists to remove.
+                self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+                if !self.storage.has_chunk(&real_chunk_id) {
+                    if let Some(healing) = self.healing.read().await.as_ref() {
+                        warn!("fold_slot_now: file {} chunk {} was folded elsewhere to {} which this node does not \
+                               hold — queueing immediate heal rather than reporting a replica it has no bytes for",
+                            file_id, chunk_idx, real_chunk_id);
+                        healing.queue_chunks_immediate(vec![real_chunk_id]).await;
+                    }
+                }
+                return true;
+            }
+            Ok(None) => {
+                // The slot moved on to a newer token since we read
+                // dirty_patch_slots above — nothing pending under this one.
                 self.dirty_patch_slots.remove(&(file_id, chunk_idx));
                 return true;
             }
@@ -1713,7 +2144,48 @@ impl OverlayForkCtx {
             };
 
             if last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE {
-                if self.fold_slot_now(file_id, chunk_idx).await {
+                // Fold the slot's whole replica set, peers FIRST, then locally.
+                //
+                // A fold mints a NEW chunk identity, so the only nodes that can
+                // hold its bytes are the ones that actually ran it. This
+                // backstop is per-node and re-sleeps a whole fresh
+                // PATCH_DEBOUNCE_IDLE whenever it wakes to find the slot was
+                // touched inside the window, so a sub-second difference in when
+                // a generation started on each replica becomes a ~20s
+                // difference in when each one fires. Whoever fired first used to
+                // fold ALONE and broadcast ReplicatePatchFold, at which point
+                // the peer's own fold_slot_now saw PatchState::Folded, dropped
+                // the dirty slot and returned WITHOUT folding — one holder, and
+                // a ChunkLocation naming only that node.
+                //
+                // Confirmed on staging 2026-07-20 (VM-111 install, file
+                // d159a6c7…, chunk_idx 1791): gluster1 folded alone at 10:52:20
+                // with no client ForceFold anywhere, gluster4 logged nothing at
+                // all for that slot, and the chunk sat at "total nodes: 1" for
+                // 3m18s on a fully healthy 5-node cluster until healing
+                // happened to reach it.
+                //
+                // Dispatched as one WAVE — every replica's fold, including this
+                // node's, starts at the same moment. An earlier version folded
+                // the peers first and awaited them before folding locally, which
+                // removed the short-circuit but left a window a whole fold
+                // duration plus a round trip wide: any patch landing in it gives
+                // the two nodes different cut points in the same stream, so they
+                // fold to different chunk ids and end up disagreeing on the
+                // slot's identity — a worse outcome than the under-replication
+                // this is fixing. The wave narrows that window to RPC processing
+                // time.
+                //
+                // The wave is only safe because fold_slot_now no longer treats
+                // "already Folded" as "and therefore I need nothing" — see its
+                // PatchState::Folded arm. Without that, a peer whose fold lost
+                // the race to this node's ReplicatePatchFold broadcast would
+                // report success while holding none of the bytes.
+                //
+                // Client-driven ForceFold already reaches every replica by
+                // construction and is deliberately left untouched — this is the
+                // backstop path only, so the hot write path pays nothing.
+                if self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
                     return;
                 }
                 // fold_slot_now already recorded this failure (and logs its own
@@ -4052,7 +4524,7 @@ impl Server {
                 // paying a live base+delta compose. The client caches aggressively,
                 // so making this one read wait for the fold is the right trade.
                 let (file_id, chunk_idx) = slot;
-                if self.overlay_ctx().fold_slot_now(file_id, chunk_idx).await {
+                if self.overlay_ctx().fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Async).await {
                     if let Some(PatchState::Folded(real_chunk_id)) = self.metadata
                         .get_patch_state_async(chunk_id).await
                         .context("resolve_chunk_content: get_patch_state failed after fold")?
@@ -4403,7 +4875,7 @@ impl Server {
         match self.metadata.get_patch_state_async(chunk_id).await? {
             Some(PatchState::Folded(real)) => Ok(real),
             Some(PatchState::Pending { .. }) => {
-                if self.overlay_ctx().fold_slot_now(file_id, chunk_idx).await {
+                if self.overlay_ctx().fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
                     match self.metadata.get_patch_state_async(chunk_id).await? {
                         Some(PatchState::Folded(real)) => Ok(real),
                         _ => anyhow::bail!("patch_state for {} still not Folded after forced fold — slot raced onto a newer token", chunk_id),
@@ -5667,6 +6139,17 @@ impl Server {
     async fn handle_replicate_patch_fold(
         &self, public_token: ChunkId, real_chunk_id: ChunkId, file_id: FileId, chunk_idx: u64,
     ) -> Response {
+        // Read BEFORE the flip below: a Pending row here means this node was
+        // genuinely tracking this slot — it holds the base and the delta and is
+        // a real replica, whatever any published ChunkLocation happens to say.
+        // That is ground truth the should_heal check further down cannot get any
+        // other way, because by the time it runs the fold's own broadcast has
+        // already redefined the slot's node list. See that check for the bug.
+        let was_slot_participant = matches!(
+            self.metadata.get_patch_state_async(public_token).await,
+            Ok(Some(PatchState::Pending { .. }))
+        );
+
         if let Err(e) = self.metadata.update_patch_state_folded_async(public_token, real_chunk_id).await {
             warn!("handle_replicate_patch_fold: failed to record {} -> {}: {}", public_token, real_chunk_id, e);
             return Response::Error {
@@ -5713,13 +6196,29 @@ impl Server {
             // real replica set AND this node is in it; an unknown/not-yet-populated
             // entry falls back to the old behavior (queue) to preserve the
             // 2026-07-14 guarantee this backstop exists for.
-            let should_heal = self.chunk_map.get(&file_id)
-                .and_then(|entry| {
-                    let (locs, _) = entry.value();
-                    Self::chunk_map_find_by_idx(locs, chunk_idx)
-                        .map(|i| locs[i].nodes.contains(&self.cluster.local_node_id()))
-                })
-                .unwrap_or(true);
+            //
+            // The chunk_map half of this test is NOT sufficient on its own, and
+            // relying on it alone was a real bug (found 2026-07-20 alongside the
+            // backstop-fold single-replica incident). A fold publishes a
+            // ChunkLocation naming only the node that ran it, and that broadcast
+            // lands here as part of the same fold. So the genuine write-pair
+            // partner — the node holding base+delta, the one that could fix this
+            // in milliseconds — looks itself up in the fold's own single-node
+            // list, concludes it "isn't a replica", and skips the heal. The
+            // guard meant to prevent phantom heals ended up suppressing the one
+            // heal that mattered.
+            //
+            // was_slot_participant is the missing ground truth: this node had a
+            // Pending patch_state for public_token, so it really was one of this
+            // slot's replicas regardless of what the fold just published.
+            let should_heal = was_slot_participant
+                || self.chunk_map.get(&file_id)
+                    .and_then(|entry| {
+                        let (locs, _) = entry.value();
+                        Self::chunk_map_find_by_idx(locs, chunk_idx)
+                            .map(|i| locs[i].nodes.contains(&self.cluster.local_node_id()))
+                    })
+                    .unwrap_or(true);
             if should_heal {
                 if let Some(healing) = self.healing.read().await.as_ref() {
                     warn!("handle_replicate_patch_fold: real_chunk_id {} not present locally on {} — queueing immediate heal",
@@ -7591,7 +8090,7 @@ impl Server {
                     let sem = server.fold_sweep_semaphore.clone();
                     tokio::spawn(async move {
                         let _permit = sem.acquire().await.ok();
-                        ctx.fold_slot_now(file_id, chunk_idx).await;
+                        ctx.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await;
                     });
                 }
             }
@@ -7707,7 +8206,7 @@ impl Server {
                 server.pending_patch_ids.entry(token).or_insert((file_id, chunk_idx));
                 let ctx = server.overlay_ctx();
                 tokio::spawn(async move {
-                    if !ctx.fold_slot_now(file_id, chunk_idx).await {
+                    if !ctx.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
                         warn!("patch_state resume sweep: fold failed for file={} chunk={} — \
                                left Pending, will retry via the normal backstop paths",
                             file_id, chunk_idx);

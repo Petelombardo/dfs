@@ -930,8 +930,15 @@ const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(
 /// failing, and raising a spurious URGENT_SINGLE_REPLICA for a chunk a
 /// different, real coordinator is already (or about to be) handling.
 enum FoldSlotOutcome {
-    /// This node ran run_single_fold and produced the result itself.
-    FoldedHere,
+    /// This node ran run_single_fold and produced the result itself — carries
+    /// the new chunk id, its final size, and the folded bytes themselves
+    /// (already in memory from the fold, race-free since they're captured
+    /// while chunk_patch_locks was still held). Threading these out lets a
+    /// coordinated fold's replication step push the exact bytes it just
+    /// produced instead of rereading them from disk after the per-slot lock
+    /// has already been released — see replicate_fold_result's doc comment
+    /// for the race that reread caused on hot slots.
+    FoldedHere(ChunkId, usize, Arc<Vec<u8>>, Option<u64>),
     /// Nothing pending — already folded (by this node, earlier) or the token
     /// was superseded before this call reached it.
     NothingToDo,
@@ -1330,22 +1337,22 @@ impl OverlayForkCtx {
         // suite run): it tried to read bytes this node never had, failed, and
         // raised a spurious URGENT_SINGLE_REPLICA for a chunk the actual
         // coordinator was already replicating correctly elsewhere.
-        match self.fold_slot_now(file_id, chunk_idx).await {
-            FoldSlotOutcome::FoldedHere => {}
+        let (folded_id, final_size, buf, client_write_seq) = match self.fold_slot_now(file_id, chunk_idx).await {
+            FoldSlotOutcome::FoldedHere(id, size, buf, cws) => (id, size, buf, cws),
             FoldSlotOutcome::AdoptedElsewhere | FoldSlotOutcome::NothingToDo => return true,
             FoldSlotOutcome::Failed => return false,
-        }
+        };
 
         match mode {
             FoldCoordination::Wave => {
-                self.replicate_fold_result(file_id, chunk_idx, slot_token, &peers).await;
+                self.replicate_fold_result(file_id, chunk_idx, folded_id, final_size, buf, client_write_seq, slot_token, &peers).await;
             }
             FoldCoordination::Async => {
                 // Read path: the bytes are already local and the read can be
                 // served now. Replicate behind it.
                 let ctx = self.clone();
                 tokio::spawn(async move {
-                    ctx.replicate_fold_result(file_id, chunk_idx, slot_token, &peers).await;
+                    ctx.replicate_fold_result(file_id, chunk_idx, folded_id, final_size, buf, client_write_seq, slot_token, &peers).await;
                 });
             }
             FoldCoordination::Local => unreachable!("handled above"),
@@ -1355,19 +1362,63 @@ impl OverlayForkCtx {
 
     /// Confirm a completed fold's output really is on >=2 nodes, and put it
     /// there if it isn't. Shared by both coordinating modes.
+    /// True if `folded_id` is no longer the slot's current identity — some
+    /// later fold on this exact (file_id, chunk_idx) already superseded it.
+    /// Cheap and local: one DashMap read, no lock beyond that, no RPC. Used to
+    /// tell "this generation is provably dead, replicating it is wasted work
+    /// and a failure to do so is not a real gap" apart from "this generation
+    /// is still current and a failure to replicate it genuinely matters."
+    /// "No local view of this slot at all" is treated as NOT stale (the
+    /// conservative default — don't assume dead without evidence).
+    fn fold_result_superseded(&self, file_id: FileId, chunk_idx: u64, folded_id: ChunkId) -> bool {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        self.chunk_map.get(&file_id)
+            .and_then(|entry| {
+                let (locations, _) = entry.value();
+                locations.iter()
+                    .find(|loc| loc.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx))
+                    .map(|loc| loc.chunk_id != folded_id)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Replicate a fold's already-in-hand result. `buf` is the exact bytes
+    /// `run_single_fold` produced — see FoldSlotOutcome::FoldedHere's doc
+    /// comment for why threading these through (instead of rereading
+    /// `folded_id` from disk here) matters: this function runs *after*
+    /// fold_slot_now has already released chunk_patch_locks for the slot, so a
+    /// disk reread races the slot's own next fold, which can retire and
+    /// delete this exact file in the gap. Confirmed live 2026-07-20 (VM-111
+    /// install): every "cannot read back freshly-folded" warning that run
+    /// paired, same microsecond, with a URGENT_SINGLE_REPLICA alarm — on the
+    /// hottest slots (several folds/sec) that gap was wide enough to hit
+    /// repeatedly. Working from bytes already in memory removes the need to
+    /// ever touch disk again for this generation, so there is nothing left
+    /// for a subsequent fold to race.
     async fn replicate_fold_result(
         &self,
         file_id: FileId,
         chunk_idx: u64,
+        folded_id: ChunkId,
+        final_size: usize,
+        buf: Arc<Vec<u8>>,
+        client_write_seq: Option<u64>,
         slot_token: Option<ChunkId>,
         peers: &[(NodeId, SocketAddr)],
     ) {
-        let Some(folded_id) = self.folded_chunk_id_for_slot(file_id, chunk_idx, slot_token).await else {
-            warn!("fold coordination: file {} chunk {} folded but its resulting chunk id could not be resolved \
-                   from chunk_map or patch_state — cannot replicate it",
-                file_id, chunk_idx);
+        // Cheap staleness check before any network work. On the hottest slots
+        // a later fold can supersede this exact generation before replication
+        // even starts — nobody will ever read chunk_map back to this identity
+        // again, and the superseding fold owns its own replication, so there
+        // is nothing to do here. Skipping early avoids both wasted RPCs and a
+        // misleadingly scary URGENT_SINGLE_REPLICA for data that was already
+        // dead on arrival.
+        if self.fold_result_superseded(file_id, chunk_idx, folded_id) {
+            debug!("fold coordination: file {} chunk {} (folded to {}) was already superseded before \
+                    replication started — skipping, the newer generation owns replication",
+                file_id, chunk_idx, folded_id);
             return;
-        };
+        }
 
         // Ground truth, not metadata: the whole class of bug this exists for is
         // a ChunkLocation naming replicas that do not have the bytes, so a check
@@ -1383,19 +1434,31 @@ impl OverlayForkCtx {
         let file_deleted = matches!(self.metadata.get_file(&file_id), Ok(None));
 
         if holders.len() < 2 && !file_deleted {
-            // Push the bytes this fold just produced. Preference order is the
-            // slot's own replica set, so a fold does not quietly migrate a chunk
-            // off the nodes that are supposed to hold it; anything else online
-            // is a fallback for when those are unreachable.
+            // Push the bytes this fold just produced — already in memory, no
+            // disk read. Preference order is the slot's own replica set, so a
+            // fold does not quietly migrate a chunk off the nodes that are
+            // supposed to hold it; anything else online is a fallback for when
+            // those are unreachable.
             let prefer: Vec<NodeId> = peers.iter().map(|(nid, _)| *nid).collect();
-            match self.replicate_folded_bytes(folded_id, &holders, &prefer).await {
+            match self.replicate_folded_bytes(folded_id, &buf, &holders, &prefer).await {
                 Some(node_id) => holders.push(node_id),
                 None => {
-                    error!("URGENT_SINGLE_REPLICA: fold of file {} chunk {} left {} on {} node(s) — no candidate \
-                            accepted a copy of the folded bytes",
-                        file_id, chunk_idx, folded_id, holders.len());
-                    if let Some(healing) = self.healing.read().await.as_ref() {
-                        healing.queue_chunks_immediate(vec![folded_id]).await;
+                    // Recheck staleness before alarming: the confirm_chunk_holders
+                    // round trip above takes real time, long enough on a hot slot
+                    // for a later fold to have superseded this generation in the
+                    // interim. If so, every candidate correctly had nothing to
+                    // accept — there is nothing left that needs these bytes.
+                    if self.fold_result_superseded(file_id, chunk_idx, folded_id) {
+                        debug!("fold coordination: file {} chunk {} (folded to {}) was superseded during \
+                                replication — no candidate accepting a copy is expected, not urgent",
+                            file_id, chunk_idx, folded_id);
+                    } else {
+                        error!("URGENT_SINGLE_REPLICA: fold of file {} chunk {} left {} on {} node(s) — no \
+                                candidate accepted a copy of the folded bytes",
+                            file_id, chunk_idx, folded_id, holders.len());
+                        if let Some(healing) = self.healing.read().await.as_ref() {
+                            healing.queue_chunks_immediate(vec![folded_id]).await;
+                        }
                     }
                 }
             }
@@ -1421,8 +1484,11 @@ impl OverlayForkCtx {
         // merges onto the new base — silent divergence, not caught by anything
         // else in this path since ONLY the coordinator's patch_state was ever
         // updated by fold_slot_now.
+        //
+        // final_size is used here (not re-derived) for the same reread-avoidance
+        // reason as buf: it's the exact value full_rewrite_chunk produced.
         if !file_deleted && !holders.is_empty() {
-            self.announce_fold_result(file_id, chunk_idx, folded_id, slot_token, &holders, peers).await;
+            self.announce_fold_result(file_id, chunk_idx, folded_id, final_size, client_write_seq, slot_token, &holders, peers).await;
         }
     }
 
@@ -1437,24 +1503,33 @@ impl OverlayForkCtx {
         file_id: FileId,
         chunk_idx: u64,
         folded_id: ChunkId,
+        final_size: usize,
+        client_write_seq: Option<u64>,
         slot_token: Option<ChunkId>,
         holders: &[NodeId],
         peers: &[(NodeId, SocketAddr)],
     ) {
+        // final_size/client_write_seq come from run_single_fold's own
+        // already-computed, race-free values (see FoldSlotOutcome::FoldedHere)
+        // instead of a fresh get_chunk_location_async lookup here. That lookup
+        // used to be able to return None — full_rewrite_chunk deletes the old
+        // ChunkLocation record in the same breath as the file it retires, so a
+        // later fold superseding this exact generation before this async step
+        // ran could make the record vanish just like the file did, producing
+        // "folded to X but it has no registered ChunkLocation at all". Same
+        // race as the disk reread this change also removes, same fix: don't
+        // depend on anything that a subsequent fold's cleanup can delete out
+        // from under us — use what run_single_fold already had in hand.
+        //
+        // put_chunk_location_async below is a blind overwrite, not a merge (see
+        // MetadataStore::put_chunk_location), so client_write_seq specifically
+        // has to be the correct value here, not just "good enough" — an
+        // incoming None would silently regress a real, already-persisted
+        // sequence number. checksum and file_offset need no such care: checksum
+        // is always folded_id.hash, and file_offset is always chunk_idx *
+        // CHUNK_SIZE — full_rewrite_chunk's own self-registration derives them
+        // identically, so there was never a real lookup dependency for those two.
         const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-        let existing = match self.metadata.get_chunk_location_async(folded_id).await {
-            Ok(Some(loc)) => loc,
-            Ok(None) => {
-                warn!("fold coordination: file {} chunk {} folded to {} but it has no registered \
-                       ChunkLocation at all — cannot correct its holder set",
-                    file_id, chunk_idx, folded_id);
-                return;
-            }
-            Err(e) => {
-                warn!("fold coordination: failed to look up ChunkLocation for {}: {}", folded_id, e);
-                return;
-            }
-        };
 
         let mut nodes: Vec<NodeId> = holders.to_vec();
         nodes.sort_unstable();
@@ -1463,16 +1538,16 @@ impl OverlayForkCtx {
         let corrected = ChunkLocation {
             chunk_id: folded_id,
             nodes,
-            size: existing.size,
+            size: final_size,
             checksum: folded_id.hash,
-            file_offset: existing.file_offset.or(Some(chunk_idx * CHUNK_SIZE)),
+            file_offset: Some(chunk_idx * CHUNK_SIZE),
             written_at: Some(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64,
             ),
-            client_write_seq: existing.client_write_seq,
+            client_write_seq,
             file_id: Some(file_id),
         };
 
@@ -1542,42 +1617,6 @@ impl OverlayForkCtx {
         }
     }
 
-    /// What a slot actually resolved to after a fold, from chunk_map with the
-    /// slot's own patch_state as fallback.
-    ///
-    /// The fallback is load-bearing, not defensive padding: reading chunk_map
-    /// alone returned None often enough on a busy node that the caller's
-    /// replication check silently did nothing, which was one of the two ways a
-    /// single-replica backstop fold still slipped through after the first
-    /// version of this fix (measured: 1-2 slots per 64-slot run). `token` is the
-    /// slot's public token captured *before* folding, since fold_slot_now
-    /// removes the dirty_patch_slots entry on success.
-    async fn folded_chunk_id_for_slot(
-        &self,
-        file_id: FileId,
-        chunk_idx: u64,
-        token: Option<ChunkId>,
-    ) -> Option<ChunkId> {
-        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-        let from_map = self.chunk_map.get(&file_id).and_then(|entry| {
-            let (locations, _) = entry.value();
-            locations
-                .iter()
-                .find(|loc| loc.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx))
-                .map(|loc| loc.chunk_id)
-        });
-        if from_map.is_some() {
-            return from_map;
-        }
-        match token {
-            Some(token) => match self.metadata.get_patch_state_async(token).await {
-                Ok(Some(PatchState::Folded(real_chunk_id))) => Some(real_chunk_id),
-                _ => None,
-            },
-            None => None,
-        }
-    }
-
     /// Which nodes actually hold `chunk_id` on disk, right now.
     ///
     /// Deliberately ground truth rather than anything metadata says. The whole
@@ -1636,6 +1675,17 @@ impl OverlayForkCtx {
     /// the design dfs-client abandoned on 2026-07-11 for this exact reason, and
     /// re-adopting it here cost 47 REPLICA DISAGREEMENTs in a single suite run.
     ///
+    /// `buf` is the exact bytes run_single_fold produced for this generation —
+    /// passed in rather than rereading `new_chunk_id` from disk here. That
+    /// reread used to be a real race on hot slots: fold_slot_now releases
+    /// chunk_patch_locks for the slot before this function ever runs, so a
+    /// subsequent fold on the same slot could retire and delete this exact
+    /// file in the gap, and the reread would then fail with "cannot read back
+    /// freshly-folded" — which is what every observed URGENT_SINGLE_REPLICA
+    /// paired with, same microsecond, in a live VM-111 install (2026-07-20).
+    /// Working from bytes already in memory means there is nothing left on
+    /// disk for a later fold to race against.
+    ///
     /// `prefer` is the slot's own replica set, tried first so a fold does not
     /// quietly migrate a chunk onto nodes that were never meant to hold it.
     ///
@@ -1643,22 +1693,10 @@ impl OverlayForkCtx {
     async fn replicate_folded_bytes(
         &self,
         new_chunk_id: ChunkId,
+        buf: &Arc<Vec<u8>>,
         exclude: &[NodeId],
         prefer: &[NodeId],
     ) -> Option<NodeId> {
-        let storage = self.storage.clone();
-        let bytes = match tokio::task::spawn_blocking(move || storage.read_chunk(&new_chunk_id)).await {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => {
-                warn!("fold coordination: cannot read back freshly-folded {} to replicate it: {}", new_chunk_id, e);
-                return None;
-            }
-            Err(e) => {
-                warn!("fold coordination: spawn_blocking panicked reading {} to replicate it: {}", new_chunk_id, e);
-                return None;
-            }
-        };
-
         let local_id = self.cluster.local_node_id();
         let mut candidates: Vec<_> = self.cluster.get_all_nodes().await
             .into_iter()
@@ -1672,7 +1710,7 @@ impl OverlayForkCtx {
         for node in candidates {
             let req = Request::WriteChunk {
                 chunk_id: new_chunk_id,
-                data: bytes.clone(),
+                data: buf.as_ref().clone(),
                 checksum: new_chunk_id.hash,
             };
             match self.client.send_message(node.addr, Message::Request(req)).await {
@@ -1708,7 +1746,7 @@ impl OverlayForkCtx {
         base_chunk_id: ChunkId,
         delta_chunk_id: ChunkId,
         delta_client_write_seq: Option<u64>,
-    ) -> bool {
+    ) -> Option<(ChunkId, usize, Arc<Vec<u8>>, Option<u64>)> {
         // Cancel base_chunk_id's healing in the background, right away — base_chunk_id
         // is about to be retired by this fold, and there should never be a need for
         // a heal and a fold's retirement of the same chunk to race. See
@@ -1739,13 +1777,13 @@ impl OverlayForkCtx {
             Ok(Err(e)) => {
                 warn!("single fold: failed to read delta chunk {}: {}", delta_chunk_id, e);
                 self.abandon_patch_if_base_gone(file_id, chunk_idx, public_token, delta_chunk_id, "delta").await;
-                return false;
+                return None;
             }
-            Err(e) => { warn!("single fold: spawn_blocking panicked reading delta chunk {}: {}", delta_chunk_id, e); return false; }
+            Err(e) => { warn!("single fold: spawn_blocking panicked reading delta chunk {}: {}", delta_chunk_id, e); return None; }
         };
         let patches: Vec<(usize, Vec<u8>)> = match parse_delta_records(&delta_bytes) {
             Ok(p) => p,
-            Err(e) => { warn!("single fold: corrupt delta chunk {}: {}", delta_chunk_id, e); return false; }
+            Err(e) => { warn!("single fold: corrupt delta chunk {}: {}", delta_chunk_id, e); return None; }
         };
 
         // Consult the ring before paying for a disk read: a hot slot folds
@@ -1799,7 +1837,7 @@ impl OverlayForkCtx {
                 if code == ErrorCode::NotFound {
                     self.abandon_patch_if_base_gone(file_id, chunk_idx, public_token, base_chunk_id, "base").await;
                 }
-                return false;
+                return None;
             }
         };
 
@@ -1826,7 +1864,18 @@ impl OverlayForkCtx {
             // guard covers both.
             self.chunk_ring.shard(&base_chunk_id).lock().unwrap().pop(&base_chunk_id);
             if new_chunk_id != base_chunk_id {
-                self.chunk_ring.shard(&new_chunk_id).lock().unwrap().put(new_chunk_id, fold_buf);
+                // Cloning an Arc, not the buffer: cheap refcount bump. One
+                // reference seeds the ring cache as before; the other is
+                // returned to the caller so a coordinated fold can push these
+                // exact bytes to a second replica without a disk reread — see
+                // this function's return type change and replicate_fold_result
+                // for why that reread was a real race (2026-07-20: a hot slot's
+                // NEXT fold could retire and delete this exact file in the gap
+                // between fold_slot_now returning and the reread running,
+                // producing "cannot read back freshly-folded" -> a spurious
+                // URGENT_SINGLE_REPLICA for bytes that were never actually gone,
+                // just briefly unreachable via a redundant reread).
+                self.chunk_ring.shard(&new_chunk_id).lock().unwrap().put(new_chunk_id, fold_buf.clone());
             }
         }
 
@@ -1864,6 +1913,13 @@ impl OverlayForkCtx {
             }
             other => other,
         };
+        // Captured before the `if let Some(new_loc) = new_loc` below moves it —
+        // this is the same race-free, already-correct value a coordinated fold's
+        // replication step needs (see this function's return type and
+        // announce_fold_result): re-deriving it later via another
+        // get_chunk_location_async would reopen the exact "record already
+        // deleted by a subsequent fold" race this whole change exists to close.
+        let final_client_write_seq = new_loc.as_ref().and_then(|l| l.client_write_seq);
 
         // Flip patch_state: public_token now redirects straight to the real,
         // standalone result. Same key as the Pending row — no slot-table change,
@@ -2041,7 +2097,7 @@ impl OverlayForkCtx {
 
         info!("Single fold: file {} chunk_idx {} consolidated ({} + delta -> {}, final size {})",
             file_id, chunk_idx, base_chunk_id, new_chunk_id, final_size);
-        true
+        Some((new_chunk_id, final_size, fold_buf, final_client_write_seq))
     }
 
     /// Synchronously push a completed fold's result to the leader, with a
@@ -2270,16 +2326,19 @@ impl OverlayForkCtx {
         // route through here, giving debounce_fold_slot's jitter a true
         // cluster-wide-per-node view of current fold pressure to scale against.
         self.active_fold_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let ok = self.run_single_fold(
+        let result = self.run_single_fold(
             file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, client_write_seq,
         ).await;
         self.active_fold_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        if ok {
-            self.dirty_patch_slots.remove(&(file_id, chunk_idx));
-            FoldSlotOutcome::FoldedHere
-        } else {
-            self.record_fold_failure(file_id, chunk_idx, public_token);
-            FoldSlotOutcome::Failed
+        match result {
+            Some((new_chunk_id, final_size, buf, client_write_seq)) => {
+                self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+                FoldSlotOutcome::FoldedHere(new_chunk_id, final_size, buf, client_write_seq)
+            }
+            None => {
+                self.record_fold_failure(file_id, chunk_idx, public_token);
+                FoldSlotOutcome::Failed
+            }
         }
     }
 
@@ -8406,6 +8465,7 @@ impl Server {
         tokio::spawn(async move {
             const REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
             const PATCH_FOLD_REBROADCAST_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+            const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             loop {
                 tokio::time::sleep(REBROADCAST_INTERVAL).await;
 
@@ -8416,6 +8476,37 @@ impl Server {
                 // Drop expired entries first so the resend pass below only touches live ones.
                 server.pending_patch_fold_broadcasts
                     .retain(|_, entry| entry.first_seen.elapsed() < PATCH_FOLD_REBROADCAST_TTL);
+
+                // Self-retire entries this node's own view of the slot has
+                // already moved past. An entry is normally cleared early by
+                // apply_patch's retired_token cleanup, but only when THIS node
+                // itself processes the slot's next patch — a node whose
+                // backstop fold isn't on the client's active write-pair for
+                // that slot (a third replica, or a forced-fold-on-read) never
+                // sees that next patch, so its own entry just sits here,
+                // faithfully resent every 10s for up to the full 120s TTL, long
+                // after chunk_map has moved on. Each resend is a stale
+                // ReplicateChunkLocation/ReplicatePatchFold for an identity
+                // that may already be several generations dead — GHOST-stale-
+                // check on the receiving end correctly rejects it, but it's
+                // still wasted bandwidth and, on the hottest slots, a repeat-
+                // thrash of the exact same rejection every cycle (measured live
+                // 2026-07-20: chunk_idx 3456 hit this 8 times in under a
+                // second during a VM-111 install). Checking chunk_map here
+                // (this node's own authoritative view, no RPC needed) catches
+                // it locally instead of leaning entirely on the receiver's
+                // guard. "No local view of this slot at all" is kept, not
+                // dropped — the conservative default, since we have no
+                // evidence either way.
+                server.pending_patch_fold_broadcasts.retain(|_, entry| {
+                    let current = server.chunk_map.get(&entry.file_id).and_then(|e| {
+                        let (locations, _) = e.value();
+                        locations.iter()
+                            .find(|loc| loc.file_offset.map(|o| o / CHUNK_SIZE) == Some(entry.chunk_idx))
+                            .map(|loc| loc.chunk_id)
+                    });
+                    !matches!(current, Some(id) if id != entry.real_chunk_id)
+                });
 
                 if server.pending_patch_fold_broadcasts.is_empty() {
                     continue;
@@ -8442,17 +8533,15 @@ impl Server {
                         let loc_request = Request::ReplicateChunkLocation {
                             location: entry.location.clone(), file_id: entry.location.file_id,
                         };
-                        match server.client.send_message(node.addr, Message::Request(loc_request)).await {
-                            Ok(_) => info!("patch_fold_rebroadcast: DBG location send to {} OK", node.id),
-                            Err(e) => info!("patch_fold_rebroadcast: failed to resend location {} to node {}: {}", public_token, node.id, e),
+                        if let Err(e) = server.client.send_message(node.addr, Message::Request(loc_request)).await {
+                            debug!("patch_fold_rebroadcast: failed to resend location {} to node {}: {}", public_token, node.id, e);
                         }
                         let fold_request = Request::ReplicatePatchFold {
                             public_token: *public_token, real_chunk_id: entry.real_chunk_id,
                             file_id: entry.file_id, chunk_idx: entry.chunk_idx,
                         };
-                        match server.client.send_message(node.addr, Message::Request(fold_request)).await {
-                            Ok(resp) => info!("patch_fold_rebroadcast: DBG fold send to {} OK, resp={:?}", node.id, resp.message),
-                            Err(e) => info!("patch_fold_rebroadcast: failed to resend fold {} -> {} to node {}: {}", public_token, entry.real_chunk_id, node.id, e),
+                        if let Err(e) = server.client.send_message(node.addr, Message::Request(fold_request)).await {
+                            debug!("patch_fold_rebroadcast: failed to resend fold {} -> {} to node {}: {}", public_token, entry.real_chunk_id, node.id, e);
                         }
                     }
                 }

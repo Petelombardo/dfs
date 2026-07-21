@@ -4506,6 +4506,208 @@ wait "$T53_WRITER_PID" 2>/dev/null || true
 rm -f "$T53_IMG" "$T/t53_base.bin" 2>/dev/null || true
 fi # should_run T53
 
+if should_run T54; then
+snapshot_log T54
+echo ""
+echo "=== T54: same-chunk patches under load should never broadcast more locations than patches applied ==="
+
+# 2026-07-21 staging finding: a hot chunk under concurrent small-write load (VM
+# installer pattern) produced ~9.6 chunk-location-replicated completions per
+# actual patch applied. pending_chunk_locations is a bare Vec with no dedup
+# (client.rs ~7961), so every patch enqueues its own entry, and if several land
+# within the same 10ms batch-drain window they all ride the batch instead of
+# collapsing to the chunk's latest location. chunk_id = blake3(file_id ||
+# file_offset || data) where file_offset is the CHUNK-ALIGNED offset (not the
+# specific byte range touched) and data is the whole chunk's new content after
+# the patch -- so every patch to chunk 0 gets a different chunk_id but the same
+# dedup key (file_id, file_offset=0).
+#
+# NOTE: reproducing genuine sub-10ms overlapping same-chunk patches (the exact
+# condition that produced the 9.6x ratio in production) could not be forced
+# reliably in this single-client, low-latency local suite -- several write
+# patterns were tried (spaced bursts, concurrent processes, tightly-paced
+# groups) and all collapsed to a clean 1:1 patch:broadcast ratio here, unlike
+# production's sustained real VM-install load. So this test asserts the sound
+# invariant the fix guarantees instead (RCL broadcasts can never exceed patches
+# applied -- dedup only removes entries, never adds them) plus a byte-level
+# integrity check, rather than demonstrating the specific redundancy ratio.
+# The redundancy reduction itself is verified separately via live staging
+# re-measurement (same log-sampling technique used to find this bug) after
+# deploying, not by this test.
+#
+# Correlates patches to RCL completions via the MERGE-TRACE line's own `token=`
+# field (server.rs), which is exactly the chunk_id the paired completion log
+# uses. Empirically (checked while developing this test): only the batch
+# handler's "Successfully replicated chunk location for X" completion fires
+# under this local single-client setup (zero "Handling replicate chunk
+# location" singular self-report lines appear at all), so this counts the
+# exact path Fix 1 targets. Dedups patch tokens across server logs before
+# counting, since RF replicates each patch to multiple nodes that each
+# independently log the same MERGE-TRACE token.
+
+T54_IMG="$MOUNT/t54_hotchunk.bin"
+T54_GROUPS=8
+T54_WRITES_PER_GROUP=20
+T54_WRITE_SIZE=16384    # 20 * 16KB = 320KB/group, > SLOT_DIRTY_FLUSH_THRESHOLD_BYTES (256KB)
+T54_GROUP_GAP_S=0.004   # shorter than the ~11-40ms observed apply_patch round trip, so
+                        # the next group's threshold-crossing dispatch overlaps the
+                        # previous group's still-in-flight RPC instead of waiting for it
+
+dd if=/dev/zero of="$T54_IMG" bs=1M count=4 2>/dev/null
+dfs_sync
+
+# dfs-admin's `file info --format json` doesn't expose the file's UUID, only
+# path/size/chunks -- pull it from the server log's own
+# "[META SERVER] put path=... id=..." line instead (same field T43's neighbors
+# already rely on), from the dd+dfs_sync above.
+T54_FILE_ID=$(grep -h "\[META SERVER\] put path=/t54_hotchunk.bin id=" "$LOG"/server*.log 2>/dev/null \
+    | tail -1 | grep -oP 'id=\K[0-9a-f-]+')
+echo "  T54: file_id=${T54_FILE_ID:-<not found>}"
+
+declare -A T54_LOG_MARKS
+for f in "$LOG"/server*.log; do
+    T54_LOG_MARKS["$f"]=$(wc -l < "$f" 2>/dev/null || echo 0)
+done
+
+# Groups of scattered small writes into chunk 0 through one fd, no fsync
+# between them, paced tighter than the observed per-patch round trip so a new
+# group's fragmentation-threshold flush gets dispatched while the previous
+# group's is still in flight (flush_one_chunk snapshots-and-clears the dirty
+# tracker under a mutex before its RPC starts, so new writes land in a fresh
+# buffer immediately, not blocked on the in-flight RPC completing) -- unlike
+# T22's separate-process-per-patch pattern, which (confirmed while developing
+# this test) doesn't reliably land within the same 10ms window due to process
+# spawn overhead.
+python3 -c "
+import os, time
+fd = os.open('$T54_IMG', os.O_RDWR)
+for g in range($T54_GROUPS):
+    for i in range($T54_WRITES_PER_GROUP):
+        off = (i * 131072) % (3 * 1024 * 1024)  # scattered, non-adjacent within chunk 0
+        os.pwrite(fd, bytes([(g * 20 + i) % 256]) * $T54_WRITE_SIZE, off)
+    time.sleep($T54_GROUP_GAP_S)
+os.close(fd)
+"
+
+dfs_sync
+sleep 1   # let any fire-and-forget RPCs land
+
+if [ -z "$T54_FILE_ID" ]; then
+    check "T54 could not resolve file id" FAIL
+else
+    T54_TOKENS=$(for f in "$LOG"/server*.log; do
+        mark=${T54_LOG_MARKS["$f"]:-0}
+        tail -n "+$((mark+1))" "$f" 2>/dev/null \
+            | grep "MERGE-TRACE" | grep "file=$T54_FILE_ID " | grep "chunk_idx=0 " \
+            | grep -oP 'token=\K[0-9a-f]+'
+    done | sort -u)
+    T54_PATCH_COUNT=$(echo "$T54_TOKENS" | grep -c . || true)
+    echo "  T54: $T54_PATCH_COUNT distinct patches applied to chunk 0"
+
+    T54_RCL_COUNT=0
+    for tok in $T54_TOKENS; do
+        c=$(grep -h "Successfully replicated chunk location for $tok " "$LOG"/server*.log 2>/dev/null | wc -l)
+        T54_RCL_COUNT=$((T54_RCL_COUNT + c))
+    done
+    echo "  T54: $T54_RCL_COUNT RCL broadcasts completed by the leader for $T54_PATCH_COUNT patches applied (invariant: never more broadcasts than patches)"
+
+    if [ "$T54_PATCH_COUNT" -eq 0 ]; then
+        check "T54 no patches detected -- test setup issue" FAIL
+    else
+        [ "$T54_RCL_COUNT" -le "$T54_PATCH_COUNT" ] \
+            && check "T54 RCL broadcasts ($T54_RCL_COUNT) never exceed patches applied ($T54_PATCH_COUNT)" PASS \
+            || check "T54 RCL broadcasts ($T54_RCL_COUNT) exceed patches applied ($T54_PATCH_COUNT) -- dedup not collapsing redundant enqueues" FAIL
+    fi
+fi
+
+# Byte-level integrity check: every offset's final content must be from the
+# LAST group that touched it (group g, iteration i writes tag byte
+# (g*20+i)%256) -- catches the (file_id, file_offset) dedup change silently
+# picking a stale location if freshest-wins via client_write_seq is wrong.
+T54_LAST_GROUP=$(( T54_GROUPS - 1 ))
+T54_INTEGRITY=$(python3 -c "
+with open('$T54_IMG', 'rb') as f:
+    mismatches = 0
+    for i in range($T54_WRITES_PER_GROUP):
+        off = (i * 131072) % (3 * 1024 * 1024)
+        expected = bytes([($T54_LAST_GROUP * $T54_WRITES_PER_GROUP + i) % 256]) * $T54_WRITE_SIZE
+        f.seek(off)
+        actual = f.read($T54_WRITE_SIZE)
+        if actual != expected:
+            mismatches += 1
+    print(mismatches)
+")
+[ "$T54_INTEGRITY" -eq 0 ] \
+    && check "T54 final chunk-0 content matches the last write to every offset" PASS \
+    || check "T54 $T54_INTEGRITY/$T54_WRITES_PER_GROUP offsets have stale/wrong content after the write storm" FAIL
+
+rm -f "$T54_IMG"
+fi # should_run T54
+
+if should_run T55; then
+snapshot_log T55
+echo ""
+echo "=== T55: sustained hot-chunk writes should not push metadata on every background flush ==="
+
+# 2026-07-21 staging finding: the background flush self-refill loop
+# (fuse_impl.rs ~4266-4276) calls enqueue_metadata() after every successful
+# flush_one_chunk with no rate limit, unlike its sibling ticker-driven path
+# (fuse_impl.rs ~1776-1782) which already debounces the same kind of
+# opportunistic push to BG_METADATA_PUSH_INTERVAL=2s per inode. Live evidence:
+# 767 of 785 metadata PUTs in a 44s window were for one continuously-open file,
+# arriving every 30-160ms. This reproduces that shape: several bursts of
+# scattered small writes to the same file, spaced out over several seconds with
+# no fsync between them, so the background flusher fires repeatedly on its own.
+
+T55_FILE="$MOUNT/t55_sustained.bin"
+T55_BURSTS=5
+T55_WRITES_PER_BURST=20
+T55_WRITE_SIZE=16384   # 20 * 16KB = 320KB per burst, > SLOT_DIRTY_FLUSH_THRESHOLD_BYTES (256KB)
+T55_BURST_GAP_S=0.9
+
+dd if=/dev/zero of="$T55_FILE" bs=1M count=4 2>/dev/null
+dfs_sync
+
+declare -A T55_LOG_MARKS
+for f in "$LOG"/server*.log; do
+    T55_LOG_MARKS["$f"]=$(wc -l < "$f" 2>/dev/null || echo 0)
+done
+
+T55_START=$(date +%s.%N)
+python3 -c "
+import os, time
+fd = os.open('$T55_FILE', os.O_RDWR)
+for b in range($T55_BURSTS):
+    for i in range($T55_WRITES_PER_BURST):
+        off = (i * 131072) % (3 * 1024 * 1024)  # scattered, non-adjacent within chunk 0
+        os.pwrite(fd, bytes([(b * 20 + i) % 256]) * $T55_WRITE_SIZE, off)
+    time.sleep($T55_BURST_GAP_S)
+os.close(fd)
+"
+dfs_sync
+T55_ELAPSED=$(python3 -c "print(f'{$(date +%s.%N) - $T55_START:.1f}')")
+sleep 1   # let any fire-and-forget RPCs land
+
+T55_PUT_COUNT=0
+for f in "$LOG"/server*.log; do
+    mark=${T55_LOG_MARKS["$f"]:-0}
+    c=$(tail -n "+$((mark+1))" "$f" 2>/dev/null | grep -c "\[META SERVER\] put path=/t55_sustained.bin " || true)
+    T55_PUT_COUNT=$((T55_PUT_COUNT + c))
+done
+
+# Debounced to at most once per 2s per inode -> bound is generous (ceil+2) to
+# absorb scheduling jitter without masking a real per-flush-push regression,
+# where the count would instead track T55_BURSTS * T55_WRITES_PER_BURST (100).
+T55_BOUND=$(python3 -c "import math; print(math.ceil($T55_ELAPSED / 2.0) + 2)")
+echo "  T55: $T55_PUT_COUNT metadata PUTs over ${T55_ELAPSED}s wall time (bound: <= $T55_BOUND at a 2s-per-inode debounce)"
+
+[ "$T55_PUT_COUNT" -le "$T55_BOUND" ] \
+    && check "T55 metadata PUTs ($T55_PUT_COUNT) respect the 2s-per-inode debounce (bound $T55_BOUND)" PASS \
+    || check "T55 metadata PUTs ($T55_PUT_COUNT) exceed the 2s-per-inode debounce bound ($T55_BOUND) -- background flush loop pushing on every flush" FAIL
+
+rm -f "$T55_FILE"
+fi # should_run T55
+
 # ── cleanup ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cleanup ==="

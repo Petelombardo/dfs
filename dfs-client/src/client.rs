@@ -769,6 +769,34 @@ impl MetadataQueue {
     }
 }
 
+/// Dedup key for pending_chunk_locations: identifies a chunk SLOT (file_id +
+/// chunk-aligned file_offset), not a specific chunk_id — see that field's doc
+/// comment for why chunk_id itself can't be the key.
+type ChunkLocationSlotKey = (Option<dfs_common::FileId>, Option<u64>);
+
+/// Upsert `locations` into `pending` keyed by chunk slot, freshest-wins via
+/// client_write_seq. Shared by every pending_chunk_locations writer (enqueue,
+/// the two failed-send re-queue paths, and the two direct-extend call sites) so
+/// they can't disagree about the merge rule. When either side's write_seq is
+/// unknown (None — legacy/fresh-write records), falls back to last-write-wins
+/// by call order, matching the old Vec's behavior for those records.
+fn upsert_chunk_location(
+    pending: &mut HashMap<ChunkLocationSlotKey, dfs_common::ChunkLocation>,
+    location: dfs_common::ChunkLocation,
+) {
+    let key = (location.file_id, location.file_offset);
+    let keep_new = match pending.get(&key) {
+        Some(existing) => match (existing.client_write_seq, location.client_write_seq) {
+            (Some(old_seq), Some(new_seq)) => new_seq >= old_seq,
+            _ => true,
+        },
+        None => true,
+    };
+    if keep_new {
+        pending.insert(key, location);
+    }
+}
+
 /// Client for communicating with DFS cluster
 #[derive(Clone)]
 pub struct DfsClient {
@@ -965,7 +993,19 @@ pub struct DfsClient {
     /// control flow on the outcome), and flush_metadata_sync delivers the file's
     /// complete, authoritative chunk_locations state at the end of every flush cycle
     /// regardless — see send_chunk_locations_batched's doc comment.
-    pending_chunk_locations: Arc<tokio::sync::Mutex<Vec<dfs_common::ChunkLocation>>>,
+    ///
+    /// Keyed on (file_id, file_offset) — the chunk-SLOT identity — not on
+    /// ChunkLocation::chunk_id. chunk_id is blake3(file_id || file_offset || data),
+    /// so it changes on every patch to a slot; keying on it would never collapse a
+    /// hot slot's repeated patches. Keying on the slot instead means N patches to the
+    /// same chunk landing in one batch window collapse to that slot's single latest
+    /// location before the RPC/server loop ever sees the redundant N-1. Freshest-wins
+    /// via ChunkLocation::client_write_seq (see upsert_chunk_location) rather than
+    /// plain insertion order, so a delayed re-queue can't clobber a fresher arrival.
+    /// 2026-07-21 staging finding: a hot chunk under concurrent small-write load
+    /// produced ~9.6 chunk-location-replicated completions per actual patch applied
+    /// before this dedup existed.
+    pending_chunk_locations: Arc<tokio::sync::Mutex<HashMap<ChunkLocationSlotKey, dfs_common::ChunkLocation>>>,
 
     /// Per-file monotonic write sequence counter. Each metadata enqueue increments
     /// the counter for that file_id and stamps it on the metadata before queuing.
@@ -1254,7 +1294,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             backfill_new_candidate_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             single_replica_emergency_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             single_replica_followup_exhausted_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            pending_chunk_locations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             write_seq: Arc::new(DashMap::new()),
             chunk_seq: Arc::new(DashMap::new()),
             read_write_seq_cache: Arc::new(DashMap::new()),
@@ -5868,12 +5908,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                 info!("WRITETIMING metadata-phase inode={} offset={} leader={} leader_ms={:.1} leader_gap_ms={:.1} failed={}",
                     inode, file_offset, leader, leader_ms, leader_gap_ms, failed);
                 if failed {
-                    self.pending_chunk_locations.lock().await.extend(chunk_locations.clone());
+                    let mut pending = self.pending_chunk_locations.lock().await;
+                    for loc in chunk_locations.clone() {
+                        upsert_chunk_location(&mut pending, loc);
+                    }
                 }
             }
             None => {
                 warn!("WriteChunk: no known leader — re-queuing {} chunk location(s) for the background worker", chunk_locations.len());
-                self.pending_chunk_locations.lock().await.extend(chunk_locations.clone());
+                let mut pending = self.pending_chunk_locations.lock().await;
+                for loc in chunk_locations.clone() {
+                    upsert_chunk_location(&mut pending, loc);
+                }
             }
         }
 
@@ -7820,7 +7866,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let chunk0_size = metadata.chunk_locations.iter().find(|l| l.file_offset.unwrap_or(0) == 0).map(|l| l.size);
             debug!("[SIZE TRACE] flush_metadata_sync path={} id={} seq={} chunks={} chunk0_size={:?} pending_chunk_locations_for_this_file={}",
                 metadata.path, metadata.id, metadata.write_seq, metadata.chunk_locations.len(), chunk0_size,
-                self.pending_chunk_locations.lock().await.iter().filter(|l| l.file_id == Some(metadata.id)).count());
+                self.pending_chunk_locations.lock().await.keys().filter(|(fid, _)| *fid == Some(metadata.id)).count());
         }
         // Drain and synchronously send this file's own pending chunk-location
         // notifications first. Without this, fsync/release could return
@@ -7845,13 +7891,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         // file's concurrent flush — real head-of-line blocking introduced by batching,
         // not present in the old one-RPC-per-patch design. Anything left over (other
         // files' pending locations) stays queued for the background worker's next tick.
-        let batch = {
+        let batch: Vec<dfs_common::ChunkLocation> = {
             let mut pending = self.pending_chunk_locations.lock().await;
-            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+            let taken = std::mem::take(&mut *pending);
+            let (mine, rest): (HashMap<_, _>, HashMap<_, _>) = taken
                 .into_iter()
-                .partition(|loc| loc.file_id == Some(metadata.id));
+                .partition(|(k, _)| k.0 == Some(metadata.id));
             *pending = rest;
-            mine
+            mine.into_values().collect()
         };
         if !batch.is_empty() {
             let leader_addr = *self.leader_addr.read().await;
@@ -7884,12 +7931,18 @@ leader_addr: Arc::new(RwLock::new(None)),
                         // identical fix for the full rationale (a chunk's data write already
                         // completed by the time it lands here; dropping the location
                         // registration orphans real, already-durable bytes).
-                        self.pending_chunk_locations.lock().await.extend(batch);
+                        let mut pending = self.pending_chunk_locations.lock().await;
+                        for loc in batch {
+                            upsert_chunk_location(&mut pending, loc);
+                        }
                     }
                 }
                 None => {
                     warn!("flush_metadata_sync: no known leader — re-queuing {} pending chunk locations for the background worker", batch.len());
-                    self.pending_chunk_locations.lock().await.extend(batch);
+                    let mut pending = self.pending_chunk_locations.lock().await;
+                    for loc in batch {
+                        upsert_chunk_location(&mut pending, loc);
+                    }
                 }
             }
         }
@@ -7911,12 +7964,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             let mut interval = tokio::time::interval(Duration::from_millis(10));
             loop {
                 interval.tick().await;
-                let mut batch = {
+                let mut batch: Vec<dfs_common::ChunkLocation> = {
                     let mut pending = client.pending_chunk_locations.lock().await;
                     if pending.is_empty() {
                         continue;
                     }
-                    std::mem::take(&mut *pending)
+                    std::mem::take(&mut *pending).into_values().collect()
                 };
                 // Resolved fresh here, not at enqueue time — uses the most current
                 // leader knowledge for whatever accumulated since the last tick.
@@ -7939,16 +7992,35 @@ leader_addr: Arc::new(RwLock::new(None)),
                             // worker's previous silent-drop-on-failure, confirmed as a
                             // real cause of unreachable chunks in a 2026-07-10 incident
                             // (a ~10s leader restart during active writes).
+                            //
+                            // Merge batch (this failed, now-stale attempt) as the base, then
+                            // pending (arrived more recently, while the send was in flight) on
+                            // top, so upsert_chunk_location's write_seq comparison sees pending's
+                            // entries as the later call for any slot key both share — preserving
+                            // "newer arrivals win over a stale failed-send retry" for the
+                            // no-write-seq fallback case too, not just when write_seq differs.
                             let mut pending = client.pending_chunk_locations.lock().await;
-                            batch.extend(std::mem::take(&mut *pending));
-                            *pending = batch;
+                            let mut merged = HashMap::new();
+                            for loc in batch.drain(..) {
+                                upsert_chunk_location(&mut merged, loc);
+                            }
+                            for (_, loc) in std::mem::take(&mut *pending) {
+                                upsert_chunk_location(&mut merged, loc);
+                            }
+                            *pending = merged;
                         }
                     }
                     None => {
                         warn!("chunk_location_batch_worker: no known leader — re-queuing {} locations for next tick", batch.len());
                         let mut pending = client.pending_chunk_locations.lock().await;
-                        batch.extend(std::mem::take(&mut *pending));
-                        *pending = batch;
+                        let mut merged = HashMap::new();
+                        for loc in batch.drain(..) {
+                            upsert_chunk_location(&mut merged, loc);
+                        }
+                        for (_, loc) in std::mem::take(&mut *pending) {
+                            upsert_chunk_location(&mut merged, loc);
+                        }
+                        *pending = merged;
                     }
                 }
             }
@@ -7959,7 +8031,8 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// instead of sending it immediately inline. See pending_chunk_locations's doc
     /// comment for why this is safe for every current caller.
     async fn enqueue_chunk_location(&self, location: dfs_common::ChunkLocation) {
-        self.pending_chunk_locations.lock().await.push(location);
+        let mut pending = self.pending_chunk_locations.lock().await;
+        upsert_chunk_location(&mut pending, location);
     }
 
     /// Spawn the background metadata queue worker onto the given runtime.
@@ -8441,6 +8514,19 @@ mod tests {
         }
     }
 
+    fn loc_at(chunk_id: ChunkId, file_id: dfs_common::FileId, file_offset: u64, write_seq: Option<u64>) -> ChunkLocation {
+        ChunkLocation {
+            chunk_id,
+            nodes: vec![],
+            size: 4 * 1024 * 1024,
+            checksum: chunk_id.hash,
+            file_offset: Some(file_offset),
+            written_at: None,
+            client_write_seq: write_seq,
+            file_id: Some(file_id),
+        }
+    }
+
     /// An empty batch must be a no-op — no network call, no error — since callers
     /// (e.g. write_chunk_to_replicas with zero chunks, or a queue drain that found
     /// nothing pending) shouldn't need to special-case this themselves.
@@ -8459,23 +8545,27 @@ mod tests {
     }
 
     /// Concurrent callers (mirroring the concurrent flush_one_chunk tasks one
-    /// flush_all_pipelined call dispatches) must all land in the shared queue before
-    /// any send happens, rather than each firing its own RPC immediately — that
+    /// flush_all_pipelined call dispatches) targeting 20 DISTINCT chunk slots must all
+    /// land in the shared queue before any send happens, rather than each firing its
+    /// own RPC immediately or losing entries under concurrent locking — that
     /// accumulation is the actual coalescing opportunity the background drain worker
     /// (start_chunk_location_batch_worker) acts on. Doesn't start that worker, so this
     /// deterministically captures the queue's behavior in isolation, with no race
-    /// against an active drain.
+    /// against an active drain. Each location gets its own file_offset specifically so
+    /// this test isn't also exercising upsert_chunk_location's same-slot dedup — see
+    /// test_enqueue_chunk_location_dedups_same_slot for that.
     #[tokio::test]
     async fn test_enqueue_chunk_location_coalesces_concurrent_callers() {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let client = DfsClient::new(vec![addr]).unwrap();
+        let file_id = dfs_common::FileId::new();
 
         let mut handles = Vec::new();
         for i in 0..20u8 {
             let client = client.clone();
             let chunk_id = chunk_id_with_hash0(i);
             handles.push(tokio::spawn(async move {
-                client.enqueue_chunk_location(loc_with_nodes(chunk_id, vec![])).await;
+                client.enqueue_chunk_location(loc_at(chunk_id, file_id, (i as u64) * 4 * 1024 * 1024, None)).await;
             }));
         }
         for h in handles {
@@ -8483,7 +8573,37 @@ mod tests {
         }
 
         let pending = client.pending_chunk_locations.lock().await;
-        assert_eq!(pending.len(), 20, "all 20 concurrent enqueues should land in the shared queue");
+        assert_eq!(pending.len(), 20, "20 concurrent enqueues to 20 distinct chunk slots should all land in the shared queue");
+    }
+
+    /// Direct regression test for the 2026-07-21 staging finding: N patches to the
+    /// SAME chunk slot (same file_id + file_offset, different chunk_id per patch since
+    /// chunk_id = blake3(file_id||file_offset||data)) landing before the batch worker's
+    /// next drain must collapse to exactly one entry — the freshest one, by
+    /// client_write_seq — not ride the batch as N separate redundant entries.
+    #[tokio::test]
+    async fn test_enqueue_chunk_location_dedups_same_slot() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let client = DfsClient::new(vec![addr]).unwrap();
+        let file_id = dfs_common::FileId::new();
+
+        // Enqueue 5 patches to the same slot, out of write_seq order, to prove the
+        // dedup picks the highest write_seq rather than just the last call.
+        let seqs = [3u64, 1, 5, 2, 4];
+        let mut expected_winner = None;
+        for &seq in &seqs {
+            let chunk_id = chunk_id_with_hash0(seq as u8);
+            if expected_winner.is_none() || seq == 5 {
+                expected_winner = Some(chunk_id);
+            }
+            client.enqueue_chunk_location(loc_at(chunk_id, file_id, 0, Some(seq))).await;
+        }
+
+        let pending = client.pending_chunk_locations.lock().await;
+        assert_eq!(pending.len(), 1, "5 patches to the same slot must collapse to 1 entry, got {}", pending.len());
+        let surviving = pending.values().next().unwrap();
+        assert_eq!(surviving.client_write_seq, Some(5), "the highest write_seq (5) must win regardless of arrival order");
+        assert_eq!(surviving.chunk_id, expected_winner.unwrap(), "the surviving entry must be the one carrying write_seq 5");
     }
 
     /// Regression test for a real bug found via T48 (background-tick metadata push

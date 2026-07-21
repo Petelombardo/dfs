@@ -775,7 +775,7 @@ impl InodeWriteState {
 /// The byte cap below was previously enforced only by flush_all_pipelined (fsync/release);
 /// the ticker now enforces both, so raising this no longer raises worst-case memory —
 /// only PIPELINE_MAX_BYTES does that.
-const PIPELINE_MAX_ITEMS: usize = 32;
+const PIPELINE_MAX_ITEMS: usize = 64;
 /// fsync/release flush: each wave in flush_all_pipelined's dispatch loop spawns up to
 /// this many concurrent flush_one_chunk tasks and then awaits the ENTIRE wave before
 /// computing the next one (a full barrier — see that function's loop). One slow task
@@ -861,7 +861,19 @@ fn maybe_log_bpfill(path_tag: &str, ino: u64, fill_pct: usize, delay_ms: u64, cu
 /// flush_one_chunk's selection, and has_flushable_slot() must all agree or
 /// they can disagree about what's eligible (see has_flushable_slot's doc
 /// comment for a real bug this already caused once).
-const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 4;
+const SLOT_DIRTY_FLUSH_THRESHOLD_BYTES: usize = CHUNK_SIZE / 16;
+
+/// Rate limit for the two best-effort "notify leader of current chunk locations
+/// mid-write" pushes (the ticker-driven flush_buffer_async path and the
+/// self-refill loop in the background flusher) — NOT the durability-critical
+/// flush_metadata_sync path (fsync/release), which is unthrottled and
+/// authoritative. Shared by both call sites via the same last_bg_metadata_push
+/// map so they draw from one per-inode budget instead of two independent ones.
+/// 2026-07-21 staging finding: the self-refill loop call site was missing this
+/// throttle entirely, producing a metadata PUT RPC at nearly the cadence of
+/// every background flush (30-160ms for a hot chunk) instead of at most once
+/// per this interval.
+const BG_METADATA_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Historical note on the write-buffer cap (now computed at runtime in
 /// new_with_runtime as global_write_buffer_cap_bytes, scaled to available
@@ -921,6 +933,9 @@ struct FlushHandle {
     flush_runtime: Arc<tokio::runtime::Runtime>,
     /// Global write buffer byte counter — decremented when slots are flushed and removed.
     global_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Client-wide cap on concurrent flush_buffer_async_one executions, across all
+    /// inodes. See GLOBAL_FLUSH_CONCURRENCY's definition for the full rationale.
+    global_flush_semaphore: Arc<tokio::sync::Semaphore>,
     /// Notification channel to wake up flush workers immediately when chunks become full.
     /// This eliminates the 0-50ms polling delay from the ticker-based approach.
     flush_notify: Arc<tokio::sync::Notify>,
@@ -1770,7 +1785,6 @@ impl FlushHandle {
                 // can never be misread by the server as an intentional truncate-to-zero (empty
                 // chunk_locations skips its chunk_map union entirely; see
                 // handle_put_file_metadata's reconcile comment).
-                const BG_METADATA_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
                 let should_push = self.last_bg_metadata_push.get(&ino)
                     .map(|last| last.elapsed() >= BG_METADATA_PUSH_INTERVAL)
                     .unwrap_or(true);
@@ -2163,6 +2177,14 @@ impl FlushHandle {
     /// pre-snapshotted by flush_one_chunk while holding the mutex. Reading these from the
     /// live slot after release is wrong — the slot may have been removed and recreated.
     async fn flush_buffer_async_one(&self, ino: u64, chunk_idx: u64, mut slot_data: Vec<u8>, file_offset: u64, gap_filled_prefix: usize, real_data_end: usize, dirty_ranges: Vec<(usize, usize)>, last_modified_snap: SystemTime) -> Result<()> {
+        // Client-wide flush concurrency cap — see GLOBAL_FLUSH_CONCURRENCY's doc comment.
+        // Acquired for the whole function (held across the actual hash+RPC work below) so
+        // total concurrent flushes across ALL inodes stay bounded, not just per-inode.
+        // Owned permit (not a borrowed Semaphore::acquire) so it can be held across the
+        // awaits below without tying its lifetime to a borrow of self. Dropped automatically
+        // on return from this function, success or error.
+        let _global_flush_permit = self.global_flush_semaphore.clone().acquire_owned().await
+            .expect("global_flush_semaphore never closed");
 
         // Snapshot the file ID now. After the network write we'll verify it hasn't changed —
         // a delete+create can replace the file while the flush is in flight, and the new
@@ -4012,6 +4034,22 @@ impl DfsFilesystem {
         let global_buffered_bytes: Arc<std::sync::atomic::AtomicUsize> =
             Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+        // Client-wide cap on concurrent flush_buffer_async_one executions (the actual
+        // hash+network-RPC work), across ALL inodes — not just one. PIPELINE_MAX_ITEMS
+        // bounds concurrency per-inode, but has no cross-inode ceiling: N simultaneously
+        // hot files (e.g. multiple VM disks on one hypervisor) each independently get up
+        // to PIPELINE_MAX_ITEMS concurrent flushes, so total client-wide RPC concurrency
+        // scales with file count, unbounded. That reproduces the same server-side overload
+        // (read_ms p99 into the seconds, max 26.8s, measured on server5) that a single
+        // over-wide PIPELINE_MAX_ITEMS=128 caused for ONE file. Sized to 64 to match
+        // PIPELINE_MAX_ITEMS's own validated value — a single busy inode is already capped
+        // at 64 by its own per-inode counter, so this adds no additional throttling for the
+        // single-writer case (confirmed via local suite + kdiskmark) and only binds once a
+        // second inode starts competing for the same budget.
+        const GLOBAL_FLUSH_CONCURRENCY: usize = 64;
+        let global_flush_semaphore: Arc<tokio::sync::Semaphore> =
+            Arc::new(tokio::sync::Semaphore::new(GLOBAL_FLUSH_CONCURRENCY));
+
         // Notification channel for immediate flush triggering when chunks become full
         let flush_notify: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
 
@@ -4054,6 +4092,7 @@ impl DfsFilesystem {
                 explicit_mtime_pending: explicit_mtime_pending_shared.clone(),
                 flush_runtime: flush_runtime.clone(),
                 global_buffered_bytes: global_buffered_bytes.clone(),
+                global_flush_semaphore: global_flush_semaphore.clone(),
                 flush_notify: flush_notify.clone(),
                 write_tasks_in_flight: write_tasks_in_flight_shared.clone(),
                 chunk_write_locks: chunk_write_locks_for_bg.clone(),
@@ -4238,12 +4277,28 @@ impl DfsFilesystem {
                                 // Notify leader of current chunk locations after each successful
                                 // flush so chunk_map stays populated throughout long writes
                                 // (e.g., recordings where reads happen during the write session).
-                                // MetadataQueue deduplicates by file_id so concurrent flushes
-                                // only deliver one update; the final flush_metadata_sync at
-                                // release always wins via write_seq ordering.
-                                if let Some(meta) = handle.metadata_cache.get(&ino).map(|m| m.clone()) {
-                                    if !meta.chunk_locations.is_empty() {
-                                        handle.client.enqueue_metadata(&meta).await;
+                                // MetadataQueue deduplicates by file_id, but only collapses
+                                // pushes that are STILL QUEUED when the next one arrives — this
+                                // loop's own drain worker empties the queue almost immediately
+                                // whenever it's idle, so a hot chunk flushing every 30-160ms (a
+                                // fragmented-write pattern, see SLOT_DIRTY_FLUSH_THRESHOLD_BYTES)
+                                // produced a metadata PUT RPC at nearly that same cadence, sustained
+                                // for the file's whole write session (2026-07-21 staging finding:
+                                // 767 of 785 metadata PUTs in a 44s window were for one continuously
+                                // -open file). Debounced the same way the sibling ticker-driven push
+                                // already is (BG_METADATA_PUSH_INTERVAL, ~1776 above) — this is a
+                                // best-effort convenience push, not the durability-critical path
+                                // (flush_metadata_sync at fsync/release remains authoritative and is
+                                // untouched), so a shared 2s-per-inode budget is safe here too.
+                                let should_push_bg_meta = handle.last_bg_metadata_push.get(&ino)
+                                    .map(|last| last.elapsed() >= BG_METADATA_PUSH_INTERVAL)
+                                    .unwrap_or(true);
+                                if should_push_bg_meta {
+                                    if let Some(meta) = handle.metadata_cache.get(&ino).map(|m| m.clone()) {
+                                        if !meta.chunk_locations.is_empty() {
+                                            handle.last_bg_metadata_push.insert(ino, std::time::Instant::now());
+                                            handle.client.enqueue_metadata(&meta).await;
+                                        }
                                     }
                                 }
                                 // Check whether more flushable slots remain (full, abandoned,
@@ -4277,6 +4332,25 @@ impl DfsFilesystem {
                         });
                         }
                     }
+                }
+            });
+        }
+
+        // Unconditional write-buffer occupancy sampler — independent of BPFILLTIMING
+        // (which only logs once fill_pct crosses into a throttled tier). Without this,
+        // there's no visibility into how much unflushed data accumulates in the 0-75%
+        // "free" zone below the graduated back-pressure thresholds, which is exactly
+        // the range repro_writebuffer_uncommitted.sh needs to measure.
+        {
+            let global_buffered_bytes = global_buffered_bytes.clone();
+            let cap = global_write_buffer_cap_bytes;
+            runtime.spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(200));
+                loop {
+                    interval.tick().await;
+                    let current = global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                    let fill_pct = current * 100 / cap.max(1);
+                    tracing::debug!("WBSTATS buffered={} cap={} fill_pct={}", current, cap, fill_pct);
                 }
             });
         }
@@ -4323,6 +4397,7 @@ impl DfsFilesystem {
             explicit_mtime_pending: explicit_mtime_pending_shared.clone(),
             flush_runtime: flush_runtime.clone(),
             global_buffered_bytes: global_buffered_bytes.clone(),
+            global_flush_semaphore: global_flush_semaphore.clone(),
             flush_notify: flush_notify.clone(),
             write_tasks_in_flight: write_tasks_in_flight_shared.clone(),
             chunk_write_locks: chunk_write_locks_shared.clone(),
@@ -8750,6 +8825,7 @@ impl Filesystem for DfsFilesystem {
             explicit_mtime_pending: self.explicit_mtime_pending.clone(),
             flush_runtime: self.flush_runtime.clone(),
             global_buffered_bytes: self.global_buffered_bytes.clone(),
+            global_flush_semaphore: self.flush_handle.global_flush_semaphore.clone(),
             flush_notify: self.flush_notify.clone(),
             write_tasks_in_flight: self.write_tasks_in_flight.clone(),
             chunk_write_locks: self.chunk_write_locks.clone(),

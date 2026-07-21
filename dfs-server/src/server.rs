@@ -8673,6 +8673,84 @@ impl Server {
     /// If this node is not the leader, return NotLeader so the client can redirect.
     /// The leader stores locally, enqueues for followers, and returns Ok.
     /// A non-leader that receives a direct write (e.g. quorum replica) stores locally
+    /// Reconciles `chunk_locations` (a client's routine metadata push — typically a
+    /// small delta of just the chunks touched this cycle) against `map_locs`
+    /// (`self.chunk_map`'s authoritative, full per-file view) in two passes:
+    ///
+    /// 1. For each entry already in `chunk_locations`, if chunk_map has a provably
+    ///    newer record for the same chunk_idx, prefer chunk_map's version — guards
+    ///    against a stale chunk_id surviving when all 4 RCL broadcast attempts for a
+    ///    write failed silently (see handle_put_file_metadata's caller comment).
+    /// 2. Append any chunk_map entry whose chunk_idx isn't yet in `chunk_locations`,
+    ///    so the reconciled result never regresses below what RCL has already
+    ///    confirmed — skipped when `chunk_locations` starts empty (an intentional
+    ///    truncate-to-zero, not an incomplete snapshot).
+    ///
+    /// Then sorts by file_offset — several downstream consumers (handle_get_file_chunk_map's
+    /// max-chunk-index scan, chunk_map_update_location_for_file's partition_point)
+    /// assume offset-sorted order.
+    ///
+    /// Matches by chunk_idx (file_offset / CHUNK_SIZE), not exact file_offset,
+    /// throughout: a fresh write's explicit leader RCL and the client's own later
+    /// metadata_cache splice are two independent channels confirming the same chunk,
+    /// and exact-offset matching missed that correspondence when either carried a
+    /// non-boundary-aligned offset — appending a duplicate instead of recognizing the
+    /// same slot (observed live on staging as exact-duplicate rows).
+    ///
+    /// O(map_locs + chunk_locations) via two index maps built once, not the
+    /// O(map_locs * chunk_locations) / effectively O(map_locs^2) of the repeated
+    /// linear .find()/.any() scans this replaced. 2026-07-21: measured live at
+    /// chunk_map=1355 entries during an active VM-111 install and climbing —
+    /// quadratic cost that gets worse the longer a large file's write session runs,
+    /// on the leader's hot path for every single metadata push.
+    fn reconcile_chunk_locations_with_map(chunk_locations: &mut Vec<ChunkLocation>, map_locs: &[ChunkLocation]) {
+        const CHUNK_SIZE_RECONCILE: u64 = 4 * 1024 * 1024;
+        let was_empty = chunk_locations.is_empty();
+
+        let map_locs_by_cidx: HashMap<u64, &ChunkLocation> = map_locs.iter()
+            .filter_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE_RECONCILE, l)))
+            .collect();
+
+        for loc in chunk_locations.iter_mut() {
+            if let Some(file_offset) = loc.file_offset {
+                let incoming_cidx = file_offset / CHUNK_SIZE_RECONCILE;
+                if let Some(&map_loc) = map_locs_by_cidx.get(&incoming_cidx) {
+                    let should_use_server = if let Some(client_ts) = loc.written_at {
+                        let server_ts = map_loc.written_at.unwrap_or(0);
+                        server_ts > client_ts
+                    } else {
+                        // No timestamp: use client_write_seq to distinguish a stale
+                        // replica broadcast (cws=None, server has cws=Some) from a
+                        // genuine fresh write (cws=Some or neither has a seq).
+                        match (loc.client_write_seq, map_loc.client_write_seq) {
+                            (None, Some(_)) => true,          // server has seq, incoming doesn't → stale
+                            (Some(inc), Some(ext)) => ext > inc, // server has higher seq → prefer server
+                            _ => false,                        // incoming has seq or neither has one → accept
+                        }
+                    };
+                    if should_use_server {
+                        *loc = map_loc.clone();
+                    }
+                }
+            }
+        }
+
+        if !was_empty {
+            let mut existing_cidx: std::collections::HashSet<u64> = chunk_locations.iter()
+                .filter_map(|l| l.file_offset.map(|o| o / CHUNK_SIZE_RECONCILE))
+                .collect();
+            for map_loc in map_locs.iter() {
+                if let Some(file_offset) = map_loc.file_offset {
+                    let map_cidx = file_offset / CHUNK_SIZE_RECONCILE;
+                    if existing_cidx.insert(map_cidx) {
+                        chunk_locations.push(map_loc.clone());
+                    }
+                }
+            }
+            chunk_locations.sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
+        }
+    }
+
     /// only — the leader will disseminate to the remaining followers.
     ///
     /// `covers_from_write_seq`: the lowest write_seq this push's chunk_locations
@@ -8797,65 +8875,7 @@ impl Server {
             }
             if let Some(map_entry) = self.chunk_map.get(&m.id) {
                 let (map_locs, _) = map_entry.value();
-                const CHUNK_SIZE_RECONCILE: u64 = 4 * 1024 * 1024;
-                for loc in Arc::make_mut(&mut m.chunk_locations).iter_mut() {
-                    if let Some(file_offset) = loc.file_offset {
-                        // Match by chunk_idx, not exact file_offset: a fresh write's explicit
-                        // leader RCL and the client's own later metadata_cache splice are two
-                        // independent channels confirming the same chunk. If either ever
-                        // carries a non-boundary-aligned file_offset (e.g. a delayed/retried
-                        // RCL for a different intra-chunk position), exact matching here would
-                        // miss the correspondence and this reconcile would treat them as
-                        // unrelated chunks — appending a duplicate below instead of recognizing
-                        // it as the same slot (observed live on staging as exact-duplicate rows).
-                        let incoming_cidx = file_offset / CHUNK_SIZE_RECONCILE;
-                        if let Some(map_loc) = map_locs.iter().find(|l| {
-                            l.file_offset.map(|o| o / CHUNK_SIZE_RECONCILE) == Some(incoming_cidx)
-                        }) {
-                            let should_use_server = if let Some(client_ts) = loc.written_at {
-                                let server_ts = map_loc.written_at.unwrap_or(0);
-                                server_ts > client_ts
-                            } else {
-                                // No timestamp: use client_write_seq to distinguish a stale
-                                // replica broadcast (cws=None, server has cws=Some) from a
-                                // genuine fresh write (cws=Some or neither has a seq).
-                                match (loc.client_write_seq, map_loc.client_write_seq) {
-                                    (None, Some(_)) => true,          // server has seq, incoming doesn't → stale
-                                    (Some(inc), Some(ext)) => ext > inc, // server has higher seq → prefer server
-                                    _ => false,                        // incoming has seq or neither has one → accept
-                                }
-                            };
-                            if should_use_server {
-                                *loc = map_loc.clone();
-                            }
-                        }
-                    }
-                }
-                // Union: chunk_map grows incrementally as each chunk's RCL lands
-                // (chunk_map_update_location_for_file), but concurrent per-chunk
-                // flushes for the same file race to send their own non-cumulative
-                // chunk_locations snapshot — a later write_seq can easily carry
-                // FEWER entries than an earlier one. Append any chunk_map entry
-                // whose chunk_idx isn't already in the incoming list, so the
-                // persisted chunk_locations never regresses below what RCL has
-                // already confirmed. Skip when the incoming list is empty — that's
-                // an intentional truncate-to-zero, not an incomplete snapshot.
-                // Matched by chunk_idx (not exact file_offset) for the same reason as
-                // above — otherwise a non-aligned map_loc offset would never be
-                // recognized as already-present and gets appended as a duplicate.
-                if !m.chunk_locations.is_empty() {
-                    for map_loc in map_locs.iter() {
-                        if let Some(file_offset) = map_loc.file_offset {
-                            let map_cidx = file_offset / CHUNK_SIZE_RECONCILE;
-                            if !m.chunk_locations.iter().any(|l| {
-                                l.file_offset.map(|o| o / CHUNK_SIZE_RECONCILE) == Some(map_cidx)
-                            }) {
-                                Arc::make_mut(&mut m.chunk_locations).push(map_loc.clone());
-                            }
-                        }
-                    }
-                    Arc::make_mut(&mut m.chunk_locations).sort_by_key(|l| l.file_offset.unwrap_or(u64::MAX));
-                }
+                Self::reconcile_chunk_locations_with_map(Arc::make_mut(&mut m.chunk_locations), map_locs);
             }
             m
         };
@@ -12953,6 +12973,117 @@ mod tests {
         assert!(chunk_to_file.get(&middle.chunk_id).is_none(), "superseded chunk_id must not remain in chunk_to_file");
     }
 
+    fn recon_loc(offset: u64, seq: u64, written_at: Option<u64>) -> ChunkLocation {
+        let hash = compute_chunk_hash(format!("recon-{}-{}", offset, seq).as_bytes());
+        ChunkLocation {
+            chunk_id: ChunkId::from_hash(hash),
+            nodes: vec![dfs_common::NodeId::new()],
+            size: 4 * 1024 * 1024,
+            checksum: hash,
+            file_offset: Some(offset),
+            written_at,
+            client_write_seq: Some(seq),
+            file_id: Some(dfs_common::FileId::new()),
+        }
+    }
+
+    /// Correctness regression for reconcile_chunk_locations_with_map (2026-07-21
+    /// extraction from handle_put_file_metadata's inline reconcile, done to fix an
+    /// O(map_locs^2)-shaped pair of linear scans — see that function's doc comment).
+    /// Covers every branch the original inline code had: prefer-server-if-newer (both
+    /// the written_at and client_write_seq tie-break paths), keep-incoming-if-not-
+    /// stale, append-missing-from-map, skip-append-when-incoming-started-empty, and
+    /// final offset-sorted output. Matching by chunk_idx must also be tolerant of a
+    /// non-boundary-aligned incoming offset (real cause of a past exact-duplicate-row
+    /// bug on staging).
+    #[test]
+    fn reconcile_chunk_locations_with_map_matches_original_semantics() {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
+        // Case 1: server (chunk_map) is provably newer via written_at -> server wins.
+        let mut incoming_ts = vec![recon_loc(0, 1, Some(100))];
+        let map_ts = vec![recon_loc(0, 2, Some(200))];
+        Server::reconcile_chunk_locations_with_map(&mut incoming_ts, &map_ts);
+        assert_eq!(incoming_ts.len(), 1);
+        assert_eq!(incoming_ts[0].chunk_id, map_ts[0].chunk_id, "server's newer written_at must win");
+
+        // Case 2: incoming has a written_at that's newer -> incoming must survive.
+        let mut incoming_ts2 = vec![recon_loc(0, 1, Some(300))];
+        let map_ts2 = vec![recon_loc(0, 2, Some(200))];
+        let incoming_id2 = incoming_ts2[0].chunk_id;
+        Server::reconcile_chunk_locations_with_map(&mut incoming_ts2, &map_ts2);
+        assert_eq!(incoming_ts2[0].chunk_id, incoming_id2, "incoming's newer written_at must not be clobbered");
+
+        // Case 3: no written_at on either side, fall back to client_write_seq — server's
+        // higher seq wins.
+        let mut incoming_seq = vec![recon_loc(0, 1, None)];
+        let map_seq = vec![recon_loc(0, 5, None)];
+        Server::reconcile_chunk_locations_with_map(&mut incoming_seq, &map_seq);
+        assert_eq!(incoming_seq[0].chunk_id, map_seq[0].chunk_id, "server's higher client_write_seq must win when no written_at exists");
+
+        // Case 4: append-missing — chunk_map has an entry the (non-empty) incoming list
+        // doesn't, must be appended and the result re-sorted by offset.
+        let mut incoming_append = vec![recon_loc(CHUNK_SIZE * 2, 1, Some(1))];
+        let map_append = vec![
+            recon_loc(0, 1, Some(1)),
+            recon_loc(CHUNK_SIZE * 2, 1, Some(1)),
+        ];
+        Server::reconcile_chunk_locations_with_map(&mut incoming_append, &map_append);
+        assert_eq!(incoming_append.len(), 2, "chunk_map's extra chunk_idx 0 must be appended");
+        assert_eq!(incoming_append[0].file_offset, Some(0), "result must be sorted by file_offset ascending");
+        assert_eq!(incoming_append[1].file_offset, Some(CHUNK_SIZE * 2));
+
+        // Case 5: incoming started EMPTY -> must stay empty (intentional
+        // truncate-to-zero), never backfilled from chunk_map.
+        let mut incoming_empty: Vec<ChunkLocation> = vec![];
+        let map_nonempty = vec![recon_loc(0, 1, Some(1))];
+        Server::reconcile_chunk_locations_with_map(&mut incoming_empty, &map_nonempty);
+        assert!(incoming_empty.is_empty(), "an intentional empty push must not be backfilled from chunk_map");
+
+        // Case 6: chunk_idx matching must tolerate a non-boundary-aligned offset on
+        // either side — a delayed/retried RCL for a different intra-chunk position
+        // must still be recognized as the SAME slot, not appended as a duplicate.
+        let mut incoming_unaligned = vec![recon_loc(100, 1, Some(1))]; // chunk_idx 0, non-aligned offset
+        let map_aligned = vec![recon_loc(0, 2, Some(2))]; // chunk_idx 0, aligned offset
+        Server::reconcile_chunk_locations_with_map(&mut incoming_unaligned, &map_aligned);
+        assert_eq!(incoming_unaligned.len(), 1, "same chunk_idx at different intra-chunk offsets must collapse to one entry, not duplicate");
+        assert_eq!(incoming_unaligned[0].chunk_id, map_aligned[0].chunk_id, "server's newer entry must win even with an unaligned incoming offset");
+    }
+
+    /// Direct regression test for the 2026-07-21 O(map_locs^2) fix: reconciling a
+    /// large chunk_map against a from-scratch incoming list must scale ~linearly, not
+    /// quadratically. Measured in-process (no network/disk) specifically to avoid the
+    /// noise floor that made an equivalent integration-level timing test unreliable
+    /// (see T54's development history in scripts/test_local_suite.sh) — this isolates
+    /// the actual reconcile cost from RPC/serialization/durability overhead entirely.
+    /// N chosen (20,000) so the O(n^2) shape this replaced (~2*10^8 comparisons) would
+    /// take on the order of a second or more, made unmissable against the O(n) fix's
+    /// sub-50ms result — not a close call either way.
+    #[test]
+    fn reconcile_chunk_locations_with_map_scales_linearly_not_quadratically() {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        const N: u64 = 20_000;
+
+        // Worst case for the O(n^2) shape this replaced: incoming starts non-empty
+        // (so the append pass runs) but shares NO chunk_idx with map_locs, forcing
+        // every one of N append checks to scan the entire (growing) incoming list —
+        // the classic incremental-growth-inside-the-scanned-list quadratic blowup.
+        let mut incoming = vec![recon_loc(u64::MAX - CHUNK_SIZE, 1, Some(1))]; // unrelated chunk_idx, keeps incoming non-empty
+        let map_locs: Vec<ChunkLocation> = (0..N).map(|i| recon_loc(i * CHUNK_SIZE, 1, Some(1))).collect();
+
+        let start = std::time::Instant::now();
+        Server::reconcile_chunk_locations_with_map(&mut incoming, &map_locs);
+        let elapsed = start.elapsed();
+
+        assert_eq!(incoming.len() as u64, N + 1, "all N chunk_map entries plus the original unrelated one must be present");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "reconcile of {} chunk_map entries took {:?} — expected well under 500ms for O(n); \
+             a multi-second result here means the O(n^2) shape this test guards against was reintroduced",
+            N, elapsed
+        );
+    }
+
     /// L1 invariant (2026-07-19 ghost-clobber fix): once the healer preserves the
     /// healed chunk's real seq instead of registering `None` (see healing.rs L1
     /// edits), a *current* chunk always carries its seq — so a stale broadcast of an
@@ -15217,7 +15348,7 @@ mod tests {
             // from this exact state — i.e. this is a valid, retryable starting point.
             // Force it directly rather than waiting on the debounce timer, since
             // apply_patch was never called here to spawn one.
-            assert!(matches!(h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx).await, FoldSlotOutcome::FoldedHere),
+            assert!(matches!(h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx).await, FoldSlotOutcome::FoldedHere(..)),
                 "fold must succeed from this Pending state");
             let state = h.metadata.get_patch_state(&public_token).unwrap().unwrap();
             let folded = match state {

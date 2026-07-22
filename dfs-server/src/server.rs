@@ -10027,6 +10027,15 @@ impl Server {
         // past it, and trusting the leader unconditionally turned a case this
         // node could resolve correctly on its own into a livelock (every retry
         // re-asked the same wrong leader, got the same stale answer).
+        // APTIMING sub-spans (2026-07-22): SPTIMING reports apply_patch as ONE blob, which
+        // was enough to prove the ~190ms client-observed MultiPatch round trip is spent
+        // server-side but not enough to say WHERE. Measurement so far accounts for only
+        // ~22ms of a 122ms median (syncfs ~20ms via [DURABILITY], metadata commits ~1-3ms
+        // via [META COMMITTER], lock_wait ~0, and 85% of ops are merges so the leader
+        // refresh RPC is not on the common path) — the other ~100ms is unattributed inside
+        // this function. These spans split it into the six real stages so the next load
+        // test answers it with a number instead of a hypothesis.
+        let t_ap_start = std::time::Instant::now();
         let merge_base = match self.metadata.get_patch_state_async(chunk_id).await {
             Ok(Some(PatchState::Folded(real))) => Some((real, None, true)),
             Ok(Some(pending @ PatchState::Pending { .. })) => Some((chunk_id, Some(pending), true)),
@@ -10038,6 +10047,8 @@ impl Server {
         };
         let (base_for_lookup, existing_pending, resolved_via_local_fold) = merge_base.expect("all three match arms above produce Some");
 
+        let t_resolve = t_ap_start.elapsed();
+        let t_base_start = std::time::Instant::now();
         let (base_chunk_id, prior_delta, base_size, is_merge) = match existing_pending {
             Some(PatchState::Pending { base_chunk_id, delta_chunk_id, size, .. }) => {
                 (base_chunk_id, Some(delta_chunk_id), size, true)
@@ -10173,10 +10184,15 @@ impl Server {
         // DIAGNOSTIC (2026-07-11, VM-108 qcow2 corruption investigation): exact
         // byte-range detail for every patch merged into this slot's accumulator,
         // to check for a causal/arrival-order inversion under concurrent writers
-        // to the same chunk_idx (info!, not debug! — servers run at info level).
-        {
+        // to the same chunk_idx. Demoted to debug! 2026-07-22: that investigation
+        // closed (the cause was the client-side sparse-write bypass, not arrival
+        // order), and an info! on EVERY patch is one of the main contributors to
+        // the multi-GB server logs that now sit on the same filesystem the
+        // durability syncfs has to flush. Re-enable with debug when chasing a
+        // suspected ordering inversion.
+        if tracing::enabled!(tracing::Level::DEBUG) {
             let ranges: Vec<(usize, usize)> = patches.iter().map(|(off, d)| (*off, d.len())).collect();
-            info!("[MERGE-TRACE] file={} chunk_idx={} is_merge={} base={} prior_delta={:?} ranges={:?}",
+            debug!("[MERGE-TRACE] file={} chunk_idx={} is_merge={} base={} prior_delta={:?} ranges={:?}",
                 file_id, cidx, is_merge, base_chunk_id, prior_delta, ranges);
         }
 
@@ -10187,6 +10203,9 @@ impl Server {
         // correctly overwrites an earlier one's overlapping bytes — same semantics a
         // single patch's own multi-range Vec already relies on, just extended across
         // accumulation cycles.
+        let t_base = t_base_start.elapsed();
+        let t_hash_start = std::time::Instant::now();
+
         let mut new_record_bytes = Vec::new();
         for (off, data) in &patches {
             new_record_bytes.extend_from_slice(&encode_delta_record(*off, data));
@@ -10260,6 +10279,8 @@ impl Server {
         // O(1) metadata work, not another O(total accumulated size) rewrite. Renaming
         // away the prior path also replaces the old cleanup-delete-prior-delta step —
         // there's no separate file left to delete.
+        let t_hash = t_hash_start.elapsed();
+        let t_write_start = std::time::Instant::now();
         let storage = self.storage.clone();
         match prior_delta {
             Some(prior_delta_id) => {
@@ -10299,6 +10320,9 @@ impl Server {
             }
         }
 
+        let t_write = t_write_start.elapsed();
+        let t_state_start = std::time::Instant::now();
+
         // Public token: derived from the delta's own hash through a second,
         // domain-separated Blake3 pass, so it can never coincide with any real
         // content hash (delta_chunk_id, base_chunk_id, or a future full-chunk hash).
@@ -10312,6 +10336,13 @@ impl Server {
         let public_token = ChunkId::from_hash(*token_hasher.finalize().as_bytes());
 
         let needed_len = patches.iter().map(|(off, d)| off + d.len()).max().unwrap_or(0).max(base_size);
+        // LOAD-BEARING for T54 in scripts/test_local_suite.sh: that test correlates each
+        // applied patch to the leader's RCL broadcasts via this line's `token=`, and the
+        // suite runs servers at info. Demoting it to debug (tried 2026-07-22 during the
+        // log-volume reduction) makes T54 fail with "no patches detected -- test setup
+        // issue". Kept at info! deliberately: it's one compact line per patch, comparable
+        // to the sibling "MultiPatch:" line, unlike the verbose ranges= MERGE-TRACE above
+        // which is now debug. If this ever needs to move, update T54's detection first.
         info!("[MERGE-TRACE] file={} chunk_idx={} delta={} token={} needed_len={}",
             file_id, cidx, delta_chunk_id, public_token, needed_len);
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -10328,6 +10359,9 @@ impl Server {
             self.pending_patch_ids.remove(&retired);
             self.pending_patch_fold_broadcasts.remove(&retired);
         }
+
+        let t_state = t_state_start.elapsed();
+        let t_loc_start = std::time::Instant::now();
 
         let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         if !is_merge {
@@ -10451,6 +10485,29 @@ impl Server {
             });
         }
         drop(patch_guard);
+
+        // APTIMING: the six stages of apply_patch (see t_ap_start's comment). Same
+        // two-tier volume discipline as NETTIMING/SPTIMING — routine samples at debug!,
+        // only genuinely slow ones at info!, so this stays usable on a production node
+        // without re-inflating the logs that the durability syncfs has to flush.
+        // `resolve` = patch_state lookup; `base` = chunk-location lookup + (fresh
+        // accumulators only) leader confirmation, ghost-chunk check and any peer pull;
+        // `hash` = delta-record encode + running-hash update, including a prior-delta
+        // read on a delta_ring miss; `write` = delta append/rename + the blocking
+        // Foreground durability barrier; `state` = put_patch_state_pending; `loc` =
+        // chunk-location register/retire/slide + chunk_map update.
+        {
+            let total = t_ap_start.elapsed();
+            let t_loc = t_loc_start.elapsed();
+            const APTIMING_INFO_MS: u128 = 100;
+            if total.as_millis() >= APTIMING_INFO_MS {
+                info!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} state={:?} loc={:?}",
+                    file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_state, t_loc);
+            } else {
+                debug!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} state={:?} loc={:?}",
+                    file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_state, t_loc);
+            }
+        }
 
         Ok((public_token, needed_len, Some(now_ms), None))
     }
@@ -10794,10 +10851,21 @@ impl Server {
         // itself). `lock_wait` isolates queuing time; `apply_patch` is the actual work
         // once holding the lock; `other` is everything else in this handler (staleness
         // checks, chunk_seq lookups, etc.) not otherwise measured.
+        //
+        // 2026-07-22: "unconditional" cost ~497K lines in one staging log; now two-tier
+        // (info! for slow ops, debug! otherwise) for the same reason as NETTIMING — see
+        // that gate's comment. The lock_wait question above is settled, incidentally: it
+        // fired twice in a 30MB sample, so chunk_patch_locks is NOT the bottleneck.
         let total_handle = handle_start.elapsed();
         let other_handle = total_handle.saturating_sub(lock_wait_elapsed + apply_patch_elapsed);
-        info!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?}",
-            file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle);
+        const SPTIMING_INFO_MS: u128 = 100;
+        if total_handle.as_millis() < SPTIMING_INFO_MS {
+            debug!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?}",
+                file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle);
+        } else {
+            info!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?}",
+                file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle);
+        }
         match result {
             Ok((new_chunk_id, final_size, patch_ts, final_buf)) => {
                 info!("MultiPatch: {} -> {} (final size={}, chunk_idx={:?}, full_rewrite={})",

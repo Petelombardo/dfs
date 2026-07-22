@@ -263,8 +263,23 @@ async fn handle_connection<H: MessageHandler>(
                     break;
                 }
                 let write_elapsed = write_start.elapsed();
-                if dispatch_elapsed.as_millis() >= 5 || write_elapsed.as_millis() >= 5 {
+                // Volume control (2026-07-22): the >=5ms gate below turned out to be the
+                // COMMON case, not the exceptional one — one staging node accumulated 3.49M
+                // NETTIMING lines in a 4.8GB dfs-server.log. That log lives on the SAME
+                // filesystem as the chunk data, and durability is a per-device syncfs
+                // (DurabilityCoalescer), so every client-facing patch barrier had to flush
+                // those dirty log pages too — verbose logging was feeding directly back into
+                // write latency. Routine samples now go to debug!; only genuinely
+                // pathological dispatches stay at info! so a real stall is still visible in
+                // production without re-enabling debug (which on a busy node is itself a
+                // load event).
+                const NETTIMING_INFO_MS: u128 = 500;
+                let slow_ms = dispatch_elapsed.as_millis().max(write_elapsed.as_millis());
+                if slow_ms >= NETTIMING_INFO_MS {
                     info!("NETTIMING peer={} read_wait={:?} dispatch={:?} write_response={:?}",
+                        peer_addr, read_elapsed, dispatch_elapsed, write_elapsed);
+                } else if slow_ms >= 5 {
+                    debug!("NETTIMING peer={} read_wait={:?} dispatch={:?} write_response={:?}",
                         peer_addr, read_elapsed, dispatch_elapsed, write_elapsed);
                 }
             }

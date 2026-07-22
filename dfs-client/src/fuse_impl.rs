@@ -477,10 +477,6 @@ struct InodeMeta {
     /// that metadata_cache still refers to the same file — if it changed (delete+recreate
     /// with inode reuse), existing_chunk_size from the old file must be ignored.
     expected_file_id: Option<dfs_common::FileId>,
-    /// Chunk index of the most recent write_at call. Used to detect when the caller
-    /// jumps to a different chunk, so the previous chunk's partial slot can be flushed
-    /// immediately rather than waiting for the timer.
-    last_written_chunk: Option<u64>,
 }
 
 impl InodeMeta {
@@ -489,7 +485,6 @@ impl InodeMeta {
             sync_on_fsync,
             is_truncated_session: false,
             expected_file_id: None,
-            last_written_chunk: None,
         }
     }
 }
@@ -553,7 +548,20 @@ struct InodeWriteBuffer {
     /// write_at() puts real data into a previously-empty slot, removed
     /// whenever a slot is reset to `ChunkSlot::new()` (flush completion).
     active_chunks: dashmap::DashSet<u64>,
+    /// Chunk index of the most recent write_at call (see InodeMeta's old
+    /// last_written_chunk doc comment for what this is for — moved out of the
+    /// `meta` Mutex into a lock-free atomic: this is read-and-swapped on
+    /// EVERY write_at() call, not just chunk-boundary crossings, so it's the
+    /// single hottest piece of per-write bookkeeping in the whole struct.
+    /// Under an async Mutex that meant every write — even fully uncontended,
+    /// single-threaded Q1T1 sequential writes — paid a real async-mutex
+    /// acquisition just to update a cursor. `u64::MAX` is the sentinel for
+    /// "no previous write yet" (None) — a real chunk_idx would require a file
+    /// size of MAX*4MB, not reachable in practice.
+    last_written_chunk: std::sync::atomic::AtomicU64,
 }
+
+const NO_CHUNK: u64 = u64::MAX;
 
 impl InodeWriteBuffer {
     fn new(sync_on_fsync: bool) -> Self {
@@ -561,6 +569,7 @@ impl InodeWriteBuffer {
             meta: Mutex::new(InodeMeta::new(sync_on_fsync)),
             chunks: DashMap::new(),
             active_chunks: dashmap::DashSet::new(),
+            last_written_chunk: std::sync::atomic::AtomicU64::new(NO_CHUNK),
         }
     }
 
@@ -575,6 +584,7 @@ impl InodeWriteBuffer {
             meta: Mutex::new(meta),
             chunks: DashMap::new(),
             active_chunks: dashmap::DashSet::new(),
+            last_written_chunk: std::sync::atomic::AtomicU64::new(NO_CHUNK),
         }
     }
 
@@ -589,7 +599,21 @@ impl InodeWriteBuffer {
 
     /// Get-or-create the shard lock handle for `idx` (mirrors the old
     /// `slots.entry(idx).or_insert_with(...)`).
+    ///
+    /// `get()`-first, `entry()`-on-miss-only: DashMap::entry() takes a write
+    /// lock on the key's internal shard bucket even when the entry already
+    /// exists (needed to support the insert-if-absent semantics), while
+    /// get() only takes a read lock. Since this is called on every write_at()
+    /// invocation — i.e. on every single write, not just the first touch of a
+    /// chunk_idx — always going through entry() serialized concurrent writers
+    /// targeting DIFFERENT chunk_idx values whenever they happened to hash
+    /// into the same DashMap-internal bucket, reintroducing exactly the kind
+    /// of cross-chunk contention this whole sharded design exists to avoid.
+    /// Root-caused 2026-07-22 alongside CONCURRENT_STREAMS_SCAN_CAP.
     fn chunk_entry(&self, idx: u64) -> Arc<Mutex<ChunkShardState>> {
+        if let Some(existing) = self.chunks.get(&idx) {
+            return existing.clone();
+        }
         self.chunks.entry(idx).or_insert_with(|| Arc::new(Mutex::new(ChunkShardState::new()))).clone()
     }
 
@@ -609,8 +633,36 @@ impl InodeWriteBuffer {
     /// shard alone, released before this chunk's own shard is locked — so
     /// there is no lock-ordering pair for two concurrent writers to deadlock
     /// on (only ever one shard lock held at a time by this function).
-    async fn write_at(&self, file_offset: u64, data: &[u8]) -> bool {
+    /// Returns `(pattern_changed, added_bytes)`.
+    ///
+    /// `added_bytes` is the EXACT number of newly-resident buffer bytes this call added,
+    /// summed per touched slot while holding that slot's own lock. Callers feed it straight
+    /// into `global_buffered_bytes` for write back-pressure.
+    ///
+    /// It is returned from here rather than derived by the caller because the caller cannot
+    /// measure it correctly. Callers used to do:
+    ///     let before = state_arc.resident_bytes().await;
+    ///     <write>
+    ///     let added = state_arc.resident_bytes().await.saturating_sub(before);
+    /// but `resident_bytes()` sums the WHOLE buffer and SKIPS any shard whose try_lock fails
+    /// (see its doc comment). Once the write buffer was sharded per chunk_idx, that made the
+    /// delta of two samples meaningless under concurrency: if fewer shards happened to be
+    /// busy during the second scan than the first, the difference swept in OTHER chunks'
+    /// resident bytes and charged them to this one write. `saturating_sub` then clamped the
+    /// opposite error to zero, so the mistake was one-way — a ratchet that could only inflate
+    /// the counter. It walked up to the cap and pinned there, making every subsequent write
+    /// pay back-pressure delay forever, with no recovery short of a client restart (which
+    /// resets the counter to 0). Observed live on server5 2026-07-22: buffered frozen at
+    /// exactly 936452096 of a 1GB cap across 3+ minutes while writes kept flowing, random
+    /// writes collapsed to ~1MB/s while sequential (which keeps far fewer shards busy, so
+    /// the sampling error stayed small) only fell by about half.
+    ///
+    /// Measuring per-slot under the lock we already hold is both exact and O(1) — it also
+    /// removes two O(active_chunks) scans from every single write, which at ~1000 dirty
+    /// chunks was ~2000 try_locks per 4K write of pure overhead.
+    async fn write_at(&self, file_offset: u64, data: &[u8]) -> (bool, usize) {
         let mut pattern_changed = false;
+        let mut added_bytes: usize = 0;
         let mut remaining = data;
         let mut cur_offset = file_offset;
 
@@ -620,12 +672,11 @@ impl InodeWriteBuffer {
 
             // Cross-chunk pattern change (see old write_at's doc comment for the
             // full rationale, root cause, and the concurrent_streams guard).
-            let prev_idx = {
-                let mut meta = self.meta.lock().await;
-                let prev = meta.last_written_chunk;
-                meta.last_written_chunk = Some(idx);
-                prev.filter(|&p| p != idx)
-            };
+            // Lock-free swap (see last_written_chunk's doc comment) — this runs on
+            // every write, not just chunk-boundary crossings, so it must not cost
+            // an async mutex acquisition.
+            let prev_raw = self.last_written_chunk.swap(idx, std::sync::atomic::Ordering::Relaxed);
+            let prev_idx = (prev_raw != NO_CHUNK).then_some(prev_raw).filter(|&p| p != idx);
             if let Some(prev_idx) = prev_idx {
                 // Non-blocking scan: a shard that's busy right now is conservatively
                 // treated as "still active" (skip abandon), matching the safe
@@ -635,17 +686,36 @@ impl InodeWriteBuffer {
                 // Scan active_chunks (currently-buffered working set), NOT the full
                 // `chunks` map — see active_chunks' doc comment for the O(n^2)
                 // regression this avoids on a large sequential write.
-                let concurrent_streams = self.active_chunks.iter().any(|e| {
-                    let other_idx = *e;
-                    if other_idx == prev_idx { return false; }
-                    match self.chunk_get(other_idx) {
-                        Some(shard) => match shard.try_lock() {
-                            Ok(s) => (s.slot.real_data_end > 0 || s.slot.gap_filled_prefix > 0) && !s.slot.flushing,
-                            Err(_) => true,
-                        },
-                        None => false,
-                    }
-                });
+                // Bounded scan (see CONCURRENT_STREAMS_SCAN_CAP's doc comment): this
+                // check used to iterate ALL of active_chunks, which is fine for the
+                // small working sets it was validated against (T22/T26/T27, a handful
+                // of concurrent streams) but scales with however many chunks are
+                // simultaneously buffered — under real random-write pressure across a
+                // large file (kdiskmark RND4K against a multi-GB test region) that's
+                // easily hundreds, and chunk-boundary crossings fire on nearly every
+                // single write for genuinely random access, making this an unbounded
+                // per-write cost. Root-caused 2026-07-22: kdiskmark random writes
+                // (Q32 and Q1) collapsed to ~1MB/s after this check was added.
+                const CONCURRENT_STREAMS_SCAN_CAP: usize = 16;
+                let concurrent_streams = if self.active_chunks.len() > CONCURRENT_STREAMS_SCAN_CAP {
+                    // Already strong evidence of wide multi-region activity on its
+                    // own (this many chunks simultaneously buffered) — treat as
+                    // concurrent without paying to scan them. Cheap AND the more
+                    // likely-correct answer at this point, not just a shortcut.
+                    true
+                } else {
+                    self.active_chunks.iter().any(|e| {
+                        let other_idx = *e;
+                        if other_idx == prev_idx { return false; }
+                        match self.chunk_get(other_idx) {
+                            Some(shard) => match shard.try_lock() {
+                                Ok(s) => (s.slot.real_data_end > 0 || s.slot.gap_filled_prefix > 0) && !s.slot.flushing,
+                                Err(_) => true,
+                            },
+                            None => false,
+                        }
+                    })
+                };
                 if !concurrent_streams {
                     if let Some(prev_shard) = self.chunk_get(prev_idx) {
                         let mut prev = prev_shard.lock().await;
@@ -661,6 +731,12 @@ impl InodeWriteBuffer {
 
             let shard = self.chunk_entry(idx);
             let mut cs = shard.lock().await;
+            // Exact per-slot growth accounting for global_buffered_bytes (see this
+            // function's doc comment). Captured before any mutation in this iteration and
+            // compared under the SAME lock hold, so it can never observe another chunk's
+            // bytes. resident() only counts this slot's extents and only grows within one
+            // iteration, so the difference below is exact, not a heuristic.
+            let resident_before = cs.slot.resident();
             // This slot is receiving data again — if it was previously marked abandoned
             // (a write moved away from it, then came back before the ticker flushed it),
             // that's no longer true. Also: seed span_end/gap_filled_prefix from
@@ -747,13 +823,15 @@ impl InodeWriteBuffer {
                    idx, write_start_offset, intra, write_end, n, cs.slot.span_end, cs.slot.resident(), cs.slot.gap_filled_prefix, cs.slot.real_data_end,
                    cs.slot.dirty_ranges);
 
+            added_bytes += cs.slot.resident().saturating_sub(resident_before);
+
             drop(cs);
             self.active_chunks.insert(idx);
             remaining = &remaining[n..];
             cur_offset += n as u64;
         }
 
-        pattern_changed
+        (pattern_changed, added_bytes)
     }
 
     /// How many dirty bytes are buffered across all slots. Non-blocking per-shard
@@ -790,8 +868,9 @@ impl InodeWriteBuffer {
         out
     }
 
-    /// True if any slot is ready for flush_one_chunk to pick up right now (see
-    /// old has_flushable_slot's doc comment — same selection criteria).
+    /// True if any slot is ready for flush_one_chunk to pick up right now — must stay
+    /// byte-for-byte in agreement with flush_one_chunk's own selection criteria (see the
+    /// self-refill loop's safety-valve comment for the spin bug a mismatch causes).
     async fn has_flushable_slot(&self) -> bool {
         for idx in self.active_chunks.iter() {
             let Some(shard) = self.chunk_get(*idx) else { continue };
@@ -1982,6 +2061,15 @@ impl FlushHandle {
             // simply skipped this round, picked up again on the next call). This
             // used to run under one held per-inode lock; now it's lock-free w.r.t.
             // any OTHER chunk's writer, and takes only a brief try_lock per shard.
+            //
+            // NOTE (2026-07-22): hoisting this selection out so ONE scan could feed MANY
+            // flushes (a batch owned by each self-refill task) was tried and REVERTED — it
+            // regressed T41c, the SIGTERM-drain durability test, which passes here. The
+            // batch was a stale unclaimed snapshot: every concurrent task selected the SAME
+            // chunks, so claims raced and coverage suffered. Any future attempt must make
+            // selection and claiming atomic, not just cheaper. It also did NOT fix the
+            // random-write collapse it was written for, so the O(N) rescan here is not that
+            // bottleneck — see the write-buffer back-pressure path instead.
             //
             // Full slots first (lowest index, not already claimed, not already on server).
             // Backoff only applies when !urgent — the ticker's opportunistic path should
@@ -4298,13 +4386,6 @@ impl DfsFilesystem {
                                 .map(|cs| cs.slot.dirty_ranges.iter().map(|&(a, b)| b - a).sum::<usize>())))
                             .sum();
                         if in_flight_bytes >= PIPELINE_MAX_BYTES { continue; }
-                        // Backoff only gates this opportunistic background dispatch, not
-                        // full_slot_indices() itself — fsync/release/flush_all_pipelined
-                        // callers elsewhere need an accurate answer immediately, not one
-                        // silently suppressed by a terminal-failure backoff the caller
-                        // doesn't know about.
-                        let has_full = state_arc.active_chunks.iter()
-                            .any(|idx| state_arc.chunk_get(*idx).and_then(|s| s.try_lock().ok().map(|cs| cs.slot.is_full() && !cs.slot.flushing && !cs.slot.in_backoff())).unwrap_or(false));
                         let no_active_writers = write_open_counts_for_bg
                             .get(&ino).map(|c| *c == 0).unwrap_or(true);
                         // Flush idle slots with no new writes for >500ms, even with active
@@ -4328,35 +4409,38 @@ impl DfsFilesystem {
                             .map(|lock| lock.try_lock().is_err())
                             .unwrap_or(false);
                         if pipeline_busy { continue; }
-                        let has_stale = release_inflight == 0 && state_arc.active_chunks.iter().any(|idx| {
-                            state_arc.chunk_get(*idx).and_then(|s| s.try_lock().ok().map(|cs| {
-                                let s = &cs.slot;
-                                !s.is_empty() && !s.flushing && !s.in_backoff() && s.is_idle() &&
-                                s.last_modified.elapsed().map(|e| e.as_millis()).unwrap_or(0) >= STALE_FLUSH_MS
-                            })).unwrap_or(false)
-                        });
-                        let has_idle = no_active_writers && state_arc.active_chunks.iter().any(|idx| {
-                            state_arc.chunk_get(*idx).and_then(|s| s.try_lock().ok().map(|cs| {
-                                let s = &cs.slot;
-                                s.is_idle() && !s.is_empty() && !s.flushing && !s.in_backoff()
-                            })).unwrap_or(false)
-                        });
-                        // Event-driven, no time delay and no no_active_writers requirement —
-                        // an abandoned slot (write moved to a different chunk) is definitively
-                        // done regardless of what else the file's writers are doing elsewhere.
-                        // See `abandoned`'s doc comment for why this is safe for DVR too.
-                        let has_abandoned = state_arc.active_chunks.iter()
-                            .any(|idx| state_arc.chunk_get(*idx).and_then(|s| s.try_lock().ok().map(|cs| cs.slot.abandoned && !cs.slot.is_empty() && !cs.slot.flushing && !cs.slot.in_backoff())).unwrap_or(false));
-                        // Safety net for slots that keep getting revisited (so never go idle,
-                        // never get abandoned via cross-chunk move, and never hit is_full())
-                        // — flush once meaningfully dirty regardless of activity elsewhere.
-                        let has_dirty_threshold = state_arc.active_chunks.iter().any(|idx| {
-                            state_arc.chunk_get(*idx).and_then(|s| s.try_lock().ok().map(|cs| {
-                                let s = &cs.slot;
-                                !s.flushing && !s.in_backoff() && s.is_fragmented()
-                                    && s.dirty_bytes() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES
-                            })).unwrap_or(false)
-                        });
+                        // Single consolidated pass over active_chunks computing all five
+                        // candidacy conditions together (each shard locked exactly once),
+                        // instead of five separate full scans. Root-caused 2026-07-22
+                        // alongside CONCURRENT_STREAMS_SCAN_CAP: under sustained random-write
+                        // pressure active_chunks can hold hundreds of entries, and this loop
+                        // runs on every "chunk full" notification — five separate O(n) scans
+                        // per wake was the dominant remaining cost behind kdiskmark RND4K
+                        // staying collapsed even after the write_at() hot-path fixes (which
+                        // fixed sequential but not random).
+                        let check_stale = release_inflight == 0;
+                        let mut has_full = false;
+                        let mut has_stale = false;
+                        let mut has_idle = false;
+                        let mut has_abandoned = false;
+                        let mut has_dirty_threshold = false;
+                        for idx in state_arc.active_chunks.iter() {
+                            let Some(shard) = state_arc.chunk_get(*idx) else { continue };
+                            let lock_result = shard.try_lock();
+                            let Ok(cs) = lock_result else { continue };
+                            let s = &cs.slot;
+                            if s.is_empty() || s.in_backoff() { continue; }
+                            if !s.flushing {
+                                if s.is_full() { has_full = true; }
+                                if check_stale && s.is_idle()
+                                    && s.last_modified.elapsed().map(|e| e.as_millis()).unwrap_or(0) >= STALE_FLUSH_MS
+                                { has_stale = true; }
+                                if no_active_writers && s.is_idle() { has_idle = true; }
+                                if s.abandoned { has_abandoned = true; }
+                                if s.is_fragmented() && s.dirty_bytes() >= SLOT_DIRTY_FLUSH_THRESHOLD_BYTES { has_dirty_threshold = true; }
+                            }
+                            if has_full && has_stale && has_idle && has_abandoned && has_dirty_threshold { break; }
+                        }
                         if !has_full && !has_idle && !has_stale && !has_abandoned && !has_dirty_threshold { continue; }
 
                         // Fill the gap to PIPELINE_MAX_ITEMS in this tick instead of dispatching
@@ -4412,6 +4496,11 @@ impl DfsFilesystem {
                             // testing (has_flushable_slot was missing !in_backoff()). If this
                             // ever recurs for some other reason, cap the spin and surface it
                             // loudly rather than hanging silently forever.
+                            //
+                            // 2026-07-22: server4 logged 495 of these warnings during one
+                            // degraded kdiskmark session. Replacing this loop with an
+                            // owned-batch drain was tried and REVERTED (regressed T41c) —
+                            // see flush_one_chunk's selection comment.
                             let mut spin_count: u32 = 0;
                             const SPIN_WARN_THRESHOLD: u32 = 200;
                             loop {
@@ -6678,9 +6767,7 @@ impl Filesystem for DfsFilesystem {
                                 inc_write_tasks_for_chunks(&write_tasks_in_flight, ino, &write_chunk_indices)
                             );
                             {
-                                let bytes_before = state_arc.resident_bytes().await;
-                                let pattern_changed = state_arc.write_at(offset as u64, &data_vec).await;
-                                let bytes_after = state_arc.resident_bytes().await;
+                                let (pattern_changed, added) = state_arc.write_at(offset as u64, &data_vec).await;
                                 let has_full = !state_arc.full_slot_indices().await.is_empty();
                                 let new_end = (offset as u64) + data_vec.len() as u64;
                                 {
@@ -6714,7 +6801,10 @@ impl Filesystem for DfsFilesystem {
                                 // Only count bytes actually added to the buffer, not the write
                                 // size. Overlapping writes don't grow the slot, so adding
                                 // data_vec.len() unconditionally causes the counter to drift up.
-                                let added = bytes_after.saturating_sub(bytes_before);
+                                // `added` comes back from write_at itself, measured per-slot
+                                // under that slot's own lock — see write_at's doc comment for
+                                // why deriving it here from resident_bytes() deltas was a
+                                // one-way ratchet that wedged the buffer at its cap.
                                 if added > 0 {
                                     global_buffered_bytes.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
                                 }
@@ -6873,8 +6963,8 @@ impl Filesystem for DfsFilesystem {
                             .entry(ino)
                             .or_insert_with(|| Arc::new(InodeWriteBuffer::new(is_sqlite_buf)))
                             .clone();
-                        let bytes_before = state_arc.resident_bytes().await;
-                        let pattern_changed = state_arc.write_at(gap_write_offset, &padded).await;
+                        // `added` measured per-slot inside write_at — see its doc comment.
+                        let (pattern_changed, added) = state_arc.write_at(gap_write_offset, &padded).await;
                         // Mark the gap bytes as synthetic so flush doesn't mistake them
                         // for real app data when deciding whether to PatchChunk.
                         let gap_chunk_idx = InodeWriteBuffer::chunk_index(gap_write_offset);
@@ -6883,7 +6973,6 @@ impl Filesystem for DfsFilesystem {
                             let mut cs = shard.lock().await;
                             cs.slot.gap_filled_prefix = gap_intra + gap;
                         }
-                        let added = state_arc.resident_bytes().await.saturating_sub(bytes_before);
 
                         // Notify flush worker if chunks are now full or write pattern changed.
                         let has_full_chunks = !state_arc.full_slot_indices().await.is_empty();
@@ -7008,9 +7097,8 @@ impl Filesystem for DfsFilesystem {
 
                     // t_buf: time to acquire the slot lock and copy bytes into the buffer.
                     let t_buf_start = std::time::Instant::now();
-                    let bytes_before = state_arc.resident_bytes().await;
-                    let pattern_changed = state_arc.write_at(write_offset, &data_vec).await;
-                    let added = state_arc.resident_bytes().await.saturating_sub(bytes_before);
+                    // `added` measured per-slot inside write_at — see its doc comment.
+                    let (pattern_changed, added) = state_arc.write_at(write_offset, &data_vec).await;
 
                     // Notify the flush worker if a 4MB chunk is full or the write pattern
                     // changed from sequential to random (event-driven, no timer needed).

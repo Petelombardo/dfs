@@ -105,3 +105,22 @@ of losing track of them. Add an entry whenever you find one; remove the entry wh
   had the same doc-comment note that `resident_bytes()` is what back-pressure actually uses
   since the 2026-07-15 sparse-extent rework made the two nearly equivalent. No call site uses
   `buffered_bytes()` in either the old or new design.
+
+- **`dfs-client/src/fuse_impl.rs` — `InodeWriteBuffer::resident_bytes`** (~line 850). Became
+  dead 2026-07-22 when write back-pressure stopped deriving "bytes this write added" from the
+  delta of two `resident_bytes()` samples and `write_at()` started returning the exact
+  per-slot growth instead. **Prefer deleting this one over reviving it.** It sums the WHOLE
+  buffer and silently SKIPS any shard whose `try_lock` fails, so it is only ever an
+  approximation — safe for a coarse occupancy gauge, actively wrong as a term in a
+  difference. Using it in a subtraction is precisely what wedged the write buffer at its
+  cap on server4/server5 (adds inflated by other chunks' bytes, `saturating_sub` clamping
+  the opposite error to zero, so the counter could only ratchet up until every write paid
+  back-pressure forever and only a client restart recovered). Left in place here rather than
+  deleted inline to keep that fix reviewable on its own; if it stays, it needs a
+  "never use this in a delta" warning on the function itself.
+
+- **`dfs-client/src/fuse_impl.rs` — `InodeWriteBuffer::all_slot_indices`** (~line 891).
+  Compiler-flagged unused alongside `buffered_bytes`/`resident_bytes`. Its doc comment still
+  claims "Used by fsync/release", which is no longer true — worth confirming whether the
+  fsync/release path lost a call it should still be making, or whether the comment is simply
+  stale, before deleting.

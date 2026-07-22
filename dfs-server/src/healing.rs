@@ -3125,6 +3125,74 @@ impl HealingManager {
             }));
         }
 
+        // Superseded-generation guard (2026-07-22). "Does the file exist?" above is too
+        // weak a test. A fold/patch replaces a chunk with a new generation and the file
+        // moves on, but the OLD chunk's routing entry keeps pointing at the still-live
+        // file_id — so the guard above passes, the healer commits a full transfer to a
+        // chunk no file references, the source bytes fail checksum verification
+        // ("disk corruption"), the chunk goes to stalled_healing, and the next discovery
+        // cycle re-queues it because the routing entry still looks under-replicated.
+        // That loop is unbounded. Live staging measurement: 17,094 heal attempts against
+        // 307 such chunks with ZERO successes, while the fast guard above fired only 94
+        // times — enough metadata load to stall the group-commit committer for 2+ seconds
+        // and starve unrelated client writes.
+        //
+        // This deliberately only DECLINES TO HEAL — it never deletes. During a fold there
+        // is a legitimate transient window where a chunk is briefly unreferenced (the
+        // pointer gap); deleting on that signal is exactly the fold-mapping data loss that
+        // left VM-108/111 unbootable. Skipping one heal cycle in that window is harmless,
+        // so deletion stays the deep orphan sweep's job with its age grace, two-pass
+        // confirmation and leader cross-check.
+        //
+        // Gated on a FULLY healthy cluster — stricter than drain_heal_queue's
+        // `nodes_down <= 1` — because the whole test reads THIS node's FILE_TABLE view. If
+        // any node is offline or wedged, that view may be stale or mid-convergence, and a
+        // stale view would make us skip healing a chunk that IS still referenced, i.e.
+        // withhold redundancy at exactly the moment redundancy is degraded. The
+        // leader-change grace applies for the same reason: a freshly elected leader has
+        // not necessarily caught up. Every uncertain outcome below (read error, file row
+        // missing) falls through to healing, so ambiguity always costs a wasted heal
+        // rather than a missing replica.
+        //
+        // Known tradeoff: a chunk serving as the BASE of an active Pending patch is not in
+        // its file's chunk_locations (the public token is), so it reads as unreferenced and
+        // its heal is deferred until the fold resolves. Accepted because today that same
+        // chunk's heal fails on checksum anyway — this makes it cheap instead of expensive,
+        // not less likely to succeed.
+        if let Some(file_id) = location.file_id {
+            let cluster_fully_healthy = {
+                let all_nodes = cluster.get_all_nodes().await;
+                let online = all_nodes.iter()
+                    .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                    .count();
+                let grace_elapsed = cluster.time_since_became_leader().await
+                    .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+                !all_nodes.is_empty() && online == all_nodes.len() && grace_elapsed
+            };
+            if cluster_fully_healthy {
+                if let Ok(Some(file_meta)) = metadata.get_file_async(file_id).await {
+                    // POSITIVE CONTROL: only trust an "unreferenced" answer from a view that
+                    // demonstrably HAS references. An empty chunk list is indistinguishable
+                    // from a stale or not-yet-caught-up FILE_TABLE replica, and treating that
+                    // as "nothing is referenced" would withhold healing from every chunk of
+                    // the file at once. The same principle is what makes this safe against
+                    // the lost-disk case generally: prove some things resolve before
+                    // concluding a specific thing doesn't. A node whose storage or metadata
+                    // has gone missing entirely sees zero references and therefore concludes
+                    // nothing at all, which is the correct behavior for a node that has lost
+                    // its ability to know anything.
+                    let view_is_usable = !file_meta.chunk_locations.is_empty();
+                    let still_referenced = file_meta.chunk_locations.iter()
+                        .any(|l| l.chunk_id == *chunk_id);
+                    if view_is_usable && !still_referenced {
+                        warn!("Chunk {} is a superseded generation of live file {} ({} chunks referenced, this one not) — skipping heal, deferring deletion to the orphan sweep",
+                            chunk_id, file_id, file_meta.chunk_locations.len());
+                        return Ok(Some(HealOutcome::clear_only(*chunk_id)));
+                    }
+                }
+            }
+        }
+
         // Build alive list from confirmed_alive_nodes passed in from the bulk scan.
         // These were verified by the HasChunks bulk RPC in the classification phase —
         // no per-chunk re-querying here, which avoids misclassifying healthy nodes as

@@ -82,3 +82,26 @@ of losing track of them. Add an entry whenever you find one; remove the entry wh
   for a follow-up pass: confirm via a live counter (add a debug! or metric if this branch
   ever actually executes) that it's truly dead, then delete it and the load-gate scaffolding
   together.
+
+## Found 2026-07-22 (per-chunk write-buffer sharding refactor)
+
+- **`dfs-client/src/fuse_impl.rs` — `FlushHandle::flush_buffer_async` and
+  `DfsFilesystem::flush_buffer_async`/`flush_all_pipelined` thin wrapper** (~line 4671/4676
+  area). Compiler-flagged unused (`flush_buffer_async`, `flush_all_pipelined`,
+  `should_update_metadata`, `record_metadata_update`, `safe_metadata_update`,
+  `get_or_create_inode` all in the same dead-code warning block). Pre-existing, not
+  introduced by the sharding refactor — confirmed via grep that `flush_buffer_async` has
+  exactly one caller (its own `DfsFilesystem` wrapper) and that wrapper itself has zero
+  callers. Live flush paths are `flush_all_pipelined` (the `FlushHandle` one, called from
+  release/fsync) and the background ticker calling `flush_one_chunk` directly — this
+  whole `FlushHandle::flush_buffer_async` function (with its own internal PatchChunk logic,
+  duplicating much of `flush_buffer_async_one`) looks superseded and never wired back in.
+  Was carried forward faithfully during the sharding refactor since removing/behavior-
+  changing dead code was out of scope for that task.
+
+- **`dfs-client/src/fuse_impl.rs` — `InodeWriteBuffer::buffered_bytes`** (~line 741, added
+  during the sharding refactor as a direct port of the pre-existing
+  `InodeWriteState::buffered_bytes`). Confirmed pre-existing dead code, not new: the original
+  had the same doc-comment note that `resident_bytes()` is what back-pressure actually uses
+  since the 2026-07-15 sparse-extent rework made the two nearly equivalent. No call site uses
+  `buffered_bytes()` in either the old or new design.

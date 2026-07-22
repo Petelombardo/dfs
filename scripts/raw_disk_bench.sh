@@ -94,6 +94,7 @@ read_seq_file = os.environ['READ_SEQ_FILE']
 read_rand_file= os.environ['READ_RAND_FILE']
 conc_read_file  = os.environ['CONCURRENT_READ_FILE']
 conc_write_file = os.environ['CONCURRENT_WRITE_FILE']
+conc_mixed_file = os.environ['CONCURRENT_MIXED_FILE']
 seq_size_mb   = int(os.environ['SEQ_SIZE_MB'])
 num_chunk_ops = int(os.environ['NUM_CHUNK_OPS'])
 disk_size_mb  = int(os.environ['DISK_SIZE_MB'])

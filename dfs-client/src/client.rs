@@ -1147,6 +1147,34 @@ pub struct DfsClient {
     fold_concurrency: Arc<tokio::sync::Semaphore>,
 }
 
+/// True if a replica write/patch failure is a transient node-level connectivity or
+/// latency problem (unreachable, OR reachable-but-slow / black-holing) rather than a
+/// data/protocol error. The MultiPatch retry loop rides these out within
+/// CONNECT_RETRY_BUDGET instead of failing the whole patch to the lossy "all replicas
+/// failed" fallback.
+///
+/// 2026-07-21: originally this only matched "Failed to connect", so a merely-overloaded
+/// leader (which returns "Timeout reading chunk" / "Timeout writing to", not a connect
+/// error) failed the patch instantly with no retry — falling through to a fallback that
+/// drops the write and leaves a gap in chunk_locations (root cause of qcow2 VM-disk
+/// corruption). A slow-but-alive node is exactly the case we most want to wait out, so
+/// its timeout errors must count as transient too. Matched case-insensitively against
+/// the error strings produced by send_request / send_split_frame_write_request.
+fn is_transient_write_failure(err_msg: &str) -> bool {
+    let s = err_msg.to_lowercase();
+    // All distinctive client-side network-wrapper phrases (see send_request /
+    // send_split_frame_write_request). Deliberately does NOT match server-side data
+    // errors ("chunk data missing", "unexpected response") or ChunkStale — those are
+    // real and must fail/retry-with-correction, not spin as a connectivity blip.
+    s.contains("failed to connect")                    // connect refused/timeout
+        || s.contains("connect timeout")               // pooled-reconnect connect timeout
+        || s.contains("timeout reading")               // slow/black-hole response read
+        || s.contains("timeout writing")               // slow/black-hole request write
+        || s.contains("i/o error talking to")          // connection dropped mid-write
+        || s.contains("i/o error reading write response") // connection dropped mid-read
+        || s.contains("i/o error on retry")            // connection dropped on write-retry
+}
+
 impl DfsClient {
     /// Create a new DFS client
     pub fn new(cluster_nodes: Vec<SocketAddr>) -> Result<Self> {
@@ -2197,14 +2225,47 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
         }
 
-        // Read response
+        // Read response — BOUNDED. This used to be two bare read_exact().await calls
+        // with no timeout: a server that received the request but was slow or never
+        // answered (an overloaded leader, or a black-holing node — TCP up, never
+        // replies) hung this flush task forever, holding its global_flush_semaphore
+        // permit and the per-chunk lock. That cascaded into every other inode's flushes
+        // (permit-pool exhaustion, seen live as "FIFO wait timeout - previous flush
+        // stuck for >30s"), and on VM shutdown / client restart the drain's own bounded
+        // flush abandoned the still-hung write — silently losing the chunk's bytes and
+        // leaving a gap in chunk_locations. Root cause of qcow2 VM-disk corruption,
+        // 2026-07-21. The small-payload sibling (send_request) already bounds its read
+        // exactly this way; this large-payload (split-frame) path was missing it. 30s
+        // matches the fresh-write path's WRITE_TIMEOUT_SECS — long enough for a
+        // genuinely loaded-but-alive leader to answer, short enough that a true black
+        // hole is shed (via confirm_liveness_or_penalize) instead of hanging forever.
+        const WRITE_RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
         let recv_start = std::time::Instant::now();
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-
-        let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).await?;
+        let read_response = async {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        };
+        let buf = match tokio::time::timeout(WRITE_RESPONSE_READ_TIMEOUT, read_response).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => {
+                self.node_health.record_failure(addr).await;
+                return Err(anyhow::anyhow!("I/O error reading write response from {}: {}", addr, e));
+            }
+            Err(_) => {
+                self.node_health.record_failure(addr).await;
+                // Response never arrived after the request was sent — the exact
+                // black-hole signature. Confirm with a Ping and shed the node fast if
+                // it's genuinely hung (same handling as send_request's read timeout).
+                // Returns "Timeout reading chunk" so the MultiPatch retry loop's
+                // is_transient_write_failure check rides it out rather than failing.
+                self.confirm_liveness_or_penalize(addr).await;
+                return Err(anyhow::anyhow!("Timeout reading chunk from {}", addr));
+            }
+        };
         let recv_time = recv_start.elapsed();
         debug!("Split-frame write response received in {:?}", recv_time);
 
@@ -6896,28 +6957,32 @@ leader_addr: Arc::new(RwLock::new(None)),
         let (authoritative_chunk_id, authoritative_size, authoritative_patch_ts) = match authoritative {
             Some(x) => x,
             None => {
-                // All replicas failed. If every single failure was a connection failure
-                // (not a data/protocol error, not a ChunkStale response — those are
-                // handled separately above) this looks like a transient node outage —
-                // e.g. a compaction-triggered self-restart — rather than a permanent
-                // problem. Retry with a bounded backoff instead of failing the write
-                // outright. Root-caused 2026-07-11: a VM install hit guest-visible EIO
-                // during exactly an ~8s gluster4 self-restart window (redb exclusive-
-                // lock wedge -> process exit -> systemd restart) because this bailed on
-                // the very first attempt — has_any_success=false and stale_retry=None
-                // for a pure connection failure meant the existing attempt<2 stale-retry
-                // loop never even got a second try. A single dead-but-unreplaced node
-                // (not just a brief restart) still surfaces the same error, just after
-                // CONNECT_RETRY_BUDGET instead of instantly.
-                let all_connection_failures = !replica_results.is_empty()
+                // All replicas failed. If every single failure was transient — a node
+                // that's unreachable OR reachable-but-slow/black-holing (NOT a
+                // data/protocol error, NOT a ChunkStale response — those are handled
+                // separately above) — this looks like a passing node outage or a
+                // temporarily-overloaded leader rather than a permanent problem. Retry
+                // with a bounded backoff instead of failing the write outright.
+                // Root-caused 2026-07-11: a VM install hit guest-visible EIO during
+                // exactly an ~8s gluster4 self-restart window (redb exclusive-lock wedge
+                // -> process exit -> systemd restart) because this bailed on the very
+                // first attempt. Broadened 2026-07-21 (see is_transient_write_failure):
+                // it previously matched ONLY "Failed to connect", so a slow-but-alive
+                // leader (which returns a *timeout* error, not a connect error) skipped
+                // this retry entirely and fell through to the lossy "all replicas
+                // failed" fallback below — dropping the write and leaving a gap. A slow
+                // leader is precisely the case to wait out. A genuinely dead node still
+                // surfaces the error, just after CONNECT_RETRY_BUDGET instead of
+                // instantly.
+                let all_transient_failures = !replica_results.is_empty()
                     && replica_results.iter().all(|(_, r)| {
                         r.as_ref().err()
-                            .map(|e| e.to_string().contains("Failed to connect"))
+                            .map(|e| is_transient_write_failure(&e.to_string()))
                             .unwrap_or(false)
                     });
-                if all_connection_failures && retry_started.elapsed() < CONNECT_RETRY_BUDGET {
-                    warn!("MultiPatch: all {} replica(s) unreachable for chunk {} (connection \
-                           failure, elapsed {:?}/{:?}) — retrying in {:?}",
+                if all_transient_failures && retry_started.elapsed() < CONNECT_RETRY_BUDGET {
+                    warn!("MultiPatch: all {} replica(s) unavailable for chunk {} (transient \
+                           connect/timeout failure, elapsed {:?}/{:?}) — retrying in {:?}",
                         replica_results.len(), old_chunk_id, retry_started.elapsed(),
                         CONNECT_RETRY_BUDGET, CONNECT_RETRY_BACKOFF);
                     tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
@@ -8604,6 +8669,83 @@ mod tests {
         let surviving = pending.values().next().unwrap();
         assert_eq!(surviving.client_write_seq, Some(5), "the highest write_seq (5) must win regardless of arrival order");
         assert_eq!(surviving.chunk_id, expected_winner.unwrap(), "the surviving entry must be the one carrying write_seq 5");
+    }
+
+    /// Classification guard for the 2026-07-21 write-corruption fix. A slow-but-alive
+    /// leader (the corruption trigger) returns a *timeout* error, not a connect error;
+    /// before the fix the MultiPatch retry loop only treated "Failed to connect" as
+    /// transient, so a merely-overloaded leader failed the whole patch instantly and
+    /// fell through to the lossy "all replicas failed" fallback that drops the write.
+    /// Timeouts and connection-drops must count as transient (ride out via
+    /// CONNECT_RETRY_BUDGET); genuine server-side data errors must NOT.
+    #[test]
+    fn is_transient_write_failure_matches_timeouts_not_data_errors() {
+        // Slow / black-holing leader — the exact case that was silently dropping writes:
+        assert!(is_transient_write_failure("Timeout reading chunk from 10.0.0.1:8900"));
+        assert!(is_transient_write_failure("Timeout writing to 10.0.0.1:8900"));
+        // Node restart / connection drop (CONNECT_RETRY_BUDGET's documented purpose):
+        assert!(is_transient_write_failure("Failed to connect to node: connect timeout"));
+        assert!(is_transient_write_failure("Failed to connect to node 10.0.0.1:8900: connection refused"));
+        assert!(is_transient_write_failure("Connect timeout to 10.0.0.1:8900"));
+        assert!(is_transient_write_failure("I/O error talking to 10.0.0.1:8900: broken pipe"));
+        assert!(is_transient_write_failure("I/O error reading write response from 10.0.0.1:8900: connection reset"));
+        // Real errors that must NOT be treated as a retriable connectivity blip:
+        assert!(!is_transient_write_failure("chunk data missing on this node"));
+        assert!(!is_transient_write_failure("unexpected response"));
+        assert!(!is_transient_write_failure("chunk 224 fresh-write safety check found real existing data"));
+    }
+
+    /// Direct regression for the 2026-07-21 corruption root cause: the split-frame
+    /// write path's response read was a bare read_exact().await with no timeout, so a
+    /// server that received the request but never replied (overloaded leader, or a
+    /// black-holing node — TCP up, never answers) hung the flush task forever, holding
+    /// a global_flush_semaphore permit + chunk lock and ultimately losing the write on
+    /// drain. This stands up a black-hole server (accepts, reads the request, then
+    /// never responds) and asserts the call returns a bounded timeout error instead of
+    /// hanging. Uses paused virtual time so the 30s bound is exercised instantly; the
+    /// drive loop advances the clock in steps rather than assuming exactly when the
+    /// task parks on the read. Without the fix this test hangs (the task never returns).
+    #[tokio::test(start_paused = true)]
+    async fn split_frame_write_response_read_is_bounded_not_infinite() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Consume the incoming request, then hang forever without replying.
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let client = DfsClient::new(vec![addr]).unwrap();
+        let env = MessageEnvelope::new(RequestId::new(1), Message::Request(Request::Ping));
+        let encoded = env.to_bytes().unwrap();
+        let raw = vec![0u8; 128];
+
+        let handle = tokio::spawn(async move {
+            client.send_split_frame_write_request(addr, &encoded, &raw).await
+        });
+
+        // Let real loopback I/O (connect + write) complete and the task park on the
+        // response read, then advance virtual time past the 30s read bound. Stepping +
+        // yielding is robust to exactly when the read-timeout's Sleep gets armed.
+        for _ in 0..120 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+            if handle.is_finished() {
+                break;
+            }
+        }
+
+        assert!(handle.is_finished(), "the call must not hang on a non-responding server");
+        let result = handle.await.unwrap();
+        assert!(result.is_err(), "a black-holing server must yield a bounded error, not a value");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Timeout reading chunk"),
+            "expected a bounded read-timeout error, got: {}", msg);
     }
 
     /// Regression test for a real bug found via T48 (background-tick metadata push

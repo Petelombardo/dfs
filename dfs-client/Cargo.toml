@@ -25,3 +25,10 @@ futures = "0.3"
 dashmap = "6.1"
 arc-swap = "1"
 mimalloc = "0.1"
+
+[dev-dependencies]
+# test-util enables tokio's pausable virtual clock (tokio::time::pause/advance,
+# #[tokio::test(start_paused = true)]) for deterministic timeout tests without real
+# waits. NOT in the "full" feature set (it alters runtime timing), and test-only, so
+# it has no effect on the production binary.
+tokio = { workspace = true, features = ["test-util"] }

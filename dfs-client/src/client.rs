@@ -3316,6 +3316,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 Err(_) => {
                                     // Local nodes don't have it either; fall through to
                                     // leader-refresh path below.
+                                    //
+                                    // L4 (2026-07-22 fold-mapping data-loss incident):
+                                    // local_cid is now confirmed missing on every node this
+                                    // session recorded for it — purge this (inode, idx) entry
+                                    // so it can't keep re-pinning a dead chunk_id (e.g. one a
+                                    // background fold replaced) on every future read of this
+                                    // slot. Only remove if it still points at exactly the
+                                    // chunk_id just confirmed missing — a concurrent write
+                                    // may have already replaced this entry with a newer one.
+                                    self.recent_chunk_writes.remove_if(&(inode, idx as u64), |_, v| v.0 == local_cid);
                                 }
                             }
                         }

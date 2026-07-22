@@ -264,6 +264,12 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     ));
     info!("✓ Server instance created");
 
+    // Rebuild the fold-origin set BEFORE the chunk map rebuild below: the chunk
+    // map rebuild's per-slot merge consults this set for the fold-vs-client
+    // tiebreak, so it must already be populated when that merge runs.
+    server.rebuild_fold_result_chunk_ids();
+    info!("✓ Fold-result chunk_id set rebuilt");
+
     // Rebuild in-memory chunk map from persistent metadata.
     // This is required on every startup — GetFileChunkMap is served from this
     // in-memory map, so without it every file returns "no chunk map from leader".

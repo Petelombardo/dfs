@@ -248,8 +248,11 @@ impl InodeReadEngine {
     ///
     /// `from_write_path`: when true, write-path updates always win regardless of seq
     ///   (the client just received a confirmed result from the server — it's authoritative).
-    ///   When false (server refresh), use strict `>` so an equal-seq server entry cannot
-    ///   revert the engine to an older chunk_id that was already renamed on disk.
+    ///   When false (server refresh), accept `>=` — GetFileChunkMap's answer is the
+    ///   leader's already origin-resolved winner (see server.rs's location_supersedes
+    ///   ServerFold-origin tiebreak), so an equal-seq entry from it is trusted outright;
+    ///   only a strictly-lower incoming seq is rejected, so a stale server response still
+    ///   can't revert the engine to an older chunk_id that was already renamed on disk.
     pub fn update_chunk_map_window(
         &self,
         window: Vec<ChunkLocation>,
@@ -292,16 +295,28 @@ impl InodeReadEngine {
             let Some(offset) = loc.file_offset else { continue };
             let idx = (offset / CHUNK_SIZE_U64) as usize;
             if idx < new_map.len() {
-                // Guard: for server-refresh calls, only update if the incoming seq is
-                // strictly newer (prevents equal-seq server entries from reverting the
-                // engine to an older chunk_id that has already been renamed on disk).
-                // For write-path calls, always update — the client just received a
+                // Guard: for server-refresh calls, only update if the incoming seq is at
+                // least as new (prevents a strictly-OLDER equal-or-lower-seq server entry
+                // from reverting the engine to a chunk_id that has already been renamed on
+                // disk). For write-path calls, always update — the client just received a
                 // confirmed result; it is authoritative regardless of seq equality.
+                //
+                // L4 (2026-07-22 fold-mapping data-loss incident): equal seq used to be
+                // REJECTED here (strict `>`), so a client already pointed at a stale
+                // pre-fold chunk_id could never self-heal from a server refresh, even
+                // after the leader's own chunk_map had already correctly resolved to the
+                // fold's result (server.rs's location_supersedes ServerFold-origin
+                // tiebreak). The client has no PATCH_STATE, so it cannot independently
+                // derive fold-vs-client origin the way the server does — but it doesn't
+                // need to: GetFileChunkMap's answer is the leader's already-origin-
+                // resolved winner, so trusting it outright at equal seq (`>=`) is the
+                // client-side counterpart of the same (seq, origin) rule, not a separate
+                // guess. Strictly-lower incoming seq is still rejected.
                 let should_update = if from_write_path {
                     true
                 } else {
                     match (loc.client_write_seq, new_map[idx].client_write_seq) {
-                        (Some(inc), Some(ext)) => inc > ext,
+                        (Some(inc), Some(ext)) => inc >= ext,
                         (Some(_), None)        => true,
                         (None, Some(_))        => false,
                         (None, None)           => true,
@@ -678,5 +693,41 @@ mod tests {
         assert_eq!(r.len(), 1, "reading chunk 0 must resolve to exactly one entry");
         assert_eq!(map[r[0].0].chunk_id, real_chunk0.chunk_id,
             "reading offset 0 must fetch chunk 0's real chunk_id, not the stray entry's");
+    }
+
+    /// L4 (2026-07-22 fold-mapping data-loss incident, test 6 in the plan): a
+    /// server-refresh (`from_write_path=false`) carrying an EQUAL client_write_seq
+    /// for a chunk_idx must still be adopted, not rejected. Before this fix the
+    /// guard was strict `>`, so a client already pointed at a stale pre-fold
+    /// chunk_id could never self-heal from GetFileChunkMap even after the leader's
+    /// own chunk_map had already correctly resolved to the fold's result (server-
+    /// side ServerFold-origin tiebreak) — the client had no way to adopt an
+    /// equal-seq answer. The client has no PatchState of its own, so it can't
+    /// independently verify origin; it just has to trust the leader's answer.
+    #[test]
+    fn update_chunk_map_window_adopts_equal_seq_server_refresh() {
+        let engine = InodeReadEngine::new(1);
+
+        // Seed the engine with the stale pre-fold chunk_id at seq=104.
+        let stale = ChunkLocation {
+            client_write_seq: Some(104),
+            ..loc_with_nodes(chunk_id_with_hash0(1), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(vec![stale.clone()], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, false);
+        let (map, _, _) = engine.snapshot();
+        assert_eq!(map[0].chunk_id, stale.chunk_id, "sanity: engine starts on the stale chunk_id");
+
+        // A server refresh with the SAME seq (104) but a DIFFERENT chunk_id — the
+        // shape of a fold's result reaching the client via GetFileChunkMap.
+        let fold_result = ChunkLocation {
+            client_write_seq: Some(104),
+            ..loc_with_nodes(chunk_id_with_hash0(2), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_chunk_map_window(vec![fold_result.clone()], 0, 1, Arc::new(HashMap::new()), 4 * 1024 * 1024, false);
+
+        let (map2, _, _) = engine.snapshot();
+        assert_eq!(map2[0].chunk_id, fold_result.chunk_id,
+            "an equal-seq server refresh must be adopted, not rejected — the leader's answer \
+             is already origin-resolved, so the client must trust it at equal seq");
     }
 }

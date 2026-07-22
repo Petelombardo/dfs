@@ -2433,6 +2433,32 @@ impl MetadataStore {
             .context("spawn_blocking panicked in prune_stale_folded_patch_states_async")?
     }
 
+    /// Every chunk_id that is currently the durable *result* of a background
+    /// fold — i.e. every `PatchState::Folded(target)` row's target, scanned
+    /// straight from PATCH_STATE_TABLE. Same scan shape as
+    /// `prune_stale_folded_patch_states` (just collecting targets instead of
+    /// candidates for removal), used at startup to rebuild
+    /// `Server::fold_result_chunk_ids` — the in-memory set that lets
+    /// `location_supersedes` derive a chunk's fold-vs-client origin without a
+    /// `ChunkLocation` wire field (see that field's doc comment for why).
+    pub fn all_folded_chunk_ids(&self) -> Result<Vec<ChunkId>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for item in table.range::<&str>(..)? {
+            let (_k, v) = item?;
+            if let Ok(PatchState::Folded(target)) = bincode::deserialize::<PatchState>(v.value()) {
+                out.push(target);
+            }
+        }
+        Ok(out)
+    }
+
     /// Total PATCH_STATE_TABLE row count still in the Pending state (not yet
     /// folded) — used for Response::HealingStatus's outstanding-patches gauge.
     pub fn count_pending_patch_entries(&self) -> Result<usize> {

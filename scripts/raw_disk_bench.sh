@@ -21,6 +21,12 @@
 #   T5  Random read       (50 ops 1KB-512KB, seed=42)
 #   T6  Concurrent random read  (QD=CONCURRENCY, 4KB ops, seed=43 — mirrors KDiskMark RND4K QxT1)
 #   T7  Concurrent random write (QD=CONCURRENCY, 4KB ops, seed=44, single fsync at end)
+#   T8  Concurrent MIXED read+write on the SAME file (QD=CONCURRENCY split half/half,
+#       4KB ops, seed=45/46) — T6 and T7 only ever run reads or writes in isolation, so
+#       neither can show read/write contention (a lock or resource shared by both paths).
+#       T8 runs both at once and reports per-op-kind throughput/latency (p50/p95/max) so a
+#       real block (one kind's ops periodically stalling behind the other) shows up as a
+#       latency outlier, not just a lower aggregate number.
 #
 # Fixed RNG seeds make op sequences identical across runs for before/after comparison.
 # Results are appended to $CSV (default /tmp/dfs-bench-results.csv).
@@ -64,13 +70,15 @@ echo ""
 
 CONCURRENT_READ_FILE="$MOUNT/bench-concurrent-read.img"
 CONCURRENT_WRITE_FILE="$MOUNT/bench-concurrent-write.img"
+CONCURRENT_MIXED_FILE="$MOUNT/bench-concurrent-mixed.img"
 
 rm -f "$SEQ_FILE" "$CHUNK_FILE" "$PATCH_FILE" "$READ_SEQ_FILE" "$READ_RAND_FILE" \
-      "$CONCURRENT_READ_FILE" "$CONCURRENT_WRITE_FILE"
+      "$CONCURRENT_READ_FILE" "$CONCURRENT_WRITE_FILE" "$CONCURRENT_MIXED_FILE"
 
 MOUNT="$MOUNT" SEQ_FILE="$SEQ_FILE" CHUNK_FILE="$CHUNK_FILE" PATCH_FILE="$PATCH_FILE" \
 READ_SEQ_FILE="$READ_SEQ_FILE" READ_RAND_FILE="$READ_RAND_FILE" \
 CONCURRENT_READ_FILE="$CONCURRENT_READ_FILE" CONCURRENT_WRITE_FILE="$CONCURRENT_WRITE_FILE" \
+CONCURRENT_MIXED_FILE="$CONCURRENT_MIXED_FILE" \
 SEQ_SIZE_MB="$SEQ_SIZE_MB" NUM_CHUNK_OPS="$NUM_CHUNK_OPS" DISK_SIZE_MB="$DISK_SIZE_MB" NUM_OPS="$NUM_OPS" \
 CONCURRENCY="$CONCURRENCY" CONCURRENT_OPS="$CONCURRENT_OPS" \
 LABEL="$LABEL" CSV="$CSV" \
@@ -320,6 +328,104 @@ conc_write_mbps = conc_write_mb / conc_write_elapsed
 conc_write_iops = concurrent_ops / conc_write_elapsed
 print(f"  {concurrent_ops} ops, {conc_write_mb:.2f}MB in {conc_write_elapsed:.2f}s = {conc_write_mbps:.2f} MB/s ({conc_write_iops:.1f} ops/s)\n")
 
+# ── Test 8: Concurrent MIXED read+write on the SAME file ──────────────────
+# Tests 6/7 run reads and writes in complete isolation — neither can reveal
+# read/write contention (a lock or resource shared by both paths), only how
+# each performs alone. This runs both at once, submitted together to one
+# thread pool so they genuinely interleave, and reports per-op-kind
+# throughput AND latency percentiles. A real block (one kind's ops
+# periodically stalling behind the other — e.g. a per-inode lock shared by
+# read() and write()) shows up as a p95/max latency outlier on the blocked
+# side, not just a lower aggregate number.
+print(f"--- Test 8: Concurrent MIXED read+write, same file (QD={concurrency}, "
+      f"{concurrent_ops} ops total, 4KB, single fsync) ---")
+conc_mixed_size = disk_size_mb * MB
+with open(conc_mixed_file, 'wb') as f:
+    for _ in range(disk_size_mb):
+        f.write(os.urandom(MB))
+    f.flush(); os.fsync(f.fileno())
+
+mixed_read_ops  = concurrent_ops // 2
+mixed_write_ops = concurrent_ops - mixed_read_ops
+
+random.seed(45)
+mixed_read_offsets = [
+    random.randint(0, conc_mixed_size - CONC_BLOCK) // CONC_BLOCK * CONC_BLOCK
+    for _ in range(mixed_read_ops)
+]
+random.seed(46)
+mixed_write_offsets = [
+    random.randint(0, conc_mixed_size - CONC_BLOCK) // CONC_BLOCK * CONC_BLOCK
+    for _ in range(mixed_write_ops)
+]
+
+def do_mixed_read(off):
+    fd = os.open(conc_mixed_file, os.O_RDONLY)
+    try:
+        t0 = time.perf_counter()
+        n = len(os.pread(fd, CONC_BLOCK, off))
+        return ('read', time.perf_counter() - t0, n)
+    finally:
+        os.close(fd)
+
+def do_mixed_write(off):
+    fd = os.open(conc_mixed_file, os.O_WRONLY)
+    try:
+        t0 = time.perf_counter()
+        n = os.pwrite(fd, os.urandom(CONC_BLOCK), off)
+        return ('write', time.perf_counter() - t0, n)
+    finally:
+        os.close(fd)
+
+# Interleave read/write tasks in the SUBMISSION order (not grouped) so both
+# kinds are in flight together from the start, rather than the pool draining
+# a whole batch of one kind before starting the other.
+mixed_tasks = []
+ri = wi = 0
+for i in range(concurrent_ops):
+    if ri < len(mixed_read_offsets) and (i % 2 == 0 or wi >= len(mixed_write_offsets)):
+        mixed_tasks.append((do_mixed_read, mixed_read_offsets[ri])); ri += 1
+    else:
+        mixed_tasks.append((do_mixed_write, mixed_write_offsets[wi])); wi += 1
+
+t0 = time.time()
+with ThreadPoolExecutor(max_workers=concurrency) as pool:
+    futures = [pool.submit(fn, off) for fn, off in mixed_tasks]
+    mixed_results = [fut.result() for fut in futures]
+fsync_fd = os.open(conc_mixed_file, os.O_WRONLY)
+os.fsync(fsync_fd)
+os.close(fsync_fd)
+mixed_elapsed = time.time() - t0
+
+def _pct(sorted_vals, p):
+    if not sorted_vals:
+        return 0.0
+    idx = min(len(sorted_vals) - 1, int(len(sorted_vals) * p))
+    return sorted_vals[idx]
+
+mixed_read_lat  = sorted(lat for kind, lat, _ in mixed_results if kind == 'read')
+mixed_write_lat = sorted(lat for kind, lat, _ in mixed_results if kind == 'write')
+mixed_read_bytes  = sum(n for kind, _, n in mixed_results if kind == 'read')
+mixed_write_bytes = sum(n for kind, _, n in mixed_results if kind == 'write')
+mixed_read_mbps  = (mixed_read_bytes / MB) / mixed_elapsed
+mixed_write_mbps = (mixed_write_bytes / MB) / mixed_elapsed
+mixed_read_iops  = len(mixed_read_lat) / mixed_elapsed
+mixed_write_iops = len(mixed_write_lat) / mixed_elapsed
+mixed_read_p50, mixed_read_p95, mixed_read_max = (
+    _pct(mixed_read_lat, 0.50) * 1000, _pct(mixed_read_lat, 0.95) * 1000,
+    (mixed_read_lat[-1] * 1000 if mixed_read_lat else 0.0))
+mixed_write_p50, mixed_write_p95, mixed_write_max = (
+    _pct(mixed_write_lat, 0.50) * 1000, _pct(mixed_write_lat, 0.95) * 1000,
+    (mixed_write_lat[-1] * 1000 if mixed_write_lat else 0.0))
+print(f"  reads : {len(mixed_read_lat)} ops, {mixed_read_mbps:.2f} MB/s ({mixed_read_iops:.1f} ops/s), "
+      f"latency p50={mixed_read_p50:.1f}ms p95={mixed_read_p95:.1f}ms max={mixed_read_max:.1f}ms")
+print(f"  writes: {len(mixed_write_lat)} ops, {mixed_write_mbps:.2f} MB/s ({mixed_write_iops:.1f} ops/s), "
+      f"latency p50={mixed_write_p50:.1f}ms p95={mixed_write_p95:.1f}ms max={mixed_write_max:.1f}ms")
+print(f"  (compare against isolated Test 6/7 at the same QD={concurrency}: "
+      f"read {conc_read_iops:.1f} ops/s, write {conc_write_iops:.1f} ops/s — a large drop here "
+      f"for either kind, or a max latency far above its own isolated run, indicates real "
+      f"read/write contention rather than independent per-path cost)\n")
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print("=== Summary ===")
 print(f"  Sequential write : {seq_mbps:6.2f} MB/s  ({seq_size_mb}MB in {seq_elapsed:.2f}s)")
@@ -329,6 +435,10 @@ print(f"  Sequential read  : {seq_read_mbps:6.2f} MB/s  ({read_total // MB}MB in
 print(f"  Random read      : {rand_read_mbps:6.2f} MB/s  ({rand_read_mb:.2f}MB / {num_ops} ops in {rand_read_elapsed:.2f}s, {rand_read_iops:.1f} ops/s)")
 print(f"  Concurrent read  : {conc_read_mbps:6.2f} MB/s  ({conc_read_mb:.2f}MB / {concurrent_ops} ops, QD={concurrency} in {conc_read_elapsed:.2f}s, {conc_read_iops:.1f} ops/s)")
 print(f"  Concurrent write : {conc_write_mbps:6.2f} MB/s  ({conc_write_mb:.2f}MB / {concurrent_ops} ops, QD={concurrency} in {conc_write_elapsed:.2f}s, {conc_write_iops:.1f} ops/s)")
+print(f"  Mixed R+W (read ): {mixed_read_mbps:6.2f} MB/s  ({len(mixed_read_lat)} ops, QD={concurrency} in {mixed_elapsed:.2f}s, {mixed_read_iops:.1f} ops/s, "
+      f"p50={mixed_read_p50:.1f}ms p95={mixed_read_p95:.1f}ms max={mixed_read_max:.1f}ms)")
+print(f"  Mixed R+W (write): {mixed_write_mbps:6.2f} MB/s  ({len(mixed_write_lat)} ops, QD={concurrency} in {mixed_elapsed:.2f}s, {mixed_write_iops:.1f} ops/s, "
+      f"p50={mixed_write_p50:.1f}ms p95={mixed_write_p95:.1f}ms max={mixed_write_max:.1f}ms)")
 
 write_header = not os.path.exists(csv_path)
 with open(csv_path, 'a') as f:
@@ -340,7 +450,9 @@ with open(csv_path, 'a') as f:
                 "seq_read_mb,seq_read_s,seq_read_mbps,"
                 "rand_read_ops,rand_read_mb,rand_read_s,rand_read_mbps,rand_read_iops,"
                 "conc_qd,conc_read_ops,conc_read_mb,conc_read_s,conc_read_mbps,conc_read_iops,"
-                "conc_write_ops,conc_write_mb,conc_write_s,conc_write_mbps,conc_write_iops\n")
+                "conc_write_ops,conc_write_mb,conc_write_s,conc_write_mbps,conc_write_iops,"
+                "mixed_read_ops,mixed_read_mb,mixed_s,mixed_read_mbps,mixed_read_iops,mixed_read_p50ms,mixed_read_p95ms,mixed_read_maxms,"
+                "mixed_write_ops,mixed_write_mb,mixed_write_mbps,mixed_write_iops,mixed_write_p50ms,mixed_write_p95ms,mixed_write_maxms\n")
     f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{label},"
             f"{seq_size_mb},{seq_elapsed:.4f},{seq_mbps:.4f},"
             f"{num_chunk_ops},{chunk_mb:.4f},{chunk_elapsed:.4f},{chunk_mbps:.4f},"
@@ -348,6 +460,8 @@ with open(csv_path, 'a') as f:
             f"{read_total // MB},{seq_read_elapsed:.4f},{seq_read_mbps:.4f},"
             f"{num_ops},{rand_read_mb:.4f},{rand_read_elapsed:.4f},{rand_read_mbps:.4f},{rand_read_iops:.4f},"
             f"{concurrency},{concurrent_ops},{conc_read_mb:.4f},{conc_read_elapsed:.4f},{conc_read_mbps:.4f},{conc_read_iops:.4f},"
-            f"{concurrent_ops},{conc_write_mb:.4f},{conc_write_elapsed:.4f},{conc_write_mbps:.4f},{conc_write_iops:.4f}\n")
+            f"{concurrent_ops},{conc_write_mb:.4f},{conc_write_elapsed:.4f},{conc_write_mbps:.4f},{conc_write_iops:.4f},"
+            f"{len(mixed_read_lat)},{mixed_read_bytes/MB:.4f},{mixed_elapsed:.4f},{mixed_read_mbps:.4f},{mixed_read_iops:.4f},{mixed_read_p50:.2f},{mixed_read_p95:.2f},{mixed_read_max:.2f},"
+            f"{len(mixed_write_lat)},{mixed_write_bytes/MB:.4f},{mixed_write_mbps:.4f},{mixed_write_iops:.4f},{mixed_write_p50:.2f},{mixed_write_p95:.2f},{mixed_write_max:.2f}\n")
 print(f"\nResults appended to {csv_path}")
 PYEOF

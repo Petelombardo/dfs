@@ -3178,6 +3178,50 @@ impl HealingManager {
         heal_max_concurrent_per_node: &Arc<AtomicUsize>,
         heal_push_failure: &Arc<DashMap<ChunkId, (Instant, u32)>>,
     ) -> Result<Option<HealOutcome>> {
+        // Patch tokens are NOT independently replicable content — never heal one.
+        //
+        // A public_token is blake3("dfs-patch-token" || delta_chunk_id.hash): deliberately
+        // NOT a content hash, precisely so nothing mistakes it for directly-readable
+        // content (see PATCH_STATE_TABLE's doc comment). It has no file of its own; reading
+        // it resolves through patch_state to base+delta and composes the bytes. So
+        // handle_push_chunk_to's source-side verification —
+        // compute_chunk_hash_at(&data, offset, file_id) != chunk_id.hash — is TRUE BY
+        // CONSTRUCTION for every token, and reports it as "content hash mismatch (disk
+        // corruption)". The heal then fails, the chunk is stalled, discovery re-queues it
+        // because its routing row still looks under-replicated, and it retries forever.
+        //
+        // This is not theoretical: staging logged 372,854 such "corruption" events and
+        // 191,437 heal failures overnight against 849 distinct tokens, individual chunks
+        // reaching 482 consecutive failures, with a 0% success rate. None of it was real
+        // corruption. Tokens enter the queue structurally, not exceptionally: apply_patch
+        // registers each new token's ChunkLocation with nodes: [local_node_id] only
+        // (deliberately — carrying the old node list forward caused a real T28 corruption),
+        // so EVERY patch mints a chunk that looks 1-of-RF replicated. A patch-heavy
+        // workload like a VM install therefore manufactures these continuously.
+        //
+        // Skipping is correct, not merely cheaper: copying a token's composed bytes under
+        // the token's own name would store content whose hash does not match its
+        // identity, breaking content-addressing. If the underlying data really is at risk,
+        // the remedy is the backstop fold — consolidate to a real content-addressed chunk
+        // and heal THAT (see T53) — never replicating the token.
+        //
+        // O(1) single-key lookup, not the table scan all_pending_patch_chunk_ids does: a
+        // chunk_id that HAS a patch_state row IS a token, since that table is keyed by
+        // public_token. Note base_chunk_id/delta_chunk_id are real content chunks with real
+        // files and must still heal normally — they are not keys here, so they are
+        // unaffected. Any lookup error falls through to healing: uncertainty must never
+        // withhold redundancy from something that might be genuine content.
+        match metadata.get_patch_state_async(*chunk_id).await {
+            Ok(Some(_)) => {
+                debug!("Skipping heal for {} — it is a patch token (resolves via patch_state, not independently replicable); the fold path owns this slot", chunk_id);
+                return Ok(Some(HealOutcome::clear_only(*chunk_id)));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("Heal: patch-state lookup failed for {} ({}) — proceeding with heal rather than withholding redundancy", chunk_id, e);
+            }
+        }
+
         info!("Leader healing under-replicated chunk: {}", chunk_id);
 
         let location = metadata

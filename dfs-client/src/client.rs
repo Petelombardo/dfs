@@ -89,6 +89,19 @@ pub struct NodeHealthTracker {
 impl NodeHealthTracker {
     /// Number of consecutive failures before a node is penalized.
     const PENALTY_THRESHOLD: u32 = 5;
+
+    /// How long a node proven dead (connection refused/reset) is skipped. Deliberately
+    /// MUCH shorter than BASE_PROBE_SECS (30s), and it never escalates.
+    ///
+    /// The reason is the case where the only nodes holding a chunk are both offline.
+    /// `send_request` hard-rejects a penalized address without attempting a connection,
+    /// so a long shed on those two nodes converts "wait for them to come back" into
+    /// "instant EIO" — and for a VM guest, waiting is enormously preferable to an I/O
+    /// error, which can remount its filesystem read-only. A restarting node is typically
+    /// back in seconds, so this window only needs to be long enough to stop the current
+    /// retry ladder from re-paying an RPC timeout against a corpse, not long enough to
+    /// exile it. Data availability outranks the latency win whenever they conflict.
+    const DEAD_SHED_SECS: u64 = 5;
     /// Base probe interval (seconds) — doubles on each repeated failure.
     const BASE_PROBE_SECS: u64 = 30;
     /// Maximum probe interval (seconds).
@@ -135,6 +148,59 @@ impl NodeHealthTracker {
                 addr, secs, consecutive_failures
             );
         }
+    }
+
+    /// Record an UNAMBIGUOUS death signal from `addr` — connection refused, reset,
+    /// aborted, or host/network unreachable. Penalizes immediately rather than
+    /// accumulating toward PENALTY_THRESHOLD.
+    ///
+    /// `UnexpectedEof` is deliberately NOT in that set: it is the ordinary signature of
+    /// a pooled connection the server closed after its idle timeout, which
+    /// `send_request` already retries transparently on a fresh connection precisely
+    /// because the node itself is fine. Treating it as death would shed healthy nodes
+    /// during normal idle churn.
+    ///
+    /// The distinction this draws is the whole point: a timeout says "no answer YET"
+    /// (the node might merely be slow under load, and shedding it would be wrong),
+    /// whereas a refused/reset connection is positive proof from the kernel that
+    /// nothing is listening. Treating those identically is what made a single node
+    /// restart cost tens of seconds: `record_failure` needed PENALTY_THRESHOLD (5)
+    /// accumulations, and `claim_probe` needed PROBE_AFTER_FAILURES (2) before it
+    /// would even spend a 1s liveness probe — so a corpse stayed in the rotation and
+    /// every retry-ladder pass paid a full RPC timeout against it.
+    ///
+    /// Measured on staging 2026-07-22: a rolling restart during a live VM produced
+    /// client stalls of 4.7s/12.8s/27.3s with ZERO failover events logged, because the
+    /// ladder walked every node twice at 3s each and kept being redirected back to the
+    /// dead leader. The guest's ~30s SCSI timeout expired first and the install took an
+    /// I/O error. Failover detection must be far cheaper than the deadline that
+    /// ultimately surfaces as EIO, and proof-of-death is the cheapest signal available.
+    ///
+    /// Deliberately does NOT touch `backoff_level`'s escalation the way hard_penalize
+    /// does, and uses DEAD_SHED_SECS rather than BASE_PROBE_SECS — see that constant.
+    pub async fn record_dead(&self, addr: SocketAddr) {
+        let mut h = self.inner.entry(addr).or_insert_with(NodeHealth::new);
+        let already_penalized = h.penalized_until.is_some();
+        h.consecutive_failures = h.consecutive_failures.max(Self::PENALTY_THRESHOLD);
+        h.penalized_until = Some(std::time::Instant::now() + Duration::from_secs(Self::DEAD_SHED_SECS));
+        drop(h);
+        if !already_penalized {
+            warn!("Node {} shed immediately on proof of death (connection refused/reset/EOF) — skipping it for {}s instead of paying a full RPC timeout per retry",
+                addr, Self::DEAD_SHED_SECS);
+        }
+    }
+
+    /// True when an io::Error is positive proof the peer is gone, as opposed to
+    /// merely slow. Used to choose between `record_dead` and `record_failure`.
+    pub fn is_proof_of_death(kind: std::io::ErrorKind) -> bool {
+        matches!(
+            kind,
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::NetworkUnreachable
+        )
     }
 
     /// Consecutive failures that make a node "suspicious" enough to spend a
@@ -1452,6 +1518,24 @@ leader_addr: Arc::new(RwLock::new(None)),
     async fn send_request_with_retry(&self, request: Request) -> Result<Response> {
         let nodes = self.cluster_nodes.read().await.clone();
         let mut last_error = None;
+        // Addresses already proven dead in THIS ladder. The second (post-rebootstrap)
+        // round skips them instead of paying another full RPC timeout each.
+        //
+        // Cost model this exists to fix (measured on staging 2026-07-22): the ladder was
+        // `all nodes -> 500ms -> re-bootstrap -> all nodes AGAIN`, at up to one RPC
+        // timeout per node per round. On a 5-node cluster that is 2 * 5 * 3s + 500ms ~=
+        // 31s worst case -- longer than the ~30s SCSI timeout of the guest whose write
+        // is waiting on it, so the VM reported an I/O error before the client had even
+        // finished deciding where to send. Worse, the cost is O(nodes * timeout * rounds),
+        // so it degrades as the cluster grows.
+        //
+        // Note this is deliberately NOT a deadline on the whole operation. Capping total
+        // time would abort legitimately-slow-but-succeeding writes (a 4MB patch to a busy
+        // node) and turn "slow" into "failed", generating more retry load exactly when the
+        // cluster is already struggling. The goal is to fail OVER fast, not to fail fast:
+        // remove dead paths from the ladder, never shorten the deadline for a node that is
+        // actually working.
+        let mut proven_dead: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
 
         for (i, node_addr) in nodes.iter().enumerate() {
             if i > 0 {
@@ -1462,6 +1546,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             match self.send_request(*node_addr, request.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
+                    if Self::error_is_proof_of_death(&e) {
+                        proven_dead.insert(*node_addr);
+                        self.node_health.record_dead(*node_addr).await;
+                    }
                     warn!("Failed to send request to {}: {}", node_addr, e);
                     last_error = Some(e);
                 }
@@ -1477,12 +1565,23 @@ leader_addr: Arc::new(RwLock::new(None)),
         } else {
             let refreshed = self.cluster_nodes.read().await.clone();
             for (i, node_addr) in refreshed.iter().enumerate() {
+                // Skip anything the kernel already proved is gone this pass. Re-bootstrap
+                // can legitimately hand back the same list, and a node that refused the
+                // connection 500ms ago will refuse it again — there is nothing to learn
+                // from a second timeout against it, only time to lose.
+                if proven_dead.contains(node_addr) {
+                    debug!("Post-refresh: skipping {} — already proven dead this pass", node_addr);
+                    continue;
+                }
                 if i > 0 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 match self.send_request(*node_addr, request.clone()).await {
                     Ok(response) => return Ok(response),
                     Err(e) => {
+                        if Self::error_is_proof_of_death(&e) {
+                            self.node_health.record_dead(*node_addr).await;
+                        }
                         warn!("Post-refresh: failed to send request to {}: {}", node_addr, e);
                         last_error = Some(e);
                     }
@@ -1491,6 +1590,20 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All nodes failed")))
+    }
+
+    /// True when an error that came back up the stack is positive proof the peer is
+    /// gone rather than merely slow. Walks the anyhow chain because the io::Error is
+    /// usually wrapped in context by the time it reaches the retry ladder.
+    fn error_is_proof_of_death(err: &anyhow::Error) -> bool {
+        for cause in err.chain() {
+            if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+                if NodeHealthTracker::is_proof_of_death(io_err.kind()) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Send a request with retry, returning the successful node's address

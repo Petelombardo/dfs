@@ -113,7 +113,7 @@ cd "$REPO" && cargo build --release 2>&1 | tail -2
 echo "=== Starting 5-node cluster ==="
 bash "$REPO/scripts/setup-cluster.sh" 5 2>/dev/null
 for i in 1 2 3 4 5; do
-    RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
         > "$LOG/server${i}.log" 2>&1 &
 done
 sleep 3
@@ -2872,7 +2872,7 @@ echo "  Rolling restart of all 5 server nodes (one at a time)..."
 for i in 1 2 3 4 5; do
     pkill -f "dfs-server start --config $BASE/node${i}/config.toml" 2>/dev/null || true
     sleep 0.5
-    RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
+    RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${i}/config.toml" \
         >> "$LOG/server${i}.log" 2>&1 &
     sleep 2
 done
@@ -3360,7 +3360,7 @@ check "T45b healing set persisted to config.toml on all 5 nodes" "$T45_CONFIG_OK
 echo "  T45: restarting node1 to confirm tuned values survive (not reverted to defaults)..."
 pkill -f "dfs-server start --config $BASE/node1/config.toml" 2>/dev/null || true
 sleep 0.5
-RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node1/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node1/config.toml" \
     >> "$LOG/server1.log" 2>&1 &
 
 # Poll for a full 5-node rejoin, not just node1's RPC listener being up — Part B below
@@ -3453,7 +3453,7 @@ grep -q "replication_factor = 3" "$BASE/node5/config.toml" || T45_NODE5_STALE_OK
 check "T45f node5 config still stale (=3) while down — confirms no silent cross-node update" "$T45_NODE5_STALE_OK"
 
 echo "  T45: restarting node5 — expect it to self-reconcile replication_factor to 4 on rejoin..."
-RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node5/config.toml" \
     >> "$LOG/server5.log" 2>&1 &
 
 T45_DEADLINE=$(( $(date +%s) + 30 ))
@@ -3862,6 +3862,14 @@ for w in $(seq 0 $((T51_CONCURRENCY-1))); do
         seq_n=0
         byte_off=$(( w * 65536 ))
         while [ ! -f "$T51_STOP" ]; do
+            # Wall time for the whole open/write/close cycle. T51d asserts on the max of
+            # these: killing the leader mid-storm must not stall a client write for longer
+            # than a guest's I/O timeout, or a VM running on the mount takes an EIO even
+            # though no data was lost. Added 2026-07-22 after a rolling restart during a
+            # live VM produced client stalls of 4.7s/12.8s/27.3s with zero failover events
+            # logged — this test already killed the leader mid-write and passed, because it
+            # only ever checked correctness, never latency.
+            t51_w_start=$(date +%s%N)
             python3 -c "
 import os, sys
 img, byte_off, patch_size, worker, seq_n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
@@ -3873,6 +3881,7 @@ os.write(fd, data)
 os.close(fd)
 " "$T51_IMG" "$byte_off" "$T51_PATCH_SIZE" "$w" "$seq_n" 2>>"$T51_LOGDIR/err_$w" \
                 && echo "$seq_n" > "$T51_LOGDIR/last_$w"
+            echo $(( ($(date +%s%N) - t51_w_start) / 1000000 )) >> "$T51_LOGDIR/lat_$w"
             seq_n=$((seq_n+1))
             sleep 0.05
         done
@@ -3920,7 +3929,7 @@ pkill -9 -f "dfs-server start --config $BASE/node${T51_LEADER_NODE}/config.toml"
 # repeatedly, the same way the real incident's ~16s leader outage did.
 sleep 3
 
-RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node${T51_LEADER_NODE}/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${T51_LEADER_NODE}/config.toml" \
     >> "$LOG/server${T51_LEADER_NODE}.log" 2>&1 &
 
 # Storm keeps running through the outage and recovery — that's the whole
@@ -3969,6 +3978,22 @@ done
 [ "$T51_MISMATCHES" -eq 0 ] \
     && check "T51a all $T51_CONCURRENCY worker slots hold their last write after leader-restart storm" PASS \
     || check "T51a $T51_MISMATCHES/$T51_CONCURRENCY worker slots corrupted/lost after leader-restart storm" FAIL
+
+# T51d: failover LATENCY, not just correctness. Killing the leader mid-storm must not
+# stall a client write past a guest's I/O deadline — a VM on this mount takes an EIO
+# (and may remount read-only) even when no data was lost. Bound is deliberately well
+# under a Linux guest's ~30s SCSI timeout while leaving generous headroom for a loaded
+# CI box; the behavior this guards against was a measured 27.3s stall on staging, from a
+# retry ladder that walked every node twice at one RPC timeout each without ever
+# shedding the dead one.
+T51_MAX_LAT=$(cat "$T51_LOGDIR"/lat_* 2>/dev/null | sort -n | tail -1)
+T51_MAX_LAT=${T51_MAX_LAT:-0}
+T51_P99_LAT=$(cat "$T51_LOGDIR"/lat_* 2>/dev/null | sort -n | awk '{a[NR]=$1} END {if(NR) print a[int(NR*0.99)]; else print 0}')
+T51_LAT_BOUND_MS=15000
+echo "  T51: worst single-write latency during leader restart: ${T51_MAX_LAT}ms (p99 ${T51_P99_LAT}ms, bound ${T51_LAT_BOUND_MS}ms)"
+[ "$T51_MAX_LAT" -le "$T51_LAT_BOUND_MS" ] \
+    && check "T51d no client write stalled past ${T51_LAT_BOUND_MS}ms during leader restart (worst ${T51_MAX_LAT}ms)" PASS \
+    || check "T51d a client write stalled ${T51_MAX_LAT}ms during leader restart (bound ${T51_LAT_BOUND_MS}ms) — failover too slow, a guest would see EIO" FAIL
 
 # Cold-restart the client and re-verify — the real incident's corruption only
 # surfaced on read-back after a client restart (cache masked it beforehand).
@@ -4177,7 +4202,7 @@ sleep 2
 echo "  Killing node$T52_VICTIM_NUM ($T52_VICTIM_NODE) mid-storm (SIGKILL, matching a real abrupt outage)..."
 pkill -9 -f "dfs-server start --config $BASE/node${T52_VICTIM_NUM}/config.toml" 2>/dev/null || true
 sleep 3
-RUST_LOG=info "$BIN/dfs-server" start --config "$BASE/node${T52_VICTIM_NUM}/config.toml" \
+RUST_LOG=info DFS_LEADER_HANDOFF_GRACE_MS=0 "$BIN/dfs-server" start --config "$BASE/node${T52_VICTIM_NUM}/config.toml" \
     >> "$LOG/server${T52_VICTIM_NUM}.log" 2>&1 &
 
 sleep $(( T52_DURATION - 2 ))

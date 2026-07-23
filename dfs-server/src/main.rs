@@ -543,15 +543,29 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
             // round-trip needed. The client's send_to_leader_with_retry redirects on that
             // response immediately with zero backoff — so the only thing standing between
             // a client and the successor is whether our port is still open when it retries.
-            // Default is short to match the existing 100ms (test-suite teardown does
-            // `pkill` + `sleep 0.5` and assumes shutdown finishes well under that);
-            // staging/production should set DFS_LEADER_HANDOFF_GRACE_MS higher (e.g. 2000)
-            // via the systemd unit so real clients have time to land a retry.
+            // Defaults to 2000ms — safe for real clients, NOT zero.
+            //
+            // This previously defaulted to 0 with a comment saying staging/production
+            // "should set" it via the systemd unit. Nobody did: on 2026-07-22 all five
+            // staging nodes had it unset, and a rolling restart performed while a VM was
+            // running produced client stalls of 4.7s, 12.8s and 27.3s, a guest SCSI
+            // timeout, and an I/O error mid-install. The client log across that whole
+            // window contained ZERO NotLeader responses, ZERO NodeLeaving responses, and
+            // ZERO leader-change events — the entire graceful-handoff path was never
+            // exercised, because with grace 0 the leader is gone before it can answer the
+            // retry that would have carried the redirect. The client just sat on its 30s
+            // send/receive timeout instead.
+            //
+            // A default that only works when an operator remembers to override it is not a
+            // default; the safe value belongs here and the fast-teardown value belongs with
+            // the thing that wants fast teardown (the local suite exports 0 explicitly).
+            // Cost when it fires is ~2s of extra shutdown on the ONE node that was leader,
+            // against clients otherwise blocking for tens of seconds.
             if was_leader {
                 let grace_ms = std::env::var("DFS_LEADER_HANDOFF_GRACE_MS")
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
+                    .unwrap_or(2000);
                 if grace_ms > 0 {
                     info!("Was leader — staying up {}ms to redirect clients to the successor before exiting", grace_ms);
                     tokio::time::sleep(tokio::time::Duration::from_millis(grace_ms)).await;

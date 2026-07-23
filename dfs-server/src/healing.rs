@@ -1330,6 +1330,9 @@ impl HealingManager {
         let mut to_heal: Vec<ChunkId> = Vec::new();
         let mut db_puts: Vec<ChunkLocation> = Vec::new();
         let mut broadcasts: Vec<ChunkLocation> = Vec::new();
+        // Candidates for tombstone GC — see the collection site below.
+        let mut tombstone_candidates: Vec<ChunkId> = Vec::new();
+        let live_chunks = self.live_chunk_ids_from_chunk_map();
 
         for loc in chunks_to_check {
             let mut confirmed_present: Vec<NodeId> = Vec::new();
@@ -1360,9 +1363,35 @@ impl HealingManager {
                         .filter(|n| !confirmed_missing.contains(n))
                         .copied()
                         .collect();
-                    warn!("Phantom reconciliation: chunk {} has {} confirmed-absent node(s) {:?} \
-                           but no other listed node confirmed present (unverified: {:?}) — skipping to avoid stranding",
-                        loc.chunk_id, confirmed_missing.len(), confirmed_missing, unverified);
+                    // Tombstone GC (2026-07-22). "Never strand at zero replicas" is exactly
+                    // right for a chunk some file still wants — don't destroy the location
+                    // record, recovery may still be possible. But it makes no sense for a
+                    // chunk that NO file references: the guard then protects something that
+                    // does not exist and cannot be wanted, and the row churns forever.
+                    // Live staging: 12,724 such rows produced ~8,700 of these warnings every
+                    // 3 minutes, driving enough metadata/CPU load to give the client
+                    // leader_gap stalls of 4.7s/12.8s/27.3s — long enough for a guest to
+                    // time out and log an I/O error mid-install.
+                    //
+                    // A row is collected only when ALL of:
+                    //   * no node confirmed present (the data really is gone), and
+                    //   * `unverified` is EMPTY — every listed node returned a verdict this
+                    //     pass. This is the positive control: absence only counts when the
+                    //     probe demonstrably worked. A node that is offline, wedged, or whose
+                    //     HasChunks timed out lands in `unverified` (see the presence loop
+                    //     above, which records a verdict only for nodes that answered), so a
+                    //     cluster that cannot see its own storage collects nothing at all.
+                    //   * no file references the chunk in chunk_map.
+                    // Deletion additionally requires a fully healthy cluster, leader grace,
+                    // and authorize_live_file_orphan_deletes' cross-node pending-patch union
+                    // (see the post-loop site). Ambiguity anywhere keeps the row.
+                    if unverified.is_empty() && !live_chunks.contains(&loc.chunk_id) {
+                        tombstone_candidates.push(loc.chunk_id);
+                    } else {
+                        warn!("Phantom reconciliation: chunk {} has {} confirmed-absent node(s) {:?} \
+                               but no other listed node confirmed present (unverified: {:?}) — skipping to avoid stranding",
+                            loc.chunk_id, confirmed_missing.len(), confirmed_missing, unverified);
+                    }
                 }
                 continue;
             }
@@ -1408,6 +1437,66 @@ impl HealingManager {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!("Phantom reconciliation: batch metadata update failed: {}", e),
                 Err(e) => warn!("Phantom reconciliation: batch update spawn_blocking panicked: {}", e),
+            }
+        }
+
+        // Tombstone GC: delete CHUNK_TABLE rows for chunks that are simultaneously
+        // unreferenced by any file AND confirmed absent on every node that answered.
+        // Nothing recoverable can be destroyed here — the bytes are already gone and
+        // already unwanted; what's left is a row that only generates churn.
+        //
+        // Gated exactly like the other destructive paths, and routed through
+        // authorize_live_file_orphan_deletes so it inherits the cross-node pending-patch
+        // union (a chunk can be a live Pending base on a node that never got asked —
+        // the mechanism behind the 2026-07-10 VM-111 data loss) plus the leader/follower
+        // confirmation and cluster-stability rules, rather than inventing a second,
+        // less-tested notion of "safe to delete".
+        if !tombstone_candidates.is_empty() {
+            let destructive_allowed = {
+                let all_nodes = self.cluster.get_all_nodes().await;
+                let online = all_nodes.iter()
+                    .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                    .count();
+                let grace_elapsed = self.cluster.time_since_became_leader().await
+                    .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+                // SELF_RESTART_GRACE_SECS is load-bearing here, not belt-and-braces: the
+                // whole "is it referenced?" test reads live_chunk_ids_from_chunk_map(),
+                // and after a restart that map is only as fresh as the last durable
+                // FileMetadata sync — nowhere near a long-running peer's, which updates
+                // synchronously on every patch. A node that restarted recently can
+                // therefore see genuinely LIVE chunks as unreferenced and tombstone them.
+                // This is not hypothetical: a rolling restart performed during an active
+                // VM install on 2026-07-22 is exactly the window that would have hit it,
+                // and the disk orphan sweep already carries this same check for the same
+                // reason (see its call site above).
+                let self_uptime = self.local_started_at.elapsed().as_secs();
+                let self_settled = self_uptime >= SELF_RESTART_GRACE_SECS;
+                !all_nodes.is_empty() && online == all_nodes.len() && grace_elapsed && self_settled
+            };
+            if !destructive_allowed {
+                info!("Phantom reconciliation: {} unreferenced zero-replica tombstone(s) found but cluster not fully healthy/settled (or this node restarted recently) — deferring", tombstone_candidates.len());
+            } else {
+                let authorized = self.authorize_live_file_orphan_deletes(&tombstone_candidates).await;
+                if !authorized.is_empty() {
+                    let metadata = Arc::clone(&self.metadata);
+                    let deletes = authorized.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        // Same list for both: drop the routing row AND its pending_healing
+                        // row, otherwise the healer keeps rediscovering a chunk whose
+                        // location no longer exists and logs "Chunk location not found —
+                        // stalling until next discovery" on every pass (198 such warnings
+                        // per burst were still firing on staging after the orphan cleanup).
+                        metadata.batch_update_chunk_locations(&[], &deletes, &deletes)
+                    }).await;
+                    match result {
+                        Ok(Ok(())) => info!("Phantom reconciliation: garbage-collected {} unreferenced zero-replica location row(s) ({} candidate(s) authorized)",
+                            authorized.len(), tombstone_candidates.len()),
+                        Ok(Err(e)) => warn!("Phantom reconciliation: tombstone GC batch delete failed: {}", e),
+                        Err(e) => warn!("Phantom reconciliation: tombstone GC spawn_blocking panicked: {}", e),
+                    }
+                } else {
+                    info!("Phantom reconciliation: {} tombstone candidate(s) all withheld by live-file authorization — deferring", tombstone_candidates.len());
+                }
             }
         }
 

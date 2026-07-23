@@ -345,11 +345,22 @@ pub struct Server {
     /// fly, so a cold read is never stuck behind the debounce window either.
     dirty_patch_slots: Arc<DashMap<(FileId, u64), DirtyPatchSlot>>,
 
-    /// Per-chunk_id read-exclusion lock for in-place patching. The in-place
-    /// patch path (handle_patch_chunk/handle_multi_patch) mutates the
-    /// existing chunk file's bytes directly rather than writing a new file,
-    /// so a concurrent ReadChunk/ReadChunkRange for that exact chunk_id must
-    /// not be allowed to read mid-write. chunk_patch_locks above already
+    /// Per-chunk_id read-exclusion lock covering the RECLAIM (unlink) of a
+    /// superseded chunk, so a concurrent ReadChunk/ReadChunkRange for that exact
+    /// chunk_id can't be interleaved with its file being removed.
+    ///
+    /// This doc used to say the patch path "mutates the existing chunk file's
+    /// bytes directly rather than writing a new file, so a concurrent read must
+    /// not be allowed to read mid-write." That has been false since 2026-07-09,
+    /// when in-place mutation (and its PatchJournalEntry undo journal) was
+    /// replaced by write-to-temp-then-atomic-rename — full_rewrite_chunk never
+    /// opens old_chunk_id's file for writing, so a torn read of it is not
+    /// possible. The stale premise cost real throughput: the guard was held
+    /// across the whole ~438ms rewrite, starving every concurrent reader of that
+    /// chunk (see full_rewrite_chunk for the measurement). It is now taken only
+    /// around the unlink itself.
+    ///
+    /// chunk_patch_locks above already
     /// serializes writers against each other (keyed by (file_id, chunk_idx),
     /// and patch-derived chunk_ids are file+offset-scoped so they're never
     /// shared across slots — see compute_chunk_hash_at) — this lock's only
@@ -400,6 +411,13 @@ pub struct Server {
     delta_ring: Arc<ShardedChunkRing>,
     delta_ring_hits: Arc<std::sync::atomic::AtomicU64>,
     delta_ring_misses: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Forwarding pointers for chunks full_rewrite_chunk has retired — see
+    /// ShardedAliasMap. Ephemeral by design; never a durability dependency.
+    retired_chunk_aliases: Arc<ShardedAliasMap>,
+    /// Count of reads served via the (file_id, chunk_idx) slot backstop — see
+    /// resolve_by_slot. A high rate means clients are being handed stale chunk maps.
+    slot_backstop_hits: Arc<std::sync::atomic::AtomicU64>,
 
     /// Number of run_single_fold calls currently in flight cluster-wide-per-
     /// this-node, regardless of trigger (client-driven ForceFold or the idle
@@ -646,6 +664,7 @@ async fn full_rewrite_chunk(
     storage: Arc<ChunkStorage>,
     metadata: Arc<MetadataStore>,
     chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>>,
+    retired_chunk_aliases: Arc<ShardedAliasMap>,
     file_id: FileId,
     chunk_file_offset: u64,
     old_chunk_id: ChunkId,
@@ -654,21 +673,41 @@ async fn full_rewrite_chunk(
     local_node_id: NodeId,
 ) -> Result<(ChunkId, usize, Arc<Vec<u8>>), (String, ErrorCode)> {
     let old_path = storage.get_chunk_path(&old_chunk_id);
+    let old_path_for_unlink = old_path.clone();
 
-    let io_guard = chunk_io_locks
-        .entry(old_chunk_id)
-        .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
-        .clone()
-        .write_owned()
-        .await;
-
+    // NOTE: chunk_io_locks is deliberately NOT taken around the read-modify-write
+    // below — only around the unlink of old_chunk_id at the very end (see the
+    // reclaim block after this spawn_blocking).
+    //
+    // The write guard used to be acquired here and moved *into* the blocking
+    // closure, so it was held for this entire function — a 438ms median locally,
+    // and 115-150ms on staging. Every concurrent read of that chunk_id blocked on
+    // it, then queued behind the next writer, which is what starved readers under
+    // any mixed read/write load: measured 3562.9 iops read-alone vs 7.4 iops with
+    // one concurrent writer (scripts/repro_mixed_rw_collapse.sh).
+    //
+    // That hold was protecting a hazard this function no longer has.
+    // chunk_io_locks' field doc describes the patch path as one that "mutates the
+    // existing chunk file's bytes directly rather than writing a new file", so a
+    // reader must not observe it mid-write. That stopped being true on 2026-07-09,
+    // when the in-place design was replaced (along with its PatchJournalEntry undo
+    // journal) by write-to-temp-then-atomic-rename — see the comment on the
+    // storage.write_chunk call below: "old_chunk_id's own file is never opened for
+    // writing." A reader of old_chunk_id therefore either sees the complete old
+    // file or, once the reclaim below has run, no file at all. It can never see a
+    // torn one, with or without this lock.
+    //
+    // The one genuine race left is a reader that resolves old_path before the
+    // unlink and opens it after — which yields NotFound, not corruption, and is
+    // the same already-handled stale-chunk_id case as any read racing a fold.
+    // Narrowing the guard to just the unlink keeps that window closed exactly as
+    // before, while dropping the hold time from ~438ms to a single filesystem op.
     let storage_inner = storage.clone();
     let metadata_inner = metadata.clone();
     let result = tokio::task::spawn_blocking(move || {
         use std::fs;
         let storage = storage_inner;
         let metadata = metadata_inner;
-        let _io_guard = io_guard;
 
         let mut buf = if let Some(arc_data) = prefetched {
             match Arc::try_unwrap(arc_data) {
@@ -814,18 +853,40 @@ async fn full_rewrite_chunk(
             }
         }
 
-        if new_chunk_id != old_chunk_id {
-            // Only now — new_chunk_id is durably on disk and registered — is
-            // old_chunk_id's file safe to reclaim. Best-effort: a crash or failure
-            // here just leaves it as a harmless orphan (unreferenced by any
-            // metadata) for the storage-reconciliation sweep to eventually clean up.
-            let _ = fs::remove_file(&old_path);
-            let _ = metadata.delete_chunk_location(&old_chunk_id);
-            storage.invalidate_cache(&old_chunk_id);
-        }
-
         Ok((new_chunk_id, final_size, Arc::new(buf)))
     }).await;
+
+    // Reclaim old_chunk_id — moved out of the blocking closure above so it can run
+    // under the chunk_io_locks write guard without that guard also covering the
+    // read-modify-write. Only now, with new_chunk_id durably on disk and
+    // registered, is the old file safe to remove; ordering is unchanged, only the
+    // lock scope is. Best-effort as before: a failure here leaves a harmless
+    // orphan (unreferenced by any metadata) for the storage-reconciliation sweep.
+    //
+    // Taken only when the content actually changed. A byte-identical patch (T34's
+    // concurrent same-pattern writers) leaves new_chunk_id == old_chunk_id, where
+    // there is nothing to reclaim and nothing to exclude readers from — so the
+    // common no-op case now takes no lock at all.
+    if let Ok(Ok((new_chunk_id, _, _))) = &result {
+        if *new_chunk_id != old_chunk_id {
+            let io_guard = chunk_io_locks
+                .entry(old_chunk_id)
+                .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+                .clone()
+                .write_owned()
+                .await;
+            // Leave a forwarding pointer BEFORE the old id becomes unreadable, so a
+            // client still holding it resolves through instead of getting NotFound.
+            // Recorded under the io guard for the same reason the unlink is: a reader
+            // must not be able to observe the window where the file is gone and no
+            // alias exists yet. See ShardedAliasMap for why this is memory-only.
+            retired_chunk_aliases.insert(old_chunk_id, *new_chunk_id);
+            let _ = tokio::fs::remove_file(&old_path_for_unlink).await;
+            let _ = metadata.delete_chunk_location_async(old_chunk_id).await;
+            storage.invalidate_cache(&old_chunk_id);
+            drop(io_guard);
+        }
+    }
 
     chunk_io_locks.remove(&old_chunk_id);
 
@@ -881,6 +942,7 @@ struct OverlayForkCtx {
     delta_ring: Arc<ShardedChunkRing>,
     delta_ring_hits: Arc<std::sync::atomic::AtomicU64>,
     delta_ring_misses: Arc<std::sync::atomic::AtomicU64>,
+    retired_chunk_aliases: Arc<ShardedAliasMap>,
     active_fold_count: Arc<std::sync::atomic::AtomicU64>,
     cluster: Arc<ClusterManager>,
     client: Arc<NetworkClient>,
@@ -1081,6 +1143,76 @@ impl ShardedChunkRing {
     /// Total capacity across all shards, for stats reporting.
     fn total_capacity(&self) -> usize {
         self.shards[0].lock().unwrap().cap().get() * CHUNK_RING_SHARD_COUNT
+    }
+}
+
+/// Ephemeral forwarding pointers for chunks that full_rewrite_chunk has retired:
+/// `old_chunk_id -> the chunk_id that superseded it`.
+///
+/// Why this exists: the overlay path leaves a trail when it retires a token
+/// (PatchState::Folded, "a permanent alias to one living at a different
+/// identity"), but full_rewrite_chunk did not — it unlinked the old chunk and
+/// deleted its ChunkLocation with nothing left pointing forward. A client whose
+/// chunk map still named the old id got a hard NotFound. That asymmetry is what
+/// made the FUSE read path block: it waits out an entire in-flight flush purely
+/// to avoid fetching "a chunk that no longer exists" (fuse_impl.rs), which
+/// measured as 18.56s of stall in a 20s mixed read/write window.
+///
+/// Why in-memory and NOT durable — the distinction is derivable vs authoritative:
+/// this is only a shortcut. The superseded content exists standalone under the new
+/// id, and a client that misses here simply refetches the chunk map from the leader
+/// and finds it. Losing these entries costs latency, never data. That is the
+/// opposite of PatchState::Pending, which must stay durable because a Pending token
+/// names no real file at all — base+delta is the *sole* record of how to
+/// reconstruct those bytes, and losing it is real data loss (2026-07-17 VM-111
+/// install EIO, fixed in 996e728 by making the read path consult durable
+/// patch_state). Do not "optimize" Pending into memory on the strength of this map.
+///
+/// Bounded by construction: a fixed-capacity LRU per shard, evicting oldest-first,
+/// which is the right policy — the entries that can still be referenced by an
+/// in-flight client read are the newest ones. No TTL sweep, no startup sweep, no
+/// schema change, and no redb write on the hot retire path (a durable row here
+/// would have added a disk write to the very path whose latency we're fixing).
+struct ShardedAliasMap {
+    shards: Vec<std::sync::Mutex<lru::LruCache<ChunkId, ChunkId>>>,
+}
+
+impl ShardedAliasMap {
+    fn new(total_capacity: usize) -> Self {
+        let per_shard = std::num::NonZeroUsize::new((total_capacity / CHUNK_RING_SHARD_COUNT).max(1)).unwrap();
+        Self {
+            shards: (0..CHUNK_RING_SHARD_COUNT).map(|_| std::sync::Mutex::new(lru::LruCache::new(per_shard))).collect(),
+        }
+    }
+
+    fn insert(&self, old_chunk_id: ChunkId, new_chunk_id: ChunkId) {
+        self.shards[ring_shard_index(&old_chunk_id)].lock().unwrap().put(old_chunk_id, new_chunk_id);
+    }
+
+    /// Follow the forwarding chain from `chunk_id` to the newest id we know of.
+    ///
+    /// Chains happen under sustained writes to one chunk: A is retired for B, then
+    /// B for C, so a reader still holding A needs two hops. Hard-capped rather than
+    /// looped to exhaustion so a cycle (which should be impossible — ids are
+    /// content-addressed and a rewrite that produced identical content records no
+    /// alias at all) fails closed instead of hanging a read.
+    fn resolve(&self, chunk_id: ChunkId) -> Option<ChunkId> {
+        const MAX_HOPS: usize = 4;
+        let mut current = chunk_id;
+        let mut hops = 0;
+        loop {
+            let next = self.shards[ring_shard_index(&current)].lock().unwrap().get(&current).copied();
+            match next {
+                Some(n) if n != current => {
+                    current = n;
+                    hops += 1;
+                    if hops >= MAX_HOPS {
+                        return Some(current);
+                    }
+                }
+                _ => return (hops > 0).then_some(current),
+            }
+        }
     }
 }
 
@@ -1844,6 +1976,7 @@ impl OverlayForkCtx {
             self.storage.clone(),
             self.metadata.clone(),
             self.chunk_io_locks.clone(),
+            self.retired_chunk_aliases.clone(),
             file_id,
             chunk_file_offset,
             base_chunk_id,
@@ -2908,6 +3041,11 @@ impl Server {
             )),
             delta_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delta_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // ~72 bytes per entry, so 64k entries is ~4.6MB — negligible beside the
+            // content tiers, and far more retired generations than any in-flight
+            // client staleness window can reference.
+            retired_chunk_aliases: Arc::new(ShardedAliasMap::new(65536)),
+            slot_backstop_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active_fold_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ops_tracker: Arc::new(OpsTracker::new()),
@@ -4528,17 +4666,17 @@ impl Server {
             // subsystem is contended. A node that can't reach this arm (all workers
             // parked, as in the 2026-07-19 gluster3 wedge) is a genuine black hole.
             Request::Ping => Response::Pong,
-            Request::ReadChunk { chunk_id, sequential_hint, client_write_seq } => {
+            Request::ReadChunk { chunk_id, sequential_hint, client_write_seq, file_id, chunk_idx } => {
                 self.ops_tracker.inc_read();
                 if let Some((idx, total)) = sequential_hint {
                     debug!("ReadChunk {} with sequential hint: {}/{} chunks", chunk_id, idx, total);
                     // TODO: Use hint for server-side prefetching
                 }
-                self.handle_read_chunk(chunk_id, client_write_seq).await
+                self.handle_read_chunk(chunk_id, client_write_seq, file_id.zip(chunk_idx)).await
             },
-            Request::ReadChunkRange { chunk_id, offset, length, client_write_seq } => {
+            Request::ReadChunkRange { chunk_id, offset, length, client_write_seq, file_id, chunk_idx } => {
                 self.ops_tracker.inc_read();
-                self.handle_read_chunk_range(chunk_id, offset, length, client_write_seq).await
+                self.handle_read_chunk_range(chunk_id, offset, length, client_write_seq, file_id.zip(chunk_idx)).await
             }
             Request::WriteChunk {
                 chunk_id,
@@ -4772,23 +4910,73 @@ impl Server {
     /// fold genuinely failed) and handle_push_chunk_to (healing must never
     /// replicate a delta chunk's raw bytes to a new node as if they were
     /// standalone content).
+    /// Overlay `delta_bytes`' records onto `buf` in place. Split out of
+    /// compose_one_patch so the resident-in-RAM fast path and the read-from-disk
+    /// path can't drift apart in how they apply a delta.
+    fn apply_delta_records_inner(buf: &mut Vec<u8>, delta_bytes: &[u8], delta_chunk_id: ChunkId) -> Result<()> {
+        let patches: Vec<(usize, Vec<u8>)> = parse_delta_records(delta_bytes)
+            .with_context(|| format!("patch compose: corrupt delta chunk {}", delta_chunk_id))?;
+        for (offset, data) in patches {
+            let end = offset + data.len();
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[offset..end].copy_from_slice(&data);
+        }
+        Ok(())
+    }
+
+    /// Compose a Pending slot's logical content from its base plus its merged delta.
+    ///
+    /// Both halves are looked up in memory first and only fall back to disk on a
+    /// miss. This is not incidental: `apply_patch` deliberately prefetches
+    /// `base_chunk_id` into chunk_ring the instant an accumulator starts (giving the
+    /// whole active-patching window as lead time), and the merge path keeps the
+    /// current delta in delta_ring — so on the read path, which is now the hot
+    /// consumer of this function (see resolve_chunk_content's Pending arm), the
+    /// bytes we need are usually already resident. `storage.read_chunk_arc` consults
+    /// the storage LRU but knows nothing about either ring, so calling it blindly
+    /// threw away two caches that were populated specifically for this work and went
+    /// to disk for content sitting in RAM.
+    ///
+    /// Ring lookups happen out here rather than inside spawn_blocking so a hit costs
+    /// no thread hop at all; spawn_blocking is entered only when something actually
+    /// has to be read from disk.
     async fn compose_one_patch(&self, base_chunk_id: ChunkId, delta_chunk_id: ChunkId) -> Result<Arc<Vec<u8>>> {
+        let base_ring = self.chunk_ring.shard(&base_chunk_id).lock().unwrap().get(&base_chunk_id).cloned();
+        if base_ring.is_some() {
+            self.chunk_ring_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.chunk_ring_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let delta_ring = self.delta_ring.shard(&delta_chunk_id).lock().unwrap().get(&delta_chunk_id).cloned();
+        if delta_ring.is_some() {
+            self.delta_ring_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.delta_ring_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Both resident — compose without touching disk or a blocking thread.
+        if let (Some(base_bytes), Some(delta_bytes)) = (&base_ring, &delta_ring) {
+            let mut buf = (**base_bytes).clone();
+            Self::apply_delta_records_inner(&mut buf, delta_bytes, delta_chunk_id)?;
+            return Ok(Arc::new(buf));
+        }
+
         let storage = self.storage.clone();
         let composed = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let mut buf = (*storage.read_chunk_arc(&base_chunk_id)
-                .with_context(|| format!("patch compose: failed to read base chunk {}", base_chunk_id))?)
-                .clone();
-            let delta_bytes = storage.read_chunk_arc(&delta_chunk_id)
-                .with_context(|| format!("patch compose: failed to read delta chunk {}", delta_chunk_id))?;
-            let patches: Vec<(usize, Vec<u8>)> = parse_delta_records(&delta_bytes)
-                .with_context(|| format!("patch compose: corrupt delta chunk {}", delta_chunk_id))?;
-            for (offset, data) in patches {
-                let end = offset + data.len();
-                if end > buf.len() {
-                    buf.resize(end, 0);
-                }
-                buf[offset..end].copy_from_slice(&data);
-            }
+            let mut buf = match base_ring {
+                Some(b) => (*b).clone(),
+                None => (*storage.read_chunk_arc(&base_chunk_id)
+                    .with_context(|| format!("patch compose: failed to read base chunk {}", base_chunk_id))?)
+                    .clone(),
+            };
+            let delta_bytes = match delta_ring {
+                Some(d) => d,
+                None => storage.read_chunk_arc(&delta_chunk_id)
+                    .with_context(|| format!("patch compose: failed to read delta chunk {}", delta_chunk_id))?,
+            };
+            Self::apply_delta_records_inner(&mut buf, &delta_bytes, delta_chunk_id)?;
             Ok(buf)
         }).await.context("spawn_blocking panicked in compose_one_patch")??;
         Ok(Arc::new(composed))
@@ -4803,9 +4991,14 @@ impl Server {
     /// slot moved on to a new one) — the overwhelming common case, costing nothing
     /// beyond today's plain read. Presence means `chunk_id` is either a currently
     /// outstanding public token (see PATCH_STATE_TABLE) or a base chunk whose fold
-    /// is actively in flight; either way, wait for that slot's chunk_patch_locks
-    /// (a no-op if nothing is running) before resolving, so a read can never
-    /// observe a half-renamed file.
+    /// is actively in flight; either way the content is resolved from patch_state
+    /// (composing base+delta when Pending) rather than from a raw file read, so a
+    /// read can never observe a half-renamed file.
+    ///
+    /// This path takes NO slot lock. It used to acquire chunk_patch_locks
+    /// transitively, by forcing a fold on read — which starved readers behind any
+    /// active writer (see the Pending arm's comment for the measurement and the
+    /// removal).
     ///
     /// MUST NOT be used for chunk *replication* (ReplicateChunk / healing transfers) —
     /// those need `chunk_id`'s own honest, standalone bytes exactly as stored, never
@@ -4849,6 +5042,73 @@ impl Server {
         }
     }
 
+    /// Resolve `chunk_id` through retired_chunk_aliases: if some rewrite superseded
+    /// it, read whatever id now holds that content. Returns None when there is no
+    /// forwarding pointer (a genuinely unknown chunk) so callers keep their original
+    /// NotFound, which the client's stale-metadata retry already handles.
+    ///
+    /// The successor is read via resolve_chunk_content, not a raw read, so a
+    /// forwarded target that is itself an overlay token still composes correctly.
+    /// Recursion is bounded by ShardedAliasMap::resolve's hop cap plus the fact that
+    /// the successor is a different id each time (content-addressed).
+    async fn resolve_forwarded(&self, chunk_id: ChunkId) -> Option<Arc<Vec<u8>>> {
+        let target = self.retired_chunk_aliases.resolve(chunk_id)?;
+        debug!("resolve_forwarded: {} was retired, following alias to {}", chunk_id, target);
+        match Box::pin(self.resolve_chunk_content(target)).await {
+            Ok(arc) => {
+                self.storage.cache_put(chunk_id, arc.clone());
+                Some(arc)
+            }
+            Err(e) => {
+                debug!("resolve_forwarded: alias target {} for {} unreadable: {}", target, chunk_id, e);
+                None
+            }
+        }
+    }
+
+    /// Authoritative backstop for a read whose `chunk_id` can't be found: resolve
+    /// the content that currently occupies the logical (file_id, chunk_idx) slot.
+    ///
+    /// Unlike retired_chunk_aliases (a best-effort, memory-only shortcut that any
+    /// retirement path could forget to populate and an LRU can evict), this reads
+    /// the node's own chunk_map — which is durable, rebuilt from metadata at
+    /// startup, and kept current on every node via handle_replicate_chunk_location.
+    /// It is therefore the real answer to "what content belongs at this position",
+    /// independent of *which* path retired the requested id. That's why the client
+    /// now sends (file_id, chunk_idx) alongside chunk_id (see protocol.rs): the
+    /// alias is the fast path, this is the catch-all beneath it.
+    ///
+    /// Returns None when this node has no chunk_map entry for the slot (e.g. it
+    /// hasn't received the file's metadata yet) — the caller keeps its original
+    /// error, which the client's stale-metadata retry against another replica
+    /// already handles.
+    ///
+    /// A hit is logged at info with a counter: serving the current occupant of a
+    /// slot the client asked for by a stale id is correct, but a HIGH rate of it
+    /// means something upstream is handing clients stale chunk maps, and that
+    /// should be visible rather than silently absorbed.
+    async fn resolve_by_slot(&self, file_id: FileId, chunk_idx: u64) -> Option<Arc<Vec<u8>>> {
+        let current_id = {
+            let entry = self.chunk_map.get(&file_id)?;
+            let (locs, _) = entry.value();
+            let i = Self::chunk_map_find_by_idx(locs, chunk_idx)?;
+            locs[i].chunk_id
+        };
+        match self.resolve_chunk_content(current_id).await {
+            Ok(arc) => {
+                let n = self.slot_backstop_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                info!("resolve_by_slot: served current chunk {} for retired id at (file={}, chunk_idx={}) — slot backstop hit #{}",
+                    current_id, file_id, chunk_idx, n);
+                Some(arc)
+            }
+            Err(e) => {
+                debug!("resolve_by_slot: current chunk {} for (file={}, chunk_idx={}) unreadable: {}",
+                    current_id, file_id, chunk_idx, e);
+                None
+            }
+        }
+    }
+
     async fn resolve_chunk_content(&self, chunk_id: ChunkId) -> Result<Arc<Vec<u8>>> {
         let Some(slot) = self.pending_patch_ids.get(&chunk_id).map(|e| *e) else {
             let storage = self.storage.clone();
@@ -4863,7 +5123,14 @@ impl Server {
                 // resolve_via_durable_patch_state for the incident this closes.
                 Err(raw_err) => match self.resolve_via_durable_patch_state(chunk_id).await {
                     Ok(Some(arc)) => Ok(arc),
-                    _ => Err(raw_err),
+                    // Last resort before failing: this may be a chunk that
+                    // full_rewrite_chunk retired while the caller's chunk map was in
+                    // flight. Follow the forwarding pointer rather than returning
+                    // NotFound and forcing the client to block or refetch.
+                    _ => match self.resolve_forwarded(chunk_id).await {
+                        Some(arc) => Ok(arc),
+                        None => Err(raw_err),
+                    },
                 },
             };
         };
@@ -4882,51 +5149,73 @@ impl Server {
                 Ok(arc)
             }
             Some(PatchState::Pending { base_chunk_id, delta_chunk_id, .. }) => {
-                // A read forces the fold to happen right now instead of composing
-                // on the fly — bounds how large a hot chunk's accumulator can grow
-                // (see dirty_patch_slots's doc comment) and makes every subsequent
-                // read of this chunk a cheap direct read instead of repeatedly
-                // paying a live base+delta compose. The client caches aggressively,
-                // so making this one read wait for the fold is the right trade.
-                let (file_id, chunk_idx) = slot;
-                if self.overlay_ctx().fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Async).await {
-                    if let Some(PatchState::Folded(real_chunk_id)) = self.metadata
-                        .get_patch_state_async(chunk_id).await
-                        .context("resolve_chunk_content: get_patch_state failed after fold")?
-                    {
-                        let storage = self.storage.clone();
-                        let arc = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&real_chunk_id))
-                            .await
-                            .context("spawn_blocking panicked in resolve_chunk_content")??;
-                        self.storage.cache_put(chunk_id, arc.clone());
-                        return Ok(arc);
-                    }
-                }
-                // Fold failed, or the slot raced onto a newer token mid-fold —
-                // fall back to a live compose of whatever's current rather than
-                // failing the read outright.
-                match self.metadata.get_patch_state_async(chunk_id).await
-                    .context("resolve_chunk_content: get_patch_state failed (post-fold fallback)")?
-                {
-                    Some(PatchState::Pending { base_chunk_id, delta_chunk_id, .. }) =>
-                        self.compose_one_patch(base_chunk_id, delta_chunk_id).await,
-                    _ => self.compose_one_patch(base_chunk_id, delta_chunk_id).await,
-                }
+                // Compose live; do NOT fold here.
+                //
+                // This used to force a synchronous fold on every read of a pending
+                // slot, justified as "the client caches aggressively, so making this
+                // one read wait for the fold is the right trade." That premise only
+                // holds when reads and writes don't overlap. Under a concurrent
+                // read/write workload the writer re-dirties the slot immediately, so
+                // the "every subsequent read is cheap" payoff never arrives and every
+                // read instead pays a full 4MB read+write+fsync — while queued behind
+                // chunk_patch_locks, which fold_slot_now takes and which apply_patch
+                // re-takes on every single patch. Reads end up starved by a writer
+                // that never yields the slot.
+                //
+                // Measured (scripts/repro_mixed_rw_collapse.sh, 2026-07-23, the
+                // script built for exactly this): reader alone 2779.8 iops, reader
+                // with one concurrent writer 1.0 iops — a 2779x collapse, with 18.5%
+                // of reads failing outright (read timeouts, plus "failed to open
+                // chunk file" when the fold retired the old chunk_id mid-read) while
+                // the writer sailed through completely unaffected. This is the
+                // server-side half of the kdiskmark R70%/W30% result that showed the
+                // mixed column *below* both pure columns (RND4K 1900 read / 3019
+                // write / 67 mixed iops).
+                //
+                // compose_one_patch is bounded work: one base read (which apply_patch
+                // has already prefetched into chunk_ring for exactly this slot) plus
+                // one merged delta applied in memory. No lock, no write, no fsync.
+                //
+                // Nothing here was the only thing folding this slot. The fold still
+                // happens on its own schedule via the debounce_fold_slot task
+                // apply_patch spawns per accumulator, the client's own ~8s ForceFold
+                // timer, and start_patch_fold_sweep_loop's backstop — all of which
+                // already bound accumulator growth, which was this call site's other
+                // stated reason for existing. Removing fold work from the read path
+                // adds no per-patch rewrites, so it does not reintroduce the
+                // full-rewrite throughput collapse that deferred coalescing exists
+                // to avoid.
+                //
+                // Deliberately not caching the composed bytes under chunk_id the way
+                // the Folded arms above do: a merge can grow this accumulator's delta
+                // while the token is still outstanding, so a cached compose could go
+                // stale in a way a post-fold cache entry cannot. The lock and the
+                // fsync were the cost that mattered; recomposing is cheap.
+                let _ = slot;
+                self.compose_one_patch(base_chunk_id, delta_chunk_id).await
             }
             None => {
                 // Retired since the pending_patch_ids check above (this slot's
-                // next patch already superseded it) — a plain direct read now
-                // correctly either finds the still-current content or fails
-                // NotFound, prompting the caller's existing stale-metadata retry.
+                // next patch already superseded it) — try a plain direct read, and
+                // if the id is genuinely gone, follow the forwarding pointer left by
+                // whoever retired it before falling back to the caller's
+                // stale-metadata retry.
                 let storage = self.storage.clone();
-                tokio::task::spawn_blocking(move || storage.read_chunk_arc(&chunk_id))
+                let direct = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&chunk_id))
                     .await
-                    .context("spawn_blocking panicked in resolve_chunk_content")?
+                    .context("spawn_blocking panicked in resolve_chunk_content")?;
+                match direct {
+                    Ok(arc) => Ok(arc),
+                    Err(e) => match self.resolve_forwarded(chunk_id).await {
+                        Some(arc) => Ok(arc),
+                        None => Err(e),
+                    },
+                }
             }
         }
     }
 
-    async fn handle_read_chunk(&self, chunk_id: ChunkId, client_write_seq: Option<u64>) -> Response {
+    async fn handle_read_chunk(&self, chunk_id: ChunkId, client_write_seq: Option<u64>, slot: Option<(FileId, u64)>) -> Response {
         debug!("Handling read chunk: {}", chunk_id);
 
         // Client-driven staleness detection: if client has newer metadata than us,
@@ -4976,6 +5265,17 @@ impl Server {
         // extra cheap redb read transaction before falling through to the exact same
         // storage.read_chunk_arc call this used to make directly.
         let read_result = self.resolve_chunk_content(chunk_id).await;
+        let read_result = match read_result {
+            Ok(arc) => Ok(arc),
+            // chunk_id couldn't be resolved (retired while the client's chunk map
+            // was stale). If the client told us which slot it's reading, serve the
+            // slot's current occupant rather than EIO-ing the guest — see
+            // resolve_by_slot.
+            Err(e) => match slot {
+                Some((file_id, chunk_idx)) => self.resolve_by_slot(file_id, chunk_idx).await.ok_or(e),
+                None => Err(e),
+            },
+        };
         match read_result {
             Ok(arc) => {
                 let (capacity, size) = self.storage.get_cache_stats();
@@ -4992,7 +5292,7 @@ impl Server {
     }
 
     /// Handle read chunk range request (for striped multi-replica reads)
-    async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64, client_write_seq: Option<u64>) -> Response {
+    async fn handle_read_chunk_range(&self, chunk_id: ChunkId, offset: u64, length: u64, client_write_seq: Option<u64>, slot: Option<(FileId, u64)>) -> Response {
         debug!("Handling read chunk range: {} offset={} length={}", chunk_id, offset, length);
 
         // Client-driven staleness detection (same as handle_read_chunk — see the
@@ -5049,15 +5349,49 @@ impl Server {
                 // resume sweep re-tracked it). Resolve the full content from durable
                 // patch_state and slice out the requested range rather than EIO-ing
                 // the guest. See resolve_via_durable_patch_state.
-                Err(raw_err) => match self.resolve_via_durable_patch_state(chunk_id).await {
-                    Ok(Some(arc)) => {
+                Err(raw_err) => {
+                    // Try durable patch_state first (the restart case above), then the
+                    // retired-chunk alias. Both are needed here, not just in
+                    // resolve_chunk_content: this fast partial-read branch is taken
+                    // whenever chunk_id isn't a *currently* outstanding patch token,
+                    // which is exactly the case for an id that a rewrite just retired.
+                    // Without this, removing the client's flushing-wait surfaced 125
+                    // "Failed to fetch range ... after metadata refresh" EIOs in a
+                    // single 20s run — reads that the wait had previously been hiding.
+                    let slice = |arc: Arc<Vec<u8>>| {
+                        let start = (offset as usize).min(arc.len());
+                        let end = (start + length as usize).min(arc.len());
+                        arc[start..end].to_vec()
+                    };
+                    match self.resolve_via_durable_patch_state(chunk_id).await {
+                        Ok(Some(arc)) => Ok(slice(arc)),
+                        _ => match self.resolve_forwarded(chunk_id).await {
+                            Some(arc) => Ok(slice(arc)),
+                            None => Err(raw_err),
+                        },
+                    }
+                }
+            }
+        };
+        // Authoritative backstop, covering BOTH branches above: if chunk_id still
+        // couldn't be resolved and the client told us the slot, serve whatever
+        // chunk_id currently occupies (file_id, chunk_idx). This is what closed the
+        // residual EIO class the alias alone couldn't — the alias depends on this
+        // node having populated it, the slot lookup only depends on this node's
+        // chunk_map, which every node keeps current. See resolve_by_slot.
+        let range_result: Result<Vec<u8>> = match range_result {
+            Ok(d) => Ok(d),
+            Err(e) => match slot {
+                Some((file_id, chunk_idx)) => match self.resolve_by_slot(file_id, chunk_idx).await {
+                    Some(arc) => {
                         let start = (offset as usize).min(arc.len());
                         let end = (start + length as usize).min(arc.len());
                         Ok(arc[start..end].to_vec())
                     }
-                    _ => Err(raw_err),
+                    None => Err(e),
                 },
-            }
+                None => Err(e),
+            },
         };
         match range_result {
             Ok(data) => {
@@ -7334,6 +7668,8 @@ impl Server {
                     chunk_id: *chunk_id,
                     sequential_hint: None,
                     client_write_seq: None,
+                    file_id: None,
+                    chunk_idx: None,
                 };
 
                 let result = tokio::time::timeout(
@@ -9832,6 +10168,7 @@ impl Server {
             delta_ring: self.delta_ring.clone(),
             delta_ring_hits: self.delta_ring_hits.clone(),
             delta_ring_misses: self.delta_ring_misses.clone(),
+            retired_chunk_aliases: self.retired_chunk_aliases.clone(),
             active_fold_count: self.active_fold_count.clone(),
             cluster: self.cluster.clone(),
             client: self.client.clone(),
@@ -9932,7 +10269,7 @@ impl Server {
             if node.status != dfs_common::NodeStatus::Online {
                 continue;
             }
-            let req = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: None };
+            let req = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: None, file_id: None, chunk_idx: None };
             let resp = match self.client.send_message(node.addr, Message::Request(req)).await {
                 Ok(envelope) => envelope.message,
                 Err(e) => {
@@ -10020,6 +10357,7 @@ impl Server {
             );
             let (new_chunk_id, size, buf) = full_rewrite_chunk(
                 self.storage.clone(), self.metadata.clone(), self.chunk_io_locks.clone(),
+                self.retired_chunk_aliases.clone(),
                 file_id, chunk_file_offset, chunk_id, patches, prefetched,
                 self.cluster.local_node_id(),
             ).await?;
@@ -15219,6 +15557,7 @@ mod tests {
             ref_storage.write_chunk(&original_chunk_id, &original_data).unwrap();
             let (reference_chunk_id, _size, _buf) = full_rewrite_chunk(
                 ref_storage.clone(), ref_metadata.clone(), chunk_io_locks.clone(),
+                Arc::new(ShardedAliasMap::new(1024)),
                 file_id, chunk_file_offset, original_chunk_id, vec![patch.clone()], None,
                 NodeId::new(),
             ).await.unwrap();

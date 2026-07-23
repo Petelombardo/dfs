@@ -2948,6 +2948,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let fallbacks = rf.fallbacks.clone();
                     let ws = write_seq; // Capture for async block
                     let inode = inode; // Capture for async block
+                    let file_id = file_id; // Capture for the (file_id, chunk_idx) slot backstop
                     tokio::spawn(async move {
                         // Try primary then fallbacks.
                         let mut last_err = None;
@@ -2961,6 +2962,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             let _permit = permit_sem.acquire_owned().await;
                             match client.read_chunk_range_from_server(
                                 addr, cid, offset_in_chunk as u64, len_in_chunk as u64, ws,
+                                Some((file_id, idx as u64)),
                             ).await {
                                 Ok(data) => {
                                     // Per-range-read trace — fires on every single successful
@@ -3076,6 +3078,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         for &addr in std::iter::once(&fp).chain(ffb.iter()) {
                             if let Ok(data) = self.read_chunk_range_from_server(
                                 addr, fresh_cid, offset_in_chunk as u64, len_in_chunk as u64, None,
+                                Some((file_id, idx as u64)),
                             ).await {
                                 retry_data = Some(data);
                                 break;
@@ -3101,6 +3104,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     for &addr in std::iter::once(&fp2).chain(ffb2.iter()) {
                                         if let Ok(data) = self.read_chunk_range_from_server(
                                             addr, fresh_loc.chunk_id, offset_in_chunk as u64, len_in_chunk as u64, None,
+                                            Some((file_id, idx as u64)),
                                         ).await {
                                             retry_data = Some(data);
                                             break;
@@ -3109,8 +3113,63 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 }
                             }
                         }
-                        let data = retry_data.ok_or_else(|| anyhow::anyhow!(
-                            "Failed to fetch range for chunk {} after metadata refresh", fresh_cid
+                        // The single refresh+retry above is a one-shot: it raced a
+                        // metadata-convergence window where every replica — and the
+                        // leader we just refreshed from — was momentarily behind the
+                        // write that retired this chunk_id. That's transient (replication
+                        // converges in a few ms), so back off briefly and try again a few
+                        // rounds, re-refreshing each time so a later round picks up the
+                        // now-committed state, rather than surfacing an EIO. An EIO on a
+                        // VM disk read flips the guest read-only, so a rare few hundred ms
+                        // of latency is vastly the better trade. Bounded, so a genuinely
+                        // lost chunk still fails instead of hanging the read forever.
+                        //
+                        // This is the last 0.02% the (file_id, chunk_idx) slot backstop
+                        // couldn't reach: the backstop needs *some* node to already know
+                        // the slot's new occupant; this loop waits for that to become true.
+                        let mut data = retry_data;
+                        if data.is_none() {
+                            const RANGE_RETRY_ROUNDS: usize = 5;
+                            const RANGE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+                            for round in 0..RANGE_RETRY_ROUNDS {
+                                tokio::time::sleep(RANGE_RETRY_BACKOFF).await;
+                                engine.refresh_in_progress.store(false, Ordering::Release);
+                                self.refresh_engine(&engine, file_id, file_size, 0).await;
+                                let rsnap = engine.snapshot();
+                                let rmap = rsnap.0;
+                                let rnim = rsnap.2;
+                                let rnodes = self.cluster_nodes.read().await.clone();
+                                let rcid = self.recent_chunk_writes
+                                    .get(&(inode, idx as u64))
+                                    .map(|e| e.0)
+                                    .or_else(|| rmap.get(idx).map(|l| l.chunk_id));
+                                let Some(rcid) = rcid else { continue };
+                                let (rfp, rffb) = match rmap.get(idx).and_then(|loc| InodeReadEngine::resolve_primary(
+                                    loc, &rnim, &rnodes, selector + idx as u64,
+                                )) {
+                                    Some(pf) => pf,
+                                    None => {
+                                        let p = rnodes[selector as usize % rnodes.len()];
+                                        (p, rnodes.iter().filter(|&&a| a != p).copied().collect())
+                                    }
+                                };
+                                for &addr in std::iter::once(&rfp).chain(rffb.iter()) {
+                                    if let Ok(d) = self.read_chunk_range_from_server(
+                                        addr, rcid, offset_in_chunk as u64, len_in_chunk as u64, None,
+                                        Some((file_id, idx as u64)),
+                                    ).await {
+                                        data = Some(d);
+                                        break;
+                                    }
+                                }
+                                if data.is_some() {
+                                    info!("Range fetch for (inode={}, idx={}) recovered after {} backoff round(s)", inode, idx, round + 1);
+                                    break;
+                                }
+                            }
+                        }
+                        let data = data.ok_or_else(|| anyhow::anyhow!(
+                            "Failed to fetch range for chunk {} after metadata refresh + backoff retries", fresh_cid
                         ))?;
                         let arc = Arc::new(data);
                         {
@@ -4448,7 +4507,12 @@ leader_addr: Arc::new(RwLock::new(None)),
                             let hint = read_hint.as_ref().unwrap();
                             info!("PARTIAL READ: chunk {} offset={} length={}", r.chunk_id, hint.offset_in_chunk, hint.length);
                             client.read_chunk_range_from_server(node_addr, r.chunk_id,
-                                hint.offset_in_chunk as u64, hint.length as u64, None).await
+                                hint.offset_in_chunk as u64, hint.length as u64, None,
+                                // read_data (sequential/full-chunk path) does not thread
+                                // file_id; this partial-read branch is not the one that errors
+                                // under mixed load. TODO: carry file_id via
+                                // ResolvedFetch to give this the slot backstop too.
+                                None).await
                         } else {
                             client.read_chunk_from_server(node_addr, r.chunk_id, None).await
                         };
@@ -5058,6 +5122,11 @@ leader_addr: Arc::new(RwLock::new(None)),
             chunk_id,
             sequential_hint: None, // TODO: Pass sequential hint when available
             client_write_seq: ws,
+            // Full-chunk reads don't currently carry the slot backstop; the mixed
+            // read/write collapse manifests on the range path. TODO: thread file_id
+            // here too if the full-chunk path shows the same stale-id EIOs.
+            file_id: None,
+            chunk_idx: None,
         };
 
         // Try using pooled connection first, with fallback to new connection
@@ -5235,7 +5304,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Look up write_seq from cache if not explicitly provided
         let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| e.0));
 
-        let request = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: ws };
+        let request = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: ws, file_id: None, chunk_idx: None };
         let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
         let envelope = MessageEnvelope::new(request_id, Message::Request(request));
         let encoded = envelope.to_bytes().context("serialize")?;
@@ -5432,11 +5501,19 @@ leader_addr: Arc::new(RwLock::new(None)),
         offset: u64,
         length: u64,
         client_write_seq: Option<u64>,
+        // The logical (file_id, chunk_idx) this read is for, when the caller knows
+        // it. Lets the server fall back to the current occupant of that slot if
+        // chunk_id has been retired — see ReadChunkRange's doc in protocol.rs.
+        slot: Option<(FileId, u64)>,
     ) -> Result<Vec<u8>> {
         // Look up write_seq from cache if not explicitly provided
         let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| e.0));
 
-        let request = Request::ReadChunkRange { chunk_id, offset, length, client_write_seq: ws };
+        let (file_id, chunk_idx) = match slot {
+            Some((f, c)) => (Some(f), Some(c)),
+            None => (None, None),
+        };
+        let request = Request::ReadChunkRange { chunk_id, offset, length, client_write_seq: ws, file_id, chunk_idx };
         let response = tokio::time::timeout(
             tokio::time::Duration::from_secs(1),
             self.send_request(server_addr, request),
@@ -5525,11 +5602,11 @@ leader_addr: Arc::new(RwLock::new(None)),
         let client2 = self.clone();
 
         let task1 = tokio::spawn(async move {
-            client1.read_chunk_range_from_server(node1, chunk_id, 0, first_half_size as u64, None).await
+            client1.read_chunk_range_from_server(node1, chunk_id, 0, first_half_size as u64, None, None).await
         });
 
         let task2 = tokio::spawn(async move {
-            client2.read_chunk_range_from_server(node2, chunk_id, mid_point as u64, second_half_size as u64, None).await
+            client2.read_chunk_range_from_server(node2, chunk_id, mid_point as u64, second_half_size as u64, None, None).await
         });
 
         let (result1, result2) = tokio::join!(task1, task2);

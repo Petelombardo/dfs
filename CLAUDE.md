@@ -19,12 +19,18 @@ Always redirect the output of a build into a log file so that you can grep for e
 
 ## Local test suite
 
+**Always `cargo build --release` FIRST, as a separate step, and only then run the suite.**
+Otherwise the build lands inside the timed region and the elapsed time is a mix of compile
+time and test time — which makes the run-over-run comparison below meaningless, since build
+time swings wildly depending on how much was already cached. Build separately, confirm it
+succeeded, then time the suite alone.
+
 Run with: `{ time ./scripts/test_local_suite.sh; } > /root/dfs-suite-runN.log 2>&1` — the `{ }`
 group is required: `time cmd > log 2>&1` only redirects `cmd`'s own output, `time`'s own
 real/user/sys report still goes to the shell's stderr and is lost unless the whole group is
 redirected. Track the elapsed real time run-over-run — a growing runtime with the same pass
 count is itself a regression signal (e.g. a heal/compaction path getting slower), even when
-every test still passes.
+every test still passes. Only compare against runs that were also timed build-free.
 
 The suite runs 5-node local cluster on ports 8900–8904, mounts at /tmp/dfs-mount, and exercises
 T1–T22. Logs go to /tmp/dfs-test-logs/. The client runs at **debug** log level so all events are

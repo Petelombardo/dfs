@@ -5827,10 +5827,17 @@ impl Filesystem for DfsFilesystem {
                 let buf = write_buffers.get(&ino).map(|r| r.clone());
                 let shard = buf.as_ref().and_then(|b| b.chunk_get(chunk_idx));
                 if let Some(shard) = shard {
+                    // RDSTALL DIAGNOSTIC (2026-07-23) — see the flushing-wait probe below.
+                    let shard_wait_start = std::time::Instant::now();
                     let lock_result = tokio::time::timeout(
                         READ_LOCK_TIMEOUT,
                         shard.lock(),
                     ).await;
+                    let shard_waited = shard_wait_start.elapsed();
+                    if shard_waited.as_millis() >= 20 {
+                        debug!("RDSTALL shard-lock ino={} chunk={} waited_ms={}",
+                            ino, chunk_idx, shard_waited.as_millis());
+                    }
                     if lock_result.is_err() {
                         // Flush is stuck (likely slow node) — fall through to network
                         let result = client.read_file(
@@ -5930,27 +5937,31 @@ impl Filesystem for DfsFilesystem {
                             reply.data(&[]);
                             return;
                         }
-                        // If this slot is currently being flushed (mid-PatchChunk), the
-                        // old chunk ID is being deleted on the server right now. Falling
-                        // through to the network would fetch a chunk that no longer exists.
-                        // Drop the lock and wait briefly for the flush to complete, then
-                        // the slot will be gone and we can safely fetch the new chunk ID.
-                        if slot.flushing {
-                            drop(cs);
-                            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-                            loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                                let still_flushing = write_buffers.get(&ino)
-                                    .and_then(|a| a.chunk_get(chunk_idx))
-                                    .map(|s| s.try_lock().map(|cs| cs.slot.flushing).unwrap_or(true))
-                                    .unwrap_or(false);
-                                if !still_flushing || tokio::time::Instant::now() >= deadline {
-                                    break;
-                                }
-                            }
-                            // Fall through to network — flush is done, chunk ID is current.
-                        }
-                        // Fall through to network — server has data here.
+                        // NOTE: there used to be a `if slot.flushing { ... }` block here
+                        // that polled every 5ms for up to 5 SECONDS waiting for an
+                        // in-flight flush to finish before falling through to the
+                        // network. Its stated reason: "the old chunk ID is being deleted
+                        // on the server right now. Falling through to the network would
+                        // fetch a chunk that no longer exists."
+                        //
+                        // It was never protecting the correctness of the bytes — only
+                        // dodging a NotFound. The server now leaves a forwarding pointer
+                        // whenever it retires a chunk (see ShardedAliasMap in
+                        // dfs-server/src/server.rs), so a read arriving with a
+                        // just-superseded chunk_id resolves through to the current
+                        // content instead of failing. With the error gone, so is the
+                        // reason to wait for it.
+                        //
+                        // This wait was THE bottleneck, not a contributor: RDSTALL
+                        // instrumentation attributed 18.56s of stall to it across 25
+                        // occurrences in a single 20s mixed read/write window, versus
+                        // 2.13s for the entire network leg. Because a flush is a
+                        // MultiPatch to two replicas at ~438ms apply_patch each plus a
+                        // fold, a read that touched a flushing slot blocked for the full
+                        // duration of somebody else's write.
+                        drop(cs);
+                        // Fall through to network — server has data here, and resolves
+                        // any stale chunk_id via the alias.
                     } else {
                         drop(cs);
                         // No slot for THIS chunk_idx — check if we're at the live write edge.
@@ -6050,9 +6061,18 @@ impl Filesystem for DfsFilesystem {
                     .unwrap_or(false)
             };
             debug!("FUSE read: ino={}, offset={}, size={}, file_size={}", ino, offset, size, effective_size);
+            // RDSTALL DIAGNOSTIC (2026-07-23): time in the network/read-engine leg
+            // specifically, so a slow read can be attributed to it rather than to
+            // the write-buffer branches probed above.
+            let net_start = std::time::Instant::now();
             let result = client.read_file(
                 ino, effective_size, file_id, &file_path, offset, size, has_active_writer, write_seq,
             ).await;
+            let net_ms = net_start.elapsed().as_millis();
+            if net_ms >= 20 {
+                debug!("RDSTALL read_file ino={} offset={} waited_ms={} has_active_writer={}",
+                    ino, offset, net_ms, has_active_writer);
+            }
 
             let elapsed = start.elapsed();
             match result {

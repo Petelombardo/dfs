@@ -1326,6 +1326,8 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
             chunk_id: *chunk_id,
             sequential_hint: Some((i as u64, old_chunk_count as u64)),
             client_write_seq: None,
+            file_id: None,
+            chunk_idx: None,
         }).await? {
             Response::ChunkData { data, .. } => data,
             Response::Error { message, .. } => {
@@ -1337,6 +1339,8 @@ async fn handle_repack(path: String, yes: bool, cluster_addrs: &[SocketAddr]) ->
                         chunk_id: *chunk_id,
                         sequential_hint: None,
                         client_write_seq: None,
+                        file_id: None,
+                        chunk_idx: None,
                     }).await {
                         data_opt = Some(data);
                         break;

@@ -112,6 +112,11 @@ pub enum Request {
         /// fresh metadata from the leader before serving the read.
         #[serde(default)]
         client_write_seq: Option<u64>,
+        /// (file, chunk index) slot backstop — see ReadChunkRange's file_id/chunk_idx.
+        #[serde(default)]
+        file_id: Option<FileId>,
+        #[serde(default)]
+        chunk_idx: Option<u64>,
     },
 
     /// Read a byte range from a chunk (for striped multi-replica reads)
@@ -122,6 +127,18 @@ pub enum Request {
         /// Client's cached metadata write_seq for staleness detection
         #[serde(default)]
         client_write_seq: Option<u64>,
+        /// The logical (file, chunk index) slot this read is for. When `chunk_id`
+        /// can't be resolved — e.g. a rewrite retired it while the client's chunk
+        /// map was stale — the server falls back to whatever chunk_id currently
+        /// occupies this slot, which is the authoritative answer to "what content
+        /// belongs at this position" and never depends on a best-effort alias
+        /// having been populated. Optional because internal/striped read paths
+        /// don't always have file context; the backstop only fires when both are
+        /// present.
+        #[serde(default)]
+        file_id: Option<FileId>,
+        #[serde(default)]
+        chunk_idx: Option<u64>,
     },
 
     /// Write a chunk

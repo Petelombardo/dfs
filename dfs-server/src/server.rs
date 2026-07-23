@@ -1146,6 +1146,13 @@ impl ShardedChunkRing {
     }
 }
 
+/// Hard ceiling on resolve_chunk_content <-> resolve_forwarded mutual recursion.
+/// Independent of ShardedAliasMap::resolve's own hop cap on purpose: that cap
+/// bounds one chain walk, this bounds how many times a read may re-enter the
+/// resolver. A read must never be able to abort the process — see the 2026-07-23
+/// stack-overflow incident documented on ShardedAliasMap::resolve.
+const MAX_RESOLVE_DEPTH: u8 = 4;
+
 /// Ephemeral forwarding pointers for chunks that full_rewrite_chunk has retired:
 /// `old_chunk_id -> the chunk_id that superseded it`.
 ///
@@ -1192,25 +1199,59 @@ impl ShardedAliasMap {
     /// Follow the forwarding chain from `chunk_id` to the newest id we know of.
     ///
     /// Chains happen under sustained writes to one chunk: A is retired for B, then
-    /// B for C, so a reader still holding A needs two hops. Hard-capped rather than
-    /// looped to exhaustion so a cycle (which should be impossible — ids are
-    /// content-addressed and a rewrite that produced identical content records no
-    /// alias at all) fails closed instead of hanging a read.
+    /// B for C, so a reader still holding A needs two hops.
+    ///
+    /// Returns `Some(id)` ONLY when the walk actually reached the end of the chain
+    /// (the next lookup came back empty). A chain longer than MAX_HOPS, or any
+    /// cycle, returns `None` — we do not know the newest id, so we must not hand
+    /// back a guess. Callers treat `None` as "no usable forwarding pointer" and keep
+    /// their original NotFound, which the client's stale-metadata retry handles.
+    ///
+    /// CYCLES ARE REAL — this is not a theoretical guard. The previous version
+    /// asserted a cycle "should be impossible — ids are content-addressed", and on
+    /// hitting the cap returned `Some(current)`. Both were wrong, and together they
+    /// aborted two storage nodes in production:
+    ///
+    ///   * chunk_id = hash(file_id, offset, data) (see compute_chunk_hash_at), so
+    ///     rewriting a block back to a value it previously held regenerates the
+    ///     SAME id. full_rewrite_chunk then records A->B and later B->A. A qcow2
+    ///     under a running VM does this constantly (L2/refcount blocks, journal
+    ///     blocks, allocation bitmaps flipping between states).
+    ///   * Walking that 2-cycle with only an `n != current` self-loop guard reaches
+    ///     the cap and returns `Some(A)` — the caller's own input. resolve_forwarded
+    ///     then re-entered resolve_chunk_content with the identical argument, which
+    ///     failed the same way and called resolve_forwarded again: unbounded mutual
+    ///     recursion, "thread 'tokio-rt-worker' has overflowed its stack", SIGABRT.
+    ///     gluster4 18:11:39 and gluster1 (the leader) 18:11:40 on 2026-07-23, one
+    ///     second apart because both replicas held the same cycle for the same chunk.
+    ///
+    /// Hence: track visited ids and fail closed. MAX_HOPS is small, so a linear scan
+    /// of `visited` is cheaper than allocating a set.
     fn resolve(&self, chunk_id: ChunkId) -> Option<ChunkId> {
         const MAX_HOPS: usize = 4;
+        let mut visited: Vec<ChunkId> = Vec::with_capacity(MAX_HOPS + 1);
+        visited.push(chunk_id);
         let mut current = chunk_id;
-        let mut hops = 0;
+        let mut hops = 0usize;
         loop {
             let next = self.shards[ring_shard_index(&current)].lock().unwrap().get(&current).copied();
             match next {
-                Some(n) if n != current => {
+                // Revisiting an id we've already walked through means a cycle
+                // (including the A->A self-loop the old `n != current` arm caught).
+                Some(n) if visited.contains(&n) => return None,
+                Some(n) => {
+                    // Still more chain than we're willing to follow: we have NOT
+                    // confirmed the end, so report no forwarding pointer rather
+                    // than an unverified id.
+                    if hops >= MAX_HOPS {
+                        return None;
+                    }
                     current = n;
                     hops += 1;
-                    if hops >= MAX_HOPS {
-                        return Some(current);
-                    }
+                    visited.push(n);
                 }
-                _ => return (hops > 0).then_some(current),
+                // Confirmed end of chain.
+                None => return (hops > 0).then_some(current),
             }
         }
     }
@@ -5049,12 +5090,24 @@ impl Server {
     ///
     /// The successor is read via resolve_chunk_content, not a raw read, so a
     /// forwarded target that is itself an overlay token still composes correctly.
-    /// Recursion is bounded by ShardedAliasMap::resolve's hop cap plus the fact that
-    /// the successor is a different id each time (content-addressed).
-    async fn resolve_forwarded(&self, chunk_id: ChunkId) -> Option<Arc<Vec<u8>>> {
+    ///
+    /// `depth` bounds that mutual recursion (resolve_chunk_content -> here ->
+    /// resolve_chunk_content -> ...). ShardedAliasMap::resolve is now cycle-safe and
+    /// fails closed, which removes the known trigger — but this guard is deliberately
+    /// independent of it. A read failing must never be able to abort the process, and
+    /// the 2026-07-23 double node crash happened precisely because the only thing
+    /// standing between an alias-graph shape and a stack overflow was an assumption
+    /// about that graph's shape (see ShardedAliasMap::resolve). Structural bound
+    /// here, correctness fix there; neither alone.
+    async fn resolve_forwarded(&self, chunk_id: ChunkId, depth: u8) -> Option<Arc<Vec<u8>>> {
+        if depth >= MAX_RESOLVE_DEPTH {
+            warn!("resolve_forwarded: depth limit {} reached resolving {} — refusing to recurse further",
+                MAX_RESOLVE_DEPTH, chunk_id);
+            return None;
+        }
         let target = self.retired_chunk_aliases.resolve(chunk_id)?;
         debug!("resolve_forwarded: {} was retired, following alias to {}", chunk_id, target);
-        match Box::pin(self.resolve_chunk_content(target)).await {
+        match Box::pin(self.resolve_chunk_content_at_depth(target, depth + 1)).await {
             Ok(arc) => {
                 self.storage.cache_put(chunk_id, arc.clone());
                 Some(arc)
@@ -5110,6 +5163,14 @@ impl Server {
     }
 
     async fn resolve_chunk_content(&self, chunk_id: ChunkId) -> Result<Arc<Vec<u8>>> {
+        self.resolve_chunk_content_at_depth(chunk_id, 0).await
+    }
+
+    /// Depth-carrying body of resolve_chunk_content — see resolve_forwarded's
+    /// `depth` doc for why the recursion between these two is explicitly bounded.
+    /// Entry points call resolve_chunk_content (depth 0); only resolve_forwarded
+    /// re-enters here, with depth + 1.
+    async fn resolve_chunk_content_at_depth(&self, chunk_id: ChunkId, depth: u8) -> Result<Arc<Vec<u8>>> {
         let Some(slot) = self.pending_patch_ids.get(&chunk_id).map(|e| *e) else {
             let storage = self.storage.clone();
             let raw = tokio::task::spawn_blocking(move || storage.read_chunk_arc(&chunk_id))
@@ -5127,7 +5188,7 @@ impl Server {
                     // full_rewrite_chunk retired while the caller's chunk map was in
                     // flight. Follow the forwarding pointer rather than returning
                     // NotFound and forcing the client to block or refetch.
-                    _ => match self.resolve_forwarded(chunk_id).await {
+                    _ => match self.resolve_forwarded(chunk_id, depth).await {
                         Some(arc) => Ok(arc),
                         None => Err(raw_err),
                     },
@@ -5206,7 +5267,7 @@ impl Server {
                     .context("spawn_blocking panicked in resolve_chunk_content")?;
                 match direct {
                     Ok(arc) => Ok(arc),
-                    Err(e) => match self.resolve_forwarded(chunk_id).await {
+                    Err(e) => match self.resolve_forwarded(chunk_id, depth).await {
                         Some(arc) => Ok(arc),
                         None => Err(e),
                     },
@@ -5365,7 +5426,8 @@ impl Server {
                     };
                     match self.resolve_via_durable_patch_state(chunk_id).await {
                         Ok(Some(arc)) => Ok(slice(arc)),
-                        _ => match self.resolve_forwarded(chunk_id).await {
+                        // Entry point (range read), so depth 0.
+                        _ => match self.resolve_forwarded(chunk_id, 0).await {
                             Some(arc) => Ok(slice(arc)),
                             None => Err(raw_err),
                         },
@@ -13546,6 +13608,61 @@ mod tests {
     use dfs_common::hash::compute_chunk_hash;
     use tempfile::TempDir;
 
+    /// Regression for the 2026-07-23 double node crash: gluster4 at 18:11:39 and
+    /// gluster1 (the leader) at 18:11:40 both died with
+    /// "thread 'tokio-rt-worker' has overflowed its stack / fatal runtime error" ->
+    /// SIGABRT, one second apart, taking 2 of 5 storage nodes down at RF=3 and
+    /// surfacing to a VM as an I/O error.
+    ///
+    /// ShardedAliasMap::resolve used to return `Some(current)` on hitting MAX_HOPS
+    /// and guarded only against a direct self-loop (`n != current`). Walking a
+    /// 2-cycle A->B->A therefore returned A — the caller's OWN INPUT — and
+    /// resolve_forwarded re-entered resolve_chunk_content with the identical id,
+    /// which failed identically and called resolve_forwarded again: unbounded
+    /// mutual recursion.
+    ///
+    /// Cycles are reachable in ordinary operation, not a theoretical concern:
+    /// chunk_id = hash(file_id, offset, data), so rewriting a block back to a value
+    /// it previously held regenerates the earlier id, and full_rewrite_chunk records
+    /// A->B and later B->A. A qcow2 under a running VM does this constantly.
+    #[test]
+    fn alias_resolve_fails_closed_on_cycles_and_overlong_chains() {
+        let id = |tag: &str| ChunkId::from_hash(compute_chunk_hash(tag.as_bytes()));
+        let (a, b, c) = (id("a"), id("b"), id("c"));
+
+        // The production case: A -> B -> A must resolve to nothing at all, and in
+        // particular must never hand back `a` itself.
+        let m = ShardedAliasMap::new(1024);
+        m.insert(a, b);
+        m.insert(b, a);
+        assert_eq!(m.resolve(a), None, "2-cycle must fail closed, not return the input");
+        assert_eq!(m.resolve(b), None, "2-cycle must fail closed from either entry point");
+
+        // Degenerate self-loop (previously the only cycle shape handled).
+        let m = ShardedAliasMap::new(1024);
+        m.insert(a, a);
+        assert_eq!(m.resolve(a), None);
+
+        // A normal chain still resolves to the end of the chain.
+        let m = ShardedAliasMap::new(1024);
+        m.insert(a, b);
+        m.insert(b, c);
+        assert_eq!(m.resolve(a), Some(c));
+        assert_eq!(m.resolve(b), Some(c));
+        assert_eq!(m.resolve(id("never-inserted")), None);
+
+        // Chain strictly longer than MAX_HOPS: the walk never confirms the end, so
+        // it must fail closed rather than return an unverified midpoint. A chain
+        // exactly at the cap still resolves.
+        let m = ShardedAliasMap::new(1024);
+        let chain: Vec<ChunkId> = (0..7).map(|i| id(&format!("chain{}", i))).collect();
+        for w in chain.windows(2) {
+            m.insert(w[0], w[1]);
+        }
+        assert_eq!(m.resolve(chain[0]), None, "chain longer than MAX_HOPS must fail closed");
+        assert_eq!(m.resolve(chain[2]), Some(chain[6]), "chain exactly at MAX_HOPS still resolves");
+    }
+
     /// Regression for the 2026-07-16 rebuild dedup fix: chunk_map_update_location_for_file_sync
     /// must correctly arbitrate when multiple ChunkLocation rows exist for the same
     /// (file_id, chunk_idx) slot (real, confirmed-live scenario: successive patch
@@ -14550,7 +14667,7 @@ mod tests {
         }
 
         // Test read
-        let response = server.handle_read_chunk(chunk_id, None).await;
+        let response = server.handle_read_chunk(chunk_id, None, None).await;
 
         match response {
             Response::ChunkData { data: read_data, .. } => {
@@ -15403,7 +15520,7 @@ mod tests {
             // Whole-chunk read must resolve via durable patch_state → compose.
             let mut expected = base_data.clone();
             expected[patch_off..patch_off + patch_bytes.len()].copy_from_slice(&patch_bytes);
-            match h.server.handle_read_chunk(token, None).await {
+            match h.server.handle_read_chunk(token, None, None).await {
                 Response::ChunkData { arc_data: Some(arc), .. } =>
                     assert_eq!(&**arc, &expected, "composed content must match base+delta"),
                 other => panic!("read of a Pending token with lost in-memory tracking must \
@@ -15411,7 +15528,7 @@ mod tests {
             }
 
             // Range read must resolve identically (its own fast-path/fallback).
-            match h.server.handle_read_chunk_range(token, patch_off as u64, patch_bytes.len() as u64, None).await {
+            match h.server.handle_read_chunk_range(token, patch_off as u64, patch_bytes.len() as u64, None, None).await {
                 Response::ChunkData { data, .. } =>
                     assert_eq!(data, patch_bytes, "range read must return the patched bytes"),
                 other => panic!("range read of a Pending token with lost tracking must resolve, got {:?}", other),
@@ -15435,7 +15552,7 @@ mod tests {
             assert!(!h.server.pending_patch_ids.contains_key(&token));
             assert!(!h.storage.has_chunk(&token));
 
-            match h.server.handle_read_chunk(token, None).await {
+            match h.server.handle_read_chunk(token, None, None).await {
                 Response::ChunkData { arc_data: Some(arc), .. } =>
                     assert_eq!(&**arc, &real_data, "must resolve to the folded real chunk"),
                 other => panic!("read of a stale Folded token with lost tracking must resolve, got {:?}", other),

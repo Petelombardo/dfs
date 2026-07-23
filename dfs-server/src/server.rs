@@ -10499,8 +10499,17 @@ impl Server {
         {
             let total = t_ap_start.elapsed();
             let t_loc = t_loc_start.elapsed();
-            const APTIMING_INFO_MS: u128 = 100;
-            if total.as_millis() >= APTIMING_INFO_MS {
+            // Threshold is env-tunable so a diagnostic run can be dialed down (or to 0 for
+            // "log every patch") without a rebuild+redeploy cycle. Default 100ms suits a
+            // loaded node, where apply_patch's median measured 122ms; a light QD1 run can
+            // sit entirely under that and emit nothing at info, which is exactly the
+            // wasted-test-cycle this knob avoids. Parsed once per call, but it's a single
+            // env read against work already measured in milliseconds.
+            let aptiming_info_ms: u128 = std::env::var("DFS_APTIMING_INFO_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100);
+            if total.as_millis() >= aptiming_info_ms {
                 info!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} state={:?} loc={:?}",
                     file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_state, t_loc);
             } else {

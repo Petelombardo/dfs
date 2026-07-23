@@ -5235,7 +5235,48 @@ impl Server {
     /// this can no longer just wait-then-error the way it used to.
     async fn resolve_push_target(&self, chunk_id: ChunkId) -> Result<ChunkId> {
         let Some((file_id, chunk_idx)) = self.pending_patch_ids.get(&chunk_id).map(|e| *e) else {
-            return Ok(chunk_id);
+            // MISS in the in-memory map is NOT proof this is an ordinary chunk.
+            // pending_patch_ids is rebuilt from live activity and is EMPTY after a
+            // restart, so every token minted before the restart misses here. Falling
+            // straight through returns the token unresolved, and the caller then does a
+            // raw read that succeeds off the LRU cache (resolve_via_durable_patch_state
+            // caches composed content under the TOKEN's id) and verifies those bytes
+            // against the token's hash. A public_token is
+            // blake3("dfs-patch-token" || delta.hash), never a content hash, so that
+            // comparison fails 100% of the time and is reported as
+            // "content hash mismatch (disk corruption)" — a false corruption alarm that
+            // then retries forever because discovery keeps re-queueing the row.
+            //
+            // Measured on staging 2026-07-23: 372,854 such events overnight, ~770/min
+            // sustained, 0% success, individual chunks at 482 consecutive failures. The
+            // storm reliably resumed after every restart, which is the tell — it tracks
+            // pending_patch_ids being empty, not anything about the data.
+            //
+            // Same class as the bug fixed in 996e728 ("overlay Pending token unreadable
+            // after restart wiped in-memory pending_patch_ids; read path never consulted
+            // durable patch_state"). That fix taught the READ path to consult the durable
+            // table; this is the PUSH path, which was left gating on the volatile map.
+            // PATCH_STATE_TABLE is durable and survives restart, so consult it directly.
+            return match self.metadata.get_patch_state_async(chunk_id).await? {
+                // Already folded: the real content-addressed chunk is what should be
+                // replicated, exactly as the in-memory fast path below would decide.
+                Some(PatchState::Folded(real)) => Ok(real),
+                // Still Pending, and without pending_patch_ids we have no (file_id,
+                // chunk_idx) to drive fold_slot_coordinated. Fail loudly rather than
+                // pushing the token: replicating composed bytes under the token's own
+                // name would store content whose hash doesn't match its identity, which
+                // is what breaks content-addressing in the first place. Deliberately NOT
+                // ErrorCode::NotFound — that path deletes the routing row, and a live
+                // Pending token IS the slot's current identity. A transient failure here
+                // is correct; the slot folds shortly and the next discovery pass resolves
+                // cleanly via the Folded arm above.
+                Some(PatchState::Pending { .. }) => anyhow::bail!(
+                    "chunk {} is an unfolded patch token and this node has no slot mapping for it \
+                     (pending_patch_ids empty, likely post-restart) — not replicable until it folds",
+                    chunk_id
+                ),
+                None => Ok(chunk_id),
+            };
         };
         match self.metadata.get_patch_state_async(chunk_id).await? {
             Some(PatchState::Folded(real)) => Ok(real),

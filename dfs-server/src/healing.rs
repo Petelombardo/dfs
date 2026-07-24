@@ -49,6 +49,18 @@ pub const LEADER_CHANGE_GRACE_SECS: u64 = 1200;
 /// created copies of at least one of them, for real.
 pub const SELF_RESTART_GRACE_SECS: u64 = LEADER_CHANGE_GRACE_SECS;
 
+/// Settle grace specifically for the NON-destructive orphan-dequeue in discovery
+/// (dropping an unreferenced under-RF chunk from the heal queue). Much shorter than
+/// SELF_RESTART_GRACE_SECS on purpose: that 20-minute grace exists to keep the
+/// DESTRUCTIVE paths from *deleting* off a stale post-restart chunk_map. Dropping a
+/// chunk from the heal queue deletes nothing and is self-correcting — a chunk
+/// mislabeled unreferenced (because the map hadn't finished converging) is simply
+/// re-added by the next deep scan if it's still under-RF. So we only need enough
+/// settle for rebuild_chunk_map_from_metadata to populate the map, not the full
+/// destructive grace. 120s keeps the heal queue from staying clogged for 20 minutes
+/// after every restart/deploy.
+pub const ORPHAN_DEQUEUE_SETTLE_SECS: u64 = 120;
+
 /// Token-bucket bandwidth limiter for heal traffic. Unlike a bytes-in-flight
 /// semaphore (which only bounds concurrency — a transfer that completes instantly
 /// just frees its permits for the next one to start at full speed), this paces
@@ -2263,7 +2275,7 @@ impl HealingManager {
                 .filter(|n| n.status == dfs_common::NodeStatus::Online)
                 .count();
             (!all_nodes.is_empty() && online == all_nodes.len(),
-             self.local_started_at.elapsed().as_secs() >= SELF_RESTART_GRACE_SECS)
+             self.local_started_at.elapsed().as_secs() >= ORPHAN_DEQUEUE_SETTLE_SECS)
         };
         // Only pay for the O(n) live-set crawl when we could actually act on it — i.e.
         // the cluster is healthy and this node is settled. During a node-down or

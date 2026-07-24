@@ -1271,13 +1271,13 @@ impl HealingManager {
         // prune without risking stranding the chunk at zero replicas.
         let metadata = self.metadata.clone();
         let scan_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ChunkLocation>> {
-            let live = metadata.live_chunk_ids()?;
+            // Combined single CHUNK_TABLE pass — see scan_live_chunk_locations's doc
+            // comment (was two full scans: live_chunk_ids then scan_chunk_locations).
             let mut chunks = Vec::new();
-            metadata.scan_chunk_locations(|loc| {
-                if live.contains(&loc.chunk_id) && loc.nodes.len() > 1 {
+            metadata.scan_live_chunk_locations(|loc| {
+                if loc.nodes.len() > 1 {
                     chunks.push(loc);
                 }
-                true
             })?;
             Ok(chunks)
         }).await;
@@ -2078,15 +2078,12 @@ impl HealingManager {
         } else {
             let pending_snapshot_for_orphans = pending_snapshot.clone();
             tokio::task::spawn_blocking(move || {
-                let live = metadata_scan.live_chunk_ids()?;
-
+                // Combined single CHUNK_TABLE pass (see scan_live_chunk_locations's doc
+                // comment) — was two separate full scans (live_chunk_ids then
+                // scan_chunk_locations), the dominant cost of a deep pass on a large table.
                 let mut chunks_to_check = Vec::new();
-
-                metadata_scan.scan_chunk_locations(|loc| {
-                    if live.contains(&loc.chunk_id) {
-                        chunks_to_check.push(loc);
-                    }
-                    true
+                let live = metadata_scan.scan_live_chunk_locations(|loc| {
+                    chunks_to_check.push(loc);
                 })?;
 
                 // See ScanResult::orphaned_pending's doc comment. Safety: an empty

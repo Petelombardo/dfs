@@ -2805,6 +2805,51 @@ impl MetadataStore {
         Ok(live)
     }
 
+    /// Combined single-pass version of `live_chunk_ids()` + a `scan_chunk_locations()`
+    /// filtered to that same live set — for callers (the discovery deep scan, phantom
+    /// reconciliation) that previously called both back-to-back and paid for CHUNK_TABLE
+    /// twice. Scans FILE_TABLE once (building live_file_ids, same as live_chunk_ids)
+    /// then CHUNK_TABLE exactly ONCE, invoking `f` for every chunk whose file_id is live
+    /// while simultaneously building the returned live-id set — so both outputs come
+    /// from a SINGLE CHUNK_TABLE deserialize pass instead of two. Found 2026-07-24: on a
+    /// large CHUNK_TABLE under concurrent write load, the redundant second scan was
+    /// measured to matter — this cuts a deep pass's dominant cost roughly in half.
+    /// Bonus correctness property: the old two-call pattern used two separate read
+    /// transactions, so a commit landing between them could make the live-id set and
+    /// the filtered locations reflect slightly different snapshots; this uses one
+    /// shared transaction for both, eliminating that window.
+    pub fn scan_live_chunk_locations<F>(&self, mut f: F) -> Result<std::collections::HashSet<ChunkId>>
+    where
+        F: FnMut(ChunkLocation),
+    {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let mut live_file_ids: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+        {
+            let table = txn.open_table(FILE_TABLE)?;
+            for item in table.range::<&str>(..)? {
+                let (_, v) = item?;
+                if let Ok(m) = dfs_common::deserialize_file_metadata(v.value()) {
+                    live_file_ids.insert(m.id);
+                }
+            }
+        }
+        let mut live = std::collections::HashSet::new();
+        {
+            let table = txn.open_table(CHUNK_TABLE)?;
+            for item in table.range::<&str>(..)? {
+                let (_, v) = item?;
+                if let Ok(loc) = bincode::deserialize::<ChunkLocation>(v.value()) {
+                    if loc.file_id.is_some_and(|fid| live_file_ids.contains(&fid)) {
+                        live.insert(loc.chunk_id);
+                        f(loc);
+                    }
+                }
+            }
+        }
+        Ok(live)
+    }
+
     /// Rebuild missing chunk: routing table entries from file metadata.
     pub fn rebuild_chunk_locations_from_files(&self) -> Result<(usize, usize)> {
         // Collect missing chunk records (read phase).

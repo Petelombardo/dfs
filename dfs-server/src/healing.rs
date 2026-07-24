@@ -912,6 +912,17 @@ impl HealingManager {
             .unwrap_or(false)
     }
 
+    /// Decide whether an under-RF chunk that is NOT referenced by any live file should
+    /// be dropped from the heal queue as an orphan, rather than healed (which would fail
+    /// content-hash verification forever, since the id is stale). Only acts on a
+    /// trustworthy view: `all_online` (a peer being offline could be the sole holder of
+    /// the file reference, so "unreferenced" wouldn't be safe to trust) AND `self_settled`
+    /// (a freshly-restarted node's chunk_map can lag and mislabel a live chunk). Purely a
+    /// queue decision — never deletes the chunk; the age-gated orphan sweep owns deletion.
+    fn should_dequeue_orphan(is_referenced: bool, all_online: bool, self_settled: bool) -> bool {
+        !is_referenced && all_online && self_settled
+    }
+
     /// May this cycle declare a 0-replica chunk permanently lost and purge it?
     ///
     /// BOTH conditions are required, and they are not redundant:
@@ -2234,6 +2245,39 @@ impl HealingManager {
         //
         // Note: chunks_to_check now carries full ChunkLocation records from the sled
         // scan, so we don't need a per-chunk DB lookup here.
+        // Fix (orphan-heal clog, 2026-07-24): an under-RF chunk that no live file
+        // references is an orphan — its lingering 1-replica routing row sits ahead of
+        // the age-gated sweep, and the shallow discovery pass otherwise re-heals it
+        // every cycle, each PushChunkTo failing content-hash verification forever (the
+        // id is stale, so the bytes never match). Drop such chunks from the heal queue
+        // so they stop clogging it and starving legitimate heals. Purely a queue
+        // decision — the disk orphan sweep still owns actual deletion. Gated on a
+        // trustworthy view: all nodes online (so "unreferenced" isn't just a peer being
+        // offline holding the only file reference) AND this node settled since restart
+        // (so its chunk_map isn't stale enough to mislabel a genuinely-live chunk).
+        // Both mirror the destructive paths' gate; but this is non-destructive and
+        // self-correcting (a mis-drop is re-added by the next deep scan if still under-RF).
+        let (all_online, self_settled) = {
+            let all_nodes = self.cluster.get_all_nodes().await;
+            let online = all_nodes.iter()
+                .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                .count();
+            (!all_nodes.is_empty() && online == all_nodes.len(),
+             self.local_started_at.elapsed().as_secs() >= SELF_RESTART_GRACE_SECS)
+        };
+        // Only pay for the O(n) live-set crawl when we could actually act on it — i.e.
+        // the cluster is healthy and this node is settled. During a node-down or
+        // just-restarted window (exactly when real client ops are most contended and the
+        // "unreferenced" verdict is least trustworthy) we skip it entirely, so this
+        // orphan check never competes with real work when the system is under stress.
+        let orphan_gate = all_online && self_settled;
+        let live_referenced = if orphan_gate {
+            self.live_chunk_ids_from_chunk_map()
+        } else {
+            HashSet::new()
+        };
+        let mut orphan_dequeues: Vec<ChunkId> = Vec::new();
+
         let mut classify_count = 0usize;
         for location in chunks_to_check {
             let chunk_id = location.chunk_id;
@@ -2251,6 +2295,15 @@ impl HealingManager {
                 // unconditionally) stays in the reported heal queue forever, even
                 // though there is deliberately nothing left to do for it.
                 self.clear_pending(&chunk_id).await;
+                continue;
+            }
+
+            // Orphan (unreferenced by any live file) — drop from the heal queue rather
+            // than re-heal a stale id forever. See the note before this loop. Batched
+            // (collected here, applied after the loop) to avoid a per-chunk DB delete
+            // under a large backlog.
+            if Self::should_dequeue_orphan(live_referenced.contains(&chunk_id), all_online, self_settled) {
+                orphan_dequeues.push(chunk_id);
                 continue;
             }
 
@@ -2577,6 +2630,27 @@ impl HealingManager {
                     }
                 }
             }
+        }
+
+        // Drain orphan de-queues (collected above): remove from the in-memory queues so
+        // the reported Pending count drops immediately, clear the push-failure backoff,
+        // and fold the routing-row/pending-table cleanup into the batched write below.
+        if !orphan_dequeues.is_empty() {
+            {
+                let mut pending = self.pending_healing.write().await;
+                let mut stalled = self.stalled_healing.write().await;
+                for id in &orphan_dequeues {
+                    pending.remove(id);
+                    stalled.remove(id);
+                    self.heal_push_failure.remove(id);
+                }
+            }
+            deferred_pending_clears.extend(orphan_dequeues.iter().copied());
+            info!(
+                "Discovery: dropped {} unreferenced-orphan chunk(s) from the heal queue \
+                 (all nodes online + settled) — deletion left to the orphan sweep",
+                orphan_dequeues.len()
+            );
         }
 
         // Apply all accumulated metadata writes in a single spawn_blocking call.
@@ -4291,6 +4365,27 @@ mod tests {
         );
         assert!(severely_under < mildly_under_but_older,
             "1-of-N must sort before 2-of-3 even when the 2-of-3 chunk is far older");
+    }
+
+    /// Orphan-heal clog fix (2026-07-24): an under-RF chunk that no live file references
+    /// is dropped from the heal queue ONLY when the view is trustworthy (all nodes
+    /// online AND this node settled). A referenced chunk is never dropped; and while a
+    /// peer is offline or this node is freshly restarted, we keep it queued rather than
+    /// risk mislabeling a genuinely-live chunk as an orphan.
+    #[test]
+    fn orphan_is_dequeued_only_when_unreferenced_and_view_is_trustworthy() {
+        // The clog case: unreferenced, full healthy view → drop it.
+        assert!(HealingManager::should_dequeue_orphan(false, true, true));
+
+        // Referenced chunk is never an orphan, regardless of view.
+        assert!(!HealingManager::should_dequeue_orphan(true, true, true));
+
+        // Unreferenced but untrustworthy view → keep it queued (don't act on a partial
+        // membership or a stale post-restart chunk_map).
+        assert!(!HealingManager::should_dequeue_orphan(false, false, true),
+            "a peer being offline could hold the only file reference — don't drop");
+        assert!(!HealingManager::should_dequeue_orphan(false, true, false),
+            "a freshly-restarted node's chunk_map can mislabel a live chunk — don't drop");
     }
 
     /// UnderReplicated must always outrank OverReplicated — restoring durability

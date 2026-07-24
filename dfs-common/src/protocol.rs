@@ -336,6 +336,13 @@ pub enum Request {
         /// scanning all files by file_offset (which matches offset=0 on every file).
         #[serde(default)]
         file_id: Option<FileId>,
+        /// Per-slot generation (the client's monotone new_chunk_seq) of `location`'s
+        /// chunk — the authoritative causal ordering the receiver feeds to
+        /// `location_supersedes` so a REORDERED broadcast for a retired generation
+        /// can't revert the slot's current pointer (fix S, 2026-07-24 VM-108). None
+        /// from legacy/mixed-version senders → receiver falls back to cws/written_at.
+        #[serde(default)]
+        generation: Option<u64>,
     },
 
     /// Batch replicate chunk locations — one round-trip replaces N×ReplicateChunkLocation.

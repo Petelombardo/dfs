@@ -5683,7 +5683,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let loc = location.clone();
             let is_leader = Some(addr) == leader_addr;
             tokio::spawn(async move {
-                let req = Request::ReplicateChunkLocation { location: loc, file_id: None };
+                let req = Request::ReplicateChunkLocation { location: loc, file_id: None, generation: None };
                 if is_leader {
                     // Retry to the leader with exponential backoff so the chunk map stays
                     // current even if the leader is momentarily slow.

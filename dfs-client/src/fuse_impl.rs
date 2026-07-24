@@ -2345,21 +2345,33 @@ impl FlushHandle {
         dirty_ranges: &[(usize, usize)],
         candidate_ids: &[dfs_common::ChunkId],
     ) -> Result<()> {
-        let base = candidate_ids.iter().find_map(|id| self.client.chunk_cache.get(id));
-        if let Some(base_arc) = base {
-            let mut reconstructed = (*base_arc).clone();
-            if reconstructed.len() < slot_data.len() {
-                reconstructed.resize(slot_data.len(), 0);
-            }
-            for &(start, end) in dirty_ranges {
-                let e = end.min(slot_data.len()).min(reconstructed.len());
-                if start < e {
-                    reconstructed[start..e].copy_from_slice(&slot_data[start..e]);
-                }
-            }
-            info!("flush_buffer_async_one: ino={} chunk={} reconstructed from cache — untouched chunk regions preserved, writing fresh",
-                ino, chunk_idx);
-            *slot_data = reconstructed;
+        // Base acquisition + reconstruction are factored into the free functions
+        // `select_reconstruction_base` / `apply_reconstruction` (below) so the
+        // 2026-07-24 cluster-fetch fallback can be unit-tested without a live cluster.
+        // Prefer a locally-cached base (no network). On a miss, DON'T give up — fetch
+        // an authoritative copy from the cluster before aborting. chunk_cache is keyed
+        // by content-addressed chunk_id, so a miss means the base was *evicted*, NOT
+        // that its bytes are gone: a candidate base can still be alive on the storage
+        // nodes. Reading it by explicit chunk_id is a plain content read, not subject
+        // to the current-pointer arbitration that just failed our patch — so it
+        // succeeds even when the slot's "current" pointer is poisoned/dangling. This
+        // lets the client reconstruct + fresh-write and self-heal the slot forward,
+        // instead of EIO'ing over bytes that are sitting on multiple replicas (the
+        // 2026-07-24 VM-108 incident: base 480f0070 was live on 3 nodes but evicted
+        // locally). Candidate order is preserved (old_location first) because
+        // dirty_ranges are deltas relative to that base — see the caller.
+        let selected = select_reconstruction_base(
+            candidate_ids,
+            |id| self.client.chunk_cache.get(id),
+            |id| self.client.read_chunk_by_id(id, &[]),
+        ).await;
+        if let Some((base_id, base_arc)) = selected {
+            // Warm the cache with whatever we ended up using (idempotent for a cache
+            // hit; populates it after a cluster fetch so an immediate retry is free).
+            self.client.chunk_cache.insert(base_id, base_arc.clone());
+            info!("flush_buffer_async_one: ino={} chunk={} reconstructing from base {} — untouched chunk regions preserved, writing fresh",
+                ino, chunk_idx, base_id);
+            *slot_data = apply_reconstruction(&base_arc, slot_data, dirty_ranges);
             Ok(())
         } else {
             let mut backoff_secs = 0u64;
@@ -2374,8 +2386,8 @@ impl FlushHandle {
                         .unwrap_or(0);
                 }
             }
-            warn!("flush_buffer_async_one: ino={} chunk={} cache miss — aborting to prevent zeroing untouched chunk regions \
-                   (returning EIO, backing off retries for this chunk {}s)",
+            warn!("flush_buffer_async_one: ino={} chunk={} base not in cache and unreadable from any replica — aborting \
+                   to prevent zeroing untouched chunk regions (returning EIO, backing off retries for this chunk {}s)",
                 ino, chunk_idx, backoff_secs);
             self.notify_chunk_flush_complete(ino, chunk_idx).await;
             Err(anyhow::anyhow!(
@@ -9538,5 +9550,159 @@ impl Filesystem for DfsFilesystem {
                 reply.error(libc::ENOTTY);
             }
         }
+    }
+}
+
+/// Pick the base bytes to reconstruct an evicted chunk from, for the fresh-write
+/// fallback. Prefer a locally-cached candidate (no network); on a full cache miss,
+/// fall back to fetching an authoritative copy from the cluster (2026-07-24 fix —
+/// the old behavior was cache-only, which returned EIO over bytes that were still
+/// alive on the storage nodes: the VM-108 incident, where base 480f0070 was live on
+/// 3 replicas but evicted from the client cache). `chunk_cache` is keyed by a
+/// content-addressed chunk_id, so a miss means *evicted*, never *stale* — reading
+/// it back by explicit chunk_id is a plain content read, not subject to the
+/// current-pointer arbitration that just failed the patch. Candidate order is
+/// honored on BOTH paths because `dirty_ranges` are deltas relative to the first
+/// (base) candidate. Returns the winning `(chunk_id, bytes)`, or None only if
+/// neither the cache nor any replica can supply any candidate.
+async fn select_reconstruction_base<C, F, Fut>(
+    candidate_ids: &[dfs_common::ChunkId],
+    cache_get: C,
+    fetch: F,
+) -> Option<(dfs_common::ChunkId, std::sync::Arc<Vec<u8>>)>
+where
+    C: Fn(&dfs_common::ChunkId) -> Option<std::sync::Arc<Vec<u8>>>,
+    F: Fn(dfs_common::ChunkId) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    if let Some((id, cached)) = candidate_ids
+        .iter()
+        .find_map(|id| cache_get(id).map(|b| (*id, b)))
+    {
+        return Some((id, cached));
+    }
+    for id in candidate_ids {
+        match fetch(*id).await {
+            Ok(bytes) => return Some((*id, std::sync::Arc::new(bytes))),
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Overlay the dirty (written) ranges onto a full base image to produce the
+/// faithful full-chunk bytes for a fresh write. Untouched regions come from `base`;
+/// `dirty_ranges` regions come from `slot_data`. Pure (no I/O) so it's unit-testable.
+fn apply_reconstruction(base: &[u8], slot_data: &[u8], dirty_ranges: &[(usize, usize)]) -> Vec<u8> {
+    let mut reconstructed = base.to_vec();
+    if reconstructed.len() < slot_data.len() {
+        reconstructed.resize(slot_data.len(), 0);
+    }
+    for &(start, end) in dirty_ranges {
+        let e = end.min(slot_data.len()).min(reconstructed.len());
+        if start < e {
+            reconstructed[start..e].copy_from_slice(&slot_data[start..e]);
+        }
+    }
+    reconstructed
+}
+
+#[cfg(test)]
+mod reconstruct_fallback_tests {
+    use super::{apply_reconstruction, select_reconstruction_base};
+    use std::sync::Arc;
+
+    fn cid(b: u8) -> dfs_common::ChunkId {
+        dfs_common::ChunkId::from_hash([b; 32])
+    }
+
+    /// The 2026-07-24 VM-108 repro, isolated: a patch has failed on all replicas and
+    /// the fresh-write fallback needs the base chunk. The base is EVICTED from the
+    /// local cache but still ALIVE on the cluster (the dangling "current" chunk is
+    /// not). Old behavior (cache-only) finds nothing → EIO. New behavior fetches the
+    /// base from the cluster and reconstructs. Fails-before / passes-after in one test:
+    /// the `old_cache_only` assertion captures the pre-fix path.
+    #[tokio::test]
+    async fn evicted_base_is_fetched_from_cluster_instead_of_eio() {
+        let base = cid(0x48); // stand-in for 480f0070 — alive on the cluster
+        let current = cid(0xc7); // stand-in for c729 — dangling, no bytes anywhere
+        let candidates = [base, current];
+        let base_bytes = vec![0xAAu8; 4096];
+
+        // Client cache misses on everything (base was evicted under memory pressure).
+        let cache_get = |_id: &dfs_common::ChunkId| -> Option<Arc<Vec<u8>>> { None };
+        // Cluster: the base reads back; the dangling current chunk does not.
+        let bb = base_bytes.clone();
+        let fetch = move |id: dfs_common::ChunkId| {
+            let bb = bb.clone();
+            async move {
+                if id == cid(0x48) {
+                    Ok(bb)
+                } else {
+                    anyhow::bail!("dangling chunk: no bytes on any replica")
+                }
+            }
+        };
+
+        // PRE-FIX behavior (cache-only) would have found no base → the abort/EIO path.
+        let old_cache_only = candidates.iter().find_map(cache_get);
+        assert!(
+            old_cache_only.is_none(),
+            "repro precondition: cache-only recovery finds no base and would return EIO",
+        );
+
+        // POST-FIX behavior: recover the base from the cluster.
+        let selected = select_reconstruction_base(&candidates, cache_get, fetch).await;
+        let (winner, bytes) = selected.expect("must recover the base from the cluster, not EIO");
+        assert_eq!(
+            winner, base,
+            "must reconstruct from the base candidate — dirty_ranges are deltas relative to it",
+        );
+        assert_eq!(&*bytes, &base_bytes);
+    }
+
+    /// The abort path is still correct when the base is genuinely gone everywhere:
+    /// we must NOT fabricate a fresh write (that would zero untouched real data).
+    #[tokio::test]
+    async fn aborts_only_when_no_replica_has_any_candidate() {
+        let candidates = [cid(1), cid(2)];
+        let cache_get = |_: &dfs_common::ChunkId| None;
+        let fetch =
+            |_: dfs_common::ChunkId| async { anyhow::bail!("gone on every replica") as Result<Vec<u8>, _> };
+        let selected = select_reconstruction_base(&candidates, cache_get, fetch).await;
+        assert!(
+            selected.is_none(),
+            "a base that is truly gone everywhere must still abort, not silently zero data",
+        );
+    }
+
+    /// A cache hit short-circuits and never touches the network.
+    #[tokio::test]
+    async fn cache_hit_wins_without_fetch() {
+        let base = cid(0x48);
+        let cached_bytes = Arc::new(vec![1u8; 16]);
+        let cb = cached_bytes.clone();
+        let cache_get = move |id: &dfs_common::ChunkId| if *id == base { Some(cb.clone()) } else { None };
+        let fetch = |_: dfs_common::ChunkId| async {
+            panic!("must not hit the network on a cache hit");
+            #[allow(unreachable_code)]
+            Ok::<Vec<u8>, anyhow::Error>(vec![])
+        };
+        let selected = select_reconstruction_base(&[base], cache_get, fetch).await;
+        assert_eq!(selected.unwrap().1, cached_bytes);
+    }
+
+    #[test]
+    fn reconstruction_overlays_dirty_ranges_on_base() {
+        let base = vec![0u8; 8];
+        let mut slot = vec![0u8; 8];
+        slot[2] = 9;
+        slot[3] = 9;
+        let out = apply_reconstruction(&base, &slot, &[(2, 4)]);
+        assert_eq!(
+            out,
+            vec![0, 0, 9, 9, 0, 0, 0, 0],
+            "untouched regions from base, dirty range from slot_data",
+        );
     }
 }

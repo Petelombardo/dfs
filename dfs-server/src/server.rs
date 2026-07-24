@@ -324,6 +324,21 @@ pub struct Server {
     /// back on written_at alone and get the fold result orphan-swept.
     fold_result_chunk_ids: Arc<dashmap::DashSet<ChunkId>>,
 
+    /// In-memory `chunk_id -> per-slot generation` (the client's monotone
+    /// new_chunk_seq for the (file_id, chunk_idx) that produced this chunk). The
+    /// AUTHORITATIVE causal ordering used by `location_supersedes` to reject a
+    /// reordered ReplicateChunkLocation for a RETIRED generation (2026-07-24 VM-108
+    /// dangling-pointer incident). Deliberately NOT disk-durable: a generation only
+    /// needs to survive as long as the chunk's data does, and it co-locates with it
+    /// (every holder of the current chunk received the RCL/patch that set it) — full
+    /// cluster loss leaves no latent stale RCL to defend against, and a rolling
+    /// restart recovers it from surviving peers (see the fold-generation-reorder
+    /// design note). Populated on patch/fold completion and on receiving a peer's
+    /// generation-bearing RCL; entries for retired chunks are cleaned alongside their
+    /// ChunkLocation. A miss => None => the arbiter falls back to the legacy
+    /// cws/written_at rule (mixed-version and pre-population safe).
+    chunk_generations: Arc<DashMap<ChunkId, u64>>,
+
     /// (file_id, chunk_idx) slots with an un-folded Pending patch_state.
     /// Populated by apply_patch every time it merges a new patch into a slot's
     /// existing Pending delta instead of folding immediately (2026-07-09
@@ -934,6 +949,9 @@ struct OverlayForkCtx {
     pending_patch_fold_broadcasts: Arc<DashMap<ChunkId, PendingPatchFoldBroadcast>>,
     /// Same Arc as Server::fold_result_chunk_ids — see its doc comment.
     fold_result_chunk_ids: Arc<dashmap::DashSet<ChunkId>>,
+    /// Same Arc as Server::chunk_generations — the fold path stamps its result's
+    /// generation and carries it on the fold RCLs (fix S).
+    chunk_generations: Arc<DashMap<ChunkId, u64>>,
     dirty_patch_slots: Arc<DashMap<(FileId, u64), DirtyPatchSlot>>,
     chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
     chunk_ring: Arc<ShardedChunkRing>,
@@ -1317,6 +1335,18 @@ fn jittered_debounce_sleep(base: std::time::Duration, active_fold_count: u64, fi
 /// seed/consult (added same day) for the actual follow-up: make each fold
 /// cheaper via a warm cache instead of trying to make folds happen less
 /// expensively-but-more-often.
+
+/// Record a chunk's per-slot generation, monotonically (fix S — see
+/// `Server::chunk_generations`). A reordered/stale source must never LOWER a
+/// chunk's recorded generation; a content-addressed chunk_id belongs to one
+/// generation, so this normally inserts once and the max guard only matters if the
+/// same id is re-stamped out of order (e.g. a late RCL after a local patch already
+/// recorded it). Shared by `Server` and the fold path's `OverlayForkCtx`.
+fn bump_chunk_generation(map: &DashMap<ChunkId, u64>, chunk_id: ChunkId, generation: u64) {
+    map.entry(chunk_id)
+        .and_modify(|g| { if generation > *g { *g = generation; } })
+        .or_insert(generation);
+}
 
 impl OverlayForkCtx {
     /// Abandon and clean up a Pending patch whose base or delta chunk is
@@ -1790,7 +1820,11 @@ impl OverlayForkCtx {
         };
 
         const ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-        let loc_req = Request::ReplicateChunkLocation { location: corrected.clone(), file_id: Some(file_id) };
+        let loc_req = Request::ReplicateChunkLocation {
+            location: corrected.clone(),
+            file_id: Some(file_id),
+            generation: self.chunk_generations.get(&corrected.chunk_id).map(|v| *v),
+        };
         let fold_req = Request::ReplicatePatchFold { public_token, real_chunk_id: folded_id, file_id, chunk_idx };
 
         let local_id = self.cluster.local_node_id();
@@ -2074,6 +2108,18 @@ impl OverlayForkCtx {
             // at worst a transient loss of the origin tiebreak until restart, not
             // a correctness gap.
             self.fold_result_chunk_ids.insert(new_chunk_id);
+            // Fix S: the fold output belongs to the SAME slot generation as the base
+            // it was consolidated from (folding doesn't advance the client's
+            // new_chunk_seq). Inherit the base's recorded generation so the fold's own
+            // RCL can out-rank any reordered stale-generation broadcast. If the base
+            // has no recorded generation (legacy / not-yet-populated), the arbiter
+            // simply falls back to the pre-existing cws/written_at rule for this chunk.
+            if let Some(base_gen) = self.chunk_generations.get(&base_chunk_id).map(|v| *v) {
+                bump_chunk_generation(&self.chunk_generations, new_chunk_id, base_gen);
+            }
+            // Bound the map: base_chunk_id is now permanently retired by this fold, so
+            // its generation entry is dead weight (a hot qcow2 slot rewrites forever).
+            self.chunk_generations.remove(&base_chunk_id);
         }
         // Else: a byte-identical (no-op) fold — base_chunk_id is still genuinely
         // current, so healing_cancel_guard stays armed and retracts the
@@ -2249,6 +2295,9 @@ impl OverlayForkCtx {
             // time — that reasoning still holds for non-leader peers.
             let cluster = self.cluster.clone();
             let client = self.client.clone();
+            // Fix S: capture the fold result's generation before the detached task so
+            // its RCLs to peers carry it (the task has no &self).
+            let fold_generation = self.chunk_generations.get(&new_loc.chunk_id).map(|v| *v);
             tokio::spawn(async move {
                 let nodes = cluster.get_all_nodes().await;
                 let local_id = cluster.local_node_id();
@@ -2286,7 +2335,7 @@ impl OverlayForkCtx {
                         let mut fold_ok = false;
                         for attempt in 0..ATTEMPTS {
                             if !loc_ok {
-                                let request = Request::ReplicateChunkLocation { location: new_loc.clone(), file_id: new_loc.file_id };
+                                let request = Request::ReplicateChunkLocation { location: new_loc.clone(), file_id: new_loc.file_id, generation: fold_generation };
                                 loc_ok = matches!(
                                     tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client.send_message(node_addr, Message::Request(request))).await,
                                     Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
@@ -2394,6 +2443,7 @@ impl OverlayForkCtx {
 
             let loc_req = Request::ReplicateChunkLocation {
                 location: location.clone(), file_id: location.file_id,
+                generation: self.chunk_generations.get(&location.chunk_id).map(|v| *v),
             };
             let fold_req = Request::ReplicatePatchFold {
                 public_token, real_chunk_id, file_id, chunk_idx,
@@ -3051,6 +3101,7 @@ impl Server {
             pending_patch_ids: Arc::new(DashMap::new()),
             pending_patch_fold_broadcasts: Arc::new(DashMap::new()),
             fold_result_chunk_ids: Arc::new(dashmap::DashSet::new()),
+            chunk_generations: Arc::new(DashMap::new()),
             dirty_patch_slots: Arc::new(DashMap::new()),
             chunk_io_locks: Arc::new(DashMap::new()),
             chunk_prefetch: Arc::new(DashMap::new()),
@@ -3241,7 +3292,7 @@ impl Server {
                     skipped_no_file_id += 1;
                     return true;
                 };
-                Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, file_id, &loc);
+                Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, None, file_id, &loc);
                 // The shared helper seeds a brand-new entry's write_seq field from the
                 // CHUNK's own client_write_seq (chunk-level) — preserve this rebuild's
                 // original semantics of also folding in the FILE's scalar write_seq
@@ -3412,7 +3463,26 @@ impl Server {
         existing: &ChunkLocation,
         incoming_is_fold: bool,
         existing_is_fold: bool,
+        incoming_gen: Option<u64>,
+        existing_gen: Option<u64>,
     ) -> bool {
+        // Per-slot generation is the AUTHORITATIVE causal ordering: the client's
+        // monotone new_chunk_seq for this (file_id, chunk_idx) slot, carried in-memory
+        // and on control messages (see `chunk_generations`). A strictly-higher
+        // generation always wins; a strictly-lower one never does. This is what stops a
+        // REORDERED ReplicateChunkLocation for a RETIRED fold generation from reverting
+        // the slot's current pointer to a chunk whose bytes were already retired
+        // (2026-07-24 VM-108 dangling-pointer incident). `client_write_seq` — which
+        // TIES across fold generations under the pure-max `fold_successor_write_seq`
+        // rule (the T28 trap forbids minting) — and `written_at` — wall-clock, subject
+        // to skew/drift on the aarch64 fleet — are neither of them reliable causal
+        // clocks across generations, so they are demoted to a SAME-generation /
+        // unknown-generation fallback only.
+        if let (Some(inc_gen), Some(ext_gen)) = (incoming_gen, existing_gen) {
+            if inc_gen != ext_gen {
+                return inc_gen > ext_gen;
+            }
+        }
         match (incoming.client_write_seq, existing.client_write_seq) {
             (Some(inc), Some(ext)) if inc != ext => inc >= ext,
             // Equal seq → origin, then written_at.
@@ -3422,6 +3492,11 @@ impl Server {
             // Both predate client_write_seq → origin, then written_at, same as above.
             (None, None) => Self::fold_then_written_at(incoming, existing, incoming_is_fold, existing_is_fold),
         }
+    }
+
+    /// Record the per-slot generation for `chunk_id` (fix S — see `chunk_generations`).
+    fn record_chunk_generation(&self, chunk_id: ChunkId, generation: u64) {
+        bump_chunk_generation(&self.chunk_generations, chunk_id, generation);
     }
 
     /// Shared equal-seq tiebreak for `location_supersedes`: `ServerFold` beats `Client`
@@ -3644,7 +3719,7 @@ impl Server {
     /// timestamp) for legacy records that predate the client_write_seq field.
     /// Fresh writes carry client_write_seq=None so any patch (seq > 0) always wins.
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
-        Self::chunk_map_update_location_for_file_sync(&self.chunk_map, &self.chunk_to_file, &self.fold_result_chunk_ids, file_id, location);
+        Self::chunk_map_update_location_for_file_sync(&self.chunk_map, &self.chunk_to_file, &self.fold_result_chunk_ids, Some(&self.chunk_generations), file_id, location);
     }
 
     /// Sync core of chunk_map_update_location_for_file — extracted so
@@ -3670,6 +3745,9 @@ impl Server {
         chunk_map: &DashMap<FileId, (Vec<ChunkLocation>, u64)>,
         chunk_to_file: &DashMap<ChunkId, FileId>,
         fold_result_chunk_ids: &dashmap::DashSet<ChunkId>,
+        // Per-slot generation authority for the arbiter (None => legacy cws/written_at
+        // fallback; only the live RCL path supplies it — rebuild/tests pass None).
+        chunk_generations: Option<&DashMap<ChunkId, u64>>,
         file_id: FileId,
         location: &ChunkLocation,
     ) {
@@ -3717,6 +3795,8 @@ impl Server {
                         loc,
                         fold_result_chunk_ids.contains(&location.chunk_id),
                         fold_result_chunk_ids.contains(&loc.chunk_id),
+                        chunk_generations.and_then(|m| m.get(&location.chunk_id).map(|v| *v)),
+                        chunk_generations.and_then(|m| m.get(&loc.chunk_id).map(|v| *v)),
                     );
                 if should_update {
                     chunk_to_file.remove(&loc.chunk_id);
@@ -4769,8 +4849,8 @@ impl Server {
             Request::DeletePathIndex { path } => {
                 self.handle_delete_path_index(path).await
             }
-            Request::ReplicateChunkLocation { location, file_id } => {
-                self.handle_replicate_chunk_location(location, file_id).await
+            Request::ReplicateChunkLocation { location, file_id, generation } => {
+                self.handle_replicate_chunk_location(location, file_id, generation).await
             }
             Request::ReplicateChunkLocations { locations } => {
                 self.handle_replicate_chunk_locations(locations).await
@@ -6194,8 +6274,18 @@ impl Server {
         })
     }
 
-    async fn handle_replicate_chunk_location(&self, location: ChunkLocation, file_id: Option<FileId>) -> Response {
+    async fn handle_replicate_chunk_location(&self, location: ChunkLocation, file_id: Option<FileId>, generation: Option<u64>) -> Response {
         info!("Handling replicate chunk location: {} (nodes: {:?})", location.chunk_id, location.nodes);
+
+        // Fix S: record the incoming chunk's per-slot generation BEFORE any chunk_map
+        // arbitration below, so `location_supersedes` (which reads chunk_generations)
+        // can out-rank a reordered stale-generation broadcast. A generation-bearing
+        // RCL is the ONLY way a peer learns the generation of a chunk it didn't itself
+        // create (e.g. another node's fold result). None (legacy/mixed-version sender)
+        // leaves the map untouched → arbiter falls back to cws/written_at.
+        if let Some(g) = generation {
+            self.record_chunk_generation(location.chunk_id, g);
+        }
 
         // A ReplicateChunkLocation from a peer means a client write just completed somewhere
         // in the cluster — update the shared write-activity timestamp so the adaptive
@@ -6407,6 +6497,7 @@ impl Server {
                     }
                     let request = Request::ReplicateChunkLocation {
                         location: broadcast_loc.clone(), file_id: broadcast_loc.file_id,
+                        generation: None, // RF-restore re-broadcast of a current location
                     };
                     if let Err(e) = client.send_message(node.addr, Message::Request(request)).await {
                         warn!("[RF-restore] failed to broadcast restored location {} to node {}: {}", broadcast_loc.chunk_id, node.id, e);
@@ -7481,6 +7572,7 @@ impl Server {
                             let request = Request::ReplicateChunkLocation {
                                 location: location_clone.clone(),
                                 file_id: None,
+                                generation: None,
                             };
                             ok = matches!(
                                 tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client_clone.send_message(node_addr, Message::Request(request))).await,
@@ -9130,6 +9222,9 @@ impl Server {
                     for node in &online_peers {
                         let loc_request = Request::ReplicateChunkLocation {
                             location: entry.location.clone(), file_id: entry.location.file_id,
+                            // Fold rebroadcast backstop — must carry generation so a late
+                            // re-announce still out-ranks a stale-generation broadcast (fix S).
+                            generation: server.chunk_generations.get(&entry.location.chunk_id).map(|v| *v),
                         };
                         if let Err(e) = server.client.send_message(node.addr, Message::Request(loc_request)).await {
                             debug!("patch_fold_rebroadcast: failed to resend location {} to node {}: {}", public_token, node.id, e);
@@ -10062,7 +10157,7 @@ impl Server {
                     let client = self.client.clone();
                     let loc = location.clone();
                     tokio::spawn(async move {
-                        let req = Request::ReplicateChunkLocation { location: loc, file_id: None };
+                        let req = Request::ReplicateChunkLocation { location: loc, file_id: None, generation: None };
                         let _ = client.send_message(node.addr, Message::Request(req)).await;
                     });
                 }
@@ -10222,6 +10317,7 @@ impl Server {
             pending_patch_ids: self.pending_patch_ids.clone(),
             pending_patch_fold_broadcasts: self.pending_patch_fold_broadcasts.clone(),
             fold_result_chunk_ids: self.fold_result_chunk_ids.clone(),
+            chunk_generations: self.chunk_generations.clone(),
             dirty_patch_slots: self.dirty_patch_slots.clone(),
             chunk_patch_locks: self.chunk_patch_locks.clone(),
             chunk_ring: self.chunk_ring.clone(),
@@ -11047,6 +11143,9 @@ impl Server {
                     if let Err(e) = self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
                         warn!("PatchChunk: failed to record chunk_seq {} for file {} chunk {}: {}", seq, file_id, cidx, e);
                     }
+                    // Stamp the resulting chunk with this slot's generation so the
+                    // arbiter can out-rank any reordered stale-generation RCL (fix S).
+                    self.record_chunk_generation(new_chunk_id, seq);
                 }
                 Response::PatchChunkResult { new_chunk_id, size, chunk_seq: new_chunk_seq }
             }
@@ -11368,6 +11467,8 @@ impl Server {
                     if let Err(e) = self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
                         warn!("MultiPatch: failed to record chunk_seq {} for file {} chunk {}: {}", seq, file_id, cidx, e);
                     }
+                    // Stamp the resulting chunk with this slot's generation (fix S).
+                    self.record_chunk_generation(new_chunk_id, seq);
                 }
                 Response::MultiPatchResult { new_chunk_id, size: final_size, patch_ts, chunk_seq: new_chunk_seq }
             }
@@ -12217,7 +12318,7 @@ impl Server {
                         let mut built = 0usize;
                         let scan2 = metadata.scan_chunk_locations(|loc| {
                             let Some(file_id) = loc.file_id else { return true; };
-                            Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, file_id, &loc);
+                            Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, None, file_id, &loc);
                             let seed_write_seq = file_write_seqs.get(&file_id).map(|v| *v).unwrap_or(0);
                             if let Some(mut entry) = chunk_map.get_mut(&file_id) {
                                 let (_, seq) = entry.value_mut();
@@ -12801,6 +12902,7 @@ impl Server {
                                 if node.id == bc_lid || node.status != dfs_common::NodeStatus::Online { continue; }
                                 let req = dfs_common::Request::ReplicateChunkLocation {
                                     location: bc_loc.clone(), file_id: None,
+                                    generation: None,
                                 };
                                 let _ = bc_client.send_message(node.addr, dfs_common::Message::Request(req)).await;
                             }
@@ -12951,6 +13053,9 @@ impl Server {
                             e.get(),
                             fold_result_chunk_ids.contains(&loc.chunk_id),
                             fold_result_chunk_ids.contains(&e.get().chunk_id),
+                            // TODO(fix-S increment 2): pass chunk_generations lookups here.
+                            None,
+                            None,
                         ) {
                             e.insert(loc);
                         }
@@ -13700,7 +13805,7 @@ mod tests {
         let middle = make_loc("middle-patch", 20);
 
         for loc in [&old, &newest, &middle] {
-            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, file_id, loc);
+            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,loc);
         }
 
         let entry = chunk_map.get(&file_id).unwrap();
@@ -13859,7 +13964,7 @@ mod tests {
             for loc in order {
                 let mut l = (*loc).clone();
                 l.file_id = Some(file_id);
-                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, file_id, &l);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l);
             }
             let entry = chunk_map.get(&file_id).unwrap();
             let (locs, _) = entry.value();
@@ -13901,7 +14006,7 @@ mod tests {
             for &i in &perm {
                 let mut loc = candidates[i].clone();
                 loc.file_id = Some(file_id);
-                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, file_id, &loc);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&loc);
             }
             let entry = chunk_map.get(&file_id).unwrap();
             winners.push((perm, entry.value().0[0].chunk_id));
@@ -13970,8 +14075,8 @@ mod tests {
         let earlier = make_loc("racing-write-A", 11, 601505);
         let later = make_loc("racing-write-B", 11, 602084);
 
-        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, file_id, &later);
-        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, file_id, &earlier);
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&later);
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&earlier);
 
         let entry = chunk_map.get(&file_id).unwrap();
         let (locs, _) = entry.value();
@@ -13980,6 +14085,62 @@ mod tests {
             "equal client_write_seq must be tie-broken by written_at, not by scan/arrival order");
         assert!(chunk_to_file.get(&earlier.chunk_id).is_none(),
             "superseded same-seq candidate must not remain in chunk_to_file");
+    }
+
+    /// Integrated repro for fix S through the REAL chunk_map update path (not just the
+    /// arbiter in isolation): the current generation is installed, then a RETIRED
+    /// older-generation location arrives reordered — with the tied client_write_seq and
+    /// higher written_at that made it win before — and its generation is recorded in
+    /// the map (as it would be by a generation-bearing RCL). The pointer must STAY on
+    /// the current generation. This is the 2026-07-24 VM-108 dangling-pointer scenario
+    /// end to end at the chunk_map layer.
+    #[test]
+    fn chunk_map_update_rejects_reordered_stale_generation_via_map() {
+        let chunk_map: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
+        let chunk_to_file: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
+        let fold_ids: Arc<dashmap::DashSet<ChunkId>> = Arc::new(dashmap::DashSet::new());
+        let gens: DashMap<ChunkId, u64> = DashMap::new();
+        let file_id = dfs_common::FileId::new();
+        let node = dfs_common::NodeId::new();
+
+        let make_loc = |tag: &str, written_at: u64| {
+            let hash = compute_chunk_hash(tag.as_bytes());
+            ChunkLocation {
+                chunk_id: ChunkId::from_hash(hash), nodes: vec![node], size: 4194304,
+                checksum: hash, file_offset: Some(0), written_at: Some(written_at),
+                client_write_seq: Some(7), file_id: Some(file_id), // tied cws
+            }
+        };
+        // current = newer generation, LOWER written_at; stale = retired generation,
+        // HIGHER written_at (clock skew). Both fold results.
+        let current = make_loc("gen-current", 100);
+        let stale = make_loc("gen-stale", 200);
+        fold_ids.insert(current.chunk_id);
+        fold_ids.insert(stale.chunk_id);
+        bump_chunk_generation(&gens, current.chunk_id, 5);
+        bump_chunk_generation(&gens, stale.chunk_id, 2);
+
+        // Install current, then deliver the reordered stale RCL afterward.
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, Some(&gens), file_id, &current);
+        Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, Some(&gens), file_id, &stale);
+
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].chunk_id, current.chunk_id,
+            "reordered retired-generation RCL must NOT revert the slot pointer (VM-108 repro)");
+        assert!(chunk_to_file.get(&stale.chunk_id).is_none(),
+            "the stale-generation chunk must not be indexed as current");
+
+        // Sanity: the LEGACY path (no generation map) still tie-breaks by written_at —
+        // stale would win — confirming the fix is generation-gated, not a behavior change.
+        let cm2: Arc<DashMap<dfs_common::FileId, (Vec<ChunkLocation>, u64)>> = Arc::new(DashMap::new());
+        let ctf2: Arc<DashMap<ChunkId, dfs_common::FileId>> = Arc::new(DashMap::new());
+        Server::chunk_map_update_location_for_file_sync(&cm2, &ctf2, &fold_ids, None, file_id, &current);
+        Server::chunk_map_update_location_for_file_sync(&cm2, &ctf2, &fold_ids, None, file_id, &stale);
+        let e2 = cm2.get(&file_id).unwrap();
+        assert_eq!(e2.value().0[0].chunk_id, stale.chunk_id,
+            "without generations, the old written_at tiebreak still applies (stale wins) — fix is gen-gated");
     }
 
     // ------------------------------------------------------------------
@@ -14028,7 +14189,7 @@ mod tests {
             for loc in order {
                 let mut l = loc.clone();
                 l.file_id = Some(file_id);
-                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, file_id, &l);
+                Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l);
             }
             let entry = chunk_map.get(&file_id).unwrap();
             let (locs, _) = entry.value();
@@ -14067,7 +14228,7 @@ mod tests {
         for loc in [&fold_result, &real_write] {
             let mut l = (*loc).clone();
             l.file_id = Some(file_id);
-            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, file_id, &l);
+            Server::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_ids, None, file_id,&l);
         }
         let entry = chunk_map.get(&file_id).unwrap();
         let (locs, _) = entry.value();
@@ -14158,8 +14319,68 @@ mod tests {
         // Neither chunk_id is in fold_result_chunk_ids -> both are Client-origin ->
         // falls straight through to the pre-existing written_at comparison.
         let loc_b = ChunkLocation { chunk_id: ChunkId::from_hash(hash_b), written_at: Some(50), ..loc_a.clone() };
-        assert!(Server::location_supersedes(&loc_a, &loc_b, false, false),
+        assert!(Server::location_supersedes(&loc_a, &loc_b, false, false, None, None),
             "with neither side in fold_result_chunk_ids, ordering must fall back to plain written_at comparison");
+    }
+
+    /// REPRO (2026-07-24 VM-108 dangling-pointer / fold-generation reorder).
+    /// A hot slot folds through generations G_old -> G_current. The RETIRED G_old's
+    /// ReplicateChunkLocation arrives REORDERED, after G_current's, and — because of
+    /// clock skew/drift across the folding nodes (aarch64 SBCs, NTP steps) — carries
+    /// a HIGHER `written_at`. Both are ServerFold-origin, and `fold_successor_write_seq`
+    /// is a pure max so their `client_write_seq` can TIE. location_supersedes then
+    /// falls through to `fold_then_written_at` -> plain `written_at`, so the STALE
+    /// generation wins and the slot's current pointer reverts to G_old — whose bytes
+    /// were already retired (renamed away by full_rewrite_chunk) => zero replicas =>
+    /// the MultiPatch livelock and the VM's write EIO.
+    ///
+    /// This test asserts the CORRECT outcome (stale must NOT supersede) and therefore
+    /// FAILS on the current written_at-only arbiter — it is the red repro that Fix S
+    /// (generation-ordered arbitration) must turn green.
+    #[test]
+    fn fold_reorder_stale_generation_must_not_win_over_current() {
+        let hash_current = compute_chunk_hash(b"fold-gen-current"); // newer generation
+        let hash_stale = compute_chunk_hash(b"fold-gen-stale");     // retired generation
+        let current = ChunkLocation {
+            chunk_id: ChunkId::from_hash(hash_current),
+            nodes: vec![dfs_common::NodeId::new()],
+            size: 4 * 1024 * 1024,
+            checksum: hash_current,
+            file_offset: Some(0),
+            written_at: Some(100),      // lower wall-clock
+            client_write_seq: Some(5),
+            file_id: None,
+        };
+        let stale = ChunkLocation {
+            chunk_id: ChunkId::from_hash(hash_stale),
+            written_at: Some(200),      // higher wall-clock (skew/drift) — the trap
+            client_write_seq: Some(5),  // TIES with current (pure-max fold seq)
+            ..current.clone()
+        };
+
+        // incoming = stale (reordered, arrives later); existing = current; both folds.
+        // Generations: stale is the RETIRED (older) generation (lower new_chunk_seq),
+        // current is newer. With generation authoritative, the stale one must lose
+        // despite its higher written_at and tied client_write_seq.
+        let stale_gen = Some(2u64);
+        let current_gen = Some(5u64);
+        assert!(
+            !Server::location_supersedes(&stale, &current, true, true, stale_gen, current_gen),
+            "a retired-generation fold RCL must NOT supersede the current generation \
+             just because clock skew handed it a higher written_at (VM-108 repro)",
+        );
+        // And the current generation, arriving against the stale one, MUST win.
+        assert!(
+            Server::location_supersedes(&current, &stale, true, true, current_gen, stale_gen),
+            "the newer generation must supersede the retired one regardless of written_at",
+        );
+        // Guard the demotion: with generations ABSENT (legacy/unknown), the old
+        // written_at fallback still applies — a higher written_at still wins. This
+        // documents that the fix is generation-gated, not a blanket written_at change.
+        assert!(
+            Server::location_supersedes(&stale, &current, true, true, None, None),
+            "with no generation info, ordering must fall back to the pre-existing written_at rule",
+        );
     }
 
     /// Regression tests for the write_seq gap-detection defense-in-depth added

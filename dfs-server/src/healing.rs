@@ -299,6 +299,24 @@ pub struct HealingManager {
     /// is eventually fixed/replaced. Cleared on any successful heal of that chunk.
     heal_push_failure: Arc<DashMap<ChunkId, (Instant, u32)>>,
 
+    /// Dispatch-priority override for chunks that have failed/stalled at least once,
+    /// separate from pending_healing's `detected_at` (which must stay the ORIGINAL
+    /// first-detection time — cleanup_stale_pending's staleness bound depends on it
+    /// never resetting, or a chronically-failing chunk could never age out). Without
+    /// this, heal_queue_sort_key's oldest-first ordering means a chunk that just
+    /// stalled or failed a push looks like the MOST urgent candidate the instant it
+    /// becomes eligible again (it's technically been "detected" the longest) and jumps
+    /// to the FRONT of dispatch — starving chunks that are genuinely waiting their
+    /// normal turn behind a doomed/flaky one that will likely just fail again. Touched
+    /// (Instant::now()) at every failure/stall point (drain_heal_queue's heal-failed
+    /// and heal-timed-out arms, and discovery's 0-alive-nodes stall) so the sort key
+    /// (see its read site) uses "time since last failure" instead of "time since first
+    /// detection" for any chunk that has ever failed — it re-earns front-of-queue
+    /// priority only by going a while without failing again, same durability urgency
+    /// otherwise unchanged. Absent entry (never failed) falls back to detected_at, so
+    /// normal chunks are completely unaffected. Cleared alongside pending_healing.
+    requeue_priority: Arc<DashMap<ChunkId, Instant>>,
+
     /// Two-cycle orphan guard: chunk IDs that were absent from live_chunk_ids in the
     /// previous discovery pass. Only purged when absent in two consecutive passes.
     /// This prevents premature orphan-purge when the leader's metadata DB is temporarily
@@ -471,6 +489,7 @@ impl HealingManager {
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
             stalled_healing: Arc::new(RwLock::new(HashSet::new())),
             heal_push_failure: Arc::new(DashMap::new()),
+            requeue_priority: Arc::new(DashMap::new()),
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
             heal_transfer_timeout_secs,
             phantom_reconcile_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -852,6 +871,7 @@ impl HealingManager {
     /// longer relevant) and clear its persisted detection time.
     async fn clear_pending(&self, chunk_id: &ChunkId) {
         Self::clear_pending_static(&self.pending_healing, &self.metadata, chunk_id).await;
+        self.requeue_priority.remove(chunk_id);
     }
 
     /// A fold is about to retire `chunk_id` as the base it's consolidating —
@@ -924,15 +944,16 @@ impl HealingManager {
             .unwrap_or(false)
     }
 
-    /// Decide whether an under-RF chunk that is NOT referenced by any live file should
-    /// be dropped from the heal queue as an orphan, rather than healed (which would fail
-    /// content-hash verification forever, since the id is stale). Only acts on a
-    /// trustworthy view: `all_online` (a peer being offline could be the sole holder of
-    /// the file reference, so "unreferenced" wouldn't be safe to trust) AND `self_settled`
-    /// (a freshly-restarted node's chunk_map can lag and mislabel a live chunk). Purely a
-    /// queue decision — never deletes the chunk; the age-gated orphan sweep owns deletion.
-    fn should_dequeue_orphan(is_referenced: bool, all_online: bool, self_settled: bool) -> bool {
-        !is_referenced && all_online && self_settled
+    /// Are this deep pass's orphan-dequeue candidates (pending chunks the durable
+    /// `live` set doesn't recognize) trustworthy enough to act on? An empty `live`
+    /// while there IS pending work outstanding is the signature of a not-yet-converged
+    /// FILE_TABLE (e.g. moments after a leader election) — not evidence that every
+    /// pending chunk is genuinely orphaned. In that case nothing should be treated as
+    /// orphaned this pass; a later, converged pass will still find the same real
+    /// orphans (self-correcting, since this only ever drops from the heal QUEUE —
+    /// the disk orphan sweep, not this check, owns actual deletion).
+    fn orphan_candidates_are_trustworthy(live_is_empty: bool, pending_is_empty: bool) -> bool {
+        !(live_is_empty && !pending_is_empty)
     }
 
     /// May this cycle declare a 0-replica chunk permanently lost and purge it?
@@ -2001,6 +2022,22 @@ impl HealingManager {
         struct ScanResult {
             /// Locations to verify with HasChunks this cycle.
             chunks_to_check: Vec<ChunkLocation>,
+            /// Fix (orphan-heal clog, 2026-07-24): chunk_ids from pending_healing that
+            /// the deep pass's own durable live-set does NOT recognize — true orphans
+            /// (superseded/retired chunk_ids with a lingering CHUNK_TABLE row) that
+            /// would otherwise cycle in the heal queue forever, since PushChunkTo can
+            /// never verify a stale id. Computed by reusing `live` (already fetched to
+            /// filter chunks_to_check below — zero extra scan cost) rather than a
+            /// separate in-memory chunk_map crawl: two DIFFERENT liveness views can
+            /// disagree right after a restart (chunk_map is rebuilt on a background
+            /// thread and fed by live traffic with no convergence guarantee tied to
+            /// wall-clock uptime — this caused a real T38 regression, a genuinely-live
+            /// chunk wrongly dequeued because chunk_map hadn't caught up yet), whereas
+            /// this and the chunks_to_check filter share one read transaction and can
+            /// never disagree with each other. Always empty on the shallow pass (no
+            /// fresh `live` there — see should_apply_orphan_dequeue's doc comment for
+            /// why we don't act without one).
+            orphaned_pending: Vec<ChunkId>,
         }
 
         // Fast path: no sled scan at all. We fetch locations only for chunks already
@@ -2037,8 +2074,9 @@ impl HealingManager {
                     Err(_) => {}
                 }
             }
-            ScanResult { chunks_to_check }
+            ScanResult { chunks_to_check, orphaned_pending: Vec::new() }
         } else {
+            let pending_snapshot_for_orphans = pending_snapshot.clone();
             tokio::task::spawn_blocking(move || {
                 let live = metadata_scan.live_chunk_ids()?;
 
@@ -2051,7 +2089,23 @@ impl HealingManager {
                     true
                 })?;
 
-                Ok::<_, anyhow::Error>(ScanResult { chunks_to_check })
+                // See ScanResult::orphaned_pending's doc comment. Safety: an empty
+                // `live` while pending work is outstanding means this node's FILE_TABLE
+                // hasn't converged (e.g. moments after a leader election), not that
+                // every pending chunk is genuinely orphaned — treat nothing as orphaned
+                // this pass rather than risk wiping the whole queue in one shot.
+                let orphaned_pending = if Self::orphan_candidates_are_trustworthy(
+                    live.is_empty(), pending_snapshot_for_orphans.is_empty(),
+                ) {
+                    pending_snapshot_for_orphans.iter()
+                        .filter(|id| !live.contains(id))
+                        .copied()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                Ok::<_, anyhow::Error>(ScanResult { chunks_to_check, orphaned_pending })
             })
             .await
             .context("spawn_blocking for chunk scan panicked")??
@@ -2065,7 +2119,18 @@ impl HealingManager {
             return Ok(());
         }
 
-        let ScanResult { chunks_to_check } = scan_result;
+        let ScanResult { chunks_to_check, orphaned_pending } = scan_result;
+        // Modest additional settle floor (process uptime), defense-in-depth alongside
+        // the live-set-trustworthiness check above — cheap, and this node's own recent
+        // restart is exactly when its local metadata is least likely to have finished
+        // syncing. Non-destructive/self-correcting either way (see ScanResult's doc
+        // comment), so this does not need SELF_RESTART_GRACE_SECS's full 20 minutes.
+        let orphan_dequeues: Vec<ChunkId> =
+            if self.local_started_at.elapsed().as_secs() >= ORPHAN_DEQUEUE_SETTLE_SECS {
+                orphaned_pending
+            } else {
+                Vec::new()
+            };
 
         // work carries (chunk_id, status, confirmed_alive_node_ids) from the bulk scan.
         let mut work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = Vec::new();
@@ -2257,39 +2322,6 @@ impl HealingManager {
         //
         // Note: chunks_to_check now carries full ChunkLocation records from the sled
         // scan, so we don't need a per-chunk DB lookup here.
-        // Fix (orphan-heal clog, 2026-07-24): an under-RF chunk that no live file
-        // references is an orphan — its lingering 1-replica routing row sits ahead of
-        // the age-gated sweep, and the shallow discovery pass otherwise re-heals it
-        // every cycle, each PushChunkTo failing content-hash verification forever (the
-        // id is stale, so the bytes never match). Drop such chunks from the heal queue
-        // so they stop clogging it and starving legitimate heals. Purely a queue
-        // decision — the disk orphan sweep still owns actual deletion. Gated on a
-        // trustworthy view: all nodes online (so "unreferenced" isn't just a peer being
-        // offline holding the only file reference) AND this node settled since restart
-        // (so its chunk_map isn't stale enough to mislabel a genuinely-live chunk).
-        // Both mirror the destructive paths' gate; but this is non-destructive and
-        // self-correcting (a mis-drop is re-added by the next deep scan if still under-RF).
-        let (all_online, self_settled) = {
-            let all_nodes = self.cluster.get_all_nodes().await;
-            let online = all_nodes.iter()
-                .filter(|n| n.status == dfs_common::NodeStatus::Online)
-                .count();
-            (!all_nodes.is_empty() && online == all_nodes.len(),
-             self.local_started_at.elapsed().as_secs() >= ORPHAN_DEQUEUE_SETTLE_SECS)
-        };
-        // Only pay for the O(n) live-set crawl when we could actually act on it — i.e.
-        // the cluster is healthy and this node is settled. During a node-down or
-        // just-restarted window (exactly when real client ops are most contended and the
-        // "unreferenced" verdict is least trustworthy) we skip it entirely, so this
-        // orphan check never competes with real work when the system is under stress.
-        let orphan_gate = all_online && self_settled;
-        let live_referenced = if orphan_gate {
-            self.live_chunk_ids_from_chunk_map()
-        } else {
-            HashSet::new()
-        };
-        let mut orphan_dequeues: Vec<ChunkId> = Vec::new();
-
         let mut classify_count = 0usize;
         for location in chunks_to_check {
             let chunk_id = location.chunk_id;
@@ -2307,15 +2339,6 @@ impl HealingManager {
                 // unconditionally) stays in the reported heal queue forever, even
                 // though there is deliberately nothing left to do for it.
                 self.clear_pending(&chunk_id).await;
-                continue;
-            }
-
-            // Orphan (unreferenced by any live file) — drop from the heal queue rather
-            // than re-heal a stale id forever. See the note before this loop. Batched
-            // (collected here, applied after the loop) to avoid a per-chunk DB delete
-            // under a large backlog.
-            if Self::should_dequeue_orphan(live_referenced.contains(&chunk_id), all_online, self_settled) {
-                orphan_dequeues.push(chunk_id);
                 continue;
             }
 
@@ -2570,6 +2593,7 @@ impl HealingManager {
                         // it back to pending as soon as a node that holds it comes online.
                         debug!("Chunk {} has 0 confirmed alive nodes — moving to stalled", chunk_id);
                         self.stalled_healing.write().await.insert(chunk_id);
+                        self.requeue_priority.insert(chunk_id, Instant::now());
                         // Keep first_detected timestamp in pending so we know how long
                         // it has been under-replicated, but mark it explicitly stalled.
                         self.mark_pending_deferred(chunk_id, &mut deferred_pending_marks).await;
@@ -2655,12 +2679,13 @@ impl HealingManager {
                     pending.remove(id);
                     stalled.remove(id);
                     self.heal_push_failure.remove(id);
+                    self.requeue_priority.remove(id);
                 }
             }
             deferred_pending_clears.extend(orphan_dequeues.iter().copied());
             info!(
                 "Discovery: dropped {} unreferenced-orphan chunk(s) from the heal queue \
-                 (all nodes online + settled) — deletion left to the orphan sweep",
+                 (absent from this pass's durable live-set) — deletion left to the orphan sweep",
                 orphan_dequeues.len()
             );
         }
@@ -2850,6 +2875,19 @@ impl HealingManager {
         (severity_rank, alive_count, std::cmp::Reverse(age))
     }
 
+    /// Effective age for heal_queue_sort_key's ordering — see `requeue_priority`'s
+    /// doc comment for the full rationale. `since_last_failure` (from requeue_priority,
+    /// touched at every stall/push-failure) always wins when present, so a chunk that
+    /// has failed before sorts by how recently it failed, not by its original
+    /// detection time; a chunk that has NEVER failed falls back to `since_detected`
+    /// (from pending_healing), preserving today's oldest-first behavior for the
+    /// common case.
+    fn effective_heal_priority_age(
+        since_last_failure: Option<Duration>, since_detected: Option<Duration>,
+    ) -> Duration {
+        since_last_failure.or(since_detected).unwrap_or(Duration::ZERO)
+    }
+
     /// Drain the heal queue — dispatches PushChunkTo / DeleteChunkReplica for all
     /// chunks in pending_healing that are ready (delay passed, source known, not
     /// in-flight, not stalled). Tasks are spawned-and-forgotten; in_flight_healing
@@ -2945,9 +2983,10 @@ impl HealingManager {
             {
                 let pending = self.pending_healing.read().await;
                 v.sort_by_cached_key(|(chunk_id, status, confirmed_alive)| {
-                    let age = pending.get(chunk_id)
-                        .map(|t| t.elapsed())
-                        .unwrap_or(Duration::ZERO);
+                    let age = Self::effective_heal_priority_age(
+                        self.requeue_priority.get(chunk_id).map(|t| t.elapsed()),
+                        pending.get(chunk_id).map(|t| t.elapsed()),
+                    );
                     Self::heal_queue_sort_key(*status, confirmed_alive.len(), age)
                 });
             }
@@ -3005,6 +3044,7 @@ impl HealingManager {
                 let cancelled_heals = self.cancelled_heals.clone();
                 let stalled_healing = self.stalled_healing.clone();
                 let heal_push_failure = self.heal_push_failure.clone();
+                let requeue_priority = self.requeue_priority.clone();
                 let heal_semaphore = self.heal_semaphore.clone();
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
                 let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs.load(Ordering::Relaxed));
@@ -3040,12 +3080,14 @@ impl HealingManager {
                             warn!("Heal failed for chunk {}: {} — stalling until next discovery", chunk_id, e);
                             in_flight_healing.write().await.remove(&chunk_id);
                             stalled_healing.write().await.insert(chunk_id);
+                            requeue_priority.insert(chunk_id, Instant::now());
                             None
                         }
                         Err(_) => {
                             warn!("Heal timed out for chunk {} after {}s — stalling until next discovery", chunk_id, transfer_timeout.as_secs());
                             in_flight_healing.write().await.remove(&chunk_id);
                             stalled_healing.write().await.insert(chunk_id);
+                            requeue_priority.insert(chunk_id, Instant::now());
                             None
                         }
                     }
@@ -4379,25 +4421,42 @@ mod tests {
             "1-of-N must sort before 2-of-3 even when the 2-of-3 chunk is far older");
     }
 
-    /// Orphan-heal clog fix (2026-07-24): an under-RF chunk that no live file references
-    /// is dropped from the heal queue ONLY when the view is trustworthy (all nodes
-    /// online AND this node settled). A referenced chunk is never dropped; and while a
-    /// peer is offline or this node is freshly restarted, we keep it queued rather than
-    /// risk mislabeling a genuinely-live chunk as an orphan.
+    /// Orphan-heal clog fix (2026-07-24, redesigned after a real T38 regression): the
+    /// orphan-dequeue candidate set is trustworthy UNLESS `live` came back empty while
+    /// there's real pending work — that specific combination is the signature of a
+    /// not-yet-converged FILE_TABLE, not genuine mass orphaning.
     #[test]
-    fn orphan_is_dequeued_only_when_unreferenced_and_view_is_trustworthy() {
-        // The clog case: unreferenced, full healthy view → drop it.
-        assert!(HealingManager::should_dequeue_orphan(false, true, true));
+    fn orphan_candidates_are_trustworthy_unless_live_is_suspiciously_empty() {
+        // Normal cases: live has entries → trust the candidate set either way.
+        assert!(HealingManager::orphan_candidates_are_trustworthy(false, true));
+        assert!(HealingManager::orphan_candidates_are_trustworthy(false, false));
+        // No pending work outstanding → nothing to distrust regardless of live's state.
+        assert!(HealingManager::orphan_candidates_are_trustworthy(true, true));
 
-        // Referenced chunk is never an orphan, regardless of view.
-        assert!(!HealingManager::should_dequeue_orphan(true, true, true));
+        // The red flag: live is empty AND there IS pending work — don't trust it as
+        // "everything is orphaned"; more likely this node's metadata hasn't converged.
+        assert!(!HealingManager::orphan_candidates_are_trustworthy(true, false),
+            "an empty live-set with real pending work outstanding must not be trusted \
+             as evidence everything is orphaned — could be a not-yet-converged FILE_TABLE");
+    }
 
-        // Unreferenced but untrustworthy view → keep it queued (don't act on a partial
-        // membership or a stale post-restart chunk_map).
-        assert!(!HealingManager::should_dequeue_orphan(false, false, true),
-            "a peer being offline could hold the only file reference — don't drop");
-        assert!(!HealingManager::should_dequeue_orphan(false, true, false),
-            "a freshly-restarted node's chunk_map can mislabel a live chunk — don't drop");
+    /// Regression test for the real T38 failure this redesign fixes (2026-07-24): a
+    /// chunk genuinely referenced by a live file's chunk_locations must NEVER appear in
+    /// orphaned_pending, because it's computed as pending_snapshot MINUS the exact same
+    /// durable `live` set already trusted to build chunks_to_check — by construction, a
+    /// chunk present in live can't also end up in the orphan difference.
+    #[test]
+    fn a_chunk_present_in_the_durable_live_set_is_never_in_the_orphan_difference() {
+        let live: HashSet<ChunkId> = [ChunkId::from_hash(compute_chunk_hash(b"genuinely-live"))]
+            .into_iter().collect();
+        let pending_snapshot = live.clone();
+        let orphaned_pending: Vec<ChunkId> = pending_snapshot.iter()
+            .filter(|id| !live.contains(id))
+            .copied()
+            .collect();
+        assert!(orphaned_pending.is_empty(),
+            "a chunk_id present in `live` must never be computed as an orphan, regardless \
+             of any other node's or subsystem's view — same source, same read transaction");
     }
 
     /// UnderReplicated must always outrank OverReplicated — restoring durability
@@ -4426,6 +4485,45 @@ mod tests {
             ReplicationStatus::UnderReplicated, 2, Duration::from_secs(1),
         );
         assert!(older < newer, "older entry must still sort first when severity and alive count are equal");
+    }
+
+    /// requeue_priority fix (2026-07-24): a chunk that has failed/stalled before must
+    /// sort by time-since-that-failure, NOT its original detection time — otherwise a
+    /// flaky/doomed chunk that keeps failing looks like the MOST urgent candidate the
+    /// instant it becomes eligible again (oldest-detected) and jumps to the front of
+    /// dispatch, starving chunks genuinely waiting their normal turn.
+    #[test]
+    fn effective_heal_priority_age_prefers_last_failure_over_original_detection() {
+        // No failure history: falls back to original detection time, unchanged from
+        // today's behavior for the common (never-failed) case.
+        assert_eq!(
+            HealingManager::effective_heal_priority_age(None, Some(Duration::from_secs(9999))),
+            Duration::from_secs(9999),
+        );
+
+        // Failed before: even though this chunk was detected ages ago (would sort
+        // FIRST / front-of-queue under the old oldest-first-only logic), a RECENT
+        // failure means it must sort as young/back-of-queue instead.
+        let age = HealingManager::effective_heal_priority_age(
+            Some(Duration::from_secs(1)), Some(Duration::from_secs(9999)),
+        );
+        assert_eq!(age, Duration::from_secs(1),
+            "a chunk that JUST failed must sort by that recency, not by how long ago it was first detected");
+
+        // End-to-end via the real sort key: a chunk detected long ago but that failed
+        // moments ago must sort AFTER (not before) a chunk that has been quietly
+        // waiting the whole time with no failure at all.
+        let just_failed_but_ancient = HealingManager::heal_queue_sort_key(
+            ReplicationStatus::UnderReplicated, 1,
+            HealingManager::effective_heal_priority_age(Some(Duration::from_secs(1)), Some(Duration::from_secs(9999))),
+        );
+        let never_failed_genuinely_old = HealingManager::heal_queue_sort_key(
+            ReplicationStatus::UnderReplicated, 1,
+            HealingManager::effective_heal_priority_age(None, Some(Duration::from_secs(500))),
+        );
+        assert!(never_failed_genuinely_old < just_failed_but_ancient,
+            "a chunk that just failed must not jump ahead of a chunk that has been \
+             quietly, successfully waiting its turn without ever failing");
     }
 
     #[tokio::test]

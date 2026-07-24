@@ -694,7 +694,6 @@ impl HealingManager {
     ///   healing_delay_secs so new under-replicated chunks are discovered within one
     ///   delay window. Same scoped-per-node approach.
     async fn run_discovery_loop(&self) {
-        let mut cycle_counter = 0u32;
         let mut cleanup_counter = 0u32;
         let mut disk_sweep_counter = 0u32;
         let mut was_leader = false;
@@ -717,11 +716,6 @@ impl HealingManager {
             if is_leader != was_leader {
                 if is_leader {
                     info!("This node is now the cluster leader — taking over healing coordination");
-                    // Reset cycle_counter so the first scan after a leadership change is
-                    // always a deep scan. Without this, cycle_counter may be at an arbitrary
-                    // value and the fast-path condition (% deep_every == 1) might not fire
-                    // for many cycles, delaying discovery of under-replicated chunks.
-                    cycle_counter = 0;
                 } else {
                     info!("This node is no longer the cluster leader — yielding healing to new leader");
                 }
@@ -773,13 +767,26 @@ impl HealingManager {
                 continue;
             }
 
-            // Deep scan every healing_delay_secs (rounded to whole 60s cycles, minimum 1).
-            // This ensures new under-replicated chunks are discovered within one healing delay
-            // window — the same responsiveness guarantee the delay provides for known chunks.
-            let deep_every = ((self.healing_delay_secs.load(Ordering::Relaxed) + 59) / 60).max(1) as u32;
-            cycle_counter += 1;
-            let deep = cycle_counter % deep_every == 1; // first cycle after becoming leader is always deep
-            if let Err(e) = self.run_discovery_pass(deep).await {
+            // Every cycle is now a deep scan (2026-07-24). The shallow/deep split existed
+            // because a deep pass — two full CHUNK_TABLE scans via live_chunk_ids() +
+            // scan_chunk_locations() — was expensive enough that running it every 60s
+            // wasn't affordable, so it was rationed to once per healing_delay_secs.
+            // scan_live_chunk_locations (one combined CHUNK_TABLE pass) removed that cost:
+            // confirmed live at ~5-14s per pass against a large table, vs. 15-20+ minutes
+            // before. Runnable every cycle now, which matters beyond just being
+            // affordable: dispatch (drain_heal_queue) has no working pre-flight orphan
+            // check of its own (the existing "superseded-generation guard" in
+            // do_heal_chunk_shared is dead code — it reads FileMetadata.chunk_locations,
+            // which is never populated post-2026-07-16, see put_file_in_txn's doc
+            // comment) — it relies entirely on discovery's orphan-dequeue to keep the
+            // queue clean. At the old ~5-minute deep cadence, a freshly-orphaned chunk
+            // could sit in the queue for up to 5 minutes getting repeatedly dispatched
+            // and failing content-hash verification before the next deep pass caught it —
+            // confirmed live: a 500-line log window during that gap was 0 successes /
+            // 252 failures, effectively all dispatch capacity wasted. Now every ~60s
+            // cycle both discovers new under-replication AND re-runs the orphan-dequeue,
+            // shrinking that wasted-capacity window roughly 5x.
+            if let Err(e) = self.run_discovery_pass(true).await {
                 warn!("Discovery pass error: {}", e);
             }
 

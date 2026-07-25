@@ -3458,7 +3458,7 @@ impl Server {
     ///
     /// Returns true on a full tie, i.e. "incoming is at least as new" — callers use
     /// this to accept the later-seen of two indistinguishable rows.
-    fn location_supersedes(
+    pub(crate) fn location_supersedes(
         incoming: &ChunkLocation,
         existing: &ChunkLocation,
         incoming_is_fold: bool,
@@ -3939,6 +3939,20 @@ impl Server {
     /// doc comment on the struct.
     pub fn compaction_quiescing_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.compaction_quiescing.clone()
+    }
+
+    /// Shared fold-result-origin set — passed to HealingManager so its
+    /// superseded-generation detection (see HealingManager's
+    /// superseded_generation_chunk_ids) can use the exact same
+    /// location_supersedes tiebreak the read/write path already trusts, instead
+    /// of a separately-maintained approximation.
+    pub fn fold_result_chunk_ids_ref(&self) -> Arc<dashmap::DashSet<ChunkId>> {
+        self.fold_result_chunk_ids.clone()
+    }
+
+    /// Shared per-slot generation map — see fold_result_chunk_ids_ref's doc comment.
+    pub fn chunk_generations_ref(&self) -> Arc<DashMap<ChunkId, u64>> {
+        self.chunk_generations.clone()
     }
 
     /// Marks every compaction_quiescing-respecting writer (fold_slot_now,
@@ -14688,7 +14702,8 @@ mod tests {
         let healing = Arc::new(HealingManager::new(
             storage.clone(), metadata.clone(), cluster.clone(), client,
             Arc::new(std::sync::atomic::AtomicUsize::new(3)), 300, 24, true,
-            Arc::new(DashMap::new()), Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             100, 60.0, 8, 3, 120,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ));

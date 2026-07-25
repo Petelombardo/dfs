@@ -167,6 +167,33 @@ pub struct HealingManager {
     /// hasn't caught up yet" for "patch-superseded" — see reconcile_live_file_candidates.
     chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
 
+    /// Same Arc as Server::fold_result_chunk_ids / Server::chunk_generations —
+    /// needed to call Server::location_supersedes with full fidelity when
+    /// resolving which chunk_id currently owns a (file_id, chunk_idx) slot (see
+    /// superseded_generation_chunk_ids). Without these, a same-client_write_seq
+    /// tie (rare, but exactly what the 2026-07-24 VM-108 dangling-pointer bug
+    /// hit) would fall back to a same-generation/unknown-generation heuristic
+    /// instead of the authoritative tiebreak the read path itself uses — this
+    /// scan can then run destructive disk deletes (via run_disk_orphan_sweep),
+    /// so it must resolve ties the exact same way reads do, not an approximation.
+    fold_result_chunk_ids: Arc<dashmap::DashSet<ChunkId>>,
+    chunk_generations: Arc<DashMap<ChunkId, u64>>,
+
+    /// Chunk_ids that are file_id-live (their file still exists) but lost the
+    /// supersession contest for their (file_id, chunk_idx) slot to a newer
+    /// generation — i.e. a stale routing row CHUNK_TABLE never pruned when the
+    /// slot moved on, invisible to live_chunk_ids()'s file-existence-only check.
+    /// Recomputed once per deep discovery pass (run_discovery_pass) as a
+    /// byproduct of the scan it already does — see ScanResult::slot_losers —
+    /// and consulted by both the discovery classification loop (so these never
+    /// get queued as under-replicated / never occupy a dispatch slot) and
+    /// run_disk_orphan_sweep (so they're finally eligible for the existing
+    /// age-gated + leader-confirmed physical-delete pipeline instead of being
+    /// permanently invisible to it). Cached rather than recomputed by each
+    /// reader: both consumers would otherwise pay for their own full CHUNK_TABLE
+    /// scan+group every cycle for data the deep pass already produced.
+    superseded_generation_chunk_ids: Arc<RwLock<HashSet<ChunkId>>>,
+
     /// Cluster manager
     cluster: Arc<ClusterManager>,
 
@@ -404,6 +431,8 @@ impl HealingManager {
         scrub_interval_hours: u64,
         auto_heal: bool,
         chunk_map: Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
+        fold_result_chunk_ids: Arc<dashmap::DashSet<ChunkId>>,
+        chunk_generations: Arc<DashMap<ChunkId, u64>>,
         last_cluster_write_ms: Arc<std::sync::atomic::AtomicU64>,
         link_bandwidth_mb: usize,
         heal_max_pct_config: f64,
@@ -467,6 +496,9 @@ impl HealingManager {
             storage,
             metadata,
             chunk_map,
+            fold_result_chunk_ids,
+            chunk_generations,
+            superseded_generation_chunk_ids: Arc::new(RwLock::new(HashSet::new())),
             cluster,
             client,
             replication_factor,
@@ -1697,6 +1729,13 @@ impl HealingManager {
         // handler and never has that gap. Taking the union means a chunk is only
         // ever treated as "not live" if BOTH sources agree it's gone.
         let live_from_chunk_map = self.live_chunk_ids_from_chunk_map();
+        // See superseded_generation_chunk_ids's doc comment: chunks that ARE
+        // file_id-live (so they'd otherwise pass the live_chunks check below and
+        // be "kept" forever) but lost their slot's supersession contest to a
+        // newer generation. Without this, this sweep — the ONLY thing that
+        // physically deletes chunk bytes off disk — could never touch this class
+        // of stale row, no matter how long it sat there.
+        let superseded_generations = self.superseded_generation_chunk_ids.read().await.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let mut live_chunks = metadata.live_chunk_ids()?;
@@ -1739,7 +1778,8 @@ impl HealingManager {
                 // under-replicated. Route every case uniformly through the same
                 // leader-confirm + cluster-stability gate below instead of deleting
                 // on local metadata alone.
-                if loc_record.is_some() && live_chunks.contains(chunk_id) {
+                if loc_record.is_some() && live_chunks.contains(chunk_id)
+                    && !superseded_generations.contains(chunk_id) {
                     kept += 1;
                     continue;
                 }
@@ -2045,6 +2085,24 @@ impl HealingManager {
             /// fresh `live` there — see should_apply_orphan_dequeue's doc comment for
             /// why we don't act without one).
             orphaned_pending: Vec<ChunkId>,
+            /// Fix (superseded-generation clog, 2026-07-25): chunk_ids that ARE
+            /// file_id-live (so `live` above includes them — their file genuinely
+            /// exists) but lost the supersession contest for their own
+            /// (file_id, chunk_idx) slot to a different, newer chunk_id — a
+            /// generation CHUNK_TABLE never pruned when the slot moved on. Root
+            /// cause confirmed live on staging 2026-07-24/25: `live_chunk_ids()`
+            /// only ever checks "does file_id resolve", by design (see its doc
+            /// comment) — it was never meant to also confirm "is this exact
+            /// chunk_id still current", so this class of stale row is invisible
+            /// to both the orphan-dequeue diff above AND run_disk_orphan_sweep's
+            /// candidate gate (both are downstream of the same file_id-only
+            /// oracle). PushChunkTo can never heal one (its on-disk bytes no
+            /// longer match this retired generation's hash — "content hash
+            /// mismatch"), so left alone it cycles in the queue forever. Resolved
+            /// here as a byproduct of the same scan (group chunks_to_check by
+            /// slot, keep only the location_supersedes winner) rather than a
+            /// second CHUNK_TABLE pass.
+            slot_losers: Vec<ChunkId>,
         }
 
         // Fast path: no sled scan at all. We fetch locations only for chunks already
@@ -2081,9 +2139,11 @@ impl HealingManager {
                     Err(_) => {}
                 }
             }
-            ScanResult { chunks_to_check, orphaned_pending: Vec::new() }
+            ScanResult { chunks_to_check, orphaned_pending: Vec::new(), slot_losers: Vec::new() }
         } else {
             let pending_snapshot_for_orphans = pending_snapshot.clone();
+            let fold_result_chunk_ids = self.fold_result_chunk_ids.clone();
+            let chunk_generations = self.chunk_generations.clone();
             tokio::task::spawn_blocking(move || {
                 // Combined single CHUNK_TABLE pass (see scan_live_chunk_locations's doc
                 // comment) — was two separate full scans (live_chunk_ids then
@@ -2109,7 +2169,44 @@ impl HealingManager {
                     Vec::new()
                 };
 
-                Ok::<_, anyhow::Error>(ScanResult { chunks_to_check, orphaned_pending })
+                // See ScanResult::slot_losers's doc comment. Group the already-fetched
+                // file_id-live rows by (file_id, chunk_idx) and keep only the
+                // location_supersedes winner per slot — same tiebreak the read path
+                // (chunk_locations_for_info) and the fold path use, so this can never
+                // pick a different "current" chunk than a live read would. Rows
+                // without a file_offset can't be slot-deduped (no chunk_idx to group
+                // by) and are left untouched, same as chunk_locations_for_info does.
+                const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                let mut slot_winners: std::collections::HashMap<(dfs_common::FileId, u64), &ChunkLocation> =
+                    std::collections::HashMap::new();
+                for loc in &chunks_to_check {
+                    let (Some(file_id), Some(offset)) = (loc.file_id, loc.file_offset) else {
+                        continue;
+                    };
+                    let key = (file_id, offset / CHUNK_SIZE);
+                    match slot_winners.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            let cur = *e.get();
+                            if crate::server::Server::location_supersedes(
+                                loc, cur,
+                                fold_result_chunk_ids.contains(&loc.chunk_id),
+                                fold_result_chunk_ids.contains(&cur.chunk_id),
+                                chunk_generations.get(&loc.chunk_id).map(|v| *v),
+                                chunk_generations.get(&cur.chunk_id).map(|v| *v),
+                            ) {
+                                e.insert(loc);
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => { e.insert(loc); }
+                    }
+                }
+                let slot_winner_ids: HashSet<ChunkId> = slot_winners.values().map(|l| l.chunk_id).collect();
+                let slot_losers: Vec<ChunkId> = chunks_to_check.iter()
+                    .filter(|loc| loc.file_offset.is_some() && !slot_winner_ids.contains(&loc.chunk_id))
+                    .map(|loc| loc.chunk_id)
+                    .collect();
+
+                Ok::<_, anyhow::Error>(ScanResult { chunks_to_check, orphaned_pending, slot_losers })
             })
             .await
             .context("spawn_blocking for chunk scan panicked")??
@@ -2123,7 +2220,7 @@ impl HealingManager {
             return Ok(());
         }
 
-        let ScanResult { chunks_to_check, orphaned_pending } = scan_result;
+        let ScanResult { chunks_to_check, orphaned_pending, slot_losers } = scan_result;
         // Modest additional settle floor (process uptime), defense-in-depth alongside
         // the live-set-trustworthiness check above — cheap, and this node's own recent
         // restart is exactly when its local metadata is least likely to have finished
@@ -2135,6 +2232,19 @@ impl HealingManager {
             } else {
                 Vec::new()
             };
+
+        // Refresh the cached slot-loser set (see superseded_generation_chunk_ids's
+        // doc comment) for run_disk_orphan_sweep and the classification loop below
+        // to both consult without paying for their own scan+group. Only a deep pass
+        // computes this (see ScanResult::slot_losers — always empty on shallow); on
+        // a shallow pass, leave the previous deep pass's set in place rather than
+        // clobbering it with an empty one — every caller runs deep-only today (see
+        // ScanResult's doc comment history), but this keeps the cache correct even
+        // if a shallow caller is reintroduced later.
+        let slot_losers: HashSet<ChunkId> = slot_losers.into_iter().collect();
+        if deep {
+            *self.superseded_generation_chunk_ids.write().await = slot_losers.clone();
+        }
 
         // work carries (chunk_id, status, confirmed_alive_node_ids) from the bulk scan.
         let mut work: Vec<(ChunkId, ReplicationStatus, Vec<NodeId>)> = Vec::new();
@@ -2342,6 +2452,21 @@ impl HealingManager {
                 // healing file` trigger, which marks every chunk in a file
                 // unconditionally) stays in the reported heal queue forever, even
                 // though there is deliberately nothing left to do for it.
+                self.clear_pending(&chunk_id).await;
+                continue;
+            }
+
+            if slot_losers.contains(&chunk_id) {
+                // See ScanResult::slot_losers's doc comment: file_id-live but not
+                // this slot's current generation — never worth healing (its bytes
+                // can never verify against this retired chunk_id) and must not sit
+                // in pending_healing occupying a dispatch slot or a queue-depth
+                // count. Non-destructive here — same as the patch-token skip above,
+                // this only drops the in-memory/durable heal-queue bookkeeping.
+                // Actual physical deletion still goes through run_disk_orphan_sweep's
+                // full age-gate + leader-confirm pipeline (see
+                // superseded_generation_chunk_ids's doc comment), same as any other
+                // live-file orphan candidate.
                 self.clear_pending(&chunk_id).await;
                 continue;
             }
@@ -2691,6 +2816,15 @@ impl HealingManager {
                 "Discovery: dropped {} unreferenced-orphan chunk(s) from the heal queue \
                  (absent from this pass's durable live-set) — deletion left to the orphan sweep",
                 orphan_dequeues.len()
+            );
+        }
+
+        if deep && !slot_losers.is_empty() {
+            info!(
+                "Discovery: found {} superseded-generation chunk(s) this pass — file-live but not \
+                 their slot's current generation, excluded from healing and queued as disk-orphan \
+                 sweep candidates",
+                slot_losers.len()
             );
         }
 
@@ -4398,7 +4532,8 @@ mod tests {
 
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
-            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
@@ -4545,7 +4680,8 @@ mod tests {
 
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 2, 24, true,
-            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ); // 2s delay
 
@@ -4597,7 +4733,8 @@ mod tests {
         // already elapsed before restart must carry over.
         let healing = HealingManager::new(
             storage, metadata, cluster, client, Arc::new(AtomicUsize::new(3)), 10, 24, true,
-            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
@@ -4621,7 +4758,8 @@ mod tests {
         let client = Arc::new(NetworkClient::new());
         let healing = HealingManager::new(
             storage.clone(), metadata.clone(), cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
-            Arc::new(DashMap::new()), Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 8, 3, 120,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         (storage, metadata, healing, temp_storage, temp_metadata)

@@ -359,6 +359,8 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
         config.replication.scrub_interval_hours,
         config.replication.auto_heal,
         server.chunk_map_ref(),
+        server.fold_result_chunk_ids_ref(),
+        server.chunk_generations_ref(),
         server.last_cluster_write_ms(),
         config.replication.link_bandwidth_mb.expect("resolved by load_or_migrate_healing_tuning"),
         config.replication.heal_max_pct.expect("resolved by load_or_migrate_healing_tuning"),

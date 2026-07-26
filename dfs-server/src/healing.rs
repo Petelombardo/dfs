@@ -1729,13 +1729,9 @@ impl HealingManager {
         // handler and never has that gap. Taking the union means a chunk is only
         // ever treated as "not live" if BOTH sources agree it's gone.
         let live_from_chunk_map = self.live_chunk_ids_from_chunk_map();
-        // See superseded_generation_chunk_ids's doc comment: chunks that ARE
-        // file_id-live (so they'd otherwise pass the live_chunks check below and
-        // be "kept" forever) but lost their slot's supersession contest to a
-        // newer generation. Without this, this sweep — the ONLY thing that
-        // physically deletes chunk bytes off disk — could never touch this class
-        // of stale row, no matter how long it sat there.
-        let superseded_generations = self.superseded_generation_chunk_ids.read().await.clone();
+        // superseded_generation_chunk_ids is intentionally NOT consulted here anymore —
+        // see the NOTE at its use site below (removed 2026-07-26) for why gating physical
+        // deletion on this node-local, unreconciled generation map was unsafe.
 
         let result = tokio::task::spawn_blocking(move || {
             let mut live_chunks = metadata.live_chunk_ids()?;
@@ -1778,8 +1774,24 @@ impl HealingManager {
                 // under-replicated. Route every case uniformly through the same
                 // leader-confirm + cluster-stability gate below instead of deleting
                 // on local metadata alone.
-                if loc_record.is_some() && live_chunks.contains(chunk_id)
-                    && !superseded_generations.contains(chunk_id) {
+                // NOTE (2026-07-26): superseded_generations deliberately does NOT gate
+                // deletion here anymore. It's derived from this node's own in-memory
+                // chunk_generations/fold_result_chunk_ids (location_supersedes), which
+                // falls back to the cws/written_at tiebreak whenever either side's
+                // generation is unknown (server.rs location_supersedes) — and that map
+                // is never reconciled with peers (fold-announcement dissemination is
+                // push-only/ephemeral, see project_fold_announcement_rebroadcast_gap).
+                // authorize_live_file_orphan_deletes below only cross-checks pending
+                // PATCH state, never re-verifies the slot generation contest with the
+                // leader — so a node with an incomplete local generation map had a live
+                // path to physically delete a chunk it merely *misjudged* as retired.
+                // Confirmed on staging 2026-07-26: ~21k chunks/node flagged and hundreds
+                // of eviction batches logged since deploy, coinciding with VM-108/VM-111
+                // taking unrecoverable read I/O errors. Reverted to file_id-liveness-only
+                // gating (pre-739435c behavior) until generation state has a real
+                // cluster-reconciled source of truth. The heal-queue-exclusion half of
+                // 739435c (slot_losers skip below, non-destructive) is unaffected and stays.
+                if loc_record.is_some() && live_chunks.contains(chunk_id) {
                     kept += 1;
                     continue;
                 }

@@ -1799,6 +1799,45 @@ impl MetadataStore {
             .context("spawn_blocking panicked in get_chunk_location_async")?
     }
 
+    /// Look up many chunk locations in one read transaction. Root-caused 2026-07-27
+    /// (staging gluster1 rejoin wedge): handle_replicate_chunk_locations and its v2
+    /// sibling used to call get_chunk_location_async once per item in a for loop —
+    /// each call is its own spawn_blocking, i.e. its own tokio blocking-pool OS
+    /// thread request. A batch of ~450-500 locations (the normal size of a rejoin
+    /// catch-up push) meant ~450-500 concurrent blocking-thread requests per
+    /// incoming RPC; with several peers pushing their full backlogs at once to a
+    /// node that just came back from a long absence, measured live: thread count
+    /// 6 -> 131 and RSS 350MB -> 2.1GB in about 3 seconds, on a box with no swap.
+    /// One read txn + one table open, looping over keys in-process, is the same
+    /// primitive get_files_batch already uses for exactly this reason.
+    pub fn get_chunk_locations_batch(&self, chunk_ids: &[ChunkId]) -> Result<std::collections::HashMap<ChunkId, ChunkLocation>> {
+        let mut out = std::collections::HashMap::with_capacity(chunk_ids.len());
+        if chunk_ids.is_empty() {
+            return Ok(out);
+        }
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = txn.open_table(CHUNK_TABLE)?;
+        for chunk_id in chunk_ids {
+            let key = format!("{}", chunk_id);
+            if let Some(v) = table.get(key.as_str())? {
+                let loc = bincode::deserialize::<ChunkLocation>(v.value())
+                    .with_context(|| format!("Failed to deserialize chunk location {}", chunk_id))?;
+                out.insert(*chunk_id, loc);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Async wrapper for get_chunk_locations_batch — see its doc comment for the
+    /// incident this closes.
+    pub async fn get_chunk_locations_batch_async(self: &Arc<Self>, chunk_ids: Vec<ChunkId>) -> Result<std::collections::HashMap<ChunkId, ChunkLocation>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_chunk_locations_batch(&chunk_ids))
+            .await
+            .context("spawn_blocking panicked in get_chunk_locations_batch_async")?
+    }
+
     /// Delete chunk location.
     pub fn delete_chunk_location(&self, chunk_id: &ChunkId) -> Result<()> {
         let key = format!("{}", chunk_id);
@@ -2207,6 +2246,39 @@ impl MetadataStore {
         tokio::task::spawn_blocking(move || store.get_patch_state(&public_token))
             .await
             .context("spawn_blocking panicked in get_patch_state_async")?
+    }
+
+    /// Which of `tokens` currently have a PATCH_STATE_TABLE row, in one read
+    /// transaction — see get_chunk_locations_batch's doc comment for the incident
+    /// this closes (handle_replicate_chunk_locations called get_patch_state_async
+    /// once per under-replicated item in its loop instead of once per batch).
+    pub fn get_patch_states_present_batch(&self, tokens: &[ChunkId]) -> Result<std::collections::HashSet<ChunkId>> {
+        let mut out = std::collections::HashSet::new();
+        if tokens.is_empty() {
+            return Ok(out);
+        }
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for token in tokens {
+            let key = format!("{}", token);
+            if table.get(key.as_str())?.is_some() {
+                out.insert(*token);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Async wrapper for get_patch_states_present_batch.
+    pub async fn get_patch_states_present_batch_async(self: &Arc<Self>, tokens: Vec<ChunkId>) -> Result<std::collections::HashSet<ChunkId>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_patch_states_present_batch(&tokens))
+            .await
+            .context("spawn_blocking panicked in get_patch_states_present_batch_async")?
     }
 
     /// Every `base_chunk_id` and `delta_chunk_id` referenced by a currently-Pending
@@ -3262,6 +3334,16 @@ impl MetadataStore {
             }
         }
         Ok(out)
+    }
+
+    /// Async wrapper for get_files_batch — see get_chunk_locations_batch_async for
+    /// the incident this closes (handle_replicate_chunk_locations's file-existence
+    /// check, called once per unique file_id in a batch).
+    pub async fn get_files_batch_async(self: &Arc<Self>, ids: Vec<FileId>) -> Result<Vec<FileMetadata>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_files_batch(&ids))
+            .await
+            .context("spawn_blocking panicked in get_files_batch_async")?
     }
 
     /// Scan all file records, calling `f` for each deserialized FileMetadata.

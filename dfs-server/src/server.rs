@@ -6825,7 +6825,42 @@ impl Server {
         } else {
             std::collections::HashSet::new()
         };
-        let mut file_exists_cache: std::collections::HashMap<dfs_common::FileId, bool> = std::collections::HashMap::new();
+
+        // Prefetch, batched: two calls total regardless of batch size, instead of one
+        // spawn_blocking (one tokio blocking-pool OS thread request) per item below.
+        // Root-caused 2026-07-27 (staging gluster1 rejoin wedge) — see
+        // get_chunk_locations_batch_async's doc comment for the incident. A rejoin
+        // catch-up batch runs ~450-500 locations; at one spawn_blocking per item for
+        // both the file-existence check and the chunk-location lookup, several peers
+        // pushing their backlogs at once turned into hundreds of concurrent blocking-
+        // thread requests per incoming RPC — measured live: thread count 6 -> 131 and
+        // RSS 350MB -> 2.1GB in about 3 seconds, on a box with no swap.
+        let unique_file_ids: Vec<dfs_common::FileId> = {
+            let mut seen = std::collections::HashSet::new();
+            locations.iter().filter_map(|l| l.file_id).filter(|fid| seen.insert(*fid)).collect()
+        };
+        let file_exists: std::collections::HashSet<dfs_common::FileId> = if unique_file_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            match self.metadata.get_files_batch_async(unique_file_ids).await {
+                Ok(files) => files.into_iter().map(|f| f.id).collect(),
+                Err(e) => {
+                    warn!("handle_replicate_chunk_locations: failed to batch-load file existence: {}", e);
+                    std::collections::HashSet::new()
+                }
+            }
+        };
+        let unique_chunk_ids: Vec<ChunkId> = {
+            let mut seen = std::collections::HashSet::new();
+            locations.iter().map(|l| l.chunk_id).filter(|cid| seen.insert(*cid)).collect()
+        };
+        let existing_locations = match self.metadata.get_chunk_locations_batch_async(unique_chunk_ids).await {
+            Ok(map) => map,
+            Err(e) => {
+                warn!("handle_replicate_chunk_locations: failed to batch-load existing chunk locations: {}", e);
+                std::collections::HashMap::new()
+            }
+        };
 
         let mut rejected = 0usize;
         let mut under_replicated: Vec<ChunkId> = Vec::new();
@@ -6839,15 +6874,7 @@ impl Server {
         for location in &locations {
             // Reject orphans: see the comment above this loop.
             let is_live = match location.file_id {
-                Some(fid) => {
-                    if let Some(exists) = file_exists_cache.get(&fid) {
-                        *exists
-                    } else {
-                        let exists = self.metadata.get_file_async(fid).await.ok().flatten().is_some();
-                        file_exists_cache.insert(fid, exists);
-                        exists
-                    }
-                }
+                Some(fid) => file_exists.contains(&fid),
                 None => live_chunks.contains(&location.chunk_id),
             };
             if !is_live {
@@ -6868,7 +6895,7 @@ impl Server {
             // the healer's deep scan eventually corrects it.
             let existing = match pending.get(&location.chunk_id) {
                 Some(p) => Some(p.clone()),
-                None => self.metadata.get_chunk_location_async(location.chunk_id).await.ok().flatten(),
+                None => existing_locations.get(&location.chunk_id).cloned(),
             };
             let incoming_count = location.nodes.len();
             let existing_count = existing.as_ref().map_or(0, |e| e.nodes.len());
@@ -6944,13 +6971,16 @@ impl Server {
         if !under_replicated.is_empty() {
             // Exclude patch tokens (deferred chunk-patch consolidation) — see the
             // single-location ReplicateChunkLocation handler's comment on why these
-            // are never worth actively healing directly.
-            let mut to_queue = Vec::with_capacity(under_replicated.len());
-            for chunk_id in under_replicated {
-                if self.metadata.get_patch_state_async(chunk_id).await.unwrap_or(None).is_none() {
-                    to_queue.push(chunk_id);
-                }
-            }
+            // are never worth actively healing directly. One batched presence check
+            // instead of one spawn_blocking per under-replicated item — see
+            // get_patch_states_present_batch_async's doc comment.
+            let patch_tokens = self.metadata
+                .get_patch_states_present_batch_async(under_replicated.clone())
+                .await
+                .unwrap_or_default();
+            let to_queue: Vec<ChunkId> = under_replicated.into_iter()
+                .filter(|cid| !patch_tokens.contains(cid))
+                .collect();
             if !to_queue.is_empty() {
                 if let Some(healing) = self.healing.read().await.as_ref() {
                     healing.queue_chunks_immediate(to_queue).await;
@@ -7033,17 +7063,24 @@ impl Server {
         }
 
         let rf = self.replication_factor.load(Ordering::Relaxed);
+        // One batched prefetch instead of one spawn_blocking per item — see
+        // get_chunk_locations_batch_async's doc comment for the incident this closes.
+        let unique_chunk_ids: Vec<ChunkId> = {
+            let mut seen = std::collections::HashSet::new();
+            locations.iter().map(|l| l.chunk_id).filter(|cid| seen.insert(*cid)).collect()
+        };
+        let existing_locations = match self.metadata.get_chunk_locations_batch_async(unique_chunk_ids).await {
+            Ok(map) => map,
+            Err(e) => {
+                warn!("handle_replicate_chunk_locations_v2: failed to batch-load existing chunk locations: {}", e);
+                std::collections::HashMap::new()
+            }
+        };
         let mut pending: std::collections::HashMap<ChunkId, ChunkLocation> = std::collections::HashMap::new();
         for location in locations {
             let existing = match pending.get(&location.chunk_id) {
                 Some(p) => Some(p.clone()),
-                None => match self.metadata.get_chunk_location_async(location.chunk_id).await {
-                    Ok(existing) => existing,
-                    Err(e) => {
-                        warn!("Failed to get existing chunk location: {}, using new location", e);
-                        None
-                    }
-                },
+                None => existing_locations.get(&location.chunk_id).cloned(),
             };
             if let Some(merged) = Self::merge_replicated_chunk_location(location, existing, rf) {
                 pending.insert(merged.chunk_id, merged);

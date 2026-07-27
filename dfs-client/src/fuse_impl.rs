@@ -2949,18 +2949,26 @@ impl FlushHandle {
                                                 }
                                                 break 'try_patch;
                                             }
-                                            // Even though the retry failed, update metadata cache with
-                                            // the fresh location so the next attempt uses the current
-                                            // chunk ID instead of looping forever on the stale one.
-                                            if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
-                                                if let Some(existing) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
-                                                    *existing = loc.clone();
-                                                }
-                                            }
-                                            self.client.recent_chunk_writes.insert(
-                                                (ino, chunk_idx),
-                                                (loc.chunk_id, file_id_at_flush_start.unwrap_or_default(), std::time::Instant::now(), loc.nodes.clone()),
-                                            );
+                                            // Do NOT cache `loc` into metadata_cache/recent_chunk_writes
+                                            // here — it's the leader's answer, but the retry that just
+                                            // used it (`retry_err`) also failed, so it's NOT a confirmed
+                                            // value. recent_chunk_writes exists to be trusted as "locally
+                                            // confirmed truth, no leader round-trip needed" (see its
+                                            // read-path Source-1 usage in client.rs) — inserting an
+                                            // unreachable/unconfirmed id here used to poison it: the next
+                                            // flush attempt trusted this exact entry, retried the same
+                                            // value, failed the same way, and re-cached the same value
+                                            // again — a self-sustaining loop (confirmed live on staging
+                                            // 2026-07-27: VM-111 chunk_idx 1757 stuck retrying a chunk_id
+                                            // that only ever had a single unreconciled replica, while the
+                                            // real, healthy, current chunk sat untouched the whole time).
+                                            // Purge any existing entry pointing at either candidate
+                                            // instead, mirroring the read path's remove_if pattern, so
+                                            // the next attempt re-asks the leader fresh rather than
+                                            // trusting a value just proven bad.
+                                            self.client.recent_chunk_writes.remove_if(&(ino, chunk_idx), |_, v| {
+                                                v.0 == old_location.chunk_id || v.0 == loc.chunk_id
+                                            });
                                             if let Some(shard) = buf.as_ref().and_then(|b| b.chunk_get(chunk_idx)) {
                                                 let mut cs = shard.lock().await;
                                                 cs.slot.flushing = false;

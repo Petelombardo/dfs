@@ -1740,8 +1740,23 @@ leader_addr: Arc::new(RwLock::new(None)),
                     debug!("Pooled connection to {} closed by peer, reconnecting", addr);
                     let mut s = s;
                     let _ = s.shutdown().await;
+                    // 5s, matching the other connect paths in this file (truly-fresh,
+                    // and mid-request-failure retry) — this used to be a tighter 1s,
+                    // which is backwards: a peer we already know was reachable (we had
+                    // it pooled) shouldn't get LESS patience reconnecting than a total
+                    // stranger. This is also the single most common connect path for a
+                    // GetFileChunkMap refresh to the leader specifically — that
+                    // connection is used rarely enough (each file refreshes only every
+                    // ~5s of active reading, or on open) that the server's own 5s idle
+                    // close routinely beats us to it, so nearly every "cold cache" first
+                    // refresh lands here. Confirmed live on server4's dfs-client.log
+                    // (2026-07-27): 6 real refresh failures, all landing at ~1.0-1.4s —
+                    // exactly the old timeout — for inodes later confirmed to be real,
+                    // populated files. A momentarily busy leader (e.g. many files
+                    // cold-opening at once) had exactly enough margin to trip this one
+                    // artificially-tight timeout.
                     let fresh = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(1000),
+                        tokio::time::Duration::from_secs(5),
                         TcpStream::connect(addr),
                     ).await
                         .map_err(|_| anyhow::anyhow!("Connect timeout to {}", addr))?
@@ -1810,8 +1825,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // Stale pooled connection — server closed it after idle timeout.
                 // Retry transparently on a fresh connection; do NOT record a health
                 // failure since the node itself is fine.
-                // UnexpectedEof is the common case: server's 5s idle timeout fires
-                // while a connection is sitting in the client pool.
+                // UnexpectedEof is the common case: the server's idle-connection
+                // timeout (network.rs IDLE_TIMEOUT, 300s/5min — NOT 5s, corrected
+                // 2026-07-27 after this comment's wrong number fed a mistaken root-
+                // cause theory) fires while a connection is sitting in the client
+                // pool, or the peer closed it for some other reason (restart, RST).
                 debug!("Stale pooled connection to {} ({}), retrying with fresh connection", addr, e);
                 let mut fresh = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(5),
@@ -2016,8 +2034,23 @@ leader_addr: Arc::new(RwLock::new(None)),
                     debug!("Pooled connection to {} closed by peer, reconnecting", addr);
                     let mut s = s;
                     let _ = s.shutdown().await;
+                    // 5s, matching the other connect paths in this file (truly-fresh,
+                    // and mid-request-failure retry) — this used to be a tighter 1s,
+                    // which is backwards: a peer we already know was reachable (we had
+                    // it pooled) shouldn't get LESS patience reconnecting than a total
+                    // stranger. This is also the single most common connect path for a
+                    // GetFileChunkMap refresh to the leader specifically — that
+                    // connection is used rarely enough (each file refreshes only every
+                    // ~5s of active reading, or on open) that the server's own 5s idle
+                    // close routinely beats us to it, so nearly every "cold cache" first
+                    // refresh lands here. Confirmed live on server4's dfs-client.log
+                    // (2026-07-27): 6 real refresh failures, all landing at ~1.0-1.4s —
+                    // exactly the old timeout — for inodes later confirmed to be real,
+                    // populated files. A momentarily busy leader (e.g. many files
+                    // cold-opening at once) had exactly enough margin to trip this one
+                    // artificially-tight timeout.
                     let fresh = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(1000),
+                        tokio::time::Duration::from_secs(5),
                         TcpStream::connect(addr),
                     ).await
                         .map_err(|_| anyhow::anyhow!("Connect timeout to {}", addr))?
@@ -2234,8 +2267,23 @@ leader_addr: Arc::new(RwLock::new(None)),
                     debug!("Pooled connection to {} closed by peer, reconnecting", addr);
                     let mut s = s;
                     let _ = s.shutdown().await;
+                    // 5s, matching the other connect paths in this file (truly-fresh,
+                    // and mid-request-failure retry) — this used to be a tighter 1s,
+                    // which is backwards: a peer we already know was reachable (we had
+                    // it pooled) shouldn't get LESS patience reconnecting than a total
+                    // stranger. This is also the single most common connect path for a
+                    // GetFileChunkMap refresh to the leader specifically — that
+                    // connection is used rarely enough (each file refreshes only every
+                    // ~5s of active reading, or on open) that the server's own 5s idle
+                    // close routinely beats us to it, so nearly every "cold cache" first
+                    // refresh lands here. Confirmed live on server4's dfs-client.log
+                    // (2026-07-27): 6 real refresh failures, all landing at ~1.0-1.4s —
+                    // exactly the old timeout — for inodes later confirmed to be real,
+                    // populated files. A momentarily busy leader (e.g. many files
+                    // cold-opening at once) had exactly enough margin to trip this one
+                    // artificially-tight timeout.
                     let fresh = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(1000),
+                        tokio::time::Duration::from_secs(5),
                         TcpStream::connect(addr),
                     ).await
                         .map_err(|_| anyhow::anyhow!("Connect timeout to {}", addr))?
@@ -2749,16 +2797,38 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         if chunk_map.is_empty() {
-            // Still empty after a synchronous refresh: the file has zero chunks anywhere
-            // (e.g. a VM disk image created via ftruncate and never written — fully
-            // sparse). offset < file_size was already checked at function entry, so this
-            // is a hole within the file's logical extent: return zero-filled bytes, same
-            // as the "Hole (sparse file)" case below. Returning an empty Vec here signals
-            // EOF to FUSE/the kernel; O_DIRECT readers (e.g. QEMU with cache=none) treat a
-            // short read at a non-EOF offset as an I/O error — which is exactly what turns
-            // fdisk/mkfs/fsck on a freshly created VM disk into "lots of corruption".
-            let len = (file_size as usize).min(offset + size).saturating_sub(offset);
-            return Ok(vec![0u8; len]);
+            // Still empty after a synchronous refresh (our own, or one we waited on via
+            // refresh_engine's refresh_in_progress guard). Only trust this as "the file
+            // genuinely has zero chunks" (e.g. a VM disk image created via ftruncate and
+            // never written — fully sparse) if the server has actually CONFIRMED that at
+            // least once — never on an unconfirmed empty map. Without this check, a merely
+            // SLOW cold-cache fetch (a big/sparse VM disk's first-ever chunk map fetch,
+            // or one delayed behind a known legitimate multi-second server-side stall) that
+            // outlasts refresh_engine's 10s concurrent-waiter timeout left every OTHER
+            // concurrent reader on this inode falling through to here with a snapshot that
+            // was never actually populated — silently returning zero-filled bytes for a
+            // real, non-sparse file instead of erroring or waiting longer. That's a bigger
+            // hazard than a returned error: those zeros can get written back by the VM's
+            // own qcow2 layer as if they were the real data, turning a slow leader into
+            // silent on-disk corruption (suspected root cause of the VM-108/111 boot
+            // corruption incidents, 2026-07 — the "restart client fixes it" signature
+            // matches a poisoned engine snapshot from exactly this race).
+            //
+            // offset < file_size was already checked at function entry, so a CONFIRMED
+            // empty map here is a hole within the file's logical extent: return zero-filled
+            // bytes, same as the "Hole (sparse file)" case below. Returning an empty Vec
+            // signals EOF to FUSE/the kernel; O_DIRECT readers (e.g. QEMU with cache=none)
+            // treat a short read at a non-EOF offset as an I/O error — which is exactly what
+            // turns fdisk/mkfs/fsck on a freshly created VM disk into "lots of corruption",
+            // so this path must stay zero-fill for the genuinely-confirmed-sparse case.
+            if engine.confirmed_at_least_once.load(std::sync::atomic::Ordering::Relaxed) {
+                let len = (file_size as usize).min(offset + size).saturating_sub(offset);
+                return Ok(vec![0u8; len]);
+            }
+            anyhow::bail!(
+                "inode={} chunk map unavailable (leader refresh never confirmed) — refusing to fabricate zero-filled data",
+                inode
+            );
         }
 
         // Chunks are content-addressed (ChunkId = hash of data), so there is no
@@ -3406,16 +3476,23 @@ leader_addr: Arc::new(RwLock::new(None)),
                         result_chunks.push((idx, arc));
                     }
                     Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("metadata may be stale") {
-                            // All listed replicas said "not found" — the metadata is stale
-                            // (chunk was patched and replaced since we last fetched the map).
-                            // Queue for one fresh-metadata retry rather than surfacing EIO.
-                            warn!("Chunk {} missing on all replicas — will refresh metadata and retry", cid);
-                            stale_retries.push((idx, cid));
-                        } else {
-                            return Err(e).with_context(|| format!("Failed to fetch chunk {}", cid));
-                        }
+                        // Every replica failed for this chunk_id — whether because they all
+                        // said "not found" (metadata is stale: chunk was patched/folded since
+                        // we last fetched the map) or some other failure (timeout, transient
+                        // overload, a slow node during a known legitimate multi-second stall —
+                        // see read_file's REGRESSION comment history). Both shapes get the same
+                        // bounded refresh-and-retry treatment below rather than surfacing EIO
+                        // immediately: an EIO on a VM disk read flips the guest read-only, so a
+                        // bounded few seconds of latency is vastly the better trade, and this
+                        // was previously only extended to the "metadata may be stale" message —
+                        // a real fetch failure with a different message (e.g. a plain
+                        // connectivity error) went straight to EIO with no retry at all, even
+                        // though the correct current chunk_id was fully healthy on every
+                        // replica the whole time (confirmed live on staging 2026-07-27: VM-111
+                        // dd EIO on a chunk verified present + hash-correct on all 3 replicas).
+                        // Bounded by STALE_RETRY_DELAYS_MS below — not unconditional retry.
+                        warn!("Chunk {} failed on all replicas ({}) — will refresh metadata and retry", cid, e);
+                        stale_retries.push((idx, cid));
                     }
                 }
             }
@@ -3530,8 +3607,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                                     resolved.push((idx, arc));
                                 }
                                 Err(e) => {
-                                    let msg = e.to_string();
-                                    if msg.contains("metadata may be stale") && attempt + 1 < STALE_RETRY_DELAYS_MS.len() {
+                                    // Same broadened treatment as the initial-failure classification
+                                    // above (not gated on "metadata may be stale" specifically) —
+                                    // still bounded by STALE_RETRY_DELAYS_MS, so this can't loop
+                                    // past the fixed schedule regardless of error shape.
+                                    if attempt + 1 < STALE_RETRY_DELAYS_MS.len() {
                                         still_stale.push((idx, fresh_cid));
                                     } else {
                                         last_err = Some(e);
@@ -4041,13 +4121,20 @@ leader_addr: Arc::new(RwLock::new(None)),
         const CHUNK_MAP_WINDOW: u32 = u32::MAX;
         let rpc_start = std::time::Instant::now();
         match self.get_file_chunk_map(file_id, 0, CHUNK_MAP_WINDOW).await {
-            Ok((locs, window_from, total_chunks, _)) if !locs.is_empty() => {
+            // A real answer from the server — including a legitimate "zero chunks"
+            // (total_chunks == 0) response — is a CONFIRMED result, not a failure.
+            // Previously this arm required `!locs.is_empty()`, so a genuinely empty
+            // file's confirmed answer fell into the same bucket as a network error
+            // (see confirmed_at_least_once's doc comment) — both left the engine
+            // indistinguishable from "we don't actually know yet".
+            Ok((locs, window_from, total_chunks, _)) => {
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader in {:?}",
                       engine.inode, locs.len(), window_from, total_chunks, rpc_start.elapsed());
                 engine.clear_failed_refresh();
                 engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size, false);
+                engine.confirmed_at_least_once.store(true, Ordering::Relaxed);
             }
-            Ok(_) | Err(_) => {
+            Err(_) => {
                 info!("refresh_engine: inode={} no chunk map from leader (took {:?})",
                       engine.inode, rpc_start.elapsed());
                 engine.record_failed_refresh();

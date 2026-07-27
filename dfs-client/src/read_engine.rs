@@ -66,6 +66,17 @@ pub struct InodeReadEngine {
     /// Monotonic ms timestamp of the last refresh that returned no chunk map from the leader.
     pub last_failed_refresh_ms: AtomicU64,
 
+    /// Set the first time a GetFileChunkMap RPC for this inode gets a genuine answer from
+    /// the server — including a legitimate "this file has zero chunks" answer — as opposed
+    /// to a network error/timeout or another refresh still in flight. read_file's "chunk map
+    /// still empty after refresh" fallback (which returns zero-filled bytes for what it
+    /// assumes is a fresh/sparse file) must not fire on an UNCONFIRMED empty map — see
+    /// that call site's doc comment for the real incident this closes: a slow cold-cache
+    /// fetch racing many concurrent reads (e.g. a VM boot storm) could leave a waiter's 10s
+    /// refresh_done wait timing out with the real fetch still in flight, silently returning
+    /// zeros for a real, non-empty file instead of erroring.
+    pub confirmed_at_least_once: AtomicBool,
+
     /// Chunk index range [window_start, window_end) covered by the last windowed fetch.
     pub last_window_start: AtomicU32,
     pub last_window_end: AtomicU32,
@@ -105,6 +116,7 @@ impl InodeReadEngine {
             refresh_in_progress: AtomicBool::new(false),
             refresh_done: tokio::sync::Notify::new(),
             last_failed_refresh_ms: AtomicU64::new(0),
+            confirmed_at_least_once: AtomicBool::new(false),
             last_window_start: AtomicU32::new(0),
             last_window_end: AtomicU32::new(0),
             last_chunk_fetch_ms: AtomicU64::new(50),

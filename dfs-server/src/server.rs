@@ -3466,6 +3466,27 @@ impl Server {
         incoming_gen: Option<u64>,
         existing_gen: Option<u64>,
     ) -> bool {
+        // Durability guard (2026-07-27, VM-111 dd EIO investigation): an ORDINARY
+        // (non-fold) write must never supersede an existing pointer with FEWER
+        // replicas than what it would replace, regardless of what generation/seq/
+        // written_at says. A MultiPatch round that fails to reach quorum can still
+        // leave one target node with a durable local commit — that node broadcasts
+        // (or, on the leader itself, directly records via apply_patch's own
+        // update_chunk_map_after_patch) a ChunkLocation with a legitimately higher
+        // client_write_seq, which used to win this arbiter outright and orphan a
+        // fully-replicated, healthy predecessor in favor of a chunk that existed on
+        // exactly one node — confirmed live on staging: `GetFileChunkMap` served a
+        // single-replica phantom as "current" for a slot whose real, 3-replica,
+        // durably-verified chunk was never actually superseded in CHUNK_TABLE (the
+        // divergence was purely in this in-memory arbitration, which every other
+        // reader — chunk_locations_for_info's fresh CHUNK_TABLE scan, dfs-admin —
+        // correctly avoided by never seeing the phantom). Folds are exempt: a
+        // fold's freshly-computed result is a deliberate single-node-then-
+        // replicate-forward design (see run_single_fold), not a failure — it
+        // legitimately starts under-replicated by intent.
+        if !incoming_is_fold && incoming.nodes.len() < existing.nodes.len() {
+            return false;
+        }
         // Per-slot generation is the AUTHORITATIVE causal ordering: the client's
         // monotone new_chunk_seq for this (file_id, chunk_idx) slot, carried in-memory
         // and on control messages (see `chunk_generations`). A strictly-higher
@@ -13344,6 +13365,24 @@ impl Server {
                 self.chunk_map.insert(file_id, (locations.clone(), write_seq));
                 slice_response(&locations, write_seq)
             }
+            // The file itself exists (get_file found it) but a full CHUNK_TABLE scan
+            // filtered to this file_id genuinely found zero rows — e.g. freshly
+            // truncated/created and never written. This is a CONFIRMED "zero chunks"
+            // answer, not a lookup failure, and must be reported as a valid (empty)
+            // FileChunkMap — not Response::Error. The client (read_file) distinguishes
+            // a confirmed-empty map (safe to serve as zero-filled reads) from an
+            // unconfirmed one (a real error, must not be treated as sparse) — see
+            // InodeReadEngine::confirmed_at_least_once. Reporting this as NotFound
+            // made every never-written file indistinguishable from a genuine failure
+            // (leader unreachable, RPC timeout), which the client-side fix would then
+            // correctly refuse to zero-fill, breaking reads of brand-new sparse files.
+            Ok(Ok(Some((_locations, write_seq)))) => Response::FileChunkMap {
+                file_id,
+                locations: Vec::new(),
+                from_chunk,
+                total_chunks: 0,
+                write_seq,
+            },
             _ => Response::Error {
                 message: format!("No chunk map entry for file {}", file_id),
                 code: ErrorCode::NotFound,

@@ -4131,6 +4131,16 @@ leader_addr: Arc::new(RwLock::new(None)),
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader in {:?}",
                       engine.inode, locs.len(), window_from, total_chunks, rpc_start.elapsed());
                 engine.clear_failed_refresh();
+                // Seed chunk_seq from every location the leader just told us about,
+                // before this client ever assigns its own next seq for any of these
+                // slots — see seed_chunk_seq's doc comment for why this matters now
+                // that chunk_generations is durable and authoritative.
+                const CHUNK_SIZE_SEED: u64 = 4 * 1024 * 1024;
+                for loc in &locs {
+                    if let (Some(offset), Some(seq)) = (loc.file_offset, loc.client_write_seq) {
+                        self.seed_chunk_seq(file_id, offset / CHUNK_SIZE_SEED, seq);
+                    }
+                }
                 engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size, false);
                 engine.confirmed_at_least_once.store(true, Ordering::Relaxed);
             }
@@ -7962,6 +7972,30 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
+    /// Seed the per-slot chunk_seq counter from a server-reported value — the
+    /// `chunk_seq` sibling of `seed_write_seq` above, same rationale, same
+    /// "only advance, never lower" rule. `chunk_seq` had NO such seeding until
+    /// 2026-07-28 (see its field doc comment — "nothing consumes the server's
+    /// returned chunk_seq yet"): it started every (file_id, chunk_idx) counter
+    /// at 0 on every client process start, with zero awareness of what the
+    /// server already durably knows. That was always a latent bug (a restarted
+    /// client's first write to a hot slot could lose to the durable
+    /// client_write_seq already recorded there), but harmless-ish while
+    /// chunk_generations was purely in-memory and server-restart-fragile —
+    /// once chunk_generations became durable and authoritative (CHUNK_SEQ_TABLE,
+    /// same day), the same restarted-client write could now lose PERMANENTLY,
+    /// with no accidental fallback-to-written_at window to save it, until this
+    /// client's own counter organically climbed back past the old high-water
+    /// mark. Called from every chunk_map refresh (see refresh_engine_flagged)
+    /// so a freshly (re)started client picks up whatever the server already
+    /// knows before it ever assigns a new seq for that slot.
+    pub fn seed_chunk_seq(&self, file_id: FileId, chunk_idx: u64, server_seq: u64) {
+        let mut entry = self.chunk_seq.entry((file_id, chunk_idx)).or_insert(0);
+        if server_seq >= *entry {
+            *entry = server_seq;
+        }
+    }
+
     /// Increment and return the next write sequence number for a file.
     fn next_write_seq(&self, file_id: FileId) -> u64 {
         let mut entry = self.write_seq.entry(file_id).or_insert(0);
@@ -9267,6 +9301,61 @@ mod tests {
             "pending_resync must be cleared on delete");
         assert!(!client.last_resync_sent_at.contains_key(&file_id),
             "last_resync_sent_at must be cleared on delete");
+    }
+
+    /// Root-caused 2026-07-28 (VM-108 dd EIO, third mechanism found the same day):
+    /// `chunk_seq`'s own doc comment already flagged it as unfinished ("nothing
+    /// consumes the server's returned chunk_seq yet") — unlike its sibling
+    /// `write_seq`, it was never seeded from server state, so it started every
+    /// (file_id, chunk_idx) counter at 0 on every client process start. A freshly
+    /// (re)started client's first write to a slot the server already has at a high
+    /// seq (e.g. 3867, from before the restart) would then get its OWN new write
+    /// stamped with a low seq (1, 2, 3...) — which loses outright against the
+    /// server's higher-but-possibly-phantom seq in BOTH `location_supersedes`
+    /// (server-side, generation/seq comparison) AND `reconcile_chunk_locations_with_map`
+    /// (server-side, `ext > inc` prefers the server's higher seq unconditionally).
+    /// Confirmed live: a manual corrective write kept losing to a known-dead phantom
+    /// token specifically because of this — the write's own seq was 1, the phantom's
+    /// was 3867. `seed_chunk_seq` (mirroring `seed_write_seq`, called from
+    /// `refresh_engine_flagged` and the write path's pre-flight leader check) fixes
+    /// this by seeding from whatever the server already reports before this client
+    /// ever assigns a fresh seq for that slot.
+    #[test]
+    fn test_seed_chunk_seq_advances_past_server_value_before_next_write() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let client = DfsClient::new(vec![addr]).unwrap();
+        let file_id = FileId::new();
+        let chunk_idx = 2835u64;
+
+        // Simulate a freshly (re)started client: chunk_seq is empty, so its very
+        // first write to this slot would otherwise be stamped with seq=1 —
+        // regardless of whatever the server already durably knows.
+        let unseeded_next = client.next_chunk_seq(file_id, chunk_idx);
+        assert_eq!(unseeded_next, 1, "sanity: an unseeded counter starts at 0 and increments to 1");
+
+        // A second, independent slot for the seeding test — the assertion above
+        // already consumed slot chunk_idx's first value, so use a fresh one.
+        let chunk_idx2 = 2984u64;
+        client.seed_chunk_seq(file_id, chunk_idx2, 3867);
+        let seeded_next = client.next_chunk_seq(file_id, chunk_idx2);
+        assert_eq!(
+            seeded_next, 3868,
+            "after seeding from a server-reported seq of 3867 (as refresh_engine_flagged \
+             now does from every ChunkLocation it fetches), this client's next write to \
+             the same slot must be stamped ABOVE the server's known value (3868), not \
+             restart from 1 — otherwise it loses outright to whatever the server already \
+             has, even when the server's value is itself the wrong, stale one",
+        );
+
+        // Seeding must never LOWER an already-higher local counter (e.g. a second,
+        // stale refresh response arriving after this client already advanced past it
+        // via its own writes) — same monotonic rule as seed_write_seq.
+        client.seed_chunk_seq(file_id, chunk_idx2, 100);
+        let next_after_stale_seed = client.next_chunk_seq(file_id, chunk_idx2);
+        assert_eq!(
+            next_after_stale_seed, 3869,
+            "a lower/stale seed must never roll this client's own counter backward",
+        );
     }
 
     /// With equal load (the common case), different chunks on the same 2-replica

@@ -124,3 +124,19 @@ of losing track of them. Add an entry whenever you find one; remove the entry wh
   claims "Used by fsync/release", which is no longer true — worth confirming whether the
   fsync/release path lost a call it should still be making, or whether the comment is simply
   stale, before deleting.
+
+## Found 2026-07-28 (VM-108 dangling-pointer incident, fold-generation + chunk_seq fixes)
+
+- **`dfs-client/src/client.rs` — `broadcast_chunk_location`** (~line 5760). Zero callers
+  (confirmed via grep across `dfs-client/src/*.rs`). Its own doc comment ("The leader gets
+  reliable delivery with exponential-backoff retries... Followers get fire-and-forget") reads
+  as though it's the live per-patch chunk-location notification path, and initially misled
+  this investigation into thinking ordinary writes' leader-notification was a bounded,
+  no-backstop, one-shot RPC (unlike folds' `pending_patch_fold_broadcasts`). It is not — the
+  real live path is `pending_chunk_locations` + `enqueue_chunk_location` (called from both
+  `PatchChunk` and `MultiPatch` response handling) drained by
+  `start_chunk_location_batch_worker`, which retries every 10ms **forever, no TTL**, re-queuing
+  on any failure rather than dropping — actually *more* durable than folds' 120s-TTL backstop,
+  not less. Superseded by that mechanism; candidate for deletion, but its misleading doc
+  comment is the more urgent problem if it's kept around — at minimum mark it
+  `#[allow(dead_code)]` with a pointer to the real mechanism, or just delete it.

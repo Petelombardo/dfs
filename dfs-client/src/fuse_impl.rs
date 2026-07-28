@@ -2709,6 +2709,14 @@ impl FlushHandle {
                                     info!("flush_buffer_async_one: ino={} chunk={} no session override yet — \
                                            refreshing node list from leader before first patch this session ({:?} -> {:?})",
                                         ino, chunk_idx, loc.nodes, fresh.nodes);
+                                    // Also seed chunk_seq from what the leader just told us —
+                                    // this is the very first patch this session for this slot,
+                                    // exactly the case seed_chunk_seq's doc comment describes
+                                    // (a freshly (re)started client's counter otherwise starts
+                                    // at 0 with no idea what the server already durably knows).
+                                    if let Some(seq) = fresh.client_write_seq {
+                                        self.client.seed_chunk_seq(meta.id, chunk_idx, seq);
+                                    }
                                     Some(ChunkLocation { nodes: fresh.nodes.clone(), ..loc })
                                 }
                                 _ => Some(loc),

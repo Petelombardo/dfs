@@ -2041,6 +2041,42 @@ impl MetadataStore {
         rx.await.context("metadata group-commit thread dropped its reply")?
     }
 
+    /// Every (file_id, chunk_idx, seq) row in CHUNK_SEQ_TABLE — for backfilling
+    /// `Server::chunk_generations` (an in-memory-only, always-empty-after-restart
+    /// map) at startup and during `dfs-admin healing repair`. CHUNK_SEQ_TABLE is
+    /// durable, per-slot (not per-chunk_id, so no COW-churn growth concern — same
+    /// key gets overwritten in place, exactly like PATCH_STATE_SLOT_TABLE), and
+    /// already monotonic (put_chunk_seq only ever advances it); as of the fold-
+    /// generation-durability fix, it's now written both by the client-facing
+    /// write handlers AND by handle_replicate_chunk_location's receive side and
+    /// run_single_fold's generation stamp, so a node that only ever *learned* a
+    /// slot's generation via RPC — never originated a write for it itself — can
+    /// now recover that value after a restart too, instead of only nodes that
+    /// personally handled the write (the gap that stranded VM-108's leader).
+    ///
+    /// One scan over this (typically much smaller than CHUNK_TABLE — one row per
+    /// actively-patched slot, not one per historical chunk_id) table, rather than
+    /// a point lookup per chunk_map entry, to bound the extra I/O this adds to an
+    /// already-expensive startup/repair pass.
+    pub fn all_chunk_seqs(&self) -> Result<Vec<(FileId, u64, u64)>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(CHUNK_SEQ_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for item in table.range::<&str>(..)? {
+            let (key, seq) = item?;
+            let Some((file_id_str, chunk_idx_str)) = key.value().rsplit_once(':') else { continue };
+            let Ok(file_uuid) = uuid::Uuid::parse_str(file_id_str) else { continue };
+            let Ok(chunk_idx) = chunk_idx_str.parse::<u64>() else { continue };
+            out.push((FileId::from_uuid(file_uuid), chunk_idx, seq.value()));
+        }
+        Ok(out)
+    }
+
     // -------------------------------------------------------------------------
     // Patch state (deferred single-patch consolidation — see PATCH_STATE_TABLE)
     // -------------------------------------------------------------------------

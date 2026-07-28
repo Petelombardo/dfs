@@ -1348,6 +1348,46 @@ fn bump_chunk_generation(map: &DashMap<ChunkId, u64>, chunk_id: ChunkId, generat
         .or_insert(generation);
 }
 
+/// Backfill `chunk_generations` (in-memory only, always empty right after a
+/// restart) from CHUNK_SEQ_TABLE (durable, per-slot, already monotonic — see
+/// `MetadataStore::all_chunk_seqs`' doc comment) once `chunk_map` has already
+/// been (re)built, so each row's (file_id, chunk_idx) can be resolved to the
+/// chunk_id currently occupying that slot. Shared by
+/// `Server::rebuild_chunk_map_from_metadata` (startup) and
+/// `Server::handle_trigger_metadata_repair` (`dfs-admin healing repair`) —
+/// exactly the two places that (re)build chunk_map from durable state and
+/// therefore both need this same follow-up pass.
+///
+/// A single scan over CHUNK_SEQ_TABLE (routed through in-memory chunk_map
+/// lookups from there) rather than a point lookup per chunk_map entry — see
+/// `all_chunk_seqs`' doc comment for why: CHUNK_SEQ_TABLE is typically much
+/// smaller than CHUNK_TABLE, so this bounds the extra disk I/O this backfill
+/// adds to an already-expensive rebuild pass.
+fn backfill_chunk_generations_from_chunk_seq_table(
+    metadata: &MetadataStore,
+    chunk_map: &DashMap<FileId, (Vec<ChunkLocation>, u64)>,
+    chunk_generations: &DashMap<ChunkId, u64>,
+) {
+    let seqs = match metadata.all_chunk_seqs() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("backfill_chunk_generations_from_chunk_seq_table: failed to scan CHUNK_SEQ_TABLE: {}", e);
+            return;
+        }
+    };
+    let mut seeded = 0usize;
+    for (file_id, chunk_idx, seq) in seqs {
+        if let Some(entry) = chunk_map.get(&file_id) {
+            let (locs, _) = entry.value();
+            if let Some(i) = Server::chunk_map_find_by_idx(locs, chunk_idx) {
+                bump_chunk_generation(chunk_generations, locs[i].chunk_id, seq);
+                seeded += 1;
+            }
+        }
+    }
+    info!("backfill_chunk_generations_from_chunk_seq_table: seeded {} chunk_generations entries from CHUNK_SEQ_TABLE", seeded);
+}
+
 impl OverlayForkCtx {
     /// Abandon and clean up a Pending patch whose base or delta chunk is
     /// confirmed gone cluster-wide — not just missing on this node's local
@@ -2088,6 +2128,18 @@ impl OverlayForkCtx {
             }
         };
 
+        // Read the slot's CURRENT seq from chunk_map here, strictly before
+        // update_chunk_map_after_patch below overwrites it with new_chunk_id — see
+        // this value's other use site (client_write_seq correction) for the full
+        // "pure max, never mint" rationale (the T28 trap). Hoisted up here (rather
+        // than computed just before that use, as originally) so the generation
+        // stamp immediately below can also see it — see that comment for why.
+        let current_slot_seq = self.chunk_map.get(&file_id).and_then(|entry| {
+            let (locs, _) = entry.value();
+            Server::chunk_map_find_by_idx(locs, chunk_idx).and_then(|i| locs[i].client_write_seq)
+        });
+        let fold_seq = fold_successor_write_seq(current_slot_seq, delta_client_write_seq);
+
         // Seed the ring with this fold's own output — mirrors the re-key MultiPatch
         // already does for its chunk_idx=None fallback path (see that call site's
         // "Re-key ring" comment). base_chunk_id's file is gone the moment
@@ -2108,14 +2160,53 @@ impl OverlayForkCtx {
             // at worst a transient loss of the origin tiebreak until restart, not
             // a correctness gap.
             self.fold_result_chunk_ids.insert(new_chunk_id);
-            // Fix S: the fold output belongs to the SAME slot generation as the base
-            // it was consolidated from (folding doesn't advance the client's
-            // new_chunk_seq). Inherit the base's recorded generation so the fold's own
-            // RCL can out-rank any reordered stale-generation broadcast. If the base
-            // has no recorded generation (legacy / not-yet-populated), the arbiter
-            // simply falls back to the pre-existing cws/written_at rule for this chunk.
-            if let Some(base_gen) = self.chunk_generations.get(&base_chunk_id).map(|v| *v) {
-                bump_chunk_generation(&self.chunk_generations, new_chunk_id, base_gen);
+            // Fix S (2026-07-24): the fold output was originally stamped with ONLY
+            // the base's inherited generation, on the theory that "folding doesn't
+            // advance the client's new_chunk_seq." That's true for a fold racing a
+            // REORDERED broadcast of its own base's generation — but false the
+            // instant a fold consolidates a delta from a genuinely newer write:
+            // that write's own generation (delta_client_write_seq, folded into
+            // fold_seq above via the same max-of-current-and-delta rule already
+            // used for client_write_seq) can be far higher than the stale base's.
+            // Inheriting only base_gen then stamps the fold's own, freshly-computed,
+            // byte-verified result with a generation LOWER than the write it just
+            // consolidated — location_supersedes' generation check (which is
+            // authoritative, checked before client_write_seq/written_at) then
+            // rejects the fold's announcement outright, permanently stranding
+            // chunk_map on the write's raw patch token: a token whose
+            // PATCH_STATE_TABLE row this same fold flip to Folded below makes
+            // unresolvable as a pending overlay, and which was never a real chunk
+            // file — a dangling pointer with no recovery path. Confirmed live
+            // 2026-07-28 (VM-108 dd EIO, ~14h after the unrelated 3d2a2ad/f1e19cc
+            // deploy): the leader's chunk_map stayed on the token while a fresh
+            // CHUNK_TABLE-based scan (chunk_locations_for_info, used by
+            // dfs-admin file info) — and this node's own disk — both agreed on the
+            // fold's real result. Fix: stamp with max(base_gen, fold_seq), never
+            // just base_gen. A fold that's merely racing a reordered copy of its
+            // OWN generation is unaffected (fold_seq falls back to base_gen's own
+            // slot seq when there's no newer delta); only a fold trailing a
+            // genuinely newer write now correctly outranks that write's stale-base
+            // predecessor. If neither side has a recorded value the arbiter falls
+            // back to the pre-existing cws/written_at rule for this chunk, exactly
+            // as before.
+            let base_gen = self.chunk_generations.get(&base_chunk_id).map(|v| *v);
+            let stamped_gen = match (base_gen, fold_seq) {
+                (Some(g), Some(s)) => Some(g.max(s)),
+                (Some(g), None) => Some(g),
+                (None, Some(s)) => Some(s),
+                (None, None) => None,
+            };
+            if let Some(g) = stamped_gen {
+                bump_chunk_generation(&self.chunk_generations, new_chunk_id, g);
+                // Durability follow-up (2026-07-28) — see handle_replicate_chunk_location's
+                // matching call for the full rationale: chunk_generations is in-memory
+                // only, so persist this fold's freshly-computed generation into
+                // CHUNK_SEQ_TABLE too, rather than relying solely on some earlier
+                // write having already durably recorded a value at least this high.
+                if let Err(e) = self.metadata.put_chunk_seq_async(file_id, chunk_idx, g).await {
+                    warn!("single fold: failed to durably record generation {} for file {} chunk {}: {}",
+                        g, file_id, chunk_idx, e);
+                }
             }
             // Bound the map: base_chunk_id is now permanently retired by this fold, so
             // its generation entry is dead weight (a hot qcow2 slot rewrites forever).
@@ -2176,14 +2267,10 @@ impl OverlayForkCtx {
         // higher seq than the delta did — read BOTH and take the max. This must
         // be a pure max, NEVER a mint/increment: an invented seq could collide
         // with the client's own next real write and get deduped away as a noop
-        // (the T28 trap — see fold_successor_write_seq's doc comment). Read the
-        // slot's CURRENT seq from chunk_map here, strictly before
-        // update_chunk_map_after_patch below overwrites it with new_chunk_id.
-        let current_slot_seq = self.chunk_map.get(&file_id).and_then(|entry| {
-            let (locs, _) = entry.value();
-            Server::chunk_map_find_by_idx(locs, chunk_idx).and_then(|i| locs[i].client_write_seq)
-        });
-        let fold_seq = fold_successor_write_seq(current_slot_seq, delta_client_write_seq);
+        // (the T28 trap — see fold_successor_write_seq's doc comment). current_slot_seq
+        // and fold_seq are computed once, above (before the generation stamp, which
+        // needs the same value — see that comment), strictly before
+        // update_chunk_map_after_patch below overwrites chunk_map with new_chunk_id.
         let new_loc = match self.metadata.get_chunk_location_async(new_chunk_id).await.ok().flatten() {
             Some(loc) if loc.client_write_seq != fold_seq && fold_seq.is_some() => {
                 let corrected = ChunkLocation { client_write_seq: fold_seq, ..loc };
@@ -3240,6 +3327,7 @@ impl Server {
         let file_write_seqs = self.file_write_seqs.clone();
         let metadata = self.metadata.clone();
         let fold_result_chunk_ids = self.fold_result_chunk_ids.clone();
+        let chunk_generations = self.chunk_generations.clone();
 
         std::thread::spawn(move || {
             // Pass 1: scan_files, unchanged — seeds file_write_seqs from each file's
@@ -3313,6 +3401,12 @@ impl Server {
                 ),
                 Err(e) => warn!("Chunk map build failed during chunk scan: {}", e),
             }
+
+            // Pass 3: backfill chunk_generations (in-memory only, always empty at
+            // this point) from CHUNK_SEQ_TABLE now that chunk_map knows what's
+            // currently at each slot — see backfill_chunk_generations_from_chunk_seq_table's
+            // doc comment. Must run after pass 2, not interleaved with it.
+            backfill_chunk_generations_from_chunk_seq_table(&metadata, &chunk_map, &chunk_generations);
         });
     }
 
@@ -6320,6 +6414,22 @@ impl Server {
         // leaves the map untouched → arbiter falls back to cws/written_at.
         if let Some(g) = generation {
             self.record_chunk_generation(location.chunk_id, g);
+            // Durability follow-up (2026-07-28, VM-108 leader-restart-doesn't-help
+            // incident): chunk_generations itself is in-memory only, so a restart
+            // wipes what this line just recorded. This is the ONLY place a node
+            // learns a generation for a chunk it didn't itself write/fold — persist
+            // it into CHUNK_SEQ_TABLE (durable, per-slot, already monotonic — see
+            // MetadataStore::all_chunk_seqs' doc comment) so a later restart can
+            // recover it via the startup/repair backfill instead of silently
+            // falling back to the weaker cws/written_at rule until fresh live
+            // traffic happens to touch this exact slot again.
+            if let (Some(fid), Some(offset)) = (file_id, location.file_offset) {
+                let chunk_idx = offset / self.chunker.chunk_size() as u64;
+                if let Err(e) = self.metadata.put_chunk_seq_async(fid, chunk_idx, g).await {
+                    warn!("handle_replicate_chunk_location: failed to durably record generation {} for file {} chunk {}: {}",
+                        g, fid, chunk_idx, e);
+                }
+            }
         }
 
         // A ReplicateChunkLocation from a peer means a client write just completed somewhere
@@ -12352,6 +12462,7 @@ impl Server {
         let chunk_to_file = self.chunk_to_file.clone();
         let file_write_seqs = self.file_write_seqs.clone();
         let fold_result_chunk_ids = self.fold_result_chunk_ids.clone();
+        let chunk_generations = self.chunk_generations.clone();
         let cluster = self.cluster.clone();
         let client = self.network_client();
         let local_id = self.cluster.local_node_id();
@@ -12379,6 +12490,19 @@ impl Server {
                         // helper — NOT a blind per-file overwrite, since CHUNK_TABLE can
                         // hold multiple chunk_id rows for the same (file_id, chunk_idx)
                         // slot from patch rotation, in arbitrary (hash) iteration order.
+                        //
+                        // Unlike rebuild_chunk_map_from_metadata (cold startup, where
+                        // chunk_generations is unconditionally empty — nothing durable to
+                        // seed it from yet), this repair runs on an already-live node:
+                        // self.chunk_generations may already hold real, currently-correct
+                        // entries accumulated from ordinary write/fold traffic since this
+                        // node booted. Passing None here (as this used to) discarded that
+                        // live signal for no reason and fell back straight to the weaker
+                        // client_write_seq/fold-tiebreak/written_at rule — exactly the
+                        // rule generation was introduced to be authoritative over (Fix S).
+                        // Passing Some(&chunk_generations) lets repair benefit from
+                        // whatever this node already correctly knows, same as any live
+                        // ReplicateChunkLocation merge does.
                         let mut total = 0usize;
                         let _ = metadata.scan_files(|file| {
                             total += 1;
@@ -12390,7 +12514,7 @@ impl Server {
                         let mut built = 0usize;
                         let scan2 = metadata.scan_chunk_locations(|loc| {
                             let Some(file_id) = loc.file_id else { return true; };
-                            Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, None, file_id, &loc);
+                            Self::chunk_map_update_location_for_file_sync(&chunk_map, &chunk_to_file, &fold_result_chunk_ids, Some(&chunk_generations), file_id, &loc);
                             let seed_write_seq = file_write_seqs.get(&file_id).map(|v| *v).unwrap_or(0);
                             if let Some(mut entry) = chunk_map.get_mut(&file_id) {
                                 let (_, seq) = entry.value_mut();
@@ -12403,6 +12527,13 @@ impl Server {
                             warn!("Metadata repair: chunk map rebuild failed during chunk scan: {}", e);
                         }
                         info!("Metadata repair: chunk map rebuilt: {} chunks across {} files", built, total);
+
+                        // Also backfill from CHUNK_SEQ_TABLE — covers any slot this
+                        // node's own live chunk_generations doesn't (yet) have an
+                        // entry for, e.g. one it only ever learned about before this
+                        // node's own most recent restart. See
+                        // backfill_chunk_generations_from_chunk_seq_table's doc comment.
+                        backfill_chunk_generations_from_chunk_seq_table(&metadata, &chunk_map, &chunk_generations);
 
                         // Rebuild missing chunk: routing table entries.
                         info!("Metadata repair: rebuilding missing chunk location records");
@@ -14814,6 +14945,237 @@ mod tests {
             stats.pending_healing, 0,
             "this node is not in the chunk's real replica set per chunk_map — must not \
              queue a phantom heal for a chunk it was never assigned to hold"
+        );
+    }
+
+    /// Root-caused 2026-07-28 (VM-108 dd EIO, second occurrence, ~14h after the
+    /// 3d2a2ad/f1e19cc deploy — so a fresh bug, not leftover pre-fix damage). A
+    /// fold's result must be able to supersede the pending patch token it just
+    /// consolidated. `run_single_fold` used to stamp the fold's `chunk_generations`
+    /// entry by inheriting ONLY `base_chunk_id`'s (possibly ancient) generation,
+    /// ignoring `delta_client_write_seq` — the generation of the write actually being
+    /// folded in, already available as a parameter and already correctly used a few
+    /// lines later for `client_write_seq` (see `fold_seq`). When a fold consolidates a
+    /// genuinely newer write on top of an old base, the fold's own byte-verified
+    /// result ended up stamped with a STALE generation lower than the write's, so
+    /// `location_supersedes` rejected the fold's announcement to the leader and left
+    /// the slot pointing at the write's raw patch token forever — a token whose
+    /// PATCH_STATE_TABLE row this same fold had *just* flipped to `Folded` (so it's
+    /// no longer resolvable as a pending overlay either) and which never had a
+    /// backing chunk file (so it's not resolvable as a real chunk either). Permanent
+    /// dangling pointer, confirmed live: `dfs-admin file raw-location` showed the
+    /// token's bytes present on zero nodes while the fold's real result was
+    /// byte-identical and durable on all 3 replicas.
+    #[tokio::test]
+    async fn test_run_single_fold_generation_reflects_folded_write_not_stale_base() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let client = Arc::new(NetworkClient::new());
+        let healing = Arc::new(HealingManager::new(
+            storage.clone(), metadata.clone(), cluster.clone(), client,
+            Arc::new(std::sync::atomic::AtomicUsize::new(3)), 300, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            100, 60.0, 8, 3, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        server.set_healing_manager(healing.clone()).await;
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // base_chunk_id: this slot's old, long-settled ancestor — generation 5,
+        // e.g. from a fold that ran hours earlier.
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        server.record_chunk_generation(base_chunk_id, 5);
+
+        // A much newer client write lands on this exact slot: real generation 500.
+        // Per the normal patch/overlay design, chunk_map is pointed at the write's
+        // public token immediately (readable before folding), and the write's own
+        // generation is recorded exactly as an ordinary write does via
+        // record_chunk_generation (see the PatchChunk/MultiPatch call sites).
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"pending-patch-token"));
+        server.record_chunk_generation(public_token, 500);
+        server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
+            chunk_id: public_token,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: [0u8; 32],
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(500),
+            file_id: Some(file_id),
+        }], 1));
+
+        // The delta this write registered: a 1-byte change, encoded in the normal
+        // append-only delta record format.
+        let delta_record = encode_delta_record(0, &[0xABu8]);
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_record));
+        storage.write_chunk(&delta_chunk_id, &delta_record).unwrap();
+
+        // Run the fold: consolidates base_chunk_id (generation 5) + this write's
+        // delta (generation 500) into a new physical chunk. run_single_fold lives on
+        // OverlayForkCtx (the Arc-bundle the background fold task runs from, not
+        // &Server directly) — see Server::overlay_ctx's doc comment.
+        let ctx = server.overlay_ctx();
+        let result = ctx.run_single_fold(
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500),
+        ).await;
+        let (new_chunk_id, ..) = result.expect("fold should succeed: base and delta are both valid");
+        assert_ne!(new_chunk_id, base_chunk_id, "the delta changes content, so this must not be a no-op fold");
+
+        // The fold's own result generation must be at least as fresh as the write
+        // it just consolidated (500) — not the stale base's ancient generation (5).
+        let new_gen = server.chunk_generations_ref().get(&new_chunk_id).map(|v| *v);
+        assert!(
+            new_gen.unwrap_or(0) >= 500,
+            "fold result generation ({:?}) must be >= the folded write's own generation \
+             (500) — inheriting only the stale base's generation (5) means the fold's \
+             correct result can never supersede the write's own token in \
+             location_supersedes' generation check, permanently stranding the pointer",
+            new_gen,
+        );
+
+        // Directly prove the practical consequence: the leader-side arbiter must let
+        // the fold's result win over the pending token it just folded.
+        let existing_loc = ChunkLocation {
+            chunk_id: public_token,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: [0u8; 32],
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(500),
+            file_id: Some(file_id),
+        };
+        let incoming_loc = ChunkLocation {
+            chunk_id: new_chunk_id,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: new_chunk_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(500),
+            file_id: Some(file_id),
+        };
+        assert!(
+            Server::location_supersedes(&incoming_loc, &existing_loc, true, false, new_gen, Some(500)),
+            "the fold's own correctly-consolidated result must supersede the pending \
+             patch token it just folded — otherwise the slot is left pointing at a token \
+             whose PATCH_STATE_TABLE row was just flipped to Folded (unresolvable as a \
+             pending overlay) and which has no backing chunk file (unresolvable as a real \
+             chunk either) — a permanent dangling pointer, exactly the 2026-07-28 VM-108 \
+             incident"
+        );
+    }
+
+    /// Increment 4 (2026-07-28, same session as the fold-generation fix above): a
+    /// node that only ever LEARNS a slot's generation via a peer's
+    /// ReplicateChunkLocation broadcast — never originates a write or fold for that
+    /// slot itself — must still recover that generation after its own restart. Before
+    /// this fix, chunk_generations was purely in-memory: a node's own writes/folds
+    /// durably recorded their generation into CHUNK_SEQ_TABLE (already existed,
+    /// already monotonic, already durable), but handle_replicate_chunk_location's
+    /// RECEIVE side only ever updated the in-memory map, never CHUNK_SEQ_TABLE. This
+    /// is exactly the gap that stranded VM-108's leader: the leader never originated
+    /// the fold in question, so restarting it alone could never recover the fact —
+    /// only restarting the fold's actual origin nodes (which DID durably know, via
+    /// their own writes) worked, and only incidentally (whichever one became leader
+    /// during the rolling restart). This test proves the narrower, reliable fix: ANY
+    /// node that has ever received the generation via RPC now durably remembers it,
+    /// independent of whether it originated anything.
+    #[tokio::test]
+    async fn test_chunk_generation_learned_via_rpc_survives_restart() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+        let foreign_node = dfs_common::NodeId::new();
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"fold-result-this-node-never-made"));
+
+        // Simulate receiving a peer's broadcast for a chunk THIS node had no part in
+        // creating (nodes: [foreign_node], not node_id) — exactly what happens when a
+        // fold's origin node announces its result to the rest of the cluster.
+        let location = ChunkLocation {
+            chunk_id,
+            nodes: vec![foreign_node],
+            size: 4096,
+            checksum: chunk_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(500),
+            file_id: Some(file_id),
+        };
+        server.handle_replicate_chunk_location(location.clone(), Some(file_id), Some(500)).await;
+
+        // Sanity: the live in-memory map picked it up (this part already worked
+        // before this fix).
+        assert_eq!(
+            server.chunk_generations_ref().get(&chunk_id).map(|v| *v), Some(500),
+            "handle_replicate_chunk_location must record the incoming generation in-memory",
+        );
+
+        // The actual fix: this must ALSO be durable, in CHUNK_SEQ_TABLE, keyed by
+        // slot — not just in-memory.
+        let durable_seq = metadata.get_chunk_seq_async(file_id, chunk_idx).await.unwrap();
+        assert_eq!(
+            durable_seq, Some(500),
+            "a generation learned purely via RPC (this node never wrote or folded \
+             this chunk itself) must be persisted into CHUNK_SEQ_TABLE, or it cannot \
+             survive this node's own restart",
+        );
+
+        // Simulate this node restarting: chunk_generations comes back empty (exactly
+        // what happens on process restart — it's never persisted directly), then run
+        // the same backfill pass rebuild_chunk_map_from_metadata/healing repair run.
+        server.chunk_generations_ref().clear();
+        assert!(server.chunk_generations_ref().get(&chunk_id).is_none(), "sanity: simulated restart cleared it");
+
+        backfill_chunk_generations_from_chunk_seq_table(
+            &metadata, &server.chunk_map_ref(), &server.chunk_generations_ref(),
+        );
+
+        assert_eq!(
+            server.chunk_generations_ref().get(&chunk_id).map(|v| *v), Some(500),
+            "after a simulated restart, backfilling from CHUNK_SEQ_TABLE must recover \
+             the generation this node only ever learned via RPC — without this, only \
+             nodes that personally originated a write/fold can recover after restart, \
+             exactly the gap that made VM-108's leader-only restart fail while a full \
+             rolling restart (by luck of which node ended up leader) happened to work",
         );
     }
 

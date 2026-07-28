@@ -92,6 +92,23 @@ pub struct Server {
     /// promptly without re-creating the herd.
     fold_sweep_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// Bounds concurrent foreground client writes (handle_write_chunk's
+    /// background=false branch, and apply_patch's delta write — the two paths
+    /// a real client write always goes through). Every OTHER fan-out point in
+    /// this file (prefetch, broadcast, delete, fold_sweep above) already has an
+    /// explicit cap; this was the one write path with none. Root-caused
+    /// 2026-07-28: running kdiskmark and a large sequential transfer at once
+    /// gave two independent, uncoordinated sources of write concurrency both
+    /// hitting this same unthrottled path — each in-flight write holds its
+    /// full chunk payload (up to 4MB) resident for the duration of its
+    /// spawn_blocking disk write, and thread count was observed climbing into
+    /// the 70-130 range under combined load with nothing to cap it beyond
+    /// tokio's own default max_blocking_threads (512). Sized well above any
+    /// concurrency actually observed so far (single-workload peak was 78
+    /// threads) so legitimate multi-VM throughput isn't the thing that hits
+    /// this cap first — this is a worst-case backstop, not a throughput knob.
+    write_semaphore: Arc<tokio::sync::Semaphore>,
+
     /// Leader-maintained in-memory chunk map: FileId -> Vec<ChunkLocation>.
     /// Only the leader serves GetFileChunkMap requests from this map.
     /// All nodes keep it up-to-date so leadership transitions are seamless.
@@ -626,15 +643,36 @@ fn update_chunk_map_after_patch(
 }
 
 /// On-disk format for an overlay patch delta: a plain concatenation of records,
-/// each `[offset: u64 LE][len: u32 LE][data: len bytes]`, with no overall count
-/// or length prefix — parsed by reading records until EOF. Deliberately not
-/// bincode's `Vec<(usize, Vec<u8>)>` encoding, which prefixes the element count:
-/// appending one more element changes bytes at the *front* of the buffer, so
-/// growing that encoding always means re-serializing everything accumulated so
-/// far. This format never needs to be rewritten to add a record — a merge can
-/// open the existing delta file and literally append the new record's bytes.
-fn encode_delta_record(offset: usize, data: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8 + 4 + data.len());
+/// each `[seq: u64 LE][offset: u64 LE][len: u32 LE][data: len bytes]`, with no
+/// overall count or length prefix — parsed by reading records until EOF.
+/// Deliberately not bincode's `Vec<(usize, Vec<u8>)>` encoding, which prefixes
+/// the element count: appending one more element changes bytes at the *front*
+/// of the buffer, so growing that encoding always means re-serializing
+/// everything accumulated so far. This format never needs to be rewritten to
+/// add a record — a merge can open the existing delta file and literally
+/// append the new record's bytes.
+///
+/// `seq` (2026-07-28, VM-111 REPLICA DISAGREEMENT storm): the record's
+/// client_write_seq at encode time — NOT just positional metadata, this is
+/// what makes replaying these records order-independent across replicas. See
+/// parse_delta_records' doc comment for why this field exists at all: without
+/// it, two replicas that received the same two overlapping concurrent patches
+/// in different arrival order would fold to genuinely different bytes, with
+/// no network fault and no bug in the fold math itself — confirmed via a
+/// direct repro (test_concurrent_overlapping_patches_diverge_by_arrival_order)
+/// and matching a real production incident (VM-111 install, ~1,176 disagreement
+/// warnings/hour). A 2026-07-11 investigation (VM-108 qcow2 corruption)
+/// already suspected this exact mechanism and added diagnostic logging for it,
+/// then closed with an unrelated root cause for that incident — the hazard
+/// itself was never fixed until now.
+///
+/// Not rolling-deploy-safe: an accumulator straddling old and new binary
+/// versions on the same node would mix 12-byte and 20-byte record headers.
+/// Deploy this as an all-at-once restart, same as any other non-rolling-safe
+/// wire/disk format change in this codebase (e.g. the RCL generation field).
+fn encode_delta_record(seq: u64, offset: usize, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + 8 + 4 + data.len());
+    buf.extend_from_slice(&seq.to_le_bytes());
     buf.extend_from_slice(&(offset as u64).to_le_bytes());
     buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
     buf.extend_from_slice(data);
@@ -642,24 +680,36 @@ fn encode_delta_record(offset: usize, data: &[u8]) -> Vec<u8> {
 }
 
 /// Parse the append-only delta format (see encode_delta_record) back into the
-/// (offset, data) pairs run_single_fold and compose_one_patch apply in order.
+/// (offset, data) pairs run_single_fold and compose_one_patch apply in order —
+/// ordered by each record's own client_write_seq (stable sort: records sharing
+/// a seq, i.e. multiple ranges from one patch call, keep their original
+/// relative order), NOT by file/append position. Append position is arrival
+/// order at THIS node, which can differ from arrival order at another replica
+/// for the same two concurrent patches — sorting by the client-assigned seq
+/// instead makes the result identical on every replica regardless of network
+/// timing, since seq is fixed once by the client before fan-out. A record with
+/// no meaningful seq (there is none pre-this-fix; can't happen from current
+/// encode_delta_record callers) would sort as oldest, never overriding a
+/// properly-seq'd record it overlaps.
 fn parse_delta_records(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
-    let mut out = Vec::new();
+    let mut records: Vec<(u64, usize, Vec<u8>)> = Vec::new();
     let mut pos = 0usize;
     while pos < bytes.len() {
-        if pos + 12 > bytes.len() {
+        if pos + 20 > bytes.len() {
             anyhow::bail!("truncated delta record header at offset {}", pos);
         }
-        let offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
-        let len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap()) as usize;
-        pos += 12;
+        let seq = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let offset = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(bytes[pos + 16..pos + 20].try_into().unwrap()) as usize;
+        pos += 20;
         if pos + len > bytes.len() {
             anyhow::bail!("truncated delta record data at offset {} (need {} bytes)", pos, len);
         }
-        out.push((offset, bytes[pos..pos + len].to_vec()));
+        records.push((seq, offset, bytes[pos..pos + len].to_vec()));
         pos += len;
     }
-    Ok(out)
+    records.sort_by_key(|(seq, ..)| *seq);
+    Ok(records.into_iter().map(|(_, offset, data)| (offset, data)).collect())
 }
 
 /// Read-modify-write the *entire* current content of `old_chunk_id`, apply every
@@ -748,9 +798,21 @@ async fn full_rewrite_chunk(
         // exact order and byte ranges actually applied during this fold, to
         // cross-reference against [MERGE-TRACE]'s per-patch log — confirms
         // whether the fold applies records in the same order they were merged.
-        {
+        // Demoted to debug! (2026-07-28) — its sibling [MERGE-TRACE] in
+        // apply_patch got this same treatment on 2026-07-22 when that
+        // investigation closed, but this one was missed and has been firing
+        // unconditionally at info! on every single fold cluster-wide ever
+        // since. Confirmed live as a real, non-trivial contributor to disk
+        // I/O pressure during the 2026-07-28 gluster5 rejoin incident: this
+        // log file lives on the same filesystem as chunk data, and durability
+        // is a per-device syncfs (DurabilityCoalescer), so every one of these
+        // (one per fold, cluster-wide, with an unbounded `ranges` vector that
+        // can run to dozens of entries) competed for the same disk bandwidth
+        // needed for actual chunk/metadata durability. Re-enable with debug
+        // when chasing a suspected ordering inversion, same as the sibling.
+        if tracing::enabled!(tracing::Level::DEBUG) {
             let ranges: Vec<(usize, usize)> = patches.iter().map(|(off, d)| (*off, d.len())).collect();
-            info!("[FOLD-TRACE] file={} chunk_idx={} old={} applying {} record(s) ranges={:?}",
+            debug!("[FOLD-TRACE] file={} chunk_idx={} old={} applying {} record(s) ranges={:?}",
                 file_id, chunk_file_offset / (4 * 1024 * 1024), old_chunk_id, patches.len(), ranges);
         }
         for (intra_offset, patch_data) in &patches {
@@ -2466,6 +2528,17 @@ impl OverlayForkCtx {
         // this slot's *next* patch retires it (see apply_patch).
         self.pending_patch_ids.remove(&base_chunk_id);
 
+        // NOT demoted to debug! (tried 2026-07-28, same session as the
+        // [FOLD-TRACE] demotion above) — this exact string is LOAD-BEARING:
+        // scripts/t53_collect_folds.py regex-matches
+        // "Single fold: file {} chunk_idx (\d+) consolidated " directly
+        // against the server logs, and the test suite runs dfs-server at
+        // RUST_LOG=info (only the client runs at debug) — demoting this
+        // silently broke T53a ("no backstop fold observed... test setup did
+        // not reproduce the trigger"). Same class of load-bearing info! line
+        // as the sibling [MERGE-TRACE] in apply_patch (kept at info! for T54,
+        // see that call site's comment) — check both suite scripts before
+        // ever touching this one again.
         info!("Single fold: file {} chunk_idx {} consolidated ({} + delta -> {}, final size {})",
             file_id, chunk_idx, base_chunk_id, new_chunk_id, final_size);
         Some((new_chunk_id, final_size, fold_buf, final_client_write_seq))
@@ -3169,6 +3242,7 @@ impl Server {
             broadcast_semaphore: Arc::new(tokio::sync::Semaphore::new(20)),
             delete_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             fold_sweep_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            write_semaphore: Arc::new(tokio::sync::Semaphore::new(48)),
             chunk_map: Arc::new(DashMap::new()),
             chunk_to_file: Arc::new(DashMap::new()),
             missing_chunks: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -5757,6 +5831,10 @@ impl Server {
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)))
         } else {
+            // See write_semaphore's doc comment: bounds concurrent foreground
+            // writes so an unthrottled burst can't pile up spawn_blocking
+            // threads and buffered chunk payloads without limit.
+            let _permit = self.write_semaphore.acquire().await.ok();
             let storage = self.storage.clone();
             tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data))
                 .await
@@ -10925,9 +11003,13 @@ impl Server {
         let t_base = t_base_start.elapsed();
         let t_hash_start = std::time::Instant::now();
 
+        // Fallback 0 for a missing seq (no current caller of apply_patch omits
+        // client_write_seq, but treat absence as "oldest" rather than panicking —
+        // it can never wrongly override a properly-seq'd overlapping record).
+        let record_seq = client_write_seq.unwrap_or(0);
         let mut new_record_bytes = Vec::new();
         for (off, data) in &patches {
-            new_record_bytes.extend_from_slice(&encode_delta_record(*off, data));
+            new_record_bytes.extend_from_slice(&encode_delta_record(record_seq, *off, data));
         }
 
         // Running content hash for this accumulator (see DirtyPatchSlot::delta_hasher's
@@ -11001,6 +11083,10 @@ impl Server {
         let t_hash = t_hash_start.elapsed();
         let t_write_start = std::time::Instant::now();
         let storage = self.storage.clone();
+        // See write_semaphore's doc comment: this is the other foreground
+        // client-write path (small/random writes go through the delta
+        // accumulator here, not handle_write_chunk) that needs the same cap.
+        let _write_permit = self.write_semaphore.acquire().await.ok();
         match prior_delta {
             Some(prior_delta_id) => {
                 let append_bytes = new_record_bytes.clone();
@@ -15028,7 +15114,7 @@ mod tests {
 
         // The delta this write registered: a 1-byte change, encoded in the normal
         // append-only delta record format.
-        let delta_record = encode_delta_record(0, &[0xABu8]);
+        let delta_record = encode_delta_record(500, 0, &[0xABu8]);
         let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_record));
         storage.write_chunk(&delta_chunk_id, &delta_record).unwrap();
 
@@ -15176,6 +15262,139 @@ mod tests {
              nodes that personally originated a write/fold can recover after restart, \
              exactly the gap that made VM-108's leader-only restart fail while a full \
              rolling restart (by luck of which node ended up leader) happened to work",
+        );
+    }
+
+    /// Root-caused 2026-07-28 (VM-111 grub-install I/O error + REPLICA DISAGREEMENT
+    /// storm on server3/server4). apply_patch's own doc comment says merged records
+    /// are applied "in order, so a later entry correctly overwrites an earlier one's
+    /// overlapping bytes" — but "in order" means FILE/APPEND order (whatever order
+    /// apply_patch calls happened to be LOCALLY PROCESSED in), not the client's
+    /// monotone client_write_seq. chunk_patch_locks only serializes processing order
+    /// on ONE node; it says nothing about cross-node ordering. Each replica receives
+    /// its own independent copy of every MultiPatch RPC in parallel, so ordinary
+    /// network/scheduling jitter lets two replicas process the same two overlapping
+    /// concurrent patches in opposite arrival order. The delta record format
+    /// (encode_delta_record: [offset][len][data]) carries no ordering key at all, so
+    /// there is nothing to correct this with downstream — whichever patch a given
+    /// node happened to apply LAST wins that node's copy of the overlap, independent
+    /// of which one was actually issued later. Two replicas can legitimately diverge
+    /// with no network fault, no corruption of either individual write, and no bug in
+    /// the fold math itself — just a missing global ordering key. A 2026-07-11
+    /// investigation (VM-108 qcow2 corruption) already suspected exactly this
+    /// mechanism ("causal/arrival-order inversion under concurrent writers") and
+    /// added diagnostic logging for it, then closed with a different root cause for
+    /// that specific incident — the underlying hazard itself was never fixed.
+    ///
+    /// This test proves it directly: two patches to the same overlapping byte range,
+    /// tagged with different client_write_seq values (100 = logically earlier, 200 =
+    /// logically later), applied to two independent "replicas" in opposite arrival
+    /// order. The logically-later write (seq 200) must win the overlap on BOTH
+    /// replicas regardless of arrival order — but today, whichever one is applied
+    /// SECOND wins, so reversing arrival order reverses the result.
+    #[tokio::test]
+    async fn test_concurrent_overlapping_patches_diverge_by_arrival_order() {
+        // Runs one full "replica": writes a base chunk, applies `first` then `second`
+        // (each (offset, data, client_write_seq)) via two separate apply_patch calls
+        // simulating two independent MultiPatch RPCs landing on this node in that
+        // order, then resolves the resulting Pending accumulator's final bytes the
+        // same way compose_one_patch/the eventual fold would (parse the delta,
+        // apply records in FILE order onto the base).
+        async fn run_replica(
+            first: (usize, &[u8], u64),
+            second: (usize, &[u8], u64),
+        ) -> Vec<u8> {
+            let temp_storage = TempDir::new().unwrap();
+            let temp_metadata = TempDir::new().unwrap();
+            let temp_metadata_dir = TempDir::new().unwrap();
+            let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+            let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+            let node_id = NodeId::new();
+            let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+            let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+            let server = Server::new(
+                storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+                temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+            );
+
+            let file_id = dfs_common::FileId::new();
+            let chunk_idx = 0u64;
+            let chunk_file_offset = 0u64;
+
+            // A settled base chunk — registered as already-Folded (onto itself) so
+            // apply_patch's fresh-accumulator path takes the locally-verified branch
+            // and skips the leader-confirmation round trip (irrelevant to what this
+            // test measures, and there's no real leader to answer it in this harness).
+            let base_content = vec![0u8; 64];
+            let base_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+            );
+            storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+            metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+            metadata.put_chunk_location(&ChunkLocation {
+                chunk_id: base_chunk_id,
+                nodes: vec![node_id],
+                size: base_content.len(),
+                checksum: base_chunk_id.hash,
+                file_offset: Some(chunk_file_offset),
+                written_at: None,
+                client_write_seq: None,
+                file_id: Some(file_id),
+            }).unwrap();
+
+            let (off1, data1, seq1) = first;
+            let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let (token1, ..) = server.apply_patch(
+                Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+                vec![(off1, data1.to_vec())], Some(seq1), None,
+            ).await.expect("first apply_patch should succeed");
+
+            let (off2, data2, seq2) = second;
+            let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let (token2, ..) = server.apply_patch(
+                Some(lock2), token1, file_id, Some(chunk_idx), chunk_file_offset,
+                vec![(off2, data2.to_vec())], Some(seq2), None,
+            ).await.expect("second apply_patch (merge) should succeed");
+
+            let state = metadata.get_patch_state(&token2).unwrap().expect("token2 must resolve");
+            let (resolved_base, delta_id) = match state {
+                PatchState::Pending { base_chunk_id, delta_chunk_id, .. } => (base_chunk_id, delta_chunk_id),
+                other => panic!("expected Pending accumulator, got {:?}", other),
+            };
+            let mut buf = storage.read_chunk(&resolved_base).unwrap();
+            let delta_bytes = storage.read_chunk(&delta_id).unwrap();
+            for (off, data) in parse_delta_records(&delta_bytes).unwrap() {
+                let end = off + data.len();
+                if end > buf.len() { buf.resize(end, 0); }
+                buf[off..end].copy_from_slice(&data);
+            }
+            buf
+        }
+
+        // Both patches touch the SAME overlapping range (offset 10, 4 bytes) with
+        // different content: seq=100 is the logically-earlier write, seq=200 the
+        // logically-later one. The logically-later write must win regardless of
+        // which order the two replicas happened to receive them in.
+        let earlier = (10usize, &[0xAAu8; 4][..], 100u64);
+        let later = (10usize, &[0xBBu8; 4][..], 200u64);
+
+        // "Replica X" receives them in causal order (earlier, then later).
+        let replica_x = run_replica(earlier, later).await;
+        // "Replica Y" receives the exact same two writes in the OPPOSITE order —
+        // an entirely ordinary outcome of independent network delivery to two
+        // different replicas, not a fault condition.
+        let replica_y = run_replica(later, earlier).await;
+
+        assert_eq!(
+            replica_x, replica_y,
+            "two replicas that received the same two writes (seq=100, seq=200) in a \
+             different ARRIVAL order produced different final bytes for the same \
+             overlapping range — this is REPLICA DISAGREEMENT with no network fault \
+             involved: the delta format has no ordering key, so whichever write a node \
+             happened to apply LAST wins its copy of the overlap, instead of the \
+             logically-later (higher client_write_seq) write always winning regardless \
+             of arrival order",
         );
     }
 
@@ -16173,7 +16392,7 @@ mod tests {
             // Delta chunk: patch bytes [100..108) := 0xAB, append-only delta format.
             let patch_off = 100usize;
             let patch_bytes = vec![0xABu8; 8];
-            let delta_bytes = encode_delta_record(patch_off, &patch_bytes);
+            let delta_bytes = encode_delta_record(1, patch_off, &patch_bytes);
             let delta_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
             h.storage.write_chunk(&delta_id, &delta_bytes).unwrap();
 
@@ -16907,7 +17126,7 @@ mod tests {
             // delta chunk, constructed directly rather than through handle_multi_patch
             // so this test isn't racing that patch's own real, immediately-triggered
             // background fold.
-            let delta_bytes = encode_delta_record(0, &[1u8; 100]);
+            let delta_bytes = encode_delta_record(1, 0, &[1u8; 100]);
             let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
             h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
             let public_token = ChunkId::from_hash(compute_chunk_hash(b"mid-fold-crash-token"));

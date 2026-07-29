@@ -795,6 +795,111 @@ pub enum Request {
     ReplicateChunkLocationsV2 {
         locations: Vec<ChunkLocation>,
     },
+
+    /// Peer-to-peer pre-fold arbitration for the debounce/idle-timer fold path
+    /// (OverlayForkCtx::coordinate_and_fold_slot / debounce_fold_slot) — closes
+    /// a real incident where two replicas' independent debounce timers each
+    /// folded from a possibly-divergent local accumulator, producing two
+    /// different chunk_ids for the same slot (see fold_slot_coordinated's doc
+    /// comment for the full history: three prior mitigation attempts never
+    /// closed this, only shrank the window). Sent by whichever replica's
+    /// debounce timer fires first, to every OTHER online replica of the slot
+    /// (normally exactly one, given dual-RF), BEFORE that node ever calls
+    /// fold_slot_now for this generation. A single round trip doubles as both
+    /// the hash-agreement check (base_chunk_id + delta_chunk_id are themselves
+    /// content-addressed, so equality proves byte-identical accumulators with
+    /// no extra hashing) and the exclusive-lock acquisition (a Granted
+    /// response is the peer's promise not to independently fold this exact
+    /// slot itself until released or the lease TTL expires).
+    /// Appended at the end of the enum, not inserted mid-list — bincode is
+    /// positional (see ReplicateChunkLocationsV2's doc comment for the
+    /// incident this rule exists to prevent).
+    ProposeFold {
+        file_id: FileId,
+        chunk_idx: u64,
+        proposer: NodeId,
+        /// Wall-clock ms (dfs_common::types::current_timestamp_ms(), matching
+        /// CompactionIntent::proposed_at_ms's precision) — used ONLY to break
+        /// a simultaneous mutual-proposal collision, never to decide data
+        /// correctness. Both sides evaluate the same (proposed_at_ms,
+        /// proposer) tuple, so clock skew can only affect *which* side wins,
+        /// not whether both sides agree on the outcome.
+        proposed_at_ms: u64,
+        /// This node's current PatchState::Pending.base_chunk_id for the slot.
+        base_chunk_id: ChunkId,
+        /// This node's current PatchState::Pending.delta_chunk_id — itself a
+        /// content hash of the full accumulated delta bytes, so two nodes
+        /// reporting the same value have byte-identical accumulators by
+        /// construction. No separate hash-exchange step is needed.
+        delta_chunk_id: ChunkId,
+        /// Cheap stat (ChunkStorage::get_chunk_size), not a read — lets the
+        /// receiving side, on a same-base/different-delta disagreement, tell
+        /// which side's accumulator is strictly more complete (patches are
+        /// appended in order from a shared base, so a longer delta file is a
+        /// safe proxy for "has seen more of the same stream") without reading
+        /// either delta's bytes.
+        delta_size_hint: u64,
+    },
+
+    /// Release a lease granted by a prior ProposeFold — sent once, right
+    /// after the proposer's own fold_slot_coordinated(Wave) call returns
+    /// (success or failure), to every peer it proposed to. Best-effort/no
+    /// retry: a lost release just means the peer waits out
+    /// FOLD_COORD_LOCK_TTL instead of noticing immediately, the same
+    /// crash-safety net that already covers the proposer dying mid-fold.
+    ReleaseFoldLock {
+        file_id: FileId,
+        chunk_idx: u64,
+        holder: NodeId,
+        outcome: FoldReleaseOutcome,
+    },
+}
+
+/// See Request::ProposeFold's doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProposeFoldOutcome {
+    /// Agreement confirmed (or proposer's accumulator is strictly more
+    /// complete) — responder promises to stand down for FOLD_COORD_LOCK_TTL.
+    Granted,
+    /// Responder had nothing pending for this slot at all — nothing to
+    /// protect, proposer may proceed. Functionally identical to Granted for
+    /// the proposer; kept distinct only for observability.
+    NothingPending,
+    /// Responder already promised this exact slot to a THIRD node (RF>2
+    /// corner case — unreachable in a dual-RF cluster, which has only one peer).
+    DeclinedAlreadyLocked,
+    /// Responder is already mid-fold (or mid-ordinary-patch-write) for this
+    /// exact slot right now (chunk_patch_locks contended) — it is already the
+    /// de facto coordinator; proposer should stand down and adopt normally.
+    DeclinedAlreadyFolding,
+    /// Simultaneous mutual proposal: proposer lost the (proposed_at_ms,
+    /// node_id) tiebreak. Proposer should NOT retry this slot itself — the
+    /// winning side's own inbound ProposeFold (already in flight the other
+    /// direction) is what drives the actual fold.
+    DeclinedCollision,
+    /// Same base_chunk_id, but responder's own delta_chunk_id disagrees and
+    /// its delta_size_hint is larger — proposer's accumulator is stale.
+    /// Responder proactively kicks off its own coordinate_and_fold_slot in
+    /// the background when it returns this.
+    DeclinedStaleProposer,
+    /// Responder's base_chunk_id disagrees entirely — proposer's view of
+    /// "current generation" for this slot is stale (a fold already advanced
+    /// it, whose broadcast hasn't reached the proposer yet). Proposer should
+    /// not fold; a retry after normal backoff resolves once dissemination
+    /// catches up.
+    DeclinedBaseMismatch,
+    /// ANOMALY: same base_chunk_id AND same delta_size_hint, but different
+    /// delta_chunk_id — should be impossible from correctly-ordered patch
+    /// delivery. Neither side folds; logged loudly on the responder.
+    DeclinedDivergentAccumulators,
+}
+
+/// See Request::ReleaseFoldLock's doc comment. Purely informational for the
+/// receiver's own logging — the grant is cleared identically either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FoldReleaseOutcome {
+    Completed,
+    Failed,
 }
 
 /// Response types
@@ -1145,6 +1250,11 @@ pub enum Response {
     /// this rule.
     ResyncMetadataRequested {
         file_id: FileId,
+    },
+
+    /// Response to ProposeFold — see Request::ProposeFold's doc comment.
+    ProposeFoldResult {
+        outcome: ProposeFoldOutcome,
     },
 }
 

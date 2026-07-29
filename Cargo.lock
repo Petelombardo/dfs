@@ -415,6 +415,7 @@ dependencies = [
  "clap",
  "dashmap",
  "dfs-common",
+ "futures",
  "libc",
  "lru",
  "nix",

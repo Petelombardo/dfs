@@ -5264,6 +5264,7 @@ impl Filesystem for DfsFilesystem {
             self.client.write_open_inodes.insert(ino);
 
             let is_first_writer = self.write_open_counts.get(&ino).map(|c| *c == 1).unwrap_or(true);
+            debug!("[SEQDIAG] open ino={} is_first_writer={} is_trunc={}", ino, is_first_writer, is_trunc);
             if is_first_writer {
                 // O_TRUNC: skip — the writer is about to replace file content wholesale, so
                 // stale chunk locations are irrelevant, and the O_TRUNC branch below removes

@@ -25,6 +25,7 @@ nix = { version = "0.29", features = ["fs"] }
 libc = { workspace = true }
 dashmap = "6.1"
 lru = "0.12"
+futures = "0.3"
 # Fair (queue-ordered) RwLock for MetadataStore.db — std::sync::RwLock wraps
 # pthread_rwlock on Linux, which under sustained heavy reader load can starve
 # a waiting writer indefinitely (new readers keep cutting ahead of the queued

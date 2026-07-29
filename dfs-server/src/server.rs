@@ -8,7 +8,7 @@ use crate::storage::{ChunkStorage, DurabilityClass};
 use anyhow::{Context, Result};
 use dfs_common::{
     ChunkId, ChunkLocation, ClusterMessage, ErrorCode, FileId, FileMetadata,
-    Message, NodeId, Request, Response,
+    FoldReleaseOutcome, Message, NodeId, ProposeFoldOutcome, Request, Response,
 };
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -286,6 +286,38 @@ pub struct Server {
     /// this, the second patch passes the stale check and enters spawn_blocking
     /// while the first is still renaming A→B, and fails with "file not found".
     chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
+
+    /// Cross-node: slots this node has GRANTED to a peer via ProposeFold — see
+    /// FoldLockGrant's doc comment and OverlayForkCtx::coordinate_and_fold_slot.
+    fold_lock_grants: Arc<DashMap<(FileId, u64), FoldLockGrant>>,
+
+    /// This node's own in-flight ProposeFold sends, keyed by slot — used only
+    /// to detect and deterministically resolve the rare case where both
+    /// replicas of a slot propose to each other within the same round-trip
+    /// window. See handle_propose_fold's collision check.
+    outbound_fold_claims: Arc<DashMap<(FileId, u64), OutboundFoldClaim>>,
+
+    /// Bounds the ENTIRE debounce-triggered fold-coordination protocol's
+    /// concurrency (base self-verify through ProposeFold through the actual
+    /// fold through leader-confirm through ReleaseFoldLock) — not just the
+    /// exclusive lock/lease. Sized like fold_sweep_semaphore (8) rather than
+    /// write_semaphore (48) or global_flush_semaphore (64): this path does
+    /// strictly more expensive work per permit (a full 4MB read+hash+write
+    /// plus two network round trips) and is never latency-sensitive (bounded
+    /// only by PATCH_DEBOUNCE_IDLE, not any client-facing path), so avoiding a
+    /// self-inflicted disk/CPU thundering herd matters far more than
+    /// throughput here.
+    fold_coordination_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// Transient, single-read handoff of notify_leader_of_fold's actual
+    /// result, written immediately after that call inside run_single_fold and
+    /// read+removed once by coordinate_and_fold_slot right after
+    /// fold_slot_coordinated returns. Exists only so coordinate_and_fold_slot
+    /// can tell "folded" apart from "and the leader actually knows" without
+    /// changing FoldSlotOutcome::FoldedHere/run_single_fold's tuple (which
+    /// four other, out-of-scope call sites also use) — a missing entry is
+    /// treated as leader-confirm-failed, the conservative default.
+    last_fold_leader_confirm: Arc<DashMap<(FileId, u64), bool>>,
 
     /// Fast in-memory index of every chunk_id that currently requires
     /// PATCH_STATE_TABLE resolution instead of a direct disk read: a patch's
@@ -856,8 +888,27 @@ async fn full_rewrite_chunk(
             if !old_path.exists() {
                 return Err((format!("Failed to read chunk range: Failed to open chunk file: {:?}", old_path), ErrorCode::NotFound));
             }
-            fs::read(&old_path)
-                .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?
+            let data = fs::read(&old_path)
+                .map_err(|e| (format!("Failed to read chunk: {}", e), ErrorCode::InternalError))?;
+            // Self-verify BEFORE mutating — catches on-disk corruption of the
+            // fold's input at the earliest point, independent of and in
+            // addition to OverlayForkCtx::coordinate_and_fold_slot's
+            // cross-node pre-check (which can attempt a peer-pull recovery;
+            // this check has no network access, so its only recourse is to
+            // fail the fold cleanly — patch_state stays Pending, retried
+            // later). Mirrors handle_push_chunk_to's identical check. Only on
+            // the disk-read branch — the prefetched/ring-cache path is
+            // trusted in-process content that never round-tripped through
+            // disk.
+            let actual_hash = dfs_common::compute_chunk_hash_at(&data, chunk_file_offset, file_id);
+            if actual_hash != old_chunk_id.hash {
+                return Err((
+                    format!("Base chunk {} at offset {} failed content hash verification before folding — disk corruption detected",
+                        old_chunk_id, chunk_file_offset),
+                    ErrorCode::ChecksumMismatch,
+                ));
+            }
+            data
         };
 
         let needed_len = patches.iter()
@@ -1089,6 +1140,12 @@ struct OverlayForkCtx {
     chunk_generations: Arc<DashMap<ChunkId, u64>>,
     dirty_patch_slots: Arc<DashMap<(FileId, u64), DirtyPatchSlot>>,
     chunk_patch_locks: Arc<DashMap<(FileId, u64), Arc<tokio::sync::Mutex<()>>>>,
+    /// Same Arc instances as Server's fields of the same name — see their doc
+    /// comments there.
+    fold_lock_grants: Arc<DashMap<(FileId, u64), FoldLockGrant>>,
+    outbound_fold_claims: Arc<DashMap<(FileId, u64), OutboundFoldClaim>>,
+    fold_coordination_semaphore: Arc<tokio::sync::Semaphore>,
+    last_fold_leader_confirm: Arc<DashMap<(FileId, u64), bool>>,
     chunk_ring: Arc<ShardedChunkRing>,
     chunk_ring_hits: Arc<std::sync::atomic::AtomicU64>,
     chunk_ring_misses: Arc<std::sync::atomic::AtomicU64>,
@@ -1234,6 +1291,80 @@ enum FoldCoordination {
     /// coordinated by whoever sent it — and what stops peer→peer recursion.
     Local,
 }
+
+/// This node's promise to a peer, granted via a Request::ProposeFold response
+/// of Granted, not to independently fold this (file_id, chunk_idx) slot itself
+/// until released (Request::ReleaseFoldLock) or `expires_at` passes. The TTL
+/// is the crash-safety net: if the holder (the peer this was granted to) dies
+/// or is partitioned before ever releasing, this node's own next
+/// coordinate_and_fold_slot attempt for the slot finds the lease expired and
+/// competes for it again, exactly as if no grant had ever existed. `Instant`,
+/// not a wall-clock ms value — this is a purely local expiry judgement (this
+/// node's own clock deciding when ITS OWN promise lapses), unlike
+/// proposed_at_ms on the wire, which two different nodes' clocks must agree
+/// on well enough for a deterministic tiebreak.
+#[derive(Clone, Copy)]
+struct FoldLockGrant {
+    holder: dfs_common::NodeId,
+    expires_at: std::time::Instant,
+}
+
+/// This node's own outstanding ProposeFold send, not yet resolved — used only
+/// to detect and deterministically resolve the rare case where both replicas
+/// of a slot fire their debounce timers within the same round-trip window and
+/// propose to each other simultaneously. See handle_propose_fold's collision
+/// check.
+#[derive(Clone, Copy)]
+struct OutboundFoldClaim {
+    proposed_at_ms: u64,
+}
+
+/// Read-only snapshot of what this node would fold right now for a slot — the
+/// fingerprint sent in ProposeFold and compared against on the responder
+/// side. See OverlayForkCtx::local_fold_fingerprint.
+#[derive(Clone, Copy)]
+struct FoldFingerprint {
+    base_chunk_id: ChunkId,
+    delta_chunk_id: ChunkId,
+    delta_size: u64,
+}
+
+/// Result of one coordinate_and_fold_slot attempt — see its doc comment and
+/// debounce_fold_slot's call site.
+enum CoordinatedFoldOutcome {
+    /// This node folded (or the trivial NothingToDo/AdoptedElsewhere fallback
+    /// resolved cleanly) — debounce_fold_slot's task for this slot is done.
+    Done,
+    /// A peer is the rightful folder for this generation right now (already
+    /// folding, holds a strictly more-complete accumulator, or won a
+    /// collision tiebreak) — NOT a failure, must not count toward
+    /// record_fold_failure/escalation.
+    Deferred,
+    /// Genuine failure: peer-unreachable solo-fold fallback also failed, base
+    /// corruption unrecoverable even after a peer-pull attempt, divergent-
+    /// accumulator anomaly, or the fold ran but its mandatory leader-confirm
+    /// step never succeeded.
+    Failed,
+}
+
+/// Per-step timeout once a coordinate_and_fold_slot attempt is actively
+/// running (has its fold_coordination_semaphore permit and is mid-protocol) —
+/// "writing a 4MB block on any disk shouldn't take more than 5 seconds".
+/// Deliberately NOT applied to the wait to acquire the semaphore permit in
+/// the first place, which must stay unbounded/patient so a fold blocked only
+/// by the concurrency cap is queued fairly (tokio's Semaphore is FIFO) and
+/// retried in order, never dropped.
+const FOLD_COORD_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Crash-safety TTL for a granted FoldLockGrant. Sized comfortably above the
+/// worst-case sequential sum of one coordinate_and_fold_slot attempt's steps
+/// (~5s self-verify read + ~5s fold's own base read + ~5s fold's own write +
+/// ~2.2s notify_leader_of_fold's own bounded retry + ~5s propose RPC + ~5s
+/// release RPC ≈ 27s), not pared to exactly that sum.
+const FOLD_COORD_LOCK_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+/// Recheck cadence after a Deferred outcome — short, since we already know a
+/// peer is actively handling the slot; not the same scale as the
+/// exponential failure-path backoff below.
+const FOLD_COORD_DEFER_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Consecutive fold_slot_now failures (same DirtyPatchSlot generation) before
 /// a slot is treated as stuck rather than transiently failing.
@@ -2512,7 +2643,14 @@ impl OverlayForkCtx {
             // attempts. A few seconds of lock-hold on one hot slot during a
             // genuine leader outage is an acceptable trade for the leader never
             // silently missing a fold.
-            if !self.notify_leader_of_fold(public_token, new_chunk_id, file_id, chunk_idx, &new_loc).await {
+            let leader_confirmed = self.notify_leader_of_fold(public_token, new_chunk_id, file_id, chunk_idx, &new_loc).await;
+            // See last_fold_leader_confirm's doc comment — read once by
+            // OverlayForkCtx::coordinate_and_fold_slot right after this fold
+            // returns, to tell "folded" apart from "and the leader actually
+            // knows" without changing this function's own return signature
+            // (which 4 other, out-of-scope call sites also use).
+            self.last_fold_leader_confirm.insert((file_id, chunk_idx), leader_confirmed);
+            if !leader_confirmed {
                 warn!("single fold: leader unreachable/unconfirmed after retries for {} -> {} — relying on backstop rebroadcast loop",
                     public_token, new_chunk_id);
             }
@@ -2789,6 +2927,229 @@ impl OverlayForkCtx {
         }
     }
 
+    /// Read-only snapshot of what fold_slot_now would fold right now, without
+    /// any side effects (no dirty_patch_slots removal, no heal queueing) —
+    /// deliberately NOT shared code with fold_slot_now's own read below, which
+    /// also has to clean up on its non-Pending arms. Returns None for every
+    /// case fold_slot_now would treat as "nothing new here" (no dirty slot, or
+    /// patch_state isn't Pending) — coordinate_and_fold_slot's caller falls
+    /// back to calling the existing, unmodified fold_slot_coordinated directly
+    /// in all of those cases.
+    async fn local_fold_fingerprint(&self, file_id: FileId, chunk_idx: u64) -> Option<FoldFingerprint> {
+        let public_token = self.dirty_patch_slots.get(&(file_id, chunk_idx)).map(|e| e.value().token)?;
+        match self.metadata.get_patch_state_async(public_token).await {
+            Ok(Some(PatchState::Pending { base_chunk_id, delta_chunk_id, .. })) => {
+                let delta_size = self.storage.get_chunk_size(&delta_chunk_id).unwrap_or(0);
+                Some(FoldFingerprint { base_chunk_id, delta_chunk_id, delta_size })
+            }
+            _ => None,
+        }
+    }
+
+    /// One bounded recovery attempt when this node's own on-disk base chunk
+    /// fails content-hash self-verification (see coordinate_and_fold_slot's
+    /// step 3) — pulls a fresh copy from the exact peer already being
+    /// coordinated with (a known replica of this slot) and verifies it before
+    /// trusting it. Mirrors Server::pull_chunk_from_peers's exact
+    /// ChunkData-parsing pattern (arc_data vs data — ChunkData's `data` field
+    /// is always empty over the wire; real bytes come via arc_data or the
+    /// split-frame path) but targets one already-known peer instead of
+    /// scanning a candidate list, since that scan's whole point (finding SOME
+    /// node that has it) doesn't apply here — we already know a specific
+    /// replica does.
+    async fn heal_base_from_peer(&self, chunk_id: ChunkId, file_id: FileId, file_offset: u64, peer_addr: std::net::SocketAddr) -> bool {
+        let req = Request::ReadChunk { chunk_id, sequential_hint: None, client_write_seq: None, file_id: None, chunk_idx: None };
+        let resp = match tokio::time::timeout(FOLD_COORD_STEP_TIMEOUT, self.client.send_message(peer_addr, Message::Request(req))).await {
+            Ok(Ok(envelope)) => envelope.message,
+            Ok(Err(e)) => {
+                warn!("heal_base_from_peer: RPC to {} failed for chunk {}: {}", peer_addr, chunk_id, e);
+                return false;
+            }
+            Err(_) => {
+                warn!("heal_base_from_peer: RPC to {} timed out for chunk {}", peer_addr, chunk_id);
+                return false;
+            }
+        };
+        let data = match resp {
+            Message::Response(Response::ChunkData { arc_data: Some(arc), .. }) => arc,
+            Message::Response(Response::ChunkData { data, arc_data: None, .. }) => Arc::new(data),
+            other => {
+                warn!("heal_base_from_peer: unexpected response from {} for chunk {}: {:?}", peer_addr, chunk_id, other);
+                return false;
+            }
+        };
+        let actual = dfs_common::compute_chunk_hash_at(&data, file_offset, file_id);
+        if actual != chunk_id.hash {
+            warn!("heal_base_from_peer: peer {}'s copy of chunk {} ALSO fails verification — not recoverable from this peer",
+                peer_addr, chunk_id);
+            return false;
+        }
+        let storage = self.storage.clone();
+        let data_for_write = data.clone();
+        matches!(
+            tokio::task::spawn_blocking(move || storage.write_chunk(&chunk_id, &data_for_write)).await,
+            Ok(Ok(()))
+        )
+    }
+
+    /// Entry point debounce_fold_slot uses INSTEAD OF calling
+    /// fold_slot_coordinated directly — see PATCH_DEBOUNCE_IDLE's and
+    /// fold_slot_coordinated's doc comments for the exact race this closes:
+    /// two replicas' independent debounce timers must never both decide "I
+    /// fold now" for the same generation from possibly-divergent local
+    /// accumulators. Ensures at most one replica, cluster-wide, ever reaches
+    /// fold_slot_coordinated(Wave) for a given (file_id, chunk_idx)
+    /// generation, by having the slot's other replica(s) agree BEFORE anyone
+    /// folds — once that agreement is reached, execution is delegated
+    /// verbatim to the existing, unmodified
+    /// fold_slot_now/AdoptedElsewhere/replicate_fold_result machinery.
+    ///
+    /// Bounded by fold_coordination_semaphore for this call's ENTIRE lifetime
+    /// (acquired first, released last via RAII) — deliberately
+    /// unbounded-patient to ACQUIRE (a real write must eventually fold), but
+    /// every step WITHIN an acquired permit is short-timeout bounded (~5s) so
+    /// one stuck peer can't hold a permit forever.
+    async fn coordinate_and_fold_slot(&self, file_id: FileId, chunk_idx: u64) -> CoordinatedFoldOutcome {
+        let _permit = self.fold_coordination_semaphore.clone().acquire_owned().await
+            .expect("fold_coordination_semaphore is never closed");
+        let key = (file_id, chunk_idx);
+
+        // 0. Already granted this exact slot to a peer — don't compete with our
+        //    own promise. Lazily reclaim it if the lease has lapsed with no
+        //    release ever received (peer crash/partition — the crash-safety net).
+        if let Some(grant) = self.fold_lock_grants.get(&key) {
+            if grant.value().expires_at > std::time::Instant::now() {
+                return CoordinatedFoldOutcome::Deferred;
+            }
+            drop(grant);
+            self.fold_lock_grants.remove(&key);
+        }
+
+        // 1. Nothing pending, or already resolved elsewhere — delegate straight
+        //    to the existing, unmodified path (handles NothingToDo/AdoptedElsewhere).
+        let Some(fp) = self.local_fold_fingerprint(file_id, chunk_idx).await else {
+            return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
+                true => CoordinatedFoldOutcome::Done,
+                false => CoordinatedFoldOutcome::Failed,
+            };
+        };
+
+        // 2. No reachable peer to coordinate with — loud, explicit fallback to
+        //    today's uncoordinated behavior (not silent).
+        let peers = self.slot_replica_peers(file_id, chunk_idx).await;
+        if peers.is_empty() {
+            warn!("coordinate_and_fold_slot: no reachable peer for file {} chunk {} — folding solo, uncoordinated \
+                   (this reintroduces the pre-fix race for the duration of this outage)", file_id, chunk_idx);
+            return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
+                true => CoordinatedFoldOutcome::Done,
+                false => CoordinatedFoldOutcome::Failed,
+            };
+        }
+
+        // 3. Self-verify our own base BEFORE ever contacting a peer about it —
+        //    catches "base already corrupt" locally. Since peer addresses are
+        //    already in hand here, attempt one bounded recovery pull before
+        //    giving up (independent of full_rewrite_chunk's own defense-in-depth
+        //    check, which has no network access and so cannot recover).
+        const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
+        let chunk_file_offset = chunk_idx * CHUNK_SIZE_U64;
+        if !self.storage.verify_chunk_at(&fp.base_chunk_id, chunk_file_offset, Some(file_id)) {
+            warn!("coordinate_and_fold_slot: local base chunk {} for file {} chunk {} failed self-verification \
+                   — attempting recovery from peer {:?}", fp.base_chunk_id, file_id, chunk_idx, peers[0].1);
+            if !self.heal_base_from_peer(fp.base_chunk_id, file_id, chunk_file_offset, peers[0].1).await {
+                error!("coordinate_and_fold_slot: base chunk {} for file {} chunk {} is corrupt locally AND \
+                        unrecoverable from peer {:?} — refusing to fold on unverified data",
+                        fp.base_chunk_id, file_id, chunk_idx, peers[0].1);
+                return CoordinatedFoldOutcome::Failed;
+            }
+            info!("coordinate_and_fold_slot: recovered base chunk {} for file {} chunk {} from peer",
+                fp.base_chunk_id, file_id, chunk_idx);
+        }
+
+        // 4. Propose to every peer in parallel; require unanimous agreement.
+        let proposed_at_ms = dfs_common::types::current_timestamp_ms();
+        self.outbound_fold_claims.insert(key, OutboundFoldClaim { proposed_at_ms });
+        let local_id = self.cluster.local_node_id();
+        let client = self.client.clone();
+        let propose_requests: Vec<_> = peers.iter().map(|&(peer_id, peer_addr)| {
+            let request = Request::ProposeFold {
+                file_id, chunk_idx, proposer: local_id, proposed_at_ms,
+                base_chunk_id: fp.base_chunk_id, delta_chunk_id: fp.delta_chunk_id, delta_size_hint: fp.delta_size,
+            };
+            let client = client.clone();
+            async move {
+                (peer_id, tokio::time::timeout(FOLD_COORD_STEP_TIMEOUT, client.send_message(peer_addr, Message::Request(request))).await)
+            }
+        }).collect();
+        let propose_responses = futures::future::join_all(propose_requests).await;
+        self.outbound_fold_claims.remove(&key);
+
+        let mut all_granted = true;
+        let mut hard_failure = false;
+        for (peer_id, result) in propose_responses {
+            match result {
+                Ok(Ok(envelope)) => match envelope.message {
+                    Message::Response(Response::ProposeFoldResult { outcome: ProposeFoldOutcome::Granted | ProposeFoldOutcome::NothingPending }) => {}
+                    Message::Response(Response::ProposeFoldResult { outcome }) => {
+                        debug!("coordinate_and_fold_slot: peer {} declined for file {} chunk {}: {:?}", peer_id, file_id, chunk_idx, outcome);
+                        all_granted = false;
+                    }
+                    other => {
+                        warn!("coordinate_and_fold_slot: unexpected response from {}: {:?}", peer_id, other);
+                        all_granted = false;
+                        hard_failure = true;
+                    }
+                },
+                Ok(Err(e)) => {
+                    warn!("coordinate_and_fold_slot: ProposeFold to {} failed for file {} chunk {}: {}", peer_id, file_id, chunk_idx, e);
+                    all_granted = false;
+                    hard_failure = true;
+                }
+                Err(_) => {
+                    warn!("coordinate_and_fold_slot: ProposeFold to {} timed out for file {} chunk {}", peer_id, file_id, chunk_idx);
+                    all_granted = false;
+                    hard_failure = true;
+                }
+            }
+        }
+
+        if !all_granted {
+            if hard_failure {
+                warn!("coordinate_and_fold_slot: peer unreachable/misbehaving for file {} chunk {} — falling back to \
+                       solo fold (loud, not silent; this is the exact condition the fix is most needed for)", file_id, chunk_idx);
+                return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
+                    true => CoordinatedFoldOutcome::Done,
+                    false => CoordinatedFoldOutcome::Failed,
+                };
+            }
+            return CoordinatedFoldOutcome::Deferred;
+        }
+
+        // 5. Every peer granted — delegate the actual execution unchanged.
+        let folded_ok = self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await;
+
+        // Leader-confirm gate: folded_ok alone does NOT mean the leader was ever
+        // told (notify_leader_of_fold's failure is today just a WARN inside
+        // run_single_fold) — see last_fold_leader_confirm's doc comment.
+        let leader_confirmed = !folded_ok || self.last_fold_leader_confirm.remove(&key).map(|(_, v)| v).unwrap_or(false);
+
+        // 6. Release regardless of outcome: the fold's local commit is already
+        //    durable the moment fold_slot_coordinated returns true; withholding
+        //    release buys nothing (the peer's own TTL already covers "proposer
+        //    vanished") and risks the peer's lease lapsing anyway for no reason.
+        let release_outcome = if folded_ok && leader_confirmed { FoldReleaseOutcome::Completed } else { FoldReleaseOutcome::Failed };
+        let release_requests: Vec<_> = peers.iter().map(|&(_, peer_addr)| {
+            let request = Request::ReleaseFoldLock { file_id, chunk_idx, holder: local_id, outcome: release_outcome };
+            let client = client.clone();
+            async move {
+                let _ = tokio::time::timeout(FOLD_COORD_STEP_TIMEOUT, client.send_message(peer_addr, Message::Request(request))).await;
+            }
+        }).collect();
+        futures::future::join_all(release_requests).await;
+
+        if folded_ok && leader_confirmed { CoordinatedFoldOutcome::Done } else { CoordinatedFoldOutcome::Failed }
+    }
+
     /// Acquires chunk_patch_locks itself (unlike run_single_fold, which expects
     /// an already-held guard handed to it) since callers here never held it to
     /// begin with — merges in apply_patch release it immediately after writing
@@ -2952,28 +3313,39 @@ impl OverlayForkCtx {
                 // 3m18s on a fully healthy 5-node cluster until healing
                 // happened to reach it.
                 //
-                // Dispatched as one WAVE — every replica's fold, including this
-                // node's, starts at the same moment. An earlier version folded
-                // the peers first and awaited them before folding locally, which
-                // removed the short-circuit but left a window a whole fold
-                // duration plus a round trip wide: any patch landing in it gives
-                // the two nodes different cut points in the same stream, so they
-                // fold to different chunk ids and end up disagreeing on the
-                // slot's identity — a worse outcome than the under-replication
-                // this is fixing. The wave narrows that window to RPC processing
-                // time.
-                //
-                // The wave is only safe because fold_slot_now no longer treats
-                // "already Folded" as "and therefore I need nothing" — see its
-                // PatchState::Folded arm. Without that, a peer whose fold lost
-                // the race to this node's ReplicatePatchFold broadcast would
-                // report success while holding none of the bytes.
-                //
-                // Client-driven ForceFold already reaches every replica by
-                // construction and is deliberately left untouched — this is the
-                // backstop path only, so the hot write path pays nothing.
-                if self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
-                    return;
+                // Dispatching the fold as one WAVE (every replica's fold,
+                // including this node's, starting at the same moment) narrows
+                // but does NOT close the disagreement window: two independent
+                // per-node timers can still each decide "I fold now" from
+                // possibly-divergent local accumulators. Measured live: three
+                // mitigation attempts (peers-first, wave, better peer
+                // discovery) never closed it — disagreements actually rose
+                // (10 -> 34 -> 47) as peer discovery improved, since none of
+                // them stopped two nodes from independently deciding to fold.
+                // A real production incident (2026-07-29) confirmed this is
+                // exactly the class of bug that produces a permanently
+                // dangling chunk_id — see coordinate_and_fold_slot's doc
+                // comment for the actual fix: coordinate who's allowed to fold
+                // BEFORE anyone folds, via a peer-to-peer propose/lock
+                // protocol, so at most one replica ever reaches this Wave call
+                // for a given generation. Client-driven ForceFold already
+                // reaches every replica by construction and is deliberately
+                // left untouched — this is the backstop path only, so the hot
+                // write path pays nothing.
+                match self.coordinate_and_fold_slot(file_id, chunk_idx).await {
+                    CoordinatedFoldOutcome::Done => return,
+                    CoordinatedFoldOutcome::Deferred => {
+                        // A peer is the rightful folder right now — NOT a
+                        // failure, must not count toward fold_failures/
+                        // escalation. Recheck soon: either the peer's fold
+                        // lands (this node's dirty_patch_slots resolves via
+                        // the existing AdoptedElsewhere path on the next
+                        // wake) or its grant expires (crash/partition) and
+                        // this node competes again.
+                        retry_backoff = FOLD_COORD_DEFER_RECHECK;
+                        continue;
+                    }
+                    CoordinatedFoldOutcome::Failed => {}
                 }
                 // fold_slot_now already recorded this failure (and logs its own
                 // one-time ERROR on crossing MAX_FOLD_FAILURES_BEFORE_ESCALATION)
@@ -3357,6 +3729,10 @@ impl Server {
             file_write_seqs: Arc::new(DashMap::new()),
             delete_drain_notify: Arc::new(tokio::sync::Notify::new()),
             chunk_patch_locks: Arc::new(DashMap::new()),
+            fold_lock_grants: Arc::new(DashMap::new()),
+            outbound_fold_claims: Arc::new(DashMap::new()),
+            fold_coordination_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            last_fold_leader_confirm: Arc::new(DashMap::new()),
             pending_patch_ids: Arc::new(DashMap::new()),
             pending_patch_fold_broadcasts: Arc::new(DashMap::new()),
             fold_result_chunk_ids: Arc::new(dashmap::DashSet::new()),
@@ -5227,6 +5603,12 @@ impl Server {
             }
             Request::ForceFold { file_id, chunk_idx } => {
                 self.handle_force_fold(file_id, chunk_idx).await
+            }
+            Request::ProposeFold { file_id, chunk_idx, proposer, proposed_at_ms, base_chunk_id, delta_chunk_id, delta_size_hint } => {
+                self.handle_propose_fold(file_id, chunk_idx, proposer, proposed_at_ms, base_chunk_id, delta_chunk_id, delta_size_hint).await
+            }
+            Request::ReleaseFoldLock { file_id, chunk_idx, holder, outcome } => {
+                self.handle_release_fold_lock(file_id, chunk_idx, holder, outcome).await
             }
             Request::DeleteFile { path } => {
                 self.ops_tracker.inc_meta();
@@ -9451,6 +9833,33 @@ impl Server {
         });
     }
 
+    /// Same class of leak as chunk_patch_locks above, for fold_lock_grants: a
+    /// grant this node gave a peer via handle_propose_fold is only ever
+    /// removed by an explicit ReleaseFoldLock or lazily on this node's OWN
+    /// next coordinate_and_fold_slot attempt for that exact key — a slot that
+    /// never gets touched again by this node (e.g. its peer folded it and no
+    /// further writes ever land here) would otherwise leak the grant forever.
+    pub fn start_fold_lock_grants_sweep_loop(self: Arc<Self>) {
+        let server = self;
+        tokio::spawn(async move {
+            const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                let before = server.fold_lock_grants.len();
+                if before == 0 {
+                    continue;
+                }
+                let now = std::time::Instant::now();
+                server.fold_lock_grants.retain(|_, v| v.expires_at > now);
+                let removed = before - server.fold_lock_grants.len();
+                if removed > 0 {
+                    debug!("fold_lock_grants sweep: pruned {} expired lease(s) ({} -> {})",
+                        removed, before, server.fold_lock_grants.len());
+                }
+            }
+        });
+    }
+
     /// One-shot startup sweep: re-discover every Pending PATCH_STATE_TABLE row
     /// directly from disk and resume folding it.
     ///
@@ -10689,6 +11098,10 @@ impl Server {
             chunk_generations: self.chunk_generations.clone(),
             dirty_patch_slots: self.dirty_patch_slots.clone(),
             chunk_patch_locks: self.chunk_patch_locks.clone(),
+            fold_lock_grants: self.fold_lock_grants.clone(),
+            outbound_fold_claims: self.outbound_fold_claims.clone(),
+            fold_coordination_semaphore: self.fold_coordination_semaphore.clone(),
+            last_fold_leader_confirm: self.last_fold_leader_confirm.clone(),
             chunk_ring: self.chunk_ring.clone(),
             chunk_ring_hits: self.chunk_ring_hits.clone(),
             chunk_ring_misses: self.chunk_ring_misses.clone(),
@@ -11959,6 +12372,91 @@ impl Server {
                 code: ErrorCode::InternalError,
             },
         }
+    }
+
+    /// Responder side of the debounce-fold coordination protocol — see
+    /// Request::ProposeFold's doc comment for the full mechanism. Grants or
+    /// declines a proposer's request to be the sole folder of this slot's
+    /// current generation.
+    async fn handle_propose_fold(
+        &self,
+        file_id: dfs_common::FileId,
+        chunk_idx: u64,
+        proposer: NodeId,
+        proposed_at_ms: u64,
+        base_chunk_id: ChunkId,
+        delta_chunk_id: ChunkId,
+        delta_size_hint: u64,
+    ) -> Response {
+        let key = (file_id, chunk_idx);
+        let respond = |outcome| Response::ProposeFoldResult { outcome };
+
+        if let Some(existing) = self.fold_lock_grants.get(&key) {
+            if existing.value().expires_at > std::time::Instant::now() && existing.value().holder != proposer {
+                return respond(ProposeFoldOutcome::DeclinedAlreadyLocked);
+            }
+        }
+        // Peek without taking: try_lock never blocks and has no side effect if
+        // it fails (the guard, if acquired, is dropped immediately), so this
+        // can't deadlock against this node's own fold attempt.
+        if let Some(lock) = self.chunk_patch_locks.get(&key) {
+            if lock.value().try_lock().is_err() {
+                return respond(ProposeFoldOutcome::DeclinedAlreadyFolding);
+            }
+        }
+        let local_id = self.cluster.local_node_id();
+        if let Some(outbound) = self.outbound_fold_claims.get(&key) {
+            if (outbound.value().proposed_at_ms, local_id) < (proposed_at_ms, proposer) {
+                return respond(ProposeFoldOutcome::DeclinedCollision);
+            }
+            drop(outbound);
+            self.outbound_fold_claims.remove(&key);
+        }
+
+        let Some(local_fp) = self.overlay_ctx().local_fold_fingerprint(file_id, chunk_idx).await else {
+            return respond(ProposeFoldOutcome::NothingPending);
+        };
+        if local_fp.base_chunk_id != base_chunk_id {
+            return respond(ProposeFoldOutcome::DeclinedBaseMismatch);
+        }
+        if local_fp.delta_chunk_id == delta_chunk_id {
+            self.fold_lock_grants.insert(key, FoldLockGrant { holder: proposer, expires_at: std::time::Instant::now() + FOLD_COORD_LOCK_TTL });
+            return respond(ProposeFoldOutcome::Granted);
+        }
+        match delta_size_hint.cmp(&local_fp.delta_size) {
+            std::cmp::Ordering::Greater => {
+                self.fold_lock_grants.insert(key, FoldLockGrant { holder: proposer, expires_at: std::time::Instant::now() + FOLD_COORD_LOCK_TTL });
+                respond(ProposeFoldOutcome::Granted)
+            }
+            std::cmp::Ordering::Less => {
+                let ctx = self.overlay_ctx();
+                tokio::spawn(async move { ctx.coordinate_and_fold_slot(file_id, chunk_idx).await; });
+                respond(ProposeFoldOutcome::DeclinedStaleProposer)
+            }
+            std::cmp::Ordering::Equal => {
+                error!("handle_propose_fold: DIVERGENT ACCUMULATORS file={} chunk={} base={} size={} \
+                        (ours {}, proposer {}'s {}) — refusing either side; should be impossible from \
+                        correctly-ordered patch delivery, investigate",
+                        file_id, chunk_idx, base_chunk_id, local_fp.delta_size, local_fp.delta_chunk_id, proposer, delta_chunk_id);
+                respond(ProposeFoldOutcome::DeclinedDivergentAccumulators)
+            }
+        }
+    }
+
+    /// Responder side of releasing a lease granted via handle_propose_fold —
+    /// see Request::ReleaseFoldLock's doc comment.
+    async fn handle_release_fold_lock(&self, file_id: dfs_common::FileId, chunk_idx: u64, holder: NodeId, outcome: FoldReleaseOutcome) -> Response {
+        let key = (file_id, chunk_idx);
+        if let Some(entry) = self.fold_lock_grants.get(&key) {
+            if entry.value().holder == holder {
+                drop(entry);
+                self.fold_lock_grants.remove(&key);
+            }
+        }
+        if matches!(outcome, FoldReleaseOutcome::Failed) {
+            warn!("handle_release_fold_lock: peer {} reported an incomplete coordinated fold for file {} chunk {}", holder, file_id, chunk_idx);
+        }
+        Response::Ok { data: None }
     }
 
     /// Handle delete file request.

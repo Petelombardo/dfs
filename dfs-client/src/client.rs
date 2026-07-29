@@ -7988,9 +7988,14 @@ leader_addr: Arc::new(RwLock::new(None)),
         // Only seed if we don't already have a counter for this file, or if the
         // server has a higher value (e.g. after a client restart).
         let mut entry = self.write_seq.entry(file_id).or_insert(0);
+        let prior = *entry;
         if server_seq >= *entry {
             *entry = server_seq;
         }
+        debug!(
+            "[SEQDIAG] seed_write_seq file_id={} prior={} server_seq={} result={}",
+            file_id, prior, server_seq, *entry
+        );
     }
 
     /// Seed the per-slot chunk_seq counter from a server-reported value — the
@@ -8012,9 +8017,14 @@ leader_addr: Arc::new(RwLock::new(None)),
     /// knows before it ever assigns a new seq for that slot.
     pub fn seed_chunk_seq(&self, file_id: FileId, chunk_idx: u64, server_seq: u64) {
         let mut entry = self.chunk_seq.entry((file_id, chunk_idx)).or_insert(0);
+        let prior = *entry;
         if server_seq >= *entry {
             *entry = server_seq;
         }
+        debug!(
+            "[SEQDIAG] seed_chunk_seq file_id={} chunk_idx={} prior={} server_seq={} result={}",
+            file_id, chunk_idx, prior, server_seq, *entry
+        );
     }
 
     /// Increment and return the next write sequence number for a file.
@@ -8029,6 +8039,10 @@ leader_addr: Arc::new(RwLock::new(None)),
     fn next_chunk_seq(&self, file_id: FileId, chunk_idx: u64) -> u64 {
         let mut entry = self.chunk_seq.entry((file_id, chunk_idx)).or_insert(0);
         *entry += 1;
+        debug!(
+            "[SEQDIAG] next_chunk_seq file_id={} chunk_idx={} new_seq={}",
+            file_id, chunk_idx, *entry
+        );
         *entry
     }
 

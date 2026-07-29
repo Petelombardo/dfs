@@ -382,6 +382,7 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_metadata_healer_loop();
     server.clone().start_patch_fold_sweep_loop();
     server.clone().start_chunk_patch_locks_sweep_loop();
+    server.clone().start_fold_lock_grants_sweep_loop();
     server.clone().start_patch_fold_rebroadcast_loop();
     server.clone().start_periodic_reconciliation_loop();
     server.clone().start_delete_drain_loop();

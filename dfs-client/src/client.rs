@@ -4131,16 +4131,23 @@ leader_addr: Arc::new(RwLock::new(None)),
                 info!("refresh_engine: inode={} got {} chunks (from={} total={}) from leader in {:?}",
                       engine.inode, locs.len(), window_from, total_chunks, rpc_start.elapsed());
                 engine.clear_failed_refresh();
-                // Seed chunk_seq from every location the leader just told us about,
-                // before this client ever assigns its own next seq for any of these
-                // slots — see seed_chunk_seq's doc comment for why this matters now
-                // that chunk_generations is durable and authoritative.
-                const CHUNK_SIZE_SEED: u64 = 4 * 1024 * 1024;
-                for loc in &locs {
-                    if let (Some(offset), Some(seq)) = (loc.file_offset, loc.client_write_seq) {
-                        self.seed_chunk_seq(file_id, offset / CHUNK_SIZE_SEED, seq);
-                    }
-                }
+                // NOTE (2026-07-28): this used to seed chunk_seq here from
+                // loc.client_write_seq — wrong number space (client_write_seq is the
+                // per-FILE write counter, chunk_seq is per-(file,chunk_idx)) and the
+                // actual cause of a "chunk_seq gap" storm on gluster4 during the
+                // VM-111 install failures (5,288 of 7,184 gap events had magnitude
+                // >100, up to 122,682). The correctness need this was solving (a
+                // freshly-seeded client's low local seq stamping a chunk's generation
+                // too low, losing to a stale-but-higher phantom token) is now fixed
+                // server-side instead — see put_chunk_seq_async's doc comment and its
+                // callers in dfs-server/src/server.rs, which stamp generations from
+                // the durable, monotonic, authoritative value regardless of what raw
+                // seq a client sends. No client-side pre-seeding is needed for
+                // correctness; do_patch_chunk/do_multi_patch already adopt the
+                // server's authoritative chunk_seq from each response (see
+                // seed_chunk_seq's call sites there) as this client's own local
+                // counter converges naturally the first time it actually patches
+                // a slot.
                 engine.update_chunk_map_window(locs, window_from, total_chunks, Arc::new(nim), file_size, false);
                 engine.confirmed_at_least_once.store(true, Ordering::Relaxed);
             }
@@ -6738,7 +6745,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         for (addr, result) in results {
             match result {
-                Ok(Response::PatchChunkResult { new_chunk_id: ncid, size, chunk_seq: _ }) => {
+                Ok(Response::PatchChunkResult { new_chunk_id: ncid, size, chunk_seq: returned_seq }) => {
                     // A non-empty patch that returns the same chunk_id means the node read stale
                     // base data and the patch landed on wrong content. Skip this result so
                     // the stale node doesn't contaminate the consensus hash.
@@ -6758,6 +6765,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                     new_size = size;
                     if let Some(&nid) = addr_to_node_id_snap.get(&addr) {
                         patched_node_ids.push(nid);
+                    }
+                    // Adopt the server's authoritative chunk_seq (now the effective,
+                    // monotonic-merged value — see put_chunk_seq_async) as this
+                    // client's own local counter for this slot. seed_chunk_seq only
+                    // ever advances, never lowers, so this is safe regardless of
+                    // response ordering across replicas.
+                    if let (Some(cidx), Some(seq)) = (chunk_idx, returned_seq) {
+                        self.seed_chunk_seq(file_id, cidx, seq);
                     }
                 }
                 Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
@@ -7160,12 +7175,18 @@ leader_addr: Arc::new(RwLock::new(None)),
         let mut stale_ahead: Vec<(SocketAddr, ChunkId)> = Vec::new();
         for (addr, result) in results {
             match result {
-                Ok(Response::MultiPatchResult { new_chunk_id: ncid, size, patch_ts, chunk_seq: _ }) => {
+                Ok(Response::MultiPatchResult { new_chunk_id: ncid, size, patch_ts, chunk_seq: returned_seq }) => {
                     // ncid == old_chunk_id means the patch produced no content change (hash
                     // unchanged). This is always a legitimate no-op — the server applied the
                     // patch bytes and got the same hash back. A stale base is signalled by the
                     // server via ChunkStale, not by an unchanged hash. Accept it as success.
                     replica_results.push((addr, Ok((ncid, size, patch_ts))));
+                    // Adopt the server's authoritative (effective, monotonic-merged)
+                    // chunk_seq as this client's local counter for this slot — see the
+                    // matching comment in patch_chunk_on_replicas_inner.
+                    if let (Some(cidx), Some(seq)) = (chunk_idx, returned_seq) {
+                        self.seed_chunk_seq(file_id, cidx, seq);
+                    }
                 }
                 Ok(Response::ChunkStale { current_chunk_id, current_nodes }) => {
                     warn!("MultiPatch replica {}: chunk_id {} is stale, server has {} — retrying",

@@ -666,10 +666,28 @@ fn update_chunk_map_after_patch(
 /// then closed with an unrelated root cause for that incident — the hazard
 /// itself was never fixed until now.
 ///
-/// Not rolling-deploy-safe: an accumulator straddling old and new binary
-/// versions on the same node would mix 12-byte and 20-byte record headers.
-/// Deploy this as an all-at-once restart, same as any other non-rolling-safe
-/// wire/disk format change in this codebase (e.g. the RCL generation field).
+/// **Format marker (2026-07-29, gluster1 post-deploy instability):** a fresh
+/// accumulator's file starts with an 8-byte `DELTA_ACCUMULATOR_V2_MAGIC`
+/// prefix, followed by these 20-byte records. This is NOT about a rolling
+/// deploy straddling two binary versions on one node (that hazard is real but
+/// was already being handled by an all-at-once restart) — it's that any
+/// accumulator already Pending *on disk* at the moment of that restart is
+/// still in the pre-existing 12-byte legacy format (`[offset: u64 LE][len:
+/// u32 LE][data]`, no seq, no magic), and a live write stream (e.g. the DVR's
+/// continuously-appended recording) merges a brand-new record onto one of
+/// those within seconds of the restart. Encoding that merge with the new
+/// 20-byte shape and appending it straight onto a legacy file produces a
+/// mixed-format file: parse_delta_records misreads the boundary and reports
+/// nonsense record lengths (observed: "need 2092731379 bytes"). See
+/// `is_legacy_delta_format`/`parse_delta_records_legacy`/
+/// `encode_delta_record_legacy` — every read site now sniffs the leading 8
+/// bytes and every merge site now checks the *target accumulator's* detected
+/// format (via `DirtyPatchSlot::legacy_delta_format`) before choosing which
+/// encoder to append with, so a legacy accumulator only ever receives legacy-
+/// shaped appends and never gets corrupted by a mixed-format straddle,
+/// regardless of deploy order.
+const DELTA_ACCUMULATOR_V2_MAGIC: u64 = 0xD15A_FEED_C0FF_EE02;
+
 fn encode_delta_record(seq: u64, offset: usize, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + 8 + 4 + data.len());
     buf.extend_from_slice(&seq.to_le_bytes());
@@ -677,6 +695,29 @@ fn encode_delta_record(seq: u64, offset: usize, data: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
     buf.extend_from_slice(data);
     buf
+}
+
+/// Pre-2026-07-28 record shape: `[offset: u64 LE][len: u32 LE][data]`, no
+/// seq, no magic. Only ever used to APPEND onto an accumulator that
+/// `is_legacy_delta_format` already identified as legacy — never for a fresh
+/// accumulator, which always starts with `DELTA_ACCUMULATOR_V2_MAGIC` and
+/// uses `encode_delta_record` from record one.
+fn encode_delta_record_legacy(offset: usize, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + 4 + data.len());
+    buf.extend_from_slice(&(offset as u64).to_le_bytes());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// A legacy file's first 8 bytes decode as a raw chunk-relative byte offset
+/// (bounded by this system's 4MB chunk size), so `DELTA_ACCUMULATOR_V2_MAGIC`
+/// — chosen far outside that range — can never collide with real legacy
+/// data. Anything shorter than 8 bytes can't be a valid accumulator of
+/// either format; treated as legacy so it fails via the legacy parser's own
+/// bounds check rather than an out-of-bounds slice here.
+fn is_legacy_delta_format(bytes: &[u8]) -> bool {
+    bytes.len() < 8 || u64::from_le_bytes(bytes[0..8].try_into().unwrap()) != DELTA_ACCUMULATOR_V2_MAGIC
 }
 
 /// Parse the append-only delta format (see encode_delta_record) back into the
@@ -691,7 +732,16 @@ fn encode_delta_record(seq: u64, offset: usize, data: &[u8]) -> Vec<u8> {
 /// no meaningful seq (there is none pre-this-fix; can't happen from current
 /// encode_delta_record callers) would sort as oldest, never overriding a
 /// properly-seq'd record it overlaps.
+///
+/// Dispatches on `is_legacy_delta_format` first: a pre-2026-07-28 accumulator
+/// (no `DELTA_ACCUMULATOR_V2_MAGIC` prefix) is parsed by
+/// `parse_delta_records_legacy` instead — see that magic constant's doc
+/// comment for why both shapes can exist on disk at once.
 fn parse_delta_records(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
+    if is_legacy_delta_format(bytes) {
+        return parse_delta_records_legacy(bytes);
+    }
+    let bytes = &bytes[8..]; // skip the magic prefix
     let mut records: Vec<(u64, usize, Vec<u8>)> = Vec::new();
     let mut pos = 0usize;
     while pos < bytes.len() {
@@ -710,6 +760,29 @@ fn parse_delta_records(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
     }
     records.sort_by_key(|(seq, ..)| *seq);
     Ok(records.into_iter().map(|(_, offset, data)| (offset, data)).collect())
+}
+
+/// Parse a pre-2026-07-28 legacy accumulator: `[offset: u64 LE][len: u32
+/// LE][data]` repeated to EOF, no seq. Records have no ordering field of
+/// their own, so — same as before this whole seq mechanism existed — they're
+/// returned in on-disk (append/arrival) order, not seq-sorted.
+fn parse_delta_records_legacy(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
+    let mut records: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        if pos + 12 > bytes.len() {
+            anyhow::bail!("truncated legacy delta record header at offset {}", pos);
+        }
+        let offset = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap()) as usize;
+        pos += 12;
+        if pos + len > bytes.len() {
+            anyhow::bail!("truncated legacy delta record data at offset {} (need {} bytes)", pos, len);
+        }
+        records.push((offset, bytes[pos..pos + len].to_vec()));
+        pos += len;
+    }
+    Ok(records)
 }
 
 /// Read-modify-write the *entire* current content of `old_chunk_id`, apply every
@@ -1067,6 +1140,21 @@ struct DirtyPatchSlot {
     token: ChunkId,
     last_patch_at: std::time::Instant,
     delta_hasher: blake3::Hasher,
+    /// True once `delta_hasher` and `legacy_delta_format` are known to
+    /// actually reflect this accumulator's on-disk bytes. The resume sweep
+    /// (patch_state rows found Pending from before this process started)
+    /// inserts a slot with neither derived — it has no cheap way to know
+    /// either without reading the accumulator — so it sets this false.
+    /// apply_patch's merge path treats `false` exactly like "no cached slot
+    /// at all": it re-derives both from disk (or delta_ring) before trusting
+    /// them, rather than merging onto a hasher that never actually saw this
+    /// accumulator's real prior content, or guessing its on-disk format.
+    verified: bool,
+    /// Whether this accumulator's on-disk delta file is the pre-2026-07-28
+    /// legacy 12-byte-header format (see `DELTA_ACCUMULATOR_V2_MAGIC`'s doc
+    /// comment) rather than the current magic-prefixed 20-byte format.
+    /// Meaningless when `verified` is false.
+    legacy_delta_format: bool,
     /// Consecutive fold attempts (via fold_slot_now) that returned false for
     /// this exact accumulator generation. Reset to 0 whenever a new patch
     /// replaces this slot's DirtyPatchSlot entirely (apply_patch's insert) —
@@ -2265,9 +2353,19 @@ impl OverlayForkCtx {
                 // only, so persist this fold's freshly-computed generation into
                 // CHUNK_SEQ_TABLE too, rather than relying solely on some earlier
                 // write having already durably recorded a value at least this high.
-                if let Err(e) = self.metadata.put_chunk_seq_async(file_id, chunk_idx, g).await {
-                    warn!("single fold: failed to durably record generation {} for file {} chunk {}: {}",
-                        g, file_id, chunk_idx, e);
+                // put_chunk_seq_async returns the EFFECTIVE (monotonic-merged) value,
+                // which can exceed `g` if the durable table already held something
+                // higher (e.g. backfilled from a restart this in-memory map missed) —
+                // re-bump so the in-memory map never trails the durable one.
+                match self.metadata.put_chunk_seq_async(file_id, chunk_idx, g).await {
+                    Ok(effective_g) if effective_g > g => {
+                        bump_chunk_generation(&self.chunk_generations, new_chunk_id, effective_g);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("single fold: failed to durably record generation {} for file {} chunk {}: {}",
+                            g, file_id, chunk_idx, e);
+                    }
                 }
             }
             // Bound the map: base_chunk_id is now permanently retired by this fold, so
@@ -6503,9 +6601,18 @@ impl Server {
             // traffic happens to touch this exact slot again.
             if let (Some(fid), Some(offset)) = (file_id, location.file_offset) {
                 let chunk_idx = offset / self.chunker.chunk_size() as u64;
-                if let Err(e) = self.metadata.put_chunk_seq_async(fid, chunk_idx, g).await {
-                    warn!("handle_replicate_chunk_location: failed to durably record generation {} for file {} chunk {}: {}",
-                        g, fid, chunk_idx, e);
+                // See the matching comment in run_single_fold: the returned effective
+                // value can exceed `g` if CHUNK_SEQ_TABLE already held something higher;
+                // re-bump in-memory so it never trails the durable table.
+                match self.metadata.put_chunk_seq_async(fid, chunk_idx, g).await {
+                    Ok(effective_g) if effective_g > g => {
+                        self.record_chunk_generation(location.chunk_id, effective_g);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("handle_replicate_chunk_location: failed to durably record generation {} for file {} chunk {}: {}",
+                            g, fid, chunk_idx, e);
+                    }
                 }
             }
         }
@@ -9383,6 +9490,8 @@ impl Server {
                     token,
                     last_patch_at: std::time::Instant::now(),
                     delta_hasher: blake3::Hasher::new(),
+                    verified: false, // unknown until a merge cold-reads this accumulator
+                    legacy_delta_format: false, // unused while verified is false
                     fold_failures: 0,
                     last_fold_attempt_at: std::time::Instant::now(),
                 });
@@ -11007,34 +11116,38 @@ impl Server {
         // client_write_seq, but treat absence as "oldest" rather than panicking —
         // it can never wrongly override a properly-seq'd overlapping record).
         let record_seq = client_write_seq.unwrap_or(0);
-        let mut new_record_bytes = Vec::new();
-        for (off, data) in &patches {
-            new_record_bytes.extend_from_slice(&encode_delta_record(record_seq, *off, data));
-        }
 
         // Running content hash for this accumulator (see DirtyPatchSlot::delta_hasher's
         // doc comment): reuse it from this node's own in-memory tracking when present
-        // (the common case — every merge but the first on this node for this slot),
-        // falling back to bootstrapping it from the prior delta's actual on-disk bytes
-        // only when this node never saw this accumulator's earlier merges (e.g. a
-        // replica handling its first MultiPatch for an already-Pending slot it learned
-        // about via ReplicateChunkLocation/healing, not by building it locally).
-        let mut hasher = match prior_delta {
+        // AND verified (the common case — every merge but the first on this node for
+        // this slot), falling back to bootstrapping it from the prior delta's actual
+        // on-disk bytes when this node never saw this accumulator's earlier merges
+        // (e.g. a replica handling its first MultiPatch for an already-Pending slot it
+        // learned about via ReplicateChunkLocation/healing, not by building it
+        // locally) OR when the cached slot came from the resume sweep, which cannot
+        // know either value without reading the accumulator (`verified: false` — see
+        // DirtyPatchSlot's doc comment). The same cold-read also tells us whether this
+        // accumulator predates DELTA_ACCUMULATOR_V2_MAGIC (`is_legacy`), so a merge
+        // onto it appends in the matching format instead of corrupting it with a
+        // mixed-format straddle.
+        let (mut hasher, is_legacy) = match prior_delta {
             Some(prior_delta_id) => {
                 let cached = self.dirty_patch_slots.get(&(file_id, cidx))
-                    .map(|e| e.value().delta_hasher.clone());
+                    .filter(|e| e.value().verified)
+                    .map(|e| (e.value().delta_hasher.clone(), e.value().legacy_delta_format));
                 match cached {
-                    Some(h) => h,
+                    Some(h_and_legacy) => h_and_legacy,
                     None => {
-                        // No local delta_hasher (this node is catching up on an
+                        // No verified local state (this node is catching up on an
                         // already-pending slot via replication/healing, not
-                        // building it from direct patches) — consult delta_ring
-                        // before paying for a disk read, same as run_single_fold
-                        // already does for the fold's base chunk (in its own
-                        // separate chunk_ring — see delta_ring's field doc
-                        // comment for why these two are split). Every merge on
-                        // a hot slot needs the prior delta, not just the eventual
-                        // fold, so this path was a real gap in ring coverage.
+                        // building it from direct patches, or is resuming a slot
+                        // found Pending at startup) — consult delta_ring before
+                        // paying for a disk read, same as run_single_fold already
+                        // does for the fold's base chunk (in its own separate
+                        // chunk_ring — see delta_ring's field doc comment for why
+                        // these two are split). Every merge on a hot slot needs
+                        // the prior delta, not just the eventual fold, so this
+                        // path was a real gap in ring coverage.
                         let ring_hit = self.delta_ring.shard(&prior_delta_id).lock().unwrap().get(&prior_delta_id).cloned();
                         if ring_hit.is_some() {
                             self.delta_ring_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -11054,11 +11167,12 @@ impl Server {
                         // Seed/refresh the ring so a later merge or fold on this
                         // same delta chain doesn't cold-read again.
                         self.delta_ring.shard(&prior_delta_id).lock().unwrap().put(prior_delta_id, prior_bytes.clone());
+                        let legacy = is_legacy_delta_format(&prior_bytes);
                         let mut h = blake3::Hasher::new();
                         h.update(file_id.as_bytes());
                         h.update(&chunk_file_offset.to_le_bytes());
                         h.update(&prior_bytes);
-                        h
+                        (h, legacy)
                     }
                 }
             }
@@ -11066,9 +11180,21 @@ impl Server {
                 let mut h = blake3::Hasher::new();
                 h.update(file_id.as_bytes());
                 h.update(&chunk_file_offset.to_le_bytes());
-                h
+                (h, false) // fresh accumulator: always written in the current format
             }
         };
+
+        let mut new_record_bytes = Vec::new();
+        if prior_delta.is_none() {
+            new_record_bytes.extend_from_slice(&DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes());
+        }
+        for (off, data) in &patches {
+            if is_legacy {
+                new_record_bytes.extend_from_slice(&encode_delta_record_legacy(*off, data));
+            } else {
+                new_record_bytes.extend_from_slice(&encode_delta_record(record_seq, *off, data));
+            }
+        }
         hasher.update(&new_record_bytes);
         let delta_chunk_id = ChunkId::from_hash(*hasher.finalize().as_bytes());
 
@@ -11249,6 +11375,8 @@ impl Server {
             token: public_token,
             last_patch_at: std::time::Instant::now(),
             delta_hasher: hasher,
+            verified: true,
+            legacy_delta_format: is_legacy,
             fold_failures: 0,
             last_fold_attempt_at: std::time::Instant::now(),
         });
@@ -11407,15 +11535,30 @@ impl Server {
                 info!("PatchChunk: {} -> {} ({} bytes at intra_offset={})", chunk_id, new_chunk_id, patch_len, intra_offset);
                 // Record-only for now — see CHUNK_SEQ_TABLE's doc comment. Nothing
                 // rejects on this yet, so failures here are logged, not fatal.
+                //
+                // Use the EFFECTIVE (monotonic-merged) value put_chunk_seq_async returns,
+                // not the raw client-sent `seq`, both for the generation stamp AND for what
+                // we hand back to the client. A client with an unseeded/reset local counter
+                // (fresh session, never touched this slot before) can send a seq far below
+                // what's already durably recorded — stamping the generation with that low
+                // raw value is exactly how a corrective write used to lose to a known-dead
+                // phantom token (chunk_seq 1 vs a durably-recorded 3867). The server already
+                // knows the correct value right here; no need for the client to guess it via
+                // a fragile pre-seed (see dfs-client/src/client.rs seed_chunk_seq's history).
+                let mut response_chunk_seq = new_chunk_seq;
                 if let (Some(cidx), Some(seq)) = (chunk_idx, new_chunk_seq) {
-                    if let Err(e) = self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
-                        warn!("PatchChunk: failed to record chunk_seq {} for file {} chunk {}: {}", seq, file_id, cidx, e);
+                    match self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
+                        Ok(effective_seq) => {
+                            response_chunk_seq = Some(effective_seq);
+                            self.record_chunk_generation(new_chunk_id, effective_seq);
+                        }
+                        Err(e) => {
+                            warn!("PatchChunk: failed to record chunk_seq {} for file {} chunk {}: {}", seq, file_id, cidx, e);
+                            self.record_chunk_generation(new_chunk_id, seq);
+                        }
                     }
-                    // Stamp the resulting chunk with this slot's generation so the
-                    // arbiter can out-rank any reordered stale-generation RCL (fix S).
-                    self.record_chunk_generation(new_chunk_id, seq);
                 }
-                Response::PatchChunkResult { new_chunk_id, size, chunk_seq: new_chunk_seq }
+                Response::PatchChunkResult { new_chunk_id, size, chunk_seq: response_chunk_seq }
             }
             Err((msg, code)) => {
                 warn!("PatchChunk {}: {}", chunk_id, msg);
@@ -11731,14 +11874,26 @@ impl Server {
 
                 // Record-only for now — see CHUNK_SEQ_TABLE's doc comment. Nothing
                 // rejects on this yet, so failures here are logged, not fatal.
+                //
+                // Use the EFFECTIVE (monotonic-merged) value, not the raw client-sent
+                // `seq`, for both the generation stamp and the response — see the
+                // matching comment in handle_patch_chunk for why (this is the fix for
+                // the seed_chunk_seq cross-space conflation / VM-111 chunk_seq-gap
+                // storm, 2026-07-28).
+                let mut response_chunk_seq = new_chunk_seq;
                 if let (Some(cidx), Some(seq)) = (chunk_idx, new_chunk_seq) {
-                    if let Err(e) = self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
-                        warn!("MultiPatch: failed to record chunk_seq {} for file {} chunk {}: {}", seq, file_id, cidx, e);
+                    match self.metadata.put_chunk_seq_async(file_id, cidx, seq).await {
+                        Ok(effective_seq) => {
+                            response_chunk_seq = Some(effective_seq);
+                            self.record_chunk_generation(new_chunk_id, effective_seq);
+                        }
+                        Err(e) => {
+                            warn!("MultiPatch: failed to record chunk_seq {} for file {} chunk {}: {}", seq, file_id, cidx, e);
+                            self.record_chunk_generation(new_chunk_id, seq);
+                        }
                     }
-                    // Stamp the resulting chunk with this slot's generation (fix S).
-                    self.record_chunk_generation(new_chunk_id, seq);
                 }
-                Response::MultiPatchResult { new_chunk_id, size: final_size, patch_ts, chunk_seq: new_chunk_seq }
+                Response::MultiPatchResult { new_chunk_id, size: final_size, patch_ts, chunk_seq: response_chunk_seq }
             }
             Err((msg, code)) => {
                 warn!("MultiPatch {}: {}", chunk_id, msg);
@@ -15113,8 +15268,10 @@ mod tests {
         }], 1));
 
         // The delta this write registered: a 1-byte change, encoded in the normal
-        // append-only delta record format.
-        let delta_record = encode_delta_record(500, 0, &[0xABu8]);
+        // append-only delta record format (a fresh accumulator, so it needs the
+        // v2 magic prefix apply_patch would normally have written).
+        let mut delta_record = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+        delta_record.extend_from_slice(&encode_delta_record(500, 0, &[0xABu8]));
         let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_record));
         storage.write_chunk(&delta_chunk_id, &delta_record).unwrap();
 
@@ -16389,10 +16546,12 @@ mod tests {
             let base_id = ChunkId::from_hash(compute_chunk_hash(&base_data));
             h.storage.write_chunk(&base_id, &base_data).unwrap();
 
-            // Delta chunk: patch bytes [100..108) := 0xAB, append-only delta format.
+            // Delta chunk: patch bytes [100..108) := 0xAB, append-only delta format
+            // (a fresh accumulator, so it needs the v2 magic prefix).
             let patch_off = 100usize;
             let patch_bytes = vec![0xABu8; 8];
-            let delta_bytes = encode_delta_record(1, patch_off, &patch_bytes);
+            let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+            delta_bytes.extend_from_slice(&encode_delta_record(1, patch_off, &patch_bytes));
             let delta_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
             h.storage.write_chunk(&delta_id, &delta_bytes).unwrap();
 
@@ -17125,8 +17284,9 @@ mod tests {
             // patch_state row referencing the (still on-disk, untouched) base plus a
             // delta chunk, constructed directly rather than through handle_multi_patch
             // so this test isn't racing that patch's own real, immediately-triggered
-            // background fold.
-            let delta_bytes = encode_delta_record(1, 0, &[1u8; 100]);
+            // background fold. Fresh accumulator, so it needs the v2 magic prefix.
+            let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+            delta_bytes.extend_from_slice(&encode_delta_record(1, 0, &[1u8; 100]));
             let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
             h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
             let public_token = ChunkId::from_hash(compute_chunk_hash(b"mid-fold-crash-token"));
@@ -17159,6 +17319,8 @@ mod tests {
                 token: public_token,
                 last_patch_at: std::time::Instant::now(),
                 delta_hasher: blake3::Hasher::new(),
+                verified: true,
+                legacy_delta_format: false,
                 fold_failures: 0,
                 last_fold_attempt_at: std::time::Instant::now(),
             });
@@ -17178,6 +17340,104 @@ mod tests {
             let mut expected = original_data.clone();
             expected[0..100].copy_from_slice(&[1u8; 100]);
             assert_eq!(resolved.as_slice(), expected.as_slice());
+        }
+
+        /// Root-caused 2026-07-29 (gluster1 instability hours after 5fc606e, the
+        /// seq-tagged delta format, shipped): a merge lands on a Pending accumulator
+        /// that already existed on disk *before* this process's own restart — this
+        /// node never built it locally (e.g. the patch_state resume sweep, or a
+        /// replica's first touch via replication/healing — see DirtyPatchSlot's
+        /// `verified` field doc comment). If that accumulator predates
+        /// DELTA_ACCUMULATOR_V2_MAGIC, it's a legacy 12-byte-header file with no
+        /// magic prefix; blindly appending this call's record in the current
+        /// 20-byte-header shape produced a file mixing both header shapes, and
+        /// parse_delta_records misread the boundary between them (observed on
+        /// gluster1: "truncated delta record data ... need 2092731379 bytes" for
+        /// a chunk that was never actually corrupt on disk — just misparsed).
+        #[tokio::test]
+        async fn merge_onto_preexisting_legacy_accumulator_does_not_corrupt_it() {
+            let temp_storage = TempDir::new().unwrap();
+            let temp_metadata = TempDir::new().unwrap();
+            let temp_metadata_dir = TempDir::new().unwrap();
+            let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+            let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+            let node_id = NodeId::new();
+            let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+            let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+            let server = Server::new(
+                storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+                temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+            );
+
+            let file_id = dfs_common::FileId::new();
+            let chunk_idx = 0u64;
+            let chunk_file_offset = 0u64;
+
+            let base_content = vec![0u8; 64];
+            let base_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+            );
+            storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+            metadata.put_chunk_location(&ChunkLocation {
+                chunk_id: base_chunk_id,
+                nodes: vec![node_id],
+                size: base_content.len(),
+                checksum: base_chunk_id.hash,
+                file_offset: Some(chunk_file_offset),
+                written_at: None,
+                client_write_seq: None,
+                file_id: Some(file_id),
+            }).unwrap();
+
+            // A pre-existing legacy (pre-2026-07-28) accumulator: one record, bytes
+            // [10..14) := 0xCD, encoded WITHOUT this fix's helpers — plain [offset:
+            // u64 LE][len: u32 LE][data], no seq, no magic — exactly what a real
+            // pre-deploy accumulator looks like on disk.
+            let legacy_off: u64 = 10;
+            let legacy_data = vec![0xCDu8; 4];
+            let mut legacy_delta_bytes = Vec::new();
+            legacy_delta_bytes.extend_from_slice(&legacy_off.to_le_bytes());
+            legacy_delta_bytes.extend_from_slice(&(legacy_data.len() as u32).to_le_bytes());
+            legacy_delta_bytes.extend_from_slice(&legacy_data);
+            let legacy_delta_id = ChunkId::from_hash(compute_chunk_hash(&legacy_delta_bytes));
+            storage.write_chunk(&legacy_delta_id, &legacy_delta_bytes).unwrap();
+
+            let public_token = ChunkId::from_hash(compute_chunk_hash(b"pre-existing-legacy-accumulator"));
+            metadata.put_patch_state_pending(
+                file_id, chunk_idx, &public_token, base_chunk_id, legacy_delta_id, 64, 1000, None,
+            ).unwrap();
+            // Deliberately no dirty_patch_slots entry — matches this node never
+            // having built this accumulator itself.
+
+            // A new patch merges onto it, exactly as a live client write would.
+            let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let (token2, ..) = server.apply_patch(
+                Some(lock), public_token, file_id, Some(chunk_idx), chunk_file_offset,
+                vec![(20usize, vec![0xEFu8; 4])], Some(999), None,
+            ).await.expect("merge onto a pre-existing legacy accumulator must succeed");
+
+            let state = metadata.get_patch_state(&token2).unwrap().expect("token2 must resolve");
+            let delta_id = match state {
+                PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+                other => panic!("expected Pending, got {:?}", other),
+            };
+            let delta_bytes = storage.read_chunk(&delta_id).unwrap();
+
+            // The real bug: this must not blow up with a garbage "need N bytes" error.
+            let records = parse_delta_records(&delta_bytes)
+                .expect("parsing a merge onto a legacy accumulator must not misread the format boundary");
+
+            let mut buf = base_content.clone();
+            for (off, data) in records {
+                let end = off + data.len();
+                if end > buf.len() { buf.resize(end, 0); }
+                buf[off..end].copy_from_slice(&data);
+            }
+            let mut expected = base_content.clone();
+            expected[10..14].copy_from_slice(&[0xCDu8; 4]);
+            expected[20..24].copy_from_slice(&[0xEFu8; 4]);
+            assert_eq!(buf, expected, "both the pre-existing legacy record and the new merged record must survive intact");
         }
     }
 

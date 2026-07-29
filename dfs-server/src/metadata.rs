@@ -216,7 +216,7 @@ enum MetaWriteOp {
         file_id: FileId,
         chunk_idx: u64,
         seq: u64,
-        reply: tokio::sync::oneshot::Sender<Result<()>>,
+        reply: tokio::sync::oneshot::Sender<Result<u64>>,
     },
     PutPatchStatePending {
         file_id: FileId,
@@ -292,6 +292,7 @@ impl MetaWriteOp {
 enum PendingReply {
     Unit(tokio::sync::oneshot::Sender<Result<()>>, Result<()>),
     RetiredToken(tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>, Result<Option<ChunkId>>),
+    ChunkSeq(tokio::sync::oneshot::Sender<Result<u64>>, Result<u64>),
 }
 
 /// Metadata storage using redb embedded database.
@@ -653,7 +654,19 @@ impl MetadataStore {
                     replies.push(PendingReply::Unit(reply, result));
                 }
                 MetaWriteOp::PutChunkSeq { file_id, chunk_idx, seq, reply } => {
-                    let result = (|| -> Result<()> {
+                    // Returns the EFFECTIVE (post-monotonic-merge) value, not just Result<()> —
+                    // callers (record_chunk_generation via handle_patch_chunk/handle_multi_patch)
+                    // need this to stamp a chunk's generation with the server's authoritative
+                    // value, not whatever raw seq the client happened to send. A client with an
+                    // unseeded/reset local counter (freshly restarted, or a brand-new session
+                    // that never touched this slot before) can send a seq far BELOW what's
+                    // already durably recorded here; stamping the generation with that low raw
+                    // value is exactly the "corrective write lost to a known-dead phantom token"
+                    // bug (chunk_seq 1 vs phantom's durable 3867) — see seed_chunk_seq's history
+                    // in dfs-client/src/client.rs. Fixed at the source of truth instead: this is
+                    // the one place that already knows the correct, monotonic value, so return
+                    // it and never make the client responsible for guessing it.
+                    let result = (|| -> Result<u64> {
                         let key = format!("{}:{}", file_id, chunk_idx);
                         let mut table = txn.open_table(CHUNK_SEQ_TABLE)?;
                         // Monotonic (L3, 2026-07-19): never roll the per-slot generation
@@ -663,13 +676,14 @@ impl MetadataStore {
                         // METADATA counter only; drops no patch data (a seq-based data drop
                         // caused the T28 regression — see handle_multi_patch).
                         let current = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
+                        let effective = seq.max(current);
                         if seq > current {
                             table.insert(key.as_str(), seq)?;
                         }
-                        Ok(())
+                        Ok(effective)
                     })();
                     self.note_txn("op:put_chunk_seq", 0);
-                    replies.push(PendingReply::Unit(reply, result));
+                    replies.push(PendingReply::ChunkSeq(reply, result));
                 }
                 MetaWriteOp::PutPatchStatePending {
                     file_id, chunk_idx, public_token, base_chunk_id, delta_chunk_id,
@@ -768,6 +782,14 @@ impl MetadataStore {
                     };
                     let _ = reply.send(final_result);
                 }
+                PendingReply::ChunkSeq(reply, result) => {
+                    let final_result = match (&commit_error, result) {
+                        (_, Err(e)) => Err(e),
+                        (Some(msg), Ok(_)) => Err(anyhow::anyhow!("{}", msg)),
+                        (None, Ok(effective_seq)) => Ok(effective_seq),
+                    };
+                    let _ = reply.send(final_result);
+                }
             }
         }
     }
@@ -778,13 +800,15 @@ impl MetadataStore {
         match op {
             MetaWriteOp::PutChunkLocation { reply, .. }
             | MetaWriteOp::DeleteChunkLocation { reply, .. }
-            | MetaWriteOp::PutChunkSeq { reply, .. }
             | MetaWriteOp::UpdatePatchStateFolded { reply, .. }
             | MetaWriteOp::DeletePatchStateAbandoned { reply, .. }
             | MetaWriteOp::PutPendingHealing { reply, .. }
             | MetaWriteOp::DeletePendingHealing { reply, .. }
             | MetaWriteOp::UpdateChunkLocationsBatch { reply, .. }
             | MetaWriteOp::PutPendingHealingBatch { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+            }
+            MetaWriteOp::PutChunkSeq { reply, .. } => {
                 let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
             }
             MetaWriteOp::PutPatchStatePending { reply, .. } => {
@@ -2003,32 +2027,37 @@ impl MetadataStore {
             .context("spawn_blocking panicked in get_chunk_seq_async")?
     }
 
-    /// Record `seq` as the last-applied sequence number for (file_id, chunk_idx).
-    /// Currently unconditional (record-only, no CAS/rejection) — see
-    /// CHUNK_SEQ_TABLE's doc comment for the follow-up that makes this
-    /// load-bearing in apply_patch/handle_multi_patch.
-    pub fn put_chunk_seq(&self, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<()> {
+    /// Record `seq` as the last-applied sequence number for (file_id, chunk_idx),
+    /// monotonically (never lowers the stored value — see the committer path's
+    /// PutChunkSeq arm). Returns the EFFECTIVE value after the merge (`seq.max(current)`),
+    /// not just whether the write succeeded — callers use this, not the raw `seq` they
+    /// passed in, to stamp a chunk's generation (record_chunk_generation) with the
+    /// server's authoritative value instead of whatever a client's local counter
+    /// happened to send.
+    pub fn put_chunk_seq(&self, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<u64> {
         let key = format!("{}:{}", file_id, chunk_idx);
         let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
+        let effective;
         {
             let mut table = txn.open_table(CHUNK_SEQ_TABLE)?;
             // Monotonic (L3, 2026-07-19) — see the committer path's PutChunkSeq arm for
             // why: a stale/out-of-order push must never lower the per-slot generation.
             let current = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
+            effective = seq.max(current);
             if seq > current {
                 table.insert(key.as_str(), seq)?;
             }
         }
         txn.commit()?;
         self.note_txn("put_chunk_seq", 0);
-        Ok(())
+        Ok(effective)
     }
 
     /// Async wrapper for put_chunk_seq — see put_chunk_location_async
     /// (group-committed since 2026-07-15; fires once per client chunk write).
-    pub async fn put_chunk_seq_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<()> {
+    pub async fn put_chunk_seq_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64, seq: u64) -> Result<u64> {
         if !Self::group_commit_enabled() {
             let store = Arc::clone(self);
             return tokio::task::spawn_blocking(move || store.put_chunk_seq(file_id, chunk_idx, seq))

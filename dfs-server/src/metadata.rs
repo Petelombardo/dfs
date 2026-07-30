@@ -249,6 +249,17 @@ enum MetaWriteOp {
         chunk_id: ChunkId,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// Forces this batch's transaction to commit with Durability::Immediate
+    /// regardless of next_write_durability_n's count-based cadence — see
+    /// start_durability_flush_timer's doc comment for why a pure write-count
+    /// cadence leaves an unbounded (not just large) crash-loss window under
+    /// idle load, which this op exists to bound in wall-clock time instead.
+    /// Carries a real write (a heartbeat timestamp in COUNTERS_TABLE) so it
+    /// can't be optimized away as a no-op transaction with nothing to flush.
+    FlushDurability {
+        now_ms: u64,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     /// Multi-record CHUNK_TABLE/PENDING_HEALING update (the batch_update /
     /// put_chunk_locations_batch async paths). These need grouping every bit as
     /// much as the single-record ops: the live write path calls
@@ -624,7 +635,18 @@ impl MetadataStore {
                 return;
             }
         };
-        txn.set_durability(self.next_write_durability_n(op_count));
+        // A queued FlushDurability op overrides the count-based cadence
+        // outright — see start_durability_flush_timer's doc comment. Checked
+        // before computing next_write_durability_n so the timer-forced flush
+        // never itself gets folded into (and hidden inside) the normal
+        // durability-cadence accounting.
+        let forced_immediate = ops.iter().any(|op| matches!(op, MetaWriteOp::FlushDurability { .. }));
+        let durability = if forced_immediate {
+            Durability::Immediate
+        } else {
+            self.next_write_durability_n(op_count)
+        };
+        txn.set_durability(durability);
 
         let mut replies: Vec<PendingReply> = Vec::with_capacity(ops.len());
         let mut payload_bytes: usize = 0;
@@ -737,6 +759,15 @@ impl MetadataStore {
                     self.note_txn("op:delete_pending_healing", 0);
                     replies.push(PendingReply::Unit(reply, result));
                 }
+                MetaWriteOp::FlushDurability { now_ms, reply } => {
+                    let result = (|| -> Result<()> {
+                        let mut table = txn.open_table(COUNTERS_TABLE)?;
+                        table.insert("durability_heartbeat_ms", now_ms)?;
+                        Ok(())
+                    })();
+                    self.note_txn("op:flush_durability", 0);
+                    replies.push(PendingReply::Unit(reply, result));
+                }
                 MetaWriteOp::UpdateChunkLocationsBatch { puts, deletes, pending_healing_deletes, reply } => {
                     let result = Self::apply_chunk_location_updates_in_txn(
                         &txn, &puts, &deletes, &pending_healing_deletes,
@@ -804,6 +835,7 @@ impl MetadataStore {
             | MetaWriteOp::DeletePatchStateAbandoned { reply, .. }
             | MetaWriteOp::PutPendingHealing { reply, .. }
             | MetaWriteOp::DeletePendingHealing { reply, .. }
+            | MetaWriteOp::FlushDurability { reply, .. }
             | MetaWriteOp::UpdateChunkLocationsBatch { reply, .. }
             | MetaWriteOp::PutPendingHealingBatch { reply, .. } => {
                 let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
@@ -850,6 +882,74 @@ impl MetadataStore {
         } else {
             Durability::None
         }
+    }
+
+    /// How often start_durability_flush_timer checks whether a forced flush is
+    /// due. Bounds the crash-loss window for Durability::None writes to this
+    /// duration, independent of write volume — see that function's doc comment
+    /// for the incident this closes.
+    const DURABILITY_FLUSH_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Force whatever's currently sitting at Durability::None to become durable
+    /// right now, via commit_worker_loop/apply_ops_group so it's serialized with
+    /// (and can piggyback a real write onto, if any is already queued) ordinary
+    /// traffic rather than opening a second concurrent writer against redb.
+    async fn flush_durability_async(self: &Arc<Self>) -> Result<()> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if !Self::group_commit_enabled() {
+            let store = Arc::clone(self);
+            return tokio::task::spawn_blocking(move || {
+                let _db = store.db.read();
+                let mut txn = _db.begin_write()?;
+                txn.set_durability(Durability::Immediate);
+                {
+                    let mut table = txn.open_table(COUNTERS_TABLE)?;
+                    table.insert("durability_heartbeat_ms", now_ms)?;
+                }
+                txn.commit()?;
+                store.note_txn("flush_durability", 0);
+                Ok(())
+            }).await.context("spawn_blocking panicked in flush_durability_async")?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().send(MetaWriteOp::FlushDurability { now_ms, reply }).await
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.await.context("metadata group-commit thread dropped its reply")?
+    }
+
+    /// Background backstop closing the gap next_write_durability_n leaves open:
+    /// that cadence is purely write-COUNT-based (every 200 ops), so its
+    /// wall-clock crash-loss window is inversely proportional to write rate —
+    /// milliseconds under sustained load, but UNBOUNDED once traffic goes idle,
+    /// since commit_worker_loop's blocking_recv() never wakes on its own and
+    /// next_write_durability_n only ever runs reactively, in response to an
+    /// incoming op. A write that lands as Durability::None right before the
+    /// system goes quiet (e.g. a VM idling overnight after its last patch of
+    /// the evening) can sit unflushed for hours: acknowledged to the caller as
+    /// successful, genuinely applied and visible in-process, but never fsync'd
+    /// — so a crash, OOM-kill, or power loss any time in that window silently
+    /// loses it with no error anywhere. Root-caused 2026-07-30: a local repro
+    /// confirmed a patch's PATCH_STATE_TABLE row did not survive a `kill -9`
+    /// immediately after the client's own write returned success, even with an
+    /// explicit client-side `sync` first — sync only confirms the RPC was
+    /// acknowledged, it does nothing to force this node's own batched
+    /// durability policy to flush early. This loop bounds that window to
+    /// DURABILITY_FLUSH_MAX_AGE regardless of load shape, while leaving the
+    /// count-based cadence (and its own, separate compaction-cost motivation)
+    /// untouched for the sustained-load case, where it already fires far more
+    /// often than this timer would.
+    pub fn start_durability_flush_timer(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Self::DURABILITY_FLUSH_MAX_AGE).await;
+                if let Err(e) = self.flush_durability_async().await {
+                    warn!("durability flush timer: failed to force a flush: {}", e);
+                }
+            }
+        });
     }
 
     // -------------------------------------------------------------------------

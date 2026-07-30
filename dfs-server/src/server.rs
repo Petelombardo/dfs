@@ -625,6 +625,7 @@ fn update_chunk_map_after_patch(
     new_chunk_id: ChunkId,
     size: usize,
     written_at_ms: u64,
+    new_client_write_seq: Option<u64>,
 ) {
     if new_chunk_id == old_chunk_id {
         return;
@@ -666,10 +667,39 @@ fn update_chunk_map_after_patch(
             None => locations.iter_mut().find(|l| l.chunk_id == old_chunk_id),
         };
         if let Some(loc) = found {
-            loc.chunk_id = new_chunk_id;
-            loc.checksum = new_chunk_id.hash;
-            loc.size = size;
-            loc.written_at = Some(written_at_ms);
+            // Staleness guard: the "no concurrent writer" argument above (why
+            // matching by position alone, not also old_chunk_id, is safe) only
+            // rules out two updates racing at the exact same instant — it says
+            // nothing about a SEQUENTIALLY stale one. A fold computed from a
+            // patch_state row resumed after a restart can execute long after
+            // chunk_map's current entry for this slot was legitimately advanced
+            // by real traffic that happened while this node was down — applying
+            // it unconditionally would silently revert the slot backward on
+            // THIS node alone. The equivalent incoming-replication path
+            // (chunk_map_update) already rejects exactly this shape of update
+            // via the same client_write_seq comparison; this mirrors it for the
+            // self-computed/local-fold path, which had no such check before.
+            // Same tri-state semantics as that guard: both known → reject only
+            // if incoming is strictly older; one side unknown → trust whichever
+            // side actually carries a seq; both unknown → no signal, proceed
+            // (preserves prior behavior for callers that never had seq info).
+            let stale = match (new_client_write_seq, loc.client_write_seq) {
+                (Some(incoming), Some(existing)) => incoming < existing,
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (None, None) => false,
+            };
+            if stale {
+                warn!("update_chunk_map_after_patch: rejecting stale self-computed update for file {} \
+                       (incoming {} seq={:?} vs current {} seq={:?}) — a later write already advanced this slot",
+                    file_id, new_chunk_id, new_client_write_seq, loc.chunk_id, loc.client_write_seq);
+            } else {
+                loc.chunk_id = new_chunk_id;
+                loc.checksum = new_chunk_id.hash;
+                loc.size = size;
+                loc.written_at = Some(written_at_ms);
+                loc.client_write_seq = new_client_write_seq;
+            }
         }
     }
 }
@@ -2601,7 +2631,7 @@ impl OverlayForkCtx {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        update_chunk_map_after_patch(&self.chunk_map, file_id, Some(chunk_idx), public_token, new_chunk_id, final_size, now_ms);
+        update_chunk_map_after_patch(&self.chunk_map, file_id, Some(chunk_idx), public_token, new_chunk_id, final_size, now_ms, final_client_write_seq);
 
         // The fold just changed this (file_id, chunk_idx) slot's current identity
         // WITHOUT any client-visible RPC — nothing else in the cluster would ever
@@ -9860,6 +9890,12 @@ impl Server {
         });
     }
 
+    /// Delegates to MetadataStore::start_durability_flush_timer — see that
+    /// function's doc comment for the crash-loss-window gap this closes.
+    pub fn start_durability_flush_timer(self: Arc<Self>) {
+        self.metadata.clone().start_durability_flush_timer();
+    }
+
     /// One-shot startup sweep: re-discover every Pending PATCH_STATE_TABLE row
     /// directly from disk and resume folding it.
     ///
@@ -11311,7 +11347,7 @@ impl Server {
                 warn!("apply_patch: cancel_healing_for_chunk task panicked for {}: {}", chunk_id, e);
             }
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-            update_chunk_map_after_patch(&self.chunk_map, file_id, None, chunk_id, new_chunk_id, size, now_ms);
+            update_chunk_map_after_patch(&self.chunk_map, file_id, None, chunk_id, new_chunk_id, size, now_ms, client_write_seq);
             return Ok((new_chunk_id, size, if new_chunk_id != chunk_id { Some(now_ms) } else { None }, Some(buf)));
         };
         let patch_guard = patch_guard.expect("chunk_idx Some implies patch_guard Some (see callers)");
@@ -11780,7 +11816,7 @@ impl Server {
             }
             let _ = self.metadata.delete_chunk_location_async(chunk_id).await;
         }
-        update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_map_old_id, public_token, needed_len, now_ms);
+        update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_map_old_id, public_token, needed_len, now_ms, client_write_seq);
 
         self.pending_patch_ids.insert(public_token, (file_id, cidx));
         self.pending_patch_ids.insert(base_chunk_id, (file_id, cidx));

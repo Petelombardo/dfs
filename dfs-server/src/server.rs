@@ -2457,80 +2457,104 @@ impl OverlayForkCtx {
         // full_rewrite_chunk renames it away, so pop it; new_chunk_id becomes
         // whatever the *next* fold or read on this slot needs, kept warm without
         // paying for another disk read.
+        // L0: new_chunk_id is a real fold result — record it so location_supersedes
+        // can derive ServerFold origin for it (see Server::fold_result_chunk_ids's
+        // doc comment) — UNCONDITIONALLY, including when new_chunk_id == base_chunk_id
+        // (a content no-op: the patch reproduced byte-identical bytes, so the fold's
+        // output hash equals its input hash). This used to live inside the
+        // `if new_chunk_id != base_chunk_id` block below and only ran on a genuine
+        // content change. A no-op fold's announcement still goes out via the exact
+        // same ReplicateChunkLocation/ReplicatePatchFold path, still registers with
+        // `nodes: [local_node_id]` only (single-node by design, same as any fold —
+        // see full_rewrite_chunk's registration comment), and location_supersedes'
+        // very first check is `if !incoming_is_fold && incoming.nodes.len() <
+        // existing.nodes.len() { return false }` — a hard reject checked BEFORE any
+        // generation or seq comparison, for exactly this shape. Without this flag, a no-op
+        // fold's 1-node announcement permanently loses to whatever multi-node entry
+        // it's replacing, on every single rebroadcast, forever: the guard has no
+        // notion of "eventually converges," it's a flat reject every time. Confirmed
+        // live 2026-07-31 (VM-108 read EIO): a no-op fold's redirect never stuck on
+        // any peer or the leader for exactly this reason, patch_state stayed stranded
+        // on the original token, and that token's delta — correctly deleted by the
+        // folding node as normal fold cleanup — became permanently unrecoverable
+        // everywhere else, since nothing else had a live reason to keep it.
+        // Recorded here (not gated on the metadata writes below succeeding) since
+        // this node has already durably committed new_chunk_id's bytes and PatchState
+        // is rebuilt from a startup scan anyway — an in-memory-only miss here is at
+        // worst a transient loss of the origin tiebreak until restart, not a
+        // correctness gap.
+        self.fold_result_chunk_ids.insert(new_chunk_id);
+        // Fix S (2026-07-24): the fold output was originally stamped with ONLY
+        // the base's inherited generation, on the theory that "folding doesn't
+        // advance the client's new_chunk_seq." That's true for a fold racing a
+        // REORDERED broadcast of its own base's generation — but false the
+        // instant a fold consolidates a delta from a genuinely newer write:
+        // that write's own generation (delta_client_write_seq, folded into
+        // fold_seq above via the same max-of-current-and-delta rule already
+        // used for client_write_seq) can be far higher than the stale base's.
+        // Inheriting only base_gen then stamps the fold's own, freshly-computed,
+        // byte-verified result with a generation LOWER than the write it just
+        // consolidated — location_supersedes' generation check (which is
+        // authoritative, checked before client_write_seq/written_at) then
+        // rejects the fold's announcement outright, permanently stranding
+        // chunk_map on the write's raw patch token: a token whose
+        // PATCH_STATE_TABLE row this same fold flip to Folded below makes
+        // unresolvable as a pending overlay, and which was never a real chunk
+        // file — a dangling pointer with no recovery path. Confirmed live
+        // 2026-07-28 (VM-108 dd EIO, ~14h after the unrelated 3d2a2ad/f1e19cc
+        // deploy): the leader's chunk_map stayed on the token while a fresh
+        // CHUNK_TABLE-based scan (chunk_locations_for_info, used by
+        // dfs-admin file info) — and this node's own disk — both agreed on the
+        // fold's real result. Fix: stamp with max(base_gen, fold_seq), never
+        // just base_gen. A fold that's merely racing a reordered copy of its
+        // OWN generation is unaffected (fold_seq falls back to base_gen's own
+        // slot seq when there's no newer delta); only a fold trailing a
+        // genuinely newer write now correctly outranks that write's stale-base
+        // predecessor. If neither side has a recorded value the arbiter falls
+        // back to the pre-existing cws/written_at rule for this chunk, exactly
+        // as before. Also unconditional now, for the same no-op reason as the
+        // fold_result_chunk_ids insert directly above: a no-op fold still
+        // consolidates a real delta and must still stamp at least that delta's
+        // generation, or it re-loses the very reject this pair of fixes closes.
+        let base_gen = self.chunk_generations.get(&base_chunk_id).map(|v| *v);
+        let stamped_gen = match (base_gen, fold_seq) {
+            (Some(g), Some(s)) => Some(g.max(s)),
+            (Some(g), None) => Some(g),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        };
+        if let Some(g) = stamped_gen {
+            bump_chunk_generation(&self.chunk_generations, new_chunk_id, g);
+            // Durability follow-up (2026-07-28) — see handle_replicate_chunk_location's
+            // matching call for the full rationale: chunk_generations is in-memory
+            // only, so persist this fold's freshly-computed generation into
+            // CHUNK_SEQ_TABLE too, rather than relying solely on some earlier
+            // write having already durably recorded a value at least this high.
+            // put_chunk_seq_async returns the EFFECTIVE (monotonic-merged) value,
+            // which can exceed `g` if the durable table already held something
+            // higher (e.g. backfilled from a restart this in-memory map missed) —
+            // re-bump so the in-memory map never trails the durable one.
+            match self.metadata.put_chunk_seq_async(file_id, chunk_idx, g).await {
+                Ok(effective_g) if effective_g > g => {
+                    bump_chunk_generation(&self.chunk_generations, new_chunk_id, effective_g);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("single fold: failed to durably record generation {} for file {} chunk {}: {}",
+                        g, file_id, chunk_idx, e);
+                }
+            }
+        }
         if new_chunk_id != base_chunk_id {
             // Genuine supersession — base_chunk_id is permanently retired, so the
             // healing cancellation should outlive this guard rather than being
             // retracted. See FoldHealingCancelGuard's doc comment.
             healing_cancel_guard.keep_cancelled();
-            // L0: new_chunk_id is now a real fold result — record it so
-            // location_supersedes can derive ServerFold origin for it (see
-            // Server::fold_result_chunk_ids's doc comment). Recorded here (not
-            // gated on the metadata writes below succeeding) since this node has
-            // already durably committed new_chunk_id's bytes and PatchState is
-            // rebuilt from a startup scan anyway — an in-memory-only miss here is
-            // at worst a transient loss of the origin tiebreak until restart, not
-            // a correctness gap.
-            self.fold_result_chunk_ids.insert(new_chunk_id);
-            // Fix S (2026-07-24): the fold output was originally stamped with ONLY
-            // the base's inherited generation, on the theory that "folding doesn't
-            // advance the client's new_chunk_seq." That's true for a fold racing a
-            // REORDERED broadcast of its own base's generation — but false the
-            // instant a fold consolidates a delta from a genuinely newer write:
-            // that write's own generation (delta_client_write_seq, folded into
-            // fold_seq above via the same max-of-current-and-delta rule already
-            // used for client_write_seq) can be far higher than the stale base's.
-            // Inheriting only base_gen then stamps the fold's own, freshly-computed,
-            // byte-verified result with a generation LOWER than the write it just
-            // consolidated — location_supersedes' generation check (which is
-            // authoritative, checked before client_write_seq/written_at) then
-            // rejects the fold's announcement outright, permanently stranding
-            // chunk_map on the write's raw patch token: a token whose
-            // PATCH_STATE_TABLE row this same fold flip to Folded below makes
-            // unresolvable as a pending overlay, and which was never a real chunk
-            // file — a dangling pointer with no recovery path. Confirmed live
-            // 2026-07-28 (VM-108 dd EIO, ~14h after the unrelated 3d2a2ad/f1e19cc
-            // deploy): the leader's chunk_map stayed on the token while a fresh
-            // CHUNK_TABLE-based scan (chunk_locations_for_info, used by
-            // dfs-admin file info) — and this node's own disk — both agreed on the
-            // fold's real result. Fix: stamp with max(base_gen, fold_seq), never
-            // just base_gen. A fold that's merely racing a reordered copy of its
-            // OWN generation is unaffected (fold_seq falls back to base_gen's own
-            // slot seq when there's no newer delta); only a fold trailing a
-            // genuinely newer write now correctly outranks that write's stale-base
-            // predecessor. If neither side has a recorded value the arbiter falls
-            // back to the pre-existing cws/written_at rule for this chunk, exactly
-            // as before.
-            let base_gen = self.chunk_generations.get(&base_chunk_id).map(|v| *v);
-            let stamped_gen = match (base_gen, fold_seq) {
-                (Some(g), Some(s)) => Some(g.max(s)),
-                (Some(g), None) => Some(g),
-                (None, Some(s)) => Some(s),
-                (None, None) => None,
-            };
-            if let Some(g) = stamped_gen {
-                bump_chunk_generation(&self.chunk_generations, new_chunk_id, g);
-                // Durability follow-up (2026-07-28) — see handle_replicate_chunk_location's
-                // matching call for the full rationale: chunk_generations is in-memory
-                // only, so persist this fold's freshly-computed generation into
-                // CHUNK_SEQ_TABLE too, rather than relying solely on some earlier
-                // write having already durably recorded a value at least this high.
-                // put_chunk_seq_async returns the EFFECTIVE (monotonic-merged) value,
-                // which can exceed `g` if the durable table already held something
-                // higher (e.g. backfilled from a restart this in-memory map missed) —
-                // re-bump so the in-memory map never trails the durable one.
-                match self.metadata.put_chunk_seq_async(file_id, chunk_idx, g).await {
-                    Ok(effective_g) if effective_g > g => {
-                        bump_chunk_generation(&self.chunk_generations, new_chunk_id, effective_g);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("single fold: failed to durably record generation {} for file {} chunk {}: {}",
-                            g, file_id, chunk_idx, e);
-                    }
-                }
-            }
             // Bound the map: base_chunk_id is now permanently retired by this fold, so
             // its generation entry is dead weight (a hot qcow2 slot rewrites forever).
+            // Gated on genuine supersession only — for a no-op fold, base_chunk_id IS
+            // new_chunk_id, and removing it here would erase the very entry
+            // bump_chunk_generation just set two lines above.
             self.chunk_generations.remove(&base_chunk_id);
         }
         // Else: a byte-identical (no-op) fold — base_chunk_id is still genuinely

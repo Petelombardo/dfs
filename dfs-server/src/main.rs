@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dfs_common::Config;
 use std::path::PathBuf;
-use tracing::{debug, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber;
 
 #[derive(Parser)]
@@ -694,7 +694,32 @@ async fn run_planned_offline_compaction(
     // left on the floor, because building a B-tree by insertion re-fragments it as
     // pages split, whereas compact() relocates live pages and truncates. It also
     // converges (a second pass is a no-op), so there's no iteration to manage.
-    let compact_result = tokio::task::spawn_blocking(move || metadata.compact_db_blocking()).await;
+    //
+    // Wrapped in the same 60s wedge-detection timeout every other compact_db_blocking/
+    // compact_db_prepare call site in this codebase already carries (server.rs's periodic
+    // loop: 60s around compact_db_prepare, 20s around compact_db_finish, 60s around its own
+    // compact_db_blocking escalation) — this was the one call site that didn't have one.
+    // Root-caused 2026-07-31 (gluster1): this call wedged holding MetadataStore's exclusive
+    // lock with nothing watching it; the node only came back because a LATER, unrelated
+    // periodic-compaction-loop iteration queued behind the same lock and its OWN 60s
+    // Phase 1-2 timeout fired first, killing the whole process out from under this still-
+    // stuck task ~3 minutes in — an incidental save, not a designed one. Every peer had
+    // already marked this node Failed and evicted it from the ring by the time that
+    // happened. Same remedy as every other site: if the exclusive lock is still wedged
+    // after 60s, there is no way to un-stick it from here — restart so HA replicas keep
+    // serving and a fresh process gets a clean redb handle.
+    let compact_task = tokio::task::spawn_blocking(move || metadata.compact_db_blocking());
+    let compact_result = match tokio::time::timeout(std::time::Duration::from_secs(60), compact_task).await {
+        Ok(r) => r,
+        Err(_) => {
+            error!(
+                "Planned offline compaction: compact_db_blocking() exceeded 60s — exclusive \
+                 metadata write lock is wedged on this node (already offline, out of the \
+                 cluster ring). Restarting so HA replicas can continue serving."
+            );
+            std::process::exit(1);
+        }
+    };
     server.end_compaction_quiesce();
     let succeeded = match &compact_result {
         Ok(Ok((before, after))) => {

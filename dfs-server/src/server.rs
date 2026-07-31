@@ -1191,6 +1191,11 @@ struct OverlayForkCtx {
     /// see that field's doc comment. fold_slot_now waits on this before folding.
     compaction_quiescing: Arc<std::sync::atomic::AtomicBool>,
     compaction_quiesce_notify: Arc<tokio::sync::Notify>,
+    /// Same Arc as Server::replication_factor. Used by replicate_fold_result to
+    /// decide whether a freshly-folded chunk needs an immediate heal-queue push
+    /// to close the gap to full RF, rather than waiting on the passive discovery
+    /// pass (see that function's comment for why the wait matters).
+    replication_factor: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// One completed fold, kept around for start_patch_fold_rebroadcast_loop to
@@ -2057,6 +2062,28 @@ impl OverlayForkCtx {
             }
         }
 
+        // Dual-RF by design leaves a fold at exactly 2 holders — see
+        // client.rs's "Dual-RF: patch the first 2 replicas" comment and
+        // write_chunk_to_replicas's "server healer will lazily replicate to
+        // additional nodes up to RF". That lazy path is HealingManager's passive
+        // discovery pass: a ~60s scan + healing_delay_secs (default 300s) grace
+        // + a ~15s heal-tick, so a chunk that just converged on 2 holders can sit
+        // there for several minutes before the 3rd copy lands — a real exposure
+        // window, not a bug, but one where a single node problem during that
+        // window can turn "temporarily under-RF" into permanent loss (as seen in
+        // the 2026-07-30 no-op-fold incident: this same window, combined with
+        // that separate now-fixed bug, is what let the gap go unclosed for 13
+        // hours instead of minutes). Queueing here reuses the exact same
+        // immediate-heal path as the URGENT_SINGLE_REPLICA case above, just
+        // without the "no candidate accepted a copy" alarm — 2 holders is a
+        // healthy, expected state, not an error, so this is silent.
+        let rf = self.replication_factor.load(std::sync::atomic::Ordering::Relaxed);
+        if !file_deleted && holders.len() >= 2 && holders.len() < rf {
+            if let Some(healing) = self.healing.read().await.as_ref() {
+                healing.queue_chunks_immediate(vec![folded_id]).await;
+            }
+        }
+
         // Publish the corrected location and correct patch_state on every peer,
         // unconditionally — including when holders was already >=2.
         //
@@ -2524,24 +2551,50 @@ impl OverlayForkCtx {
             (None, None) => None,
         };
         if let Some(g) = stamped_gen {
+            // Read before bumping so a no-op fold (new_chunk_id == base_chunk_id, prev ==
+            // base_gen) can tell whether this stamp actually advances anything. For a
+            // genuine content change new_chunk_id is a brand-new chunk_id (this file/slot
+            // has never seen it before — see chunk_id's file-scoped hashing), so prev is
+            // always None and the write below fires exactly as it did before this check
+            // existed — this only ever skips work in the no-op case.
+            let prev = self.chunk_generations.get(&new_chunk_id).map(|v| *v);
             bump_chunk_generation(&self.chunk_generations, new_chunk_id, g);
             // Durability follow-up (2026-07-28) — see handle_replicate_chunk_location's
             // matching call for the full rationale: chunk_generations is in-memory
             // only, so persist this fold's freshly-computed generation into
             // CHUNK_SEQ_TABLE too, rather than relying solely on some earlier
             // write having already durably recorded a value at least this high.
-            // put_chunk_seq_async returns the EFFECTIVE (monotonic-merged) value,
-            // which can exceed `g` if the durable table already held something
-            // higher (e.g. backfilled from a restart this in-memory map missed) —
-            // re-bump so the in-memory map never trails the durable one.
-            match self.metadata.put_chunk_seq_async(file_id, chunk_idx, g).await {
-                Ok(effective_g) if effective_g > g => {
-                    bump_chunk_generation(&self.chunk_generations, new_chunk_id, effective_g);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("single fold: failed to durably record generation {} for file {} chunk {}: {}",
-                        g, file_id, chunk_idx, e);
+            //
+            // Gated on an actual advance (2026-07-31): put_chunk_seq's write transaction
+            // commits unconditionally even when the row's value doesn't change (it still
+            // takes MetadataStore's exclusive write lock and runs a full begin_write/
+            // commit cycle either way) — every no-op fold used to pay that cost even when
+            // g == prev == base_gen, i.e. nothing new to record, because base_gen was
+            // already durably stamped whenever it was first set. Root-caused 2026-07-31:
+            // this extra unconditional write-per-no-op-fold load is a plausible
+            // contributor to a same-day gluster1 compact_db wedge (compact_db_prepare's
+            // Phase 2 catch-up can't converge against a live db under sustained write
+            // churn — see run_planned_offline_compaction's doc comment — and every one of
+            // these no-op writes is churn). Skipping it when prev already covers g changes
+            // nothing observable: the durable table already holds a value >= g in that
+            // case (that's exactly what "prev == g" or "prev > g" means), so a restart
+            // recovers the same generation either way. A fold that genuinely consolidates
+            // a newer write (g > prev) still always writes through, unchanged from before.
+            let needs_durable_write = prev.is_none_or(|p| g > p);
+            if needs_durable_write {
+                // put_chunk_seq_async returns the EFFECTIVE (monotonic-merged) value,
+                // which can exceed `g` if the durable table already held something
+                // higher (e.g. backfilled from a restart this in-memory map missed) —
+                // re-bump so the in-memory map never trails the durable one.
+                match self.metadata.put_chunk_seq_async(file_id, chunk_idx, g).await {
+                    Ok(effective_g) if effective_g > g => {
+                        bump_chunk_generation(&self.chunk_generations, new_chunk_id, effective_g);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("single fold: failed to durably record generation {} for file {} chunk {}: {}",
+                            g, file_id, chunk_idx, e);
+                    }
                 }
             }
         }
@@ -11175,6 +11228,7 @@ impl Server {
             healing: self.healing.clone(),
             compaction_quiescing: self.compaction_quiescing.clone(),
             compaction_quiesce_notify: self.compaction_quiesce_notify.clone(),
+            replication_factor: self.replication_factor.clone(),
         }
     }
 

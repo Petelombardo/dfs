@@ -80,6 +80,29 @@ const CHUNK_REFCOUNT_TABLE: TableDefinition<&str, u64> = TableDefinition::new("c
 /// CHUNK_REFCOUNT_TABLE — no migration needed, not in the startup table-open list.
 const PATCH_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("patch_state");
 
+/// public_token hex string → unix seconds when that token's PATCH_STATE_TABLE row
+/// transitioned from Pending to Folded. Written alongside every
+/// PatchState::Folded update, read only by prune_stale_folded_patch_states.
+///
+/// Added 2026-08-01 (VM-108 race, chunk_idx 3877): PatchState::Folded carries no
+/// timestamp of its own (see that variant's doc comment), so the GC used to infer
+/// a token's age from its *target* chunk's ChunkLocation.written_at instead of the
+/// token's own age — correct for a genuine content change (the target is freshly
+/// created right when the fold happens, so the two ages roughly coincide), but
+/// wrong for a no-op fold: there the target is old, pre-existing content by
+/// definition, so a token folded seconds ago could already read as
+/// hours-old-enough-to-prune on the very next GC sweep (every 30 minutes -- see
+/// start_patch_state_gc_loop) if that pre-existing target happened to already be
+/// past MIN_AGE. A separate table (not a PatchState field) avoids touching
+/// PatchState's on-disk bincode shape, which is matched in 15+ places across
+/// server.rs and would otherwise need a versioned-legacy-fallback migration (see
+/// deserialize_file_metadata's pattern) for a change this contained. Rows missing
+/// here (any Folded row written before this fix existed) fall back to the old
+/// written_at-based estimate in prune_stale_folded_patch_states — never wrong in
+/// the "prune too early" direction for those, since target written_at was already
+/// today's exact behavior for them.
+const PATCH_FOLD_TIMESTAMP_TABLE: TableDefinition<&str, u64> = TableDefinition::new("patch_fold_timestamp");
+
 /// "{file_id}:{chunk_idx}" → public_token hex string (the PATCH_STATE_TABLE key
 /// currently outstanding for this slot).
 ///
@@ -729,6 +752,10 @@ impl MetadataStore {
                         payload_bytes += value.len();
                         let mut table = txn.open_table(PATCH_STATE_TABLE)?;
                         table.insert(token_key.as_str(), value.as_slice())?;
+                        // See PATCH_FOLD_TIMESTAMP_TABLE's doc comment: this token's own
+                        // fold time, not the target's, is what the GC must age-check against.
+                        let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
+                        ts_table.insert(token_key.as_str(), dfs_common::types::current_timestamp())?;
                         Ok(())
                     })();
                     self.note_txn("op:update_patch_state_folded", 0);
@@ -2304,6 +2331,10 @@ impl MetadataStore {
         {
             let mut table = txn.open_table(PATCH_STATE_TABLE)?;
             table.insert(token_key.as_str(), value.as_slice())?;
+            // See PATCH_FOLD_TIMESTAMP_TABLE's doc comment: this token's own fold
+            // time, not the target's, is what the GC must age-check against.
+            let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
+            ts_table.insert(token_key.as_str(), dfs_common::types::current_timestamp())?;
         }
         txn.commit()?;
         self.note_txn("update_patch_state_folded", value.len());
@@ -2589,13 +2620,16 @@ impl MetadataStore {
     /// ~4300 chunk_idx slots, and most go quiet — never patched again — well
     /// before the file itself is deleted, if it ever is).
     ///
-    /// Uses the target chunk's own ChunkLocation.written_at as the age proxy
-    /// rather than adding a timestamp to PatchState::Folded itself — that would
-    /// be a bincode wire-format change to an enum variant, riskier to roll out
-    /// safely than reusing a timestamp that's already there.
+    /// Age-checks each token against its OWN fold time (PATCH_FOLD_TIMESTAMP_TABLE
+    /// — see that table's doc comment) when available. Falls back to the target
+    /// chunk's ChunkLocation.written_at (the old proxy, kept only for rows folded
+    /// before that table existed) when it isn't: never wrong in the "prune too
+    /// early" direction for those, since written_at was already exactly today's
+    /// behavior for them before this fix.
     pub fn prune_stale_folded_patch_states(&self, min_age: std::time::Duration) -> Result<usize> {
         let now = std::time::SystemTime::now();
-        let candidates: Vec<(String, ChunkId)> = {
+        let now_secs = dfs_common::types::current_timestamp();
+        let candidates: Vec<(String, ChunkId, Option<u64>)> = {
             let _db = self.db.read();
             let txn = _db.begin_read()?;
             let table = match txn.open_table(PATCH_STATE_TABLE) {
@@ -2603,18 +2637,26 @@ impl MetadataStore {
                 Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
                 Err(e) => return Err(e.into()),
             };
+            let ts_table = match txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE) {
+                Ok(t) => Some(t),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(e.into()),
+            };
             let mut out = Vec::new();
             for item in table.range::<&str>(..)? {
                 let (k, v) = item?;
                 if let Ok(PatchState::Folded(target)) = bincode::deserialize::<PatchState>(v.value()) {
-                    out.push((k.value().to_string(), target));
+                    let folded_at = ts_table.as_ref()
+                        .and_then(|t| t.get(k.value()).ok().flatten())
+                        .map(|v| v.value());
+                    out.push((k.value().to_string(), target, folded_at));
                 }
             }
             out
         };
 
         let mut to_remove = Vec::new();
-        for (key, target) in candidates {
+        for (key, target, folded_at) in candidates {
             let safe_to_remove = match self.get_chunk_location(&target)? {
                 // Target already gone (superseded/deleted) — nothing can resolve
                 // through this token correctly anymore regardless of age.
@@ -2626,6 +2668,8 @@ impl MetadataStore {
                     };
                     if file_gone {
                         true
+                    } else if let Some(folded_at_secs) = folded_at {
+                        now_secs.saturating_sub(folded_at_secs) >= min_age.as_secs()
                     } else {
                         match loc.written_at {
                             Some(ts_ms) => {
@@ -2655,6 +2699,12 @@ impl MetadataStore {
             let mut table = txn.open_table(PATCH_STATE_TABLE)?;
             for key in &to_remove {
                 table.remove(key.as_str())?;
+            }
+            // Clean up the companion row too, else PATCH_FOLD_TIMESTAMP_TABLE grows
+            // unbounded — a no-op if this token predates the table (nothing to remove).
+            let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
+            for key in &to_remove {
+                ts_table.remove(key.as_str())?;
             }
         }
         txn.commit()?;

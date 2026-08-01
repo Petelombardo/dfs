@@ -3134,7 +3134,23 @@ impl OverlayForkCtx {
 
         // 1. Nothing pending, or already resolved elsewhere — delegate straight
         //    to the existing, unmodified path (handles NothingToDo/AdoptedElsewhere).
+        //
+        // Was silent (2026-08-01): this is the ONLY branch in this function that
+        // skips ProposeFold entirely and falls through to the pre-coordination,
+        // uncoordinated fold path this function exists to replace — "nothing
+        // pending" and "patch_state raced out from under us between
+        // debounce_fold_slot's dirty_patch_slots check and this call" are
+        // indistinguishable from here, and both were silent. Root-caused a VM-108
+        // incident this way (file b297b393, chunk_idx 3877, 2026-07-31): gluster5
+        // folded alone through this exact branch, and gluster3 — the other
+        // original replica holding the same raw patch token — has zero log trace
+        // of ever being contacted, which looked identical in the logs to
+        // coordination having succeeded. Logging unconditionally so this is
+        // observed directly instead of inferred after the fact.
         let Some(fp) = self.local_fold_fingerprint(file_id, chunk_idx).await else {
+            info!("coordinate_and_fold_slot: local_fold_fingerprint unavailable for file {} chunk {} (dirty_patch_slots present: {}) \
+                   — skipping ProposeFold coordination, folding via the uncoordinated path",
+                file_id, chunk_idx, self.dirty_patch_slots.get(&(file_id, chunk_idx)).is_some());
             return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
                 true => CoordinatedFoldOutcome::Done,
                 false => CoordinatedFoldOutcome::Failed,
@@ -10118,14 +10134,21 @@ impl Server {
                             generation: server.chunk_generations.get(&entry.location.chunk_id).map(|v| *v),
                         };
                         if let Err(e) = server.client.send_message(node.addr, Message::Request(loc_request)).await {
-                            debug!("patch_fold_rebroadcast: failed to resend location {} to node {}: {}", public_token, node.id, e);
+                            // Was debug! (2026-08-01): this loop is the only backstop standing
+                            // between a fold's result and a peer permanently stranded on a
+                            // deleted patch token, and staging runs at --log-level info, so a
+                            // debug! here is completely invisible in production — every one of
+                            // these 12-attempts-over-120s windows failing left zero trace,
+                            // making "did delivery fail" indistinguishable from "did coordination
+                            // never even try" during the VM-108 chunk_idx=3877 investigation.
+                            warn!("patch_fold_rebroadcast: failed to resend location {} to node {}: {}", public_token, node.id, e);
                         }
                         let fold_request = Request::ReplicatePatchFold {
                             public_token: *public_token, real_chunk_id: entry.real_chunk_id,
                             file_id: entry.file_id, chunk_idx: entry.chunk_idx,
                         };
                         if let Err(e) = server.client.send_message(node.addr, Message::Request(fold_request)).await {
-                            debug!("patch_fold_rebroadcast: failed to resend fold {} -> {} to node {}: {}", public_token, entry.real_chunk_id, node.id, e);
+                            warn!("patch_fold_rebroadcast: failed to resend fold {} -> {} to node {}: {}", public_token, entry.real_chunk_id, node.id, e);
                         }
                     }
                 }

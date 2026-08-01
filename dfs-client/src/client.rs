@@ -3969,7 +3969,7 @@ leader_addr: Arc::new(RwLock::new(None)),
     ) -> Result<Vec<u8>> {
         let mut all_not_found = true;
         for &addr in std::iter::once(&primary).chain(fallbacks.iter()) {
-            match self.read_chunk_from_server(addr, cid, client_write_seq).await {
+            match self.read_chunk_from_server(addr, cid, client_write_seq, None).await {
                 Ok(d) => {
                     self.node_health.record_success(addr).await;
                     return Ok(d);
@@ -4572,7 +4572,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                             let mut fallback_data = None;
                             let mut last_err = e;
                             for &fb_addr in &r.fallbacks {
-                                match client.read_chunk_from_server(fb_addr, r.chunk_id, None).await {
+                                match client.read_chunk_from_server(fb_addr, r.chunk_id, None, None).await {
                                     Ok(d) => { fallback_data = Some(d); break; }
                                     Err(e) => { last_err = e; }
                                 }
@@ -4618,7 +4618,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 // ResolvedFetch to give this the slot backstop too.
                                 None).await
                         } else {
-                            client.read_chunk_from_server(node_addr, r.chunk_id, None).await
+                            client.read_chunk_from_server(node_addr, r.chunk_id, None, None).await
                         };
                         match result {
                             Ok(d) => {
@@ -4744,7 +4744,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         .chain(replicas.iter().filter(|&n| n != &selected_replica))
                         .enumerate()
                     {
-                        match self.read_chunk_from_server(*node_addr, chunk_id, None).await {
+                        match self.read_chunk_from_server(*node_addr, chunk_id, None, None).await {
                             Ok(data) => {
                                 if i > 0 {
                                     debug!("Fetched chunk {} from fallback replica {} after timeout", chunk_id, node_addr);
@@ -5217,8 +5217,17 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Read a single chunk from a specific server using connection pooling
-    async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId, client_write_seq: Option<u64>) -> Result<Vec<u8>> {
+    /// Read a single chunk from a specific server using connection pooling.
+    /// `slot`, when known, is the (file_id, chunk_idx) this read is logically for —
+    /// see ReadChunk's doc in protocol.rs. Root-caused 2026-08-01 (VM-108, chunk_idx
+    /// 3877): this used to hardcode file_id/chunk_idx to None unconditionally ("the
+    /// mixed read/write collapse manifests on the range path" — wrong, it manifests
+    /// here too), meaning the server's resolve_by_slot backstop could never run for
+    /// this call no matter how stale `chunk_id` was. Confirmed as the direct cause of
+    /// reconstruct_or_abort_for_fresh_write's "base not in cache and unreadable from
+    /// any replica" EIOs on a slot whose fold result was sitting on every replica the
+    /// whole time. Pass None only where a slot genuinely isn't known at the call site.
+    async fn read_chunk_from_server(&self, server_addr: SocketAddr, chunk_id: ChunkId, client_write_seq: Option<u64>, slot: Option<(FileId, u64)>) -> Result<Vec<u8>> {
         // Look up write_seq from cache if not explicitly provided
         let ws = client_write_seq.or_else(|| self.read_write_seq_cache.get(&chunk_id).map(|e| e.0));
 
@@ -5226,11 +5235,8 @@ leader_addr: Arc::new(RwLock::new(None)),
             chunk_id,
             sequential_hint: None, // TODO: Pass sequential hint when available
             client_write_seq: ws,
-            // Full-chunk reads don't currently carry the slot backstop; the mixed
-            // read/write collapse manifests on the range path. TODO: thread file_id
-            // here too if the full-chunk path shows the same stale-id EIOs.
-            file_id: None,
-            chunk_idx: None,
+            file_id: slot.map(|s| s.0),
+            chunk_idx: slot.map(|s| s.1),
         };
 
         // Try using pooled connection first, with fallback to new connection
@@ -5560,7 +5566,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             let (p1_addr, p1_handle) = match pending.take() {
                 Some(p) => p,
                 None => {
-                    results.push(self.read_chunk_from_server(addr, cid, None).await);
+                    results.push(self.read_chunk_from_server(addr, cid, None, None).await);
                     continue;
                 }
             };
@@ -5583,7 +5589,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 }
                 Ok(Err(e)) => {
                     warn!("Pipeline Phase-1 failed for chunk {:?} on {}: {}", cid, p1_addr, e);
-                    self.read_chunk_from_server(addr, cid, None).await
+                    self.read_chunk_from_server(addr, cid, None, None).await
                 }
                 Err(e) => Err(anyhow::anyhow!("Phase-1 task panicked: {}", e)),
             };
@@ -5665,7 +5671,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let mut last_err: Option<anyhow::Error> = None;
                 for addr in replicas.iter().copied().chain(cluster_nodes.iter().copied()) {
                     if !tried.insert(addr) { continue; }
-                    match client.read_chunk_from_server(addr, chunk_id, None).await {
+                    match client.read_chunk_from_server(addr, chunk_id, None, None).await {
                         Ok(data) => return Ok(data),
                         Err(e) => {
                             debug!("Whole-chunk fallback: {} failed for chunk {}: {}", addr, chunk_id, e);
@@ -5745,7 +5751,10 @@ leader_addr: Arc::new(RwLock::new(None)),
 
     /// Read a single chunk by ID, resolving node IDs to addresses.
     /// Used to re-read the partial last chunk when re-aligning a write buffer after an interrupted append.
-    pub async fn read_chunk_by_id(&self, chunk_id: ChunkId, node_ids: &[dfs_common::NodeId]) -> Result<Vec<u8>> {
+    /// `slot`, when known, lets the server fall back to whatever chunk_id currently
+    /// occupies (file_id, chunk_idx) if `chunk_id` itself is stale/retired — see
+    /// read_chunk_from_server's doc comment for the incident this closes.
+    pub async fn read_chunk_by_id(&self, chunk_id: ChunkId, node_ids: &[dfs_common::NodeId], slot: Option<(FileId, u64)>) -> Result<Vec<u8>> {
         // Resolve NodeIds to SocketAddrs
         let mut node_addrs: Vec<SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
@@ -5761,7 +5770,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         }
 
         for addr in &node_addrs {
-            match self.read_chunk_from_server(*addr, chunk_id, None).await {
+            match self.read_chunk_from_server(*addr, chunk_id, None, slot).await {
                 Ok(data) => return Ok(data),
                 Err(e) => debug!("read_chunk_by_id: failed from {}: {}", addr, e),
             }
@@ -7433,7 +7442,12 @@ leader_addr: Arc::new(RwLock::new(None)),
             let _fold_permit = self.fold_concurrency.acquire().await.unwrap();
             timing_fold_permit_wait += permit_wait_start.elapsed();
             let backfill_started = std::time::Instant::now();
-            let source_bytes = self.read_chunk_by_id(authoritative_chunk_id, &patched_node_ids).await;
+            // No slot threaded here: authoritative_chunk_id was just computed by this
+            // same MultiPatch round, so it's fresh rather than a stale cached reference
+            // — much lower risk than the reconstruct_or_abort_for_fresh_write case this
+            // parameter exists for. Could still thread (file_id, chunk_file_offset/
+            // CHUNK_SIZE) through if this backfill read ever shows the same failure.
+            let source_bytes = self.read_chunk_by_id(authoritative_chunk_id, &patched_node_ids, None).await;
             match source_bytes {
                 Ok(data) => {
                     let data = std::sync::Arc::new(data);

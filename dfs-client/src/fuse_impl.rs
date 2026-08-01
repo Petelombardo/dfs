@@ -174,6 +174,16 @@ async fn wait_for_inode_writes_done(
 /// The padded contiguous view still exists, but only transiently: `materialize()`
 /// builds it at flush-snapshot time (bounded by flush concurrency, freed after the
 /// network round) instead of it living in the buffer map for the slot's lifetime.
+/// How long `ChunkSlot::server_chunk_id` is trusted as authoritative before falling
+/// through to recent_chunk_writes/metadata_cache instead — see that field's doc
+/// comment. Matches the 120s window already used for recent_chunk_writes elsewhere
+/// in this file (existing_chunk_nodes, the old_location resolution in
+/// flush_buffer_async_one) rather than inventing a new number: comfortably longer
+/// than a fold's expected completion time (PATCH_DEBOUNCE_IDLE's 20s plus
+/// coordination/network margin), while nowhere near long enough to survive into the
+/// hours-idle window that let this go stale undetected before.
+const SERVER_CHUNK_ID_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[derive(Clone)]
 struct ChunkSlot {
     /// App-written byte runs, sorted by intra-chunk start offset, non-overlapping,
@@ -221,9 +231,25 @@ struct ChunkSlot {
     consecutive_patch_failures: u32,
     /// The chunk_id last confirmed by the server for this slot — set from every
     /// successful MultiPatch or fresh-write response, never from metadata_cache or
-    /// recent_chunk_writes. This is the authoritative base for the next patch: if set,
-    /// it takes priority over all other sources so we never use a stale chunk_id.
+    /// recent_chunk_writes. This is the authoritative base for the next patch: if set
+    /// AND still within SERVER_CHUNK_ID_TTL of server_chunk_id_set_at, it takes
+    /// priority over all other sources so we never use a stale chunk_id.
     server_chunk_id: Option<ChunkId>,
+    /// When server_chunk_id was last set. Added 2026-08-01: server_chunk_id used to be
+    /// trusted indefinitely on the theory that "confirmed by server" means "still
+    /// current" — but a background fold can retire it at any point after the 20s
+    /// debounce window closes (PATCH_DEBOUNCE_IDLE), with zero client-visible signal.
+    /// A VM disk left idle for hours and then revisited would still present the
+    /// original patch token as the "authoritative" base, long after the real content
+    /// had been folded and the token itself deleted as normal post-fold cleanup —
+    /// root-caused as the direct explanation for why this failure mode only ever hit
+    /// long-idle sessions (VM-108, chunk_idx 3877, 2026-08-01: 7+ hours between the
+    /// write and the read/write that reused this exact stale id). Past the TTL, the
+    /// slot falls through to recent_chunk_writes/metadata_cache exactly as if
+    /// server_chunk_id had never been set, forcing a fresh look at what the server
+    /// currently has instead of trusting a reference old enough that a fold could
+    /// have already retired it and been garbage-collected.
+    server_chunk_id_set_at: Option<std::time::Instant>,
     /// Total flush attempts that ended in the terminal "cannot safely fresh-write"
     /// failure (see reconstruct_or_abort_for_fresh_write), across ticks — unlike
     /// consecutive_patch_failures, this is NOT reset when that failure fires, since its
@@ -270,6 +296,7 @@ impl ChunkSlot {
             flushing: false,
             last_sequential_end: None,
             server_chunk_id: None,
+            server_chunk_id_set_at: None,
             terminal_failure_count: 0,
             retry_backoff_until: None,
             abandoned: false,
@@ -1605,6 +1632,7 @@ impl FlushHandle {
                                 if let Some(shard) = buf.chunk_get(*chunk_idx) {
                                     let mut cs = shard.lock().await;
                                     cs.slot.server_chunk_id = Some(new_location.chunk_id);
+                                    cs.slot.server_chunk_id_set_at = Some(std::time::Instant::now());
                                 }
                                 // Evict the old chunk_id — the file at that hash path has been
                                 // renamed away on the server. Any cached entry for it would cause
@@ -2340,6 +2368,7 @@ impl FlushHandle {
     async fn reconstruct_or_abort_for_fresh_write(
         &self,
         ino: u64,
+        file_id: dfs_common::FileId,
         chunk_idx: u64,
         slot_data: &mut Vec<u8>,
         dirty_ranges: &[(usize, usize)],
@@ -2352,18 +2381,23 @@ impl FlushHandle {
         // an authoritative copy from the cluster before aborting. chunk_cache is keyed
         // by content-addressed chunk_id, so a miss means the base was *evicted*, NOT
         // that its bytes are gone: a candidate base can still be alive on the storage
-        // nodes. Reading it by explicit chunk_id is a plain content read, not subject
-        // to the current-pointer arbitration that just failed our patch — so it
-        // succeeds even when the slot's "current" pointer is poisoned/dangling. This
-        // lets the client reconstruct + fresh-write and self-heal the slot forward,
-        // instead of EIO'ing over bytes that are sitting on multiple replicas (the
-        // 2026-07-24 VM-108 incident: base 480f0070 was live on 3 nodes but evicted
-        // locally). Candidate order is preserved (old_location first) because
-        // dirty_ranges are deltas relative to that base — see the caller.
+        // nodes. Reading it by explicit chunk_id first tries a plain content read (not
+        // subject to the current-pointer arbitration that just failed our patch), and
+        // now also passes the (file_id, chunk_idx) slot so the server's resolve_by_slot
+        // backstop can redirect to whatever currently occupies the slot if the specific
+        // candidate id is gone — added 2026-08-01 after read_chunk_by_id's missing slot
+        // hint was confirmed as the direct cause of a VM-108 "base not in cache and
+        // unreadable from any replica" EIO on a slot whose fold result was sitting on
+        // every replica the entire time (see read_chunk_from_server's doc comment).
+        // This still succeeds even when the slot's "current" pointer is poisoned/
+        // dangling — resolve_by_slot is only consulted after the direct id lookup
+        // fails, so it doesn't change behavior for the common case. Candidate order is
+        // preserved (old_location first) because dirty_ranges are deltas relative to
+        // that base — see the caller.
         let selected = select_reconstruction_base(
             candidate_ids,
             |id| self.client.chunk_cache.get(id),
-            |id| self.client.read_chunk_by_id(id, &[]),
+            |id| self.client.read_chunk_by_id(id, &[], Some((file_id, chunk_idx))),
         ).await;
         if let Some((base_id, base_arc)) = selected {
             // Warm the cache with whatever we ended up using (idempotent for a cache
@@ -2555,17 +2589,24 @@ impl FlushHandle {
                 // unavailable (metadata_cache miss at flush start).
                 let effective_file_id = file_id_at_flush_start.unwrap_or(meta.id);
                 // Priority order for the base chunk_id:
-                //   1. slot.server_chunk_id — confirmed by server in this session (highest)
+                //   1. slot.server_chunk_id — confirmed by server, within SERVER_CHUNK_ID_TTL (highest)
                 //   2. recent_chunk_writes  — last server-confirmed id (120s window)
                 //   3. metadata_cache       — server metadata, may lag by a flush cycle
                 //
-                // server_chunk_id is set from every successful MultiPatch/write response
-                // and is never overwritten by a cache refresh. It is the authoritative base
-                // and eliminates the stale-base problem for any chunk that has been written
-                // at least once in this session.
+                // server_chunk_id is set from every successful MultiPatch/write response and
+                // is never overwritten by a cache refresh, but it IS time-bounded (see
+                // server_chunk_id_set_at's doc comment) — past SERVER_CHUNK_ID_TTL it falls
+                // through to the same sources a chunk never written this session would use,
+                // rather than trusting a reference old enough that a background fold could
+                // have already retired and forgotten it.
                 let slot_server_id = match &buf {
                     Some(b) => b.chunk_get(chunk_idx)
-                        .and_then(|s| s.try_lock().ok().and_then(|cs| cs.slot.server_chunk_id)),
+                        .and_then(|s| s.try_lock().ok().and_then(|cs| {
+                            cs.slot.server_chunk_id.filter(|_| {
+                                cs.slot.server_chunk_id_set_at
+                                    .is_some_and(|t| t.elapsed() < SERVER_CHUNK_ID_TTL)
+                            })
+                        })),
                     None => None,
                 };
                 let mut recent_write_present = false;
@@ -2922,7 +2963,7 @@ impl FlushHandle {
                                                     ino, chunk_idx, loc.chunk_id, old_location.chunk_id);
                                                 if !is_full_replacement {
                                                     self.reconstruct_or_abort_for_fresh_write(
-                                                        ino, chunk_idx, &mut slot_data, &dirty_ranges,
+                                                        ino, effective_file_id, chunk_idx, &mut slot_data, &dirty_ranges,
                                                         &[old_location.chunk_id, loc.chunk_id],
                                                     ).await?;
                                                 }
@@ -2949,7 +2990,7 @@ impl FlushHandle {
                                                 // reconstruct_or_abort_for_fresh_write).
                                                 if !is_full_replacement {
                                                     self.reconstruct_or_abort_for_fresh_write(
-                                                        ino, chunk_idx, &mut slot_data, &dirty_ranges,
+                                                        ino, effective_file_id, chunk_idx, &mut slot_data, &dirty_ranges,
                                                         &[old_location.chunk_id, loc.chunk_id],
                                                     ).await?;
                                                 }
@@ -3153,6 +3194,7 @@ impl FlushHandle {
                             // causing every subsequent flush to use the wrong base chunk_id.
                             // Covers both first-success and retry-success paths.
                             cs.slot.server_chunk_id = Some(new_location.chunk_id);
+                            cs.slot.server_chunk_id_set_at = Some(std::time::Instant::now());
                             cs.slot.consecutive_patch_failures = 0;
                             if !new_location.nodes.is_empty() {
                                 // Union with the existing canonical set instead of replacing it
@@ -3441,6 +3483,7 @@ impl FlushHandle {
                     cs.flushed_size = flushed_len;
                     if let Some(loc) = locations.first() {
                         cs.slot.server_chunk_id = Some(loc.chunk_id);
+                        cs.slot.server_chunk_id_set_at = Some(std::time::Instant::now());
                     }
                     // Update canonical_write_nodes so the next patch targets the correct
                     // nodes. Without this, canonical_write_nodes retains the pre-fallback

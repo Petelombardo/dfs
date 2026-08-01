@@ -3378,6 +3378,26 @@ impl FlushHandle {
         // sparse write to a genuinely-new chunk (e.g. VM disk image creation) — only the
         // narrow window where existing_chunk_size hasn't yet been confirmed by this
         // session's own flush history.
+        //
+        // Instrumentation added 2026-08-01 (VM-108, chunk_idx 0, silent header-zeroing
+        // corruption): this risk condition (about to zero-fill a gap prefix on the belief
+        // a chunk doesn't exist) is logged unconditionally now, INCLUDING when
+        // is_first_flush_this_session is false and this whole safety check is therefore
+        // SKIPPED — that's the exact blind spot a chunk under sustained heavy contention
+        // (100+ patches/sec for over an hour, in the incident this is investigating) can
+        // hit well after its own first flush, with nothing left to catch it. Purely
+        // additive logging; the check's own behavior is unchanged pending what this
+        // reveals about which of the two suspected mechanisms (the check re-arming but
+        // racing the server, vs. never re-arming at all) is actually happening.
+        if !chunk_exists && gap_filled_prefix > 0 {
+            if is_first_flush_this_session {
+                info!("flush_buffer_async_one: ino={} chunk={} risk condition (chunk_exists=false, gap_filled_prefix={}) — first flush this session, safety check WILL run",
+                    ino, chunk_idx, gap_filled_prefix);
+            } else {
+                warn!("flush_buffer_async_one: ino={} chunk={} risk condition (chunk_exists=false, gap_filled_prefix={}) on a NON-first flush — safety check SKIPPED (is_first_flush_this_session=false), about to send {} bytes of fabricated zeros with no server-side verification",
+                    ino, chunk_idx, gap_filled_prefix, gap_filled_prefix);
+            }
+        }
         if !chunk_exists && gap_filled_prefix > 0 && is_first_flush_this_session {
             let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
             let fresh_has_chunk = if let Some(path) = path_opt.clone() {
@@ -3385,7 +3405,7 @@ impl FlushHandle {
                     Ok(Some(fresh)) => {
                         let fresh_chunk0 = fresh.chunk_location_for_idx(chunk_idx).map(|l| l.size);
                         let has_chunk = fresh_chunk0.map(|s| s > 0).unwrap_or(false);
-                        debug!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} fresh_chunks={} fresh_chunk0_size={:?} has_chunk={}",
+                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} fresh_chunks={} fresh_chunk0_size={:?} has_chunk={}",
                             ino, chunk_idx, path, fresh.chunk_locations.len(), fresh_chunk0, has_chunk);
                         if has_chunk {
                             self.metadata_cache.insert(ino, fresh);
@@ -3393,16 +3413,16 @@ impl FlushHandle {
                         has_chunk
                     }
                     Ok(None) => {
-                        debug!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} server_says_not_found", ino, chunk_idx, path);
+                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} server_says_not_found", ino, chunk_idx, path);
                         false
                     }
                     Err(e) => {
-                        debug!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} lookup_error={}", ino, chunk_idx, path, e);
+                        info!("[SIZE TRACE] flush-safety-check ino={} chunk={} path={} lookup_error={}", ino, chunk_idx, path, e);
                         false
                     }
                 }
             } else {
-                debug!("[SIZE TRACE] flush-safety-check ino={} chunk={} no_path_known", ino, chunk_idx);
+                info!("[SIZE TRACE] flush-safety-check ino={} chunk={} no_path_known", ino, chunk_idx);
                 false
             };
             if fresh_has_chunk {

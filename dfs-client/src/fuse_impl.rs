@@ -8132,7 +8132,6 @@ impl Filesystem for DfsFilesystem {
                     .unwrap_or(false);
                 let flush_handle = self.flush_handle.clone();
                 let flush_rt = flush_handle.flush_runtime.clone();
-                let write_buffers = self.write_buffers.clone();
                 reply.ok();
                 flush_rt.spawn(async move {
                     if has_buffer {
@@ -8140,8 +8139,28 @@ impl Filesystem for DfsFilesystem {
                         if let Err(e) = flush_handle.flush_all_pipelined(ino).await {
                             error!("release: flush failed for inode {}: {}", ino, e);
                         }
-                        write_buffers.remove(&ino);
-                        flush_handle.client.evict_recent_chunk_writes(ino);
+                        // Do NOT remove write_buffers or evict recent_chunk_writes here — this
+                        // is the third instance of a bug already root-caused twice elsewhere in
+                        // this file (see open()'s is_first_writer comment and the sync-release
+                        // path's 2026-07-11 qemu-img-convert repro comment, both citing the
+                        // identical symptom: flushed_sizes reading back as 0 immediately after a
+                        // release despite the chunk holding real server-confirmed content
+                        // moments earlier, there correlated with a deterministic qcow2 "overlaps
+                        // with active L2 table" corruption). This branch fires whenever a
+                        // read-only fd closes while no writer fd is currently counted as open —
+                        // reachable during QEMU's own documented write-fd close/reopen cycling
+                        // (multiple times per second) if some other read-only touch (Proxmox
+                        // polling, a backup/snapshot check, or QEMU itself mid-cycle) lands in
+                        // that narrow window right after a writer closes. Removing the buffer
+                        // here has already been flushed to disk by this point, so it protects
+                        // nothing — its only effect is wiping flushed_size/canonical_write_nodes/
+                        // server_chunk_id for every chunk in the file, forcing the next write to
+                        // any of them (chunk_idx 0 included) to fall back to metadata_cache,
+                        // which is the exact "chunk_exists incorrectly reads false" precondition
+                        // for the gap-fill-zeros corruption path (see reconstruct_or_abort_for_
+                        // fresh_write / FRESH WRITE PATH's own doc comments). Root-caused
+                        // 2026-08-01 (VM-108, chunk_idx 0 header zeroed while other offsets in
+                        // the same chunk held real data).
                     }
                     if let Some(owner) = lock_owner {
                         if let Err(e) = lock_manager.release_all(ino, owner).await {

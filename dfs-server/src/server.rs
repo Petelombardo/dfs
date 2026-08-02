@@ -300,13 +300,23 @@ pub struct Server {
     /// Bounds the ENTIRE debounce-triggered fold-coordination protocol's
     /// concurrency (base self-verify through ProposeFold through the actual
     /// fold through leader-confirm through ReleaseFoldLock) — not just the
-    /// exclusive lock/lease. Sized like fold_sweep_semaphore (8) rather than
-    /// write_semaphore (48) or global_flush_semaphore (64): this path does
-    /// strictly more expensive work per permit (a full 4MB read+hash+write
-    /// plus two network round trips) and is never latency-sensitive (bounded
-    /// only by PATCH_DEBOUNCE_IDLE, not any client-facing path), so avoiding a
-    /// self-inflicted disk/CPU thundering herd matters far more than
-    /// throughput here.
+    /// exclusive lock/lease.
+    ///
+    /// Originally sized at 8, matching fold_sweep_semaphore, on the assumption
+    /// this path is "never latency-sensitive (bounded only by
+    /// PATCH_DEBOUNCE_IDLE, not any client-facing path)". That assumption
+    /// doesn't hold under sustained concurrent write load (e.g. kdiskmark
+    /// Q32T1): debounce timers for many distinct chunk_idx slots fire close
+    /// together, and each permit is held across two full network round trips
+    /// (near-free on loopback, real cost on an actual cluster) plus the fold's
+    /// own disk I/O — so 8 became a real throughput ceiling, not just a
+    /// thundering-herd guard. Measured 2026-08-02: raising this alongside
+    /// fixing verify_chunk_at's missing spawn_blocking (see that call site)
+    /// meaningfully narrowed the Q32T1 gap against the pre-adf3faf
+    /// uncoordinated baseline. 24 (3x) keeps a real ceiling — this path's
+    /// actual disk I/O per permit is still genuinely more expensive than
+    /// write_semaphore (48) or global_flush_semaphore (64)'s work — while
+    /// giving real network latency much more headroom than 8 ever did.
     fold_coordination_semaphore: Arc<tokio::sync::Semaphore>,
 
     /// Transient, single-read handoff of notify_leader_of_fold's actual
@@ -3176,7 +3186,18 @@ impl OverlayForkCtx {
         //    check, which has no network access and so cannot recover).
         const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
         let chunk_file_offset = chunk_idx * CHUNK_SIZE_U64;
-        if !self.storage.verify_chunk_at(&fp.base_chunk_id, chunk_file_offset, Some(file_id)) {
+        // Real synchronous disk read (up to 4MB) + hash — must go through
+        // spawn_blocking like every other storage read on this codebase's async
+        // paths (e.g. the read_chunk call at handle_read_chunk's hot path).
+        // Calling it inline here blocked a tokio worker thread for the read's
+        // full duration, stalling every other task scheduled on that thread —
+        // not just this fold — for as long as it took. 2026-08-02 perf finding.
+        let verify_storage = self.storage.clone();
+        let verify_base_id = fp.base_chunk_id;
+        let verify_ok = tokio::task::spawn_blocking(move || {
+            verify_storage.verify_chunk_at(&verify_base_id, chunk_file_offset, Some(file_id))
+        }).await.unwrap_or(false);
+        if !verify_ok {
             warn!("coordinate_and_fold_slot: local base chunk {} for file {} chunk {} failed self-verification \
                    — attempting recovery from peer {:?}", fp.base_chunk_id, file_id, chunk_idx, peers[0].1);
             if !self.heal_base_from_peer(fp.base_chunk_id, file_id, chunk_file_offset, peers[0].1).await {
@@ -3854,7 +3875,7 @@ impl Server {
             chunk_patch_locks: Arc::new(DashMap::new()),
             fold_lock_grants: Arc::new(DashMap::new()),
             outbound_fold_claims: Arc::new(DashMap::new()),
-            fold_coordination_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            fold_coordination_semaphore: Arc::new(tokio::sync::Semaphore::new(24)),
             last_fold_leader_confirm: Arc::new(DashMap::new()),
             pending_patch_ids: Arc::new(DashMap::new()),
             pending_patch_fold_broadcasts: Arc::new(DashMap::new()),

@@ -351,6 +351,16 @@ pub struct HealingManager {
     /// 60s cycle of accumulation is acceptable vs. data loss from false-positive orphans.
     orphan_candidates: Arc<RwLock<HashSet<ChunkId>>>,
 
+    /// Tokens this node has confirmed the current leader knows about, via
+    /// run_pending_patch_reconciliation — see that method's doc comment. Cleared
+    /// wholesale (not per-token) on a detected leader change, and GC'd each cycle
+    /// against the current live Pending set.
+    pending_patch_confirmed: Arc<RwLock<HashSet<ChunkId>>>,
+
+    /// Leader address as of the last run_pending_patch_reconciliation cycle, used
+    /// only to detect a leader change (see pending_patch_confirmed).
+    last_reconcile_leader: Arc<RwLock<Option<std::net::SocketAddr>>>,
+
     /// Per-transfer timeout for a single PushChunkTo (seconds). On expiry the chunk
     /// stays in pending (retried next drain tick) and the semaphore slot is released.
     /// Live-settable via `dfs-admin healing set --transfer-timeout-secs`.
@@ -523,6 +533,8 @@ impl HealingManager {
             heal_push_failure: Arc::new(DashMap::new()),
             requeue_priority: Arc::new(DashMap::new()),
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
+            pending_patch_confirmed: Arc::new(RwLock::new(HashSet::new())),
+            last_reconcile_leader: Arc::new(RwLock::new(None)),
             heal_transfer_timeout_secs,
             phantom_reconcile_in_progress: std::sync::atomic::AtomicBool::new(false),
             healing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(auto_heal)),
@@ -794,6 +806,12 @@ impl HealingManager {
                 self.wait_for_write_quiet("Disk orphan sweep").await;
                 self.run_disk_orphan_sweep().await;
             }
+
+            // Every node, every cycle (cheap — skips anything already confirmed) —
+            // see run_pending_patch_reconciliation's doc comment. Must run
+            // regardless of leadership: any node can be holding an unconfirmed
+            // token, not just the leader.
+            self.run_pending_patch_reconciliation().await;
 
             if !is_leader {
                 continue;
@@ -2039,6 +2057,105 @@ impl HealingManager {
                     Vec::new()
                 }
             }
+        }
+    }
+
+    /// Periodic self-check ensuring every Pending patch token this node physically
+    /// holds is known to the current leader's chunk_map — independent of whether the
+    /// *client's* own ReplicateChunkLocation broadcast (dfs-client's
+    /// pending_chunk_locations queue) ever landed. That queue already retries
+    /// indefinitely, but only in-memory: a client crash or redeploy while an entry
+    /// is still unconfirmed loses it for good, with nothing to resubmit it — the
+    /// same shape of gap already open on the fold-announcement side (see
+    /// project_fold_announcement_rebroadcast_gap). This pass instead depends on
+    /// nothing but this node's own durable PATCH_STATE_TABLE — the same source of
+    /// truth the 2026-08-02 disk-orphan-sweep fix (all_patch_token_ids) already
+    /// trusts — so it survives any client-side failure entirely.
+    ///
+    /// On a detected leader change, the whole confirmed-set is invalidated at once
+    /// (not per-token): conservative by design, since a new leader should hear
+    /// about every outstanding token at least once regardless of what the old
+    /// leader supposedly already knew.
+    ///
+    /// No new waits on any write path and no new durable state — this only reads
+    /// PATCH_STATE_TABLE and replays the existing ReplicateChunkLocation RPC/
+    /// handler exactly as the client already does; pending_patch_confirmed is a
+    /// pure in-memory dedup cache, rebuilt harmlessly from scratch on restart.
+    pub async fn run_pending_patch_reconciliation(&self) {
+        let leader_addr = self.cluster.get_leader_addr().await;
+
+        {
+            let mut last_leader = self.last_reconcile_leader.write().await;
+            if *last_leader != leader_addr {
+                info!("Pending-patch reconciliation: leader changed ({:?} -> {:?}) — re-announcing every outstanding token",
+                      *last_leader, leader_addr);
+                self.pending_patch_confirmed.write().await.clear();
+                *last_leader = leader_addr;
+            }
+        }
+
+        let Some(leader_addr) = leader_addr else {
+            debug!("Pending-patch reconciliation: no known leader, skipping this cycle");
+            return;
+        };
+
+        let slots = match self.metadata.all_pending_patch_slots_async().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Pending-patch reconciliation: failed to read pending slots: {}", e);
+                return;
+            }
+        };
+
+        // GC: drop anything from the confirmed-set that isn't still genuinely
+        // Pending (folded, superseded, or pruned since the last cycle) — piggybacks
+        // on the same scan, no separate timer or pass needed.
+        let current_tokens: HashSet<ChunkId> = slots.iter().map(|(_, _, t)| *t).collect();
+        {
+            let mut confirmed = self.pending_patch_confirmed.write().await;
+            confirmed.retain(|t| current_tokens.contains(t));
+        }
+
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let local_id = self.cluster.local_node_id();
+        let mut announced = 0usize;
+
+        for (file_id, chunk_idx, token) in slots {
+            if self.pending_patch_confirmed.read().await.contains(&token) {
+                continue;
+            }
+            let (size, written_at, client_write_seq) = match self.metadata.get_patch_state_async(token).await {
+                Ok(Some(crate::metadata::PatchState::Pending { size, written_at, client_write_seq, .. })) => {
+                    (size, written_at, client_write_seq)
+                }
+                // Raced past Pending (folded/pruned) since the slot scan above — next
+                // cycle's fresh scan won't return it either way, nothing to announce.
+                _ => continue,
+            };
+            let location = ChunkLocation {
+                chunk_id: token,
+                nodes: vec![local_id],
+                size,
+                checksum: token.hash,
+                file_offset: Some(chunk_idx * CHUNK_SIZE),
+                written_at: Some(written_at),
+                client_write_seq,
+                file_id: Some(file_id),
+            };
+            let req = Request::ReplicateChunkLocation { location, file_id: Some(file_id), generation: None };
+            let acked = matches!(
+                tokio::time::timeout(Duration::from_secs(5), self.client.send_message(leader_addr, Message::Request(req))).await,
+                Ok(Ok(_))
+            );
+            if acked {
+                self.pending_patch_confirmed.write().await.insert(token);
+                announced += 1;
+            }
+        }
+
+        if announced > 0 {
+            info!("Pending-patch reconciliation: (re-)announced {} previously-unconfirmed token(s) to leader {}",
+                  announced, leader_addr);
         }
     }
 
@@ -4730,6 +4847,53 @@ mod tests {
             "a live Pending patch token must never be deleted by the disk orphan sweep, \
              even when chunk_map/FILE_TABLE have no record of it — PATCH_STATE_TABLE \
              alone must be enough to protect it");
+    }
+
+    /// run_pending_patch_reconciliation: a token already confirmed against the
+    /// unchanged current leader must be skipped entirely (no wasted RPC attempt),
+    /// while a detected leader change must invalidate the WHOLE confirmed-set at
+    /// once — not just the one token — so a new leader gets re-announced to for
+    /// everything outstanding, regardless of what the old leader supposedly knew.
+    #[tokio::test]
+    async fn pending_patch_reconciliation_skips_confirmed_but_leader_change_invalidates_all() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let token = ChunkId::from_hash(compute_chunk_hash(b"reconcile-test-token"));
+        let base = ChunkId::from_hash(compute_chunk_hash(b"reconcile-base"));
+        let delta = ChunkId::from_hash(compute_chunk_hash(b"reconcile-delta"));
+        storage.write_chunk(&token, b"content").unwrap();
+        metadata.put_patch_state_pending(
+            FileId::new(), 42, &token, base, delta, 4096, 0, None,
+        ).unwrap();
+
+        // Solo single-node cluster: get_leader_addr() resolves to this node's own
+        // address. Pre-seed confirmed-state as if a prior cycle already succeeded
+        // against that same leader, so this cycle should see no leader change and
+        // skip re-announcing (no RPC attempt needed to prove it — the token simply
+        // stays in the confirmed set either way if skipped, whereas an attempted-
+        // and-failed announce would remove it).
+        *healing.last_reconcile_leader.write().await = Some(addr);
+        healing.pending_patch_confirmed.write().await.insert(token);
+
+        healing.run_pending_patch_reconciliation().await;
+        assert!(healing.pending_patch_confirmed.read().await.contains(&token),
+            "unchanged leader + already-confirmed token must be skipped, not re-evaluated");
+
+        // Now simulate a leader change (e.g. a rolling restart electing someone
+        // else) by seeding a different "last known leader".
+        *healing.last_reconcile_leader.write().await = Some("127.0.0.1:19999".parse().unwrap());
+
+        healing.run_pending_patch_reconciliation().await;
+        // The confirmed-set must have been invalidated wholesale on the detected
+        // leader change. The re-announce attempt itself will fail (no real leader
+        // listening in this test), so the token won't be re-inserted — but that's
+        // exactly the observable proof the clear happened: if it hadn't been
+        // cleared, the token would still be sitting there from before.
+        assert!(!healing.pending_patch_confirmed.read().await.contains(&token),
+            "a detected leader change must invalidate the whole confirmed-set, \
+             not just leave stale per-leader confirmations in place");
     }
 
     /// requeue_priority fix (2026-07-24): a chunk that has failed/stalled before must

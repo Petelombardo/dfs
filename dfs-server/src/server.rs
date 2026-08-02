@@ -7428,6 +7428,19 @@ impl Server {
                     Ok(pending_ids) => live_set.extend(pending_ids),
                     Err(e) => warn!("handle_confirm_chunks_live: failed to read pending patch chunk_ids: {}", e),
                 }
+                // all_pending_patch_chunk_ids only protects a Pending patch's base/delta
+                // INPUTS — it never includes the token itself (the PATCH_STATE_TABLE row's
+                // own key), which is what chunk_map/clients actually treat as "the current
+                // content" for its slot and holds real, already-merged data (MultiPatch's
+                // full_rewrite=false path). Root cause of the 2026-08-02 VM-108
+                // chunk_idx=3147 loss: a live, un-superseded, un-folded token (dc0f9bf3...)
+                // was invisible to this exact cross-node check and got deleted as a
+                // false-positive orphan. all_patch_token_ids covers every outstanding
+                // token (Pending or Folded), closing that gap.
+                match self.metadata.all_patch_token_ids_async().await {
+                    Ok(token_ids) => live_set.extend(token_ids),
+                    Err(e) => warn!("handle_confirm_chunks_live: failed to read patch token ids: {}", e),
+                }
                 let local_id = self.cluster.local_node_id();
                 let peers = self.cluster.get_all_nodes().await;
                 for peer in &peers {
@@ -7482,13 +7495,24 @@ impl Server {
     /// handle_confirm_chunks_live must gather this from every online node instead
     /// of trusting its own local table alone.
     async fn handle_get_pending_patch_chunk_ids(&self) -> Response {
-        match self.metadata.all_pending_patch_chunk_ids_async().await {
-            Ok(ids) => Response::PendingPatchChunkIds { ids: ids.into_iter().collect() },
+        // Union of base/delta inputs (all_pending_patch_chunk_ids) and outstanding
+        // tokens themselves (all_patch_token_ids) — see handle_confirm_chunks_live's
+        // matching comment for why the token itself must also be protected here.
+        let mut ids = match self.metadata.all_pending_patch_chunk_ids_async().await {
+            Ok(ids) => ids,
             Err(e) => {
                 warn!("handle_get_pending_patch_chunk_ids: failed to read local patch_state table: {}", e);
-                Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError }
+                return Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError };
+            }
+        };
+        match self.metadata.all_patch_token_ids_async().await {
+            Ok(token_ids) => ids.extend(token_ids),
+            Err(e) => {
+                warn!("handle_get_pending_patch_chunk_ids: failed to read local patch token ids: {}", e);
+                return Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError };
             }
         }
+        Response::PendingPatchChunkIds { ids: ids.into_iter().collect() }
     }
 
     /// Run this node's local orphan reconciliation sweep right now instead of

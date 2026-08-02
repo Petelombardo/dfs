@@ -1802,6 +1802,32 @@ impl HealingManager {
                 live_file_candidates.push((*chunk_id, age_secs));
             }
 
+            // Neither chunk_map nor FILE_TABLE ever learns about a MultiPatch/PatchChunk
+            // result until the client's own one-shot ReplicateChunkLocation broadcast to
+            // the leader lands (see handle_multi_patch's "Replicas do NOT self-report"
+            // comment) — a fire-and-forget RPC with no retry or delivery confirmation. If
+            // it's ever lost, a chunk this node correctly wrote to disk moments ago is
+            // invisible to both liveness sources forever, ages past the grace period, and
+            // reaches here as a false-positive candidate — even though PATCH_STATE_TABLE
+            // (updated synchronously and locally by the same apply_patch call that wrote
+            // the file, no broadcast involved) has known about it the whole time. Root
+            // cause of the 2026-08-02 VM-108 chunk_idx=3147 loss (dc0f9bf3...): a Pending
+            // patch token deleted by this sweep ~13h after being correctly written, having
+            // never been superseded — only its chunk_map broadcast never arrived. Exclude
+            // anything PATCH_STATE_TABLE still tracks before it ever becomes a candidate.
+            if !live_file_candidates.is_empty() {
+                let candidate_ids: Vec<ChunkId> = live_file_candidates.iter().map(|(id, _)| *id).collect();
+                match metadata.get_patch_states_present_batch(&candidate_ids) {
+                    Ok(tracked) if !tracked.is_empty() => {
+                        let before = live_file_candidates.len();
+                        live_file_candidates.retain(|(id, _)| !tracked.contains(id));
+                        kept += before - live_file_candidates.len();
+                    }
+                    Ok(_) => {}
+                    Err(e) => debug!("Disk orphan sweep: patch_state batch check failed, proceeding without it this cycle: {}", e),
+                }
+            }
+
             Ok::<_, anyhow::Error>((kept, chunks.len(), live_file_candidates))
         }).await;
 
@@ -1852,10 +1878,30 @@ impl HealingManager {
             return;
         }
 
-        let authorized = self.authorize_live_file_orphan_deletes(&ready_to_delete).await;
+        let mut authorized = self.authorize_live_file_orphan_deletes(&ready_to_delete).await;
         if authorized.is_empty() {
             debug!("Live-file orphan sweep: {} candidate(s) confirmed-absent locally but not authorized for deletion this cycle",
                    ready_to_delete.len());
+            return;
+        }
+
+        // Final re-check immediately before the irreversible delete: a candidate could
+        // have picked up a PATCH_STATE_TABLE row in the time since run_disk_orphan_sweep
+        // first scanned it (a late-arriving patch, or the leader-confirm RPC round trip
+        // above taking a moment) — see the matching check and comment in
+        // run_disk_orphan_sweep for why this table is the one source that's never subject
+        // to the lost-broadcast gap chunk_map/FILE_TABLE have. Cheap (one batch read) and
+        // this is the last point before data is gone for good, so worth re-asking.
+        match self.metadata.get_patch_states_present_batch_async(authorized.clone()).await {
+            Ok(tracked) if !tracked.is_empty() => {
+                info!("Live-file orphan sweep: {} candidate(s) now show a PATCH_STATE_TABLE row — pulling back from deletion",
+                      tracked.len());
+                authorized.retain(|id| !tracked.contains(id));
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Live-file orphan sweep: final patch_state re-check failed ({}) — proceeding, relying on the earlier check", e),
+        }
+        if authorized.is_empty() {
             return;
         }
 
@@ -1914,6 +1960,16 @@ impl HealingManager {
                     return Vec::new();
                 }
             };
+            // Also protect outstanding tokens themselves, not just their base/delta
+            // inputs — see handle_confirm_chunks_live's matching comment (server.rs)
+            // for the gap this closes (2026-08-02 VM-108 chunk_idx=3147 loss).
+            match self.metadata.all_patch_token_ids_async().await {
+                Ok(token_ids) => pending_ids.extend(token_ids),
+                Err(e) => {
+                    warn!("Live-file orphan sweep: failed to read local patch token ids, deferring this cycle: {}", e);
+                    return Vec::new();
+                }
+            }
             for node in &nodes {
                 if node.id == local_id {
                     continue;
@@ -4636,6 +4692,44 @@ mod tests {
             ReplicationStatus::UnderReplicated, 2, Duration::from_secs(1),
         );
         assert!(older < newer, "older entry must still sort first when severity and alive count are equal");
+    }
+
+    /// Root cause of the 2026-08-02 VM-108 chunk_idx=3147 data loss: a live,
+    /// un-superseded, un-folded MultiPatch token was invisible to
+    /// authorize_live_file_orphan_deletes because all_pending_patch_chunk_ids only
+    /// protects a Pending patch's base/delta INPUTS, never the token itself (the
+    /// PATCH_STATE_TABLE row's own key) — even though the token is exactly what
+    /// chunk_map/clients treat as "the current content" for its slot. Simulates the
+    /// actual failure: chunk written to disk + genuine Pending row, but chunk_map
+    /// deliberately left empty (the client's one-shot ReplicateChunkLocation
+    /// broadcast never arrived). Confirmed via negative control (see session notes)
+    /// that reverting the all_patch_token_ids union makes this fail.
+    #[tokio::test]
+    async fn live_pending_patch_token_survives_disk_orphan_sweep_even_without_chunk_map_entry() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let token = ChunkId::from_hash(compute_chunk_hash(b"patch-token-never-broadcast"));
+        let base = ChunkId::from_hash(compute_chunk_hash(b"base-chunk"));
+        let delta = ChunkId::from_hash(compute_chunk_hash(b"delta-chunk"));
+        storage.write_chunk(&token, b"patched chunk content").unwrap();
+        metadata.put_patch_state_pending(
+            FileId::new(), 3147, &token, base, delta, 4194304, 0, None,
+        ).unwrap();
+        // Deliberately NO chunk_map entry — the lost-broadcast condition.
+
+        // Old enough to clear any grace period. Two consecutive passes: the sweep's
+        // own two-pass debounce requires a candidate be seen on back-to-back cycles
+        // before it's ever routed to authorize_live_file_orphan_deletes at all.
+        let candidates = vec![(token, 999_999u64)];
+        healing.reconcile_live_file_candidates(candidates.clone(), 0).await;
+        healing.reconcile_live_file_candidates(candidates, 0).await;
+
+        assert!(storage.get_chunk_path(&token).exists(),
+            "a live Pending patch token must never be deleted by the disk orphan sweep, \
+             even when chunk_map/FILE_TABLE have no record of it — PATCH_STATE_TABLE \
+             alone must be enough to protect it");
     }
 
     /// requeue_priority fix (2026-07-24): a chunk that has failed/stalled before must

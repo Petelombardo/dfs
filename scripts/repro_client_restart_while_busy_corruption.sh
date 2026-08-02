@@ -58,8 +58,15 @@ start_cluster() {
 }
 
 mount_client() {
+    # Redirect explicitly -- without it, the backgrounded daemon inherits the
+    # $(...) command substitution's pipe as fd 1 and never closes it, hanging
+    # the calling shell forever even though the mount itself is fine. Hit
+    # this as an intermittent hang in a later sibling repro script; it's
+    # timing-dependent (whether dfs-client detaches from the inherited fd
+    # before the 2s sleep elapses) which is why this script didn't always hang.
     env RUST_LOG=debug "$BIN/dfs-client" mount "$MOUNT" --cluster "$CLUSTER" \
-        --log-file "$LOG/client.log" --allow-other --log-level debug &
+        --log-file "$LOG/client.log" --allow-other --log-level debug \
+        > /dev/null 2>&1 &
     sleep 2
     mountpoint -q "$MOUNT" || { echo "MOUNT FAILED"; tail -30 "$LOG/client.log"; exit 1; }
     pgrep -f "dfs-client mount $MOUNT" | head -1

@@ -4526,6 +4526,37 @@ impl Server {
     /// timestamp) for legacy records that predate the client_write_seq field.
     /// Fresh writes carry client_write_seq=None so any patch (seq > 0) always wins.
     async fn chunk_map_update_location_for_file(&self, file_id: FileId, location: &ChunkLocation) {
+        // Backfill the slot's CURRENT occupant's generation before arbitrating, if this
+        // node never directly recorded it. chunk_generations is in-memory, per-chunk_id,
+        // and only ever populated by whichever node computed a patch/fold's merge
+        // (handle_multi_patch/run_single_fold) or by an incoming RCL that happens to
+        // carry a generation for that exact chunk_id. A node that only received the raw
+        // written bytes as a plain replica -- never a generation-tagged broadcast for
+        // that specific chunk_id -- has no entry, and location_supersedes silently skips
+        // its generation check entirely (both sides must be Some), falling through to
+        // client_write_seq/written_at -- which a differently-sourced stale value (e.g. a
+        // fold computed from a base a concurrent patch had already superseded) can win.
+        // CHUNK_SEQ_TABLE is the durable, per-SLOT counter every generation stamp
+        // (patch or fold, on whichever node computed it) writes through -- consulting it
+        // here, right before arbitration, closes exactly that gap. Confirmed live
+        // 2026-08-03 (VM-108, file 93ed6f93, chunk_idx 1280): a fold whose base predated
+        // an interleaved patch reverted the slot back to its own retired pre-patch value,
+        // because the node running the fold had no generation entry for the patch's
+        // chunk_id and so never even compared generations.
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        if let Some(chunk_idx) = location.file_offset.map(|o| o / CHUNK_SIZE) {
+            let existing_id = self.chunk_map.get(&file_id).and_then(|e| {
+                let (locs, _) = e.value();
+                Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+            });
+            if let Some(existing_id) = existing_id {
+                if existing_id != location.chunk_id && !self.chunk_generations.contains_key(&existing_id) {
+                    if let Ok(Some(seq)) = self.metadata.get_chunk_seq_async(file_id, chunk_idx).await {
+                        self.record_chunk_generation(existing_id, seq);
+                    }
+                }
+            }
+        }
         Self::chunk_map_update_location_for_file_sync(&self.chunk_map, &self.chunk_to_file, &self.fold_result_chunk_ids, Some(&self.chunk_generations), file_id, location);
     }
 
@@ -16758,6 +16789,68 @@ mod tests {
         assert_eq!(matching[0].chunk_id, chunk_b,
             "chunk_map entry for chunk_idx=512 must be chunk_B (the boundary-aligned write), \
              not chunk_A (the stale non-aligned prealloc write)");
+    }
+
+    /// Root cause of the 2026-08-03 VM-108 chunk_idx=1280 data loss: a fold computed
+    /// from a base a concurrent patch had already superseded reverted the slot back
+    /// to its own retired pre-patch value, because the node running the fold had no
+    /// in-memory chunk_generations entry for the patch's chunk_id (it never directly
+    /// saw a generation-tagged broadcast for that specific chunk_id) — so
+    /// location_supersedes' generation check was silently skipped in favor of the
+    /// client_write_seq fallback, which the stale value won.
+    ///
+    /// Simulates the gap directly: chunk_a is registered as current with only a
+    /// DURABLE (CHUNK_SEQ_TABLE) generation of 10 — no chunk_generations entry, as if
+    /// this node never saw a generation-tagged RCL for it. An incoming chunk_b then
+    /// arrives with its own (lower, correct) generation of 3 and a higher
+    /// client_write_seq (10) — exactly the shape of a stale fold that would win via
+    /// the seq fallback if chunk_a's generation were never consulted.
+    #[tokio::test]
+    async fn chunk_map_update_backfills_durable_generation_before_arbitrating() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(storage, metadata.clone(), 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+
+        let hash_a = compute_chunk_hash(b"chunk-a-current-post-patch");
+        let chunk_a = ChunkId::from_hash(hash_a);
+        let loc_a = ChunkLocation {
+            chunk_id: chunk_a, nodes: vec![], size: 4194304, checksum: hash_a,
+            file_offset: Some(0), written_at: Some(1000), client_write_seq: Some(5), file_id: None,
+        };
+        // chunk_a's generation exists ONLY durably — no chunk_generations (in-memory)
+        // entry, simulating a node that never saw a generation-tagged broadcast for
+        // this exact chunk_id (only received it as a plain replica write).
+        metadata.put_chunk_seq_async(file_id, chunk_idx, 10).await.unwrap();
+        server.chunk_map_update_location_for_file(file_id, &loc_a).await;
+
+        let hash_b = compute_chunk_hash(b"chunk-b-stale-fold-of-old-base");
+        let chunk_b = ChunkId::from_hash(hash_b);
+        let loc_b = ChunkLocation {
+            chunk_id: chunk_b, nodes: vec![], size: 4194304, checksum: hash_b,
+            file_offset: Some(0), written_at: Some(2000), client_write_seq: Some(10), file_id: None,
+        };
+        // Incoming carries its own (lower, correct) generation, as a real fold
+        // broadcast would.
+        server.record_chunk_generation(chunk_b, 3);
+        server.chunk_map_update_location_for_file(file_id, &loc_b).await;
+
+        let entry = server.chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        let current = Server::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id);
+        assert_eq!(current, Some(chunk_a),
+            "chunk_a's higher DURABLE generation (10) must beat chunk_b's lower one (3), \
+             even though chunk_a had no in-memory chunk_generations entry and chunk_b's \
+             higher client_write_seq would have won the legacy fallback");
     }
 
     /// GetFileChunkMap must report CHUNK_TABLE's current node list for each chunk,

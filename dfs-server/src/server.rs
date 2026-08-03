@@ -3063,6 +3063,32 @@ impl OverlayForkCtx {
         }
     }
 
+    /// Lock-serialized wrapper around `local_fold_fingerprint` — see
+    /// `coordinate_and_fold_slot`'s call site (2026-08-03) for the race this
+    /// closes. `local_fold_fingerprint`'s own dirty_patch_slots+patch_state read
+    /// is unlocked and can tear across an in-flight `apply_patch` merge:
+    /// `apply_patch` holds `chunk_patch_locks` for its *entire* merge (both the
+    /// patch_state commit and the dirty_patch_slots update happen before it
+    /// drops the guard), but a reader with no lock of its own can observe the
+    /// half-updated moment — e.g. dirty_patch_slots still naming the token that
+    /// `apply_patch` is *in the middle of* resolving through a `Folded()`
+    /// redirect, whose patch_state has already flipped away from `Pending`.
+    /// That read comes back `None` even though a real accumulator exists one
+    /// commit away. Acquiring the same lock here forces the read to wait out
+    /// any in-flight merge instead of tearing across it, so `None` becomes
+    /// trustworthy: it means genuinely nothing is pending, not "we looked
+    /// mid-transition." Held only for the read itself — callers that go on to
+    /// actually fold (fold_slot_coordinated/fold_slot_now) re-acquire the same
+    /// lock themselves, unchanged from before this fix.
+    async fn fold_fingerprint_serialized(&self, file_id: FileId, chunk_idx: u64) -> Option<FoldFingerprint> {
+        let lock = self.chunk_patch_locks
+            .entry((file_id, chunk_idx))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock_owned().await;
+        self.local_fold_fingerprint(file_id, chunk_idx).await
+    }
+
     /// One bounded recovery attempt when this node's own on-disk base chunk
     /// fails content-hash self-verification (see coordinate_and_fold_slot's
     /// step 3) — pulls a fresh copy from the exact peer already being
@@ -3157,7 +3183,25 @@ impl OverlayForkCtx {
         // of ever being contacted, which looked identical in the logs to
         // coordination having succeeded. Logging unconditionally so this is
         // observed directly instead of inferred after the fact.
-        let Some(fp) = self.local_fold_fingerprint(file_id, chunk_idx).await else {
+        //
+        // Read under chunk_patch_locks (2026-08-03): local_fold_fingerprint's own
+        // dirty_patch_slots+patch_state read is unlocked and can tear across an
+        // in-flight apply_patch merge. Confirmed live (VM-108, file e9e3ea0f, chunk
+        // 3200): this branch fired 260ms before this node's own apply_patch
+        // committed a merge for the same slot — the "unavailable" result was a torn
+        // read of a mid-flight state transition, not a genuine absence. Falling
+        // through to the uncoordinated Wave path on a torn read reintroduces
+        // exactly the disagreement race this function exists to close: the Wave
+        // fold that eventually fired raced the just-committed merge and won
+        // arbitration with stale, divergent content, silently discarding the
+        // newer patch (the true chunk was gone from all 5 replicas afterward).
+        // Acquiring chunk_patch_locks here — the same lock apply_patch's caller and
+        // fold_slot_now already serialize on — makes this read wait out any
+        // in-flight merge instead of tearing across it, so a `None` result is now
+        // trustworthy: it means genuinely nothing is pending. Held only for this
+        // read; fold_slot_coordinated below re-acquires it itself when it actually
+        // folds, unchanged from before.
+        let Some(fp) = self.fold_fingerprint_serialized(file_id, chunk_idx).await else {
             info!("coordinate_and_fold_slot: local_fold_fingerprint unavailable for file {} chunk {} (dirty_patch_slots present: {}) \
                    — skipping ProposeFold coordination, folding via the uncoordinated path",
                 file_id, chunk_idx, self.dirty_patch_slots.get(&(file_id, chunk_idx)).is_some());
@@ -16040,6 +16084,136 @@ mod tests {
              chunk either) — a permanent dangling pointer, exactly the 2026-07-28 VM-108 \
              incident"
         );
+    }
+
+    /// 2026-08-03 fix: coordinate_and_fold_slot's fingerprint read must not tear
+    /// across an in-flight apply_patch merge. Root cause of a real VM-108 data-loss
+    /// incident (file e9e3ea0f, chunk_idx 3200): an unlocked read of
+    /// dirty_patch_slots+patch_state observed a torn mid-merge state (the OLD
+    /// token's patch_state already flipped to Folded, but dirty_patch_slots not yet
+    /// updated to the NEW accumulator apply_patch was about to commit), reported
+    /// "nothing pending", and skipped ProposeFold coordination entirely — the
+    /// resulting uncoordinated fold raced the just-committed merge and won
+    /// arbitration with stale, divergent content, permanently losing the real data.
+    #[tokio::test]
+    async fn fold_fingerprint_serialized_waits_out_torn_apply_patch_state_instead_of_reporting_none() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // Simulate apply_patch mid-merge, resolving a client write through a
+        // Folded() redirect (its "fresh accumulator" branch): the OLD token's
+        // patch_state has already flipped to Folded, but dirty_patch_slots still
+        // names the OLD token — the NEW accumulator's Pending row and
+        // dirty_patch_slots update haven't landed yet. Exactly the torn window the
+        // VM-108 incident raced.
+        let old_token = ChunkId::from_hash(compute_chunk_hash(b"old-accumulator-token"));
+        let folded_target = ChunkId::from_hash(compute_chunk_hash(b"already-folded-target"));
+        metadata.update_patch_state_folded(&old_token, folded_target).unwrap();
+        server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            token: old_token,
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+        });
+
+        // Negative control: the UNLOCKED read (local_fold_fingerprint — what
+        // coordinate_and_fold_slot used before this fix) sees exactly this torn
+        // state and reports "nothing pending" even though a real merge is one
+        // commit away from completing.
+        assert!(
+            server.overlay_ctx().local_fold_fingerprint(file_id, chunk_idx).await.is_none(),
+            "sanity check: the torn state (dirty_patch_slots names a token whose \
+             patch_state has already flipped to Folded) must reproduce the exact \
+             'fingerprint unavailable' condition this fix addresses"
+        );
+
+        // Now prove the fix: hold chunk_patch_locks for this slot exactly as
+        // apply_patch would for the duration of its merge, spawn the serialized
+        // read, confirm it blocks instead of tearing across the held lock the way
+        // the negative control above did, then complete the simulated merge (write
+        // the NEW token's Pending row + update dirty_patch_slots) and release the
+        // lock — the read must resolve to the NEW, correct fingerprint, not None.
+        let lock = server.chunk_patch_locks
+            .entry((file_id, chunk_idx))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock.lock_owned().await;
+
+        let ctx = server.overlay_ctx();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let fp = ctx.fold_fingerprint_serialized(file_id, chunk_idx).await;
+            let _ = tx.send(fp);
+        });
+
+        // Give the spawned task a chance to run and block on the lock, then confirm
+        // it genuinely hasn't resolved yet — proves it's waiting, not racing ahead
+        // to read torn state the way the unlocked call above did.
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut rx).await.is_err(),
+            "fold_fingerprint_serialized must block while chunk_patch_locks is held \
+             by an in-flight merge, not race ahead and read torn state"
+        );
+
+        // Complete the simulated apply_patch merge under the same lock discipline
+        // apply_patch itself uses (both the patch_state and dirty_patch_slots
+        // writes land before the guard drops).
+        let new_token = ChunkId::from_hash(compute_chunk_hash(b"new-accumulator-token"));
+        let base_content = vec![7u8; 32];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        let mut delta_record = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+        delta_record.extend_from_slice(&encode_delta_record(1, 0, &[0xCDu8]));
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_record));
+        storage.write_chunk(&delta_chunk_id, &delta_record).unwrap();
+        metadata.put_patch_state_pending(
+            file_id, chunk_idx, &new_token, base_chunk_id, delta_chunk_id,
+            base_content.len(), dfs_common::types::current_timestamp(), Some(1),
+        ).unwrap();
+        server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            token: new_token,
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+        });
+        drop(guard);
+
+        let fp = tokio::time::timeout(std::time::Duration::from_secs(1), rx).await
+            .expect("fold_fingerprint_serialized must resolve promptly once the lock is released")
+            .expect("sender must not be dropped without sending");
+        let fp = fp.expect(
+            "once the lock is released and the merge's real Pending state is visible, \
+             fold_fingerprint_serialized must find it — not the torn None the unlocked \
+             read reported above"
+        );
+        assert_eq!(fp.base_chunk_id, base_chunk_id);
+        assert_eq!(fp.delta_chunk_id, delta_chunk_id);
     }
 
     /// Increment 4 (2026-07-28, same session as the fold-generation fix above): a

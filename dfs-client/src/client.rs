@@ -3069,7 +3069,10 @@ leader_addr: Arc::new(RwLock::new(None)),
                 let fetch_results = futures::future::join_all(tasks).await;
 
                 // Collect results; queue stale-metadata failures for one metadata-refresh retry.
-                let mut stale_range_retries: Vec<(usize, usize, usize, usize)> = Vec::new(); // (idx, chunk_start, offset_in_chunk, len_in_chunk)
+                // Carries the failed chunk_id too (see stale_range_retries.push below) so the
+                // retry can tell "recent_chunk_writes still has a value" apart from "recent_chunk_writes
+                // still has the SAME value that just failed" — see the retry loop's use of it.
+                let mut stale_range_retries: Vec<(usize, usize, usize, usize, ChunkId)> = Vec::new(); // (idx, chunk_start, offset_in_chunk, len_in_chunk, failed_cid)
                 for (rf, res) in range_fetches.iter().zip(fetch_results) {
                     match res.context("Range fetch task panicked").and_then(|r| r) {
                         Ok((idx, chunk_start, offset_in_chunk, data)) => {
@@ -3088,7 +3091,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 .unwrap_or(false);
                             if is_stale {
                                 warn!("Range fetch for chunk {} (idx={}) completed after a newer write rotated the chunk — discarding stale bytes and retrying", rf.cid, idx);
-                                stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk));
+                                stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk, rf.cid));
                                 continue;
                             }
                             let arc = Arc::new(data);
@@ -3108,7 +3111,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         }
                         Err(e) if e.to_string().contains("metadata may be stale") => {
                             error!("Range chunk {} missing on all replicas — will refresh metadata and retry", rf.cid);
-                            stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk));
+                            stale_range_retries.push((rf.idx, rf.chunk_start, rf.offset_in_chunk, rf.len_in_chunk, rf.cid));
                         }
                         Err(e) => return Err(e),
                     }
@@ -3125,12 +3128,24 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let fresh_map = snap.0;
                     let fresh_nim = snap.2;
                     let fresh_nodes = self.cluster_nodes.read().await.clone();
-                    for (idx, chunk_start, offset_in_chunk, len_in_chunk) in stale_range_retries {
+                    for (idx, chunk_start, offset_in_chunk, len_in_chunk, failed_cid) in stale_range_retries {
                         // recent_chunk_writes holds the last chunk_id confirmed by our write
-                        // path. Prefer it over the leader's FILE_TABLE for this chunk.
+                        // path. Prefer it over the leader's FILE_TABLE for this chunk — UNLESS
+                        // it's the exact id that just failed as missing-on-all-replicas: a
+                        // server-side background fold can supersede a chunk this client itself
+                        // wrote without ever notifying this client's own write-path bookkeeping
+                        // (recent_chunk_writes only updates on a write THIS client issues), so
+                        // recent_chunk_writes can be stuck pointing at a since-retired identity
+                        // indefinitely — no TTL, no invalidation — while fresh_map (what we just
+                        // refreshed from the leader) already reflects the fold's real result.
+                        // Without this filter, every retry round re-selects the same known-dead
+                        // id from recent_chunk_writes and never converges (2026-08-02, VM-108
+                        // backup: chunk_idx 3130 retried the same retired token ~2300+ times
+                        // across a live backup run before the read finally errored out).
                         let fresh_cid = self.recent_chunk_writes
                             .get(&(inode, idx as u64))
                             .map(|e| e.0)
+                            .filter(|&cid| cid != failed_cid)
                             .or_else(|| fresh_map.get(idx).map(|l| l.chunk_id))
                             .ok_or_else(|| anyhow::anyhow!("Chunk at index {} missing from fresh metadata", idx))?;
 
@@ -3209,9 +3224,13 @@ leader_addr: Arc::new(RwLock::new(None)),
                                 let rmap = rsnap.0;
                                 let rnim = rsnap.2;
                                 let rnodes = self.cluster_nodes.read().await.clone();
+                                // Same exclusion as the one-shot retry above — don't let a
+                                // recent_chunk_writes entry that's stuck on the id we already
+                                // proved missing keep this loop from ever converging.
                                 let rcid = self.recent_chunk_writes
                                     .get(&(inode, idx as u64))
                                     .map(|e| e.0)
+                                    .filter(|&cid| cid != failed_cid)
                                     .or_else(|| rmap.get(idx).map(|l| l.chunk_id));
                                 let Some(rcid) = rcid else { continue };
                                 let (rfp, rffb) = match rmap.get(idx).and_then(|loc| InodeReadEngine::resolve_primary(

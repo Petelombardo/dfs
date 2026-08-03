@@ -2626,7 +2626,28 @@ impl MetadataStore {
     /// before that table existed) when it isn't: never wrong in the "prune too
     /// early" direction for those, since written_at was already exactly today's
     /// behavior for them before this fix.
-    pub fn prune_stale_folded_patch_states(&self, min_age: std::time::Duration) -> Result<usize> {
+    ///
+    /// Returns the pruned tokens' own ChunkIds (not just a count) — 2026-08-03:
+    /// this row's key IS the token's own chunk_id, and that token has its own
+    /// physical file on disk (apply_patch's merge path materializes each
+    /// accumulator round's full composed bytes under the round's own token
+    /// name — see PatchState::Pending's doc comment). This function only ever
+    /// removed the metadata row; nothing deleted that file. It should have
+    /// been caught later by the disk-orphan sweep, but a token that's Folded
+    /// still reads as "referenced" to that sweep (it's a live redirect target,
+    /// not garbage) right up until THIS GC removes the row — so there's a
+    /// window, and if the orphan sweep's own next pass doesn't happen to catch
+    /// the exact moment after, the file just sits there indefinitely. Confirmed
+    /// live: a token from 2026-08-01 was still on gluster5's disk two days
+    /// later, and because a patch token's chunk_id is deliberately NOT a
+    /// content hash (see the token construction's own doc comment), any code
+    /// that later tries to content-verify that leaked file — e.g.
+    /// handle_push_chunk_to's healing-time check — fails 100% of the time and
+    /// reports "disk corruption" that was never real. Returning these ids lets
+    /// the caller (which holds the ChunkStorage handle this module doesn't)
+    /// delete the file in the same pass that retires the metadata row, closing
+    /// the window instead of depending on the orphan sweep to notice later.
+    pub fn prune_stale_folded_patch_states(&self, min_age: std::time::Duration) -> Result<Vec<ChunkId>> {
         let now = std::time::SystemTime::now();
         let now_secs = dfs_common::types::current_timestamp();
         let candidates: Vec<(String, ChunkId, Option<u64>)> = {
@@ -2634,7 +2655,7 @@ impl MetadataStore {
             let txn = _db.begin_read()?;
             let table = match txn.open_table(PATCH_STATE_TABLE) {
                 Ok(t) => t,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
                 Err(e) => return Err(e.into()),
             };
             let ts_table = match txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE) {
@@ -2689,7 +2710,7 @@ impl MetadataStore {
         }
 
         if to_remove.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         let _db = self.db.read();
@@ -2709,11 +2730,11 @@ impl MetadataStore {
         }
         txn.commit()?;
         self.note_txn("prune_stale_folded_patch_states", 0);
-        Ok(to_remove.len())
+        Ok(to_remove.iter().filter_map(|key| decode_hex_32(key).map(ChunkId::from_hash)).collect())
     }
 
     /// Async wrapper for prune_stale_folded_patch_states — see get_chunk_location_async.
-    pub async fn prune_stale_folded_patch_states_async(self: &Arc<Self>, min_age: std::time::Duration) -> Result<usize> {
+    pub async fn prune_stale_folded_patch_states_async(self: &Arc<Self>, min_age: std::time::Duration) -> Result<Vec<ChunkId>> {
         let store = Arc::clone(self);
         tokio::task::spawn_blocking(move || store.prune_stale_folded_patch_states(min_age))
             .await
@@ -4278,6 +4299,33 @@ mod tests {
                 store.delete_chunk_location(&old).unwrap();
             }
         }
+    }
+
+    /// 2026-08-03 fix: prune_stale_folded_patch_states now returns the pruned
+    /// tokens' own ChunkIds (not just a count) so the caller can delete each
+    /// token's physical overlay file in the same pass — see the function's doc
+    /// comment for the leak this closes (a patch token's chunk_id is
+    /// deliberately not a content hash, so a leaked file sitting unswept can
+    /// later fail a healing-time content-hash check and get misreported as
+    /// disk corruption, confirmed live on gluster5 2026-08-03).
+    #[test]
+    fn prune_stale_folded_patch_states_returns_pruned_token_ids() {
+        let temp = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp.path().to_path_buf()).unwrap();
+        let file_id = FileId::new();
+        let token = ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(b"my-patch-token"));
+        let target = ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(b"my-fold-target"));
+
+        store.put_patch_state_pending(file_id, 0, &token, target, target, 4096, 1000, Some(1)).unwrap();
+        store.update_patch_state_folded(&token, target).unwrap();
+
+        // target has no ChunkLocation registered at all (never written / already
+        // deleted) — safe_to_remove is unconditional in that case, regardless of
+        // min_age, so a 0-duration min_age still exercises the real "is this
+        // actually safe" branch rather than trivially passing on age alone.
+        let pruned = store.prune_stale_folded_patch_states(std::time::Duration::from_secs(0)).unwrap();
+        assert_eq!(pruned, vec![token], "must return the pruned token's own ChunkId, not just a count");
+        assert!(store.get_patch_state(&token).unwrap().is_none(), "the PATCH_STATE_TABLE row must actually be gone");
     }
 
     /// HEAD-TO-HEAD from the SAME churned starting point — the comparison the first

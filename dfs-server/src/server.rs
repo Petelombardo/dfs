@@ -4350,6 +4350,31 @@ impl Server {
         bump_chunk_generation(&self.chunk_generations, chunk_id, generation);
     }
 
+    /// The identity apply_patch mints for an unfolded MultiPatch accumulator round:
+    /// blake3("dfs-patch-token" || delta_chunk_id.hash), domain-separated from any
+    /// real content hash so nothing can mistake a pending overlay for
+    /// directly-readable content (see apply_patch's public_token comment). Shared
+    /// here so a verifier (handle_push_chunk_to) can recognize a still-Pending
+    /// token as one instead of running content-hash verification against it —
+    /// see that call site's comment for the false "disk corruption" this closes.
+    fn patch_token_hash(delta_chunk_id: ChunkId) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"dfs-patch-token");
+        hasher.update(&delta_chunk_id.hash);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// True if `chunk_id` is a live, still-Pending patch token whose identity
+    /// checks out against its current delta — see `patch_token_hash`'s doc
+    /// comment and this method's call site in `handle_push_chunk_to` for the
+    /// false "disk corruption" this distinguishes against.
+    async fn is_verified_patch_token(&self, chunk_id: ChunkId) -> bool {
+        matches!(
+            self.metadata.get_patch_state_async(chunk_id).await,
+            Ok(Some(PatchState::Pending { delta_chunk_id, .. })) if Self::patch_token_hash(delta_chunk_id) == chunk_id.hash
+        )
+    }
+
     /// Shared equal-seq tiebreak for `location_supersedes`: `ServerFold` beats `Client`
     /// outright (no clock dependence); same-origin pairs fall back to written_at, the
     /// only signal left to distinguish them.
@@ -6787,11 +6812,28 @@ impl Server {
         // the shortest possible time instead of the whole RTT to target_addr (up to 90s).
         drop(io_guard);
 
+        // A still-Pending patch token's chunk_id is deliberately NOT a content hash
+        // (see patch_token_hash's doc comment) — resolve_push_target above only
+        // guarantees this isn't one for the cases it can positively classify; a
+        // token whose PATCH_STATE_TABLE row has since been GC'd (prune_stale_
+        // folded_patch_states) or was never in pending_patch_ids to begin with can
+        // still reach here unresolved. Re-check fresh right before verifying:
+        // confirmed live 2026-08-03 (gluster5) this exact gap made a perfectly
+        // intact patch-token overlay file fail the content-hash check below 100%
+        // of the time and get reported as "disk corruption" that was never real.
+        // Confirming the token identity is all this can do — unlike a
+        // content-addressed chunk, a patch token's name doesn't encode a hash of
+        // its own bytes, so there's nothing further to verify here; the read that
+        // eventually resolves it composes base+delta and validates the *result*,
+        // same as any other read of a pending patch.
+        let is_verified_patch_token = self.is_verified_patch_token(chunk_id).await;
+
         // Verify chunk content before propagating — catches disk corruption at the
         // source so we don't spread bad data to the rest of the cluster.
         // The hash is file-scoped and position-aware: blake3(file_id || file_offset || data).
         // We can only verify if we have both the file_offset and file_id from the chunk location.
-        if let (Some(offset), Some(file_id)) = (
+        if let (false, Some(offset), Some(file_id)) = (
+            is_verified_patch_token,
             loc.as_ref().and_then(|l| l.file_offset),
             loc.as_ref().and_then(|l| l.file_id),
         ) {
@@ -9756,6 +9798,7 @@ impl Server {
     /// cached metadata failing to resolve it.
     pub fn start_patch_state_gc_loop(self: Arc<Self>) {
         let metadata = self.metadata.clone();
+        let storage = self.storage.clone();
         tokio::spawn(async move {
             const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
             const MIN_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -9765,8 +9808,26 @@ impl Server {
             // minutes after every restart.
             loop {
                 match metadata.prune_stale_folded_patch_states_async(MIN_AGE).await {
-                    Ok(0) => {}
-                    Ok(n) => info!("patch_state GC: pruned {} stale Folded row(s)", n),
+                    Ok(tokens) if tokens.is_empty() => {}
+                    Ok(tokens) => {
+                        info!("patch_state GC: pruned {} stale Folded row(s)", tokens.len());
+                        // Delete each token's own physical file too — see
+                        // prune_stale_folded_patch_states' doc comment for the leak
+                        // this closes (2026-08-03): a patch token's chunk_id is
+                        // deliberately not a content hash, so leaving this file
+                        // for the disk-orphan sweep to eventually notice risks a
+                        // healing-time content-hash check finding it first and
+                        // reporting a false "disk corruption" — confirmed live on
+                        // gluster5, a token from two days earlier still un-swept.
+                        let storage = storage.clone();
+                        tokio::task::spawn_blocking(move || {
+                            for token in tokens {
+                                if let Err(e) = storage.delete_chunk(&token) {
+                                    warn!("patch_state GC: failed to delete stale token file {}: {}", token, e);
+                                }
+                            }
+                        }).await.unwrap_or_else(|e| warn!("patch_state GC: file-cleanup task panicked: {}", e));
+                    }
                     Err(e) => warn!("patch_state GC: sweep failed: {}", e),
                 }
                 tokio::time::sleep(SWEEP_INTERVAL).await;
@@ -11931,10 +11992,7 @@ impl Server {
         // whole point — nothing (the healer replicating to a new node, a stale
         // peer's chunk_map) must ever be able to mistake this for directly-
         // readable content and skip resolving it through patch_state first.
-        let mut token_hasher = blake3::Hasher::new();
-        token_hasher.update(b"dfs-patch-token");
-        token_hasher.update(&delta_chunk_id.hash);
-        let public_token = ChunkId::from_hash(*token_hasher.finalize().as_bytes());
+        let public_token = ChunkId::from_hash(Self::patch_token_hash(delta_chunk_id));
 
         let needed_len = patches.iter().map(|(off, d)| off + d.len()).max().unwrap_or(0).max(base_size);
         // LOAD-BEARING for T54 in scripts/test_local_suite.sh: that test correlates each
@@ -16214,6 +16272,72 @@ mod tests {
         );
         assert_eq!(fp.base_chunk_id, base_chunk_id);
         assert_eq!(fp.delta_chunk_id, delta_chunk_id);
+    }
+
+    /// 2026-08-03 fix: is_verified_patch_token must recognize a genuine, still-
+    /// Pending MultiPatch token (whose chunk_id is deliberately NOT a content
+    /// hash — see patch_token_hash's doc comment) so handle_push_chunk_to skips
+    /// content-hash verification against it instead of reporting a false "disk
+    /// corruption" — confirmed live on gluster5, a perfectly intact patch-token
+    /// overlay file failing that check 100% of the time. Also proves the
+    /// negative: an ordinary content-addressed chunk_id (no Pending row at all)
+    /// must NOT be misclassified as a token.
+    #[tokio::test]
+    async fn is_verified_patch_token_distinguishes_real_tokens_from_content_addressed_chunks() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"some-delta"));
+        let base_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"some-base"));
+        let real_token = ChunkId::from_hash(Server::patch_token_hash(delta_chunk_id));
+
+        metadata.put_patch_state_pending(
+            file_id, 0, &real_token, base_chunk_id, delta_chunk_id, 4096,
+            dfs_common::types::current_timestamp(), Some(1),
+        ).unwrap();
+
+        assert!(
+            server.is_verified_patch_token(real_token).await,
+            "a genuine Pending token whose identity matches blake3(\"dfs-patch-token\" || delta.hash) must be recognized"
+        );
+
+        // Negative control: an ordinary chunk_id with no patch_state row at all
+        // (the common case for a real, content-addressed fold result) must NOT
+        // be misclassified as a token — otherwise this fix would just trade one
+        // false-negative-prone check for a blanket skip that stops catching
+        // genuine corruption entirely.
+        let ordinary_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"a-real-content-addressed-chunk"));
+        assert!(
+            !server.is_verified_patch_token(ordinary_chunk_id).await,
+            "a chunk_id with no Pending patch_state row must not be treated as a verified patch token"
+        );
+
+        // Negative control 2: a Pending row whose recorded delta doesn't actually
+        // hash to this chunk_id (identity mismatch) must also be rejected, not
+        // just "any Pending row passes".
+        let mismatched_token = ChunkId::from_hash(compute_chunk_hash(b"claims-to-be-a-token-but-isnt"));
+        metadata.put_patch_state_pending(
+            file_id, 1, &mismatched_token, base_chunk_id, delta_chunk_id, 4096,
+            dfs_common::types::current_timestamp(), Some(1),
+        ).unwrap();
+        assert!(
+            !server.is_verified_patch_token(mismatched_token).await,
+            "a Pending row exists, but this chunk_id's own hash doesn't match patch_token_hash(delta) — must not be verified"
+        );
     }
 
     /// Increment 4 (2026-07-28, same session as the fold-generation fix above): a

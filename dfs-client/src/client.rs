@@ -3242,7 +3242,21 @@ leader_addr: Arc::new(RwLock::new(None)),
                                         (p, rnodes.iter().filter(|&&a| a != p).copied().collect())
                                     }
                                 };
-                                for &addr in std::iter::once(&rfp).chain(rffb.iter()) {
+                                // Targeted nodes first (rfp/rffb come from this slot's location
+                                // record, which is usually right and cheapest to try) — but a
+                                // fold can move a slot's replica set, and the location record can
+                                // still be catching up to that. Widen to every other known cluster
+                                // node afterward rather than giving up once the targeted set is
+                                // exhausted: a node outside the stale record's replica list can
+                                // easily already hold the current chunk while the nodes the record
+                                // still names haven't received it yet. Confirmed live 2026-08-02
+                                // (VM-108 backup, chunk_idx 3130): the current chunk was sitting on
+                                // a node that was never tried because it was never one of the
+                                // stale id's own replicas.
+                                let widen_nodes: Vec<SocketAddr> = rnodes.iter().copied()
+                                    .filter(|a| *a != rfp && !rffb.contains(a))
+                                    .collect();
+                                for &addr in std::iter::once(&rfp).chain(rffb.iter()).chain(widen_nodes.iter()) {
                                     if let Ok(d) = self.read_chunk_range_from_server(
                                         addr, rcid, offset_in_chunk as u64, len_in_chunk as u64, None,
                                         Some((file_id, idx as u64)),

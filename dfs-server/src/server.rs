@@ -6885,7 +6885,11 @@ impl Server {
             return err;
         }
         info!("DeleteChunkReplica: deleting excess replica of {} on this node", chunk_id);
-        match self.storage.delete_chunk(&chunk_id) {
+        let storage = self.storage.clone();
+        let result = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)));
+        match result {
             Ok(_) => Response::Ok { data: None },
             Err(e) => {
                 warn!("DeleteChunkReplica: failed to delete {}: {}", chunk_id, e);
@@ -8352,13 +8356,11 @@ impl Server {
             warn!("Failed to delete chunk location record for {}: {}", chunk_id, e);
         }
 
-        match self.storage.delete_chunk(&chunk_id) {
-            Ok(_) => Response::Ok { data: None },
-            Err(_) => {
-                // Chunk not present locally — that's fine, location record already cleaned up.
-                Response::Ok { data: None }
-            }
-        }
+        let storage = self.storage.clone();
+        let _ = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id)).await;
+        // Chunk not present locally (or the delete itself failed) is fine either way —
+        // location record already cleaned up above.
+        Response::Ok { data: None }
     }
 
     /// Handle has chunk request
@@ -12728,7 +12730,16 @@ impl Server {
             self.outbound_fold_claims.remove(&key);
         }
 
-        let Some(local_fp) = self.overlay_ctx().local_fold_fingerprint(file_id, chunk_idx).await else {
+        // Locked read (2026-08-04): local_fold_fingerprint alone is unlocked and can tear
+        // across this node's own in-flight apply_patch for the same slot — the same race
+        // fold_fingerprint_serialized was added to close in coordinate_and_fold_slot
+        // (2026-08-03, c18cc02). That fix only covered the proposer's own read; this is
+        // the second, missed call site — the *peer's* grant decision, reached whenever
+        // this node is asked to agree to someone else's proposed fold. A torn read here
+        // returns NothingPending (treated as an implicit grant by the proposer), so a
+        // false negative from tearing is just as dangerous as tearing on the proposer
+        // side: it lets a fold proceed unaware of a merge this node has in flight.
+        let Some(local_fp) = self.overlay_ctx().fold_fingerprint_serialized(file_id, chunk_idx).await else {
             return respond(ProposeFoldOutcome::NothingPending);
         };
         if local_fp.base_chunk_id != base_chunk_id {

@@ -2569,6 +2569,54 @@ impl MetadataStore {
             .context("spawn_blocking panicked in all_pending_patch_slots_async")?
     }
 
+    /// Same shape as all_pending_patch_slots but for slots whose token has already
+    /// Folded — used by run_pending_patch_reconciliation's fold-announcement backstop
+    /// (2026-08-04) to close the notify_leader_of_fold gap (see that field's doc
+    /// comment in healing.rs for the incident this closes). Returns
+    /// (file_id, chunk_idx, token, real_chunk_id) — the token so the reconciliation
+    /// loop can replay the exact ReplicatePatchFold redirect, and real_chunk_id so it
+    /// can look up that chunk's own ChunkLocation to replay ReplicateChunkLocation too.
+    pub fn all_folded_patch_slots(&self) -> Result<Vec<(FileId, u64, ChunkId, ChunkId)>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let slot_table = match txn.open_table(PATCH_STATE_SLOT_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let state_table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut out = Vec::new();
+        for item in slot_table.range::<&str>(..)? {
+            let (slot_key, token_bytes) = item?;
+            let Some((file_id_str, chunk_idx_str)) = slot_key.value().rsplit_once(':') else { continue };
+            let Ok(file_uuid) = uuid::Uuid::parse_str(file_id_str) else { continue };
+            let Ok(chunk_idx) = chunk_idx_str.parse::<u64>() else { continue };
+            let Ok(token_str) = std::str::from_utf8(token_bytes.value()) else { continue };
+            let Some(token_hash) = decode_hex_32(token_str) else { continue };
+            let token = ChunkId::from_hash(token_hash);
+
+            if let Some(v) = state_table.get(token_str)? {
+                if let Ok(PatchState::Folded(real)) = bincode::deserialize::<PatchState>(v.value()) {
+                    out.push((FileId::from_uuid(file_uuid), chunk_idx, token, real));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Async wrapper for all_folded_patch_slots — see get_chunk_location_async.
+    pub async fn all_folded_patch_slots_async(self: &Arc<Self>) -> Result<Vec<(FileId, u64, ChunkId, ChunkId)>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.all_folded_patch_slots())
+            .await
+            .context("spawn_blocking panicked in all_folded_patch_slots_async")?
+    }
+
     /// Every currently-outstanding public token — every PATCH_STATE_TABLE key,
     /// Pending or Folded. Used by the healing discovery pass to exclude tokens
     /// from its own "is this chunk under-replicated" classification entirely: a

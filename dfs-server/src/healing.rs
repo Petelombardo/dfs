@@ -357,8 +357,24 @@ pub struct HealingManager {
     /// against the current live Pending set.
     pending_patch_confirmed: Arc<RwLock<HashSet<ChunkId>>>,
 
+    /// Same purpose as pending_patch_confirmed, but for Folded tokens — closes the
+    /// notify_leader_of_fold gap (2026-08-04): that call is best-effort (2 attempts,
+    /// 1s timeout each, failure is just a warn!), and by the time it runs, run_single_fold
+    /// has already committed the fold locally (new chunk on disk, PATCH_STATE_TABLE
+    /// flipped to Folded, local chunk_map updated) — so a failed notify leaves the
+    /// leader's view silently stale with no retry beyond that one call. Confirmed live
+    /// (VM-111 install, file 01beabe2, chunk_idx=4096, 2026-08-04): a stale-base fold
+    /// happened under sustained heavy concurrent write load (OS install + 3 DVR
+    /// recordings + a read), exactly the load profile under which a 1s RPC timeout to
+    /// an overloaded leader becomes routine. Keyed on the FOLD RESULT chunk_id
+    /// (real_chunk_id), not the token — the token is retired the moment it folds and a
+    /// fresh accumulator can immediately mint a new one at the same slot, so the token
+    /// itself isn't a stable key across reconciliation cycles the way the fold's
+    /// standalone output chunk_id is.
+    folded_patch_confirmed: Arc<RwLock<HashSet<ChunkId>>>,
+
     /// Leader address as of the last run_pending_patch_reconciliation cycle, used
-    /// only to detect a leader change (see pending_patch_confirmed).
+    /// only to detect a leader change (see pending_patch_confirmed, folded_patch_confirmed).
     last_reconcile_leader: Arc<RwLock<Option<std::net::SocketAddr>>>,
 
     /// Per-transfer timeout for a single PushChunkTo (seconds). On expiry the chunk
@@ -534,6 +550,7 @@ impl HealingManager {
             requeue_priority: Arc::new(DashMap::new()),
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
             pending_patch_confirmed: Arc::new(RwLock::new(HashSet::new())),
+            folded_patch_confirmed: Arc::new(RwLock::new(HashSet::new())),
             last_reconcile_leader: Arc::new(RwLock::new(None)),
             heal_transfer_timeout_secs,
             phantom_reconcile_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -2090,6 +2107,7 @@ impl HealingManager {
                 info!("Pending-patch reconciliation: leader changed ({:?} -> {:?}) — re-announcing every outstanding token",
                       *last_leader, leader_addr);
                 self.pending_patch_confirmed.write().await.clear();
+                self.folded_patch_confirmed.write().await.clear();
                 *last_leader = leader_addr;
             }
         }
@@ -2156,6 +2174,57 @@ impl HealingManager {
         if announced > 0 {
             info!("Pending-patch reconciliation: (re-)announced {} previously-unconfirmed token(s) to leader {}",
                   announced, leader_addr);
+        }
+
+        // Fold-announcement backstop — see folded_patch_confirmed's doc comment for the
+        // notify_leader_of_fold gap this closes. Same shape as the Pending loop above,
+        // reusing whichever slots this node's own PATCH_STATE_TABLE already shows as
+        // Folded rather than tracking fold completions separately.
+        let folded_slots = match self.metadata.all_folded_patch_slots_async().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Fold-announcement reconciliation: failed to read folded slots: {}", e);
+                return;
+            }
+        };
+        let current_folded: HashSet<ChunkId> = folded_slots.iter().map(|(_, _, _, real)| *real).collect();
+        {
+            let mut confirmed = self.folded_patch_confirmed.write().await;
+            confirmed.retain(|id| current_folded.contains(id));
+        }
+
+        let mut fold_announced = 0usize;
+        for (file_id, chunk_idx, token, real_chunk_id) in folded_slots {
+            if self.folded_patch_confirmed.read().await.contains(&real_chunk_id) {
+                continue;
+            }
+            let Ok(Some(location)) = self.metadata.get_chunk_location_async(real_chunk_id).await else {
+                // No local location record for our own fold's output — nothing to
+                // replay yet (e.g. mid-commit); next cycle will pick it up once it lands.
+                continue;
+            };
+            let loc_req = Request::ReplicateChunkLocation {
+                location, file_id: Some(file_id),
+                generation: None,
+            };
+            let fold_req = Request::ReplicatePatchFold { public_token: token, real_chunk_id, file_id, chunk_idx };
+            let loc_ok = matches!(
+                tokio::time::timeout(Duration::from_secs(5), self.client.send_message(leader_addr, Message::Request(loc_req))).await,
+                Ok(Ok(_))
+            );
+            let fold_ok = matches!(
+                tokio::time::timeout(Duration::from_secs(5), self.client.send_message(leader_addr, Message::Request(fold_req))).await,
+                Ok(Ok(_))
+            );
+            if loc_ok && fold_ok {
+                self.folded_patch_confirmed.write().await.insert(real_chunk_id);
+                fold_announced += 1;
+            }
+        }
+
+        if fold_announced > 0 {
+            info!("Fold-announcement reconciliation: (re-)announced {} previously-unconfirmed fold(s) to leader {}",
+                  fold_announced, leader_addr);
         }
     }
 
@@ -4894,6 +4963,59 @@ mod tests {
         assert!(!healing.pending_patch_confirmed.read().await.contains(&token),
             "a detected leader change must invalidate the whole confirmed-set, \
              not just leave stale per-leader confirmations in place");
+    }
+
+    /// 2026-08-04 fix: notify_leader_of_fold is best-effort (2 attempts, 1s timeout
+    /// each) and run_single_fold has already committed the fold locally by the time
+    /// it runs — a failure there previously left the leader's view silently stale
+    /// forever, with nothing to retry it. run_pending_patch_reconciliation now also
+    /// reconciles Folded slots, same shape as the Pending case above: an
+    /// already-confirmed fold is skipped, and a detected leader change invalidates
+    /// the whole folded_patch_confirmed set so a new leader gets told about every
+    /// outstanding fold regardless of what the old leader supposedly knew.
+    #[tokio::test]
+    async fn fold_reconciliation_skips_confirmed_but_leader_change_invalidates_all() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8902".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let token = ChunkId::from_hash(compute_chunk_hash(b"fold-reconcile-test-token"));
+        let real_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"fold-reconcile-real-chunk"));
+        let file_id = FileId::new();
+        storage.write_chunk(&real_chunk_id, b"folded content").unwrap();
+        metadata.put_patch_state_pending(file_id, 7, &token, real_chunk_id, real_chunk_id, 15, 0, None).unwrap();
+        metadata.update_patch_state_folded(&token, real_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: real_chunk_id,
+            nodes: vec![node_id],
+            size: 15,
+            checksum: real_chunk_id.hash,
+            file_offset: Some(7 * 4 * 1024 * 1024),
+            written_at: Some(0),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // Solo single-node cluster: get_leader_addr() resolves to this node's own
+        // address. Pre-seed as if a prior cycle already confirmed this fold against
+        // that same leader — unchanged leader must skip it, no RPC attempt needed.
+        *healing.last_reconcile_leader.write().await = Some(addr);
+        healing.folded_patch_confirmed.write().await.insert(real_chunk_id);
+
+        healing.run_pending_patch_reconciliation().await;
+        assert!(healing.folded_patch_confirmed.read().await.contains(&real_chunk_id),
+            "unchanged leader + already-confirmed fold must be skipped, not re-evaluated");
+
+        // Simulate a leader change (e.g. a rolling restart electing someone else).
+        *healing.last_reconcile_leader.write().await = Some("127.0.0.1:19998".parse().unwrap());
+
+        healing.run_pending_patch_reconciliation().await;
+        // Invalidated wholesale on the detected leader change — the re-announce
+        // attempt itself fails (no real leader listening in this test), so it won't
+        // be re-inserted, which is exactly the observable proof the clear happened.
+        assert!(!healing.folded_patch_confirmed.read().await.contains(&real_chunk_id),
+            "a detected leader change must invalidate the whole folded_patch_confirmed \
+             set too, not just leave stale per-leader confirmations in place");
     }
 
     /// requeue_priority fix (2026-07-24): a chunk that has failed/stalled before must

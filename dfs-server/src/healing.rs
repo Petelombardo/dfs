@@ -1942,7 +1942,7 @@ impl HealingManager {
 
         let mut evicted = 0usize;
         for chunk_id in &authorized {
-            if let Err(e) = self.storage.delete_chunk(chunk_id) {
+            if let Err(e) = self.storage.delete_chunk(chunk_id, "live_file_orphan_sweep") {
                 debug!("Live-file orphan sweep: failed to delete {}: {}", chunk_id, e);
                 continue;
             }
@@ -4286,7 +4286,7 @@ impl HealingManager {
         if trim_id == local_id {
             let storage = storage.clone();
             let chunk_id_owned = *chunk_id;
-            let delete_result = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id_owned)).await;
+            let delete_result = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id_owned, "over_replication_trim")).await;
             match delete_result {
                 Ok(Ok(_)) => {
                     info!("Chunk {} over-replicated ({} alive, RF={}): trimmed local node {} (pair={:?})",

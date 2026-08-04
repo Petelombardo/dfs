@@ -631,15 +631,48 @@ impl ChunkStorage {
         }
     }
 
-    /// Delete a chunk from local storage
-    pub fn delete_chunk(&self, chunk_id: &ChunkId) -> Result<()> {
+    /// Delete a chunk from local storage.
+    ///
+    /// `reason` identifies which of this codebase's ~9 deletion call sites is doing
+    /// the deleting (e.g. "live_file_orphan_sweep", "fold_delta_cleanup") — every one
+    /// of them previously funneled into this single function with no way to tell them
+    /// apart afterward, since this is the ONLY place that logged the actual file
+    /// removal, and only at debug! (invisible at this fleet's info level). Added
+    /// 2026-08-04 after a real incident (VM-111 install, chunk baf9c254) took hours to
+    /// reconstruct from indirect evidence because nothing recorded which mechanism
+    /// physically deleted it.
+    ///
+    /// YOUNG_CHUNK_WARN_SECS: deleting a chunk this recently written is the specific
+    /// blind-spot shape that incident had — a newly-minted, likely-still-needed chunk
+    /// getting swept up as an apparent orphan — versus the overwhelmingly common case
+    /// of cleaning up something genuinely old and settled. Logged at warn!, at info
+    /// level, unconditionally (not gated on any deletion path's own verbosity), so a
+    /// future recurrence is visible immediately instead of requiring another multi-
+    /// hour reconstruction.
+    pub fn delete_chunk(&self, chunk_id: &ChunkId, reason: &str) -> Result<()> {
         let path = self.get_chunk_path(chunk_id);
 
         if path.exists() {
+            const YOUNG_CHUNK_WARN_SECS: u64 = 300;
+            if let Some(mtime) = self.get_chunk_mtime(chunk_id) {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let age_secs = now_secs.saturating_sub(mtime);
+                if age_secs < YOUNG_CHUNK_WARN_SECS {
+                    tracing::warn!(
+                        "delete_chunk: deleting YOUNG chunk {} (age={}s, reason={}) — recently-written \
+                         data being physically removed; if this chunk was still the live/correct \
+                         content for its slot, this is data loss",
+                        chunk_id, age_secs, reason,
+                    );
+                }
+            }
             fs::remove_file(&path)
                 .with_context(|| format!("Failed to delete chunk file: {:?}", path))?;
 
-            debug!("Deleted chunk {}", chunk_id);
+            debug!("Deleted chunk {} (reason={})", chunk_id, reason);
         }
         // Invalidate cache regardless of file presence — a previous PatchChunk may have
         // left stale bytes here.
@@ -877,7 +910,7 @@ mod tests {
         storage.write_chunk(&chunk_id, data).unwrap();
         assert!(storage.has_chunk(&chunk_id));
 
-        storage.delete_chunk(&chunk_id).unwrap();
+        storage.delete_chunk(&chunk_id, "test").unwrap();
         assert!(!storage.has_chunk(&chunk_id));
     }
 

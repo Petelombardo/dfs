@@ -2712,7 +2712,7 @@ impl OverlayForkCtx {
         // its file was just renamed away by full_rewrite_chunk itself.
         let _ = self.metadata.delete_chunk_location_async(delta_chunk_id).await;
         let storage_for_cleanup = self.storage.clone();
-        let _ = tokio::task::spawn_blocking(move || storage_for_cleanup.delete_chunk(&delta_chunk_id)).await;
+        let _ = tokio::task::spawn_blocking(move || storage_for_cleanup.delete_chunk(&delta_chunk_id, "fold_delta_cleanup")).await;
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6886,7 +6886,7 @@ impl Server {
         }
         info!("DeleteChunkReplica: deleting excess replica of {} on this node", chunk_id);
         let storage = self.storage.clone();
-        let result = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id))
+        let result = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id, "leader_delete_chunk_replica_rpc"))
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)));
         match result {
@@ -7690,7 +7690,7 @@ impl Server {
                 // Also delete the physical file — followers that missed DeleteChunk RPCs
                 // while offline accumulate orphaned chunk files that routing-table-only
                 // purges would leave on disk forever.
-                if let Err(e) = self.storage.delete_chunk(chunk_id) {
+                if let Err(e) = self.storage.delete_chunk(chunk_id, "purge_chunk_locations_rpc") {
                     debug!("Orphan {} not on local disk (ok): {}", chunk_id, e);
                 }
             }
@@ -8357,7 +8357,7 @@ impl Server {
         }
 
         let storage = self.storage.clone();
-        let _ = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id)).await;
+        let _ = tokio::task::spawn_blocking(move || storage.delete_chunk(&chunk_id, "client_delete_chunk_rpc")).await;
         // Chunk not present locally (or the delete itself failed) is fine either way —
         // location record already cleaned up above.
         Response::Ok { data: None }
@@ -9824,7 +9824,7 @@ impl Server {
                         let storage = storage.clone();
                         tokio::task::spawn_blocking(move || {
                             for token in tokens {
-                                if let Err(e) = storage.delete_chunk(&token) {
+                                if let Err(e) = storage.delete_chunk(&token, "patch_state_gc_stale_token_cleanup") {
                                     warn!("patch_state GC: failed to delete stale token file {}: {}", token, e);
                                 }
                             }
@@ -12952,7 +12952,7 @@ impl Server {
         for chunk_id in &chunk_ids {
             self.chunk_tombstones.remove(chunk_id);
             let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
-            if let Err(e) = self.storage.delete_chunk(chunk_id) {
+            if let Err(e) = self.storage.delete_chunk(chunk_id, "delete_file_batch_follower") {
                 // Not present locally — fine, log at debug.
                 debug!("DeleteChunksBatch: chunk {} not local: {}", chunk_id, e);
             }
@@ -13101,7 +13101,7 @@ impl Server {
         }
         for chunk_id in &entry.chunk_ids {
             let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
-            if let Err(e) = self.storage.delete_chunk(chunk_id) {
+            if let Err(e) = self.storage.delete_chunk(chunk_id, "delete_file_drain_leader") {
                 debug!("drain_one_delete: local chunk {} not present: {}", chunk_id, e);
             }
         }

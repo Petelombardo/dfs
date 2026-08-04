@@ -5100,6 +5100,65 @@ mod tests {
              alone must be enough to protect it");
     }
 
+    /// 2026-08-04 staging incident (vm-108-disk-0.qcow2, chunk_idx=2994, token
+    /// 0947f318...): a live, still-Pending, un-folded MultiPatch token was
+    /// evicted by the disk orphan sweep and PERMANENTLY LOST from both of its 2
+    /// replicas — real, unrecoverable data loss on a live VM disk, confirmed by
+    /// direct SSH investigation (the token's own `PATCH_STATE_TABLE` row and its
+    /// on-disk file were both gone from every node in the cluster afterward).
+    ///
+    /// The existing `live_pending_patch_token_survives_disk_orphan_sweep_...`
+    /// test above only exercises `reconcile_live_file_candidates` directly with
+    /// a hand-built candidate list — it never goes through
+    /// `run_disk_orphan_sweep_over`'s OWN earlier classification step, which has
+    /// its own separate `get_patch_states_present_batch` call before a chunk
+    /// ever becomes a candidate at all. This test closes that coverage gap by
+    /// driving the real, full `run_disk_orphan_sweep_over` entry point instead,
+    /// with a real `patch_token_hash`-constructed identity (not an arbitrary
+    /// stand-in chunk_id) — the exact shape of the staging incident: chunk_map
+    /// empty (as it always is right after a restart) and FILE_TABLE not yet
+    /// caught up (as it legitimately can be for a heavily in-place-patched
+    /// qcow2 disk), simulating a token written moments after this node's own
+    /// restart.
+    #[tokio::test]
+    async fn live_pending_patch_token_survives_the_full_run_disk_orphan_sweep_over_path() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8906".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let base = ChunkId::from_hash(compute_chunk_hash(b"vm108-base-chunk"));
+        let delta = ChunkId::from_hash(compute_chunk_hash(b"vm108-delta-chunk"));
+        // Real patch_token_hash construction, matching Server::patch_token_hash
+        // exactly: blake3("dfs-patch-token" || delta_chunk_id.hash) — deliberately
+        // NOT a content hash, see that function's doc comment.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"dfs-patch-token");
+        hasher.update(&delta.hash);
+        let token = ChunkId::from_hash(*hasher.finalize().as_bytes());
+
+        storage.write_chunk(&token, b"live patch-token content, still pending").unwrap();
+        metadata.put_patch_state_pending(
+            FileId::new(), 2994, &token, base, delta, 4194304, 0, None,
+        ).unwrap();
+        // Old enough to clear the default 600s DFS_LIVE_FILE_ORPHAN_GRACE_SECS age gate.
+        let old_ts = dfs_common::types::current_timestamp().saturating_sub(700);
+        storage.set_chunk_mtime(&token, old_ts);
+        // Deliberately no chunk_map entry, no ChunkLocation, no FILE_TABLE
+        // entry — the exact post-restart, freshly-written-token state.
+
+        // Two full passes through the REAL entry point (not the lower-level
+        // reconcile_live_file_candidates helper), matching the two-pass debounce
+        // the real paginated loop would apply across two page sightings.
+        healing.run_disk_orphan_sweep_over(vec![token]).await;
+        healing.run_disk_orphan_sweep_over(vec![token]).await;
+
+        assert!(storage.get_chunk_path(&token).exists(),
+            "a live Pending patch token must survive the FULL run_disk_orphan_sweep_over \
+             path — not just the lower-level reconcile_live_file_candidates helper — even \
+             with no chunk_map/FILE_TABLE/ChunkLocation entry at all. This exact gap caused \
+             real, permanent, unrecoverable data loss on a live VM disk on 2026-08-04.");
+    }
+
     /// run_pending_patch_reconciliation: a token already confirmed against the
     /// unchanged current leader must be skipped entirely (no wasted RPC attempt),
     /// while a detected leader change must invalidate the WHOLE confirmed-set at

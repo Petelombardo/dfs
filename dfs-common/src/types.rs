@@ -149,7 +149,7 @@ pub struct NodeHealthGossip {
 }
 
 /// Unique identifier for a chunk of data
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChunkId {
     /// Blake3 hash of the chunk data
     pub hash: [u8; 32],

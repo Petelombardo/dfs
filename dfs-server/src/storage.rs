@@ -240,7 +240,7 @@ pub struct ChunkStorage {
     /// None until the first list_chunks() call populates it via a real directory
     /// walk; Some(set) thereafter, kept correct incrementally by write_chunk /
     /// delete_chunk rather than ever being invalidated wholesale.
-    list_chunks_cache: Mutex<Option<std::collections::HashSet<ChunkId>>>,
+    list_chunks_cache: Mutex<Option<std::collections::BTreeSet<ChunkId>>>,
 
     /// Present only when `DFS_DURABILITY_COALESCE` is set: routes every durable
     /// chunk write through one per-device syncfs worker instead of a per-write
@@ -789,10 +789,30 @@ impl ChunkStorage {
             Self::collect_chunks_recursive(&chunks_dir, &mut chunk_ids)?;
         }
 
-        let index: std::collections::HashSet<ChunkId> = chunk_ids.iter().copied().collect();
+        let index: std::collections::BTreeSet<ChunkId> = chunk_ids.iter().copied().collect();
         let result = chunk_ids;
         *guard = Some(index);
         Ok(result)
+    }
+
+    /// Return up to `limit` chunk ids strictly greater than `after` (or the first
+    /// `limit` if `after` is None), in ascending order, using the same live-maintained
+    /// index as list_chunks(). Builds the index via a directory walk on first call,
+    /// same as list_chunks(). An empty result means the cursor has reached the end of
+    /// the set — callers rotate by passing None again on the next call.
+    pub fn list_chunks_page(&self, after: Option<ChunkId>, limit: usize) -> Result<Vec<ChunkId>> {
+        let mut guard = self.list_chunks_cache.lock().unwrap();
+        if guard.is_none() {
+            drop(guard);
+            self.list_chunks()?;
+            guard = self.list_chunks_cache.lock().unwrap();
+        }
+        let index = guard.as_ref().expect("index populated above");
+        let iter = match after {
+            Some(cursor) => index.range((std::ops::Bound::Excluded(cursor), std::ops::Bound::Unbounded)),
+            None => index.range(..),
+        };
+        Ok(iter.take(limit).copied().collect())
     }
 
     /// Get cache statistics for flow control
@@ -951,6 +971,93 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert!(chunks.contains(&chunk1));
         assert!(chunks.contains(&chunk2));
+    }
+
+    #[test]
+    fn test_list_chunks_page_full_rotation_no_dupes_no_gaps() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = ChunkStorage::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut expected = std::collections::BTreeSet::new();
+        for i in 0..23u32 {
+            let data = format!("chunk-{}", i).into_bytes();
+            let chunk_id = ChunkId::from_hash(compute_chunk_hash(&data));
+            storage.write_chunk(&chunk_id, &data).unwrap();
+            expected.insert(chunk_id);
+        }
+
+        // Walk the whole set in pages of 5 (23 chunks -> 4 full pages + 1 partial).
+        let mut collected = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = storage.list_chunks_page(cursor, 5).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(*page.last().unwrap());
+            collected.extend(page);
+        }
+
+        assert_eq!(collected.len(), expected.len(), "page walk should visit every chunk exactly once");
+        let collected_set: std::collections::BTreeSet<_> = collected.iter().copied().collect();
+        assert_eq!(collected_set.len(), collected.len(), "no chunk should be paged twice in one rotation");
+        assert_eq!(collected_set, expected, "page walk should cover exactly the written set, no gaps");
+
+        // Ascending order across page boundaries, not just within a page.
+        for w in collected.windows(2) {
+            assert!(w[0] < w[1], "pages must be strictly ascending across the whole rotation");
+        }
+    }
+
+    #[test]
+    fn test_list_chunks_page_mid_rotation_insert_picked_up_next_rotation() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = ChunkStorage::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut chunk_ids = Vec::new();
+        for i in 0..4u32 {
+            let data = format!("initial-{}", i).into_bytes();
+            let chunk_id = ChunkId::from_hash(compute_chunk_hash(&data));
+            storage.write_chunk(&chunk_id, &data).unwrap();
+            chunk_ids.push(chunk_id);
+        }
+        chunk_ids.sort();
+
+        // Page halfway through the first rotation.
+        let first_page = storage.list_chunks_page(None, 2).unwrap();
+        assert_eq!(first_page.len(), 2);
+
+        // Insert a new chunk mid-rotation (after the index has already been built).
+        let new_data = b"inserted-mid-rotation";
+        let new_chunk = ChunkId::from_hash(compute_chunk_hash(new_data));
+        storage.write_chunk(&new_chunk, new_data).unwrap();
+
+        // Finish out this rotation: the new chunk must NOT be skipped forever, but it's
+        // fine if it doesn't appear until the cursor wraps back around.
+        let mut cursor = Some(*first_page.last().unwrap());
+        let mut rest_of_rotation = Vec::new();
+        loop {
+            let page = storage.list_chunks_page(cursor, 2).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(*page.last().unwrap());
+            rest_of_rotation.extend(page);
+        }
+
+        // Next rotation (cursor reset to None) must include the mid-rotation insert.
+        let mut next_rotation = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = storage.list_chunks_page(cursor, 2).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(*page.last().unwrap());
+            next_rotation.extend(page);
+        }
+        assert!(next_rotation.contains(&new_chunk), "chunk inserted mid-rotation must appear on the next rotation");
+        assert_eq!(next_rotation.len(), 5, "next rotation should see all 5 chunks now on disk");
     }
 
     #[test]

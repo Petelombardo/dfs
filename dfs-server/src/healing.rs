@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::interval;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cluster::ClusterManager;
 use crate::metadata::MetadataStore;
@@ -411,6 +411,21 @@ pub struct HealingManager {
     /// Checked the same way as healing_enabled: skip this cycle, retry next tick —
     /// no need for a bounded wait here since run_heal_loop already ticks every 15s.
     compaction_quiescing: Arc<std::sync::atomic::AtomicBool>,
+
+    /// JoinHandle for the currently-running run_disk_orphan_sweep_paginated_loop
+    /// task, watched by run_disk_orphan_sweep_watchdog. Replaced (not just read) by
+    /// the watchdog when it detects the loop has ended, so this always points at
+    /// whichever instance is actually running.
+    disk_sweep_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+
+    /// Updated by the paginated loop after every page (whether or not the page was
+    /// gated/empty) — purely a liveness heartbeat for the watchdog, not used for any
+    /// pacing decision itself.
+    disk_sweep_last_page_at: Arc<std::sync::Mutex<Instant>>,
+
+    /// Last time the paginated loop's gated-retry path actually emitted a warn! —
+    /// see GATE_LOG_THROTTLE's doc comment.
+    disk_sweep_gate_log_throttle: Arc<std::sync::Mutex<Instant>>,
 }
 
 /// Deferred commit intent produced by one heal task. do_heal_chunk_inner used to
@@ -557,6 +572,13 @@ impl HealingManager {
             healing_enabled: Arc::new(std::sync::atomic::AtomicBool::new(auto_heal)),
             local_started_at: Instant::now(),
             compaction_quiescing,
+            disk_sweep_task: Arc::new(std::sync::Mutex::new(None)),
+            disk_sweep_last_page_at: Arc::new(std::sync::Mutex::new(Instant::now())),
+            // Initialized already-expired so the very first gated check logs
+            // immediately rather than being silently suppressed for the first 60s.
+            disk_sweep_gate_log_throttle: Arc::new(std::sync::Mutex::new(
+                Instant::now() - Self::GATE_LOG_THROTTLE,
+            )),
         }
     }
 
@@ -626,6 +648,22 @@ impl HealingManager {
         let emergency = self.clone();
         tokio::spawn(async move {
             emergency.run_disk_emergency_monitor().await;
+        });
+
+        // Paginated disk-orphan-sweep: bounds each destructive-scan pass to a page
+        // instead of run_discovery_loop's old inline full-scan-every-2-cycles call
+        // (removed — see run_disk_orphan_sweep_paginated_loop's doc comment).
+        // Independent of the 60s discovery cadence; watched by the watchdog below.
+        let sweep = self.clone();
+        let sweep_handle = tokio::spawn(async move {
+            sweep.run_disk_orphan_sweep_paginated_loop().await;
+        });
+        *self.disk_sweep_task.lock().unwrap() = Some(sweep_handle);
+
+        // Watchdog for the paginated sweep loop above — see its own doc comment.
+        let watchdog = self.clone();
+        tokio::spawn(async move {
+            watchdog.run_disk_orphan_sweep_watchdog().await;
         });
     }
 
@@ -756,7 +794,6 @@ impl HealingManager {
     ///   delay window. Same scoped-per-node approach.
     async fn run_discovery_loop(&self) {
         let mut cleanup_counter = 0u32;
-        let mut disk_sweep_counter = 0u32;
         let mut was_leader = false;
 
         loop {
@@ -783,46 +820,17 @@ impl HealingManager {
                 was_leader = is_leader;
             }
 
-            // Disk orphan sweep: runs on EVERY node every 2 cycles (2 minutes).
-            // First fire is at the 2-minute mark (120s startup grace from the 60s
-            // per-cycle sleep × 2 cycles).  Must run on followers too — they accumulate
-            // orphaned files when they miss DeleteChunk RPCs while offline, and also when
-            // patch operations re-place a chunk on different nodes without the old node
-            // receiving a DeleteChunk.  Intentionally before the is_leader gate.
-            //
-            // Disk-pressure early trigger (added 2026-07-12): the normal 2-minute
-            // schedule is fine under ordinary churn, but a local repro of sustained
-            // heavy concurrent writes (many hot chunks each folding repeatedly)
-            // drove a small test disk from having headroom to completely full in
-            // under 90 seconds — well before the first scheduled sweep at the
-            // 2-minute mark ever got a chance to run. Checking free space here is
-            // cheap (one statvfs call, no directory walk) and safe to run every
-            // cycle: unlike the fold-timing decision, this is a purely local,
-            // per-node cleanup of already-safely-identified orphans (still subject
-            // to run_disk_orphan_sweep's own grace-period checks), not something
-            // that needs cross-replica agreement — so triggering it early under
-            // local disk pressure can't cause the REPLICA DISAGREEMENT class of bug
-            // an independent per-node *fold* trigger would (see
-            // active_fold_bytes's doc comment in dfs-client for that distinction).
-            // 10% threshold scales with disk size: on real ~900GB staging nodes
-            // this essentially never fires under normal operation (would need
-            // >800GB consumed); on a small/constrained node it gives a real safety
-            // margin instead of letting the 2-minute window run to completion.
-            let disk_pressure = match self.storage.get_filesystem_stats() {
-                Ok((total, _free, available)) if total > 0 => {
-                    (available as f64) < (total as f64) * 0.10
-                }
-                _ => false,
-            };
-            disk_sweep_counter += 1;
-            if disk_sweep_counter >= 2 || disk_pressure {
-                disk_sweep_counter = 0;
-                if disk_pressure {
-                    warn!("Disk orphan sweep: triggering early — available space under 10% of total");
-                }
-                self.wait_for_write_quiet("Disk orphan sweep").await;
-                self.run_disk_orphan_sweep().await;
-            }
+            // Disk orphan sweep used to be triggered inline here (every 2 cycles, plus
+            // a disk-pressure early trigger). Moved to an independent, paginated,
+            // watchdogged loop (run_disk_orphan_sweep_paginated_loop, spawned in
+            // start()) — see that function's doc comment. A full unbounded sweep
+            // dumped its entire cost into whichever single 60s cycle first cleared
+            // the post-restart grace period, which produced severe redb write
+            // contention that contributed to a real VM-108 data-loss incident
+            // (2026-08-03, file 565f683c). The paginated loop bounds each pass to a
+            // page and self-paces independently of this loop's cadence, so this
+            // comment (and the disk_pressure early-trigger it replaces) no longer
+            // has anything to do here.
 
             // Every node, every cycle (cheap — skips anything already confirmed) —
             // see run_pending_patch_reconciliation's doc comment. Must run
@@ -1700,44 +1708,99 @@ impl HealingManager {
         }
     }
 
-    pub async fn run_disk_orphan_sweep(&self) {
-        // Don't delete local chunks when the cluster is degraded — a copy on a
-        // currently-offline node might be the only remaining replica.
-        {
-            let all_nodes = self.cluster.get_all_nodes().await;
-            let total = all_nodes.len();
-            let online = all_nodes.iter()
-                .filter(|n| n.status == dfs_common::NodeStatus::Online)
-                .count();
-            let nodes_down = total.saturating_sub(online);
+    /// How often the PAGINATED loop's gated retries are allowed to log at warn level.
+    /// The full-sweep path (run_disk_orphan_sweep) calls the gate at most once per
+    /// manual trigger or emergency-monitor tick (rare) and always logs; the paginated
+    /// loop re-checks this same gate every page_grace (default 3s) while gated, which
+    /// at 1-for-1 logging would produce ~400 warn lines over one 20-minute restart
+    /// grace window instead of the ~10 the old 2-minute-cadence code produced. Throttle
+    /// keeps the *check* at full frequency (still reacts to the gate clearing promptly)
+    /// while capping the *log volume* back down to roughly its pre-pagination rate.
+    const GATE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 
-            let grace_elapsed = self.cluster.time_since_became_leader().await
-                .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
-
-            if nodes_down > 1 {
-                warn!("Skipping disk orphan sweep — {} node(s) down (max 1 allowed for destructive ops)", nodes_down);
-                return;
+    /// Cluster-degradation/restart-freshness gate shared by run_disk_orphan_sweep and
+    /// run_disk_orphan_sweep_paginated_loop — don't delete local chunks when the
+    /// cluster is degraded (a copy on a currently-offline node might be the only
+    /// remaining replica) or when this node's/the leader's view might not have caught
+    /// up yet. Logs its own reason and returns false when gated; true when clear.
+    /// `throttle_log`: when true, suppresses the warn! if one was already logged
+    /// within GATE_LOG_THROTTLE — see that constant's doc comment for why the
+    /// paginated loop needs this and the rarer full-sweep callers don't.
+    async fn disk_orphan_sweep_cluster_gate_clear(&self, throttle_log: bool) -> bool {
+        let should_log = !throttle_log || {
+            let mut last = self.disk_sweep_gate_log_throttle.lock().unwrap();
+            if last.elapsed() >= Self::GATE_LOG_THROTTLE {
+                *last = Instant::now();
+                true
+            } else {
+                false
             }
-            if !grace_elapsed {
+        };
+
+        let all_nodes = self.cluster.get_all_nodes().await;
+        let total = all_nodes.len();
+        let online = all_nodes.iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online)
+            .count();
+        let nodes_down = total.saturating_sub(online);
+
+        let grace_elapsed = self.cluster.time_since_became_leader().await
+            .map_or(true, |d| d.as_secs() >= LEADER_CHANGE_GRACE_SECS);
+
+        if nodes_down > 1 {
+            if should_log {
+                warn!("Skipping disk orphan sweep — {} node(s) down (max 1 allowed for destructive ops)", nodes_down);
+            }
+            return false;
+        }
+        if !grace_elapsed {
+            if should_log {
                 let elapsed = self.cluster.time_since_became_leader().await
                     .map_or(0.0, |d| d.as_secs_f64());
                 warn!("Skipping disk orphan sweep — within grace period after leader election ({:.0}s elapsed of {}s)",
                     elapsed, LEADER_CHANGE_GRACE_SECS);
-                return;
             }
-            // See SELF_RESTART_GRACE_SECS's doc comment: the check above only ever
-            // fires for a node that's been (or recently became) leader — a plain
-            // follower always passes it trivially, no matter how recently it
-            // restarted. This is the independent check for that case: THIS node's
-            // own local_started_at, regardless of leadership.
-            let self_uptime = self.local_started_at.elapsed().as_secs();
-            if self_uptime < SELF_RESTART_GRACE_SECS {
+            return false;
+        }
+        // See SELF_RESTART_GRACE_SECS's doc comment: the check above only ever
+        // fires for a node that's been (or recently became) leader — a plain
+        // follower always passes it trivially, no matter how recently it
+        // restarted. This is the independent check for that case: THIS node's
+        // own local_started_at, regardless of leadership.
+        let self_uptime = self.local_started_at.elapsed().as_secs();
+        if self_uptime < SELF_RESTART_GRACE_SECS {
+            if should_log {
                 warn!("Skipping disk orphan sweep — this node restarted {}s ago (< {}s grace period, chunk_map may not have caught up to current cluster state yet)",
                     self_uptime, SELF_RESTART_GRACE_SECS);
-                return;
             }
+            return false;
         }
+        true
+    }
 
+    /// Full-sweep entry point — used by the manual "run everything right now"
+    /// handle_trigger_orphan_cleanup RPC, a rare, explicit, administrator-initiated
+    /// action where the old unbounded-scan semantics are still exactly what's wanted.
+    /// The recurring path is run_disk_orphan_sweep_paginated_loop, which bounds each
+    /// pass to a page via run_disk_orphan_sweep_over instead of calling this.
+    pub async fn run_disk_orphan_sweep(&self) {
+        if !self.disk_orphan_sweep_cluster_gate_clear(false).await {
+            return;
+        }
+        let chunks = match self.storage.list_chunks() {
+            Ok(v) => v,
+            Err(e) => { warn!("Disk orphan sweep: failed to list local chunks: {}", e); return; }
+        };
+        self.run_disk_orphan_sweep_over(chunks).await;
+    }
+
+    /// Core per-chunk-set engine shared by the full-sweep entry point
+    /// (run_disk_orphan_sweep) and the paginated loop (run_disk_orphan_sweep_paginated_loop) —
+    /// takes an explicit chunk_id list instead of always calling storage.list_chunks()
+    /// itself, so a caller can pass either "every chunk on disk" or just one page of
+    /// them. Caller is responsible for the cluster-gate check
+    /// (disk_orphan_sweep_cluster_gate_clear) — this function assumes it already passed.
+    async fn run_disk_orphan_sweep_over(&self, chunks: Vec<ChunkId>) {
         // 2x the periodic full-reconciliation interval (server.rs RECONCILE_INTERVAL =
         // 300s) — that loop is the slowest *guaranteed* metadata-catchup path in the
         // system, so doubling it bounds how stale this node's live_chunk_ids() view
@@ -1771,7 +1834,6 @@ impl HealingManager {
         let result = tokio::task::spawn_blocking(move || {
             let mut live_chunks = metadata.live_chunk_ids()?;
             live_chunks.extend(live_from_chunk_map);
-            let chunks = storage.list_chunks()?;
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -1882,32 +1944,152 @@ impl HealingManager {
         self.reconcile_live_file_candidates(live_file_candidates, live_file_grace_secs).await;
     }
 
+    /// Pure arithmetic for the paginated sweep's rate limiter — split out so it can be
+    /// unit-tested without real sleeps. Returns how long to sleep before the next page:
+    /// the grace floor minus however much of it this page's own work already consumed,
+    /// clamped to zero so a run of slow pages never oversleeps into negative territory.
+    fn disk_sweep_next_delay(grace: Duration, elapsed_this_iteration: Duration) -> Duration {
+        grace.saturating_sub(elapsed_this_iteration)
+    }
+
+    /// Recurring path for disk-orphan-sweep: bounds each pass to a page over the
+    /// indexed chunk set instead of run_disk_orphan_sweep's unbounded full scan, so a
+    /// large accumulated backlog (e.g. after a restart's grace period elapses) can
+    /// never dump its entire cost into a single cycle. See the design doc in the
+    /// commit that introduced this (2026-08-04, VM-108 565f683c incident) for the
+    /// full rationale. Runs independently of run_discovery_loop's 60s cadence —
+    /// watched over by run_disk_orphan_sweep_watchdog.
+    async fn run_disk_orphan_sweep_paginated_loop(&self) {
+        let page_size: usize = std::env::var("DFS_ORPHAN_SWEEP_PAGE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(5000);
+        let page_grace = Duration::from_millis(
+            std::env::var("DFS_ORPHAN_SWEEP_PAGE_GRACE_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(3000),
+        );
+
+        let mut cursor: Option<ChunkId> = None;
+        loop {
+            let iter_start = Instant::now();
+
+            if !self.healing_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                || self.compaction_quiescing.load(std::sync::atomic::Ordering::Relaxed)
+                || !self.disk_orphan_sweep_cluster_gate_clear(true).await
+            {
+                // Gated — don't advance the cursor, just wait and re-check. The
+                // individual gate methods already log their own reason.
+                *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
+                tokio::time::sleep(page_grace).await;
+                continue;
+            }
+
+            let page = match self.storage.list_chunks_page(cursor, page_size) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Disk orphan sweep (paginated): failed to list chunk page: {}", e);
+                    *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
+                    tokio::time::sleep(page_grace).await;
+                    continue;
+                }
+            };
+
+            if page.is_empty() {
+                // End of rotation — wrap the cursor and wait a beat before starting over.
+                cursor = None;
+            } else {
+                cursor = page.last().copied();
+                self.run_disk_orphan_sweep_over(page).await;
+            }
+
+            *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
+            tokio::time::sleep(Self::disk_sweep_next_delay(page_grace, iter_start.elapsed())).await;
+        }
+    }
+
+    /// Independent watchdog for run_disk_orphan_sweep_paginated_loop — modeled on
+    /// run_disk_emergency_monitor's precedent (a fast independent loop supplementing
+    /// a slower one). A self-perpetuating page-chain has nothing else to restart it
+    /// if it ever silently dies (panic, or a bug in the reschedule logic), so this
+    /// checks the stored JoinHandle every 30s and respawns on a detected death.
+    /// Startup spawn is start()'s job — this only reacts to a death it observes.
+    async fn run_disk_orphan_sweep_watchdog(self: Arc<Self>) {
+        const CHECK_INTERVAL: Duration = Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(CHECK_INTERVAL).await;
+            self.clone().disk_orphan_sweep_watchdog_check_once().await;
+        }
+    }
+
+    /// One watchdog check-and-maybe-respawn, split out from run_disk_orphan_sweep_watchdog's
+    /// sleep loop so it can be unit-tested without waiting a real 30s.
+    async fn disk_orphan_sweep_watchdog_check_once(self: Arc<Self>) {
+        let finished = {
+            let guard = self.disk_sweep_task.lock().unwrap();
+            match guard.as_ref() {
+                Some(handle) => handle.is_finished(),
+                None => true, // never spawned — shouldn't happen post-start(), but respawn anyway
+            }
+        };
+
+        if finished {
+            let old = self.disk_sweep_task.lock().unwrap().take();
+            if let Some(handle) = old {
+                match handle.await {
+                    Ok(()) => error!("Disk orphan sweep watchdog: paginated sweep loop ended unexpectedly (no panic payload) — respawning"),
+                    Err(e) if e.is_panic() => error!("Disk orphan sweep watchdog: paginated sweep loop PANICKED ({:?}) — respawning", e),
+                    Err(e) => error!("Disk orphan sweep watchdog: paginated sweep loop task error ({:?}) — respawning", e),
+                }
+            }
+            let respawn_target = self.clone();
+            let handle = tokio::spawn(async move {
+                respawn_target.run_disk_orphan_sweep_paginated_loop().await;
+            });
+            *self.disk_sweep_task.lock().unwrap() = Some(handle);
+        }
+    }
+
     /// Two-pass + age-gate + leader-confirm/stability check for category-2 candidates
     /// (routed to us, but absent from our own live_chunk_ids()). Reuses
     /// orphan_candidates as the per-node two-pass debounce set.
+    ///
+    /// Incremental merge, not wholesale replace (2026-08-04, pagination): this is now
+    /// called once per page (run_disk_orphan_sweep_paginated_loop) as well as once per
+    /// full scan (run_disk_orphan_sweep's manual-trigger path). A page only ever
+    /// covers a disjoint slice of the chunk_id space, so if this insert/remove'd
+    /// `orphan_candidates` wholesale on every call, each page's call would blow away
+    /// the first-sighting entries every other page in the same rotation just recorded
+    /// — the two-pass debounce would never actually complete a second pass for
+    /// anything. Merging in place means a chunk_id's "first sighting" set on page N of
+    /// rotation 1 survives untouched through every other page's calls until rotation
+    /// 2's page N comes back around and either promotes it (still a candidate: same
+    /// chunk_id seen again) or the entry simply ages out no differently than before
+    /// pagination existed. Full-scan callers are unaffected: one call already covered
+    /// every chunk_id in one shot, so incremental-vs-replace makes no observable
+    /// difference for that path.
     async fn reconcile_live_file_candidates(&self, candidates: Vec<(ChunkId, u64)>, grace_secs: u64) {
         if candidates.is_empty() {
-            self.orphan_candidates.write().await.clear();
             return;
         }
 
-        let prev_candidates = self.orphan_candidates.read().await.clone();
-        let mut new_candidates: HashSet<ChunkId> = HashSet::new();
         let mut ready_to_delete: Vec<ChunkId> = Vec::new();
-
-        for (chunk_id, age_secs) in &candidates {
-            if *age_secs < grace_secs {
-                debug!("Live-file orphan grace: skipping {} (age={}s, grace={}s)", chunk_id, age_secs, grace_secs);
-                continue;
-            }
-            if prev_candidates.contains(chunk_id) {
-                ready_to_delete.push(*chunk_id);
-            } else {
-                new_candidates.insert(*chunk_id);
-                debug!("Live-file orphan candidate (first sighting, will re-check next pass): {}", chunk_id);
+        {
+            let mut tracked = self.orphan_candidates.write().await;
+            for (chunk_id, age_secs) in &candidates {
+                if *age_secs < grace_secs {
+                    debug!("Live-file orphan grace: skipping {} (age={}s, grace={}s)", chunk_id, age_secs, grace_secs);
+                    continue;
+                }
+                if tracked.remove(chunk_id) {
+                    ready_to_delete.push(*chunk_id);
+                } else {
+                    tracked.insert(*chunk_id);
+                    debug!("Live-file orphan candidate (first sighting, will re-check next pass): {}", chunk_id);
+                }
             }
         }
-        *self.orphan_candidates.write().await = new_candidates;
 
         if ready_to_delete.is_empty() {
             return;
@@ -5016,6 +5198,152 @@ mod tests {
         assert!(!healing.folded_patch_confirmed.read().await.contains(&real_chunk_id),
             "a detected leader change must invalidate the whole folded_patch_confirmed \
              set too, not just leave stale per-leader confirmations in place");
+    }
+
+    /// 2026-08-04 pagination: the concrete benefit the user described — "by the time
+    /// we get to page 2, page 1's chunks would already be reconciled and would never
+    /// get enqueued in the first place" — plus a check that pagination doesn't
+    /// silently break the two-pass debounce for the OTHER, still-genuinely-orphaned
+    /// chunk on a different page in the same rotation (the bug this test would have
+    /// caught: reconcile_live_file_candidates used to replace orphan_candidates
+    /// wholesale on every call, so page 2's call was wiping out page 1's first-sighting
+    /// record before it ever got its second sighting).
+    #[tokio::test]
+    async fn disk_orphan_sweep_over_reconciled_chunk_never_flagged_and_pagination_does_not_break_debounce() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8904".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let page1_chunk = ChunkId::from_hash(compute_chunk_hash(b"page1-genuine-orphan"));
+        let page2_chunk = ChunkId::from_hash(compute_chunk_hash(b"page2-also-genuine-orphan"));
+        let page3_chunk = ChunkId::from_hash(compute_chunk_hash(b"page3-gets-reconciled-first"));
+        storage.write_chunk(&page1_chunk, b"page1 data").unwrap();
+        storage.write_chunk(&page2_chunk, b"page2 data").unwrap();
+        storage.write_chunk(&page3_chunk, b"page3 data").unwrap();
+        // Past the default 600s DFS_LIVE_FILE_ORPHAN_GRACE_SECS so all three are old
+        // enough to be tracked immediately — this test is about the debounce/
+        // reconciliation interaction, not the age gate (covered by its own test).
+        let old_ts = dfs_common::types::current_timestamp().saturating_sub(700);
+        storage.set_chunk_mtime(&page1_chunk, old_ts);
+        storage.set_chunk_mtime(&page2_chunk, old_ts);
+        storage.set_chunk_mtime(&page3_chunk, old_ts);
+
+        // Rotation 1, page 1: page1_chunk has no live reference anywhere — first
+        // sighting, recorded as a candidate.
+        healing.run_disk_orphan_sweep_over(vec![page1_chunk]).await;
+        assert!(healing.orphan_candidates.read().await.contains(&page1_chunk),
+            "an unreconciled chunk on its own page must become a first-pass candidate");
+
+        // Before page3_chunk's own page is ever processed, it gets legitimately
+        // reconciled (a real Pending patch state lands for it — same protection
+        // exercised by live_pending_patch_token_survives_disk_orphan_sweep_...).
+        // Under the old unbounded full-scan, all three chunks would have been checked
+        // in the exact same pass, before this reconciliation had any chance to land.
+        metadata.put_patch_state_pending(
+            FileId::new(), 7, &page3_chunk,
+            ChunkId::from_hash(compute_chunk_hash(b"page3-base")),
+            ChunkId::from_hash(compute_chunk_hash(b"page3-delta")),
+            4096, 0, None,
+        ).unwrap();
+
+        // Rotation 1, page 2: page2_chunk is a SEPARATE, still-genuinely-unreconciled
+        // orphan on a different page in the same rotation. This is the call that
+        // exercises the actual bug: reconcile_live_file_candidates used to REPLACE
+        // orphan_candidates wholesale with just this call's own candidates, which
+        // would silently wipe out page1_chunk's first-sighting record recorded above.
+        healing.run_disk_orphan_sweep_over(vec![page2_chunk]).await;
+        assert!(healing.orphan_candidates.read().await.contains(&page1_chunk),
+            "an earlier page's candidate in the same rotation must survive a LATER page's \
+             own (non-empty) reconcile call — pagination must not break the cross-page \
+             two-pass debounce by clobbering it wholesale");
+        assert!(healing.orphan_candidates.read().await.contains(&page2_chunk),
+            "the later page's own genuine candidate must also be tracked");
+
+        // Rotation 1, page 3: page3_chunk is now live (protected by PATCH_STATE_TABLE)
+        // and must never even become a candidate — the concrete pagination benefit.
+        healing.run_disk_orphan_sweep_over(vec![page3_chunk]).await;
+        assert!(!healing.orphan_candidates.read().await.contains(&page3_chunk),
+            "a chunk reconciled before its own page is reached must never be flagged as a candidate at all");
+        // Still unaffected by the empty-candidates call for page3.
+        assert!(healing.orphan_candidates.read().await.contains(&page1_chunk));
+        assert!(healing.orphan_candidates.read().await.contains(&page2_chunk));
+
+        // Rotation 2, page 1 and page 2: both genuine orphans are seen again, still
+        // with no live reference — second sighting, ready for the leader-confirm/
+        // stability gate. Single-node cluster (no peers) authorizes everything, so
+        // this proves the debounce survived across pages to actually trigger deletion.
+        healing.run_disk_orphan_sweep_over(vec![page1_chunk]).await;
+        healing.run_disk_orphan_sweep_over(vec![page2_chunk]).await;
+        assert!(!storage.get_chunk_path(&page1_chunk).exists(),
+            "a genuinely never-reconciled chunk must still be evicted after two real \
+             sightings, unaffected by another page's reconciliation or candidacy in between");
+        assert!(!storage.get_chunk_path(&page2_chunk).exists(),
+            "same for the second genuinely-orphaned page, proving both survived independently");
+    }
+
+    /// Pure arithmetic for the paginated sweep's rate limiter — tested directly
+    /// rather than via real sleeps to avoid timing flakiness.
+    #[test]
+    fn disk_sweep_next_delay_floors_at_zero_and_subtracts_elapsed_work() {
+        // Cheap page: most of the grace period is still owed.
+        assert_eq!(
+            HealingManager::disk_sweep_next_delay(Duration::from_millis(3000), Duration::from_millis(200)),
+            Duration::from_millis(2800),
+        );
+        // A page whose own work exactly consumed the grace period: nothing left to wait.
+        assert_eq!(
+            HealingManager::disk_sweep_next_delay(Duration::from_millis(3000), Duration::from_millis(3000)),
+            Duration::from_millis(0),
+        );
+        // A slow page that overran the grace period must floor at zero, not go
+        // negative (Duration can't represent negative — this is the saturating_sub
+        // behavior the fix relies on to avoid a panic/wraparound).
+        assert_eq!(
+            HealingManager::disk_sweep_next_delay(Duration::from_millis(3000), Duration::from_millis(5000)),
+            Duration::from_millis(0),
+        );
+    }
+
+    /// The paginated sweep loop is self-perpetuating with nothing else to restart it
+    /// if it dies — this proves the watchdog actually detects a finished task and
+    /// replaces it, rather than just trusting the design on paper. Uses a stand-in
+    /// finished task in place of a real dead paginated loop (no need to make the real
+    /// loop panic to prove is_finished()-based detection works).
+    #[tokio::test]
+    async fn disk_orphan_sweep_watchdog_detects_finished_task_and_respawns() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8905".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        let healing = Arc::new(healing);
+
+        // Stand-in for a dead paginated-sweep task: an already-completed no-op.
+        let dead_handle = tokio::spawn(async {});
+        // Let it actually finish before the watchdog checks it.
+        while !dead_handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        *healing.disk_sweep_task.lock().unwrap() = Some(dead_handle);
+
+        // Stale heartbeat, so we can tell whether the respawned task actually ran.
+        *healing.disk_sweep_last_page_at.lock().unwrap() = Instant::now() - Duration::from_secs(3600);
+
+        healing.clone().disk_orphan_sweep_watchdog_check_once().await;
+
+        let new_handle_alive = {
+            let guard = healing.disk_sweep_task.lock().unwrap();
+            guard.as_ref().map(|h| !h.is_finished())
+        };
+        assert_eq!(new_handle_alive, Some(true),
+            "watchdog must store a new, running JoinHandle after detecting the old one had finished");
+
+        // Give the newly-spawned task a moment to run its first loop iteration (it
+        // writes disk_sweep_last_page_at before its first sleep, whether gated or
+        // not — see run_disk_orphan_sweep_paginated_loop).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let heartbeat_age = healing.disk_sweep_last_page_at.lock().unwrap().elapsed();
+        assert!(heartbeat_age < Duration::from_secs(10),
+            "the respawned task must actually be running — its heartbeat should be fresh, \
+             not the stale 3600s-old value seeded before the respawn");
     }
 
     /// requeue_priority fix (2026-07-24): a chunk that has failed/stalled before must

@@ -486,6 +486,23 @@ pub struct Server {
     delta_ring_hits: Arc<std::sync::atomic::AtomicU64>,
     delta_ring_misses: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Third ring, same type as chunk_ring/delta_ring, keyed by an
+    /// accumulator's current raw-log delta_chunk_id — but holding fully
+    /// MATERIALIZED content (base + every delta record replayed onto it in
+    /// client_write_seq order), not raw delta bytes. Added 2026-08-05 for
+    /// merge-time patch no-op detection: apply_patch's merge path uses a hit
+    /// here as the cheap, self-proving check that its cached buffer still
+    /// matches current durable state — no separate staleness flag needed,
+    /// since a miss (including the unconditional miss every slot has right
+    /// after a restart, this ring being in-memory-only) always means "treat
+    /// as untrusted, fall back to today's unconditional-write behavior."
+    /// Never holds base/delta raw bytes itself — those stay in chunk_ring/
+    /// delta_ring exactly as before; this is intentionally a third, separate
+    /// pool so a burst of no-op checks can't evict either of those.
+    materialized_ring: Arc<ShardedChunkRing>,
+    materialized_ring_hits: Arc<std::sync::atomic::AtomicU64>,
+    materialized_ring_misses: Arc<std::sync::atomic::AtomicU64>,
+
     /// Forwarding pointers for chunks full_rewrite_chunk has retired — see
     /// ShardedAliasMap. Ephemeral by design; never a durability dependency.
     retired_chunk_aliases: Arc<ShardedAliasMap>,
@@ -832,6 +849,38 @@ fn parse_delta_records(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
     }
     records.sort_by_key(|(seq, ..)| *seq);
     Ok(records.into_iter().map(|(_, offset, data)| (offset, data)).collect())
+}
+
+/// The highest client_write_seq actually present in this delta's raw records —
+/// ground truth from the bytes themselves, not any in-memory bookkeeping.
+/// Returns None for a legacy-format delta (no seq field exists at all, see
+/// parse_delta_records_legacy) or an empty/unparseable one. Used exclusively
+/// by apply_patch's merge-time no-op detection to establish a trustworthy
+/// ordering baseline after a cold rebuild — see that block's doc comment for
+/// why an absent/wrong baseline here is a real correctness hazard, not just a
+/// missed optimization: unlike other callers, this one needs a *provably
+/// grounded* seq, not "no info yet" treated as "trust anything."
+fn max_seq_in_delta_records(bytes: &[u8]) -> Option<u64> {
+    if is_legacy_delta_format(bytes) {
+        return None;
+    }
+    let bytes = &bytes[8..];
+    let mut pos = 0usize;
+    let mut max_seq: Option<u64> = None;
+    while pos < bytes.len() {
+        if pos + 20 > bytes.len() {
+            return None; // truncated — same "give up cleanly" behavior as parse_delta_records
+        }
+        let seq = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[pos + 16..pos + 20].try_into().unwrap()) as usize;
+        pos += 20;
+        if pos + len > bytes.len() {
+            return None;
+        }
+        max_seq = Some(max_seq.map_or(seq, |m: u64| m.max(seq)));
+        pos += len;
+    }
+    max_seq
 }
 
 /// Parse a pre-2026-07-28 legacy accumulator: `[offset: u64 LE][len: u32
@@ -1192,6 +1241,9 @@ struct OverlayForkCtx {
     delta_ring: Arc<ShardedChunkRing>,
     delta_ring_hits: Arc<std::sync::atomic::AtomicU64>,
     delta_ring_misses: Arc<std::sync::atomic::AtomicU64>,
+    materialized_ring: Arc<ShardedChunkRing>,
+    materialized_ring_hits: Arc<std::sync::atomic::AtomicU64>,
+    materialized_ring_misses: Arc<std::sync::atomic::AtomicU64>,
     retired_chunk_aliases: Arc<ShardedAliasMap>,
     active_fold_count: Arc<std::sync::atomic::AtomicU64>,
     cluster: Arc<ClusterManager>,
@@ -1272,6 +1324,17 @@ struct DirtyPatchSlot {
     /// FOLD_ESCALATED_RETRY_INTERVAL instead of re-attempting it on every
     /// 60s sweep — see MAX_FOLD_FAILURES_BEFORE_ESCALATION's doc comment.
     last_fold_attempt_at: std::time::Instant,
+    /// Highest client_write_seq reflected in `Server::materialized_ring`'s
+    /// entry for this accumulator's *current* delta_chunk_id (the key this
+    /// slot would use to consult the ring right now — i.e. whatever
+    /// `prior_delta`/`existing_pending`'s delta_chunk_id currently is). None
+    /// if never established. Only ever trusted together with a
+    /// materialized_ring hit under that same key — see apply_patch's no-op
+    /// detection block for why: a ring miss means the cache is gone
+    /// regardless of what this field says, so this field alone can never
+    /// wrongly green-light the fast path. Added 2026-08-05 for merge-time
+    /// patch no-op detection — see materialized_ring's doc comment.
+    materialized_max_seq: Option<u64>,
 }
 
 /// How long a slot's accumulator must sit fully idle (zero patches from
@@ -3956,6 +4019,21 @@ impl Server {
             )),
             delta_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delta_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Third pool, for merge-time patch no-op detection (2026-08-05) — see
+            // materialized_ring's field doc comment. Own capacity knob, own RAM-tiered
+            // default; set to 0 to fully disable the feature without a rebuild (a
+            // total capacity of 0 makes every shard's per-shard floor still `.max(1)`
+            // internally, but a real-world working set will thrash a 16-entry cache
+            // into an effectively-always-miss state, safely degrading to today's
+            // unconditional-write behavior rather than erroring).
+            materialized_ring: Arc::new(ShardedChunkRing::new(
+                std::env::var("DFS_MATERIALIZED_RING_CAPACITY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or_else(Self::calculate_ring_capacity)
+            )),
+            materialized_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            materialized_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // ~72 bytes per entry, so 64k entries is ~4.6MB — negligible beside the
             // content tiers, and far more retired generations than any in-flight
             // client staleness window can reference.
@@ -4203,6 +4281,21 @@ impl Server {
                     let dcapacity = self.delta_ring.total_capacity();
                     info!("delta_ring stats (last 30s): {} hits, {} misses ({:.1}% hit rate), capacity={} chunks",
                         dhits, dmisses, dhit_pct, dcapacity);
+                }
+                // materialized_ring, added 2026-08-05 for merge-time patch no-op
+                // detection — see its field doc comment. Reported separately for
+                // the same reason as delta_ring: a low hit rate here specifically
+                // means most merges are paying the cold-rebuild cost rather than
+                // the cheap warm path, worth knowing independent of the other
+                // two pools' numbers.
+                let mhits = self.materialized_ring_hits.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let mmisses = self.materialized_ring_misses.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let mtotal = mhits + mmisses;
+                if mtotal > 0 {
+                    let mhit_pct = 100.0 * mhits as f64 / mtotal as f64;
+                    let mcapacity = self.materialized_ring.total_capacity();
+                    info!("materialized_ring stats (last 30s): {} hits, {} misses ({:.1}% hit rate), capacity={} chunks",
+                        mhits, mmisses, mhit_pct, mcapacity);
                 }
             }
         });
@@ -10233,6 +10326,11 @@ impl Server {
                     legacy_delta_format: false, // unused while verified is false
                     fold_failures: 0,
                     last_fold_attempt_at: std::time::Instant::now(),
+                    // materialized_ring is in-memory-only and empty after every
+                    // restart, so it always misses on this slot's first
+                    // post-restart merge regardless of this value — nothing to
+                    // get wrong here.
+                    materialized_max_seq: None,
                 });
                 // Restore the in-memory pending_patch_ids entry too. It is
                 // populated only by apply_patch (this process's own writes) and
@@ -11445,6 +11543,9 @@ impl Server {
             delta_ring: self.delta_ring.clone(),
             delta_ring_hits: self.delta_ring_hits.clone(),
             delta_ring_misses: self.delta_ring_misses.clone(),
+            materialized_ring: self.materialized_ring.clone(),
+            materialized_ring_hits: self.materialized_ring_hits.clone(),
+            materialized_ring_misses: self.materialized_ring_misses.clone(),
             retired_chunk_aliases: self.retired_chunk_aliases.clone(),
             active_fold_count: self.active_fold_count.clone(),
             cluster: self.cluster.clone(),
@@ -11919,10 +12020,27 @@ impl Server {
                         // same delta chain doesn't cold-read again.
                         self.delta_ring.shard(&prior_delta_id).lock().unwrap().put(prior_delta_id, prior_bytes.clone());
                         let legacy = is_legacy_delta_format(&prior_bytes);
-                        let mut h = blake3::Hasher::new();
-                        h.update(file_id.as_bytes());
-                        h.update(&chunk_file_offset.to_le_bytes());
-                        h.update(&prior_bytes);
+                        // Hashing prior_bytes (up to the whole accumulated delta) is
+                        // real CPU work with no yield point — moved off the worker
+                        // thread (2026-08-05) after live staging showed dfs-server at
+                        // 383% CPU during a kdiskmark storm starving connection-reader
+                        // tasks of scheduling time badly enough to exhaust the
+                        // connection semaphore (312/384 slots stuck in CLOSE-WAIT,
+                        // peer already closed but the owning task never got polled to
+                        // notice). spawn_blocking runs on tokio's separate blocking
+                        // thread pool, not the worker threads connection I/O competes
+                        // on for scheduling — see the same rationale on every other
+                        // spawn_blocking in this function.
+                        let fid_bytes = file_id.as_bytes().to_vec();
+                        let offset_bytes = chunk_file_offset.to_le_bytes();
+                        let prior_bytes_for_hash = prior_bytes.clone();
+                        let h = tokio::task::spawn_blocking(move || {
+                            let mut h = blake3::Hasher::new();
+                            h.update(&fid_bytes);
+                            h.update(&offset_bytes);
+                            h.update(&prior_bytes_for_hash);
+                            h
+                        }).await.map_err(|e| (format!("spawn_blocking panicked hashing prior delta: {}", e), ErrorCode::InternalError))?;
                         (h, legacy)
                     }
                 }
@@ -11935,6 +12053,213 @@ impl Server {
             }
         };
 
+        // Merge-time patch no-op detection (2026-08-05) — see materialized_ring's
+        // field doc comment on Server for the full design. Only attempted for a
+        // genuine merge (prior_delta.is_some(); a fresh accumulator's first patch
+        // has nothing to compare against). Gated on record_seq being a NEW MAXIMUM
+        // relative to whatever the cached materialized buffer already reflects:
+        // parse_delta_records always replays highest-seq-last for overlapping
+        // ranges, so applying a genuinely-new-maximum seq on top of a buffer that
+        // (by construction) only contains strictly-lower-seq bytes reproduces
+        // exactly what a full seq-sorted replay would produce. The moment
+        // record_seq is NOT a new maximum (a reordered arrival — see
+        // test_concurrent_overlapping_patches_diverge_by_arrival_order, the fix
+        // for a real VM-111 incident), this deliberately takes no action on the
+        // cache and falls through to the existing, unconditionally-correct
+        // append-and-rehash path below — conservative by construction: it can
+        // only produce a missed optimization, never a wrongly-skipped real write.
+        //
+        // pending_materialized_buf carries a freshly-mutated (real-change) buffer
+        // down to where delta_chunk_id is computed, so materialized_ring can be
+        // re-keyed under the correct new identity alongside the existing
+        // dirty_patch_slots insert below — the ring key has to be the NEW
+        // delta_chunk_id, which isn't known until after the hash/write section
+        // that follows this block.
+        let mut pending_materialized_buf: Option<Vec<u8>> = None;
+        if let Some(prior_delta_id) = prior_delta {
+            let ring_hit = self.materialized_ring.shard(&prior_delta_id).lock().unwrap().get(&prior_delta_id).cloned();
+            // known_max_seq must be a value PROVABLY grounded in reality, never
+            // an absence treated as "trust anything" — a warm ring hit is only
+            // trustworthy paired with dirty_patch_slots' own tracked seq (the
+            // ring's only writer, so the two can't have silently drifted apart);
+            // a cold rebuild derives it directly from the raw delta bytes
+            // (max_seq_in_delta_records) rather than from any in-memory
+            // bookkeeping, which may simply not exist yet (a brand-new Server
+            // instance that never processed this accumulator's earlier patches
+            // — e.g. a different replica, or this node post-restart — has an
+            // empty dirty_patch_slots for this slot even though the accumulator
+            // is real and already reflects a real prior seq). Getting this
+            // wrong the "None means anything goes" way was a real bug caught by
+            // reordered_lower_seq_patch_matching_current_content_is_not_treated_as_noop
+            // during development: a cold rebuild after a fresh accumulator's
+            // first patch had no tracked seq at all, so a since-reordered lower-
+            // seq repeat of that same patch was wrongly treated as a no-op.
+            let (materialized_buf, known_max_seq): (Option<Arc<Vec<u8>>>, Option<u64>) = if let Some(cached) = ring_hit {
+                self.materialized_ring_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let cached_seq = self.dirty_patch_slots.get(&(file_id, cidx))
+                    .and_then(|e| e.value().materialized_max_seq);
+                (Some(cached), cached_seq)
+            } else {
+                self.materialized_ring_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Cold rebuild: roughly fold-equivalent cost, paid once per cold
+                // slot — read base (chunk_ring first, disk fallback, same
+                // no-read-guard-needed rationale full_rewrite_chunk documents
+                // for reads of a chunk that's never mutated in place) plus the
+                // prior delta's raw bytes (chunk_ring/delta_ring above already
+                // resolved `hasher`/`is_legacy` from these same bytes, but
+                // doesn't retain the raw buffer past that block, so this
+                // re-consults the same ring/disk fallback independently).
+                let base_ring = self.chunk_ring.shard(&base_chunk_id).lock().unwrap().get(&base_chunk_id).cloned();
+                let base_bytes = match base_ring {
+                    Some(b) => Some(b),
+                    None => {
+                        let storage = self.storage.clone();
+                        let bid = base_chunk_id;
+                        tokio::task::spawn_blocking(move || storage.read_chunk_arc(&bid)).await
+                            .ok().and_then(|r| r.ok())
+                    }
+                };
+                let delta_ring_bytes = self.delta_ring.shard(&prior_delta_id).lock().unwrap().get(&prior_delta_id).cloned();
+                let delta_bytes = match delta_ring_bytes {
+                    Some(b) => Some(b),
+                    None => {
+                        let storage = self.storage.clone();
+                        let did = prior_delta_id;
+                        tokio::task::spawn_blocking(move || storage.read_chunk_arc(&did)).await
+                            .ok().and_then(|r| r.ok())
+                    }
+                };
+                match (base_bytes, delta_bytes) {
+                    (Some(base), Some(delta)) => {
+                        // Parsing + replaying onto a buffer is real CPU work scaling
+                        // with chunk/delta size (up to 4MB) — moved off the worker
+                        // thread for the same reason as the hasher rebuild above (see
+                        // its comment for the live staging evidence). Only the pure
+                        // computation moves; the ring/dirty_patch_slots seeding below
+                        // stays on the async task since DashMap access is cheap and
+                        // non-blocking.
+                        let rebuilt = tokio::task::spawn_blocking(move || {
+                            let records = parse_delta_records(&delta).ok()?;
+                            let true_max_seq = max_seq_in_delta_records(&delta)?;
+                            let needed_len = records.iter().map(|(off, d)| off + d.len()).max().unwrap_or(0).max(base.len());
+                            let mut buf = (*base).clone();
+                            buf.resize(needed_len, 0);
+                            for (off, data) in &records {
+                                let end = off + data.len();
+                                buf[*off..end].copy_from_slice(data);
+                            }
+                            Some((buf, true_max_seq))
+                        }).await.map_err(|e| (format!("spawn_blocking panicked rebuilding materialized buffer: {}", e), ErrorCode::InternalError))?;
+
+                        match rebuilt {
+                            Some((buf, true_max_seq)) => {
+                                let buf_arc = Arc::new(buf);
+                                // Seed the ring + tracked seq now, before we even know
+                                // whether THIS round's patch is a no-op — both are
+                                // valid regardless, so later calls on this slot don't
+                                // pay the cold-rebuild cost again. Uses
+                                // .or_insert_with (not .and_modify) since a slot that
+                                // just cold-rebuilt may have no dirty_patch_slots entry
+                                // at all yet (e.g. a fresh Server instance that never
+                                // processed this accumulator's earlier patches).
+                                self.materialized_ring.shard(&prior_delta_id).lock().unwrap().put(prior_delta_id, buf_arc.clone());
+                                self.dirty_patch_slots.entry((file_id, cidx))
+                                    .and_modify(|slot| slot.materialized_max_seq = Some(true_max_seq))
+                                    .or_insert_with(|| DirtyPatchSlot {
+                                        token: chunk_id,
+                                        last_patch_at: std::time::Instant::now(),
+                                        delta_hasher: hasher.clone(),
+                                        verified: true,
+                                        legacy_delta_format: is_legacy,
+                                        fold_failures: 0,
+                                        last_fold_attempt_at: std::time::Instant::now(),
+                                        materialized_max_seq: Some(true_max_seq),
+                                    });
+                                (Some(buf_arc), Some(true_max_seq))
+                            }
+                            // Unparseable, or legacy (no seq field to ground a
+                            // baseline in at all) — no no-op detection this round,
+                            // fall through to today's unconditionally-correct path.
+                            None => (None, None),
+                        }
+                    }
+                    _ => (None, None), // couldn't read base or delta — fall through
+                }
+            };
+
+            if let (Some(buf_arc), Some(known_max_seq)) = (materialized_buf, known_max_seq) {
+                if record_seq > known_max_seq {
+                    // Comparing/copying against a buffer up to the full chunk size
+                    // (4MB) is real CPU work with no yield point — moved off the
+                    // worker thread for the same reason as the two rebuilds above.
+                    // patches is cloned (not moved) since the caller still needs the
+                    // original for the encode_delta_record loop below on the
+                    // real-change path. Returns the mutated buffer only when it's
+                    // actually needed (real change); a no-op has nothing to mutate.
+                    let patches_for_check = patches.clone();
+                    let buf_arc_for_check = buf_arc.clone();
+                    let (is_noop, mutated_buf) = tokio::task::spawn_blocking(move || {
+                        let needs_growth = patches_for_check.iter().any(|(off, d)| off + d.len() > buf_arc_for_check.len());
+                        let is_noop = !needs_growth
+                            && patches_for_check.iter().all(|(off, d)| &buf_arc_for_check[*off..*off + d.len()] == d.as_slice());
+                        if is_noop {
+                            (true, None)
+                        } else {
+                            let mut buf = (*buf_arc_for_check).clone();
+                            let needed_len = patches_for_check.iter().map(|(off, d)| off + d.len()).max().unwrap_or(0).max(buf.len());
+                            buf.resize(needed_len, 0);
+                            for (off, data) in &patches_for_check {
+                                let end = off + data.len();
+                                buf[*off..end].copy_from_slice(data);
+                            }
+                            (false, Some(buf))
+                        }
+                    }).await.map_err(|e| (format!("spawn_blocking panicked in no-op check: {}", e), ErrorCode::InternalError))?;
+
+                    if is_noop {
+                        // Nothing changed: skip the raw-log append entirely, update
+                        // only the lightweight bookkeeping, and return the client's
+                        // own unchanged identity — the exact same shape
+                        // full_rewrite_chunk's pre-existing no-op case already
+                        // returns, so every downstream consumer (client accept-as-
+                        // success, RCL broadcast, chunk_generations/CHUNK_SEQ_TABLE
+                        // bookkeeping — both updated unconditionally by the caller
+                        // regardless of whether identity changed) needs no changes.
+                        // .or_insert_with mirrors the cold-rebuild seeding above,
+                        // for the same "may not have an entry yet" reason.
+                        self.dirty_patch_slots.entry((file_id, cidx))
+                            .and_modify(|slot| {
+                                slot.last_patch_at = std::time::Instant::now();
+                                slot.materialized_max_seq = Some(record_seq);
+                            })
+                            .or_insert_with(|| DirtyPatchSlot {
+                                token: chunk_id,
+                                last_patch_at: std::time::Instant::now(),
+                                delta_hasher: hasher.clone(),
+                                verified: true,
+                                legacy_delta_format: is_legacy,
+                                fold_failures: 0,
+                                last_fold_attempt_at: std::time::Instant::now(),
+                                materialized_max_seq: Some(record_seq),
+                            });
+                        drop(patch_guard);
+                        return Ok((chunk_id, base_size, None, None));
+                    } else {
+                        // Real change: buffer already mutated above (off the worker
+                        // thread). Falls through to the existing write path
+                        // unmodified; ring re-key happens once delta_chunk_id is
+                        // known, alongside the existing dirty_patch_slots insert.
+                        pending_materialized_buf = mutated_buf;
+                    }
+                }
+                // else: record_seq is not a new maximum (a reordered arrival) —
+                // deliberately take no action and fall through to today's
+                // unconditionally-correct append-and-rehash path. Conservative
+                // by construction: this can only produce a missed optimization,
+                // never a wrongly-skipped real write.
+            }
+        }
+
         let mut new_record_bytes = Vec::new();
         if prior_delta.is_none() {
             new_record_bytes.extend_from_slice(&DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes());
@@ -11946,8 +12271,18 @@ impl Server {
                 new_record_bytes.extend_from_slice(&encode_delta_record(record_seq, *off, data));
             }
         }
-        hasher.update(&new_record_bytes);
-        let delta_chunk_id = ChunkId::from_hash(*hasher.finalize().as_bytes());
+        // Usually small (just this call's own encoded patches, not the accumulated
+        // history — that's the whole point of the incremental hasher), but moved
+        // off the worker thread too for consistency with the other hashing above
+        // and in case a single call's own patches are themselves large. hasher must
+        // come back out (not be consumed) — it's stored in DirtyPatchSlot below to
+        // keep serving as this accumulator's incremental hasher for the next merge.
+        let new_record_bytes_for_hash = new_record_bytes.clone();
+        let (hasher, delta_chunk_id) = tokio::task::spawn_blocking(move || {
+            hasher.update(&new_record_bytes_for_hash);
+            let id = ChunkId::from_hash(*hasher.finalize().as_bytes());
+            (hasher, id)
+        }).await.map_err(|e| (format!("spawn_blocking panicked computing delta identity: {}", e), ErrorCode::InternalError))?;
 
         // Write: a fresh accumulator writes a brand-new file (needs_patch's first
         // record); a merge appends to the prior delta's existing file in place, then
@@ -12119,6 +12454,18 @@ impl Server {
 
         self.pending_patch_ids.insert(public_token, (file_id, cidx));
         self.pending_patch_ids.insert(base_chunk_id, (file_id, cidx));
+        // Re-key materialized_ring under the new delta_chunk_id when this merge
+        // had a materialized buffer in hand (the real-change path above) — see
+        // materialized_ring's field doc comment. Pop the now-superseded prior
+        // entry too: not required for correctness (an LRU just evicts it
+        // eventually), but avoids holding a now-unreachable buffer.
+        if let Some(prior_delta_id) = prior_delta {
+            self.materialized_ring.shard(&prior_delta_id).lock().unwrap().pop(&prior_delta_id);
+        }
+        let had_materialized_buf = pending_materialized_buf.is_some();
+        if let Some(buf) = pending_materialized_buf.take() {
+            self.materialized_ring.shard(&delta_chunk_id).lock().unwrap().put(delta_chunk_id, Arc::new(buf));
+        }
         self.dirty_patch_slots.insert((file_id, cidx), DirtyPatchSlot {
             token: public_token,
             last_patch_at: std::time::Instant::now(),
@@ -12127,6 +12474,7 @@ impl Server {
             legacy_delta_format: is_legacy,
             fold_failures: 0,
             last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: if had_materialized_buf { Some(record_seq) } else { None },
         });
         if !is_merge {
             // Fresh accumulator: this is the one patch in this cycle responsible
@@ -16221,6 +16569,7 @@ mod tests {
             legacy_delta_format: false,
             fold_failures: 0,
             last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
         });
 
         // Negative control: the UNLOCKED read (local_fold_fingerprint — what
@@ -16288,6 +16637,7 @@ mod tests {
             legacy_delta_format: false,
             fold_failures: 0,
             last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
         });
         drop(guard);
 
@@ -16674,6 +17024,646 @@ mod tests {
              happened to apply LAST wins its copy of the overlap, instead of the \
              logically-later (higher client_write_seq) write always winning regardless \
              of arrival order",
+        );
+    }
+
+    /// A byte-identical-content variant of the arrival-order test above: the
+    /// SECOND patch is a no-op relative to what the first already wrote at that
+    /// range. Proves two things at once: (1) two replicas that received this
+    /// exact same no-op-shaped pair in opposite arrival order still converge —
+    /// the no-op detector's ordering precondition (record_seq must be a NEW
+    /// maximum) means it only ever fires on the replica that happens to see the
+    /// higher-seq write second, and does nothing on the other, but both must
+    /// still end up byte-identical; (2) the no-op branch is actually exercised
+    /// on at least one of the two orderings, via materialized_ring_hits/misses
+    /// deltas — a test that could pass without ever touching the new code path
+    /// would be worthless as a regression guard for it.
+    #[tokio::test]
+    async fn concurrent_overlapping_patches_where_second_is_a_noop_still_converge() {
+        async fn run_replica(
+            first: (usize, &[u8], u64),
+            second: (usize, &[u8], u64),
+        ) -> (Vec<u8>, u64, u64) {
+            let temp_storage = TempDir::new().unwrap();
+            let temp_metadata = TempDir::new().unwrap();
+            let temp_metadata_dir = TempDir::new().unwrap();
+            let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+            let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+            let node_id = NodeId::new();
+            let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+            let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+            let server = Server::new(
+                storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+                temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+            );
+
+            let file_id = dfs_common::FileId::new();
+            let chunk_idx = 0u64;
+            let chunk_file_offset = 0u64;
+
+            let base_content = vec![0u8; 64];
+            let base_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+            );
+            storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+            metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+            metadata.put_chunk_location(&ChunkLocation {
+                chunk_id: base_chunk_id,
+                nodes: vec![node_id],
+                size: base_content.len(),
+                checksum: base_chunk_id.hash,
+                file_offset: Some(chunk_file_offset),
+                written_at: None,
+                client_write_seq: None,
+                file_id: Some(file_id),
+            }).unwrap();
+
+            let (off1, data1, seq1) = first;
+            let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let (token1, ..) = server.apply_patch(
+                Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+                vec![(off1, data1.to_vec())], Some(seq1), None,
+            ).await.expect("first apply_patch should succeed");
+
+            let hits_before = server.materialized_ring_hits.load(std::sync::atomic::Ordering::Relaxed);
+            let misses_before = server.materialized_ring_misses.load(std::sync::atomic::Ordering::Relaxed);
+
+            let (off2, data2, seq2) = second;
+            let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let (token2, ..) = server.apply_patch(
+                Some(lock2), token1, file_id, Some(chunk_idx), chunk_file_offset,
+                vec![(off2, data2.to_vec())], Some(seq2), None,
+            ).await.expect("second apply_patch (merge) should succeed");
+
+            let hits_after = server.materialized_ring_hits.load(std::sync::atomic::Ordering::Relaxed);
+            let misses_after = server.materialized_ring_misses.load(std::sync::atomic::Ordering::Relaxed);
+            let ring_was_consulted = (hits_after - hits_before) + (misses_after - misses_before) > 0;
+
+            let state = metadata.get_patch_state(&token2).unwrap().expect("token2 must resolve");
+            let (resolved_base, delta_id) = match state {
+                PatchState::Pending { base_chunk_id, delta_chunk_id, .. } => (base_chunk_id, delta_chunk_id),
+                other => panic!("expected Pending accumulator, got {:?}", other),
+            };
+            let mut buf = storage.read_chunk(&resolved_base).unwrap();
+            let delta_bytes = storage.read_chunk(&delta_id).unwrap();
+            for (off, data) in parse_delta_records(&delta_bytes).unwrap() {
+                let end = off + data.len();
+                if end > buf.len() { buf.resize(end, 0); }
+                buf[off..end].copy_from_slice(&data);
+            }
+            (buf, token1.hash[0] as u64, if token1 == token2 { 1 } else { 0 })
+        }
+
+        // First patch writes real content at offset 10; second is byte-identical
+        // to what the first already wrote there — a genuine no-op relative to
+        // current state, at a higher seq (so it satisfies the ordering
+        // precondition when it lands second).
+        let real = (10usize, &[0xBBu8; 4][..], 200u64);
+        let repeat_of_real = (10usize, &[0xBBu8; 4][..], 201u64);
+
+        let (replica_x, _, x_was_noop) = run_replica(real, repeat_of_real).await;
+        let (replica_y, _, y_was_noop) = run_replica(repeat_of_real, real).await;
+
+        assert_eq!(replica_x, replica_y, "no-op-shaped concurrent patches diverged across arrival orders");
+        assert!(
+            x_was_noop == 1 || y_was_noop == 1,
+            "neither ordering exercised the no-op branch (token unchanged after the second \
+             apply_patch call) — this test would pass even if no-op detection were entirely \
+             removed, making it worthless as a regression guard",
+        );
+    }
+
+    /// Direct proof that a genuine merge-time no-op is detected and skips the
+    /// disk append entirely: a fresh accumulator's first patch, then a second
+    /// (merge) patch with byte-identical content at a higher seq. Asserts the
+    /// returned identity is unchanged, the on-disk delta file gained zero new
+    /// records, and a real third patch on top still merges and composes
+    /// correctly (the accumulator wasn't left in a broken state).
+    #[tokio::test]
+    async fn merge_time_noop_patch_is_detected_and_skips_disk_append() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: base_chunk_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_a, ..) = server.apply_patch(
+            Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None,
+        ).await.expect("first apply_patch should succeed");
+
+        let state_a = metadata.get_patch_state(&token_a).unwrap().expect("token_a must resolve");
+        let delta_id_a = match state_a {
+            PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+            other => panic!("expected Pending accumulator, got {:?}", other),
+        };
+        let record_count_before = parse_delta_records(&storage.read_chunk(&delta_id_a).unwrap()).unwrap().len();
+
+        // Byte-identical patch, higher seq — a genuine no-op.
+        let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_b, size_b, ts_b, buf_b) = server.apply_patch(
+            Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8; 4])], Some(301), None,
+        ).await.expect("no-op merge apply_patch should still succeed");
+
+        assert_eq!(token_b, token_a, "a merge-time no-op must return the unchanged prior identity");
+        assert!(ts_b.is_none(), "a no-op must report patch_ts as None, exactly like full_rewrite_chunk's no-op contract");
+        assert!(buf_b.is_none(), "a no-op has no fresh buffer to hand back");
+        assert_eq!(size_b, base_content.len().max(14), "a no-op must not change the accumulator's reported size");
+
+        let state_b = metadata.get_patch_state(&token_b).unwrap().expect("token_b must resolve");
+        let delta_id_b = match state_b {
+            PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+            other => panic!("expected Pending accumulator, got {:?}", other),
+        };
+        assert_eq!(delta_id_b, delta_id_a, "a no-op must not mint a new delta_chunk_id");
+        let record_count_after = parse_delta_records(&storage.read_chunk(&delta_id_b).unwrap()).unwrap().len();
+        assert_eq!(
+            record_count_after, record_count_before,
+            "a detected no-op must not append a new record to the on-disk delta log",
+        );
+
+        // A real third patch on top must still merge and compose correctly —
+        // the no-op detection must not have left the accumulator broken.
+        let lock_c = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_c, ..) = server.apply_patch(
+            Some(lock_c), token_b, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(20usize, vec![0xDDu8; 4])], Some(302), None,
+        ).await.expect("third (real) apply_patch should succeed");
+        assert_ne!(token_c, token_b, "a genuinely new patch after a no-op must still mint a new identity");
+
+        let state_c = metadata.get_patch_state(&token_c).unwrap().expect("token_c must resolve");
+        let delta_id_c = match state_c {
+            PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+            other => panic!("expected Pending accumulator, got {:?}", other),
+        };
+        let mut buf = storage.read_chunk(&base_chunk_id).unwrap();
+        for (off, data) in parse_delta_records(&storage.read_chunk(&delta_id_c).unwrap()).unwrap() {
+            let end = off + data.len();
+            if end > buf.len() { buf.resize(end, 0); }
+            buf[off..end].copy_from_slice(&data);
+        }
+        let mut expected = base_content.clone();
+        expected[10..14].copy_from_slice(&[0xCCu8; 4]);
+        if expected.len() < 24 { expected.resize(24, 0); }
+        expected[20..24].copy_from_slice(&[0xDDu8; 4]);
+        assert_eq!(buf, expected, "composed content after a no-op followed by a real patch must be correct");
+    }
+
+    /// Negative control for the no-op detector: a patch that differs by even
+    /// one byte from what's already accumulated must NOT be treated as a
+    /// no-op — a new identity must be minted, the raw log must grow, and final
+    /// composed content must reflect the real change. Per this project's
+    /// standing practice for correctness-sensitive tests, this was confirmed to
+    /// fail (token_b == token_a, no new record) against a build with the
+    /// no-op-detection block's is_noop check hardcoded to `false` disabled —
+    /// i.e. verified as a real negative control, not just an assertion that
+    /// happens to pass.
+    #[tokio::test]
+    async fn merge_time_genuinely_changed_patch_still_writes_and_mints_new_identity() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: base_chunk_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_a, ..) = server.apply_patch(
+            Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None,
+        ).await.expect("first apply_patch should succeed");
+
+        // Differs by exactly one byte from what's already at this range.
+        let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_b, ..) = server.apply_patch(
+            Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8, 0xCCu8, 0xCCu8, 0xCDu8])], Some(301), None,
+        ).await.expect("genuinely-changed merge apply_patch should succeed");
+
+        assert_ne!(token_b, token_a, "a genuinely-changed patch must mint a new identity, not be treated as a no-op");
+
+        let state_b = metadata.get_patch_state(&token_b).unwrap().expect("token_b must resolve");
+        let delta_id_b = match state_b {
+            PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+            other => panic!("expected Pending accumulator, got {:?}", other),
+        };
+        let mut buf = storage.read_chunk(&base_chunk_id).unwrap();
+        for (off, data) in parse_delta_records(&storage.read_chunk(&delta_id_b).unwrap()).unwrap() {
+            let end = off + data.len();
+            if end > buf.len() { buf.resize(end, 0); }
+            buf[off..end].copy_from_slice(&data);
+        }
+        let mut expected = base_content.clone();
+        expected[10..14].copy_from_slice(&[0xCCu8, 0xCCu8, 0xCCu8, 0xCDu8]);
+        assert_eq!(buf, expected, "composed content must reflect the real change");
+    }
+
+    /// Specifically exercises the ordering guard itself (record_seq must be a
+    /// new maximum), not just the byte-comparison: a patch arriving SECOND but
+    /// carrying a LOWER seq than what's already cached, whose content happens
+    /// to byte-match the current buffer exactly — the shape a naive
+    /// byte-comparison-only check would wrongly call a no-op. Asserts the
+    /// no-op fast path is refused anyway (a new identity is minted, proving
+    /// the write path genuinely ran) purely because the ordering precondition
+    /// correctly failed, since content-equality alone would have said "skip."
+    #[tokio::test]
+    async fn reordered_lower_seq_patch_matching_current_content_is_not_treated_as_noop() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: base_chunk_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // Real content at seq=200 establishes materialized_max_seq=200 and
+        // caches a buffer with 0xBB at offset 10.
+        let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_200, ..) = server.apply_patch(
+            Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xBBu8; 4])], Some(200), None,
+        ).await.expect("seq=200 apply_patch should succeed");
+
+        // Arrives SECOND but carries seq=100 (lower) — and its content is
+        // byte-identical to what's already cached (0xBB). A byte-comparison
+        // ALONE would call this a no-op; the ordering guard must refuse it
+        // regardless, since 100 is not a new maximum relative to 200.
+        let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_100, ..) = server.apply_patch(
+            Some(lock_b), token_200, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xBBu8; 4])], Some(100), None,
+        ).await.expect("reordered seq=100 apply_patch should succeed");
+
+        assert_ne!(
+            token_100, token_200,
+            "a reordered (non-new-maximum-seq) patch must never be short-circuited as a no-op, \
+             even when its content happens to byte-match the current cached buffer — the ordering \
+             guard exists specifically to refuse the fast path here regardless of content equality",
+        );
+
+        let state = metadata.get_patch_state(&token_100).unwrap().expect("final token must resolve");
+        let delta_id = match state {
+            PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+            other => panic!("expected Pending accumulator, got {:?}", other),
+        };
+        // Both records present, seq-sorted at replay time — seq=200 (the
+        // logically-later write) still correctly determines the final byte
+        // value at this offset, per parse_delta_records' stable seq sort.
+        let records = parse_delta_records(&storage.read_chunk(&delta_id).unwrap()).unwrap();
+        assert_eq!(records.len(), 2, "both the seq=200 and the reordered seq=100 record must be present in the log");
+        let mut buf = base_content.clone();
+        for (off, data) in &records {
+            let end = *off + data.len();
+            if end > buf.len() { buf.resize(end, 0); }
+            buf[*off..end].copy_from_slice(data);
+        }
+        assert_eq!(&buf[10..14], &[0xBBu8; 4], "final composed content must reflect the correct seq-sorted result");
+    }
+
+    /// Two independent "replicas" fed the identical patch sequence (including a
+    /// repeat/no-op) independently must reach the same no-op/changed verdict on
+    /// each call and converge on identical final content and token — proving
+    /// the design's determinism argument (no cross-replica coordination needed
+    /// because both compute the same deterministic function of the same
+    /// inputs) actually holds for this specific mechanism, not just in theory.
+    #[tokio::test]
+    async fn merge_time_noop_detection_is_deterministic_across_independent_replicas() {
+        // file_id/base_chunk_id are shared across both replica runs, matching
+        // real-world reality: two replicas of the same file/chunk process the
+        // same client's patches under the SAME file_id — chunk hashing is
+        // file-scoped, so two genuinely-independent random file_ids (as a
+        // naive per-replica `FileId::new()` would produce) would make even a
+        // correct implementation mint different token bytes for a reason
+        // having nothing to do with this feature, and comparing them would be
+        // a meaningless assertion.
+        async fn run_replica(file_id: dfs_common::FileId, base_content: Vec<u8>, base_chunk_id: ChunkId) -> (Vec<u8>, ChunkId) {
+            let temp_storage = TempDir::new().unwrap();
+            let temp_metadata = TempDir::new().unwrap();
+            let temp_metadata_dir = TempDir::new().unwrap();
+            let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+            let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+            let node_id = NodeId::new();
+            let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+            let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+            let server = Server::new(
+                storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+                temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+            );
+
+            let chunk_idx = 0u64;
+            let chunk_file_offset = 0u64;
+
+            storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+            metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+            metadata.put_chunk_location(&ChunkLocation {
+                chunk_id: base_chunk_id,
+                nodes: vec![node_id],
+                size: base_content.len(),
+                checksum: base_chunk_id.hash,
+                file_offset: Some(chunk_file_offset),
+                written_at: None,
+                client_write_seq: None,
+                file_id: Some(file_id),
+            }).unwrap();
+
+            // Identical sequence on every replica: real write, then a no-op
+            // repeat of it, then a genuinely different real write.
+            let lock1 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let (t1, ..) = server.apply_patch(
+                Some(lock1), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+                vec![(10usize, vec![0xAAu8; 4])], Some(100), None,
+            ).await.unwrap();
+
+            let lock2 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let (t2, ..) = server.apply_patch(
+                Some(lock2), t1, file_id, Some(chunk_idx), chunk_file_offset,
+                vec![(10usize, vec![0xAAu8; 4])], Some(101), None,
+            ).await.unwrap();
+            assert_eq!(t2, t1, "sanity: this replica's own no-op detection must fire identically to the others");
+
+            let lock3 = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+            let (t3, ..) = server.apply_patch(
+                Some(lock3), t2, file_id, Some(chunk_idx), chunk_file_offset,
+                vec![(30usize, vec![0xEEu8; 4])], Some(102), None,
+            ).await.unwrap();
+
+            let state = metadata.get_patch_state(&t3).unwrap().expect("final token must resolve");
+            let delta_id = match state {
+                PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+                other => panic!("expected Pending accumulator, got {:?}", other),
+            };
+            let mut buf = storage.read_chunk(&base_chunk_id).unwrap();
+            for (off, data) in parse_delta_records(&storage.read_chunk(&delta_id).unwrap()).unwrap() {
+                let end = off + data.len();
+                if end > buf.len() { buf.resize(end, 0); }
+                buf[off..end].copy_from_slice(&data);
+            }
+            (buf, t3)
+        }
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_file_offset = 0u64;
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+
+        let (content_1, token_1) = run_replica(file_id, base_content.clone(), base_chunk_id).await;
+        let (content_2, token_2) = run_replica(file_id, base_content, base_chunk_id).await;
+
+        assert_eq!(content_1, content_2, "two independent replicas fed the identical patch sequence diverged in final content");
+        assert_eq!(token_1.hash, token_2.hash, "two independent replicas fed the identical patch sequence produced different final identities");
+    }
+
+    /// A slot with no warm in-memory cache at all — simulating a different node
+    /// (or this node after a restart) that only ever learned about this
+    /// accumulator via replication/healing, not by building it locally — must
+    /// still correctly detect a no-op via the cold-rebuild path (base read +
+    /// parse_delta_records replay), not just when a warm materialized_ring
+    /// entry already exists.
+    #[tokio::test]
+    async fn merge_time_noop_detection_works_via_cold_rebuild_path() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: base_chunk_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // Server A builds the accumulator — its own dirty_patch_slots/
+        // materialized_ring are warm for it.
+        let server_a = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+        let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_a, ..) = server_a.apply_patch(
+            Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8; 4])], Some(300), None,
+        ).await.expect("first apply_patch should succeed");
+
+        // Server B: a brand-new Server instance over the SAME storage/metadata
+        // — simulates a different replica (or this node post-restart) with an
+        // entirely empty dirty_patch_slots/materialized_ring for this slot.
+        // Its merge must go through the cold-rebuild path.
+        let server_b = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config_b.toml"), true,
+        );
+        assert!(server_b.dirty_patch_slots.get(&(file_id, chunk_idx)).is_none(), "sanity: server_b must start with no cached state for this slot");
+
+        let misses_before = server_b.materialized_ring_misses.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Byte-identical patch, higher seq, via the cold server — must still
+        // be detected as a no-op.
+        let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_b, ..) = server_b.apply_patch(
+            Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8; 4])], Some(301), None,
+        ).await.expect("cold no-op merge apply_patch should still succeed");
+
+        let misses_after = server_b.materialized_ring_misses.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(misses_after > misses_before, "sanity: server_b's materialized_ring must have missed (cold), forcing the rebuild path");
+        assert_eq!(token_b, token_a, "cold-rebuild path must still correctly detect a genuine no-op");
+    }
+
+    /// A single-record PatchChunk-style call (client_write_seq: None, so
+    /// record_seq defaults to 0 per apply_patch's own fallback) must never
+    /// wrongly short-circuit as a no-op once a real higher-seq MultiPatch has
+    /// already touched the slot — record_seq=0 can never be a new maximum
+    /// against any real prior seq, so the ordering precondition correctly
+    /// refuses the fast path every time, falling through to today's
+    /// unconditionally-correct write behavior. Safety/no-regression check, not
+    /// a performance one.
+    #[tokio::test]
+    async fn patch_chunk_style_seqless_merge_never_wrongly_noops() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        metadata.update_patch_state_folded(&base_chunk_id, base_chunk_id).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: base_chunk_id,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: base_chunk_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // Real MultiPatch establishes materialized_max_seq at a real, high seq.
+        let lock_a = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_a, ..) = server.apply_patch(
+            Some(lock_a), base_chunk_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8; 4])], Some(5000), None,
+        ).await.expect("first apply_patch should succeed");
+
+        let state_a = metadata.get_patch_state(&token_a).unwrap().expect("token_a must resolve");
+        let delta_id_a = match state_a {
+            PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+            other => panic!("expected Pending accumulator, got {:?}", other),
+        };
+        let record_count_before = parse_delta_records(&storage.read_chunk(&delta_id_a).unwrap()).unwrap().len();
+
+        // PatchChunk-style call: client_write_seq: None, byte-identical content
+        // to what's already there. Must NOT be treated as a no-op (record_seq
+        // falls back to 0, never a new max against 5000) — must fall through
+        // and genuinely append, exactly like today's unmodified behavior.
+        let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (token_b, ..) = server.apply_patch(
+            Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8; 4])], None, None,
+        ).await.expect("seqless merge apply_patch should succeed");
+
+        // Whether or not identity happens to change is not the point here (a
+        // genuinely-correct system could go either way depending on internal
+        // bookkeeping) — the point is that a record was genuinely appended
+        // (the write path ran for real), not silently skipped via a wrongly
+        // fired no-op fast path.
+        let state_b = metadata.get_patch_state(&token_b).unwrap().expect("token_b must resolve");
+        let delta_id_b = match state_b {
+            PatchState::Pending { delta_chunk_id, .. } => delta_chunk_id,
+            other => panic!("expected Pending accumulator, got {:?}", other),
+        };
+        let record_count_after = parse_delta_records(&storage.read_chunk(&delta_id_b).unwrap()).unwrap().len();
+        assert!(
+            record_count_after > record_count_before,
+            "a seqless (PatchChunk-style) merge must always fall through to a real append — \
+             it must never be short-circuited by the no-op fast path, since record_seq=0 can \
+             never be validly compared against a real prior seq",
         );
     }
 
@@ -18507,6 +19497,7 @@ mod tests {
                 legacy_delta_format: false,
                 fold_failures: 0,
                 last_fold_attempt_at: std::time::Instant::now(),
+                materialized_max_seq: None,
             });
 
             // Now actually run the fold to completion and confirm it succeeds cleanly

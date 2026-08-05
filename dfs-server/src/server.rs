@@ -319,6 +319,29 @@ pub struct Server {
     /// giving real network latency much more headroom than 8 ever did.
     fold_coordination_semaphore: Arc<tokio::sync::Semaphore>,
 
+    /// Bounds how many fold-triggered CPU-bound hash/replay operations
+    /// (full_rewrite_chunk's buffer replay + content hash inside
+    /// run_single_fold, heal_base_from_peer's peer-recovery verify hash) can
+    /// run concurrently, regardless of how many spawn_blocking slots are free.
+    /// Added 2026-08-05 after live staging showed dfs-server at 383% CPU
+    /// during a kdiskmark write storm, starving connection-reader tasks badly
+    /// enough to exhaust the connection semaphore — moving this work to
+    /// spawn_blocking (see the merge-path no-op detection's doc comment) frees
+    /// the *worker* threads it competes with connection I/O for, but
+    /// spawn_blocking's own pool is still one shared resource: an unbounded
+    /// burst of simultaneous folds could still crowd out a foreground merge's
+    /// own (also spawn_blocking'd) hash dispatch behind them. This is
+    /// deliberately NOT applied to apply_patch's own merge-path hashing or its
+    /// no-op-detection buffer work — those are the latency-sensitive
+    /// foreground path a client is synchronously waiting on; fold is
+    /// background maintenance nobody's blocked on, and this exists
+    /// specifically so it never competes with foreground work on equal
+    /// footing. Sized conservatively off available core count (half, minimum
+    /// 2) rather than a flat constant, so it scales sanely across the mixed
+    /// hardware this project runs on; DFS_FOLD_HASH_CONCURRENCY overrides it
+    /// for live tuning without a rebuild.
+    fold_hash_semaphore: Arc<tokio::sync::Semaphore>,
+
     /// Transient, single-read handoff of notify_leader_of_fold's actual
     /// result, written immediately after that call inside run_single_fold and
     /// read+removed once by coordinate_and_fold_slot right after
@@ -1234,6 +1257,7 @@ struct OverlayForkCtx {
     fold_lock_grants: Arc<DashMap<(FileId, u64), FoldLockGrant>>,
     outbound_fold_claims: Arc<DashMap<(FileId, u64), OutboundFoldClaim>>,
     fold_coordination_semaphore: Arc<tokio::sync::Semaphore>,
+    fold_hash_semaphore: Arc<tokio::sync::Semaphore>,
     last_fold_leader_confirm: Arc<DashMap<(FileId, u64), bool>>,
     chunk_ring: Arc<ShardedChunkRing>,
     chunk_ring_hits: Arc<std::sync::atomic::AtomicU64>,
@@ -2498,6 +2522,22 @@ impl OverlayForkCtx {
             self.chunk_ring_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // Bounded so a burst of simultaneous background folds can't crowd out
+        // a foreground merge's own spawn_blocking hash dispatch behind them —
+        // see fold_hash_semaphore's doc comment. Held across the whole call,
+        // not just the hash: full_rewrite_chunk bundles its base-chunk read,
+        // patch replay, and content hash into one spawn_blocking closure with
+        // no way to acquire/release partway through without changing its
+        // signature (it's also called directly from apply_patch's own
+        // no-chunk_idx path, which must NOT be gated by this — that path is
+        // foreground, not fold). Bounding the read alongside the hash is an
+        // acceptable, deliberately simple tradeoff: disk bandwidth is a
+        // shared resource foreground work also needs, so capping fold's
+        // concurrent draw on it isn't obviously wrong, just broader in scope
+        // than "purely CPU" — revisit if fold read throughput turns out to
+        // matter more than this measurement suggests today.
+        let _fold_hash_permit = self.fold_hash_semaphore.acquire().await
+            .expect("fold_hash_semaphore is never closed");
         let fold_result = full_rewrite_chunk(
             self.storage.clone(),
             self.metadata.clone(),
@@ -2510,6 +2550,7 @@ impl OverlayForkCtx {
             ring_prefetched,
             self.cluster.local_node_id(),
         ).await;
+        drop(_fold_hash_permit);
 
         let (new_chunk_id, final_size, fold_buf) = match fold_result {
             Ok(v) => v,
@@ -3184,7 +3225,21 @@ impl OverlayForkCtx {
                 return false;
             }
         };
-        let actual = dfs_common::compute_chunk_hash_at(&data, file_offset, file_id);
+        // Hashing up to a full chunk (4MB) is real CPU work with no yield point —
+        // moved off the worker thread (2026-08-05) for the same reason as every
+        // other spawn_blocking in this function: see the merge-path no-op
+        // detection's doc comment for the live staging evidence (383% CPU,
+        // connection-reader tasks starved of scheduling). This path is rare
+        // (only reached when local base verification already failed and a peer
+        // recovery pull is attempted), so its contribution is small, but it's
+        // the same class of gap and cheap to close while in this neighborhood.
+        let data_for_hash = data.clone();
+        let _fold_hash_permit = self.fold_hash_semaphore.acquire().await
+            .expect("fold_hash_semaphore is never closed");
+        let actual = tokio::task::spawn_blocking(move || {
+            dfs_common::compute_chunk_hash_at(&data_for_hash, file_offset, file_id)
+        }).await.unwrap_or([0u8; 32]);
+        drop(_fold_hash_permit);
         if actual != chunk_id.hash {
             warn!("heal_base_from_peer: peer {}'s copy of chunk {} ALSO fails verification — not recoverable from this peer",
                 peer_addr, chunk_id);
@@ -3983,6 +4038,16 @@ impl Server {
             fold_lock_grants: Arc::new(DashMap::new()),
             outbound_fold_claims: Arc::new(DashMap::new()),
             fold_coordination_semaphore: Arc::new(tokio::sync::Semaphore::new(24)),
+            fold_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                std::env::var("DFS_FOLD_HASH_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map(|n| (n.get() / 2).max(2))
+                            .unwrap_or(2)
+                    })
+            )),
             last_fold_leader_confirm: Arc::new(DashMap::new()),
             pending_patch_ids: Arc::new(DashMap::new()),
             pending_patch_fold_broadcasts: Arc::new(DashMap::new()),
@@ -5000,7 +5065,8 @@ impl Server {
     /// Background task: monitor TCP connection slot pressure and step down from
     /// leadership when all slots are exhausted for a sustained period.
     ///
-    /// Thresholds (MAX_CONNECTIONS = 128):
+    /// Thresholds (MAX_CONNECTIONS, currently 512 — see its own doc comment in
+    /// network.rs for the current value and sizing history):
     ///   75% used (96+)  → WARN on each accept (done in network.rs)
     ///   100% for 30s    → check CLOSE_WAIT; if real load, GracefulLeave
     ///   recovery >50%   → announce_recovery
@@ -11536,6 +11602,7 @@ impl Server {
             fold_lock_grants: self.fold_lock_grants.clone(),
             outbound_fold_claims: self.outbound_fold_claims.clone(),
             fold_coordination_semaphore: self.fold_coordination_semaphore.clone(),
+            fold_hash_semaphore: self.fold_hash_semaphore.clone(),
             last_fold_leader_confirm: self.last_fold_leader_confirm.clone(),
             chunk_ring: self.chunk_ring.clone(),
             chunk_ring_hits: self.chunk_ring_hits.clone(),

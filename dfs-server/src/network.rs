@@ -36,10 +36,23 @@ pub trait MessageHandler: Send + Sync {
 // 128 was undersized against concurrency caps we've since raised for QD32 tuning
 // (PIPELINE_MAX_ITEMS=32 dual-written to 2 replicas, range-fetch up to 6/file/node,
 // client POOL_SIZE=20 idle per peer) plus healing fan-out and gossip/heartbeat
-// traffic, all drawing from the same budget on every node at once. 384 gives real
-// headroom while remaining tiny next to the 65536 NOFILE ulimit the systemd unit
-// already grants.
-pub const MAX_CONNECTIONS: usize = 384;
+// traffic, all drawing from the same budget on every node at once. Raised
+// 384 -> 512 (2026-08-05): confirmed live on staging that 384 itself gets hit
+// under a real but bounded and brief compounding case 384 wasn't sized
+// against — a wave of accumulated folds (each fanning ProposeFold out to
+// every peer concurrently) landing on top of an already-heavy concurrent
+// write burst (kdiskmark-style QD32) — 815 connections rejected over 3.5s
+// before self-recovering. Still tiny next to the 65536 NOFILE ulimit the
+// systemd unit already grants; the real safety backstop against genuine
+// runaway exhaustion is start_conn_pressure_watchdog (leadership step-down
+// at 30s sustained, restart at 5min), not this ceiling itself, so raising it
+// trades away no safety margin, just absorbs a bigger legitimate coincidental
+// spike before that backstop would ever need to engage. If fold-coordination
+// fan-out volume keeps growing, the real root-cause fix is bounding
+// ProposeFold's own concurrency (mirroring write_semaphore/
+// fold_coordination_semaphore's existing pattern) rather than keep raising
+// this further.
+pub const MAX_CONNECTIONS: usize = 512;
 
 /// Network server for handling node-to-node communication
 /// Optimized for SBC environments (connection reuse, async I/O)

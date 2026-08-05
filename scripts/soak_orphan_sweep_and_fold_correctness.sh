@@ -4,8 +4,8 @@
 # disk-orphan-sweep (see project_paginated_disk_orphan_sweep_20260804.md) against
 # real 20-minute restart-grace timing instead of the unit tests' env-override
 # shortcuts, and to add fold-correctness coverage the project has never had
-# locally before: client-forced fold (>20 patches to one chunk), server-initiated
-# idle fold (a couple of patches + real wait past PATCH_DEBOUNCE_IDLE), and a
+# locally before: client-forced fold (>20 patches to one chunk, min 5s apart),
+# server-initiated idle fold (a couple of patches + real wait past PATCH_DEBOUNCE_IDLE), and a
 # re-patch of the post-fold chunk to check for corruption on the exact kind of
 # path several real production data-loss incidents this session trace back to
 # (stale-fold-wins-arbitration, coordinate_and_fold_slot races).
@@ -33,7 +33,9 @@
 #   2. Client-forced fold: >20 distinct patches to one chunk (fsync per patch
 #      forces each write to flush as its own patch — SLOT_DIRTY_FLUSH_THRESHOLD_BYTES
 #      doesn't gate an explicit fsync) to trip ACTIVE_FOLD_PATCH_THRESHOLD=20
-#      (dfs-client/src/client.rs:7704).
+#      (dfs-client/src/client.rs:7714) — but the fold itself won't actually
+#      fire until ACTIVE_FOLD_MIN_INTERVAL (5s) has elapsed since the first
+#      patch, added 2026-08-05 (see that constant's doc comment for why).
 #   3. Server-initiated idle fold: a couple of patches to a different chunk,
 #      then a real 45s idle wait — past PATCH_DEBOUNCE_IDLE (20s,
 #      dfs-server/src/healing.rs:1293), which re-arms a fresh 20s window each
@@ -326,7 +328,7 @@ echo "$ORPHAN_CANDIDATES" > "$T/orphan_candidates.txt"
     || check "Phase1 paused node retained at least one physical orphan candidate (got 0)" FAIL
 
 echo ""
-echo "=== Phase 2 [t=$(elapsed)s]: client-forced fold (>20 patches to one chunk) ==="
+echo "=== Phase 2 [t=$(elapsed)s]: client-forced fold (>20 patches to one chunk, min 5s apart) ==="
 if dd_with_retry "$MOUNT/fold_client.bin" 1M 4 3; then
     dfs_sync
     FOLD_CLIENT_FILE_ID=$(grep -h "\[META SERVER\] put path=/fold_client.bin id=" "$LOG"/server*.log 2>/dev/null \

@@ -7700,8 +7700,30 @@ leader_addr: Arc::new(RwLock::new(None)),
             // within the jittered 6-10s time window, so a threshold well
             // below that (20) lets the count trigger occasionally preempt
             // time/bytes during busier moments while still comfortably
-            // clearing the "no more than ~1 fold/sec" floor.
+            // clearing the "no more than ~1 fold/sec" floor — in theory.
             const ACTIVE_FOLD_PATCH_THRESHOLD: u64 = 20; // was 30, then 50, 100, 500, 1000
+
+            // Floor on how soon ANY trigger (time/bytes/count) is allowed to fire,
+            // measured from this accumulator's first patch. Added 2026-08-05: the
+            // "~1 fold/sec" floor above was only ever a rate *estimate* from a
+            // measured average touch rate — it was never actually enforced. Under
+            // a genuinely hot slot (VM-108 qcow2 restore, live), patches arrived
+            // fast enough that the count trigger alone fired 4 times in 14
+            // seconds on one slot (as little as 1.3s apart) — raising the count
+            // threshold only buys a proportionally bigger burst before the same
+            // thing happens again at a higher patch rate; it doesn't bound the
+            // worst case. Each fold's superseded predecessor becomes a
+            // disk-orphan-sweep candidate, and that many folds on one slot in one
+            // burst was enough to flood the sweep with superseded-generation
+            // chunks (~68,800 in one pass), pegging CPU on the folding node and
+            // starving the healing dispatch loop badly enough that a chunk stuck
+            // at single-replica couldn't get its second copy pushed for 10+
+            // minutes. Gating all three triggers on this floor directly caps
+            // worst-case fold frequency per slot at 1 per MIN_INTERVAL,
+            // independent of patch rate or byte volume — the count/bytes
+            // thresholds keep their original job of preempting the full
+            // time-window wait during a busy-but-not-pathological period.
+            const ACTIVE_FOLD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
             let elapsed_since_start = self.active_fold_started_at.get(&(file_id, cidx)).map(|e| e.elapsed());
             let patch_count = {
@@ -7715,9 +7737,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // accumulator — seed the timer, nothing to fold yet.
                     self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                 }
-                Some(elapsed) if elapsed >= active_fold_interval
+                Some(elapsed) if elapsed >= ACTIVE_FOLD_MIN_INTERVAL && (
+                    elapsed >= active_fold_interval
                     || accumulated_bytes >= ACTIVE_FOLD_SIZE_THRESHOLD
-                    || patch_count >= ACTIVE_FOLD_PATCH_THRESHOLD => {
+                    || patch_count >= ACTIVE_FOLD_PATCH_THRESHOLD
+                ) => {
                     // Backoff after a recent failed attempt on this exact slot — see
                     // active_fold_failure_backoff's doc comment for the retry storm
                     // this closes. Skip this round entirely (no permit acquired, no

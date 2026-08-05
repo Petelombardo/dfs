@@ -6768,8 +6768,18 @@ impl Server {
         };
 
         // Fetch location metadata for written_at, file_offset, and a size estimate.
+        //
+        // ChunkLocation.written_at is stored in Unix MILLISECONDS everywhere it's set
+        // (every call site uses SystemTime::now()...as_millis()) — but the wire field
+        // below and storage::set_chunk_mtime both document and consume Unix SECONDS.
+        // Convert here, at the one point this codebase reads written_at specifically to
+        // hand it to something seconds-denominated, rather than changing the ms
+        // convention everywhere else. Uncaught, this silently stamped every healing-
+        // pushed replica's mtime ~1000x too far in the future (e.g. a chunk written
+        // 2026-08-04 landed with an mtime of 2446-05-10) — confirmed live 2026-08-04
+        // on staging chunks pushed via PushChunkTo during the VM-108 restore.
         let loc = self.metadata.get_chunk_location(&chunk_id).ok().flatten();
-        let written_at = loc.as_ref().and_then(|l| l.written_at);
+        let written_at = loc.as_ref().and_then(|l| l.written_at).map(|ms| ms / 1000);
 
         // Pace this transfer against the configured heal bandwidth (DFS_HEAL_BANDWIDTH_MB)
         // before doing the disk read — a real bytes/sec limiter, not just a cap on how

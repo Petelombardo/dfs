@@ -390,13 +390,30 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.clone().start_chunk_tombstone_cleanup_loop();
     info!("✓ Healing manager started");
 
-    // Start network server — share its semaphore with the server before spawning.
-    let mut net_server = network::NetworkServer::new(config.node.listen_addr, server.clone());
+    // Start network servers — a client-facing listener and a separate
+    // peer-only listener (see network::PEER_PORT_OFFSET's doc comment for why
+    // inter-node RPC traffic needs its own port, not just its own semaphore on
+    // a shared port). Share both semaphores with the server before spawning.
+    let mut net_server = network::NetworkServer::new(config.node.listen_addr, server.clone(), network::MAX_CONNECTIONS);
     server.set_conn_semaphore(net_server.conn_semaphore.clone()).await;
+
+    let peer_capacity = std::env::var("DFS_RESERVED_PEER_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(network::RESERVED_PEER_CONNECTIONS);
+    let mut peer_net_server = network::NetworkServer::new(
+        network::peer_port_addr(config.node.listen_addr), server.clone(), peer_capacity,
+    );
+    server.set_peer_conn_semaphore(peer_net_server.conn_semaphore.clone(), peer_net_server.capacity()).await;
+
     server.clone().start_conn_pressure_watchdog();
     let mut server_handle = tokio::spawn(async move {
-        if let Err(e) = net_server.start().await {
+        let (client_result, peer_result) = tokio::join!(net_server.start(), peer_net_server.start());
+        if let Err(e) = client_result {
             tracing::error!("Network server error: {}", e);
+        }
+        if let Err(e) = peer_result {
+            tracing::error!("Peer network server error: {}", e);
         }
     });
 
@@ -739,12 +756,27 @@ async fn run_planned_offline_compaction(
     server.restart_sled_writes();
 
     // Rebind and come back online regardless of compaction's own outcome —
-    // going offline must never turn into staying offline.
-    let mut net_server = network::NetworkServer::new(listen_addr, server.clone());
+    // going offline must never turn into staying offline. Same dual-listener
+    // shape as the initial startup path above.
+    let mut net_server = network::NetworkServer::new(listen_addr, server.clone(), network::MAX_CONNECTIONS);
     server.set_conn_semaphore(net_server.conn_semaphore.clone()).await;
+
+    let peer_capacity = std::env::var("DFS_RESERVED_PEER_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(network::RESERVED_PEER_CONNECTIONS);
+    let mut peer_net_server = network::NetworkServer::new(
+        network::peer_port_addr(listen_addr), server.clone(), peer_capacity,
+    );
+    server.set_peer_conn_semaphore(peer_net_server.conn_semaphore.clone(), peer_net_server.capacity()).await;
+
     *server_handle = tokio::spawn(async move {
-        if let Err(e) = net_server.start().await {
+        let (client_result, peer_result) = tokio::join!(net_server.start(), peer_net_server.start());
+        if let Err(e) = client_result {
             tracing::error!("Network server error (post-compaction respawn): {}", e);
+        }
+        if let Err(e) = peer_result {
+            tracing::error!("Peer network server error (post-compaction respawn): {}", e);
         }
     });
     // Catch up on anything that landed on the interim leader while we were paused,
@@ -966,8 +998,9 @@ async fn send_join_request(
         node_info: node_info.clone(),
     };
 
-    // Connect to seed node
-    let mut stream = TcpStream::connect(seed_addr).await?;
+    // Connect to seed node's peer port — this is genuine inter-node cluster
+    // traffic (see network::PEER_PORT_OFFSET's doc comment), not a client request.
+    let mut stream = TcpStream::connect(crate::network::peer_port_addr(seed_addr)).await?;
 
     // Create message envelope
     let request_id = RequestId::new(1);
@@ -1093,7 +1126,7 @@ async fn announce_to_peers(
         info!("Announcing to peer {}", peer.addr);
 
         // Spawn announcement in background - don't block on failures
-        let peer_addr = peer.addr;
+        let peer_addr = crate::network::peer_port_addr(peer.addr);
         let announcement_clone = announcement.clone();
         tokio::spawn(async move {
             match TcpStream::connect(peer_addr).await {

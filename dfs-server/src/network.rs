@@ -54,8 +54,76 @@ pub trait MessageHandler: Send + Sync {
 // this further.
 pub const MAX_CONNECTIONS: usize = 512;
 
+/// Dedicated connection budget for the peer-only listener (see PEER_PORT_OFFSET)
+/// — additive on top of MAX_CONNECTIONS' client budget (a separate listener, not
+/// carved out of it), so this costs nothing against the 65536 NOFILE ulimit and
+/// never reduces client capacity. Added 2026-08-05 after a leader-unreachable
+/// incident where the leader's connection pool — saturated entirely by client
+/// write-burst traffic — also rejected OTHER NODES trying to open a
+/// coordination connection to it, since both drew from the same MAX_CONNECTIONS
+/// budget. That's the same class of gap the "deleting YOUNG chunk...this is
+/// data loss" warnings from that incident point back to: a missed/delayed
+/// broadcast during connection pressure.
+///
+/// First attempt classified connections by source IP at accept time on a single
+/// port — reverted after a real, twice-reproduced local-suite regression (T38b):
+/// the project's own local dev/test convention runs every node on 127.0.0.1,
+/// distinguished only by port, so IP-based classification can't work there even
+/// in principle (confirmed via `ip route get`: any loopback destination sources
+/// from 127.0.0.1 regardless of which alias is targeted). A real second port
+/// (PEER_PORT_OFFSET) sidesteps this entirely — which port a connection arrived
+/// on **is** its classification, correct in both local dev and real staging.
+///
+/// Sized at 128, not a tighter number closer to typical load, specifically to
+/// stay clear of `heal_max_concurrent`'s own admin-tunable ceiling (64, see
+/// `dfs-admin healing set --max-concurrent` / server.rs's clamp(1, 64)) with
+/// real margin left over for fold_coordination_semaphore's fan-out (bounds 24
+/// concurrent fold-coordination rounds per node, each fanning ProposeFold out
+/// to its replica peers — real measured peak during the 2026-08-05 incident
+/// was 8 concurrent ProposeFold instances, well under the theoretical max).
+/// Default healer tuning (heal_max_concurrent=8, heal_max_concurrent_per_node=3)
+/// plus that real fold-coordination peak fits in a small fraction of this —
+/// the extra headroom is specifically for an admin maxing out heal concurrency
+/// while fold coordination is also busy, not everyday load. Overridable via
+/// DFS_RESERVED_PEER_CONNECTIONS (tests shrink this to force exhaustion
+/// deterministically).
+pub const RESERVED_PEER_CONNECTIONS: usize = 128;
+
+/// Offset added to a node's client-facing listen port to get its peer-only
+/// port, where inter-node RPC traffic (ProposeFold/FoldLockGrant fan-out,
+/// healing pulls, gossip, chunk_location dissemination, cluster join/announce)
+/// is accepted separately from client (FUSE) traffic. No config field, no
+/// gossip dissemination, no wire-format change — every node derives every
+/// other node's peer port the same way from the client address it already
+/// knows (`NodeInfo.addr`), so there's nothing new to keep in sync or that a
+/// rolling deploy could disagree about. 10,000 is comfortably clear of this
+/// project's actual port range (8900s) in both local dev and staging.
+pub const PEER_PORT_OFFSET: u16 = 10_000;
+
+/// Derive a node's peer-only address from its client-facing address. Refuses
+/// (returns the original addr unchanged, logging an error) rather than silently
+/// wrapping into a bogus low port if the offset would overflow u16 — this
+/// project's ports are always ~8900s by convention, so overflow should never
+/// happen in practice, but wrapping silently into some other service's port
+/// would be a much worse failure mode than an obvious, loud one.
+pub fn peer_port_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.port().checked_add(PEER_PORT_OFFSET) {
+        Some(peer_port) => SocketAddr::new(addr.ip(), peer_port),
+        None => {
+            error!("Client port {} + PEER_PORT_OFFSET ({}) overflows u16 — cannot derive a peer port, using client address unchanged (peer traffic will NOT be isolated)", addr.port(), PEER_PORT_OFFSET);
+            addr
+        }
+    }
+}
+
 /// Network server for handling node-to-node communication
 /// Optimized for SBC environments (connection reuse, async I/O)
+///
+/// Single-purpose per instance: main.rs binds two of these per node — one on
+/// the client-facing port (capacity MAX_CONNECTIONS), one on the peer-only
+/// port (capacity RESERVED_PEER_CONNECTIONS, see its doc comment). Neither
+/// instance does any per-connection classification; which listener accepted a
+/// connection already says everything needed.
 pub struct NetworkServer<H: MessageHandler> {
     /// Address to listen on
     listen_addr: SocketAddr,
@@ -69,20 +137,35 @@ pub struct NetworkServer<H: MessageHandler> {
     /// Message handler
     handler: Arc<H>,
 
-    /// Shared semaphore — available_permits() reports free slots; cloned to Server for stats.
+    /// Shared semaphore — available_permits() reports free slots; cloned to
+    /// Server for stats. Capacity is whatever `new()` was given: MAX_CONNECTIONS
+    /// for the client-facing instance, RESERVED_PEER_CONNECTIONS for the peer one.
     pub conn_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// conn_semaphore's configured capacity — needed alongside
+    /// available_permits() to compute in-use counts for logging.
+    capacity: usize,
 }
 
 impl<H: MessageHandler + 'static> NetworkServer<H> {
-    /// Create a new network server
-    pub fn new(listen_addr: SocketAddr, handler: Arc<H>) -> Self {
+    /// Create a new network server with the given connection capacity.
+    pub fn new(listen_addr: SocketAddr, handler: Arc<H>, capacity: usize) -> Self {
         Self {
             listen_addr,
             next_request_id: Arc::new(AtomicU64::new(1)),
             shutdown_tx: None,
             handler,
-            conn_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            conn_semaphore: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity,
         }
+    }
+
+    /// conn_semaphore's configured capacity — exposed so Server can record it
+    /// alongside the semaphore itself for periodic stats logging (the
+    /// semaphore's own available_permits() only tells you what's free right now,
+    /// not what 100% looks like).
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Start the server (runs until shutdown)
@@ -94,6 +177,7 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
         info!("Network server listening on {}", self.listen_addr);
 
         let semaphore = self.conn_semaphore.clone();
+        let capacity = self.capacity;
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
@@ -139,9 +223,9 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                             // the client gets a fast failure rather than a silent hang.
                             match sem.clone().try_acquire_owned() {
                                 Ok(permit) => {
-                                    let in_use = MAX_CONNECTIONS - sem.available_permits();
-                                    if in_use > MAX_CONNECTIONS * 3 / 4 {
-                                        warn!("Connection pressure: {}/{} slots in use", in_use, MAX_CONNECTIONS);
+                                    let in_use = capacity - sem.available_permits();
+                                    if in_use > capacity * 3 / 4 {
+                                        warn!("Connection pressure on {}: {}/{} slots in use", self.listen_addr, in_use, capacity);
                                     }
                                     tokio::spawn(async move {
                                         let _permit = permit; // released on drop
@@ -151,8 +235,8 @@ impl<H: MessageHandler + 'static> NetworkServer<H> {
                                     });
                                 }
                                 Err(_) => {
-                                    let in_use = MAX_CONNECTIONS - sem.available_permits();
-                                    warn!("Connection limit reached ({}/{}) — rejecting {}", in_use, MAX_CONNECTIONS, peer_addr);
+                                    let in_use = capacity - sem.available_permits();
+                                    warn!("Connection limit reached on {} ({}/{}) — rejecting {}", self.listen_addr, in_use, capacity, peer_addr);
                                     tokio::spawn(async move {
                                         let response = MessageEnvelope::new(
                                             RequestId::new(0),
@@ -545,6 +629,17 @@ pub struct NetworkClient {
     /// (68c3bee moved the slow `shutdown().await` out of the guard but left the
     /// `entry.lock().await` under it; Arc-ing the inner Mutex closes both paths.)
     pool: Arc<DashMap<SocketAddr, Arc<Mutex<VecDeque<TcpStream>>>>>,
+
+    /// When true, every dial in send_message_inner targets peer_port_addr(target)
+    /// instead of target directly — set only for the 2 production instances that
+    /// exist purely for inter-node RPC (Server.client, ClusterManager.client; see
+    /// PEER_PORT_OFFSET's doc comment). The connection pool itself stays keyed by
+    /// the original, un-offset target — only the actual TcpStream::connect call
+    /// is redirected — so callers, logs, and existing "this is peer X's address"
+    /// reasoning are all unaffected. Plain new() (tests, any future non-peer use)
+    /// leaves this false, so test_message_framing/test_client_server need no
+    /// changes.
+    apply_peer_offset: bool,
 }
 
 impl NetworkClient {
@@ -553,6 +648,20 @@ impl NetworkClient {
         Self {
             next_request_id: Arc::new(AtomicU64::new(1)),
             pool: Arc::new(DashMap::new()),
+            apply_peer_offset: false,
+        }
+    }
+
+    /// Create a network client for inter-node RPC traffic only — every dial
+    /// targets the peer port (see PEER_PORT_OFFSET) instead of the client port.
+    /// Use only for a client whose entire purpose is server-to-server RPC
+    /// (today: Server.client, ClusterManager.client) — never for anything that
+    /// might also talk to a real client-facing endpoint.
+    pub fn new_for_peers() -> Self {
+        Self {
+            next_request_id: Arc::new(AtomicU64::new(1)),
+            pool: Arc::new(DashMap::new()),
+            apply_peer_offset: true,
         }
     }
 
@@ -585,6 +694,13 @@ impl NetworkClient {
     ) -> Result<MessageEnvelope> {
         let request_id = self.next_request_id();
         let envelope = MessageEnvelope::new(request_id, message);
+
+        // Every actual TcpStream::connect below dials dial_addr, not target — the
+        // pool itself stays keyed by target (the original, un-offset address) so
+        // callers/logs keep reasoning about "peer X's address" unchanged; only the
+        // real wire connection is redirected to the peer port for the 2 production
+        // instances built via new_for_peers() (see apply_peer_offset's doc comment).
+        let dial_addr = if self.apply_peer_offset { peer_port_addr(target) } else { target };
 
         // Try a pooled connection first; fall back to a fresh one if the pool is empty
         // or the connection has gone stale (detected by write/read failure).
@@ -619,10 +735,10 @@ impl NetworkClient {
                     let _ = s.shutdown().await;
                     let fresh = tokio::time::timeout(
                         tokio::time::Duration::from_secs(5),
-                        TcpStream::connect(target),
+                        TcpStream::connect(dial_addr),
                     ).await
-                        .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
-                        .with_context(|| format!("Failed to connect to {}", target))?;
+                        .map_err(|_| anyhow::anyhow!("Connect timeout to {}", dial_addr))?
+                        .with_context(|| format!("Failed to connect to {}", dial_addr))?;
                     let _ = fresh.set_nodelay(true);
                     fresh
                 } else {
@@ -631,13 +747,13 @@ impl NetworkClient {
                 }
             }
             None => {
-                debug!("Connecting to {}", target);
+                debug!("Connecting to {}", dial_addr);
                 let fresh = tokio::time::timeout(
                     tokio::time::Duration::from_secs(5),
-                    TcpStream::connect(target),
+                    TcpStream::connect(dial_addr),
                 ).await
-                    .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
-                    .with_context(|| format!("Failed to connect to {}", target))?;
+                    .map_err(|_| anyhow::anyhow!("Connect timeout to {}", dial_addr))?
+                    .with_context(|| format!("Failed to connect to {}", dial_addr))?;
                 let _ = fresh.set_nodelay(true);
                 fresh
             }
@@ -654,10 +770,10 @@ impl NetworkClient {
                 debug!("Pooled connection to {} failed ({}), retrying with new connection", target, e);
                 let mut fresh = tokio::time::timeout(
                     tokio::time::Duration::from_secs(5),
-                    TcpStream::connect(target),
+                    TcpStream::connect(dial_addr),
                 ).await
-                    .map_err(|_| anyhow::anyhow!("Connect timeout to {}", target))?
-                    .with_context(|| format!("Failed to reconnect to {}", target))?;
+                    .map_err(|_| anyhow::anyhow!("Connect timeout to {}", dial_addr))?
+                    .with_context(|| format!("Failed to reconnect to {}", dial_addr))?;
                 let _ = fresh.set_nodelay(true);
                 tokio::time::timeout(WRITE_TIMEOUT, write_message(&mut fresh, &envelope))
                     .await
@@ -831,4 +947,158 @@ mod tests {
             _ => panic!("Expected Bool response"),
         }
     }
+
+    // --- Reserved peer connection pool via a derived peer port (2026-08-05) ---
+    //
+    // These exercise NetworkServer::start()'s real accept loop (not the
+    // handle_connection shortcut test_client_server uses above). Unlike the
+    // first (reverted) attempt, there's no source-IP simulation needed here —
+    // the two pools are just two ordinary listeners on two known ports, since
+    // classification is now "which port did this arrive on", not a guess.
+
+    async fn read_response(stream: &mut TcpStream) -> MessageEnvelope {
+        let mut length_bytes = [0u8; 4];
+        stream.read_exact(&mut length_bytes).await.unwrap();
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        let mut message_bytes = vec![0u8; length];
+        stream.read_exact(&mut message_bytes).await.unwrap();
+        MessageEnvelope::from_bytes(&message_bytes).unwrap()
+    }
+
+    async fn send_request(stream: &mut TcpStream, req: Request) {
+        let envelope = MessageEnvelope::new(RequestId::new(1), Message::Request(req));
+        let bytes = envelope.to_bytes().unwrap();
+        let len = (bytes.len() as u32).to_be_bytes();
+        stream.write_all(&len).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    }
+
+    /// Starts a real NetworkServer with the given capacity on a fixed port and
+    /// returns a clone of its semaphore for inspection.
+    async fn start_test_server(
+        listen_addr: SocketAddr,
+        capacity: usize,
+    ) -> Arc<tokio::sync::Semaphore> {
+        let handler = Arc::new(TestHandler);
+        let mut net_server = NetworkServer::new(listen_addr, handler, capacity);
+        let sem = net_server.conn_semaphore.clone();
+        tokio::spawn(async move {
+            net_server.start().await.ok();
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        sem
+    }
+
+    #[test]
+    fn peer_port_addr_applies_offset() {
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        assert_eq!(peer_port_addr(addr), "127.0.0.1:18900".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn peer_port_addr_refuses_to_wrap_on_overflow() {
+        // 60000 + 10000 overflows u16 (max 65535) — must return the address
+        // unchanged, never a silently-wrapped low port.
+        let addr: SocketAddr = "127.0.0.1:60000".parse().unwrap();
+        assert_eq!(peer_port_addr(addr), addr);
+    }
+
+    #[tokio::test]
+    async fn new_for_peers_dials_the_offset_port_plain_new_does_not() {
+        // Listener only on the OFFSET port — a new_for_peers() client asked to
+        // reach the base address should actually land here; a plain new()
+        // client asked for the same base address should not.
+        let base_addr: SocketAddr = "127.0.0.1:19201".parse().unwrap();
+        let offset_addr = peer_port_addr(base_addr);
+        let _sem = start_test_server(offset_addr, 10).await;
+
+        let peer_client = NetworkClient::new_for_peers();
+        let response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            peer_client.send_message(base_addr, Message::Request(Request::HasChunk {
+                chunk_id: ChunkId::from_hash([1u8; 32]),
+            })),
+        ).await;
+        match response {
+            Ok(Ok(env)) => match env.message {
+                Message::Response(Response::Bool { value }) => assert!(!value),
+                other => panic!("expected Bool response, got {:?}", other),
+            },
+            other => panic!("new_for_peers() client should have reached the offset port, got {:?}", other),
+        }
+
+        let plain_client = NetworkClient::new();
+        let response = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            plain_client.send_message(base_addr, Message::Request(Request::HasChunk {
+                chunk_id: ChunkId::from_hash([1u8; 32]),
+            })),
+        ).await;
+        assert!(response.is_err() || response.unwrap().is_err(),
+            "plain new() client must NOT be redirected to the offset port — nothing is listening on the base address");
+    }
+
+    #[tokio::test]
+    async fn client_pool_saturation_does_not_block_peer_port_connections() {
+        let client_addr: SocketAddr = "127.0.0.1:19202".parse().unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:19203".parse().unwrap();
+        let client_sem = start_test_server(client_addr, 2).await;
+        let peer_sem = start_test_server(peer_addr, 2).await;
+
+        // Saturate the (tiny) client-port pool.
+        let _c1 = TcpStream::connect(client_addr).await.unwrap();
+        let _c2 = TcpStream::connect(client_addr).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert_eq!(client_sem.available_permits(), 0);
+
+        // A third client-port connection is rejected with ServerBusy, not a hang.
+        let mut c3 = TcpStream::connect(client_addr).await.unwrap();
+        match read_response(&mut c3).await.message {
+            Message::Response(Response::Error { code, .. }) => assert_eq!(code, ErrorCode::ServerBusy),
+            other => panic!("expected ServerBusy, got {:?}", other),
+        }
+
+        // But a peer-port connection still succeeds via a real round trip — the
+        // whole point: client saturation must never starve peer traffic, and
+        // now there's no shared pool at all for it to starve.
+        let mut p1 = TcpStream::connect(peer_addr).await.unwrap();
+        send_request(&mut p1, Request::HasChunk { chunk_id: ChunkId::from_hash([9u8; 32]) }).await;
+        match read_response(&mut p1).await.message {
+            Message::Response(Response::Bool { value }) => assert!(!value),
+            other => panic!("expected Bool response from peer-port connection, got {:?}", other),
+        }
+        assert_eq!(peer_sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_pool_exhaustion_rejects_without_affecting_client_pool() {
+        let client_addr: SocketAddr = "127.0.0.1:19204".parse().unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:19205".parse().unwrap();
+        let client_sem = start_test_server(client_addr, 5).await;
+        let peer_sem = start_test_server(peer_addr, 1).await;
+
+        // Saturate the reserved peer pool (capacity 1).
+        let _p1 = TcpStream::connect(peer_addr).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        assert_eq!(peer_sem.available_permits(), 0);
+
+        // A second peer-port connection is rejected with ServerBusy, not a hang —
+        // this is the specific scenario worth logging loudly in production: even
+        // the dedicated reserve ran out.
+        let mut p2 = TcpStream::connect(peer_addr).await.unwrap();
+        match read_response(&mut p2).await.message {
+            Message::Response(Response::Error { code, .. }) => assert_eq!(code, ErrorCode::ServerBusy),
+            other => panic!("expected ServerBusy, got {:?}", other),
+        }
+
+        // A concurrent client-port connection is completely unaffected.
+        let mut c1 = TcpStream::connect(client_addr).await.unwrap();
+        send_request(&mut c1, Request::HasChunk { chunk_id: ChunkId::from_hash([7u8; 32]) }).await;
+        match read_response(&mut c1).await.message {
+            Message::Response(Response::Bool { value }) => assert!(!value),
+            other => panic!("expected Bool response for client-port connection, got {:?}", other),
+        }
+        assert_eq!(client_sem.available_permits(), 4, "client pool must be unaffected by peer pool exhaustion");
+    }
+
 }

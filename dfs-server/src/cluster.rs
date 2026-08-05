@@ -137,7 +137,7 @@ impl ClusterManager {
             failure_timeout,
             node_recovered_notify: Arc::new(Notify::new()),
             became_leader_at: Arc::new(RwLock::new(None)),
-            client: Arc::new(NetworkClient::new()),
+            client: Arc::new(NetworkClient::new_for_peers()),
             local_heal_bandwidth_mb: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             compaction_intents: Arc::new(RwLock::new(HashMap::new())),
             heartbeat_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),

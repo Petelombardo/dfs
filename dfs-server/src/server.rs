@@ -555,6 +555,14 @@ pub struct Server {
     /// Shared connection semaphore from the NetworkServer.
     /// None until set_conn_semaphore() is called from main after the server starts.
     conn_semaphore: Arc<RwLock<Option<Arc<tokio::sync::Semaphore>>>>,
+
+    /// Shared reserved peer-connection semaphore from the NetworkServer, paired
+    /// with its configured capacity (needed for stats logging, since
+    /// available_permits() alone can't tell you what 100% looks like once it's
+    /// env-overridden away from RESERVED_PEER_CONNECTIONS). None until
+    /// set_peer_conn_semaphore() is called from main after the server starts.
+    /// See network::RESERVED_PEER_CONNECTIONS' doc comment for why this pool exists.
+    peer_conn_semaphore: Arc<RwLock<Option<(Arc<tokio::sync::Semaphore>, usize)>>>,
 }
 
 /// Fold a batch of pending metadata writes down to one `FileMetadata` per
@@ -1987,7 +1995,7 @@ impl OverlayForkCtx {
         mode: FoldCoordination,
     ) -> bool {
         if matches!(mode, FoldCoordination::Local) {
-            return !matches!(self.fold_slot_now(file_id, chunk_idx).await, FoldSlotOutcome::Failed);
+            return !matches!(self.fold_slot_now(file_id, chunk_idx, false).await, FoldSlotOutcome::Failed);
         }
 
         // Captured BEFORE folding: fold_slot_now removes the dirty_patch_slots
@@ -2032,7 +2040,7 @@ impl OverlayForkCtx {
         // suite run): it tried to read bytes this node never had, failed, and
         // raised a spurious URGENT_SINGLE_REPLICA for a chunk the actual
         // coordinator was already replicating correctly elsewhere.
-        let (folded_id, final_size, buf, client_write_seq) = match self.fold_slot_now(file_id, chunk_idx).await {
+        let (folded_id, final_size, buf, client_write_seq) = match self.fold_slot_now(file_id, chunk_idx, false).await {
             FoldSlotOutcome::FoldedHere(id, size, buf, cws) => (id, size, buf, cws),
             FoldSlotOutcome::AdoptedElsewhere | FoldSlotOutcome::NothingToDo => return true,
             FoldSlotOutcome::Failed => return false,
@@ -2457,6 +2465,19 @@ impl OverlayForkCtx {
     /// (file_id, chunk_idx) for the duration of this call (via chunk_patch_locks) —
     /// this function does not acquire that lock itself; apply_patch hands off its
     /// already-held guard into the spawned task that calls this.
+    ///
+    /// `is_client_initiated` distinguishes this fold's two real callers (see
+    /// fold_slot_now's doc comment): true for handle_force_fold (a client is
+    /// synchronously blocked on this exact RPC completing before its next
+    /// write to this slot can proceed — genuinely foreground, not "nobody's
+    /// waiting"), false for the idle-debounce/coordinated background path.
+    /// Controls whether fold_hash_semaphore gates this call's CPU work — see
+    /// that field's doc comment. Added 2026-08-05 after discovering the
+    /// semaphore, applied uniformly at first, was serializing client-waited
+    /// ForceFold RPCs behind background folds under kdiskmark-style
+    /// concurrent load — a real, measured throughput regression, not just a
+    /// theoretical one: exactly the class of foreground-latency cost this
+    /// semaphore was built to protect, being paid by the wrong caller.
     #[allow(clippy::too_many_arguments)]
     async fn run_single_fold(
         &self,
@@ -2467,6 +2488,7 @@ impl OverlayForkCtx {
         base_chunk_id: ChunkId,
         delta_chunk_id: ChunkId,
         delta_client_write_seq: Option<u64>,
+        is_client_initiated: bool,
     ) -> Option<(ChunkId, usize, Arc<Vec<u8>>, Option<u64>)> {
         // Cancel base_chunk_id's healing in the background, right away — base_chunk_id
         // is about to be retired by this fold, and there should never be a need for
@@ -2536,8 +2558,20 @@ impl OverlayForkCtx {
         // concurrent draw on it isn't obviously wrong, just broader in scope
         // than "purely CPU" — revisit if fold read throughput turns out to
         // matter more than this measurement suggests today.
-        let _fold_hash_permit = self.fold_hash_semaphore.acquire().await
-            .expect("fold_hash_semaphore is never closed");
+        //
+        // Skipped entirely when is_client_initiated: a client is synchronously
+        // blocked on handle_force_fold's RPC completing, so this call is
+        // foreground from the client's point of view even though it's the
+        // same function a genuinely-idle background fold also uses — gating
+        // it the same way measurably serialized ForceFold RPCs behind
+        // unrelated background folds under concurrent load (see this
+        // function's doc comment).
+        let _fold_hash_permit = if is_client_initiated {
+            None
+        } else {
+            Some(self.fold_hash_semaphore.acquire().await
+                .expect("fold_hash_semaphore is never closed"))
+        };
         let fold_result = full_rewrite_chunk(
             self.storage.clone(),
             self.metadata.clone(),
@@ -3460,7 +3494,13 @@ impl OverlayForkCtx {
     /// an already-held guard handed to it) since callers here never held it to
     /// begin with — merges in apply_patch release it immediately after writing
     /// their delta.
-    async fn fold_slot_now(&self, file_id: FileId, chunk_idx: u64) -> FoldSlotOutcome {
+    ///
+    /// `is_client_initiated`: true from handle_force_fold's direct call (a
+    /// client is synchronously waiting), false from fold_slot_coordinated's
+    /// internal call (the idle-debounce/coordinated background path) — passed
+    /// straight through to run_single_fold, see its doc comment for why this
+    /// distinction exists.
+    async fn fold_slot_now(&self, file_id: FileId, chunk_idx: u64, is_client_initiated: bool) -> FoldSlotOutcome {
         self.wait_if_compaction_quiescing().await;
         let lock = self.chunk_patch_locks
             .entry((file_id, chunk_idx))
@@ -3538,6 +3578,7 @@ impl OverlayForkCtx {
         self.active_fold_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = self.run_single_fold(
             file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, client_write_seq,
+            is_client_initiated,
         ).await;
         self.active_fold_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         match result {
@@ -4000,7 +4041,7 @@ impl Server {
             metadata_batch_drain_enabled,
             chunker: Arc::new(Chunker::new(chunk_size)),
             cluster,
-            client: Arc::new(NetworkClient::new()),
+            client: Arc::new(NetworkClient::new_for_peers()),
             replication_factor,
             metadata_dir,
             config_path,
@@ -4108,6 +4149,7 @@ impl Server {
             last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
+            peer_conn_semaphore: Arc::new(RwLock::new(None)),
             sled_write_done,
             sled_write_backlog,
             sled_write_tx,
@@ -4361,6 +4403,24 @@ impl Server {
                     let mcapacity = self.materialized_ring.total_capacity();
                     info!("materialized_ring stats (last 30s): {} hits, {} misses ({:.1}% hit rate), capacity={} chunks",
                         mhits, mmisses, mhit_pct, mcapacity);
+                }
+                // Reserved peer-connection pool, added 2026-08-05 alongside
+                // network::RESERVED_PEER_CONNECTIONS — reported next to the
+                // client-facing pool so both are visible together during normal
+                // monitoring, not just at rejection time (see its doc comment
+                // for why this pool exists).
+                if let Some((sem, capacity)) = self.peer_conn_semaphore.read().await.clone() {
+                    let in_use = capacity - sem.available_permits();
+                    info!("connection pools: peer {}/{} reserved, client {}/{}",
+                        in_use, capacity,
+                        {
+                            use crate::network::MAX_CONNECTIONS;
+                            match self.conn_semaphore.read().await.as_ref() {
+                                Some(s) => MAX_CONNECTIONS - s.available_permits(),
+                                None => 0,
+                            }
+                        },
+                        crate::network::MAX_CONNECTIONS);
                 }
             }
         });
@@ -5060,6 +5120,15 @@ impl Server {
     /// Called from main() after NetworkServer is created, before it starts.
     pub async fn set_conn_semaphore(&self, sem: Arc<tokio::sync::Semaphore>) {
         *self.conn_semaphore.write().await = Some(sem);
+    }
+
+    /// Share the NetworkServer's reserved peer-connection semaphore (and its
+    /// capacity) with the Server, for stats logging only — the watchdog above
+    /// intentionally does not watch this pool, see RESERVED_PEER_CONNECTIONS'
+    /// doc comment. Called from main() after NetworkServer is created, before
+    /// it starts.
+    pub async fn set_peer_conn_semaphore(&self, sem: Arc<tokio::sync::Semaphore>, capacity: usize) {
+        *self.peer_conn_semaphore.write().await = Some((sem, capacity));
     }
 
     /// Background task: monitor TCP connection slot pressure and step down from
@@ -13105,7 +13174,7 @@ impl Server {
     /// client" mismatch this whole ForceFold mechanism exists to prevent.
     async fn handle_force_fold(&self, file_id: dfs_common::FileId, chunk_idx: u64) -> Response {
         self.wait_if_compaction_quiescing().await;
-        if matches!(self.overlay_ctx().fold_slot_now(file_id, chunk_idx).await, FoldSlotOutcome::Failed) {
+        if matches!(self.overlay_ctx().fold_slot_now(file_id, chunk_idx, true).await, FoldSlotOutcome::Failed) {
             return Response::Error {
                 message: format!("ForceFold: fold failed for file {} chunk {}", file_id, chunk_idx),
                 code: ErrorCode::InternalError,
@@ -16538,7 +16607,7 @@ mod tests {
         // &Server directly) — see Server::overlay_ctx's doc comment.
         let ctx = server.overlay_ctx();
         let result = ctx.run_single_fold(
-            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500),
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), false,
         ).await;
         let (new_chunk_id, ..) = result.expect("fold should succeed: base and delta are both valid");
         assert_ne!(new_chunk_id, base_chunk_id, "the delta changes content, so this must not be a no-op fold");
@@ -19571,7 +19640,7 @@ mod tests {
             // from this exact state — i.e. this is a valid, retryable starting point.
             // Force it directly rather than waiting on the debounce timer, since
             // apply_patch was never called here to spawn one.
-            assert!(matches!(h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx).await, FoldSlotOutcome::FoldedHere(..)),
+            assert!(matches!(h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false).await, FoldSlotOutcome::FoldedHere(..)),
                 "fold must succeed from this Pending state");
             let state = h.metadata.get_patch_state(&public_token).unwrap().unwrap();
             let folded = match state {

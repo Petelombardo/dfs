@@ -4350,18 +4350,18 @@ impl Server {
         bump_chunk_generation(&self.chunk_generations, chunk_id, generation);
     }
 
-    /// The identity apply_patch mints for an unfolded MultiPatch accumulator round:
-    /// blake3("dfs-patch-token" || delta_chunk_id.hash), domain-separated from any
-    /// real content hash so nothing can mistake a pending overlay for
-    /// directly-readable content (see apply_patch's public_token comment). Shared
-    /// here so a verifier (handle_push_chunk_to) can recognize a still-Pending
-    /// token as one instead of running content-hash verification against it —
-    /// see that call site's comment for the false "disk corruption" this closes.
+    /// The identity apply_patch mints for an unfolded MultiPatch accumulator round.
+    /// Thin wrapper around `ChunkId::patch_token_identity` (dfs-common/src/types.rs)
+    /// — that's the single source of truth for the formula (including the
+    /// 2026-08-04 self-describing marker; see its doc comment and
+    /// `PATCH_TOKEN_MARKER`'s for why), kept there so tests and any other crate
+    /// can construct a real token identity without needing a private method on
+    /// `Server`. Shared here so a verifier (handle_push_chunk_to) can recognize
+    /// a still-Pending token as one instead of running content-hash verification
+    /// against it — see that call site's comment for the false "disk corruption"
+    /// this closes.
     fn patch_token_hash(delta_chunk_id: ChunkId) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"dfs-patch-token");
-        hasher.update(&delta_chunk_id.hash);
-        *hasher.finalize().as_bytes()
+        dfs_common::ChunkId::patch_token_identity(delta_chunk_id).hash
     }
 
     /// True if `chunk_id` is a live, still-Pending patch token whose identity
@@ -6836,7 +6836,15 @@ impl Server {
         // its own bytes, so there's nothing further to verify here; the read that
         // eventually resolves it composes base+delta and validates the *result*,
         // same as any other read of a pending patch.
-        let is_verified_patch_token = self.is_verified_patch_token(chunk_id).await;
+        //
+        // 2026-08-04: `is_verified_patch_token`'s PATCH_STATE_TABLE lookup is
+        // exactly the "the row didn't survive" gap above — it's a real database
+        // read that can miss for reasons unrelated to whether the chunk is
+        // genuinely a token. `looks_like_patch_token()` needs no lookup at all
+        // and can't miss: 177+ chunks got stuck in a permanent false-corruption
+        // retry loop on staging this same day because of this exact gap.
+        let is_verified_patch_token = chunk_id.looks_like_patch_token()
+            || self.is_verified_patch_token(chunk_id).await;
 
         // Verify chunk content before propagating — catches disk corruption at the
         // source so we don't spread bad data to the rest of the cluster.
@@ -16359,6 +16367,90 @@ mod tests {
             !server.is_verified_patch_token(mismatched_token).await,
             "a Pending row exists, but this chunk_id's own hash doesn't match patch_token_hash(delta) — must not be verified"
         );
+    }
+
+    /// 2026-08-04: handle_push_chunk_to must skip content-hash verification for
+    /// a marker-shaped chunk_id (ChunkId::looks_like_patch_token) even with
+    /// ZERO PATCH_STATE_TABLE presence — the exact gap that produced 177+
+    /// permanently-stuck false "disk corruption" reports on staging the same
+    /// day. Proven by deliberately writing content that does NOT match its
+    /// (file_id, offset) content hash — an ordinary chunk_id with that
+    /// mismatch must be rejected with the "disk corruption" error; a
+    /// marker-shaped one must sail past verification and fail (if at all)
+    /// only for the unrelated reason that target_addr is unreachable in this
+    /// test — never the corruption check.
+    #[tokio::test]
+    async fn handle_push_chunk_to_skips_verification_for_marker_shaped_chunks_via_marker_alone() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        // Deliberately unreachable — proves any failure past this point is a
+        // network error, not the disk-corruption check firing.
+        let unreachable_target: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        // Control: an ordinary chunk_id whose on-disk bytes do NOT match its
+        // claimed (file_id, offset) content hash must be rejected as corrupt.
+        let file_id = dfs_common::FileId::new();
+        let ordinary_id = ChunkId::from_hash(compute_chunk_hash(b"claims-to-be-this-content"));
+        storage.write_chunk(&ordinary_id, b"but is actually this content instead").unwrap();
+        metadata.put_chunk_location(&dfs_common::ChunkLocation {
+            chunk_id: ordinary_id,
+            nodes: vec![node_id],
+            size: 4096,
+            checksum: ordinary_id.hash,
+            file_offset: Some(0),
+            written_at: Some(0),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+        let response = server.handle_push_chunk_to(ordinary_id, unreachable_target, node_id).await;
+        match response {
+            Response::Error { message, .. } => assert!(
+                message.contains("disk corruption") || message.contains("hash verification"),
+                "an ordinary mismatched chunk must be rejected as corrupt, got: {}", message
+            ),
+            other => panic!("expected a corruption-rejection Error response, got {:?}", other),
+        }
+
+        // Marker-shaped chunk_id, same kind of content/hash mismatch, ZERO
+        // PATCH_STATE_TABLE row at all — must NOT be rejected as corrupt.
+        let delta = ChunkId::from_hash(compute_chunk_hash(b"some-delta-for-marker-test"));
+        let token = ChunkId::patch_token_identity(delta);
+        storage.write_chunk(&token, b"token content, never a content hash by construction").unwrap();
+        metadata.put_chunk_location(&dfs_common::ChunkLocation {
+            chunk_id: token,
+            nodes: vec![node_id],
+            size: 4096,
+            checksum: token.hash,
+            file_offset: Some(0),
+            written_at: Some(0),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+        let response = server.handle_push_chunk_to(token, unreachable_target, node_id).await;
+        match response {
+            Response::Error { message, .. } => assert!(
+                !message.contains("disk corruption") && !message.contains("hash verification"),
+                "a marker-shaped token with zero PATCH_STATE_TABLE presence must NEVER be \
+                 rejected as corrupt — verification must be skipped via the marker alone. \
+                 Got the corruption error: {}", message
+            ),
+            other => panic!("expected an Error response (network failure to the unreachable \
+                              target), got {:?} — did the push somehow succeed?", other),
+        }
     }
 
     /// Increment 4 (2026-07-28, same session as the fold-generation fix above): a

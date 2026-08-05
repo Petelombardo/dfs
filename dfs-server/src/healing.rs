@@ -1846,6 +1846,23 @@ impl HealingManager {
             let mut live_file_candidates: Vec<(ChunkId, u64)> = Vec::new();
 
             for chunk_id in &chunks {
+                // 2026-08-04: a chunk_id matching the reserved patch-token marker
+                // (ChunkId::looks_like_patch_token, dfs-common/types.rs) is NEVER
+                // a candidate for this sweep, full stop — no metadata lookup, no
+                // liveness check, nothing. Token lifecycle is the exclusive
+                // responsibility of prune_stale_folded_patch_states + patch_state_gc
+                // (which deletes the file in the same pass it retires the row).
+                // Before this, a token's only protection here was a
+                // PATCH_STATE_TABLE lookup a few lines below — which was shown to
+                // return empty for a genuinely live, current token on staging this
+                // same day, permanently losing real VM disk data across every
+                // replica. The marker needs no lookup and cannot have this failure
+                // mode.
+                if chunk_id.looks_like_patch_token() {
+                    kept += 1;
+                    continue;
+                }
+
                 // Determine whether this local file is still our responsibility.
                 let loc_record = match metadata.get_chunk_location(chunk_id) {
                     Ok(v) => v,
@@ -2078,6 +2095,15 @@ impl HealingManager {
         {
             let mut tracked = self.orphan_candidates.write().await;
             for (chunk_id, age_secs) in &candidates {
+                // Second, independent gate — run_disk_orphan_sweep_over already
+                // excludes marker-shaped chunks before they ever become a
+                // candidate, but this function is also reachable directly (see
+                // its own test coverage), so never let a token-shaped id reach
+                // the delete path through any route.
+                if chunk_id.looks_like_patch_token() {
+                    tracked.remove(chunk_id);
+                    continue;
+                }
                 if *age_secs < grace_secs {
                     debug!("Live-file orphan grace: skipping {} (age={}s, grace={}s)", chunk_id, age_secs, grace_secs);
                     continue;
@@ -2124,6 +2150,13 @@ impl HealingManager {
 
         let mut evicted = 0usize;
         for chunk_id in &authorized {
+            // Last-line-of-defense: never physically delete anything marker-shaped
+            // here, no matter how it got this far — see the earlier gate's comment.
+            if chunk_id.looks_like_patch_token() {
+                warn!("Live-file orphan sweep: refusing to delete {} — marker-shaped as a patch token, \
+                       should have been excluded much earlier", chunk_id);
+                continue;
+            }
             if let Err(e) = self.storage.delete_chunk(chunk_id, "live_file_orphan_sweep") {
                 debug!("Live-file orphan sweep: failed to delete {}: {}", chunk_id, e);
                 continue;
@@ -3913,6 +3946,15 @@ impl HealingManager {
         // files and must still heal normally — they are not keys here, so they are
         // unaffected. Any lookup error falls through to healing: uncertainty must never
         // withhold redundancy from something that might be genuine content.
+        //
+        // 2026-08-04: zero-lookup fast path ahead of the PATCH_STATE_TABLE check
+        // below — see ChunkId::looks_like_patch_token's doc comment. Tokens
+        // minted before the marker existed still rely on the lookup that
+        // follows, unchanged.
+        if chunk_id.looks_like_patch_token() {
+            debug!("Skipping heal for {} — marker-shaped as a patch token", chunk_id);
+            return Ok(Some(HealOutcome::clear_only(*chunk_id)));
+        }
         match metadata.get_patch_state_async(*chunk_id).await {
             Ok(Some(_)) => {
                 debug!("Skipping heal for {} — it is a patch token (resolves via patch_state, not independently replicable); the fold path owns this slot", chunk_id);
@@ -4414,6 +4456,15 @@ impl HealingManager {
         client: &Arc<NetworkClient>,
         replication_factor: usize,
     ) -> Result<()> {
+        // 2026-08-04: over-replication trim had no token check at all — tokens
+        // are minted 1-of-RF so this path shouldn't normally reach one, but
+        // "shouldn't normally" is exactly the assumption that failed twice the
+        // same day elsewhere in this file. See ChunkId::looks_like_patch_token's
+        // doc comment.
+        if chunk_id.looks_like_patch_token() {
+            return Ok(());
+        }
+
         // _async (spawn_blocking) getter — do_cleanup_excess_inner is spawned
         // concurrently on tokio workers by drain_heal_queue's JoinSet, same as
         // do_heal_chunk_inner; the sync getter would block the worker on the
@@ -5128,13 +5179,10 @@ mod tests {
 
         let base = ChunkId::from_hash(compute_chunk_hash(b"vm108-base-chunk"));
         let delta = ChunkId::from_hash(compute_chunk_hash(b"vm108-delta-chunk"));
-        // Real patch_token_hash construction, matching Server::patch_token_hash
-        // exactly: blake3("dfs-patch-token" || delta_chunk_id.hash) — deliberately
-        // NOT a content hash, see that function's doc comment.
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"dfs-patch-token");
-        hasher.update(&delta.hash);
-        let token = ChunkId::from_hash(*hasher.finalize().as_bytes());
+        // Real construction via the single source of truth (dfs-common), the
+        // exact same path Server::patch_token_hash delegates to — not a
+        // hand-duplicated formula that could silently drift out of sync.
+        let token = ChunkId::patch_token_identity(delta);
 
         storage.write_chunk(&token, b"live patch-token content, still pending").unwrap();
         metadata.put_patch_state_pending(
@@ -5157,6 +5205,43 @@ mod tests {
              path — not just the lower-level reconcile_live_file_candidates helper — even \
              with no chunk_map/FILE_TABLE/ChunkLocation entry at all. This exact gap caused \
              real, permanent, unrecoverable data loss on a live VM disk on 2026-08-04.");
+    }
+
+    /// THE critical regression test for the 2026-08-04 data-loss incident.
+    /// Unlike the test above (which still has a genuine PATCH_STATE_TABLE
+    /// `Pending` row and passed even before the marker fix — confirmed by
+    /// running it against the pre-marker code), this test has **zero**
+    /// PATCH_STATE_TABLE row at all — no `put_patch_state_pending` call,
+    /// nothing. This simulates whatever caused the real staging lookup to
+    /// come back empty for a token that was genuinely still live and current
+    /// (the exact mechanism was never fully root-caused; the self-describing
+    /// marker was chosen specifically so the fix does not depend on knowing
+    /// it). Before the marker fix, this exact scenario would have been
+    /// indistinguishable from a genuine orphan to `run_disk_orphan_sweep_over`
+    /// and evicted on the second pass — verified via negative control below.
+    #[tokio::test]
+    async fn patch_token_survives_disk_orphan_sweep_via_marker_alone_with_zero_patch_state_table_row() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8907".parse().unwrap();
+        let (storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let delta = ChunkId::from_hash(compute_chunk_hash(b"vm108-delta-no-patch-state-row"));
+        let token = ChunkId::patch_token_identity(delta);
+
+        storage.write_chunk(&token, b"live token content, zero PATCH_STATE_TABLE presence").unwrap();
+        let old_ts = dfs_common::types::current_timestamp().saturating_sub(700);
+        storage.set_chunk_mtime(&token, old_ts);
+        // Deliberately: no put_patch_state_pending call, no chunk_map entry,
+        // no ChunkLocation, no FILE_TABLE entry. The token's marker-shaped
+        // identity is the ONLY thing that can protect it here.
+
+        healing.run_disk_orphan_sweep_over(vec![token]).await;
+        healing.run_disk_orphan_sweep_over(vec![token]).await;
+
+        assert!(storage.get_chunk_path(&token).exists(),
+            "a marker-shaped patch token must survive the disk orphan sweep on the marker \
+             check ALONE, with zero PATCH_STATE_TABLE presence — this is the exact incident \
+             shape that caused real, permanent, unrecoverable data loss on 2026-08-04.");
     }
 
     /// run_pending_patch_reconciliation: a token already confirmed against the

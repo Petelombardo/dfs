@@ -9,7 +9,7 @@ pub mod storage_stats;
 pub use config::Config;
 pub use types::{
     deserialize_file_metadata, ChunkId, ChunkLocation, FileId, FileMetadata, FileType,
-    LeaveReason, NodeHealthGossip, NodeId, NodeInfo, NodeStatus,
+    LeaveReason, NodeHealthGossip, NodeId, NodeInfo, NodeStatus, PATCH_TOKEN_MARKER,
 };
 pub use protocol::{
     ClusterMessage, DeleteQueueEntry, ErrorCode, FoldReleaseOutcome, Message, MessageEnvelope,

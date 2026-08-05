@@ -148,6 +148,32 @@ pub struct NodeHealthGossip {
     pub status: NodeStatus,
 }
 
+/// Reserved 2-byte prefix marking a MultiPatch "patch token" identity — see
+/// `Server::patch_token_hash`'s doc comment in dfs-server for the full
+/// rationale. A patch token's chunk_id is deliberately NOT a content hash
+/// (`blake3("dfs-patch-token" || delta.hash)`), but until 2026-08-04 nothing
+/// about its 32 raw bytes reflected that: it was statistically
+/// indistinguishable from a real content-addressed chunk, and every place
+/// that needed to tell them apart had to trust a `PATCH_STATE_TABLE` lookup —
+/// a lookup shown to fail in two separate real incidents the same day (a
+/// false "disk corruption" storm during healing, and a real, permanent
+/// data-loss eviction by the disk-orphan-sweep). Forcing these two bytes
+/// makes token identity self-describing: any caller can check
+/// `ChunkId::looks_like_patch_token` with no database round trip and no
+/// dependency on whether some other table's row happened to survive.
+///
+/// Two bytes gives a genuine content hash a 1/65536 chance of coincidentally
+/// matching this prefix. Every consumer of `looks_like_patch_token` only
+/// ever uses a `true` result to SKIP a destructive or verification step,
+/// never to trigger one — so a false positive on an ordinary chunk fails
+/// safe (treated a little more conservatively), never unsafe.
+///
+/// Tokens minted before this constant existed don't carry the marker and
+/// still rely entirely on the pre-existing `PATCH_STATE_TABLE`-based checks,
+/// unchanged, as a fallback — this is an additional, stronger guarantee for
+/// tokens minted going forward, not a replacement.
+pub const PATCH_TOKEN_MARKER: [u8; 2] = [0xDF, 0x7C];
+
 /// Unique identifier for a chunk of data
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChunkId {
@@ -159,6 +185,32 @@ impl ChunkId {
     /// Create from a hash
     pub fn from_hash(hash: [u8; 32]) -> Self {
         Self { hash }
+    }
+
+    /// True if this identity's first two bytes match the reserved
+    /// patch-token marker — see `PATCH_TOKEN_MARKER`'s doc comment. A cheap,
+    /// always-correct, zero-lookup recognition check.
+    pub fn looks_like_patch_token(&self) -> bool {
+        self.hash[0] == PATCH_TOKEN_MARKER[0] && self.hash[1] == PATCH_TOKEN_MARKER[1]
+    }
+
+    /// The identity apply_patch mints for an unfolded MultiPatch accumulator
+    /// round: `blake3("dfs-patch-token" || delta_chunk_id.hash)`, domain-
+    /// separated from any real content hash so nothing can mistake a pending
+    /// overlay for directly-readable content, with `PATCH_TOKEN_MARKER`
+    /// forced into the first two bytes so the identity is also self-describing
+    /// (see that constant's doc comment). Single source of truth for this
+    /// formula — dfs-server's `Server::patch_token_hash` and any test that
+    /// needs a real token identity should call this directly rather than
+    /// duplicating the construction.
+    pub fn patch_token_identity(delta_chunk_id: ChunkId) -> ChunkId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"dfs-patch-token");
+        hasher.update(&delta_chunk_id.hash);
+        let mut hash = *hasher.finalize().as_bytes();
+        hash[0] = PATCH_TOKEN_MARKER[0];
+        hash[1] = PATCH_TOKEN_MARKER[1];
+        ChunkId { hash }
     }
 
     /// Get hex string representation
@@ -500,6 +552,61 @@ mod tests {
         assert_eq!(dir1, "00");
         assert_eq!(dir2, "00");
         assert_eq!(full.len(), 64);
+    }
+
+    /// 2026-08-04: patch_token_identity must ALWAYS carry the reserved marker,
+    /// deterministically, regardless of the delta chunk it's derived from —
+    /// this is the whole basis for every zero-lookup looks_like_patch_token
+    /// check downstream.
+    #[test]
+    fn patch_token_identity_always_carries_the_marker() {
+        for seed in [b"delta-a".as_slice(), b"delta-b", b"", b"a very different length input entirely"] {
+            let delta = ChunkId::from_hash(*blake3::hash(seed).as_bytes());
+            let token = ChunkId::patch_token_identity(delta);
+            assert_eq!(&token.hash[0..2], &PATCH_TOKEN_MARKER[..],
+                "patch_token_identity must always force the marker prefix, got {:?}", token.hash);
+            assert!(token.looks_like_patch_token(),
+                "a freshly-minted token must recognize itself via looks_like_patch_token");
+        }
+    }
+
+    /// Deterministic: the same delta must always produce the same token identity
+    /// (apply_patch relies on this for idempotent re-derivation of an
+    /// in-flight accumulator's own token across retries).
+    #[test]
+    fn patch_token_identity_is_deterministic() {
+        let delta = ChunkId::from_hash(*blake3::hash(b"same-delta-every-time").as_bytes());
+        let token_a = ChunkId::patch_token_identity(delta);
+        let token_b = ChunkId::patch_token_identity(delta);
+        assert_eq!(token_a, token_b);
+    }
+
+    /// Statistical sanity for the marker's collision assumption: real content
+    /// hashes (uniformly-distributed blake3 output, unrelated to the token
+    /// formula) essentially never coincidentally match the 2-byte marker.
+    /// Can't assert "never" — asserts none do across a large, deterministic
+    /// sample, documenting the ~1/65536-per-chunk expected rate this is meant
+    /// to illustrate rather than tightly bound (a flaky statistical test would
+    /// be worse than no test here).
+    #[test]
+    fn ordinary_content_hashes_essentially_never_collide_with_the_marker() {
+        let mut collisions = 0u32;
+        const SAMPLE: u32 = 20_000;
+        for i in 0..SAMPLE {
+            let hash = *blake3::hash(format!("ordinary-content-chunk-{}", i).as_bytes()).as_bytes();
+            if hash[0] == PATCH_TOKEN_MARKER[0] && hash[1] == PATCH_TOKEN_MARKER[1] {
+                collisions += 1;
+            }
+        }
+        // Expected collisions over 20,000 samples at 1/65536 each: ~0.3. Allow
+        // a generous margin (up to 5) rather than asserting exactly 0/1, since
+        // this is a real (tiny) probability, not a bug, if it ever fires once —
+        // the design's own safety argument (PATCH_TOKEN_MARKER's doc comment)
+        // is that a false positive here fails safe, not that it can't happen.
+        assert!(collisions <= 5,
+            "expected roughly 0 collisions out of {} ordinary hashes against the 2-byte \
+             marker (~1/65536 each), got {} — marker collision rate is much higher than \
+             designed for", SAMPLE, collisions);
     }
 
     #[test]

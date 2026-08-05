@@ -1146,6 +1146,21 @@ pub struct DfsClient {
     /// Reset alongside active_fold_started_at wherever that resets.
     active_fold_bytes: Arc<DashMap<(FileId, u64), usize>>,
 
+    /// When (file_id, chunk_idx)'s most recent ForceFold actually completed —
+    /// distinct from active_fold_started_at, which also gets seeded on a
+    /// slot's very first-ever patch (no prior fold at all). Only present once
+    /// at least one fold has happened for this slot; absence means "no
+    /// cooldown to respect," not "long ago." See ACTIVE_FOLD_MIN_INTERVAL's
+    /// doc comment at its use site for why this had to be a separate map:
+    /// gating the min-interval floor on active_fold_started_at alone punished
+    /// a slot's first-ever fold the same as a hot slot's fifth fold in a row,
+    /// which measurably cost sequential-write throughput (~20% in a local
+    /// benchmark, 2026-08-05) for workloads that legitimately cross the
+    /// byte/count thresholds within a couple hundred ms of first touching a
+    /// chunk — the common case, not the pathological one this floor exists
+    /// for. Pruned alongside active_fold_started_at in start_hot_chunk_sweeper.
+    active_fold_last_completed: Arc<DashMap<(FileId, u64), Instant>>,
+
     /// Chunks currently classified "hot" — only these consult the fold-trigger
     /// logic below (active_fold_interval/bytes/count); everything else applies
     /// patches directly and skips fold-trigger evaluation entirely, since most
@@ -1397,6 +1412,7 @@ leader_addr: Arc::new(RwLock::new(None)),
             active_fold_started_at: Arc::new(DashMap::new()),
             active_fold_patch_count: Arc::new(DashMap::new()),
             active_fold_bytes: Arc::new(DashMap::new()),
+            active_fold_last_completed: Arc::new(DashMap::new()),
             hot_chunk_slots: Arc::new(DashSet::new()),
             active_fold_failure_backoff: Arc::new(DashMap::new()),
             fold_concurrency: Arc::new(tokio::sync::Semaphore::new(
@@ -3987,6 +4003,11 @@ leader_addr: Arc::new(RwLock::new(None)),
                 // hot slot that hasn't been touched by this sweep's first branch
                 // since it's protected by the hot_chunk_slots check there too).
                 client.active_fold_patch_count.retain(|key, _| client.active_fold_started_at.contains_key(key));
+                // active_fold_last_completed is only ever populated for a slot that
+                // has actually folded, a subset of active_fold_started_at's keys —
+                // same eviction rule keeps it bounded without ever dropping a live
+                // hot slot's cooldown clock.
+                client.active_fold_last_completed.retain(|key, _| client.active_fold_started_at.contains_key(key));
             }
         });
     }
@@ -7703,27 +7724,39 @@ leader_addr: Arc::new(RwLock::new(None)),
             // clearing the "no more than ~1 fold/sec" floor — in theory.
             const ACTIVE_FOLD_PATCH_THRESHOLD: u64 = 20; // was 30, then 50, 100, 500, 1000
 
-            // Floor on how soon ANY trigger (time/bytes/count) is allowed to fire,
-            // measured from this accumulator's first patch. Added 2026-08-05: the
-            // "~1 fold/sec" floor above was only ever a rate *estimate* from a
-            // measured average touch rate — it was never actually enforced. Under
-            // a genuinely hot slot (VM-108 qcow2 restore, live), patches arrived
-            // fast enough that the count trigger alone fired 4 times in 14
-            // seconds on one slot (as little as 1.3s apart) — raising the count
-            // threshold only buys a proportionally bigger burst before the same
-            // thing happens again at a higher patch rate; it doesn't bound the
-            // worst case. Each fold's superseded predecessor becomes a
-            // disk-orphan-sweep candidate, and that many folds on one slot in one
-            // burst was enough to flood the sweep with superseded-generation
-            // chunks (~68,800 in one pass), pegging CPU on the folding node and
-            // starving the healing dispatch loop badly enough that a chunk stuck
-            // at single-replica couldn't get its second copy pushed for 10+
-            // minutes. Gating all three triggers on this floor directly caps
-            // worst-case fold frequency per slot at 1 per MIN_INTERVAL,
-            // independent of patch rate or byte volume — the count/bytes
-            // thresholds keep their original job of preempting the full
-            // time-window wait during a busy-but-not-pathological period.
+            // Cooldown since this slot's LAST fold actually completed — a hot
+            // slot can't fold again faster than once per MIN_INTERVAL, no matter
+            // how fast time/bytes/count re-cross their thresholds. Added
+            // 2026-08-05: under a genuinely hot slot (VM-108 qcow2 restore,
+            // live), patches arrived fast enough that the count trigger alone
+            // fired 4 folds in 14 seconds on one slot (as little as 1.3s
+            // apart) — raising the count threshold only buys a proportionally
+            // bigger burst before the same thing recurs at a higher patch
+            // rate; it doesn't bound the worst case. Each fold's superseded
+            // predecessor becomes a disk-orphan-sweep candidate, and that many
+            // folds on one slot in one burst flooded the sweep with
+            // superseded-generation chunks (~68,800 in one pass), pegging CPU
+            // and starving the healing dispatch loop badly enough that a
+            // chunk stuck at single-replica couldn't get its second copy
+            // pushed for 10+ minutes.
+            //
+            // Deliberately gated on active_fold_last_completed, NOT elapsed
+            // time since this accumulator's first patch (active_fold_started_at) —
+            // the first version of this fix used the latter and cost ~20%
+            // sequential-write throughput in a local benchmark the same day:
+            // active_fold_started_at is also seeded on a slot's very first-ever
+            // patch, so gating on it punished every slot's first fold the same
+            // as a hot slot's fifth fold in a row. A sequential write with a
+            // sub-chunk block size routinely crosses the count/bytes threshold
+            // for a brand-new slot within a couple hundred ms — the common,
+            // healthy case, not the pathological one this cooldown exists for.
+            // A slot with no completed fold yet has no cooldown to respect and
+            // fires on its own thresholds exactly as before this change; only
+            // a slot's *second and later* fold in quick succession is held back.
             const ACTIVE_FOLD_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+            let cooldown_ok = self.active_fold_last_completed.get(&(file_id, cidx))
+                .map(|t| t.elapsed() >= ACTIVE_FOLD_MIN_INTERVAL)
+                .unwrap_or(true);
 
             let elapsed_since_start = self.active_fold_started_at.get(&(file_id, cidx)).map(|e| e.elapsed());
             let patch_count = {
@@ -7737,7 +7770,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // accumulator — seed the timer, nothing to fold yet.
                     self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
                 }
-                Some(elapsed) if elapsed >= ACTIVE_FOLD_MIN_INTERVAL && (
+                Some(elapsed) if cooldown_ok && (
                     elapsed >= active_fold_interval
                     || accumulated_bytes >= ACTIVE_FOLD_SIZE_THRESHOLD
                     || patch_count >= ACTIVE_FOLD_PATCH_THRESHOLD
@@ -7832,10 +7865,14 @@ leader_addr: Arc::new(RwLock::new(None)),
                             new_size = size;
                         }
                         // New generation starts accumulating from here.
-                        self.active_fold_started_at.insert((file_id, cidx), std::time::Instant::now());
+                        let fold_completed_at = std::time::Instant::now();
+                        self.active_fold_started_at.insert((file_id, cidx), fold_completed_at);
                         self.active_fold_patch_count.insert((file_id, cidx), 0);
                         self.active_fold_bytes.insert((file_id, cidx), 0);
                         self.active_fold_failure_backoff.remove(&(file_id, cidx));
+                        // Cooldown clock for the NEXT fold on this slot — see
+                        // ACTIVE_FOLD_MIN_INTERVAL's doc comment at its use site.
+                        self.active_fold_last_completed.insert((file_id, cidx), fold_completed_at);
                     } else {
                         let mut entry = self.active_fold_failure_backoff.entry((file_id, cidx)).or_insert((std::time::Instant::now(), 0));
                         entry.0 = std::time::Instant::now();

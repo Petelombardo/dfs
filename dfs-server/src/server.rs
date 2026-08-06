@@ -1614,6 +1614,7 @@ struct FoldFingerprint {
 
 /// Result of one coordinate_and_fold_slot attempt — see its doc comment and
 /// debounce_fold_slot's call site.
+#[derive(Debug, PartialEq, Eq)]
 enum CoordinatedFoldOutcome {
     /// This node folded (or the trivial NothingToDo/AdoptedElsewhere fallback
     /// resolved cleanly) — debounce_fold_slot's task for this slot is done.
@@ -2189,7 +2190,9 @@ impl OverlayForkCtx {
         mode: FoldCoordination,
     ) -> bool {
         if matches!(mode, FoldCoordination::Local) {
-            return !matches!(self.fold_slot_now(file_id, chunk_idx, false).await, FoldSlotOutcome::Failed);
+            // Local never reaches replicate_fold_result/announce_fold_result
+            // below — this is its only peer-directed broadcast, must stay on.
+            return !matches!(self.fold_slot_now(file_id, chunk_idx, false, true).await, FoldSlotOutcome::Failed);
         }
 
         // Captured BEFORE folding: fold_slot_now removes the dirty_patch_slots
@@ -2234,7 +2237,13 @@ impl OverlayForkCtx {
         // suite run): it tried to read bytes this node never had, failed, and
         // raised a spurious URGENT_SINGLE_REPLICA for a chunk the actual
         // coordinator was already replicating correctly elsewhere.
-        let (folded_id, final_size, buf, client_write_seq) = match self.fold_slot_now(file_id, chunk_idx, false).await {
+        // Reachable only for Wave/Async (Local returned above; the match below
+        // marks Local unreachable!()) — both always proceed into
+        // replicate_fold_result/announce_fold_result, which now covers every
+        // online node with a corrected, retried broadcast. This call's own
+        // self-only "remaining peers" broadcast would be pure duplicate
+        // traffic here, so it's turned off.
+        let (folded_id, final_size, buf, client_write_seq) = match self.fold_slot_now(file_id, chunk_idx, false, false).await {
             FoldSlotOutcome::FoldedHere(id, size, buf, cws) => (id, size, buf, cws),
             FoldSlotOutcome::AdoptedElsewhere | FoldSlotOutcome::NothingToDo => return true,
             FoldSlotOutcome::Failed => return false,
@@ -2407,7 +2416,7 @@ impl OverlayForkCtx {
         // final_size is used here (not re-derived) for the same reread-avoidance
         // reason as buf: it's the exact value full_rewrite_chunk produced.
         if !file_deleted && !holders.is_empty() {
-            self.announce_fold_result(file_id, chunk_idx, folded_id, final_size, client_write_seq, slot_token, &holders, peers).await;
+            self.announce_fold_result(file_id, chunk_idx, folded_id, final_size, client_write_seq, slot_token, &holders).await;
         }
     }
 
@@ -2426,7 +2435,6 @@ impl OverlayForkCtx {
         client_write_seq: Option<u64>,
         slot_token: Option<ChunkId>,
         holders: &[NodeId],
-        peers: &[(NodeId, SocketAddr)],
     ) {
         // final_size/client_write_seq come from run_single_fold's own
         // already-computed, race-free values (see FoldSlotOutcome::FoldedHere)
@@ -2496,7 +2504,6 @@ impl OverlayForkCtx {
             return;
         };
 
-        const ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
         let loc_req = Request::ReplicateChunkLocation {
             location: corrected.clone(),
             file_id: Some(file_id),
@@ -2504,37 +2511,62 @@ impl OverlayForkCtx {
         };
         let fold_req = Request::ReplicatePatchFold { public_token, real_chunk_id: folded_id, file_id, chunk_idx };
 
+        // Target every online node (not just the slot's own peers) — this now
+        // replaces run_single_fold's separate self-only "remaining peers"
+        // broadcast (see broadcast_to_peers's doc comment), so it needs to
+        // cover the same ground that broadcast did, including the leader:
+        // notify_leader_of_fold already told the leader about this fold with
+        // a SELF-ONLY view; this corrected, ground-truth-holder-set view is
+        // what the leader actually needs to avoid ever recording a single
+        // replica for a chunk that genuinely has two. Same retry shape
+        // run_single_fold's broadcast used to have (4 attempts, 1s timeout,
+        // 500ms backoff) — reused here rather than today's single un-retried
+        // attempt, since this is now the only mechanism most peers/the leader
+        // get this corrected payload through.
         let local_id = self.cluster.local_node_id();
-        let mut targets: Vec<SocketAddr> = peers.iter()
-            .filter(|(nid, _)| *nid != local_id)
-            .map(|(_, addr)| *addr)
+        let targets: Vec<(NodeId, SocketAddr)> = self.cluster.get_all_nodes().await
+            .into_iter()
+            .filter(|n| n.id != local_id && n.status == dfs_common::NodeStatus::Online)
+            .map(|n| (n.id, n.addr))
             .collect();
-        if let Some(leader_addr) = self.cluster.get_leader_addr().await {
-            if leader_addr != self.cluster.local_addr() && !targets.contains(&leader_addr) {
-                targets.push(leader_addr);
-            }
-        }
 
-        for addr in targets {
+        for (node_id, addr) in targets {
             let client = self.client.clone();
             let loc_req = loc_req.clone();
             let fold_req = fold_req.clone();
             tokio::spawn(async move {
-                let loc_ok = matches!(
-                    tokio::time::timeout(ANNOUNCE_TIMEOUT, client.send_message(addr, Message::Request(loc_req))).await,
-                    Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
-                );
-                let fold_ok = matches!(
-                    tokio::time::timeout(ANNOUNCE_TIMEOUT, client.send_message(addr, Message::Request(fold_req))).await,
-                    Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
-                );
+                const ATTEMPTS: u8 = 4;
+                const PER_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+                const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+                let mut loc_ok = false;
+                let mut fold_ok = false;
+                for attempt in 0..ATTEMPTS {
+                    if !loc_ok {
+                        loc_ok = matches!(
+                            tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client.send_message(addr, Message::Request(loc_req.clone()))).await,
+                            Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
+                        );
+                    }
+                    if !fold_ok {
+                        fold_ok = matches!(
+                            tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client.send_message(addr, Message::Request(fold_req.clone()))).await,
+                            Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
+                        );
+                    }
+                    if loc_ok && fold_ok {
+                        return;
+                    }
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(RETRY_BACKOFF).await;
+                    }
+                }
+                // pending_patch_fold_broadcasts' periodic rebroadcast loop
+                // (registered by run_single_fold for this same public_token)
+                // is still the backstop for a delivery that doesn't land even
+                // after these retries.
                 if !loc_ok || !fold_ok {
-                    // pending_patch_fold_broadcasts' periodic rebroadcast loop
-                    // (registered by run_single_fold for this same public_token)
-                    // is the existing backstop for a delivery that doesn't land
-                    // immediately — no separate retry loop needed here.
-                    debug!("fold coordination: announce to {} incomplete for {} -> {} (loc_ok={} fold_ok={})",
-                        addr, public_token, folded_id, loc_ok, fold_ok);
+                    debug!("fold coordination: announce to {} ({}) incomplete after {} attempts for {} -> {} (loc_ok={} fold_ok={})",
+                        node_id, addr, ATTEMPTS, public_token, folded_id, loc_ok, fold_ok);
                 }
             });
         }
@@ -2672,6 +2704,20 @@ impl OverlayForkCtx {
     /// concurrent load — a real, measured throughput regression, not just a
     /// theoretical one: exactly the class of foreground-latency cost this
     /// semaphore was built to protect, being paid by the wrong caller.
+    ///
+    /// `broadcast_to_peers`: false when the caller is about to run
+    /// `replicate_fold_result`/`announce_fold_result` right after this
+    /// returns (fold_slot_coordinated's Wave/Async paths) — that function now
+    /// covers every online node with a corrected, retried broadcast, making
+    /// this function's own self-only-view "remaining peers" broadcast below
+    /// pure duplicate traffic in that case. true for every caller that never
+    /// reaches announce_fold_result (Local mode, handle_force_fold's direct
+    /// path, the one existing test call site) — those still need this as
+    /// their only peer-directed broadcast. Added 2026-08-06 after
+    /// dfs-admin rpc-stats showed peer_other (dominated by
+    /// ReplicateChunkLocation/ReplicateChunkLocations) as the single largest
+    /// RPC class cluster-wide — a coordinated fold was announcing itself via
+    /// two separate mechanisms to overlapping recipients.
     #[allow(clippy::too_many_arguments)]
     async fn run_single_fold(
         &self,
@@ -2684,6 +2730,7 @@ impl OverlayForkCtx {
         delta_client_write_seq: Option<u64>,
         patch_written_at: u64,
         is_client_initiated: bool,
+        broadcast_to_peers: bool,
     ) -> Option<(ChunkId, usize, Arc<Vec<u8>>, Option<u64>)> {
         // Cheapest possible check first, before any chunk read/hash work: a
         // deleted file's Pending patch can never matter again regardless of
@@ -3140,6 +3187,13 @@ impl OverlayForkCtx {
             // proven backstop for a broadcast that doesn't land immediately, so
             // paying for it here synchronously was pure unnecessary lock-hold
             // time — that reasoning still holds for non-leader peers.
+            //
+            // Skipped entirely when broadcast_to_peers is false — see this
+            // function's doc comment. announce_fold_result (called by the
+            // caller right after this returns, in that case) now covers every
+            // online node with a corrected, retried broadcast, making this
+            // self-only-view send pure duplicate traffic.
+            if broadcast_to_peers {
             let cluster = self.cluster.clone();
             let client = self.client.clone();
             // Fix S: capture the fold result's generation before the detached task so
@@ -3215,6 +3269,7 @@ impl OverlayForkCtx {
                     });
                 }
             });
+            }
         } else {
             warn!("single fold: no ChunkLocation found for freshly-folded {} — cannot broadcast to cluster", new_chunk_id);
         }
@@ -3707,7 +3762,12 @@ impl OverlayForkCtx {
     /// internal call (the idle-debounce/coordinated background path) — passed
     /// straight through to run_single_fold, see its doc comment for why this
     /// distinction exists.
-    async fn fold_slot_now(&self, file_id: FileId, chunk_idx: u64, is_client_initiated: bool) -> FoldSlotOutcome {
+    ///
+    /// `broadcast_to_peers`: passed straight through to run_single_fold — see
+    /// its doc comment. false only from fold_slot_coordinated's shared
+    /// Wave/Async call site (which announces via announce_fold_result right
+    /// after); true from every other caller.
+    async fn fold_slot_now(&self, file_id: FileId, chunk_idx: u64, is_client_initiated: bool, broadcast_to_peers: bool) -> FoldSlotOutcome {
         self.wait_if_compaction_quiescing().await;
         let lock = self.chunk_patch_locks
             .entry((file_id, chunk_idx))
@@ -3785,7 +3845,7 @@ impl OverlayForkCtx {
         self.active_fold_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = self.run_single_fold(
             file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, client_write_seq,
-            patch_written_at, is_client_initiated,
+            patch_written_at, is_client_initiated, broadcast_to_peers,
         ).await;
         self.active_fold_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         match result {
@@ -13401,7 +13461,9 @@ impl Server {
     /// client" mismatch this whole ForceFold mechanism exists to prevent.
     async fn handle_force_fold(&self, file_id: dfs_common::FileId, chunk_idx: u64) -> Response {
         self.wait_if_compaction_quiescing().await;
-        if matches!(self.overlay_ctx().fold_slot_now(file_id, chunk_idx, true).await, FoldSlotOutcome::Failed) {
+        // ForceFold bypasses fold_slot_coordinated entirely — never reaches
+        // announce_fold_result, so this is its only peer-directed broadcast.
+        if matches!(self.overlay_ctx().fold_slot_now(file_id, chunk_idx, true, true).await, FoldSlotOutcome::Failed) {
             return Response::Error {
                 message: format!("ForceFold: fold failed for file {} chunk {}", file_id, chunk_idx),
                 code: ErrorCode::InternalError,
@@ -16935,7 +16997,7 @@ mod tests {
         let ctx = server.overlay_ctx();
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let result = ctx.run_single_fold(
-            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), now_secs, false,
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), now_secs, false, true,
         ).await;
         let (new_chunk_id, ..) = result.expect("fold should succeed: base and delta are both valid");
         assert_ne!(new_chunk_id, base_chunk_id, "the delta changes content, so this must not be a no-op fold");
@@ -19977,7 +20039,7 @@ mod tests {
             // from this exact state — i.e. this is a valid, retryable starting point.
             // Force it directly rather than waiting on the debounce timer, since
             // apply_patch was never called here to spawn one.
-            assert!(matches!(h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false).await, FoldSlotOutcome::FoldedHere(..)),
+            assert!(matches!(h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false, true).await, FoldSlotOutcome::FoldedHere(..)),
                 "fold must succeed from this Pending state");
             let state = h.metadata.get_patch_state(&public_token).unwrap().unwrap();
             let folded = match state {
@@ -20027,7 +20089,7 @@ mod tests {
                 materialized_max_seq: None,
             });
 
-            let outcome = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false).await;
+            let outcome = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false, true).await;
             assert!(matches!(outcome, FoldSlotOutcome::Failed),
                 "no run_single_fold path returns a dedicated Abandoned variant — Failed is expected; \
                  get_patch_state below is what actually distinguishes abandonment from a real retryable failure");
@@ -20083,7 +20145,7 @@ mod tests {
                 materialized_max_seq: None,
             });
 
-            let outcome = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false).await;
+            let outcome = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false, true).await;
             let outcome_desc = match &outcome {
                 FoldSlotOutcome::FoldedHere(..) => "FoldedHere",
                 FoldSlotOutcome::NothingToDo => "NothingToDo",
@@ -20412,6 +20474,355 @@ mod tests {
             "chunk_map says this chunk is file {}'s current live content — ConfirmChunksLive \
              must not tell a follower it's safe to delete just because FILE_TABLE hasn't \
              caught up yet", file_id);
+    }
+
+    /// Tests for broadcast_to_peers (added 2026-08-06 to collapse the fold
+    /// winner's redundant self-announcements — see run_single_fold's doc
+    /// comment). A real second NetworkServer, registered as an Online peer in
+    /// the test Server's own ClusterManager, stands in for a genuine peer so
+    /// these tests observe real wire behavior (did a connection/request
+    /// actually arrive) rather than trusting the parameter threading by
+    /// inspection alone.
+    mod broadcast_to_peers_tests {
+        use super::*;
+        use crate::network::{MessageHandler, NetworkServer};
+        use dfs_common::NodeInfo;
+        use std::sync::atomic::AtomicU64;
+
+        /// Counts ReplicateChunkLocation/ReplicatePatchFold arrivals and acks
+        /// everything with Ok — stands in for a real peer node.
+        struct CountingPeerHandler {
+            loc_count: Arc<AtomicU64>,
+            fold_count: Arc<AtomicU64>,
+        }
+
+        impl MessageHandler for CountingPeerHandler {
+            fn handle_request(
+                &self,
+                request: Request,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                match &request {
+                    Request::ReplicateChunkLocation { .. } => { self.loc_count.fetch_add(1, Ordering::Relaxed); }
+                    Request::ReplicatePatchFold { .. } => { self.fold_count.fetch_add(1, Ordering::Relaxed); }
+                    _ => {}
+                }
+                Box::pin(async move {
+                    match request {
+                        // confirm_chunk_holders's HasChunks poll — answer "yes I
+                        // have it" so replicate_fold_result doesn't also try to
+                        // push bytes via WriteChunk (unhandled here, would
+                        // otherwise just error harmlessly, but keeping the
+                        // fixture minimal and predictable).
+                        Request::HasChunks { chunk_ids } => Response::BoolVec { values: vec![true; chunk_ids.len()] },
+                        _ => Response::Ok { data: None },
+                    }
+                })
+            }
+            fn handle_cluster_message(
+                &self,
+                _message: ClusterMessage,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async move { Response::Ok { data: None } })
+            }
+        }
+
+        /// Starts a real fake-peer NetworkServer and registers it as an Online
+        /// node (at `addr`) in `h`'s own ClusterManager. Returns the shared
+        /// counters so the test can assert on what actually arrived.
+        ///
+        /// Server.client is a NetworkClient::new_for_peers() instance, so every
+        /// outbound peer RPC dials network::peer_port_addr(addr) — addr.port()
+        /// + PEER_PORT_OFFSET — not addr itself. The fake peer must listen on
+        /// that derived port or every broadcast silently connection-refuses.
+        async fn spawn_fake_peer(h: &OverlayTestHarness, addr: SocketAddr) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+            let loc_count = Arc::new(AtomicU64::new(0));
+            let fold_count = Arc::new(AtomicU64::new(0));
+            let handler = Arc::new(CountingPeerHandler { loc_count: loc_count.clone(), fold_count: fold_count.clone() });
+            let listen_addr = crate::network::peer_port_addr(addr);
+            let mut net_server = NetworkServer::new(listen_addr, handler, 10);
+            tokio::spawn(async move { net_server.start().await.ok(); });
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // is_leader() is "min NodeId among Online" (cluster.rs) — force the
+            // fake peer to a guaranteed-maximal NodeId so the local harness
+            // node always wins leadership deterministically, instead of
+            // relying on NodeId::new()'s random UUID ordering.
+            let peer_id = NodeId::from_bytes([0xffu8; 16]);
+            h.server.cluster().add_node(NodeInfo::new(peer_id, addr, None)).await.unwrap();
+            assert!(h.server.cluster().is_leader().await,
+                "test assumes the local node is leader (so notify_leader_of_fold never contacts the fake peer)");
+
+            (loc_count, fold_count)
+        }
+
+        /// Sets up a fresh Pending patch on a real base+delta pair, ready for
+        /// run_single_fold. Returns the args run_single_fold needs.
+        fn setup_pending_patch(h: &OverlayTestHarness, file_id: FileId, chunk_idx: u64, tag: &str)
+            -> (ChunkId, ChunkId, ChunkId, ChunkId, u64)
+        {
+            let original_data = vec![0u8; 4096];
+            // Must be compute_chunk_hash_at (file_id + offset mixed in), not plain
+            // compute_chunk_hash — full_rewrite_chunk's self-verify (server.rs ~1142)
+            // recomputes the base's hash with compute_chunk_hash_at against exactly
+            // this (file_id, chunk_file_offset=0) pair and rejects a mismatch as
+            // "disk corruption detected". See compute_chunk_hash_at's doc comment.
+            let original_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, 0, file_id)
+            );
+            h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+            let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+            delta_bytes.extend_from_slice(&encode_delta_record(1, 0, &[1u8; 100]));
+            let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
+            h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
+
+            let public_token = ChunkId::from_hash(compute_chunk_hash(format!("broadcast-test-{}", tag).as_bytes()));
+            h.metadata.put_patch_state_pending(
+                file_id, chunk_idx, &public_token, original_chunk_id, delta_chunk_id, 4096, 1000, Some(1),
+            ).unwrap();
+
+            let mut file_meta = dfs_common::FileMetadata::new(format!("/broadcast-test-{}", tag), dfs_common::types::FileType::RegularFile);
+            file_meta.id = file_id;
+            h.metadata.put_file(&file_meta).unwrap();
+
+            let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            (public_token, original_chunk_id, delta_chunk_id, delta_chunk_id, now_secs)
+        }
+
+        #[tokio::test]
+        async fn broadcast_to_peers_true_reaches_the_peer() {
+            let h = make_overlay_test_harness();
+            let peer_addr: SocketAddr = "127.0.0.1:19301".parse().unwrap();
+            let (loc_count, fold_count) = spawn_fake_peer(&h, peer_addr).await;
+
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+            let (public_token, base_chunk_id, delta_chunk_id, _dup, now_secs) =
+                setup_pending_patch(&h, file_id, chunk_idx, "true-case");
+            let chunk_file_offset = 0u64;
+
+            let result = h.server.overlay_ctx().run_single_fold(
+                file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id,
+                Some(1), now_secs, false, true,
+            ).await;
+            assert!(result.is_some(), "fold must succeed for this test to mean anything");
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            assert!(loc_count.load(Ordering::Relaxed) >= 1,
+                "broadcast_to_peers=true must reach the peer with ReplicateChunkLocation");
+            assert!(fold_count.load(Ordering::Relaxed) >= 1,
+                "broadcast_to_peers=true must reach the peer with ReplicatePatchFold");
+        }
+
+        #[tokio::test]
+        async fn broadcast_to_peers_false_does_not_reach_the_peer() {
+            let h = make_overlay_test_harness();
+            let peer_addr: SocketAddr = "127.0.0.1:19302".parse().unwrap();
+            let (loc_count, fold_count) = spawn_fake_peer(&h, peer_addr).await;
+
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+            let (public_token, base_chunk_id, delta_chunk_id, _dup, now_secs) =
+                setup_pending_patch(&h, file_id, chunk_idx, "false-case");
+            let chunk_file_offset = 0u64;
+
+            let result = h.server.overlay_ctx().run_single_fold(
+                file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id,
+                Some(1), now_secs, false, false,
+            ).await;
+            assert!(result.is_some(), "fold must succeed for this test to mean anything");
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            assert_eq!(loc_count.load(Ordering::Relaxed), 0,
+                "broadcast_to_peers=false must suppress run_single_fold's own ReplicateChunkLocation broadcast \
+                 — the caller (fold_slot_coordinated's Wave/Async path) is responsible for announcing instead");
+            assert_eq!(fold_count.load(Ordering::Relaxed), 0,
+                "broadcast_to_peers=false must suppress run_single_fold's own ReplicatePatchFold broadcast");
+        }
+    }
+
+    /// Tests that drive real ProposeFold/FoldLockGrant coordination (added
+    /// 2026-08-06) — unlike broadcast_to_peers_tests above, which calls
+    /// run_single_fold directly and never exercises coordinate_and_fold_slot
+    /// at all, these go through coordinate_and_fold_slot itself so a genuine
+    /// ProposeFold round-trips to a real peer before folding. Confirmed via a
+    /// live staging benchmark (2026-08-06) that a single sequential writer
+    /// essentially never reaches this path in production (~14900
+    /// "local_fold_fingerprint unavailable" skips vs. dozens of real
+    /// coordination attempts) — before this module, that also meant zero
+    /// automated coverage of ProposeFold/ReleaseFoldLock ever ran in the
+    /// suite. Also the only way to directly prove broadcast_to_peers's 2-
+    /// rounds-to-1 claim under real coordination rather than a synthetic
+    /// direct call.
+    mod propose_fold_coordination_tests {
+        use super::*;
+        use crate::network::{MessageHandler, NetworkServer};
+        use dfs_common::{ChunkLocation, NodeInfo};
+        use dfs_common::protocol::{ProposeFoldOutcome};
+        use std::sync::atomic::AtomicU64;
+
+        /// Grants every ProposeFold unconditionally, acks ReleaseFoldLock, and
+        /// counts ProposeFold/ReplicateChunkLocation/ReplicatePatchFold
+        /// arrivals — stands in for a real, cooperative peer replica.
+        struct CoordinatingPeerHandler {
+            propose_count: Arc<AtomicU64>,
+            loc_count: Arc<AtomicU64>,
+            fold_count: Arc<AtomicU64>,
+        }
+
+        impl MessageHandler for CoordinatingPeerHandler {
+            fn handle_request(
+                &self,
+                request: Request,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                match &request {
+                    Request::ProposeFold { .. } => { self.propose_count.fetch_add(1, Ordering::Relaxed); }
+                    Request::ReplicateChunkLocation { .. } => { self.loc_count.fetch_add(1, Ordering::Relaxed); }
+                    Request::ReplicatePatchFold { .. } => { self.fold_count.fetch_add(1, Ordering::Relaxed); }
+                    _ => {}
+                }
+                Box::pin(async move {
+                    match request {
+                        Request::ProposeFold { .. } =>
+                            Response::ProposeFoldResult { outcome: ProposeFoldOutcome::Granted },
+                        Request::HasChunks { chunk_ids } => Response::BoolVec { values: vec![true; chunk_ids.len()] },
+                        _ => Response::Ok { data: None },
+                    }
+                })
+            }
+            fn handle_cluster_message(
+                &self,
+                _message: ClusterMessage,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async move { Response::Ok { data: None } })
+            }
+        }
+
+        /// Starts a real fake-peer NetworkServer, registers it Online in `h`'s
+        /// ClusterManager, AND (unlike broadcast_to_peers_tests's fake peer)
+        /// registers it in chunk_map as a holder of this slot's chunk — that's
+        /// what slot_replica_peers actually reads to decide who to propose to.
+        async fn spawn_coordinating_peer(
+            h: &OverlayTestHarness, addr: SocketAddr, file_id: FileId, chunk_idx: u64, base_chunk_id: ChunkId,
+        ) -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let propose_count = Arc::new(AtomicU64::new(0));
+            let loc_count = Arc::new(AtomicU64::new(0));
+            let fold_count = Arc::new(AtomicU64::new(0));
+            let handler = Arc::new(CoordinatingPeerHandler {
+                propose_count: propose_count.clone(), loc_count: loc_count.clone(), fold_count: fold_count.clone(),
+            });
+            let listen_addr = crate::network::peer_port_addr(addr);
+            let mut net_server = NetworkServer::new(listen_addr, handler, 10);
+            tokio::spawn(async move { net_server.start().await.ok(); });
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Same deterministic-leader trick as broadcast_to_peers_tests:
+            // coordinate_and_fold_slot doesn't itself require local to be
+            // leader, but notify_leader_of_fold (reached via
+            // fold_slot_coordinated once ProposeFold is granted) does, and we
+            // don't want it confusing this test's counts by contacting the
+            // fake peer as "the leader" too.
+            let peer_id = NodeId::from_bytes([0xffu8; 16]);
+            h.server.cluster().add_node(NodeInfo::new(peer_id, addr, None)).await.unwrap();
+            assert!(h.server.cluster().is_leader().await,
+                "test assumes the local node is leader");
+
+            let local_id = h.server.cluster().local_node_id();
+            let chunk_file_offset = chunk_idx * 4 * 1024 * 1024;
+            let loc = ChunkLocation {
+                chunk_id: base_chunk_id,
+                nodes: vec![local_id, peer_id],
+                size: 4096,
+                checksum: base_chunk_id.hash,
+                file_offset: Some(chunk_file_offset),
+                written_at: Some(1000),
+                client_write_seq: Some(1),
+                file_id: Some(file_id),
+            };
+            h.server.chunk_map.insert(file_id, (vec![loc], 1));
+
+            (propose_count, loc_count, fold_count)
+        }
+
+        /// Sets up a Pending patch AND seeds dirty_patch_slots — the second
+        /// part is what broadcast_to_peers_tests's setup_pending_patch didn't
+        /// need (run_single_fold reads patch_state directly), but
+        /// coordinate_and_fold_slot's local_fold_fingerprint reads
+        /// dirty_patch_slots first and returns None (skipping coordination
+        /// entirely) if it's absent — this is the exact "unavailable" skip
+        /// path this module exists to NOT take.
+        fn setup_coordinated_patch(h: &OverlayTestHarness, file_id: FileId, chunk_idx: u64, tag: &str) -> ChunkId {
+            let original_data = vec![0u8; 4096];
+            let original_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, chunk_idx * 4 * 1024 * 1024, file_id)
+            );
+            h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+            let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+            delta_bytes.extend_from_slice(&encode_delta_record(1, 0, &[1u8; 100]));
+            let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
+            h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
+
+            let public_token = ChunkId::from_hash(compute_chunk_hash(format!("propose-fold-test-{}", tag).as_bytes()));
+            h.metadata.put_patch_state_pending(
+                file_id, chunk_idx, &public_token, original_chunk_id, delta_chunk_id, 4096, 1000, Some(1),
+            ).unwrap();
+
+            let mut file_meta = dfs_common::FileMetadata::new(format!("/propose-fold-test-{}", tag), dfs_common::types::FileType::RegularFile);
+            file_meta.id = file_id;
+            h.metadata.put_file(&file_meta).unwrap();
+
+            h.server.overlay_ctx().dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+                token: public_token,
+                last_patch_at: std::time::Instant::now(),
+                delta_hasher: blake3::Hasher::new(),
+                verified: false,
+                legacy_delta_format: false,
+                fold_failures: 0,
+                last_fold_attempt_at: std::time::Instant::now(),
+                materialized_max_seq: None,
+            });
+
+            original_chunk_id
+        }
+
+        #[tokio::test]
+        async fn coordinate_and_fold_slot_reaches_real_propose_fold_and_broadcasts_once() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+
+            // base chunk_id has to be known before spawn_coordinating_peer (it
+            // seeds chunk_map with it), so compute it the same way
+            // setup_coordinated_patch will, then set up the patch after.
+            let original_data = vec![0u8; 4096];
+            let base_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, 0, file_id)
+            );
+
+            let peer_addr: SocketAddr = "127.0.0.1:19311".parse().unwrap();
+            let (propose_count, loc_count, fold_count) =
+                spawn_coordinating_peer(&h, peer_addr, file_id, chunk_idx, base_chunk_id).await;
+
+            setup_coordinated_patch(&h, file_id, chunk_idx, "coord-case");
+
+            let outcome = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
+            assert_eq!(outcome, CoordinatedFoldOutcome::Done,
+                "coordinate_and_fold_slot must succeed for this test to mean anything");
+
+            assert_eq!(propose_count.load(Ordering::Relaxed), 1,
+                "the peer must have received exactly one real ProposeFold — proof coordination \
+                 actually fired, not the local_fold_fingerprint-unavailable skip path");
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            assert_eq!(loc_count.load(Ordering::Relaxed), 1,
+                "a coordinated fold must reach the peer with exactly ONE ReplicateChunkLocation \
+                 (announce_fold_result only) — two would mean run_single_fold's own broadcast \
+                 fired too, i.e. the broadcast_to_peers=false gating regressed under real \
+                 coordination, not just the synthetic direct-call test");
+            assert_eq!(fold_count.load(Ordering::Relaxed), 1,
+                "a coordinated fold must reach the peer with exactly ONE ReplicatePatchFold");
+        }
     }
 }
 

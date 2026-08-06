@@ -1387,6 +1387,30 @@ struct DirtyPatchSlot {
 /// almost always beat it under any real write pattern.
 const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Minimum time a Pending patch must have existed before a local "file
+/// doesn't exist" reading is trusted enough to abandon it (see
+/// OverlayForkCtx::abandon_patch_if_file_gone).
+///
+/// Added 2026-08-06 after a real, reproduced regression: without this gate,
+/// T38 (rolling restart of all 5 nodes during a slow write) failed twice in a
+/// row locally (confirmed via a controlled A/B — same build, guard on vs.
+/// off, only the "on" runs failed) — a file's own FileMetadata is created
+/// moments before its chunks start getting patched, so a node that just
+/// restarted can genuinely not have caught up on that file's metadata gossip
+/// yet, making file_exists_by_id_async return a false negative for a file
+/// that is very much still live. This is the same class of mistake the
+/// 2026-07-24 orphan-dequeue v1 flaw made with a wall-clock "self_settled"
+/// proxy standing in for real convergence — except here there's no cheap
+/// durable ground-truth equivalent to lean on (unlike that fix's move to
+/// metadata.live_chunk_ids()), so a plain age floor is the mitigation: wait
+/// long enough that any legitimate metadata gossip delay has certainly
+/// resolved before trusting a negative result. 10 minutes is far longer than
+/// any realistic gossip/dissemination delay, while still being a small
+/// fraction of "stuck for hours" (the actual staging symptom this whole
+/// guard exists to fix) — real orphans still clear promptly, just not
+/// instantly.
+const MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// What fold_slot_now actually did on this call — distinguishes "this node
 /// computed a new result" from "the slot was already resolved", which
 /// fold_slot_coordinated needs to know: only the node that actually ran the
@@ -1851,6 +1875,57 @@ impl OverlayForkCtx {
             Err(e) => {
                 warn!("single fold: failed to check cluster-wide registration for {} chunk {}: {} — leaving Pending, not abandoning on an inconclusive check",
                     which, missing_chunk_id, e);
+            }
+        }
+    }
+
+    /// Abandon and clean up a Pending patch whose file has been deleted.
+    ///
+    /// Added 2026-08-06 after 11 PatchState::Pending rows sat stuck for hours
+    /// on staging. abandon_patch_if_base_gone only fires on a "no CHUNK_TABLE
+    /// record anywhere" failure (a missing chunk_id) — it's never reached by a
+    /// content-hash-mismatch failure (full_rewrite_chunk's pre-fold
+    /// verification), which deliberately leaves patch_state Pending rather
+    /// than risk abandoning something transient/recoverable. But file
+    /// existence is a strictly prior, independent question from either
+    /// failure mode: confirmed live that one of the 11 stuck patches belonged
+    /// to a file already found deleted by an unrelated check
+    /// (file_exists_by_id_async, the same helper used here — see
+    /// healing.rs's orphan-chunk routing-table cleanup). Neither
+    /// run_single_fold nor abandon_patch_if_base_gone ever checked file
+    /// existence, only chunk-level registration, so a deleted file's Pending
+    /// patch could never be abandoned no matter which chunk-level failure it
+    /// hit on retry.
+    ///
+    /// UNLIKE abandon_patch_if_base_gone's chunk-level check, this is NOT
+    /// unconditionally safe to call the instant a fold is attempted — see
+    /// MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK's doc comment for why the
+    /// caller must gate on patch age first. This function itself trusts
+    /// whatever it's told; the age gate lives at the call site.
+    ///
+    /// Returns true if the patch was abandoned (caller should return early
+    /// without attempting any chunk read/hash work for it).
+    async fn abandon_patch_if_file_gone(
+        &self,
+        file_id: FileId,
+        chunk_idx: u64,
+        public_token: ChunkId,
+    ) -> bool {
+        match self.metadata.file_exists_by_id_async(file_id).await {
+            Ok(false) => {
+                warn!("single fold: file {} no longer exists — abandoning unrecoverable Pending patch {} (chunk_idx {})",
+                    file_id, public_token, chunk_idx);
+                self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+                if let Err(e) = self.metadata.delete_patch_state_abandoned_async(public_token, file_id, chunk_idx).await {
+                    warn!("single fold: failed to delete abandoned patch_state for {}: {}", public_token, e);
+                }
+                true
+            }
+            Ok(true) => false,
+            Err(e) => {
+                warn!("single fold: failed to check file existence for {} (patch {}): {} — leaving Pending, not abandoning on an inconclusive check",
+                    file_id, public_token, e);
+                false
             }
         }
     }
@@ -2488,8 +2563,21 @@ impl OverlayForkCtx {
         base_chunk_id: ChunkId,
         delta_chunk_id: ChunkId,
         delta_client_write_seq: Option<u64>,
+        patch_written_at: u64,
         is_client_initiated: bool,
     ) -> Option<(ChunkId, usize, Arc<Vec<u8>>, Option<u64>)> {
+        // Cheapest possible check first, before any chunk read/hash work: a
+        // deleted file's Pending patch can never matter again regardless of
+        // what state its base/delta chunks are in. See
+        // abandon_patch_if_file_gone's doc comment for the gap this closes —
+        // and for why this is gated on patch age (MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK).
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if now_secs.saturating_sub(patch_written_at) >= MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK.as_secs()
+            && self.abandon_patch_if_file_gone(file_id, chunk_idx, public_token).await
+        {
+            return None;
+        }
+
         // Cancel base_chunk_id's healing in the background, right away — base_chunk_id
         // is about to be retired by this fold, and there should never be a need for
         // a heal and a fold's retirement of the same chunk to race. See
@@ -3515,8 +3603,8 @@ impl OverlayForkCtx {
             return FoldSlotOutcome::NothingToDo; // nothing pending — already folded
         };
         let pending = match self.metadata.get_patch_state_async(public_token).await {
-            Ok(Some(PatchState::Pending { base_chunk_id, delta_chunk_id, client_write_seq, .. })) => {
-                (base_chunk_id, delta_chunk_id, client_write_seq)
+            Ok(Some(PatchState::Pending { base_chunk_id, delta_chunk_id, client_write_seq, written_at, .. })) => {
+                (base_chunk_id, delta_chunk_id, client_write_seq, written_at)
             }
             Ok(Some(PatchState::Folded(real_chunk_id))) => {
                 // Another caller folded this slot first. That used to return a
@@ -3564,7 +3652,7 @@ impl OverlayForkCtx {
                 return FoldSlotOutcome::Failed;
             }
         };
-        let (base_chunk_id, delta_chunk_id, client_write_seq) = pending;
+        let (base_chunk_id, delta_chunk_id, client_write_seq, patch_written_at) = pending;
         const CHUNK_SIZE_U64: u64 = 4 * 1024 * 1024;
         let chunk_file_offset = chunk_idx * CHUNK_SIZE_U64;
 
@@ -3578,7 +3666,7 @@ impl OverlayForkCtx {
         self.active_fold_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = self.run_single_fold(
             file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, client_write_seq,
-            is_client_initiated,
+            patch_written_at, is_client_initiated,
         ).await;
         self.active_fold_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         match result {
@@ -16606,8 +16694,9 @@ mod tests {
         // OverlayForkCtx (the Arc-bundle the background fold task runs from, not
         // &Server directly) — see Server::overlay_ctx's doc comment.
         let ctx = server.overlay_ctx();
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let result = ctx.run_single_fold(
-            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), false,
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), now_secs, false,
         ).await;
         let (new_chunk_id, ..) = result.expect("fold should succeed: base and delta are both valid");
         assert_ne!(new_chunk_id, base_chunk_id, "the delta changes content, so this must not be a no-op fold");
@@ -19585,6 +19674,15 @@ mod tests {
             let file_id = dfs_common::FileId::new();
             let chunk_idx = 0u64;
 
+            // A real Pending patch always belongs to an already-created file — needed
+            // so abandon_patch_if_file_gone's existence check doesn't (correctly)
+            // abandon this test's patch before the fold under test ever runs.
+            let mut file_meta = dfs_common::FileMetadata::new(
+                format!("/test_{}", file_id), dfs_common::types::FileType::RegularFile,
+            );
+            file_meta.id = file_id;
+            h.metadata.put_file(&file_meta).unwrap();
+
             let original_data = vec![0u8; 4096];
             let original_hash = compute_chunk_hash(&original_data);
             let original_chunk_id = ChunkId::from_hash(original_hash);
@@ -19651,6 +19749,116 @@ mod tests {
             let mut expected = original_data.clone();
             expected[0..100].copy_from_slice(&[1u8; 100]);
             assert_eq!(resolved.as_slice(), expected.as_slice());
+        }
+
+        /// abandon_patch_if_file_gone (added 2026-08-06): a Pending patch whose
+        /// file was deleted must be abandoned outright on the very next fold
+        /// attempt, regardless of what state its base/delta chunks are in —
+        /// see that function's doc comment for the live incident (11 patches
+        /// stuck for hours on staging) this closes.
+        #[tokio::test]
+        async fn pending_patch_for_deleted_file_is_abandoned_not_retried() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let chunk_idx = 0u64;
+
+            // Deliberately never call h.metadata.put_file — this file_id has no
+            // FILE_TABLE row, simulating a file that existed when the patch was
+            // created but has since been deleted.
+            let original_data = vec![0u8; 4096];
+            let original_chunk_id = ChunkId::from_hash(compute_chunk_hash(&original_data));
+            h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+            let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+            delta_bytes.extend_from_slice(&encode_delta_record(1, 0, &[1u8; 100]));
+            let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
+            h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
+            let public_token = ChunkId::from_hash(compute_chunk_hash(b"deleted-file-pending-token"));
+            h.metadata.put_patch_state_pending(
+                file_id, chunk_idx, &public_token, original_chunk_id, delta_chunk_id, 4096, 1000, Some(1),
+            ).unwrap();
+            h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+                token: public_token,
+                last_patch_at: std::time::Instant::now(),
+                delta_hasher: blake3::Hasher::new(),
+                verified: true,
+                legacy_delta_format: false,
+                fold_failures: 0,
+                last_fold_attempt_at: std::time::Instant::now(),
+                materialized_max_seq: None,
+            });
+
+            let outcome = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false).await;
+            assert!(matches!(outcome, FoldSlotOutcome::Failed),
+                "no run_single_fold path returns a dedicated Abandoned variant — Failed is expected; \
+                 get_patch_state below is what actually distinguishes abandonment from a real retryable failure");
+            assert!(h.metadata.get_patch_state(&public_token).unwrap().is_none(),
+                "patch_state row must be gone — abandoned, not left Pending for a pointless retry");
+            assert!(h.server.dirty_patch_slots.get(&(file_id, chunk_idx)).is_none(),
+                "dirty_patch_slots entry must be cleared alongside the patch_state row");
+        }
+
+        /// Negative control for pending_patch_for_deleted_file_is_abandoned_not_retried:
+        /// confirms abandon_patch_if_file_gone is scoped to deleted files only — same
+        /// test shape immediately above, but the file DOES exist. Deliberately does
+        /// NOT assert the fold itself succeeds (full_rewrite_chunk_crash_safety_tests'
+        /// existing old_chunk_untouched_and_patch_state_retryable_if_fold_never_completes
+        /// test has a real, confirmed pre-existing failure in that same "fold must
+        /// succeed" assertion, reproduced identically on an unmodified baseline via
+        /// git stash — unrelated to this guard). What this guard is actually
+        /// responsible for is narrower and is what's asserted here: the patch_state
+        /// row must not be abandoned (deleted outright) when the file exists, whether
+        /// or not the fold itself happens to succeed for some other, unrelated reason.
+        #[tokio::test]
+        async fn pending_patch_for_existing_file_is_not_abandoned() {
+            let h = make_overlay_test_harness();
+            let file_id = dfs_common::FileId::new();
+            let chunk_idx = 0u64;
+
+            let mut file_meta = dfs_common::FileMetadata::new(
+                format!("/test_{}", file_id), dfs_common::types::FileType::RegularFile,
+            );
+            file_meta.id = file_id;
+            h.metadata.put_file(&file_meta).unwrap();
+
+            let original_data = vec![0u8; 4096];
+            let original_chunk_id = ChunkId::from_hash(compute_chunk_hash(&original_data));
+            h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+            let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+            delta_bytes.extend_from_slice(&encode_delta_record(1, 0, &[1u8; 100]));
+            let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
+            h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
+            let public_token = ChunkId::from_hash(compute_chunk_hash(b"existing-file-pending-token"));
+            h.metadata.put_patch_state_pending(
+                file_id, chunk_idx, &public_token, original_chunk_id, delta_chunk_id, 4096, 1000, Some(1),
+            ).unwrap();
+            h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+                token: public_token,
+                last_patch_at: std::time::Instant::now(),
+                delta_hasher: blake3::Hasher::new(),
+                verified: true,
+                legacy_delta_format: false,
+                fold_failures: 0,
+                last_fold_attempt_at: std::time::Instant::now(),
+                materialized_max_seq: None,
+            });
+
+            let outcome = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false).await;
+            let outcome_desc = match &outcome {
+                FoldSlotOutcome::FoldedHere(..) => "FoldedHere",
+                FoldSlotOutcome::NothingToDo => "NothingToDo",
+                FoldSlotOutcome::AdoptedElsewhere => "AdoptedElsewhere",
+                FoldSlotOutcome::Failed => "Failed",
+            };
+            let state_after = h.metadata.get_patch_state(&public_token).unwrap();
+            let state_desc = match &state_after {
+                None => "None".to_string(),
+                Some(PatchState::Pending { .. }) => "Pending".to_string(),
+                Some(PatchState::Folded(id)) => format!("Folded({})", id),
+            };
+            assert!(state_after.is_some(),
+                "abandon_patch_if_file_gone must not fire for a file that still exists — patch_state must not be deleted. outcome={} state_after={}", outcome_desc, state_desc);
         }
 
         /// Root-caused 2026-07-29 (gluster1 instability hours after 5fc606e, the

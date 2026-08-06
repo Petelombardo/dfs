@@ -74,20 +74,20 @@ pub const MAX_CONNECTIONS: usize = 512;
 /// (PEER_PORT_OFFSET) sidesteps this entirely — which port a connection arrived
 /// on **is** its classification, correct in both local dev and real staging.
 ///
-/// Sized at 128, not a tighter number closer to typical load, specifically to
-/// stay clear of `heal_max_concurrent`'s own admin-tunable ceiling (64, see
-/// `dfs-admin healing set --max-concurrent` / server.rs's clamp(1, 64)) with
-/// real margin left over for fold_coordination_semaphore's fan-out (bounds 24
-/// concurrent fold-coordination rounds per node, each fanning ProposeFold out
-/// to its replica peers — real measured peak during the 2026-08-05 incident
-/// was 8 concurrent ProposeFold instances, well under the theoretical max).
-/// Default healer tuning (heal_max_concurrent=8, heal_max_concurrent_per_node=3)
-/// plus that real fold-coordination peak fits in a small fraction of this —
-/// the extra headroom is specifically for an admin maxing out heal concurrency
-/// while fold coordination is also busy, not everyday load. Overridable via
-/// DFS_RESERVED_PEER_CONNECTIONS (tests shrink this to force exhaustion
-/// deterministically).
-pub const RESERVED_PEER_CONNECTIONS: usize = 128;
+/// Raised 128 -> 1024 (2026-08-06): 128 was sized against a single kdiskmark
+/// burst's measured peak (8 concurrent ProposeFold) plus default healer
+/// tuning, but a real overnight soak (5 VMs, continuous background fold/heal
+/// churn, no single dramatic burst) hit 7,336 peer-port rejections in ~8
+/// hours on the leader alone, while the client pool sat at ~9% utilization
+/// the entire time. A hard per-listener partition (this pool vs.
+/// MAX_CONNECTIONS' pool) means peer traffic can never borrow that idle
+/// client capacity, so the honest fix — short of a real dynamic-borrowing
+/// redesign, deliberately not done here — is to size this pool generously on
+/// its own terms rather than tightly against a single-incident measurement.
+/// Still trivial against the 65536 NOFILE ulimit even fully saturated on top
+/// of MAX_CONNECTIONS' own 512. Overridable via DFS_RESERVED_PEER_CONNECTIONS
+/// (tests shrink this to force exhaustion deterministically).
+pub const RESERVED_PEER_CONNECTIONS: usize = 1024;
 
 /// Offset added to a node's client-facing listen port to get its peer-only
 /// port, where inter-node RPC traffic (ProposeFold/FoldLockGrant fan-out,

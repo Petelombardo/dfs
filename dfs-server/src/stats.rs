@@ -165,3 +165,107 @@ impl OpsTracker {
         }
     }
 }
+
+/// Which bucket an RPC (Request or ClusterMessage) belongs to, for
+/// RpcClassCounts. See classify_request/classify_cluster_message in
+/// server.rs for the actual variant -> class mapping — this type is
+/// deliberately just the bucket set, not tied to the wire enums, so
+/// stats.rs doesn't need to depend on dfs_common::protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcClass {
+    PeerHealing,
+    PeerDeleteOps,
+    PeerFold,
+    PeerGossip,
+    PeerOther,
+    ClientFullPatch,
+    ClientMultiPatch,
+    ClientFold,
+    ClientOther,
+    Admin,
+}
+
+/// Cumulative-since-startup RPC counts by class. Added 2026-08-06 after a
+/// real overnight soak raised the operational question "were most of our
+/// RPCs peer or client, and within that, what kind" with no way to answer it
+/// — OpsTracker above only tracks coarse read/write/meta, missing healing/
+/// fold/delete/admin entirely. Deliberately simple (plain AtomicU64 counters,
+/// no ring buffer/rate tracking like OpsTracker) since the ask was an
+/// operational proportion ("what fraction"), not a rate — rough and in-memory
+/// is explicitly fine, this is not a durability-critical metric.
+pub struct RpcClassCounts {
+    peer_healing: AtomicU64,
+    peer_delete_ops: AtomicU64,
+    peer_fold: AtomicU64,
+    peer_gossip: AtomicU64,
+    peer_other: AtomicU64,
+    client_full_patch: AtomicU64,
+    client_multi_patch: AtomicU64,
+    client_fold: AtomicU64,
+    client_other: AtomicU64,
+    admin: AtomicU64,
+}
+
+/// Plain-u64 snapshot of RpcClassCounts, for building Response::RpcClassCounts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RpcClassSnapshot {
+    pub peer_healing: u64,
+    pub peer_delete_ops: u64,
+    pub peer_fold: u64,
+    pub peer_gossip: u64,
+    pub peer_other: u64,
+    pub client_full_patch: u64,
+    pub client_multi_patch: u64,
+    pub client_fold: u64,
+    pub client_other: u64,
+    pub admin: u64,
+}
+
+impl RpcClassCounts {
+    pub fn new() -> Self {
+        Self {
+            peer_healing: AtomicU64::new(0),
+            peer_delete_ops: AtomicU64::new(0),
+            peer_fold: AtomicU64::new(0),
+            peer_gossip: AtomicU64::new(0),
+            peer_other: AtomicU64::new(0),
+            client_full_patch: AtomicU64::new(0),
+            client_multi_patch: AtomicU64::new(0),
+            client_fold: AtomicU64::new(0),
+            client_other: AtomicU64::new(0),
+            admin: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn record(&self, class: RpcClass) {
+        let counter = match class {
+            RpcClass::PeerHealing => &self.peer_healing,
+            RpcClass::PeerDeleteOps => &self.peer_delete_ops,
+            RpcClass::PeerFold => &self.peer_fold,
+            RpcClass::PeerGossip => &self.peer_gossip,
+            RpcClass::PeerOther => &self.peer_other,
+            RpcClass::ClientFullPatch => &self.client_full_patch,
+            RpcClass::ClientMultiPatch => &self.client_multi_patch,
+            RpcClass::ClientFold => &self.client_fold,
+            RpcClass::ClientOther => &self.client_other,
+            RpcClass::Admin => &self.admin,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> RpcClassSnapshot {
+        RpcClassSnapshot {
+            peer_healing: self.peer_healing.load(Ordering::Relaxed),
+            peer_delete_ops: self.peer_delete_ops.load(Ordering::Relaxed),
+            peer_fold: self.peer_fold.load(Ordering::Relaxed),
+            peer_gossip: self.peer_gossip.load(Ordering::Relaxed),
+            peer_other: self.peer_other.load(Ordering::Relaxed),
+            client_full_patch: self.client_full_patch.load(Ordering::Relaxed),
+            client_multi_patch: self.client_multi_patch.load(Ordering::Relaxed),
+            client_fold: self.client_fold.load(Ordering::Relaxed),
+            client_other: self.client_other.load(Ordering::Relaxed),
+            admin: self.admin.load(Ordering::Relaxed),
+        }
+    }
+}

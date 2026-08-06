@@ -63,6 +63,16 @@ enum Commands {
         #[arg(long)]
         watch: bool,
     },
+
+    /// Show per-node RPC counts by class (peer healing/delete/fold/gossip/
+    /// other, client full-patch/multi-patch/fold/other, admin), plus local
+    /// chunk-delete counts by reason. Cumulative since process start,
+    /// in-memory only, not durable.
+    RpcStats {
+        /// Refresh display every second (like watch)
+        #[arg(long)]
+        watch: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -248,6 +258,7 @@ async fn main() -> Result<()> {
         Commands::File { cmd } => handle_file_command(cmd, &cluster_addrs, json_output).await?,
         Commands::Delete { cmd } => handle_delete_command(cmd, &cluster_addrs, json_output).await?,
         Commands::Stats { watch } => handle_stats_command(&cluster_addrs, watch).await?,
+        Commands::RpcStats { watch } => handle_rpc_stats_command(&cluster_addrs, watch).await?,
     }
 
     Ok(())
@@ -1847,6 +1858,219 @@ fn print_stats_table(rows: &[(SocketAddr, Option<Response>)], leader_addr: Optio
         cluster_total_avg / avg_divisor,
         "",
     );
+    println!();
+}
+
+async fn handle_rpc_stats_command(cluster_addrs: &[SocketAddr], watch: bool) -> Result<()> {
+    // Same node-discovery + persistent-connection pattern as handle_stats_command.
+    let all_addrs: Vec<SocketAddr> = match send_request(cluster_addrs[0], Request::GetClusterStatus).await {
+        Ok(Response::ClusterStatus { nodes, .. }) => {
+            let mut addrs: Vec<SocketAddr> = nodes.iter().map(|n| n.addr).collect();
+            if addrs.is_empty() {
+                addrs = cluster_addrs.to_vec();
+            }
+            addrs.sort();
+            addrs
+        }
+        _ => cluster_addrs.to_vec(),
+    };
+
+    let leader_addr: Option<SocketAddr> = match send_request(cluster_addrs[0], Request::GetClusterStatus).await {
+        Ok(Response::ClusterStatus { nodes, leader_node_id, .. }) => {
+            let lid = leader_node_id.or_else(|| {
+                nodes.iter()
+                    .filter(|n| n.status == dfs_common::NodeStatus::Online)
+                    .map(|n| n.id)
+                    .min()
+            });
+            lid.and_then(|lid| nodes.iter().find(|n| n.id == lid).map(|n| n.addr))
+        }
+        _ => None,
+    };
+
+    let mut persistent: Vec<(SocketAddr, Option<TcpStream>)> = if watch {
+        all_addrs.iter().map(|&a| (a, None)).collect()
+    } else {
+        Vec::new()
+    };
+
+    loop {
+        let mut rows: Vec<(SocketAddr, Option<Response>)> = Vec::new();
+
+        if watch {
+            for (addr, slot) in &mut persistent {
+                if slot.is_none() {
+                    *slot = tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        TcpStream::connect(*addr),
+                    ).await.ok().and_then(|r| r.ok());
+                    if let Some(s) = slot.as_mut() {
+                        let _ = s.set_nodelay(true);
+                    }
+                }
+
+                let resp = if let Some(stream) = slot.as_mut() {
+                    match rpc_stats_poll_persistent(stream, *addr).await {
+                        Ok(r) => Some(r),
+                        Err(_) => {
+                            *slot = None;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                rows.push((*addr, resp));
+            }
+        } else {
+            for &addr in &all_addrs {
+                let resp = send_request(addr, Request::GetRpcClassCounts).await.ok();
+                rows.push((addr, resp));
+            }
+        }
+
+        if watch {
+            print!("\x1b[2J\x1b[H");
+        }
+
+        print_rpc_stats_table(&rows, leader_addr);
+
+        if !watch {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+
+    Ok(())
+}
+
+/// Send a single GetRpcClassCounts request over an already-open stream and
+/// read the response. See stats_poll_persistent for the identical pattern.
+async fn rpc_stats_poll_persistent(stream: &mut TcpStream, addr: SocketAddr) -> Result<Response> {
+    let request_id = RequestId::new(REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let envelope = MessageEnvelope::new(request_id, Message::Request(Request::GetRpcClassCounts));
+    let encoded = envelope.to_bytes()?;
+    let len = (encoded.len() as u32).to_be_bytes();
+
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+        stream.write_all(&len).await?;
+        stream.write_all(&encoded).await?;
+        stream.flush().await?;
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; msg_len];
+        stream.read_exact(&mut buf).await?;
+
+        let resp_env = MessageEnvelope::from_bytes(&buf)?;
+        match resp_env.message {
+            Message::Response(r) => Ok(r),
+            _ => anyhow::bail!("unexpected message type"),
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("rpc-stats poll to {} timed out", addr))?
+}
+
+fn print_rpc_stats_table(rows: &[(SocketAddr, Option<Response>)], leader_addr: Option<SocketAddr>) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let hh = (ts % 86400) / 3600;
+    let mm = (ts % 3600) / 60;
+    let ss = ts % 60;
+
+    println!(
+        "DFS RPC Class Counts (cumulative since startup, in-memory only)   {:02}:{:02}:{:02} UTC",
+        hh, mm, ss
+    );
+    println!();
+
+    // Cluster-wide totals, accumulated while printing each node's row.
+    let mut peer_healing = 0u64;
+    let mut peer_delete_ops = 0u64;
+    let mut peer_fold = 0u64;
+    let mut peer_gossip = 0u64;
+    let mut peer_other = 0u64;
+    let mut client_full_patch = 0u64;
+    let mut client_multi_patch = 0u64;
+    let mut client_fold = 0u64;
+    let mut client_other = 0u64;
+    let mut admin = 0u64;
+    let mut delete_reasons: HashMap<String, u64> = HashMap::new();
+
+    for (addr, resp) in rows {
+        let is_leader = leader_addr == Some(*addr);
+        let label = if is_leader { format!("{} [L]", addr) } else { format!("{}", addr) };
+
+        match resp {
+            Some(Response::RpcClassCounts {
+                peer_healing: ph, peer_delete_ops: pd, peer_fold: pf, peer_gossip: pg, peer_other: po,
+                client_full_patch: cfp, client_multi_patch: cmp, client_fold: cf, client_other: co,
+                admin: ad, delete_reasons: dr,
+            }) => {
+                let peer_total = ph + pd + pf + pg + po;
+                let client_total = cfp + cmp + cf + co;
+                let total = (peer_total + client_total + ad).max(1); // avoid div-by-zero in the % below
+                println!("{}", label);
+                println!(
+                    "  peer:   healing={:<8} delete={:<8} fold={:<8} gossip={:<8} other={:<8} ({:>5.1}% of total)",
+                    ph, pd, pf, pg, po, 100.0 * peer_total as f64 / total as f64
+                );
+                println!(
+                    "  client: full-patch={:<8} multi-patch={:<8} fold={:<8} other={:<8} ({:>5.1}% of total)",
+                    cfp, cmp, cf, co, 100.0 * client_total as f64 / total as f64
+                );
+                println!(
+                    "  admin:  {:<8} ({:>5.1}% of total)",
+                    ad, 100.0 * *ad as f64 / total as f64
+                );
+                if !dr.is_empty() {
+                    let mut sorted: Vec<&(String, u64)> = dr.iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                    let reasons_str: Vec<String> = sorted.iter().map(|(r, c)| format!("{}={}", r, c)).collect();
+                    println!("  local deletes by reason: {}", reasons_str.join(", "));
+                }
+                println!();
+
+                peer_healing += ph; peer_delete_ops += pd; peer_fold += pf; peer_gossip += pg; peer_other += po;
+                client_full_patch += cfp; client_multi_patch += cmp; client_fold += cf; client_other += co;
+                admin += ad;
+                for (reason, count) in dr {
+                    *delete_reasons.entry(reason.clone()).or_insert(0) += count;
+                }
+            }
+            _ => {
+                println!("{}", label);
+                println!("  (unavailable)");
+                println!();
+            }
+        }
+    }
+
+    println!("{}", "─".repeat(60));
+    let peer_total = peer_healing + peer_delete_ops + peer_fold + peer_gossip + peer_other;
+    let client_total = client_full_patch + client_multi_patch + client_fold + client_other;
+    let total = (peer_total + client_total + admin).max(1);
+    println!("Cluster totals:");
+    println!(
+        "  peer:   healing={:<8} delete={:<8} fold={:<8} gossip={:<8} other={:<8} ({:>5.1}% of total)",
+        peer_healing, peer_delete_ops, peer_fold, peer_gossip, peer_other, 100.0 * peer_total as f64 / total as f64
+    );
+    println!(
+        "  client: full-patch={:<8} multi-patch={:<8} fold={:<8} other={:<8} ({:>5.1}% of total)",
+        client_full_patch, client_multi_patch, client_fold, client_other, 100.0 * client_total as f64 / total as f64
+    );
+    println!(
+        "  admin:  {:<8} ({:>5.1}% of total)",
+        admin, 100.0 * admin as f64 / total as f64
+    );
+    if !delete_reasons.is_empty() {
+        let mut sorted: Vec<(&String, &u64)> = delete_reasons.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        let reasons_str: Vec<String> = sorted.iter().map(|(r, c)| format!("{}={}", r, c)).collect();
+        println!("  local deletes by reason: {}", reasons_str.join(", "));
+    }
     println!();
 }
 

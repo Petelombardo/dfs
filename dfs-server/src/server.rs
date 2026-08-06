@@ -563,6 +563,10 @@ pub struct Server {
     /// set_peer_conn_semaphore() is called from main after the server starts.
     /// See network::RESERVED_PEER_CONNECTIONS' doc comment for why this pool exists.
     peer_conn_semaphore: Arc<RwLock<Option<(Arc<tokio::sync::Semaphore>, usize)>>>,
+
+    /// Cumulative-since-startup RPC counts by class — see stats::RpcClassCounts'
+    /// doc comment.
+    rpc_class_counts: crate::stats::RpcClassCounts,
 }
 
 /// Fold a batch of pending metadata writes down to one `FileMetadata` per
@@ -935,6 +939,121 @@ fn parse_delta_records_legacy(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
         pos += len;
     }
     Ok(records)
+}
+
+/// Classify a Request into an RpcClass bucket (see stats::RpcClassCounts).
+/// Built from a full survey of every variant's real-world sender(s) — most
+/// map cleanly, a handful are genuinely sent by more than one kind of caller
+/// (e.g. GetNodeStats is polled by both dfs-admin and healing.rs's own
+/// stability check); those are bucketed by their dominant/primary sender
+/// rather than disambiguated at runtime, since this is an operational rough
+/// proportion, not a precise audit trail. Two variants carry the disambiguating
+/// data in their own fields, so those ARE classified precisely: ReplicateChunk's
+/// `background` flag and PurgeFileMetadataById's `propagate` flag.
+fn classify_request(req: &Request) -> crate::stats::RpcClass {
+    use crate::stats::RpcClass::*;
+    match req {
+        // Peer: healing
+        Request::HasChunk { .. }
+        | Request::HasChunks { .. }
+        | Request::PushChunkTo { .. }
+        | Request::CancelHealing { .. }
+        | Request::RetractHealingCancellation { .. }
+        | Request::ReplicateChunkLocationsV2 { .. }
+        | Request::GetPatchTokenIds { .. }
+        | Request::VerifyChunkIntegrity { .. } => PeerHealing,
+        Request::ReplicateChunk { background, .. } => if *background { PeerHealing } else { PeerOther },
+
+        // Peer: delete ops
+        Request::DeleteChunk { .. }
+        | Request::DeleteChunksBatch { .. }
+        | Request::ClearDeleteQueueEntry { .. }
+        | Request::DeleteChunkReplica { .. }
+        | Request::DeleteMetadata { .. }
+        | Request::DeletePathIndex { .. }
+        | Request::PurgeChunkLocation { .. }
+        | Request::PurgeChunkLocations { .. }
+        | Request::PurgeFileMetadata { .. } => PeerDeleteOps,
+        Request::PurgeFileMetadataById { propagate, .. } => if *propagate { Admin } else { PeerDeleteOps },
+
+        // Peer: server-triggered folds (client-triggered ForceFold is its own bucket below)
+        Request::ProposeFold { .. }
+        | Request::ReleaseFoldLock { .. }
+        | Request::ReplicatePatchFold { .. } => PeerFold,
+
+        // Peer: everything else (gossip lives in ClusterMessage, classified separately)
+        Request::TombstoneChunk { .. }
+        | Request::QueueChunksForHealing { .. }
+        | Request::ReplicateMetadata { .. }
+        | Request::ReplicateMetadataBatch { .. }
+        | Request::ReconcileMetadata { .. }
+        | Request::GetMetadataSequence { .. }
+        | Request::DisseminateMetadata { .. }
+        | Request::GetFileInventory { .. }
+        | Request::GetFileMetadataBatch { .. }
+        | Request::PrefetchHint { .. }
+        | Request::QueryChunkSizes { .. }
+        | Request::ReplicateChunkLocation { .. }
+        | Request::ReplicateChunkLocations { .. }
+        | Request::ConfirmChunksLive { .. }
+        | Request::GetPendingPatchChunkIds { .. } => PeerOther,
+
+        // Client: the three buckets asked about specifically
+        Request::PatchChunk { .. } => ClientFullPatch,
+        Request::MultiPatch { .. } => ClientMultiPatch,
+        Request::ForceFold { .. } => ClientFold,
+
+        // Client: everything else (HealChunkToNode is healing-flavored by name
+        // but confirmed client-triggered — dfs-client sends it directly)
+        Request::ReadChunk { .. }
+        | Request::ReadChunkRange { .. }
+        | Request::WriteChunk { .. }
+        | Request::WriteFile { .. }
+        | Request::WriteFileLocalOnly { .. }
+        | Request::AppendFile { .. }
+        | Request::GetFileMetadataByPath { .. }
+        | Request::PutFileMetadata { .. }
+        | Request::ListDirectory { .. }
+        | Request::DeleteFile { .. }
+        | Request::RenameFile { .. }
+        | Request::GetFileChunkMap { .. }
+        | Request::HealChunkToNode { .. }
+        | Request::GetFileMetadata { .. }
+        | Request::UpdateFileMetadata { .. } => ClientOther,
+
+        // dfs-admin tooling — not peer, not the FUSE client
+        Request::Ping
+        | Request::GetDeleteQueue { .. }
+        | Request::TriggerOrphanCleanup
+        | Request::GetClusterStatus
+        | Request::GetStorageStats
+        | Request::GetHealingStatus
+        | Request::TriggerScrub { .. }
+        | Request::EnableHealing
+        | Request::DisableHealing
+        | Request::SetHealingTuning { .. }
+        | Request::SetReplicationFactor { .. }
+        | Request::TriggerHealing
+        | Request::TriggerPhantomReconciliation
+        | Request::DebugGetRawChunkLocation { .. }
+        | Request::TriggerMetadataRepair { .. }
+        | Request::HealFile { .. }
+        | Request::RepairFile { .. }
+        | Request::GetFileInfo { .. }
+        | Request::GetFileInfoById { .. }
+        | Request::RemoveNode { .. }
+        | Request::ListAllFiles
+        | Request::GetNodeStats
+        | Request::GetRpcClassCounts => Admin,
+    }
+}
+
+/// Classify a ClusterMessage — see classify_request's doc comment. All of
+/// these are inherently peer-side (the gossip/membership layer), so this
+/// exists mainly to feed the peer_gossip bucket specifically, distinct from
+/// Request-shaped peer traffic.
+fn classify_cluster_message(_msg: &ClusterMessage) -> crate::stats::RpcClass {
+    crate::stats::RpcClass::PeerGossip
 }
 
 /// Read-modify-write the *entire* current content of `old_chunk_id`, apply every
@@ -4238,6 +4357,7 @@ impl Server {
             ops_tracker: Arc::new(OpsTracker::new()),
             conn_semaphore: Arc::new(RwLock::new(None)),
             peer_conn_semaphore: Arc::new(RwLock::new(None)),
+            rpc_class_counts: crate::stats::RpcClassCounts::new(),
             sled_write_done,
             sled_write_backlog,
             sled_write_tx,
@@ -6018,6 +6138,7 @@ impl Server {
 
     /// Handle an incoming request message
     pub async fn handle_request(&self, request: Request) -> Response {
+        self.rpc_class_counts.record(classify_request(&request));
         match request {
             // Liveness probe — answered before touching any lock, map, or disk, so
             // it stays accurate as a "still processing?" signal even if some
@@ -6248,6 +6369,24 @@ impl Server {
                     uptime_secs: snap.uptime_secs,
                     active_connections: active_conn,
                     max_connections: max_conn,
+                }
+            }
+
+            Request::GetRpcClassCounts => {
+                let snap = self.rpc_class_counts.snapshot();
+                let delete_reasons = self.storage.delete_reason_counts_snapshot();
+                Response::RpcClassCounts {
+                    peer_healing: snap.peer_healing,
+                    peer_delete_ops: snap.peer_delete_ops,
+                    peer_fold: snap.peer_fold,
+                    peer_gossip: snap.peer_gossip,
+                    peer_other: snap.peer_other,
+                    client_full_patch: snap.client_full_patch,
+                    client_multi_patch: snap.client_multi_patch,
+                    client_fold: snap.client_fold,
+                    client_other: snap.client_other,
+                    admin: snap.admin,
+                    delete_reasons,
                 }
             }
 
@@ -15589,6 +15728,106 @@ mod tests {
     use dfs_common::hash::compute_chunk_hash;
     use tempfile::TempDir;
 
+    /// classify_request (added 2026-08-06 for RpcClassCounts) — spot-checks
+    /// representative variants from each bucket, plus the two fields-carry-
+    /// their-own-answer precise splits (ReplicateChunk's `background`,
+    /// PurgeFileMetadataById's `propagate`), and confirms the two genuinely
+    /// dead/never-implemented variants still classify without panicking.
+    #[test]
+    fn classify_request_covers_representative_variants_from_each_bucket() {
+        use crate::stats::RpcClass;
+        let cid = || ChunkId::from_hash(compute_chunk_hash(b"classify-test-chunk"));
+        let fid = || dfs_common::FileId::new();
+
+        assert_eq!(classify_request(&Request::Ping), RpcClass::Admin);
+        assert_eq!(classify_request(&Request::GetNodeStats), RpcClass::Admin);
+        assert_eq!(classify_request(&Request::GetRpcClassCounts), RpcClass::Admin);
+
+        assert_eq!(classify_request(&Request::PatchChunk {
+            chunk_id: cid(), file_id: fid(), chunk_idx: Some(0), chunk_file_offset: 0,
+            intra_offset: 0, data: vec![1, 2, 3], new_chunk_seq: None,
+        }), RpcClass::ClientFullPatch);
+
+        assert_eq!(classify_request(&Request::MultiPatch {
+            chunk_id: cid(), file_id: fid(), chunk_idx: Some(0), chunk_file_offset: 0,
+            patches: vec![(0, vec![1, 2, 3])], expected_new_chunk_id: None,
+            client_write_seq: None, prefetch_hints: None, new_chunk_seq: None,
+        }), RpcClass::ClientMultiPatch);
+
+        assert_eq!(classify_request(&Request::ForceFold { file_id: fid(), chunk_idx: 0 }), RpcClass::ClientFold);
+
+        assert_eq!(classify_request(&Request::HasChunks { chunk_ids: vec![cid()] }), RpcClass::PeerHealing);
+
+        assert_eq!(classify_request(&Request::ProposeFold {
+            file_id: fid(), chunk_idx: 0, proposer: NodeId::new(), proposed_at_ms: 0,
+            base_chunk_id: cid(), delta_chunk_id: cid(), delta_size_hint: 0,
+        }), RpcClass::PeerFold);
+
+        // Precise split #1: ReplicateChunk's own `background` field disambiguates
+        // healing traffic from the client-write replica fan-out, not a guess.
+        assert_eq!(classify_request(&Request::ReplicateChunk {
+            chunk_id: cid(), data: vec![], checksum: [0u8; 32], written_at: None, background: true,
+        }), RpcClass::PeerHealing, "background:true must classify as healing");
+        assert_eq!(classify_request(&Request::ReplicateChunk {
+            chunk_id: cid(), data: vec![], checksum: [0u8; 32], written_at: None, background: false,
+        }), RpcClass::PeerOther, "background:false must NOT classify as healing");
+
+        // Precise split #2: PurgeFileMetadataById's `propagate` field distinguishes
+        // the admin-originated first hop from the peer-to-peer rebroadcast.
+        assert_eq!(classify_request(&Request::PurgeFileMetadataById {
+            file_id: fid(), propagate: true,
+        }), RpcClass::Admin, "propagate:true (admin-originated) must classify as Admin");
+        assert_eq!(classify_request(&Request::PurgeFileMetadataById {
+            file_id: fid(), propagate: false,
+        }), RpcClass::PeerDeleteOps, "propagate:false (peer rebroadcast) must classify as PeerDeleteOps");
+
+        // Dead/never-implemented variants (fall through to handle_request's
+        // catch-all "not yet implemented" arm) must still classify cleanly.
+        assert_eq!(classify_request(&Request::GetFileMetadata { file_id: fid() }), RpcClass::ClientOther);
+        assert_eq!(classify_request(&Request::UpdateFileMetadata {
+            metadata: dfs_common::FileMetadata::new("/classify-test".to_string(), dfs_common::types::FileType::RegularFile),
+        }), RpcClass::ClientOther);
+    }
+
+    #[test]
+    fn classify_cluster_message_is_always_peer_gossip() {
+        use crate::stats::RpcClass;
+        assert_eq!(
+            classify_cluster_message(&ClusterMessage::GracefulLeave {
+                node_id: NodeId::new(),
+                addr: "127.0.0.1:8900".parse().unwrap(),
+                reason: dfs_common::types::LeaveReason::Shutdown,
+            }),
+            RpcClass::PeerGossip,
+        );
+    }
+
+    /// Integration check: real requests through the real dispatch hook
+    /// actually increment the buckets classify_request predicts, and
+    /// GetRpcClassCounts reports them back correctly.
+    #[tokio::test]
+    async fn handle_request_increments_rpc_class_counts_and_reports_them() {
+        let h = make_overlay_test_harness();
+
+        let _ = h.server.handle_request(Request::Ping).await;
+        let _ = h.server.handle_request(Request::Ping).await;
+        let _ = h.server.handle_request(Request::HasChunks { chunk_ids: vec![] }).await;
+        let _ = h.server.handle_request(Request::ForceFold {
+            file_id: dfs_common::FileId::new(), chunk_idx: 0,
+        }).await;
+
+        match h.server.handle_request(Request::GetRpcClassCounts).await {
+            Response::RpcClassCounts { admin, peer_healing, client_fold, .. } => {
+                // >= not ==: GetRpcClassCounts itself and the harness's own setup
+                // may have already ticked `admin` once before these explicit calls.
+                assert!(admin >= 3, "expected at least the 2 Pings + this GetRpcClassCounts call itself, got {}", admin);
+                assert_eq!(peer_healing, 1);
+                assert_eq!(client_fold, 1);
+            }
+            other => panic!("expected RpcClassCounts, got {:?}", other),
+        }
+    }
+
     /// Regression for the 2026-07-23 double node crash: gluster4 at 18:11:39 and
     /// gluster1 (the leader) at 18:11:40 both died with
     /// "thread 'tokio-rt-worker' has overflowed its stack / fatal runtime error" ->
@@ -20257,6 +20496,7 @@ impl MessageHandler for Server {
         message: ClusterMessage,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
         Box::pin(async move {
+            self.rpc_class_counts.record(classify_cluster_message(&message));
             // Handle cluster messages (heartbeat, join, leave, etc.)
             match message {
                 ClusterMessage::Heartbeat { node_info, cluster_view, heal_bandwidth_target_mb } => {

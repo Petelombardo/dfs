@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use dfs_common::{ChunkId, FileId};
 use lru::LruCache;
 use std::fs;
@@ -246,6 +247,14 @@ pub struct ChunkStorage {
     /// chunk write through one per-device syncfs worker instead of a per-write
     /// fsync. See DurabilityCoalescer. None = legacy per-file sync behavior.
     coalescer: Option<Arc<DurabilityCoalescer>>,
+
+    /// Cumulative-since-startup delete_chunk() call counts by `reason` tag —
+    /// added 2026-08-06 alongside RpcClassCounts (stats.rs) for the same
+    /// operational-visibility ask, reusing the reason tags delete_chunk
+    /// already carries rather than adding new instrumentation. In-memory
+    /// only, not durable — see delete_chunk's own doc comment for why these
+    /// tags exist in the first place.
+    delete_reason_counts: DashMap<String, AtomicU64>,
 }
 
 impl ChunkStorage {
@@ -294,7 +303,17 @@ impl ChunkStorage {
             cache_capacity_chunks,
             list_chunks_cache: Mutex::new(None),
             coalescer,
+            delete_reason_counts: DashMap::new(),
         })
+    }
+
+    /// Snapshot of delete_chunk() call counts by reason tag, for
+    /// Response::RpcClassCounts. See delete_reason_counts' doc comment.
+    pub fn delete_reason_counts_snapshot(&self) -> Vec<(String, u64)> {
+        self.delete_reason_counts
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect()
     }
 
     /// True when chunk writes route durability through the shared syncfs worker
@@ -650,6 +669,11 @@ impl ChunkStorage {
     /// future recurrence is visible immediately instead of requiring another multi-
     /// hour reconstruction.
     pub fn delete_chunk(&self, chunk_id: &ChunkId, reason: &str) -> Result<()> {
+        self.delete_reason_counts
+            .entry(reason.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+
         let path = self.get_chunk_path(chunk_id);
 
         if path.exists() {

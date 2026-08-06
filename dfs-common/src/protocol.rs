@@ -853,6 +853,16 @@ pub enum Request {
         holder: NodeId,
         outcome: FoldReleaseOutcome,
     },
+
+    /// Operational visibility: cumulative-since-startup counts of every RPC
+    /// this node has handled, bucketed by class (peer healing/delete/fold/
+    /// gossip/other, client full-patch/multi-patch/fold/other, admin), plus
+    /// local chunk-delete counts by reason tag (reuses delete_chunk's
+    /// existing reason strings — see RpcClassCounts' doc comment). dfs-admin
+    /// only. Appended at the end of the enum, not inserted mid-list — bincode
+    /// is positional (see ReplicateChunkLocationsV2's doc comment for the
+    /// incident this rule exists to prevent).
+    GetRpcClassCounts,
 }
 
 /// See Request::ProposeFold's doc comment.
@@ -1255,6 +1265,27 @@ pub enum Response {
     /// Response to ProposeFold — see Request::ProposeFold's doc comment.
     ProposeFoldResult {
         outcome: ProposeFoldOutcome,
+    },
+
+    /// Response to GetRpcClassCounts: cumulative-since-startup RPC counts by
+    /// class, plus local chunk-delete counts by reason tag (reuses
+    /// delete_chunk's existing reason strings, e.g. ("live_file_orphan_sweep",
+    /// 42) — an open-ended list since the tag set lives in dfs-server's
+    /// storage.rs, not the wire protocol, so this side stays generic). Both
+    /// in-memory only, not durable. APPENDED at end to preserve wire
+    /// compatibility with older nodes, matching NodeStats' shape above.
+    RpcClassCounts {
+        peer_healing: u64,
+        peer_delete_ops: u64,
+        peer_fold: u64,
+        peer_gossip: u64,
+        peer_other: u64,
+        client_full_patch: u64,
+        client_multi_patch: u64,
+        client_fold: u64,
+        client_other: u64,
+        admin: u64,
+        delete_reasons: Vec<(String, u64)>,
     },
 }
 

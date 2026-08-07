@@ -8213,7 +8213,10 @@ leader_addr: Arc::new(RwLock::new(None)),
             warn!("urgent_heal: no known node to forward chunk {} to — will only be caught by the normal (delayed) discovery pass", chunk_id);
             return;
         };
-        let req = Request::QueueChunksForHealing { chunk_ids: vec![chunk_id] };
+        // Genuine emergency (see this fn's doc comment) — marked urgent so the
+        // leader dispatches it via HealingManager's dedicated urgent pools
+        // instead of competing with routine backlog (2026-08-06).
+        let req = Request::QueueChunksForHealing { chunk_ids: vec![chunk_id], urgent: true };
         match tokio::time::timeout(URGENT_HEAL_TIMEOUT, self.send_request(target, req)).await {
             Ok(Ok(Response::Ok { .. })) => {
                 info!("urgent_heal: chunk {} queued for immediate healing via {}", chunk_id, target);

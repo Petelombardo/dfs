@@ -1698,8 +1698,11 @@ const FOLD_ESCALATED_RETRY_INTERVAL: std::time::Duration = std::time::Duration::
 /// ShardedByteRangeCache/ShardedZeroGapTable (client.rs).
 const CHUNK_RING_SHARD_COUNT: usize = 16;
 
-fn ring_shard_index(chunk_id: &ChunkId) -> usize {
-    (chunk_id.hash[0] as usize) % CHUNK_RING_SHARD_COUNT
+/// `shard_count` is the CALLER's actual shard count (shards.len()), not the
+/// CHUNK_RING_SHARD_COUNT ceiling — see ShardedChunkRing::new's doc comment
+/// on why the two can differ under a small total_capacity.
+fn ring_shard_index(chunk_id: &ChunkId, shard_count: usize) -> usize {
+    (chunk_id.hash[0] as usize) % shard_count
 }
 
 /// Sharded chunk content cache: each shard is an independently-locked
@@ -1712,20 +1715,41 @@ struct ShardedChunkRing {
 }
 
 impl ShardedChunkRing {
+    /// Never shard more ways than there is capacity to shard. Sharding at a
+    /// fixed CHUNK_RING_SHARD_COUNT regardless of total_capacity means once
+    /// total_capacity drops to <= CHUNK_RING_SHARD_COUNT, per_shard collapses
+    /// to 1 (the .max(1) floor below) — a 1-entry LRU per shard can't survive
+    /// even light concurrent churn from unrelated chunks landing in the same
+    /// shard, which is functionally a disabled cache, not a small one.
+    ///
+    /// Root-caused 2026-08-06: two individually-correct commits interacted
+    /// badly. 4078982 (2026-07-13) introduced 16-way sharding to fix real
+    /// lock contention under Q32T1 concurrency, benchmarked against
+    /// capacities like 128 where sharding is clearly worth it. 79c8e11
+    /// (2026-07-31, a real gluster1 wedge/OOM fix) later cut the RAM budget
+    /// this capacity is computed from (18%->10% of available RAM), which
+    /// nobody connected to the shard-count floor 4078982 had established —
+    /// staging's actual chunk_ring capacity landed at exactly 16, equal to
+    /// CHUNK_RING_SHARD_COUNT, and the cache measured an ~0% hit rate
+    /// cluster-wide as a direct result. Degrade shard count instead of
+    /// silently zeroing out the cache: fewer, larger shards below the
+    /// threshold, full 16-way sharding once there's enough capacity to
+    /// justify it.
     fn new(total_capacity: usize) -> Self {
-        let per_shard = std::num::NonZeroUsize::new((total_capacity / CHUNK_RING_SHARD_COUNT).max(1)).unwrap();
+        let shard_count = CHUNK_RING_SHARD_COUNT.min(total_capacity.max(1));
+        let per_shard = std::num::NonZeroUsize::new((total_capacity / shard_count).max(1)).unwrap();
         Self {
-            shards: (0..CHUNK_RING_SHARD_COUNT).map(|_| std::sync::Mutex::new(lru::LruCache::new(per_shard))).collect(),
+            shards: (0..shard_count).map(|_| std::sync::Mutex::new(lru::LruCache::new(per_shard))).collect(),
         }
     }
 
     fn shard(&self, chunk_id: &ChunkId) -> &std::sync::Mutex<lru::LruCache<ChunkId, Arc<Vec<u8>>>> {
-        &self.shards[ring_shard_index(chunk_id)]
+        &self.shards[ring_shard_index(chunk_id, self.shards.len())]
     }
 
     /// Total capacity across all shards, for stats reporting.
     fn total_capacity(&self) -> usize {
-        self.shards[0].lock().unwrap().cap().get() * CHUNK_RING_SHARD_COUNT
+        self.shards[0].lock().unwrap().cap().get() * self.shards.len()
     }
 }
 
@@ -1768,15 +1792,20 @@ struct ShardedAliasMap {
 }
 
 impl ShardedAliasMap {
+    /// Same shard-count-vs-capacity floor as ShardedChunkRing::new — see its
+    /// doc comment. Not currently at risk (both call sites use 1024+), but
+    /// the formula is identical and shouldn't silently collapse to a
+    /// 1-entry-per-shard cache if a future capacity ever landed low.
     fn new(total_capacity: usize) -> Self {
-        let per_shard = std::num::NonZeroUsize::new((total_capacity / CHUNK_RING_SHARD_COUNT).max(1)).unwrap();
+        let shard_count = CHUNK_RING_SHARD_COUNT.min(total_capacity.max(1));
+        let per_shard = std::num::NonZeroUsize::new((total_capacity / shard_count).max(1)).unwrap();
         Self {
-            shards: (0..CHUNK_RING_SHARD_COUNT).map(|_| std::sync::Mutex::new(lru::LruCache::new(per_shard))).collect(),
+            shards: (0..shard_count).map(|_| std::sync::Mutex::new(lru::LruCache::new(per_shard))).collect(),
         }
     }
 
     fn insert(&self, old_chunk_id: ChunkId, new_chunk_id: ChunkId) {
-        self.shards[ring_shard_index(&old_chunk_id)].lock().unwrap().put(old_chunk_id, new_chunk_id);
+        self.shards[ring_shard_index(&old_chunk_id, self.shards.len())].lock().unwrap().put(old_chunk_id, new_chunk_id);
     }
 
     /// Follow the forwarding chain from `chunk_id` to the newest id we know of.
@@ -1817,7 +1846,7 @@ impl ShardedAliasMap {
         let mut current = chunk_id;
         let mut hops = 0usize;
         loop {
-            let next = self.shards[ring_shard_index(&current)].lock().unwrap().get(&current).copied();
+            let next = self.shards[ring_shard_index(&current, self.shards.len())].lock().unwrap().get(&current).copied();
             match next {
                 // Revisiting an id we've already walked through means a cycle
                 // (including the A->A self-loop the old `n != current` arm caught).
@@ -2363,7 +2392,7 @@ impl OverlayForkCtx {
                                 candidate accepted a copy of the folded bytes",
                             file_id, chunk_idx, folded_id, holders.len());
                         if let Some(healing) = self.healing.read().await.as_ref() {
-                            healing.queue_chunks_immediate(vec![folded_id]).await;
+                            healing.queue_chunks_immediate_urgent(vec![folded_id]).await;
                         }
                     }
                 }
@@ -2509,7 +2538,10 @@ impl OverlayForkCtx {
             file_id: Some(file_id),
             generation: self.chunk_generations.get(&corrected.chunk_id).map(|v| *v),
         };
-        let fold_req = Request::ReplicatePatchFold { public_token, real_chunk_id: folded_id, file_id, chunk_idx };
+        let fold_req = Request::ReplicatePatchFold {
+            public_token, real_chunk_id: folded_id, file_id, chunk_idx,
+            location: Some(corrected.clone()),
+        };
 
         // Target every online node (not just the slot's own peers) — this now
         // replaces run_single_fold's separate self-only "remaining peers"
@@ -3245,6 +3277,7 @@ impl OverlayForkCtx {
                             if !fold_ok {
                                 let fold_request = Request::ReplicatePatchFold {
                                     public_token, real_chunk_id: new_chunk_id, file_id, chunk_idx,
+                                    location: Some(new_loc.clone()),
                                 };
                                 fold_ok = matches!(
                                     tokio::time::timeout(PER_ATTEMPT_TIMEOUT, client.send_message(node_addr, Message::Request(fold_request))).await,
@@ -3360,6 +3393,7 @@ impl OverlayForkCtx {
             };
             let fold_req = Request::ReplicatePatchFold {
                 public_token, real_chunk_id, file_id, chunk_idx,
+                location: Some(location.clone()),
             };
             let (loc_result, fold_result) = tokio::join!(
                 tokio::time::timeout(PER_ATTEMPT_TIMEOUT, self.client.send_message(leader_addr, Message::Request(loc_req))),
@@ -4117,26 +4151,43 @@ impl Drop for FoldHealingCancelGuard {
 }
 
 impl Server {
-    /// chunk_ring's (and delta_ring's — same function, called once per pool)
-    /// capacity: 25% each of `dfs_common::calculate_server_cache_budget_mb()`,
-    /// so the two rings together take the other 50% not claimed by
-    /// ChunkStorage::calculate_cache_size's chunk cache. See that shared budget
-    /// function's doc comment for why this moved off an independent per-cache RAM
-    /// tier (2026-07-19): nothing enforced a combined ceiling across the three
-    /// pools, which is how a 3.8GB gluster node ended up committing ~1GB (27%) to
-    /// caches before any real workload data existed.
+    /// Shared capacity formula for chunk_ring/delta_ring/materialized_ring, each
+    /// getting an explicit fraction of `dfs_common::calculate_server_cache_budget_mb()`.
+    /// ChunkStorage::calculate_cache_size takes the other 50% directly (not through
+    /// this function). See that shared budget function's doc comment for why this
+    /// moved off an independent per-cache RAM tier (2026-07-19): nothing enforces a
+    /// combined ceiling across these pools, so the fractions passed in here are the
+    /// only thing keeping the four consumers summing to <=100% of budget — see
+    /// each call site for its share.
+    ///
+    /// Root-caused 2026-08-06: this used to be a flat 25% for every caller (no
+    /// parameter), correct back when only chunk_ring+delta_ring existed (25%+25%
+    /// = the other 50% not claimed by ChunkStorage's 50%, exactly 100% total).
+    /// materialized_ring was added 2026-08-05 for merge-time patch no-op
+    /// detection and wired to this same flat-25% function without anyone updating
+    /// the accounting — three independent 25% callers plus ChunkStorage's 50% summed
+    /// to 125% of budget, structurally over-committed on top of 79c8e11's deliberate
+    /// RAM-budget cut (18%->10% of available RAM) for a real OOM/wedge incident on
+    /// these exact 3.8GB, zero-swap boards. Fixed by making the fraction explicit per
+    /// caller and rebalancing based on live 2026-08-06 evidence: under real Q32T1
+    /// concurrent load, materialized_ring measured up to 291 misses/30s on one node
+    /// (each miss a full "cold rebuild" re-reading both the base chunk and the prior
+    /// delta) vs. delta_ring's 1-12 misses/30s network-wide — delta_ring's hit window
+    /// is structurally narrow (a hit needs two near-concurrent cold-starts on the
+    /// exact same prior_delta_id), so it benefits least from extra capacity.
+    /// materialized_ring 30% / chunk_ring 15% (still a real, proven win from the
+    /// 2026-07-13 widening below, just ceding room) / delta_ring 5% / ChunkStorage's
+    /// existing 50% = 100%, not 125%.
     ///
     /// Widened 2026-07-13 (flat 32 -> tiered) after a live kdiskmark run showed
     /// folds cold-reading their base chunk almost every time: chunk_ring only
     /// gets seeded as a side effect of a fold that already ran on this exact
     /// slot, so a too-small ring can't keep more than a handful of a real
     /// workload's ~150 concurrently-hot chunks warm at once — most chains get
-    /// evicted before their next fold. Still kept smaller than ChunkStorage's own
-    /// cache (25% vs 50% of the shared budget): this is additional, not instead
-    /// of, that budget.
-    fn calculate_ring_capacity() -> usize {
+    /// evicted before their next fold.
+    fn calculate_ring_capacity(budget_fraction: f64) -> usize {
         const CHUNK_SIZE_MB: u64 = 4;
-        let mb = dfs_common::calculate_server_cache_budget_mb() / 4;
+        let mb = (dfs_common::calculate_server_cache_budget_mb() as f64 * budget_fraction) as u64;
         ((mb / CHUNK_SIZE_MB).max(1)) as usize
     }
 
@@ -4365,45 +4416,49 @@ impl Server {
             chunk_io_locks: Arc::new(DashMap::new()),
             chunk_prefetch: Arc::new(DashMap::new()),
             recently_patched: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(64))),
-            // Default scales off total RAM the same way ChunkStorage's own cache
-            // does (calculate_ring_capacity, 2026-07-13: 16/64/128 by RAM tier —
-            // gluster's 3.8GB nodes land on 64) instead of a flat constant.
-            // DFS_CHUNK_RING_CAPACITY still overrides it for live tuning without
-            // a rebuild (added same day, independently, during a live sizing
-            // investigation — see the size-dependent throughput cliff this
-            // cache's capacity is suspected to cause).
+            // Default scales off the shared cache budget (calculate_ring_capacity —
+            // see its doc comment for the 2026-08-06 rebalancing and why chunk_ring
+            // gets 15%, not the flat 25% every ring used to get). DFS_CHUNK_RING_CAPACITY
+            // still overrides it for live tuning without a rebuild (added 2026-07-13,
+            // independently, during a live sizing investigation — see the size-dependent
+            // throughput cliff this cache's capacity is suspected to cause).
             chunk_ring: Arc::new(ShardedChunkRing::new(
                 std::env::var("DFS_CHUNK_RING_CAPACITY")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or_else(Self::calculate_ring_capacity)
+                    .unwrap_or_else(|| Self::calculate_ring_capacity(0.15))
             )),
             chunk_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             chunk_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Split from chunk_ring (2026-07-13) — see delta_ring's field doc
             // comment. Own capacity knob so the two pools can be sized
             // independently if one class of chunk turns out to need more
-            // headroom than the other. Same RAM-tiered default as chunk_ring.
+            // headroom than the other. Only 5% of budget (see calculate_ring_capacity's
+            // doc comment, 2026-08-06) — live evidence shows its hit window is
+            // structurally narrow, so it benefits least from extra capacity.
             delta_ring: Arc::new(ShardedChunkRing::new(
                 std::env::var("DFS_DELTA_RING_CAPACITY")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or_else(Self::calculate_ring_capacity)
+                    .unwrap_or_else(|| Self::calculate_ring_capacity(0.05))
             )),
             delta_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delta_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // Third pool, for merge-time patch no-op detection (2026-08-05) — see
-            // materialized_ring's field doc comment. Own capacity knob, own RAM-tiered
-            // default; set to 0 to fully disable the feature without a rebuild (a
-            // total capacity of 0 makes every shard's per-shard floor still `.max(1)`
-            // internally, but a real-world working set will thrash a 16-entry cache
-            // into an effectively-always-miss state, safely degrading to today's
-            // unconditional-write behavior rather than erroring).
+            // materialized_ring's field doc comment. Own capacity knob; set to 0 to
+            // fully disable the feature without a rebuild (a total capacity of 0
+            // makes every shard's per-shard floor still `.max(1)` internally, but a
+            // real-world working set will thrash a tiny cache into an
+            // effectively-always-miss state, safely degrading to today's
+            // unconditional-write behavior rather than erroring). 30% of budget —
+            // the largest of the three rings (see calculate_ring_capacity's doc
+            // comment, 2026-08-06): live evidence is this is by far the
+            // highest-value, highest-miss-volume ring of the three.
             materialized_ring: Arc::new(ShardedChunkRing::new(
                 std::env::var("DFS_MATERIALIZED_RING_CAPACITY")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or_else(Self::calculate_ring_capacity)
+                    .unwrap_or_else(|| Self::calculate_ring_capacity(0.30))
             )),
             materialized_ring_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             materialized_ring_misses: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6251,7 +6306,7 @@ impl Server {
             }
             Request::CancelHealing { chunk_id } => self.handle_cancel_healing(chunk_id).await,
             Request::RetractHealingCancellation { chunk_id } => self.handle_retract_healing_cancellation(chunk_id).await,
-            Request::QueueChunksForHealing { chunk_ids } => self.handle_queue_chunks_for_healing(chunk_ids).await,
+            Request::QueueChunksForHealing { chunk_ids, urgent } => self.handle_queue_chunks_for_healing(chunk_ids, urgent).await,
             Request::DeleteChunkReplica { chunk_id, leader_id } => {
                 self.handle_delete_chunk_replica(chunk_id, leader_id).await
             }
@@ -6279,8 +6334,8 @@ impl Server {
             Request::HealChunkToNode { chunk_id, target_node, file_id } => {
                 self.handle_heal_chunk_to_node(chunk_id, target_node, file_id).await
             }
-            Request::ReplicatePatchFold { public_token, real_chunk_id, file_id, chunk_idx } => {
-                self.handle_replicate_patch_fold(public_token, real_chunk_id, file_id, chunk_idx).await
+            Request::ReplicatePatchFold { public_token, real_chunk_id, file_id, chunk_idx, location } => {
+                self.handle_replicate_patch_fold(public_token, real_chunk_id, file_id, chunk_idx, location).await
             }
             Request::PurgeChunkLocation { chunk_id } => {
                 self.handle_purge_chunk_location(chunk_id).await
@@ -7252,9 +7307,9 @@ impl Server {
     /// again on this (receiving) side: its own is_leader() check short-circuits to a
     /// local-only insert whenever this handler is reached on the actual leader,
     /// which is the only place this request is ever sent to.
-    async fn handle_queue_chunks_for_healing(&self, chunk_ids: Vec<ChunkId>) -> Response {
+    async fn handle_queue_chunks_for_healing(&self, chunk_ids: Vec<ChunkId>, urgent: bool) -> Response {
         if let Some(healing) = self.healing.read().await.as_ref() {
-            healing.queue_chunks_immediate(chunk_ids).await;
+            healing.queue_chunks_immediate_impl(chunk_ids, urgent).await;
         }
         Response::Ok { data: None }
     }
@@ -8618,6 +8673,7 @@ impl Server {
     /// reads or report accurate replica counts for `public_token`.
     async fn handle_replicate_patch_fold(
         &self, public_token: ChunkId, real_chunk_id: ChunkId, file_id: FileId, chunk_idx: u64,
+        location: Option<ChunkLocation>,
     ) -> Response {
         // Read BEFORE the flip below: a Pending row here means this node was
         // genuinely tracking this slot — it holds the base and the delta and is
@@ -8644,17 +8700,32 @@ impl Server {
 
         // Guarded re-eval (2026-07-22 fold-mapping data-loss fix): a fold's
         // ReplicateChunkLocation and ReplicatePatchFold are two independent
-        // fire-and-forget broadcasts and can arrive in either order. If
-        // ReplicateChunkLocation for real_chunk_id got here FIRST — before this
-        // node knew it was a fold result — it may have lost an equal-seq tiebreak
-        // against whatever Client-origin chunk_id currently holds this
-        // (file_id, chunk_idx) slot, purely because fold_result_chunk_ids didn't
-        // contain it yet. Re-run the SAME total-order merge now that the set does:
-        // this only promotes real_chunk_id if it actually wins under the
-        // (seq, origin) rule, never an unconditional overwrite. A no-op when
-        // real_chunk_id already holds the slot, or when ReplicateChunkLocation
-        // hasn't arrived yet (get_chunk_location_async returns None below).
-        if let Ok(Some(real_loc)) = self.metadata.get_chunk_location_async(real_chunk_id).await {
+        // fire-and-forget broadcasts and can arrive in either order. Re-run the
+        // SAME total-order merge now that fold_result_chunk_ids contains
+        // real_chunk_id: this only promotes real_chunk_id if it actually wins
+        // under the (seq, origin) rule, never an unconditional overwrite.
+        //
+        // Root-caused 2026-08-07: this used to depend entirely on
+        // get_chunk_location_async(real_chunk_id) already finding a durable
+        // record — i.e. on the sibling ReplicateChunkLocation broadcast having
+        // already landed on THIS node. If that message was lost or
+        // significantly delayed (no retry, no delivery confirmation), this
+        // was a silent, permanent no-op: chunk_map never got corrected, while
+        // patch_state still durably flipped to Folded above regardless. Hours
+        // later, once the routine patch_state_gc swept the now-orphaned
+        // token, any read going through chunk_map (the real FUSE path)
+        // permanently failed with EIO — a real incident, traced from a live
+        // VM disk read. `location` (carried directly on this message as of
+        // this fix) makes the correction self-sufficient: no second message
+        // needs to arrive at all. `None` only for an old, un-upgraded peer
+        // mid-rollout, or a caller that doesn't have it — fall back to
+        // exactly the pre-fix lookup-dependent behavior in that case, not a
+        // regression, just not yet the fixed behavior on that specific hop.
+        if let Some(loc) = location {
+            if loc.file_offset.is_some() {
+                self.chunk_map_update_location_for_file(file_id, &loc).await;
+            }
+        } else if let Ok(Some(real_loc)) = self.metadata.get_chunk_location_async(real_chunk_id).await {
             if real_loc.file_offset.is_some() {
                 self.chunk_map_update_location_for_file(file_id, &real_loc).await;
             }
@@ -10867,6 +10938,7 @@ impl Server {
                         let fold_request = Request::ReplicatePatchFold {
                             public_token: *public_token, real_chunk_id: entry.real_chunk_id,
                             file_id: entry.file_id, chunk_idx: entry.chunk_idx,
+                            location: Some(entry.location.clone()),
                         };
                         if let Err(e) = server.client.send_message(node.addr, Message::Request(fold_request)).await {
                             warn!("patch_fold_rebroadcast: failed to resend fold {} -> {} to node {}: {}", public_token, entry.real_chunk_id, node.id, e);
@@ -15275,6 +15347,15 @@ impl Server {
     /// Returns the sparse list as-is with total_chunks = max chunk index + 1 so the client
     /// can place each entry at its correct position using file_offset.
     async fn handle_get_file_chunk_map(&self, file_id: FileId, from_chunk: u32, count: u32) -> Response {
+        // Set by slice_response below when a cached entry's chunk_id has NO
+        // CHUNK_TABLE record at all (as opposed to the routine "still valid,
+        // node list changed" case) — see the self-heal block after the
+        // chunk_map cache-hit call further down for why this matters.
+        // AtomicBool, not Cell: slice_response is called again after an
+        // `.await` below, so the closure capturing this must be Send (Cell
+        // is !Sync, so a closure holding &Cell isn't Send; AtomicBool is
+        // both Send and Sync).
+        let found_purged_chunk_id = std::sync::atomic::AtomicBool::new(false);
         let slice_response = |locations: &Vec<dfs_common::ChunkLocation>, write_seq: u64| {
             const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             // total_chunks = max chunk index + 1 (not list length) so the client knows
@@ -15317,7 +15398,23 @@ impl Server {
                 })
                 .map(|l| match self.metadata.get_chunk_location(&l.chunk_id) {
                     Ok(Some(sled_loc)) => Self::resolve_chunk_nodes(l, sled_loc),
-                    _ => l.clone(),
+                    Ok(None) => {
+                        // The chunk_id itself has no CHUNK_TABLE record at all — not
+                        // "node list changed" (that's the Ok(Some) case above), but
+                        // "this identity is gone" (e.g. a DATA LOSS purge elsewhere).
+                        // Root-caused 2026-08-07 live: chunk_map's cached entry can
+                        // outlive the chunk_id it names (e.g. a MultiPatch no-op
+                        // reversion that never propagated into chunk_map), and
+                        // silently re-serving it here means a real, healthy file can
+                        // read back a permanent EIO for data that's actually intact
+                        // under a different, current chunk_id. Flag it — the caller
+                        // re-derives this file's chunk list from authoritative
+                        // CHUNK_TABLE truth and retries once instead of trusting
+                        // this stale entry.
+                        found_purged_chunk_id.store(true, std::sync::atomic::Ordering::Relaxed);
+                        l.clone()
+                    }
+                    Err(_) => l.clone(),
                 })
                 .collect();
             // Sort what's actually sent, independent of `locations`' own order —
@@ -15356,8 +15453,33 @@ impl Server {
         };
 
         if let Some(entry) = self.chunk_map.get(&file_id) {
-            let (locations, write_seq) = entry.value();
-            return slice_response(locations, *write_seq);
+            let (locations, write_seq) = entry.value().clone();
+            // Drop the DashMap read guard before any `.await` or `self.chunk_map.insert(...)`
+            // below — holding it across either would deadlock against the same shard
+            // (this exact class of bug has taken a node down before in this codebase,
+            // see the black-hole-node incident memory around lock-across-await).
+            drop(entry);
+            let response = slice_response(&locations, write_seq);
+            if found_purged_chunk_id.load(std::sync::atomic::Ordering::Relaxed) {
+                warn!("GetFileChunkMap: file {} had a chunk_map entry naming a chunk_id with \
+                       no CHUNK_TABLE record — re-deriving from authoritative CHUNK_TABLE truth \
+                       instead of serving the stale identity", file_id);
+                match self.chunk_locations_for_info_async(file_id).await {
+                    Ok(fresh_locations) if !fresh_locations.is_empty() => {
+                        self.chunk_map.insert(file_id, (fresh_locations.clone(), write_seq));
+                        return slice_response(&fresh_locations, write_seq);
+                    }
+                    Ok(_) => {
+                        warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
+                               rows — serving the stale response rather than an empty one", file_id);
+                    }
+                    Err(e) => {
+                        warn!("GetFileChunkMap: self-heal scan for file {} failed ({}) — serving \
+                               the stale response rather than failing the read outright", file_id, e);
+                    }
+                }
+            }
+            return response;
         }
 
         // Cache miss — fall back to CHUNK_TABLE (chunk map may still be rebuilding after
@@ -16893,8 +17015,10 @@ mod tests {
         };
         server.chunk_map_ref().insert(file_id, (vec![loc], 1));
 
-        // real_chunk_id genuinely doesn't exist on this node's disk.
-        server.handle_replicate_patch_fold(public_token, real_chunk_id, file_id, chunk_idx).await;
+        // real_chunk_id genuinely doesn't exist on this node's disk. None here
+        // preserves this test's exact original intent (exercise the lookup-
+        // dependent fallback path, not the new self-sufficient one).
+        server.handle_replicate_patch_fold(public_token, real_chunk_id, file_id, chunk_idx, None).await;
 
         let stats = healing.get_stats().await;
         assert_eq!(
@@ -16902,6 +17026,139 @@ mod tests {
             "this node is not in the chunk's real replica set per chunk_map — must not \
              queue a phantom heal for a chunk it was never assigned to hold"
         );
+    }
+
+    /// Root-caused 2026-08-07 live on staging (a real VM disk read returning
+    /// permanent EIO): handle_replicate_patch_fold's chunk_map correction used to
+    /// depend entirely on get_chunk_location_async(real_chunk_id) already finding
+    /// a durable CHUNK_TABLE record — i.e. on the SIBLING ReplicateChunkLocation
+    /// broadcast (a separate, independent, fire-and-forget message) having
+    /// already landed on this node. If that message was lost or significantly
+    /// delayed, chunk_map was silently never corrected, while patch_state still
+    /// durably flipped to Folded regardless — a permanent, undetectable drift
+    /// until the orphaned token was later garbage-collected and a real read
+    /// failed. `location`, now carried directly on Request::ReplicatePatchFold,
+    /// makes the correction self-sufficient: this test proves chunk_map gets
+    /// corrected even when the sibling broadcast NEVER arrives (no
+    /// put_chunk_location call for real_chunk_id at all).
+    #[tokio::test]
+    async fn test_handle_replicate_patch_fold_self_heals_chunk_map_without_sibling_broadcast() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let real_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"self-heal-fold-content"));
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"self-heal-fold-token"));
+
+        // chunk_map still names the stale pre-fold token — nothing has corrected
+        // it yet, matching a node that's about to receive the fold announcement.
+        let stale_loc = ChunkLocation {
+            chunk_id: public_token,
+            nodes: vec![node_id],
+            size: 4194304,
+            checksum: [0u8; 32],
+            file_offset: Some(0),
+            written_at: Some(1000),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        };
+        server.chunk_map_ref().insert(file_id, (vec![stale_loc], 1));
+
+        // The carried location — this is what the sibling ReplicateChunkLocation
+        // broadcast WOULD have delivered, had it arrived. Deliberately NOT also
+        // calling metadata.put_chunk_location for real_chunk_id: CHUNK_TABLE has
+        // no record of it either, simulating the sibling broadcast never landing.
+        let real_loc = ChunkLocation {
+            chunk_id: real_chunk_id,
+            nodes: vec![node_id],
+            size: 4194304,
+            checksum: [1u8; 32],
+            file_offset: Some(0),
+            written_at: Some(2000),
+            client_write_seq: Some(2),
+            file_id: Some(file_id),
+        };
+
+        server.handle_replicate_patch_fold(
+            public_token, real_chunk_id, file_id, chunk_idx, Some(real_loc.clone()),
+        ).await;
+
+        let chunk_map = server.chunk_map_ref();
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        let current = Server::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id);
+        assert_eq!(current, Some(real_chunk_id),
+            "chunk_map must be corrected to real_chunk_id from the carried location alone — \
+             the sibling ReplicateChunkLocation broadcast never arrived (no CHUNK_TABLE record \
+             for real_chunk_id at all), so the old lookup-dependent path would have done nothing");
+    }
+
+    /// Companion to the self-heal test above: when `location` is None (an
+    /// un-upgraded peer mid-rollout, or any other caller that doesn't have it),
+    /// behavior must be UNCHANGED from before this fix — the lookup-dependent
+    /// fallback still runs, and still correctly does nothing when CHUNK_TABLE has
+    /// no record for real_chunk_id yet. Protects the rolling-upgrade compatibility
+    /// story explicitly, not just by inspection.
+    #[tokio::test]
+    async fn test_handle_replicate_patch_fold_none_location_falls_back_to_lookup() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let real_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"legacy-fold-content"));
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"legacy-fold-token"));
+
+        let stale_loc = ChunkLocation {
+            chunk_id: public_token,
+            nodes: vec![node_id],
+            size: 4194304,
+            checksum: [0u8; 32],
+            file_offset: Some(0),
+            written_at: Some(1000),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        };
+        server.chunk_map_ref().insert(file_id, (vec![stale_loc], 1));
+
+        // location: None, and no CHUNK_TABLE record for real_chunk_id either —
+        // this is exactly today's (pre-fix) behavior for an old peer.
+        server.handle_replicate_patch_fold(public_token, real_chunk_id, file_id, chunk_idx, None).await;
+
+        let chunk_map = server.chunk_map_ref();
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        let current = Server::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id);
+        assert_eq!(current, Some(public_token),
+            "with location=None and no CHUNK_TABLE record for real_chunk_id, chunk_map must stay \
+             exactly as it was before this fix — no regression for an un-upgraded peer mid-rollout");
     }
 
     /// Root-caused 2026-07-28 (VM-108 dd EIO, second occurrence, ~14h after the
@@ -18841,6 +19098,89 @@ mod tests {
             }
             other => panic!("expected FileChunkMap response, got {:?}", other),
         }
+    }
+
+    /// Root-caused 2026-08-07 live on staging (a real VM disk read returning EIO):
+    /// GetFileChunkMap must not serve a chunk_map entry whose chunk_id has been
+    /// purged from CHUNK_TABLE entirely (as opposed to test_get_file_chunk_map_
+    /// uses_chunk_table_authoritative_nodes above, which covers the chunk_id
+    /// still being valid with just a stale node list). This is a different, worse
+    /// failure mode: the chunk identity itself is gone (e.g. after a "DATA LOSS:
+    /// ... purging stale metadata" cleanup elsewhere), and the cached chunk_map
+    /// entry was never corrected — silently re-serving it means a client reads
+    /// back a permanent EIO for data that's actually intact under a *different*,
+    /// current chunk_id for the same file offset.
+    #[tokio::test]
+    async fn test_get_file_chunk_map_self_heals_when_cached_chunk_id_is_purged() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+
+        // The stale token: chunk_map still names it, but it has NO CHUNK_TABLE
+        // record at all — never written via put_chunk_location, simulating a
+        // chunk that existed once and was later purged (e.g. by the DATA LOSS
+        // cleanup path) without chunk_map ever being corrected.
+        let stale_hash = compute_chunk_hash(b"purged-patch-token");
+        let stale_chunk_id = ChunkId::from_hash(stale_hash);
+        let stale_loc = ChunkLocation {
+            chunk_id: stale_chunk_id,
+            nodes: vec![node_id],
+            size: 4194304,
+            checksum: stale_hash,
+            file_offset: Some(0),
+            written_at: Some(1000),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        };
+        server.chunk_map.insert(file_id, (vec![stale_loc], 1));
+
+        // The real, current chunk for the exact same file_offset — present in
+        // CHUNK_TABLE under a DIFFERENT chunk_id (mirroring the real staging
+        // scenario: the old token's own base chunk, still healthy and replicated).
+        let current_hash = compute_chunk_hash(b"the-actual-live-base-chunk");
+        let current_chunk_id = ChunkId::from_hash(current_hash);
+        let current_loc = ChunkLocation {
+            chunk_id: current_chunk_id,
+            nodes: vec![node_id],
+            size: 4194304,
+            checksum: current_hash,
+            file_offset: Some(0),
+            written_at: Some(2000),
+            client_write_seq: Some(2),
+            file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&current_loc).unwrap();
+
+        let response = server.handle_get_file_chunk_map(file_id, 0, u32::MAX).await;
+        match response {
+            Response::FileChunkMap { locations, .. } => {
+                assert_eq!(locations.len(), 1);
+                assert_eq!(locations[0].chunk_id, current_chunk_id,
+                    "GetFileChunkMap must self-heal from authoritative CHUNK_TABLE truth when the \
+                     cached chunk_map entry names a chunk_id with no CHUNK_TABLE record — serving \
+                     the stale identity means a healthy file reads back a permanent, wrong EIO");
+            }
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        }
+
+        // The self-heal must also have corrected chunk_map itself, so a second
+        // call doesn't need to re-scan CHUNK_TABLE every time.
+        let entry = server.chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].chunk_id, current_chunk_id,
+            "chunk_map's cached entry must be corrected in place, not just the one response");
     }
 
     /// handle_replicate_chunk_locations (the batch self-report path a follower uses

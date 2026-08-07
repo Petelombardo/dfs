@@ -381,6 +381,18 @@ pub enum Request {
         real_chunk_id: ChunkId,
         file_id: FileId,
         chunk_idx: u64,
+        /// real_chunk_id's own ChunkLocation, carried so the receiver can
+        /// correct its in-memory chunk_map directly instead of depending on
+        /// the sibling ReplicateChunkLocation broadcast (a separate,
+        /// independent fire-and-forget message) having already landed.
+        /// `#[serde(default)]`/Option so an older peer's un-upgraded binary
+        /// omitting this field still deserializes (None falls back to the
+        /// pre-2026-08-07 lookup-dependent behavior). Root-caused 2026-08-07:
+        /// a lost/delayed ReplicateChunkLocation left chunk_map permanently
+        /// stale on receiving nodes, surfacing as a real client EIO once the
+        /// orphaned token was later garbage-collected.
+        #[serde(default)]
+        location: Option<ChunkLocation>,
     },
 
     /// Batch replicate file metadata — one round-trip replaces N×ReplicateMetadata.
@@ -774,6 +786,14 @@ pub enum Request {
     /// CancelHealing above.
     QueueChunksForHealing {
         chunk_ids: Vec<ChunkId>,
+        /// True only for genuine URGENT_SINGLE_REPLICA emergencies — routes
+        /// through HealingManager's dedicated heal_semaphore_urgent/
+        /// node_inflight_urgent pools instead of competing with routine backlog.
+        /// `#[serde(default)]` so an older peer's un-upgraded binary sending this
+        /// request without the field still deserializes (treated as non-urgent,
+        /// the safe default).
+        #[serde(default)]
+        urgent: bool,
     },
 
     /// Batch, authoritative chunk-location replication — the healer's completion

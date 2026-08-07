@@ -248,6 +248,38 @@ pub struct HealingManager {
     /// never bind, so both `apply_tuning` and `resize_heal_concurrency` clamp it down.
     heal_max_concurrent_per_node: Arc<AtomicUsize>,
 
+    /// Dedicated global concurrency pool for URGENT_SINGLE_REPLICA repairs — see
+    /// urgent_healing's doc comment. Deliberately ADDITIVE to heal_semaphore, not
+    /// carved out of it (same idiom as network.rs's RESERVED_PEER_CONNECTIONS: "a
+    /// separate listener, not carved out of it"), so routine backlog — no matter how
+    /// large — can never exhaust or borrow this capacity. Sized once at construction
+    /// (DFS_HEAL_URGENT_CONCURRENCY, default 2) — not live-tunable via `dfs-admin
+    /// healing set` for this pass, matching fold_hash_semaphore's own precedent.
+    /// 2026-08-06: root-caused live on staging — a genuine single-replica emergency
+    /// queued via queue_chunks_immediate_local only skips the 300s time-gate, not
+    /// the concurrency gate, so it competed for the same heal_semaphore permits as
+    /// a self-inflicted 29,902-item routine backlog.
+    heal_semaphore_urgent: Arc<Semaphore>,
+
+    /// Immutable target capacity for heal_semaphore_urgent (read once at construction
+    /// from DFS_HEAL_URGENT_CONCURRENCY) — used only to size max_live's extra headroom
+    /// in drain_heal_queue. Not an AtomicUsize like heal_max_concurrent: this pool is
+    /// not live-resizable in this pass.
+    heal_urgent_concurrency: usize,
+
+    /// Per-node counterpart to heal_semaphore_urgent — same additive-pool reasoning.
+    /// Without this, an urgent transfer could clear the global urgent gate instantly
+    /// and then still queue behind routine work at node_inflight's per-node permit,
+    /// which is plausible on a small cluster where all per-node permits can
+    /// legitimately be busy under a large backlog. Nearly free to add: node_semaphore/
+    /// acquire_node_permit/try_acquire_node_permit already take the DashMap/AtomicUsize
+    /// pair as generic parameters, not hardcoded to node_inflight.
+    node_inflight_urgent: Arc<DashMap<NodeId, Arc<Semaphore>>>,
+
+    /// Target capacity for each entry in node_inflight_urgent (DFS_HEAL_URGENT_CONCURRENCY_PER_NODE,
+    /// default 2). Not live-tunable in this pass, same as heal_urgent_concurrency.
+    heal_max_concurrent_per_node_urgent: Arc<AtomicUsize>,
+
     /// Real bytes/sec pacing for this node's outbound heal-chunk reads+sends.
     /// Rate is managed entirely by the adaptive bandwidth controller. Separate from
     /// heal_bandwidth_limiter_in because TX/RX are independent full-duplex capacity —
@@ -284,6 +316,19 @@ pub struct HealingManager {
     /// and healing delay has passed. Maps chunk_id → first_detected_at so oldest-
     /// first scheduling works correctly.
     pending_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
+
+    /// Chunk IDs currently queued via queue_chunks_immediate_urgent (genuine
+    /// URGENT_SINGLE_REPLICA repairs only — see that call site in server.rs).
+    /// Deliberately a separate DashSet rather than a pending_healing value-type
+    /// change (Instant -> a struct would touch ~25 call sites, almost all
+    /// irrelevant to urgency) — same additive-structure pattern as
+    /// fold_result_chunk_ids just above. drain_heal_queue consults membership to
+    /// pick heal_semaphore_urgent/node_inflight_urgent over the routine pools and
+    /// to rank urgent entries first in heal_queue_sort_key. Entries are removed on
+    /// every completion path that also clears pending_healing (clear_pending_static,
+    /// clear_pending_for_deleted_chunks, cleanup_stale_pending, flush_heal_outcomes)
+    /// so this can never leak or go stale relative to pending_healing.
+    urgent_healing: Arc<dashmap::DashSet<ChunkId>>,
 
     /// Chunk IDs a fold has claimed as "about to be retired" — checked by
     /// do_heal_chunk_inner right before it commits a heal's ChunkLocation update,
@@ -504,6 +549,23 @@ impl HealingManager {
         let node_inflight: Arc<DashMap<NodeId, Arc<Semaphore>>> = Arc::new(DashMap::new());
         let heal_max_concurrent_per_node = Arc::new(AtomicUsize::new(heal_max_concurrent_per_node));
 
+        // Dedicated, additive pools for URGENT_SINGLE_REPLICA repairs — see
+        // heal_semaphore_urgent's doc comment. Construction-time only, not
+        // live-tunable in this pass (matches fold_hash_semaphore's own precedent).
+        let heal_urgent_concurrency: usize = std::env::var("DFS_HEAL_URGENT_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2)
+            .max(1);
+        let heal_semaphore_urgent = Arc::new(Semaphore::new(heal_urgent_concurrency));
+        let node_inflight_urgent: Arc<DashMap<NodeId, Arc<Semaphore>>> = Arc::new(DashMap::new());
+        let heal_max_concurrent_per_node_urgent: usize = std::env::var("DFS_HEAL_URGENT_CONCURRENCY_PER_NODE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2)
+            .max(1);
+        let heal_max_concurrent_per_node_urgent = Arc::new(AtomicUsize::new(heal_max_concurrent_per_node_urgent));
+
         let heal_max_pct = Arc::new(RwLock::new((heal_max_pct_config / 100.0).clamp(0.10, 1.00)));
 
         let heal_transfer_timeout_secs = Arc::new(AtomicU64::new(heal_transfer_timeout_secs));
@@ -551,12 +613,17 @@ impl HealingManager {
             heal_max_concurrent,
             node_inflight,
             heal_max_concurrent_per_node,
+            heal_semaphore_urgent,
+            heal_urgent_concurrency,
+            node_inflight_urgent,
+            heal_max_concurrent_per_node_urgent,
             heal_bandwidth_limiter_out,
             heal_bandwidth_limiter_in,
             last_cluster_write_ms,
             link_bandwidth_mb,
             heal_max_pct,
             pending_healing: Arc::new(RwLock::new(pending_healing_map)),
+            urgent_healing: Arc::new(dashmap::DashSet::new()),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             cancelled_heals: Arc::new(DashMap::new()),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -952,7 +1019,7 @@ impl HealingManager {
     /// Remove `chunk_id` from pending_healing (it reached RF, was purged, or is no
     /// longer relevant) and clear its persisted detection time.
     async fn clear_pending(&self, chunk_id: &ChunkId) {
-        Self::clear_pending_static(&self.pending_healing, &self.metadata, chunk_id).await;
+        Self::clear_pending_static(&self.pending_healing, &self.urgent_healing, &self.metadata, chunk_id).await;
         self.requeue_priority.remove(chunk_id);
     }
 
@@ -966,7 +1033,7 @@ impl HealingManager {
     /// for why this must happen at every fold's start, not just here — this method
     /// is the leader-local implementation; the RPC-forwarding wrapper lives on Server.
     pub async fn cancel_healing(&self, chunk_id: ChunkId) {
-        Self::clear_pending_static(&self.pending_healing, &self.metadata, &chunk_id).await;
+        Self::clear_pending_static(&self.pending_healing, &self.urgent_healing, &self.metadata, &chunk_id).await;
         self.in_flight_healing.write().await.remove(&chunk_id);
         self.cancelled_heals.insert(chunk_id, Instant::now());
     }
@@ -1160,6 +1227,7 @@ impl HealingManager {
             if pending.remove(chunk_id).is_some() {
                 to_delete.push(*chunk_id);
             }
+            self.urgent_healing.remove(chunk_id);
         }
         drop(pending);
         if let Err(e) = self.metadata
@@ -1174,10 +1242,12 @@ impl HealingManager {
     /// (e.g. `do_heal_chunk_inner`) that don't have a `&self`.
     async fn clear_pending_static(
         pending_healing: &Arc<RwLock<HashMap<ChunkId, Instant>>>,
+        urgent_healing: &Arc<dashmap::DashSet<ChunkId>>,
         metadata: &Arc<MetadataStore>,
         chunk_id: &ChunkId,
     ) {
         let existed = pending_healing.write().await.remove(chunk_id).is_some();
+        urgent_healing.remove(chunk_id);
         if existed {
             if let Err(err) = metadata.delete_pending_healing_async(*chunk_id).await {
                 warn!("Failed to delete pending_healing entry for {}: {}", chunk_id, err);
@@ -1230,6 +1300,9 @@ impl HealingManager {
         };
         let removed_count = removed.len();
         if removed_count > 0 {
+            for chunk_id in &removed {
+                self.urgent_healing.remove(chunk_id);
+            }
             if let Err(e) = self.metadata
                 .batch_update_chunk_locations_async(Vec::new(), Vec::new(), removed)
                 .await
@@ -1800,7 +1873,11 @@ impl HealingManager {
     /// itself, so a caller can pass either "every chunk on disk" or just one page of
     /// them. Caller is responsible for the cluster-gate check
     /// (disk_orphan_sweep_cluster_gate_clear) — this function assumes it already passed.
-    async fn run_disk_orphan_sweep_over(&self, chunks: Vec<ChunkId>) {
+    /// Returns the number of real orphan-deletion candidates found in `chunks` —
+    /// consulted by run_disk_orphan_sweep_paginated_loop's adaptive backoff (an
+    /// empty page is the signal it's safe to slow down; the manual full-sweep
+    /// entry point above ignores it).
+    async fn run_disk_orphan_sweep_over(&self, chunks: Vec<ChunkId>) -> usize {
         // 2x the periodic full-reconciliation interval (server.rs RECONCILE_INTERVAL =
         // 300s) — that loop is the slowest *guaranteed* metadata-catchup path in the
         // system, so doubling it bounds how stale this node's live_chunk_ids() view
@@ -1947,18 +2024,20 @@ impl HealingManager {
 
         let (kept, total, live_file_candidates) = match result {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => { warn!("Disk orphan sweep error: {}", e); return; }
-            Err(e) => { warn!("Disk orphan sweep panicked: {}", e); return; }
+            Ok(Err(e)) => { warn!("Disk orphan sweep error: {}", e); return 0; }
+            Err(e) => { warn!("Disk orphan sweep panicked: {}", e); return 0; }
         };
 
-        if !live_file_candidates.is_empty() {
+        let candidate_count = live_file_candidates.len();
+        if candidate_count > 0 {
             info!("Disk orphan sweep: {} local chunks checked — {} kept (legitimately ours), {} candidates routed to leader-confirm gate",
-                  total, kept, live_file_candidates.len());
+                  total, kept, candidate_count);
         } else {
             debug!("Disk orphan sweep: {} chunks checked, all accounted for", total);
         }
 
         self.reconcile_live_file_candidates(live_file_candidates, live_file_grace_secs).await;
+        candidate_count
     }
 
     /// Pure arithmetic for the paginated sweep's rate limiter — split out so it can be
@@ -1967,6 +2046,78 @@ impl HealingManager {
     /// clamped to zero so a run of slow pages never oversleeps into negative territory.
     fn disk_sweep_next_delay(grace: Duration, elapsed_this_iteration: Duration) -> Duration {
         grace.saturating_sub(elapsed_this_iteration)
+    }
+
+    /// Consecutive empty-or-quiet pages (found fewer than
+    /// SIGNIFICANT_CANDIDATES_THRESHOLD orphan-deletion candidates) required
+    /// before the paginated sweep starts backing off — see
+    /// `disk_sweep_next_backoff`. Small on purpose: avoids overreacting to a
+    /// single quiet page, without meaningfully delaying the response to a
+    /// genuinely idle chunk population.
+    const EMPTY_PAGES_BEFORE_BACKOFF: u32 = 3;
+
+    /// Root-caused 2026-08-06, hours after the backoff fix first shipped: real
+    /// staging traffic has a constant low-level trickle of genuine orphans —
+    /// 1-4 candidates out of every 5000-chunk page, continuously — which is
+    /// nowhere near "a real backlog is forming" but was enough to trip the
+    /// original "reset on ANY candidate found" rule on nearly every single
+    /// page, permanently defeating backoff and keeping the sweep pacing at
+    /// the fast 3s baseline non-stop — confirmed live: near-continuous
+    /// "Disk orphan sweep" log lines every 2-15s, each reporting 1-4
+    /// candidates, while drain_heal_queue's own metadata operations appeared
+    /// starved of redb access (heal dispatch silently stalled for 20+ minutes
+    /// with discovery still correctly detecting growing under-replication).
+    /// A page must find AT LEAST this many candidates to count as "real work"
+    /// and reset pacing to the fast baseline; anything below this still
+    /// advances the empty-page backoff streak like a genuinely empty page.
+    /// The original 2026-08-02 VM-108 565f683c incident this whole mechanism
+    /// defends against involved 19,303 candidates in one unbounded pass — real
+    /// backlog volume is orders of magnitude above background noise, so this
+    /// threshold has a lot of room without risking under-reacting to a real one.
+    const SIGNIFICANT_CANDIDATES_THRESHOLD: usize = 20;
+
+    /// Pure backoff-decision arithmetic for run_disk_orphan_sweep_paginated_loop's
+    /// adaptive pacing — split out so it's unit-testable without a real loop or
+    /// real sleeps, same pattern as `disk_sweep_next_delay`.
+    ///
+    /// Added 2026-08-06: the paginated sweep (2026-08-04, f3ccc80) fixed a severe
+    /// bug — a single unbounded full-scan pass dumping an entire backlog into one
+    /// redb-contention-heavy burst (VM-108 565f683c) — but traded it for the
+    /// opposite failure mode: near-continuous, no-backoff polling (disk_sweep_next_delay
+    /// floors at zero once a page's own work exceeds `page_grace`) that taxes the
+    /// same metadata store the write path needs, even when nothing needs deleting.
+    ///
+    /// A page that finds at least SIGNIFICANT_CANDIDATES_THRESHOLD candidates
+    /// resets immediately to `base_grace` — full reset, not gradual, since
+    /// responsiveness matters most exactly when a real backlog might be
+    /// starting to accumulate (the original incident's concern). See that
+    /// constant's doc comment for why "any" was wrong: real traffic has a
+    /// constant low-level trickle of genuine orphans that isn't a backlog.
+    /// A page that finds nothing only starts backing off once
+    /// `EMPTY_PAGES_BEFORE_BACKOFF` have accumulated, then doubles per additional
+    /// empty page, capped at `max_grace`. Deliberately NOT a flat revert to the
+    /// pre-pagination ~2min cadence: that cadence applied to a single unbounded
+    /// pass, not a per-page pause, and a flat revert here would reintroduce
+    /// exactly the unbounded-backlog risk pagination exists to prevent — this
+    /// keeps pagination's bounded-per-cycle-cost property and only paces the gap
+    /// between cycles adaptively.
+    fn disk_sweep_next_backoff(
+        candidates_found: usize,
+        consecutive_empty_pages: u32,
+        current_grace: Duration,
+        base_grace: Duration,
+        max_grace: Duration,
+    ) -> (Duration, u32) {
+        if candidates_found >= Self::SIGNIFICANT_CANDIDATES_THRESHOLD {
+            return (base_grace, 0);
+        }
+        let next_empty_pages = consecutive_empty_pages.saturating_add(1);
+        let next_grace = if next_empty_pages >= Self::EMPTY_PAGES_BEFORE_BACKOFF {
+            (current_grace * 2).min(max_grace)
+        } else {
+            current_grace
+        };
+        (next_grace, next_empty_pages)
     }
 
     /// Recurring path for disk-orphan-sweep: bounds each pass to a page over the
@@ -1981,14 +2132,25 @@ impl HealingManager {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(5000);
-        let page_grace = Duration::from_millis(
+        // Fast/responsive floor — used immediately whenever a page finds real
+        // work. See disk_sweep_next_backoff's doc comment for the adaptive
+        // pacing this now drives, rather than being used as a flat constant.
+        let base_page_grace = Duration::from_millis(
             std::env::var("DFS_ORPHAN_SWEEP_PAGE_GRACE_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(3000),
         );
+        let max_page_grace = Duration::from_millis(
+            std::env::var("DFS_ORPHAN_SWEEP_MAX_PAGE_GRACE_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60_000),
+        );
 
         let mut cursor: Option<ChunkId> = None;
+        let mut current_page_grace = base_page_grace;
+        let mut consecutive_empty_pages: u32 = 0;
         loop {
             let iter_start = Instant::now();
 
@@ -1997,9 +2159,10 @@ impl HealingManager {
                 || !self.disk_orphan_sweep_cluster_gate_clear(true).await
             {
                 // Gated — don't advance the cursor, just wait and re-check. The
-                // individual gate methods already log their own reason.
+                // individual gate methods already log their own reason. No reason
+                // to poll gate checks faster than the current backoff level.
                 *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
-                tokio::time::sleep(page_grace).await;
+                tokio::time::sleep(current_page_grace).await;
                 continue;
             }
 
@@ -2008,21 +2171,25 @@ impl HealingManager {
                 Err(e) => {
                     warn!("Disk orphan sweep (paginated): failed to list chunk page: {}", e);
                     *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
-                    tokio::time::sleep(page_grace).await;
+                    tokio::time::sleep(current_page_grace).await;
                     continue;
                 }
             };
 
-            if page.is_empty() {
+            let candidates_found = if page.is_empty() {
                 // End of rotation — wrap the cursor and wait a beat before starting over.
                 cursor = None;
+                0
             } else {
                 cursor = page.last().copied();
-                self.run_disk_orphan_sweep_over(page).await;
-            }
+                self.run_disk_orphan_sweep_over(page).await
+            };
+            (current_page_grace, consecutive_empty_pages) = Self::disk_sweep_next_backoff(
+                candidates_found, consecutive_empty_pages, current_page_grace, base_page_grace, max_page_grace,
+            );
 
             *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
-            tokio::time::sleep(Self::disk_sweep_next_delay(page_grace, iter_start.elapsed())).await;
+            tokio::time::sleep(Self::disk_sweep_next_delay(current_page_grace, iter_start.elapsed())).await;
         }
     }
 
@@ -2419,10 +2586,13 @@ impl HealingManager {
                 continue;
             };
             let loc_req = Request::ReplicateChunkLocation {
-                location, file_id: Some(file_id),
+                location: location.clone(), file_id: Some(file_id),
                 generation: None,
             };
-            let fold_req = Request::ReplicatePatchFold { public_token: token, real_chunk_id, file_id, chunk_idx };
+            let fold_req = Request::ReplicatePatchFold {
+                public_token: token, real_chunk_id, file_id, chunk_idx,
+                location: Some(location),
+            };
             let loc_ok = matches!(
                 tokio::time::timeout(Duration::from_secs(5), self.client.send_message(leader_addr, Message::Request(loc_req))).await,
                 Ok(Ok(_))
@@ -3467,19 +3637,25 @@ impl HealingManager {
     }
 
     /// Sort key for drain_heal_queue's per-cycle ordering — see that function's sort
-    /// comment for the incident this closes. Pure and independently testable: severity
-    /// (UnderReplicated before OverReplicated) ranks first, then ascending alive-replica
-    /// count within UnderReplicated (1-of-N before 2-of-3), then oldest-first as the
-    /// final tie-break. Lower tuples sort first.
+    /// comment for the incident this closes. Pure and independently testable:
+    /// `is_urgent` (see urgent_healing's doc comment) ranks first — a genuine
+    /// URGENT_SINGLE_REPLICA repair always sorts ahead of every non-urgent entry
+    /// regardless of severity/age, since it's already going to a dedicated
+    /// dispatch pool but should still be picked off `pending_healing` first within
+    /// this cycle's selection. Then severity (UnderReplicated before
+    /// OverReplicated), then ascending alive-replica count within UnderReplicated
+    /// (1-of-N before 2-of-3), then oldest-first as the final tie-break. Lower
+    /// tuples sort first.
     fn heal_queue_sort_key(
-        status: ReplicationStatus, alive_count: usize, age: Duration,
-    ) -> (u8, usize, std::cmp::Reverse<Duration>) {
+        is_urgent: bool, status: ReplicationStatus, alive_count: usize, age: Duration,
+    ) -> (u8, u8, usize, std::cmp::Reverse<Duration>) {
+        let urgent_rank: u8 = if is_urgent { 0 } else { 1 };
         let severity_rank = match status {
             ReplicationStatus::UnderReplicated => 0,
             ReplicationStatus::Ok => 1,
             ReplicationStatus::OverReplicated => 2,
         };
-        (severity_rank, alive_count, std::cmp::Reverse(age))
+        (urgent_rank, severity_rank, alive_count, std::cmp::Reverse(age))
     }
 
     /// Effective age for heal_queue_sort_key's ordering — see `requeue_priority`'s
@@ -3594,7 +3770,7 @@ impl HealingManager {
                         self.requeue_priority.get(chunk_id).map(|t| t.elapsed()),
                         pending.get(chunk_id).map(|t| t.elapsed()),
                     );
-                    Self::heal_queue_sort_key(*status, confirmed_alive.len(), age)
+                    Self::heal_queue_sort_key(self.urgent_healing.contains(chunk_id), *status, confirmed_alive.len(), age)
                 });
             }
             let skipped = v.len().saturating_sub(self.max_heal_per_cycle);
@@ -3618,7 +3794,11 @@ impl HealingManager {
         // Actual byte throughput is paced separately by heal_bandwidth_limiter_out on
         // whichever node ends up being the transfer's source (and heal_bandwidth_limiter_in
         // on whichever node ends up being the target).
-        let max_live = self.heal_max_concurrent.load(Ordering::Relaxed).max(1);
+        // Bumped by heal_urgent_concurrency as extra headroom for the pathological
+        // case of more simultaneous urgent items than max_live in one cycle — urgent
+        // entries already sort first (heal_queue_sort_key), so this is a safety
+        // margin, not the primary fix (that's the dedicated pools selected below).
+        let max_live = self.heal_max_concurrent.load(Ordering::Relaxed).max(1) + self.heal_urgent_concurrency;
         let mut set: JoinSet<Option<HealOutcome>> = JoinSet::new();
         let mut iter = work.into_iter();
 
@@ -3652,12 +3832,17 @@ impl HealingManager {
                 let stalled_healing = self.stalled_healing.clone();
                 let heal_push_failure = self.heal_push_failure.clone();
                 let requeue_priority = self.requeue_priority.clone();
-                let heal_semaphore = self.heal_semaphore.clone();
+                // Dedicated pools for a genuine URGENT_SINGLE_REPLICA repair — see
+                // heal_semaphore_urgent's doc comment. Routine backlog, no matter how
+                // large, can never exhaust or borrow this capacity; a routine chunk
+                // always uses the routine pools, unchanged from before this fix.
+                let is_urgent = self.urgent_healing.contains(&chunk_id);
+                let heal_semaphore = if is_urgent { self.heal_semaphore_urgent.clone() } else { self.heal_semaphore.clone() };
+                let node_inflight = if is_urgent { self.node_inflight_urgent.clone() } else { self.node_inflight.clone() };
+                let heal_max_concurrent_per_node = if is_urgent { self.heal_max_concurrent_per_node_urgent.clone() } else { self.heal_max_concurrent_per_node.clone() };
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
                 let transfer_timeout = Duration::from_secs(self.heal_transfer_timeout_secs.load(Ordering::Relaxed));
                 let bandwidth_limiter = self.heal_bandwidth_limiter_out.clone();
-                let node_inflight = self.node_inflight.clone();
-                let heal_max_concurrent_per_node = self.heal_max_concurrent_per_node.clone();
 
                 set.spawn(async move {
                     let _permit = heal_semaphore.acquire().await;
@@ -3800,6 +3985,7 @@ impl HealingManager {
             let mut pending = self.pending_healing.write().await;
             for chunk_id in &pending_clears {
                 pending.remove(chunk_id);
+                self.urgent_healing.remove(chunk_id);
             }
         }
 
@@ -4815,7 +5001,14 @@ impl HealingManager {
     /// discovery having to wait it out. Only effective on the cluster leader — see
     /// `queue_chunks_immediate`'s doc comment, which is what every caller outside
     /// this file should use instead.
-    async fn queue_chunks_immediate_local(&self, chunk_ids: Vec<ChunkId>) {
+    ///
+    /// `urgent` additionally marks these chunks in `urgent_healing` so
+    /// `drain_heal_queue` dispatches them through the dedicated
+    /// heal_semaphore_urgent/node_inflight_urgent pools instead of competing with
+    /// routine backlog — see `queue_chunks_immediate_urgent`. Re-queuing an
+    /// already-urgent chunk is a no-op insert; a non-urgent re-queue never
+    /// downgrades an already-urgent entry (cleared only on actual completion).
+    async fn queue_chunks_immediate_local(&self, chunk_ids: Vec<ChunkId>, urgent: bool) {
         let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed) + 1);
         let backdated_secs = dfs_common::types::current_timestamp()
             .saturating_sub(self.healing_delay_secs.load(Ordering::Relaxed) + 1);
@@ -4823,6 +5016,9 @@ impl HealingManager {
         let mut pending = self.pending_healing.write().await;
         let mut cache  = self.alive_nodes_cache.write().await;
         for chunk_id in chunk_ids {
+            if urgent {
+                self.urgent_healing.insert(chunk_id);
+            }
             // Only invalidate the cache entry on a *genuinely new* pending entry —
             // i.e. this chunk wasn't already queued. Root-caused 2026-07-15 (T38
             // local-suite repro, half-capacity caches): handle_replicate_patch_fold
@@ -4880,7 +5076,27 @@ impl HealingManager {
     /// shortly after, or the forward below failing) — the forward is additive, not
     /// a replacement.
     pub async fn queue_chunks_immediate(&self, chunk_ids: Vec<ChunkId>) {
-        self.queue_chunks_immediate_local(chunk_ids.clone()).await;
+        self.queue_chunks_immediate_impl(chunk_ids, false).await
+    }
+
+    /// Like `queue_chunks_immediate`, but additionally marks these chunks urgent —
+    /// see `urgent_healing`'s doc comment. Reserve this for genuine
+    /// URGENT_SINGLE_REPLICA emergencies only (currently just the alarm in
+    /// server.rs's `replicate_fold_result`) — marking a bulk-repair or
+    /// manual-admin-heal call site urgent would recreate the exact starvation
+    /// problem this exists to fix, one layer up, the moment that sweep queues
+    /// hundreds/thousands of chunks at once.
+    pub async fn queue_chunks_immediate_urgent(&self, chunk_ids: Vec<ChunkId>) {
+        self.queue_chunks_immediate_impl(chunk_ids, true).await
+    }
+
+    /// Shared implementation for queue_chunks_immediate/_urgent. pub(crate) so
+    /// handle_queue_chunks_for_healing (server.rs) can thread the `urgent` flag
+    /// through from the wire (Request::QueueChunksForHealing) when forwarded from
+    /// a non-leader node — the alarm that raises an urgent repair can fire on any
+    /// node, not just the leader.
+    pub(crate) async fn queue_chunks_immediate_impl(&self, chunk_ids: Vec<ChunkId>, urgent: bool) {
+        self.queue_chunks_immediate_local(chunk_ids.clone(), urgent).await;
 
         if self.cluster.is_leader().await {
             return;
@@ -4894,7 +5110,7 @@ impl HealingManager {
             return;
         };
         const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
-        let req = Request::QueueChunksForHealing { chunk_ids: chunk_ids.clone() };
+        let req = Request::QueueChunksForHealing { chunk_ids: chunk_ids.clone(), urgent };
         match tokio::time::timeout(FORWARD_TIMEOUT, self.client.send_message(leader_addr, Message::Request(req))).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => warn!(
@@ -5038,13 +5254,31 @@ mod tests {
     #[test]
     fn heal_queue_sort_key_prioritizes_fewer_alive_replicas_over_age() {
         let severely_under = HealingManager::heal_queue_sort_key(
-            ReplicationStatus::UnderReplicated, 1, Duration::from_secs(10),
+            false, ReplicationStatus::UnderReplicated, 1, Duration::from_secs(10),
         );
         let mildly_under_but_older = HealingManager::heal_queue_sort_key(
-            ReplicationStatus::UnderReplicated, 2, Duration::from_secs(9999),
+            false, ReplicationStatus::UnderReplicated, 2, Duration::from_secs(9999),
         );
         assert!(severely_under < mildly_under_but_older,
             "1-of-N must sort before 2-of-3 even when the 2-of-3 chunk is far older");
+    }
+
+    /// A genuine URGENT_SINGLE_REPLICA entry must always sort before every
+    /// non-urgent entry, regardless of severity or age — see urgent_healing's doc
+    /// comment. Deliberately picks the LEAST severe/oldest urgent case against the
+    /// MOST severe/youngest non-urgent case to prove urgency dominates every other
+    /// factor, not just wins on a tie.
+    #[test]
+    fn heal_queue_sort_key_urgent_always_sorts_before_non_urgent() {
+        let urgent_but_mild_and_old = HealingManager::heal_queue_sort_key(
+            true, ReplicationStatus::OverReplicated, 5, Duration::from_secs(9999),
+        );
+        let non_urgent_but_severe_and_fresh = HealingManager::heal_queue_sort_key(
+            false, ReplicationStatus::UnderReplicated, 1, Duration::from_secs(1),
+        );
+        assert!(urgent_but_mild_and_old < non_urgent_but_severe_and_fresh,
+            "urgent must sort first regardless of severity/age — it's a distinct \
+             dispatch pool, not just a priority within the routine one");
     }
 
     /// Orphan-heal clog fix (2026-07-24, redesigned after a real T38 regression): the
@@ -5090,10 +5324,10 @@ mod tests {
     #[test]
     fn heal_queue_sort_key_prioritizes_under_replicated_over_over_replicated() {
         let under = HealingManager::heal_queue_sort_key(
-            ReplicationStatus::UnderReplicated, 2, Duration::from_secs(1),
+            false, ReplicationStatus::UnderReplicated, 2, Duration::from_secs(1),
         );
         let over = HealingManager::heal_queue_sort_key(
-            ReplicationStatus::OverReplicated, 5, Duration::from_secs(9999),
+            false, ReplicationStatus::OverReplicated, 5, Duration::from_secs(9999),
         );
         assert!(under < over,
             "UnderReplicated must sort before OverReplicated regardless of alive count or age");
@@ -5105,10 +5339,10 @@ mod tests {
     #[test]
     fn heal_queue_sort_key_falls_back_to_oldest_first_within_equal_severity() {
         let older = HealingManager::heal_queue_sort_key(
-            ReplicationStatus::UnderReplicated, 2, Duration::from_secs(100),
+            false, ReplicationStatus::UnderReplicated, 2, Duration::from_secs(100),
         );
         let newer = HealingManager::heal_queue_sort_key(
-            ReplicationStatus::UnderReplicated, 2, Duration::from_secs(1),
+            false, ReplicationStatus::UnderReplicated, 2, Duration::from_secs(1),
         );
         assert!(older < newer, "older entry must still sort first when severity and alive count are equal");
     }
@@ -5448,6 +5682,91 @@ mod tests {
         );
     }
 
+    /// Root-caused 2026-08-06: the paginated sweep never backs off, even when a
+    /// long run of pages finds nothing to delete — near-continuous polling that
+    /// taxes the same metadata store the write path needs. Below the empty-page
+    /// threshold, pacing must stay at the fast baseline (don't overreact to one
+    /// or two quiet pages).
+    #[test]
+    fn disk_sweep_next_backoff_holds_baseline_below_threshold() {
+        let base = Duration::from_millis(3000);
+        let max = Duration::from_millis(60_000);
+        let (grace, empty) = HealingManager::disk_sweep_next_backoff(0, 0, base, base, max);
+        assert_eq!((grace, empty), (base, 1), "1st empty page: still at baseline");
+        let (grace, empty) = HealingManager::disk_sweep_next_backoff(0, empty, grace, base, max);
+        assert_eq!((grace, empty), (base, 2), "2nd empty page: still at baseline (threshold is 3)");
+    }
+
+    /// Once the empty-page streak crosses EMPTY_PAGES_BEFORE_BACKOFF (3), pacing
+    /// must start doubling, and keep doubling on further empty pages, without
+    /// exceeding max_grace.
+    #[test]
+    fn disk_sweep_next_backoff_doubles_past_threshold_and_caps_at_max() {
+        let base = Duration::from_millis(3000);
+        let max = Duration::from_millis(20_000);
+        let mut grace = base;
+        let mut empty = 0u32;
+        // Pages 1-2: still below threshold, stays at base.
+        (grace, empty) = HealingManager::disk_sweep_next_backoff(0, empty, grace, base, max);
+        (grace, empty) = HealingManager::disk_sweep_next_backoff(0, empty, grace, base, max);
+        assert_eq!(grace, base, "sanity: still at baseline after 2 empty pages");
+        // Page 3: crosses the threshold (empty_pages becomes 3) — first doubling.
+        (grace, empty) = HealingManager::disk_sweep_next_backoff(0, empty, grace, base, max);
+        assert_eq!(grace, Duration::from_millis(6000), "3rd empty page: first doubling");
+        // Page 4: doubles again.
+        (grace, empty) = HealingManager::disk_sweep_next_backoff(0, empty, grace, base, max);
+        assert_eq!(grace, Duration::from_millis(12_000), "4th empty page: doubles again");
+        // Page 5: would double to 24_000, must clamp at max_grace (20_000) instead.
+        (grace, empty) = HealingManager::disk_sweep_next_backoff(0, empty, grace, base, max);
+        let _ = empty;
+        assert_eq!(grace, max, "must clamp at max_grace, never exceed it");
+    }
+
+    /// A page that finds a SIGNIFICANT number of real candidates must reset
+    /// pacing immediately back to the fast baseline, regardless of how far
+    /// backoff had climbed — responsiveness matters most exactly when a real
+    /// backlog might be starting to accumulate (the original VM-108 565f683c
+    /// incident's concern).
+    #[test]
+    fn disk_sweep_next_backoff_resets_instantly_on_significant_candidates_found() {
+        let base = Duration::from_millis(3000);
+        let max = Duration::from_millis(60_000);
+        // Simulate having backed all the way off to the cap with a long empty streak.
+        let deeply_backed_off_grace = max;
+        let deeply_backed_off_streak = 20u32;
+        let (grace, empty) = HealingManager::disk_sweep_next_backoff(
+            HealingManager::SIGNIFICANT_CANDIDATES_THRESHOLD, deeply_backed_off_streak, deeply_backed_off_grace, base, max,
+        );
+        assert_eq!((grace, empty), (base, 0),
+            "a significant candidate count must reset both pacing and the empty-page streak instantly");
+    }
+
+    /// Root-caused 2026-08-06 live on staging: real traffic has a constant
+    /// low-level trickle of genuine orphans (1-4 out of every 5000-chunk page)
+    /// that is nowhere near "a real backlog forming" but was enough, under the
+    /// original "reset on ANY candidate" rule, to permanently defeat backoff —
+    /// confirmed via near-continuous 2-15s-paced sweep activity while
+    /// drain_heal_queue's own metadata operations appeared starved. A handful
+    /// of candidates (below SIGNIFICANT_CANDIDATES_THRESHOLD) must NOT reset
+    /// pacing — it must advance the empty-page backoff streak exactly like a
+    /// genuinely empty page.
+    #[test]
+    fn disk_sweep_next_backoff_treats_background_noise_like_an_empty_page() {
+        let base = Duration::from_millis(3000);
+        let max = Duration::from_millis(60_000);
+        let background_noise = HealingManager::SIGNIFICANT_CANDIDATES_THRESHOLD - 1;
+        let mut grace = base;
+        let mut empty = 0u32;
+        for _ in 0..HealingManager::EMPTY_PAGES_BEFORE_BACKOFF {
+            (grace, empty) = HealingManager::disk_sweep_next_backoff(background_noise, empty, grace, base, max);
+        }
+        assert_eq!(grace, Duration::from_millis(6000),
+            "background-noise-level candidate counts must still let backoff proceed, \
+             exactly like a run of genuinely empty pages — otherwise real staging traffic \
+             (1-4 candidates/page, continuously) permanently defeats backoff");
+        let _ = empty;
+    }
+
     /// The paginated sweep loop is self-perpetuating with nothing else to restart it
     /// if it dies — this proves the watchdog actually detects a finished task and
     /// replaces it, rather than just trusting the design on paper. Uses a stand-in
@@ -5517,11 +5836,11 @@ mod tests {
         // moments ago must sort AFTER (not before) a chunk that has been quietly
         // waiting the whole time with no failure at all.
         let just_failed_but_ancient = HealingManager::heal_queue_sort_key(
-            ReplicationStatus::UnderReplicated, 1,
+            false, ReplicationStatus::UnderReplicated, 1,
             HealingManager::effective_heal_priority_age(Some(Duration::from_secs(1)), Some(Duration::from_secs(9999))),
         );
         let never_failed_genuinely_old = HealingManager::heal_queue_sort_key(
-            ReplicationStatus::UnderReplicated, 1,
+            false, ReplicationStatus::UnderReplicated, 1,
             HealingManager::effective_heal_priority_age(None, Some(Duration::from_secs(500))),
         );
         assert!(never_failed_genuinely_old < just_failed_but_ancient,
@@ -5627,6 +5946,160 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         (storage, metadata, healing, temp_storage, temp_metadata)
+    }
+
+    /// Like `make_healing`, but with caller-controlled `heal_max_concurrent`/
+    /// `heal_max_concurrent_per_node` — used by the urgent-pool-immunity tests to
+    /// deliberately exhaust the routine pool down to exactly 1 permit.
+    fn make_healing_with_concurrency(
+        node_id: NodeId, addr: SocketAddr, heal_max_concurrent: usize, heal_max_concurrent_per_node: usize,
+    ) -> (Arc<ChunkStorage>, Arc<MetadataStore>, HealingManager, TempDir, TempDir) {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
+        let healing = HealingManager::new(
+            storage.clone(), metadata.clone(), cluster, client, Arc::new(AtomicUsize::new(3)), 300, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, heal_max_concurrent, heal_max_concurrent_per_node, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        (storage, metadata, healing, temp_storage, temp_metadata)
+    }
+
+    /// Root-caused 2026-08-06 on staging: URGENT_SINGLE_REPLICA repairs were queued
+    /// via queue_chunks_immediate_local, which only backdates pending_healing's
+    /// timestamp to skip the 300s delay-gate — dispatch itself used the exact same
+    /// heal_semaphore as the entire routine backlog. After a self-inflicted 29,902-
+    /// item backlog, a genuine single-replica emergency would have queued behind
+    /// all of it. heal_semaphore_urgent is a dedicated, additive pool routine
+    /// backlog can never exhaust — this proves it: with the ONE routine global
+    /// permit held forever, an urgent repair must still dispatch and drain_heal_queue
+    /// must still return, not hang.
+    #[tokio::test]
+    async fn drain_heal_queue_urgent_repair_not_blocked_by_exhausted_routine_global_pool() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:19401".parse().unwrap();
+        let (storage, _metadata, healing, _t1, _t2) = make_healing_with_concurrency(node_id, addr, 1, 8);
+
+        // Hold the routine pool's only permit forever — if urgent dispatch
+        // incorrectly fell back to this semaphore, drain_heal_queue would hang.
+        let _held_forever = healing.heal_semaphore.clone().acquire_owned().await.unwrap();
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"urgent-global-pool-test"));
+        storage.write_chunk(&chunk_id, b"hello").unwrap();
+        // Seed alive_nodes_cache directly (bypassing discovery/probe) so
+        // drain_heal_queue's work-building sees this node as the sole holder —
+        // 1 < replication_factor (3) classifies it UnderReplicated.
+        healing.alive_nodes_cache.write().await.insert(chunk_id, vec![node_id]);
+        healing.queue_chunks_immediate_urgent(vec![chunk_id]).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), healing.drain_heal_queue()).await;
+        assert!(result.is_ok(),
+            "urgent repair must not hang behind an exhausted routine GLOBAL pool — \
+             heal_semaphore_urgent must be a genuinely separate Semaphore");
+    }
+
+    /// Per-node counterpart to the global-pool test above — see that test's doc
+    /// comment for the root cause. node_inflight_urgent must be a genuinely
+    /// separate DashMap from node_inflight, keyed independently even for the SAME
+    /// NodeId, so exhausting the routine per-node permit for a node can never
+    /// block an urgent repair whose source happens to be that same node.
+    #[tokio::test]
+    async fn drain_heal_queue_urgent_repair_not_blocked_by_exhausted_routine_per_node_pool() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:19402".parse().unwrap();
+        let (storage, metadata, healing, _t1, _t2) = make_healing_with_concurrency(node_id, addr, 8, 1);
+
+        // do_heal_chunk_inner requires a REAL ChunkLocation (metadata.get_chunk_location_async)
+        // to get anywhere near the source-permit acquire — a bare alive_nodes_cache entry
+        // (sufficient for the global-pool test above, which only needs to reach
+        // heal_semaphore.acquire()) short-circuits with an early Err/clear_only well
+        // before the per-node code, which would make this test pass vacuously. A bare
+        // FileMetadata with EMPTY chunk_locations keeps the "superseded generation"
+        // check (view_is_usable = !chunk_locations.is_empty()) from firing, so it falls
+        // through to the alive/preferred_sources/permit-acquire path this test targets.
+        //
+        // ALSO requires a second registered node: do_heal_chunk_inner computes `targets`
+        // (nodes that don't yet hold the chunk) and returns Ok(None) BEFORE the
+        // source-permit acquire if targets is empty (confirmed via a direct
+        // do_heal_chunk_shared debug call during development) — a single-node cluster
+        // has no possible target, so this test would otherwise pass vacuously too,
+        // without ever touching node_inflight/node_inflight_urgent.
+        let file_id = FileId::new();
+        let mut file_meta = dfs_common::FileMetadata::new("/urgent-per-node-test".to_string(), dfs_common::types::FileType::RegularFile);
+        file_meta.id = file_id;
+        metadata.put_file(&file_meta).unwrap();
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"urgent-per-node-pool-test"));
+        storage.write_chunk(&chunk_id, b"hello").unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id, nodes: vec![node_id], size: 5, checksum: chunk_id.hash,
+            file_offset: Some(0), written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        }).unwrap();
+        let peer_id = NodeId::new();
+        let peer_addr: SocketAddr = "127.0.0.1:19405".parse().unwrap();
+        healing.cluster.add_node(dfs_common::NodeInfo::new(peer_id, peer_addr, None)).await.unwrap();
+
+        // Hold the routine per-node pool's only permit for this node forever.
+        let routine_node_sem = HealingManager::node_semaphore(
+            &healing.node_inflight, &healing.heal_max_concurrent_per_node, node_id,
+        );
+        let _held_forever = routine_node_sem.acquire_owned().await.unwrap();
+
+        healing.alive_nodes_cache.write().await.insert(chunk_id, vec![node_id]);
+        healing.queue_chunks_immediate_urgent(vec![chunk_id]).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), healing.drain_heal_queue()).await;
+        assert!(result.is_ok(),
+            "urgent repair must not hang behind an exhausted routine PER-NODE pool for \
+             its own source node — node_inflight_urgent must be a genuinely separate map");
+    }
+
+    /// urgent_healing must never leak a completed entry — mirrors pending_healing's
+    /// own cleanup guarantee. A patch-token-shaped chunk_id (ChunkId::patch_token_identity)
+    /// takes do_heal_chunk_inner's guaranteed fast path — "Patch tokens are NOT
+    /// independently replicable content — never heal one" — returning
+    /// Ok(Some(HealOutcome::clear_only(...))) immediately, giving a deterministic
+    /// way to exercise flush_heal_outcomes' pending_clears loop without needing any
+    /// real ChunkLocation/storage setup.
+    #[tokio::test]
+    async fn urgent_healing_does_not_leak_after_completion() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:19403".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"urgent-no-leak-delta"));
+        let chunk_id = ChunkId::patch_token_identity(delta_chunk_id);
+        healing.alive_nodes_cache.write().await.insert(chunk_id, vec![node_id]);
+        healing.queue_chunks_immediate_urgent(vec![chunk_id]).await;
+        assert!(healing.urgent_healing.contains(&chunk_id), "sanity: must be marked urgent before draining");
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), healing.drain_heal_queue()).await;
+
+        assert!(!healing.urgent_healing.contains(&chunk_id),
+            "urgent_healing must be cleared once the chunk's pending_healing entry is cleared \
+             — otherwise it leaks forever, growing unbounded across the process lifetime");
+    }
+
+    /// Scoping guard: a chunk queued via the plain (non-urgent) `queue_chunks_immediate`
+    /// — what every call site except the genuine URGENT_SINGLE_REPLICA alarm uses —
+    /// must never appear in `urgent_healing`. Protects against a future call site
+    /// accidentally reaching for `queue_chunks_immediate_urgent` (e.g. a bulk-repair
+    /// sweep), which would recreate the exact starvation problem this fix exists to
+    /// close, one layer up.
+    #[tokio::test]
+    async fn plain_queue_chunks_immediate_never_marks_urgent() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:19404".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"routine-scoping-test"));
+        healing.queue_chunks_immediate(vec![chunk_id]).await;
+
+        assert!(!healing.urgent_healing.contains(&chunk_id),
+            "queue_chunks_immediate (non-urgent) must never populate urgent_healing");
     }
 
     /// Single-node cluster: this node is trivially its own leader with no peers to
@@ -5771,7 +6244,7 @@ mod tests {
         // Queue it (backdated, bypassing healing_delay_secs) but do NOT populate
         // alive_nodes_cache — simulating a fold that completed after the one
         // discovery pass that's already run.
-        healing.queue_chunks_immediate_local(vec![chunk_id]).await;
+        healing.queue_chunks_immediate_local(vec![chunk_id], false).await;
         assert!(
             healing.alive_nodes_cache.read().await.get(&chunk_id).is_none(),
             "test setup: cache must start empty for this chunk"
@@ -5808,7 +6281,7 @@ mod tests {
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"repeat-queue-cache"));
 
         // First queue: brand new — cache has nothing to preserve yet.
-        healing.queue_chunks_immediate_local(vec![chunk_id]).await;
+        healing.queue_chunks_immediate_local(vec![chunk_id], false).await;
 
         // Simulate a discovery pass having since populated the cache with the real,
         // confirmed-alive node set for this chunk.
@@ -5818,7 +6291,7 @@ mod tests {
         // A second, repeat queue (the rebroadcast-sweep re-notification) must NOT
         // clear that freshly-populated entry — the chunk is already pending, so
         // there's no "stale data from a finished cycle" to invalidate.
-        healing.queue_chunks_immediate_local(vec![chunk_id]).await;
+        healing.queue_chunks_immediate_local(vec![chunk_id], false).await;
 
         let cache = healing.alive_nodes_cache.read().await;
         assert_eq!(

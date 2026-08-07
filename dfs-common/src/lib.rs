@@ -13,7 +13,8 @@ pub use types::{
 };
 pub use protocol::{
     ClusterMessage, DeleteQueueEntry, ErrorCode, FoldReleaseOutcome, Message, MessageEnvelope,
-    MetadataOperation, ProposeFoldOutcome, Request, RequestId, Response,
+    MetadataOperation, PendingHealingEntry, ProposeFoldOutcome, RemotePatchState, Request,
+    RequestId, Response,
 };
 pub use hash::{compute_chunk_hash, compute_chunk_hash_at, verify_chunk_hash, ConsistentHashRing};
 pub use memory::{calculate_cache_capacity, calculate_server_cache_budget_mb, get_available_memory, get_total_memory};

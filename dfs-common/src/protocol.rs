@@ -883,6 +883,35 @@ pub enum Request {
     /// is positional (see ReplicateChunkLocationsV2's doc comment for the
     /// incident this rule exists to prevent).
     GetRpcClassCounts,
+
+    /// Ask a peer what a given identifier actually resolves to in its local
+    /// PATCH_STATE_TABLE — added 2026-08-07 to close a gap where a node with
+    /// no local history for a slot could be handed a peer-reported "current"
+    /// identifier that turns out to be a still-pending public token (never
+    /// itself real, directly-readable content — see PATCH_TOKEN_MARKER's doc
+    /// comment) and, having no way to tell the two apart, silently wire the
+    /// token in as a new patch's base_chunk_id, which no fold can ever verify
+    /// afterward — a permanent, silent dead end, not merely a stale-retry.
+    /// Answered from local patch_state only, no forwarding — the caller
+    /// already targets a specific, presumably-authoritative node (typically
+    /// one of a ChunkLocation's own `nodes`). APPENDED at end to preserve
+    /// wire compatibility, matching every other addition in this enum.
+    GetPatchState {
+        public_token: ChunkId,
+    },
+
+    /// Diagnostic: sample of the leader's pending_healing queue, oldest-first,
+    /// capped at `limit` — added 2026-08-07 during a live staging incident
+    /// where Pending sat in the thousands with In-flight persistently 0 and
+    /// GetHealingStatus's aggregate counts gave no way to see WHY (stuck
+    /// waiting on a source? already at RF but never cleared? genuinely
+    /// mid-transfer?). dfs-admin healing pending. Leader-only; a non-leader
+    /// answers with an empty sample (its own pending_healing is always empty
+    /// — see live_chunk_ids_cache's doc comment on why only the leader runs
+    /// discovery/drain at all). APPENDED at end to preserve wire compatibility.
+    GetPendingHealingSample {
+        limit: usize,
+    },
 }
 
 /// See Request::ProposeFold's doc comment.
@@ -930,6 +959,22 @@ pub enum ProposeFoldOutcome {
 pub enum FoldReleaseOutcome {
     Completed,
     Failed,
+}
+
+/// Wire-format mirror of dfs-server's internal `metadata::PatchState`, for
+/// Request::GetPatchState's response. Kept as a separate type (not the
+/// server-internal one reused directly) since dfs-common must not depend on
+/// dfs-server — see that request's doc comment for why this RPC exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RemotePatchState {
+    Pending {
+        base_chunk_id: ChunkId,
+        delta_chunk_id: ChunkId,
+        size: usize,
+        written_at: u64,
+        client_write_seq: Option<u64>,
+    },
+    Folded(ChunkId),
 }
 
 /// Response types
@@ -1307,6 +1352,40 @@ pub enum Response {
         admin: u64,
         delete_reasons: Vec<(String, u64)>,
     },
+
+    /// Response to Request::GetPatchState. None means this node has no local
+    /// patch_state record for the requested token — either it's genuinely
+    /// unknown here, or the id was never a real token to begin with (see
+    /// PATCH_TOKEN_MARKER's doc comment on the ~1/65536-per-chunk false-
+    /// positive rate the caller must tolerate). APPENDED at end to preserve
+    /// wire compatibility, matching every other addition in this enum.
+    PatchStateResult {
+        state: Option<RemotePatchState>,
+    },
+
+    /// Response to Request::GetPendingHealingSample. Oldest-first, capped at
+    /// the request's `limit`. `total_pending` is the true total queue depth
+    /// (matching GetHealingStatus's Pending count) so the caller knows how
+    /// representative this sample is. APPENDED at end to preserve wire
+    /// compatibility.
+    PendingHealingSample {
+        entries: Vec<PendingHealingEntry>,
+        total_pending: usize,
+    },
+}
+
+/// One entry in a Response::PendingHealingSample. See that response's doc
+/// comment for why this exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingHealingEntry {
+    pub chunk_id: ChunkId,
+    pub age_secs: u64,
+    pub in_flight: bool,
+    pub stalled: bool,
+    /// None = alive_nodes_cache has no entry yet (this chunk would hit the
+    /// cache-miss/probe path on its next drain_heal_queue cycle). Some(n) =
+    /// last-known count of confirmed-alive replicas.
+    pub cached_alive_count: Option<usize>,
 }
 
 /// A pending file deletion entry — stored in each node's sled delete queue.

@@ -160,6 +160,16 @@ enum HealingCommands {
     /// prunes confirmed-absent ones, queuing under-RF results for immediate
     /// healing. Runs automatically every 10 minutes; this skips the wait.
     Reconcile,
+    /// Diagnostic: list the oldest entries in the leader's pending_healing
+    /// queue, with age and status — for figuring out WHY something is stuck
+    /// (no confirmed source yet? already at replication factor but never
+    /// cleared? genuinely mid-transfer?) when the aggregate counts in
+    /// `status` aren't enough on their own.
+    Pending {
+        /// Max entries to show, oldest first
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -854,6 +864,53 @@ async fn handle_healing_command(
             match response {
                 Response::Ok { .. } => {
                     println!("Phantom reconciliation triggered on leader ({})", leader);
+                }
+                Response::Error { message, .. } => {
+                    error!("Error: {}", message);
+                    anyhow::bail!("Command failed: {}", message);
+                }
+                _ => {
+                    anyhow::bail!("Unexpected response type");
+                }
+            }
+        }
+        HealingCommands::Pending { limit } => {
+            let leader = find_leader_addr(cluster_addrs).await;
+            let response = send_request(leader, Request::GetPendingHealingSample { limit }).await?;
+
+            match response {
+                Response::PendingHealingSample { entries, total_pending } => {
+                    if json_output {
+                        let items: Vec<_> = entries.iter().map(|e| serde_json::json!({
+                            "chunk_id": e.chunk_id.to_string(),
+                            "age_secs": e.age_secs,
+                            "in_flight": e.in_flight,
+                            "stalled": e.stalled,
+                            "cached_alive_count": e.cached_alive_count,
+                        })).collect();
+                        let output = serde_json::json!({
+                            "total_pending": total_pending,
+                            "shown": entries.len(),
+                            "entries": items,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else {
+                        println!("Pending healing queue (leader: {}) — {} total, showing {} oldest\n",
+                            leader, total_pending, entries.len());
+                        println!("{:<66} {:>8} {:>10} {:>8} {:>12}", "Chunk ID", "Age(s)", "In-flight", "Stalled", "Alive-cache");
+                        println!("{}", "-".repeat(112));
+                        for e in &entries {
+                            let alive = match e.cached_alive_count {
+                                Some(n) => n.to_string(),
+                                None => "MISS".to_string(),
+                            };
+                            println!("{:<66} {:>8} {:>10} {:>8} {:>12}",
+                                e.chunk_id, e.age_secs, e.in_flight, e.stalled, alive);
+                        }
+                        if entries.is_empty() {
+                            println!("(none)");
+                        }
+                    }
                 }
                 Response::Error { message, .. } => {
                     error!("Error: {}", message);

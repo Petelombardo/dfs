@@ -394,8 +394,12 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     // peer-only listener (see network::PEER_PORT_OFFSET's doc comment for why
     // inter-node RPC traffic needs its own port, not just its own semaphore on
     // a shared port). Share both semaphores with the server before spawning.
-    let mut net_server = network::NetworkServer::new(config.node.listen_addr, server.clone(), network::MAX_CONNECTIONS);
-    server.set_conn_semaphore(net_server.conn_semaphore.clone()).await;
+    let client_capacity = std::env::var("DFS_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(network::MAX_CONNECTIONS);
+    let mut net_server = network::NetworkServer::new(config.node.listen_addr, server.clone(), client_capacity);
+    server.set_conn_semaphore(net_server.conn_semaphore.clone(), net_server.capacity()).await;
 
     let peer_capacity = std::env::var("DFS_RESERVED_PEER_CONNECTIONS")
         .ok()
@@ -758,8 +762,12 @@ async fn run_planned_offline_compaction(
     // Rebind and come back online regardless of compaction's own outcome —
     // going offline must never turn into staying offline. Same dual-listener
     // shape as the initial startup path above.
-    let mut net_server = network::NetworkServer::new(listen_addr, server.clone(), network::MAX_CONNECTIONS);
-    server.set_conn_semaphore(net_server.conn_semaphore.clone()).await;
+    let client_capacity = std::env::var("DFS_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(network::MAX_CONNECTIONS);
+    let mut net_server = network::NetworkServer::new(listen_addr, server.clone(), client_capacity);
+    server.set_conn_semaphore(net_server.conn_semaphore.clone(), net_server.capacity()).await;
 
     let peer_capacity = std::env::var("DFS_RESERVED_PEER_CONNECTIONS")
         .ok()

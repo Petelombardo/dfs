@@ -317,6 +317,22 @@ pub struct HealingManager {
     /// first scheduling works correctly.
     pending_healing: Arc<RwLock<HashMap<ChunkId, Instant>>>,
 
+    /// Cached result of metadata.live_chunk_ids() — a full scan-and-deserialize of
+    /// every FILE_TABLE and CHUNK_TABLE record — shared across pages of the
+    /// paginated orphan sweep instead of recomputed per page. Root-caused
+    /// 2026-08-07 (staging, 10k+ and growing heal backlog, 0 in-flight): the
+    /// pagination refactor (2026-08-04, f3ccc80) shares run_disk_orphan_sweep_over
+    /// between the old single-shot sweep (which called this once for a whole
+    /// sweep) and the new paginated loop — but never hoisted the expensive
+    /// live_chunk_ids() call out to match, so it silently went from "once per
+    /// sweep" to "once per page": a ~5000-chunk page size against a
+    /// multi-million-chunk table meant a full-database rescan every single page,
+    /// every ~3-5s, forever — which is what was actually starving
+    /// drain_heal_queue's own redb access, not a locking subtlety. See
+    /// cached_live_chunk_ids's doc comment for the caching policy. Arc'd so a
+    /// cache hit costs a pointer clone, not a copy of a potentially huge set.
+    live_chunk_ids_cache: Arc<RwLock<Option<(Arc<HashSet<ChunkId>>, Instant)>>>,
+
     /// Chunk IDs currently queued via queue_chunks_immediate_urgent (genuine
     /// URGENT_SINGLE_REPLICA repairs only — see that call site in server.rs).
     /// Deliberately a separate DashSet rather than a pending_healing value-type
@@ -623,6 +639,7 @@ impl HealingManager {
             link_bandwidth_mb,
             heal_max_pct,
             pending_healing: Arc::new(RwLock::new(pending_healing_map)),
+            live_chunk_ids_cache: Arc::new(RwLock::new(None)),
             urgent_healing: Arc::new(dashmap::DashSet::new()),
             in_flight_healing: Arc::new(RwLock::new(HashSet::new())),
             cancelled_heals: Arc::new(DashMap::new()),
@@ -860,7 +877,24 @@ impl HealingManager {
     ///   healing_delay_secs so new under-replicated chunks are discovered within one
     ///   delay window. Same scoped-per-node approach.
     async fn run_discovery_loop(&self) {
-        let mut cleanup_counter = 0u32;
+        // Wall-clock-paced, not cycle-counted — root-caused 2026-08-07
+        // (staging): a cycle counter is a local variable that resets to zero
+        // on every process restart, so cleanup_stale_pending needed a fresh
+        // 10 FULL cycles (up to 10 minutes) of continuous uptime after every
+        // single restart before it could fire even once, no matter how much
+        // stale garbage had already piled up or how recently the previous
+        // process instance had last cleaned. Confirmed live: three rolling
+        // deploys in quick succession (each restarting the leader) produced a
+        // 1h45m gap with zero cleanup passes, while queue_chunks_immediate
+        // kept minting fresh orphaned pending_healing entries the whole
+        // time — see queue_chunks_immediate_local's doc comment for the
+        // companion fix that reduces how much garbage gets queued in the
+        // first place. `None` (startup, or every restart) is treated as
+        // "due now" so a fresh leader cleans up within its first ~60s cycle
+        // instead of waiting out a full interval it has no way to know it
+        // already earned in a prior life.
+        const PENDING_CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
+        let mut last_cleanup_at: Option<Instant> = None;
         let mut was_leader = false;
 
         loop {
@@ -932,9 +966,8 @@ impl HealingManager {
                 warn!("Discovery pass error: {}", e);
             }
 
-            cleanup_counter += 1;
-            if cleanup_counter >= 10 {
-                cleanup_counter = 0;
+            if Self::pending_cleanup_due(last_cleanup_at, PENDING_CLEANUP_INTERVAL) {
+                last_cleanup_at = Some(Instant::now());
                 if let Err(e) = self.cleanup_stale_pending().await {
                     warn!("Pending healing cleanup error: {}", e);
                 }
@@ -1345,6 +1378,49 @@ impl HealingManager {
     /// which have no one more authoritative to ask) — see
     /// authorize_live_file_orphan_deletes(). Any ambiguity (RPC failure, timeout,
     /// unreachable leader) defers deletion to the next cycle rather than proceeding.
+    /// Cache-aware wrapper around `MetadataStore::live_chunk_ids()` — a full
+    /// scan-and-deserialize of every FILE_TABLE and CHUNK_TABLE record. See
+    /// `live_chunk_ids_cache`'s field doc comment for the incident this closes.
+    ///
+    /// TTL default 60s, `DFS_ORPHAN_SWEEP_LIVE_SET_CACHE_SECS`-overridable
+    /// (testing only). Chosen well inside this sweep's own existing staleness
+    /// tolerances — `live_file_grace_secs` (600s default) and the two-pass +
+    /// leader-confirm gate a candidate must still clear before anything is ever
+    /// deleted — so a stale cache hit can only ever delay a real orphan's
+    /// detection by up to one TTL, never cause an incorrect deletion: a chunk
+    /// that became live moments after the cache refreshed just gets correctly
+    /// reclassified as "kept" on the next refresh instead of on this exact page.
+    /// Even a 60s TTL against a page cadence of a few seconds cuts the dominant
+    /// redb cost by well over an order of magnitude, independent of how many
+    /// pages a rotation has — a hard, predictable ceiling, unlike the candidate-
+    /// count-triggered backoff this replaces as the primary mitigation for redb
+    /// load (that backoff stays, as defense in depth, but no longer needs to
+    /// carry the whole weight of the fix).
+    async fn cached_live_chunk_ids(&self) -> Result<Arc<HashSet<ChunkId>>> {
+        let ttl = Duration::from_secs(
+            std::env::var("DFS_ORPHAN_SWEEP_LIVE_SET_CACHE_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60),
+        );
+        {
+            let cache = self.live_chunk_ids_cache.read().await;
+            if let Some((set, computed_at)) = cache.as_ref() {
+                if computed_at.elapsed() < ttl {
+                    return Ok(set.clone());
+                }
+            }
+        }
+        let metadata = self.metadata.clone();
+        let fresh = Arc::new(
+            tokio::task::spawn_blocking(move || metadata.live_chunk_ids())
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking panicked computing live_chunk_ids: {}", e))??
+        );
+        *self.live_chunk_ids_cache.write().await = Some((fresh.clone(), Instant::now()));
+        Ok(fresh)
+    }
+
     /// Snapshot of every chunk_id currently referenced by any file's in-memory
     /// chunk_map entry. See the `chunk_map` field doc comment for why this is a
     /// fresher liveness source than `MetadataStore::live_chunk_ids()`.
@@ -1903,14 +1979,24 @@ impl HealingManager {
         // chunk_map is kept synchronously fresh by every patch/replicate-location
         // handler and never has that gap. Taking the union means a chunk is only
         // ever treated as "not live" if BOTH sources agree it's gone.
+        //
+        // Kept as two separate sets (checked via contains-or-contains below) rather
+        // than merged into one owned HashSet, so a cache hit on the metadata side
+        // costs an Arc clone, not a copy of a potentially huge set on every page —
+        // see cached_live_chunk_ids's doc comment for why per-page cost matters here.
         let live_from_chunk_map = self.live_chunk_ids_from_chunk_map();
+        let live_from_metadata = match self.cached_live_chunk_ids().await {
+            Ok(set) => set,
+            Err(e) => {
+                warn!("Disk orphan sweep: failed to compute live_chunk_ids: {}", e);
+                return 0;
+            }
+        };
         // superseded_generation_chunk_ids is intentionally NOT consulted here anymore —
         // see the NOTE at its use site below (removed 2026-07-26) for why gating physical
         // deletion on this node-local, unreconciled generation map was unsafe.
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut live_chunks = metadata.live_chunk_ids()?;
-            live_chunks.extend(live_from_chunk_map);
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -1982,7 +2068,7 @@ impl HealingManager {
                 // gating (pre-739435c behavior) until generation state has a real
                 // cluster-reconciled source of truth. The heal-queue-exclusion half of
                 // 739435c (slot_losers skip below, non-destructive) is unaffected and stays.
-                if loc_record.is_some() && live_chunks.contains(chunk_id) {
+                if loc_record.is_some() && (live_from_metadata.contains(chunk_id) || live_from_chunk_map.contains(chunk_id)) {
                     kept += 1;
                     continue;
                 }
@@ -2046,6 +2132,19 @@ impl HealingManager {
     /// clamped to zero so a run of slow pages never oversleeps into negative territory.
     fn disk_sweep_next_delay(grace: Duration, elapsed_this_iteration: Duration) -> Duration {
         grace.saturating_sub(elapsed_this_iteration)
+    }
+
+    /// Whether cleanup_stale_pending is due, given when it last ran this
+    /// process's lifetime. Pure so it's unit-testable without a real 600s
+    /// wait — same split-out-arithmetic pattern as disk_sweep_next_delay/
+    /// disk_sweep_next_backoff. `None` (never run yet this process — true on
+    /// every fresh restart, not just true cold start) is always due: see
+    /// run_discovery_loop's call site for the incident this closes — a cycle
+    /// counter reset to zero by every restart needed 10 full fresh cycles
+    /// before it could fire even once, regardless of how much garbage had
+    /// piled up or how recently a prior process instance had last cleaned.
+    fn pending_cleanup_due(last_cleanup_at: Option<Instant>, interval: Duration) -> bool {
+        last_cleanup_at.map_or(true, |t| t.elapsed() >= interval)
     }
 
     /// Consecutive empty-or-quiet pages (found fewer than
@@ -3739,10 +3838,45 @@ impl HealingManager {
 
             if !cache_misses.is_empty() {
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
-                for chunk_id in cache_misses {
-                    let confirmed_alive = self.probe_single_chunk_alive_nodes(&chunk_id).await;
-                    self.alive_nodes_cache.write().await.insert(chunk_id, confirmed_alive.clone());
+                // Concurrent, not sequential — root-caused 2026-08-07 (staging: heal
+                // backlog stuck at ~8,600 with 0 in-flight for 40+ minutes despite
+                // full concurrency/bandwidth headroom, only ever moving after a
+                // manual trigger). probe_single_chunk_alive_nodes can cost up to
+                // ~cluster_size peer RPCs at a 3s timeout apiece, and a purely
+                // sequential loop here paid that cost once PER cache-miss chunk,
+                // one at a time. Under sustained churn (a hot, continuously-
+                // refolding file feeding a steady stream of freshly-queued
+                // "immediate heal" chunks — each a guaranteed cache miss on its
+                // first cycle, since nothing has classified it yet), a single
+                // drain_heal_queue call could take many times longer than its own
+                // 15s run_heal_loop cadence, so it never meaningfully progressed
+                // on its own — confirmed live: dispatch only ever happened right
+                // after a manual trigger's paired discovery-then-drain call,
+                // never from the automatic loop alone. Bounded fan-out
+                // (buffer_unordered) turns cycle cost into roughly the slowest
+                // single probe instead of the sum of all of them, while still
+                // capping concurrent peer RPCs one drain cycle can generate —
+                // same order of magnitude as this codebase's other fan-out caps
+                // (MAX_CONCURRENT=16, prefetch capped at 2, etc.), not unbounded.
+                const CACHE_MISS_PROBE_CONCURRENCY: usize = 32;
+                use futures::stream::StreamExt;
+                let probed: Vec<(ChunkId, Vec<NodeId>)> = futures::stream::iter(cache_misses)
+                    .map(|chunk_id| async move {
+                        let confirmed_alive = self.probe_single_chunk_alive_nodes(&chunk_id).await;
+                        (chunk_id, confirmed_alive)
+                    })
+                    .buffer_unordered(CACHE_MISS_PROBE_CONCURRENCY)
+                    .collect()
+                    .await;
 
+                {
+                    let mut cache = self.alive_nodes_cache.write().await;
+                    for (chunk_id, confirmed_alive) in &probed {
+                        cache.insert(*chunk_id, confirmed_alive.clone());
+                    }
+                }
+
+                for (chunk_id, confirmed_alive) in probed {
                     let status = if confirmed_alive.len() < replication_factor {
                         ReplicationStatus::UnderReplicated
                     } else if confirmed_alive.len() > replication_factor {
@@ -5009,6 +5143,64 @@ impl HealingManager {
     /// already-urgent chunk is a no-op insert; a non-urgent re-queue never
     /// downgrades an already-urgent entry (cleared only on actual completion).
     async fn queue_chunks_immediate_local(&self, chunk_ids: Vec<ChunkId>, urgent: bool) {
+        // Validate liveness BEFORE ever queueing — a chunk with no current
+        // ChunkLocation record has already been superseded (a newer fold
+        // retired it) or its file was deleted; queueing it anyway creates a
+        // permanent, un-healable pending_healing entry with nothing to heal,
+        // removable only by cleanup_stale_pending's comparatively infrequent
+        // sweep (every 10 discovery cycles). Root-caused 2026-08-07
+        // (staging): a single hot, continuously-refolding file minted several
+        // such garbage entries per fold cycle — fold_slot_now and
+        // handle_replicate_patch_fold both queue "the chunk this fold just
+        // produced" with no guarantee it's still current by the time this
+        // call actually runs, and on a file folding every few seconds, a
+        // meaningful share of what got queued was stale on arrival. Same
+        // synchronous get_chunk_location check cleanup_stale_pending already
+        // uses for the identical liveness question — this just asks it
+        // before the fact instead of only after, and the cache-invalidation-
+        // on-genuinely-new-entry logic below is unaffected: a chunk that
+        // fails this filter never reaches `pending` at all, so it can't stale
+        // an alive_nodes_cache entry any node correctly holds.
+        //
+        // Leader-only: get_chunk_location is a LOCAL-metadata-only check, and
+        // this exact function's own doc comment already establishes that the
+        // insert below is "only effective on the cluster leader" — a
+        // non-leader's own pending_healing is never drained regardless. Doing
+        // the check unconditionally would have been a real correctness
+        // regression, not just stricter: ReplicateChunkLocation and
+        // ReplicatePatchFold are independent, fire-and-forget broadcasts that
+        // "can arrive in either order" (see handle_replicate_patch_fold's own
+        // doc comment) — a non-leader processing a fold broadcast can have
+        // this call fire before the sibling location broadcast lands
+        // locally, making a genuinely-still-valid chunk look orphaned on
+        // THIS node alone. Restricting the filter to the leader keeps the
+        // existing "always queue locally as an inert backstop" guarantee for
+        // non-leaders intact (see test_queue_chunks_immediate_non_leader_
+        // still_queues_locally_as_backstop) while still closing the garbage
+        // hole where it actually matters — the leader is the one node whose
+        // pending_healing genuinely gets acted on.
+        //
+        // A patch-token-shaped chunk_id (looks_like_patch_token) is
+        // deliberately exempted from the location check, not just skipped by
+        // it: a token is never expected to have a ChunkLocation at all — see
+        // PATCH_TOKEN_MARKER's doc comment — it has its own legitimate,
+        // separate "never heal one, just clear" fast path in
+        // do_heal_chunk_inner. Filtering it here for lacking something it was
+        // never supposed to have would silently break that path (see
+        // urgent_healing_does_not_leak_after_completion).
+        let chunk_ids: Vec<ChunkId> = if self.cluster.is_leader().await {
+            let filtered: Vec<ChunkId> = chunk_ids.into_iter()
+                .filter(|chunk_id| chunk_id.looks_like_patch_token()
+                    || self.metadata.get_chunk_location(chunk_id).ok().flatten().is_some())
+                .collect();
+            if filtered.is_empty() {
+                return;
+            }
+            filtered
+        } else {
+            chunk_ids
+        };
+
         let backdated = Instant::now() - Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed) + 1);
         let backdated_secs = dfs_common::types::current_timestamp()
             .saturating_sub(self.healing_delay_secs.load(Ordering::Relaxed) + 1);
@@ -5146,6 +5338,37 @@ impl HealingManager {
         }
     }
 
+    /// Diagnostic sample of pending_healing, oldest-first, capped at `limit`.
+    /// See Request::GetPendingHealingSample's doc comment for the incident
+    /// this closes. Read-only — takes read locks on the same four maps
+    /// drain_heal_queue itself reads, in the same order, so this can safely
+    /// run concurrently with normal draining.
+    pub async fn pending_healing_sample(&self, limit: usize) -> (Vec<dfs_common::PendingHealingEntry>, usize) {
+        let pending   = self.pending_healing.read().await;
+        let in_flight = self.in_flight_healing.read().await;
+        let stalled   = self.stalled_healing.read().await;
+        let cache     = self.alive_nodes_cache.read().await;
+
+        let total_pending = pending.len();
+        let mut entries: Vec<(ChunkId, Instant)> = pending.iter().map(|(id, at)| (*id, *at)).collect();
+        // Oldest first (largest elapsed / smallest Instant) — the entries most
+        // worth looking at when something's stuck.
+        entries.sort_by_key(|(_, at)| *at);
+        entries.truncate(limit);
+
+        let sample = entries.into_iter().map(|(chunk_id, detected_at)| {
+            dfs_common::PendingHealingEntry {
+                chunk_id,
+                age_secs: detected_at.elapsed().as_secs(),
+                in_flight: in_flight.contains(&chunk_id),
+                stalled: stalled.contains(&chunk_id),
+                cached_alive_count: cache.get(&chunk_id).map(|nodes| nodes.len()),
+            }
+        }).collect();
+
+        (sample, total_pending)
+    }
+
     /// Trigger an immediate heal cycle, bypassing the 60s interval.
     /// Runs check_and_heal directly on the calling task. Only has effect on the leader;
     /// non-leaders log and return immediately (same behaviour as the periodic loop).
@@ -5244,6 +5467,75 @@ mod tests {
         assert_eq!(stats.pending_healing, 0);
         assert!(stats.auto_heal_enabled);
         assert_eq!(stats.healing_delay_secs, 300);
+    }
+
+    /// Root-caused 2026-08-07 (staging: 10k+ and growing heal backlog, 0 in-flight,
+    /// despite full concurrency/bandwidth headroom). The paginated orphan sweep
+    /// (f3ccc80, 2026-08-04) shares run_disk_orphan_sweep_over with the old
+    /// single-shot sweep, which only ever called the expensive
+    /// MetadataStore::live_chunk_ids() (a full scan+deserialize of every
+    /// FILE_TABLE/CHUNK_TABLE record) once per whole sweep — but the paginated
+    /// loop calls it once per page, silently turning a bounded-per-page cost into
+    /// a full-database rescan every few seconds, which was the actual redb load
+    /// starving drain_heal_queue's own metadata access (not a locking subtlety).
+    ///
+    /// Direct proof that cached_live_chunk_ids no longer pays that cost per call:
+    /// two calls close together (simulating two consecutive sweep pages) must
+    /// return the identical cached Arc, not two independently-computed HashSets —
+    /// Arc::ptr_eq is the only way two independent live_chunk_ids() computations
+    /// could ever coincide, since each call allocates a fresh HashSet.
+    #[tokio::test]
+    async fn cached_live_chunk_ids_reused_across_consecutive_calls_not_recomputed_per_page() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8901".parse().unwrap();
+        let (_storage, metadata, healing, _temp_storage, _temp_metadata) = make_healing(node_id, addr);
+
+        // A little real data so this isn't just exercising an empty-table fast path.
+        for i in 0..5 {
+            let mut file_meta = FileMetadata::new(format!("/cache-test-{}", i), FileType::RegularFile);
+            file_meta.id = dfs_common::FileId::new();
+            metadata.put_file(&file_meta).unwrap();
+        }
+
+        let first = healing.cached_live_chunk_ids().await.expect("first call must succeed");
+        let second = healing.cached_live_chunk_ids().await.expect("second call must succeed");
+        assert!(Arc::ptr_eq(&first, &second),
+            "a second call within the cache TTL must reuse the exact same Arc — a fresh \
+             live_chunk_ids() computation would allocate a brand-new HashSet, which is \
+             exactly the per-page redb rescan this fix eliminates");
+
+        // A third call, simulating a later page in the same rotation, must still hit
+        // the same cache entry — this isn't a one-time coincidence of call ordering.
+        let third = healing.cached_live_chunk_ids().await.expect("third call must succeed");
+        assert!(Arc::ptr_eq(&first, &third),
+            "caching must hold across more than two consecutive calls within the TTL");
+    }
+
+    /// Companion negative control: with the cache TTL forced to 0 (via the
+    /// DFS_ORPHAN_SWEEP_LIVE_SET_CACHE_SECS testing override), every call must be
+    /// a fresh computation — proves the cache-hit test above isn't passing for a
+    /// trivial reason (e.g. an empty table always producing pointer-equal HashSets,
+    /// which it wouldn't, but this closes the loop with a real negative control
+    /// per this project's standing practice for correctness-sensitive tests).
+    #[tokio::test]
+    async fn cached_live_chunk_ids_recomputes_when_ttl_is_zero() {
+        // SAFETY / isolation: DFS_ORPHAN_SWEEP_LIVE_SET_CACHE_SECS is read by no
+        // other code in this codebase, so mutating it here cannot race any other
+        // concurrently-running test.
+        std::env::set_var("DFS_ORPHAN_SWEEP_LIVE_SET_CACHE_SECS", "0");
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8902".parse().unwrap();
+        let (_storage, _metadata, healing, _temp_storage, _temp_metadata) = make_healing(node_id, addr);
+
+        let first = healing.cached_live_chunk_ids().await.expect("first call must succeed");
+        let second = healing.cached_live_chunk_ids().await.expect("second call must succeed");
+
+        std::env::remove_var("DFS_ORPHAN_SWEEP_LIVE_SET_CACHE_SECS");
+
+        assert!(!Arc::ptr_eq(&first, &second),
+            "with TTL forced to 0, every call must recompute — confirms the reuse proven \
+             above is genuine caching, not a false-positive pointer coincidence");
     }
 
     /// Root-caused 2026-07-17: drain_heal_queue used to sort oldest-first only, so a
@@ -5682,6 +5974,40 @@ mod tests {
         );
     }
 
+    /// Root-caused 2026-08-07 (staging): cleanup_stale_pending's old cadence was a
+    /// cycle counter reset to zero by every process restart, so it needed 10 full
+    /// fresh discovery cycles (up to 10 minutes) of continuous uptime after every
+    /// single restart before it could fire even once — confirmed live, a 1h45m
+    /// gap with zero cleanup passes across three rolling deploys in quick
+    /// succession, while stale pending_healing garbage kept accumulating the
+    /// whole time. The wall-clock replacement must treat "never run this process
+    /// lifetime" (None) as due immediately — a fresh restart should clean up
+    /// within its first ~60s discovery cycle, not wait out an interval it has no
+    /// way to know it already earned in a prior life.
+    #[test]
+    fn pending_cleanup_due_fires_immediately_on_fresh_restart_then_respects_interval() {
+        let interval = Duration::from_secs(600);
+
+        // Never run this process lifetime — due right away, not after a full
+        // fresh interval. This is the exact restart-gap regression.
+        assert!(HealingManager::pending_cleanup_due(None, interval),
+            "a fresh process (last_cleanup_at=None) must be due immediately, not wait 10 more minutes");
+
+        // Just ran — not due yet.
+        assert!(!HealingManager::pending_cleanup_due(Some(Instant::now()), interval),
+            "must not be due immediately after running");
+
+        // Ran, but the full interval has elapsed since — due again.
+        let long_ago = Instant::now() - Duration::from_secs(601);
+        assert!(HealingManager::pending_cleanup_due(Some(long_ago), interval),
+            "must be due again once the interval has genuinely elapsed");
+
+        // Ran recently, interval not yet elapsed — still not due.
+        let recently = Instant::now() - Duration::from_secs(599);
+        assert!(!HealingManager::pending_cleanup_due(Some(recently), interval),
+            "must not be due one second before the interval elapses");
+    }
+
     /// Root-caused 2026-08-06: the paginated sweep never backs off, even when a
     /// long run of pages finds nothing to delete — near-continuous polling that
     /// taxes the same metadata store the write path needs. Below the empty-page
@@ -5932,6 +6258,129 @@ mod tests {
         assert!(healing.should_heal(&chunk_id, &mut deferred).await);
     }
 
+    /// Root-caused 2026-08-07 (staging: heal backlog stuck at ~8,600 chunks with
+    /// 0 in-flight for 40+ minutes despite full concurrency/bandwidth headroom,
+    /// only ever moving right after a manual trigger). drain_heal_queue's
+    /// cache-miss fallback used to probe one chunk at a time — each probe up to
+    /// a full per-node RPC timeout — so under sustained churn (many freshly-
+    /// queued "immediate heal" chunks, each a guaranteed cache miss on its first
+    /// cycle since nothing has classified it yet), a single drain cycle could
+    /// take many times longer than its own 15s run_heal_loop cadence, and the
+    /// automatic loop never meaningfully progressed on its own.
+    ///
+    /// Direct timing proof: several cache-miss chunks whose only candidate peer
+    /// is unreachable (a guaranteed ~3s timeout per probe) must all resolve in
+    /// roughly ONE timeout's worth of wall time, not N times that — proving
+    /// probes now run concurrently instead of sequentially.
+    #[tokio::test]
+    async fn drain_heal_queue_probes_cache_misses_concurrently_not_sequentially() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8903".parse().unwrap();
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
+        let healing = HealingManager::new(
+            storage.clone(), metadata.clone(), cluster.clone(), client, Arc::new(AtomicUsize::new(3)),
+            0, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 16, 8, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        // One "peer" registered as Online, backed by a real listener that
+        // accepts every connection but never responds — every HasChunks probe
+        // against it must hang until probe_single_chunk_alive_nodes's own 3s
+        // timeout fires. Deliberately NOT just an unbound port: a closed port
+        // fails instantly with connection-refused, which wouldn't exercise the
+        // slow path at all (confirmed: an earlier version of this test using a
+        // closed port passed in under 1s regardless of whether probing was
+        // sequential or concurrent — the real incident's peers were reachable
+        // but slow to answer, not unreachable).
+        let peer_addr: SocketAddr = "127.0.0.1:19399".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind(peer_addr).await.unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                // Hold the connection open forever, never reading or writing —
+                // simulates a peer that's up (TCP accepts) but never answers.
+                tokio::spawn(async move {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let unreachable_peer = dfs_common::NodeInfo::new(NodeId::new(), peer_addr, None);
+        cluster.add_node(unreachable_peer).await.unwrap();
+
+        // 8 distinct chunks, all guaranteed cache-misses (alive_nodes_cache
+        // starts empty), all already past the (zero-second) healing delay.
+        let chunk_ids: Vec<ChunkId> = (0..8)
+            .map(|i| ChunkId::from_hash(compute_chunk_hash(format!("slow-probe-{}", i).as_bytes())))
+            .collect();
+        for &id in &chunk_ids {
+            healing.mark_pending(id).await;
+        }
+
+        let start = std::time::Instant::now();
+        healing.drain_heal_queue().await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Sequential would be ~8 * 3s = 24s; concurrent should land close to
+        // one timeout's worth. Generous margin to avoid CI flakiness while
+        // staying far below the sequential bound this is guarding against.
+        assert!(elapsed < Duration::from_secs(10),
+            "drain_heal_queue took {:?} for 8 cache-miss chunks — expected roughly one \
+             probe's worth of wall time (concurrent), not ~8x that (sequential)", elapsed);
+    }
+
+    /// Root-caused 2026-08-07 (staging): queue_chunks_immediate's callers
+    /// (fold_slot_now, handle_replicate_patch_fold) queue a chunk based on a
+    /// point-in-time belief with no guarantee it's still the current identity
+    /// for its slot by the time the call actually runs. On a hot,
+    /// continuously-refolding file, a meaningful share of what got queued was
+    /// already superseded on arrival — permanently un-healable garbage,
+    /// removable only by cleanup_stale_pending's comparatively infrequent
+    /// sweep. Direct proof: queueing one live chunk (has a ChunkLocation) and
+    /// one already-orphaned chunk (no ChunkLocation, simulating "superseded
+    /// by the next fold before this queue call landed") together — only the
+    /// live one may ever reach pending_healing.
+    #[tokio::test]
+    async fn queue_chunks_immediate_never_queues_a_chunk_with_no_location_record() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8904".parse().unwrap();
+        let (storage, metadata, healing, _temp_storage, _temp_metadata) = make_healing(node_id, addr);
+
+        let live_content = vec![9u8; 64];
+        let live_chunk_id = ChunkId::from_hash(compute_chunk_hash(&live_content));
+        storage.write_chunk(&live_chunk_id, &live_content).unwrap();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: live_chunk_id,
+            nodes: vec![node_id],
+            size: live_content.len(),
+            checksum: live_chunk_id.hash,
+            file_offset: Some(0),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(dfs_common::FileId::new()),
+        }).unwrap();
+
+        // No ChunkLocation registered for this one at all — simulates a chunk
+        // superseded by a later fold before this queue call could land.
+        let orphaned_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"already-orphaned-chunk"));
+
+        healing.queue_chunks_immediate(vec![live_chunk_id, orphaned_chunk_id]).await;
+
+        let (sample, total_pending) = healing.pending_healing_sample(10).await;
+        assert_eq!(total_pending, 1,
+            "only the live chunk should have been queued, got {} pending entries", total_pending);
+        assert_eq!(sample.len(), 1);
+        assert_eq!(sample[0].chunk_id, live_chunk_id,
+            "the queued entry must be the live chunk, not the orphaned one");
+    }
+
     fn make_healing(node_id: NodeId, addr: SocketAddr) -> (Arc<ChunkStorage>, Arc<MetadataStore>, HealingManager, TempDir, TempDir) {
         let temp_storage = TempDir::new().unwrap();
         let temp_metadata = TempDir::new().unwrap();
@@ -6172,10 +6621,17 @@ mod tests {
     async fn test_queue_chunks_immediate_leader_queues_locally() {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
-        let (_storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        let (_storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
         assert!(healing.cluster.is_leader().await, "single-node cluster must be its own leader");
 
+        // Must have a registered ChunkLocation — on the leader, queue_chunks_immediate_local
+        // now validates liveness before queueing (see that function's doc comment).
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"leader-local"));
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id, nodes: vec![node_id], size: 4096, checksum: chunk_id.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: None,
+            file_id: Some(dfs_common::FileId::new()),
+        }).unwrap();
         healing.queue_chunks_immediate(vec![chunk_id]).await;
 
         let stats = healing.get_stats().await;
@@ -6235,11 +6691,18 @@ mod tests {
     async fn test_drain_heal_queue_probes_cache_miss_instead_of_skipping_forever() {
         let node_id = NodeId::new();
         let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
-        let (storage, _metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+        let (storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
         assert!(healing.cluster.is_leader().await, "single-node cluster must be its own leader");
 
         let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"cache-miss-probe"));
         storage.write_chunk(&chunk_id, b"real chunk bytes").unwrap();
+        // Must have a registered ChunkLocation — on the leader, queue_chunks_immediate_local
+        // now validates liveness before queueing (see that function's doc comment).
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id, nodes: vec![node_id], size: 17, checksum: chunk_id.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: None,
+            file_id: Some(dfs_common::FileId::new()),
+        }).unwrap();
 
         // Queue it (backdated, bypassing healing_delay_secs) but do NOT populate
         // alive_nodes_cache — simulating a fold that completed after the one
@@ -6326,8 +6789,15 @@ mod tests {
         healing.healing_delay_secs.store(0, Ordering::Relaxed);
 
         // Simulate unrelated concurrent healing activity: some other chunk, from
-        // some other file, already sitting in pending_healing.
+        // some other file, already sitting in pending_healing. Must have a
+        // registered ChunkLocation — on the leader, queue_chunks_immediate_local
+        // now validates liveness before queueing (see that function's doc comment).
         let unrelated_chunk = ChunkId::from_hash(compute_chunk_hash(b"unrelated-concurrent-activity"));
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: unrelated_chunk, nodes: vec![node_id], size: 4096, checksum: unrelated_chunk.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: None,
+            file_id: Some(dfs_common::FileId::new()),
+        }).unwrap();
         healing.queue_chunks_immediate(vec![unrelated_chunk]).await;
         assert_eq!(healing.pending_healing.read().await.len(), 1, "sanity: unrelated chunk seeded");
 

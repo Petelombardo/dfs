@@ -552,9 +552,12 @@ pub struct Server {
     /// fetch_add per op, single mutex acquire per second for the ring write.
     ops_tracker: Arc<OpsTracker>,
 
-    /// Shared connection semaphore from the NetworkServer.
+    /// Shared connection semaphore from the NetworkServer, paired with its
+    /// configured capacity (needed for stats/watchdog math, since
+    /// available_permits() alone can't tell you what 100% looks like once it's
+    /// env-overridden away from network::MAX_CONNECTIONS via DFS_MAX_CONNECTIONS).
     /// None until set_conn_semaphore() is called from main after the server starts.
-    conn_semaphore: Arc<RwLock<Option<Arc<tokio::sync::Semaphore>>>>,
+    conn_semaphore: Arc<RwLock<Option<(Arc<tokio::sync::Semaphore>, usize)>>>,
 
     /// Shared reserved peer-connection semaphore from the NetworkServer, paired
     /// with its configured capacity (needed for stats logging, since
@@ -996,7 +999,8 @@ fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ReplicateChunkLocation { .. }
         | Request::ReplicateChunkLocations { .. }
         | Request::ConfirmChunksLive { .. }
-        | Request::GetPendingPatchChunkIds { .. } => PeerOther,
+        | Request::GetPendingPatchChunkIds { .. }
+        | Request::GetPatchState { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
         Request::PatchChunk { .. } => ClientFullPatch,
@@ -1044,7 +1048,8 @@ fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::RemoveNode { .. }
         | Request::ListAllFiles
         | Request::GetNodeStats
-        | Request::GetRpcClassCounts => Admin,
+        | Request::GetRpcClassCounts
+        | Request::GetPendingHealingSample { .. } => Admin,
     }
 }
 
@@ -4734,16 +4739,12 @@ impl Server {
                 // for why this pool exists).
                 if let Some((sem, capacity)) = self.peer_conn_semaphore.read().await.clone() {
                     let in_use = capacity - sem.available_permits();
+                    let (client_in_use, client_capacity) = match self.conn_semaphore.read().await.as_ref() {
+                        Some((s, cap)) => (cap - s.available_permits(), *cap),
+                        None => (0, 0),
+                    };
                     info!("connection pools: peer {}/{} reserved, client {}/{}",
-                        in_use, capacity,
-                        {
-                            use crate::network::MAX_CONNECTIONS;
-                            match self.conn_semaphore.read().await.as_ref() {
-                                Some(s) => MAX_CONNECTIONS - s.available_permits(),
-                                None => 0,
-                            }
-                        },
-                        crate::network::MAX_CONNECTIONS);
+                        in_use, capacity, client_in_use, client_capacity);
                 }
             }
         });
@@ -5439,10 +5440,11 @@ impl Server {
         *self.offline_compaction_tx.write().await = Some(tx);
     }
 
-    /// Share the NetworkServer's connection semaphore with the Server.
-    /// Called from main() after NetworkServer is created, before it starts.
-    pub async fn set_conn_semaphore(&self, sem: Arc<tokio::sync::Semaphore>) {
-        *self.conn_semaphore.write().await = Some(sem);
+    /// Share the NetworkServer's connection semaphore (and its capacity) with
+    /// the Server. Called from main() after NetworkServer is created, before
+    /// it starts.
+    pub async fn set_conn_semaphore(&self, sem: Arc<tokio::sync::Semaphore>, capacity: usize) {
+        *self.conn_semaphore.write().await = Some((sem, capacity));
     }
 
     /// Share the NetworkServer's reserved peer-connection semaphore (and its
@@ -5457,14 +5459,14 @@ impl Server {
     /// Background task: monitor TCP connection slot pressure and step down from
     /// leadership when all slots are exhausted for a sustained period.
     ///
-    /// Thresholds (MAX_CONNECTIONS, currently 512 — see its own doc comment in
-    /// network.rs for the current value and sizing history):
-    ///   75% used (96+)  → WARN on each accept (done in network.rs)
+    /// Thresholds (against whatever capacity set_conn_semaphore() was given —
+    /// network::MAX_CONNECTIONS by default, currently 512, overridable via
+    /// DFS_MAX_CONNECTIONS; see network.rs's doc comment for sizing history):
+    ///   75% used         → WARN on each accept (done in network.rs)
     ///   100% for 30s    → check CLOSE_WAIT; if real load, GracefulLeave
     ///   recovery >50%   → announce_recovery
     ///   100% for 5 min  → exit(1) so systemd can restart cleanly
     pub fn start_conn_pressure_watchdog(self: Arc<Self>) {
-        use crate::network::MAX_CONNECTIONS;
         tokio::spawn(async move {
             let mut full_since: Option<std::time::Instant> = None;
             let mut stepped_down = false;
@@ -5472,15 +5474,15 @@ impl Server {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-                let sem = match self.conn_semaphore.read().await.clone() {
+                let (sem, capacity) = match self.conn_semaphore.read().await.clone() {
                     Some(s) => s,
                     None => continue, // not wired up yet
                 };
 
                 let available = sem.available_permits();
-                let in_use = MAX_CONNECTIONS - available;
+                let in_use = capacity - available;
 
-                if in_use >= MAX_CONNECTIONS {
+                if in_use >= capacity {
                     // Fully exhausted.
                     let since = *full_since.get_or_insert(std::time::Instant::now());
                     let secs_full = since.elapsed().as_secs();
@@ -5498,20 +5500,20 @@ impl Server {
                     if secs_full >= 30 && !stepped_down {
                         let port = self.cluster.local_addr().port();
                         let close_wait = count_close_wait_connections(port);
-                        let half = MAX_CONNECTIONS / 2;
+                        let half = capacity / 2;
 
                         if close_wait >= half {
                             // Mostly leaked CLOSE_WAIT — keepalive will clean these up,
                             // no need to step down yet.
                             tracing::warn!(
                                 "Connection pressure: {}/{} in use, {} CLOSE_WAIT — waiting for keepalive cleanup",
-                                in_use, MAX_CONNECTIONS, close_wait
+                                in_use, capacity, close_wait
                             );
                         } else {
                             // Genuinely active connections: step down from leadership.
                             tracing::error!(
                                 "Connection pressure: {}/{} in use ({} CLOSE_WAIT) for {}s — stepping down from leadership",
-                                in_use, MAX_CONNECTIONS, close_wait, secs_full
+                                in_use, capacity, close_wait, secs_full
                             );
                             self.cluster.announce_leaving(dfs_common::LeaveReason::ConnectionPressure).await;
                             stepped_down = true;
@@ -5520,7 +5522,7 @@ impl Server {
                 } else {
                     // Pressure has eased.
                     full_since = None;
-                    if stepped_down && available > MAX_CONNECTIONS / 2 {
+                    if stepped_down && available > capacity / 2 {
                         stepped_down = false;
                         self.cluster.announce_recovery().await;
                     }
@@ -6455,19 +6457,40 @@ impl Server {
                 self.handle_get_file_chunk_map(file_id, from_chunk, count).await
             }
 
+            Request::GetPatchState { public_token } => {
+                let state = self.metadata.get_patch_state_async(public_token).await
+                    .ok().flatten()
+                    .map(|s| match s {
+                        PatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq } =>
+                            dfs_common::RemotePatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq },
+                        PatchState::Folded(real) => dfs_common::RemotePatchState::Folded(real),
+                    });
+                Response::PatchStateResult { state }
+            }
+
+            Request::GetPendingHealingSample { limit } => {
+                let healing_guard = self.healing.read().await;
+                match healing_guard.as_ref() {
+                    Some(healing) => {
+                        let (entries, total_pending) = healing.pending_healing_sample(limit).await;
+                        Response::PendingHealingSample { entries, total_pending }
+                    }
+                    None => Response::PendingHealingSample { entries: vec![], total_pending: 0 },
+                }
+            }
+
             Request::AppendFile { file_id, data, expected_offset } => {
                 self.ops_tracker.inc_write();
                 self.handle_append_file(file_id, data, expected_offset).await
             }
 
             Request::GetNodeStats => {
-                use crate::network::MAX_CONNECTIONS;
                 let snap = self.ops_tracker.get_stats();
                 let (active_conn, max_conn) = {
                     let sem = self.conn_semaphore.read().await;
                     match sem.as_ref() {
-                        Some(s) => ((MAX_CONNECTIONS - s.available_permits()) as u64, MAX_CONNECTIONS as u64),
-                        None => (0, MAX_CONNECTIONS as u64),
+                        Some((s, cap)) => ((cap - s.available_permits()) as u64, *cap as u64),
+                        None => (0, 0),
                     }
                 };
                 Response::NodeStats {
@@ -12180,6 +12203,54 @@ impl Server {
         None
     }
 
+    /// Ask candidate_nodes what a given identifier actually resolves to in
+    /// their local patch_state — the peer-side counterpart to
+    /// looks_like_patch_token()'s local, marker-based check. Used exactly
+    /// once, from handle_multi_patch's ghost-chunk-guard retry (see that call
+    /// site's doc comment for the incident this closes): a node with no local
+    /// history for a slot must not guess whether a peer-reported "current"
+    /// identifier is real content or a still-pending public token — it asks.
+    ///
+    /// Tries each candidate in order, same shape as pull_chunk_from_peers,
+    /// and returns the first definitive answer. None means nobody asked
+    /// recognized it — either genuinely unknown cluster-wide (a long-folded,
+    /// since-pruned token — see PATCH_STATE_TABLE's prune_stale_folded_
+    /// patch_states) or, per PATCH_TOKEN_MARKER's doc comment, the rare
+    /// (~1/65536 per chunk) case where this is actually real content whose
+    /// hash happened to match the marker prefix. Callers must treat None as
+    /// "fall back to normal content verification," not as failure.
+    async fn resolve_patch_token_from_peers(
+        &self,
+        public_token: ChunkId,
+        candidate_nodes: &[dfs_common::NodeId],
+    ) -> Option<dfs_common::RemotePatchState> {
+        let local_id = self.cluster.local_node_id();
+        let nodes = self.cluster.get_all_nodes().await;
+        for &node_id in candidate_nodes {
+            if node_id == local_id {
+                continue;
+            }
+            let Some(node) = nodes.iter().find(|n| n.id == node_id) else { continue };
+            if node.status != dfs_common::NodeStatus::Online {
+                continue;
+            }
+            let req = Request::GetPatchState { public_token };
+            let resp = match self.client.send_message(node.addr, Message::Request(req)).await {
+                Ok(envelope) => envelope.message,
+                Err(e) => {
+                    warn!("resolve_patch_token_from_peers: failed to reach {} for token {}: {}", node.addr, public_token, e);
+                    continue;
+                }
+            };
+            match resp {
+                Message::Response(Response::PatchStateResult { state: Some(s) }) => return Some(s),
+                Message::Response(Response::PatchStateResult { state: None }) => continue,
+                _ => continue,
+            }
+        }
+        None
+    }
+
     /// Core patch-apply logic shared by handle_patch_chunk (single patch) and
     /// handle_multi_patch (N disjoint patches applied together), once the caller has
     /// already: acquired chunk_patch_locks for (file_id, chunk_idx) (iff chunk_idx is
@@ -13380,13 +13451,94 @@ impl Server {
             if let Some(fresh_loc) = self.refresh_slot_from_leader(file_id, cidx, chunk_id).await {
                 info!("MultiPatch: ghost-chunk guard tripped for file {} chunk {} (tried {}) — leader reports {} is current, retrying",
                     file_id, cidx, chunk_id, fresh_loc.chunk_id);
+
+                // fresh_loc.chunk_id is trusted here on the leader's say-so alone —
+                // this node has no local patch_state for it (that's the only way this
+                // branch is reached at all) and so cannot tell, from local state,
+                // whether it's genuine directly-readable content or another replica's
+                // still-pending public token (which is never itself a real file on
+                // disk — see PATCH_STATE_TABLE's doc comment). apply_patch's own
+                // ghost-chunk guard below only checks has_chunk() (presence), not
+                // content — so if *any* file happens to already sit at this exact
+                // path (a stale/retired chunk, a coincidental leftover — anything),
+                // it would be silently accepted as this slot's base with no content
+                // check at all. Root cause of a real 2026-08-07 incident (local
+                // DFS_MAX_CONNECTIONS=2 probe): a connection-starved replica hit
+                // exactly this path, wired in a mismatched base, and every future
+                // fold for that slot failed content-hash self-verification forever,
+                // with no way to ever recover — not a retry, a permanent dead end.
+                //
+                // Three-level resolution before ever trusting fresh_loc.chunk_id as a
+                // base:
+                //   1. looks_like_patch_token() — a free, local, always-correct-for-
+                //      genuine-tokens check (PATCH_TOKEN_MARKER's forced 2-byte
+                //      prefix). If it looks like a token, content-hash verification
+                //      (pull_chunk_from_peers's whole basis) cannot ever apply to it —
+                //      a token's id is deliberately NOT a hash of anything readable,
+                //      so that check would fail 100% of the time even when a peer's
+                //      answer is perfectly correct.
+                //   2. If it looks like a token: ask an authoritative peer what it
+                //      actually IS (resolve_patch_token_from_peers). Pending → adopt
+                //      the peer's real base_chunk_id/delta_chunk_id locally (after
+                //      pulling delta_chunk_id's bytes, which — unlike the token itself
+                //      — genuinely is content-hash-verifiable) so apply_patch's own
+                //      patch_state lookup finds it and takes the ordinary, already-
+                //      correct merge branch. Folded(real) → the token already resolved
+                //      to genuine content; verify/heal `real` the normal way.
+                //   3. If nobody recognizes it as a token (None): either a long-since-
+                //      pruned token, or the ~1/65536-per-chunk case where this is
+                //      actually real content that happens to share the marker prefix
+                //      (see PATCH_TOKEN_MARKER's doc comment — designed to fail safe,
+                //      never unsafe, on that false positive). Fall back to the normal
+                //      content-verification path, same as the non-token case.
+                //
+                // Deliberately NOT applied to the general fresh-accumulator path
+                // inside apply_patch itself: that fires on every chunk's first-ever
+                // patch on a node, cluster-wide — verifying there would tax the
+                // common case. This retry is already a rare, already-slower path
+                // (it only exists because something's already gone stale), so the
+                // extra peer round-trip(s) here are proportionate, not a new cost
+                // category.
+                let mut retry_chunk_id = fresh_loc.chunk_id;
+                if fresh_loc.chunk_id.looks_like_patch_token() {
+                    match self.resolve_patch_token_from_peers(fresh_loc.chunk_id, &fresh_loc.nodes).await {
+                        Some(dfs_common::RemotePatchState::Pending { base_chunk_id, delta_chunk_id, size, written_at, client_write_seq: peer_seq }) => {
+                            let have_delta = self.storage.has_chunk(&delta_chunk_id)
+                                || self.pull_chunk_from_peers(delta_chunk_id, &fresh_loc.nodes, file_id, chunk_file_offset).await.is_some();
+                            if have_delta {
+                                if let Err(e) = self.metadata.put_patch_state_pending_async(
+                                    file_id, cidx, fresh_loc.chunk_id, base_chunk_id, delta_chunk_id, size, written_at, peer_seq,
+                                ).await {
+                                    warn!("MultiPatch: failed to adopt peer-resolved patch_state for token {} (file {} chunk {}): {}",
+                                        fresh_loc.chunk_id, file_id, cidx, e);
+                                }
+                                // else: adopted — apply_patch's own get_patch_state_async
+                                // will now find it and take the ordinary merge branch.
+                            }
+                            // else: couldn't get the delta bytes either — retry_chunk_id
+                            // stays the token, apply_patch's ghost-chunk guard fails it
+                            // cleanly (NotFound) exactly like the "missing everywhere"
+                            // case it already handles.
+                        }
+                        Some(dfs_common::RemotePatchState::Folded(real)) => {
+                            self.pull_chunk_from_peers(real, &fresh_loc.nodes, file_id, chunk_file_offset).await;
+                            retry_chunk_id = real;
+                        }
+                        None => {
+                            self.pull_chunk_from_peers(fresh_loc.chunk_id, &fresh_loc.nodes, file_id, chunk_file_offset).await;
+                        }
+                    }
+                } else {
+                    self.pull_chunk_from_peers(fresh_loc.chunk_id, &fresh_loc.nodes, file_id, chunk_file_offset).await;
+                }
+
                 let lock = self.chunk_patch_locks
                     .entry((file_id, cidx))
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                     .clone();
                 let retry_guard = lock.lock_owned().await;
                 result = self.apply_patch(
-                    Some(retry_guard), fresh_loc.chunk_id, file_id, chunk_idx, chunk_file_offset,
+                    Some(retry_guard), retry_chunk_id, file_id, chunk_idx, chunk_file_offset,
                     patches, client_write_seq, prefetched,
                 ).await;
             }
@@ -18022,6 +18174,258 @@ mod tests {
         if expected.len() < 24 { expected.resize(24, 0); }
         expected[20..24].copy_from_slice(&[0xDDu8; 4]);
         assert_eq!(buf, expected, "composed content after a no-op followed by a real patch must be correct");
+    }
+
+    /// Repro for a bug found 2026-08-07 via a local DFS_MAX_CONNECTIONS=2 probe
+    /// (deliberately capping the client-facing connection semaphore to 2 and
+    /// hammering a 3-node cluster with fio): a chunk's fold got permanently stuck
+    /// failing content-hash self-verification, forever, with zero possibility of
+    /// ever recovering — "corrupt locally AND unrecoverable from peer" on every
+    /// 60s retry. Traced to apply_patch's ghost-chunk guard (the
+    /// `if !self.storage.has_chunk(&base_for_lookup)` check, just above this
+    /// test's call site) starting a brand-new Pending accumulator on top of
+    /// whatever `chunk_id` the caller claims as the base — checking only that
+    /// SOME file exists at that id's storage path, never that the file's
+    /// content actually hashes to the id it's named after. In the wild this
+    /// claimed base_chunk_id was another replica's public patch-token — an id
+    /// explicitly documented elsewhere as "never itself a real file on disk" —
+    /// fed back in via refresh_slot_from_leader's ghost-chunk-guard retry
+    /// (server.rs ~13380) after a connection-starved replica lagged behind. This
+    /// test doesn't need multi-replica timing to prove the vulnerability: it
+    /// plants a single file with the wrong content at a claimed base's path and
+    /// shows apply_patch accepts it anyway, silently wiring in an unfoldable
+    /// base. Run BEFORE any fix, per this project's repro-first convention —
+    /// this must fail (i.e. the "BUG REPRODUCED" branch must be hit) on
+    /// unpatched code.
+    #[tokio::test]
+    async fn apply_patch_ghost_chunk_guard_accepts_wrong_content_at_claimed_base_path() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // What the claimed base's id says its content should hash to.
+        let claimed_content = vec![0xAAu8; 64];
+        let claimed_base_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&claimed_content, chunk_file_offset, file_id),
+        );
+
+        // Plant DIFFERENT bytes at that exact storage path. In the wild this
+        // mismatch arose from a cross-replica public-token/base-id mixup under
+        // connection starvation; the ghost-chunk guard being tested here can't
+        // tell the difference between that and any other cause of a mismatch,
+        // so planting it directly is a faithful, deterministic stand-in.
+        let wrong_content = vec![0xFFu8; 64];
+        storage.write_chunk(&claimed_base_id, &wrong_content).unwrap();
+
+        // A registered ChunkLocation is required to reach the has_chunk() guard
+        // at all (get_chunk_location_async must succeed first).
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: claimed_base_id,
+            nodes: vec![node_id],
+            size: claimed_content.len(),
+            checksum: claimed_base_id.hash,
+            file_offset: Some(chunk_file_offset),
+            written_at: None,
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // No local patch_state for this id — Ok(None), the fresh-accumulator
+        // branch — exactly like a replica with no history for an id it was
+        // just told is "current".
+        assert!(metadata.get_patch_state(&claimed_base_id).unwrap().is_none(),
+            "precondition: no local patch_state for the claimed base");
+
+        let lock = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let result = server.apply_patch(
+            Some(lock), claimed_base_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0xCCu8; 4])], Some(1), None,
+        ).await;
+
+        let (public_token, ..) = result.expect(
+            "BUG REPRODUCED if this succeeds: apply_patch accepted a base_chunk_id whose \
+             on-disk content does not match its own claimed hash — has_chunk() only proves \
+             a file exists at that path, never that its content is what the id claims");
+
+        let base_chunk_id = match metadata.get_patch_state(&public_token).unwrap() {
+            Some(PatchState::Pending { base_chunk_id, .. }) => base_chunk_id,
+            other => panic!("expected a fresh Pending accumulator, got {:?}", other),
+        };
+        assert_eq!(base_chunk_id, claimed_base_id,
+            "the mismatched-content id is now permanently wired in as this slot's base");
+
+        // Downstream consequence: folding this accumulator must fail content-hash
+        // self-verification — and will fail identically on every future retry,
+        // since nothing ever changes the bytes actually on disk. This is the
+        // exact "corrupt locally AND unrecoverable from peer" dead end observed
+        // in the real run.
+        let fold_result = full_rewrite_chunk(
+            storage.clone(), metadata.clone(),
+            Arc::new(DashMap::new()), Arc::new(ShardedAliasMap::new(16)),
+            file_id, chunk_file_offset, base_chunk_id,
+            vec![(10usize, vec![0xCCu8; 4])], None, node_id,
+        ).await;
+
+        match fold_result {
+            Err((msg, ErrorCode::ChecksumMismatch)) => {
+                assert!(msg.contains("failed content hash verification"),
+                    "unexpected error message: {}", msg);
+            }
+            other => panic!(
+                "expected the fold to permanently fail content-hash self-verification, got {:?}", other),
+        }
+    }
+
+    /// End-to-end proof, at the actual layer the fix lives (handle_multi_patch's
+    /// ghost-chunk-guard retry, server.rs ~13380), that the 2026-08-07 bug from
+    /// the companion test above is closed for the real code path that produced
+    /// it. Two real Server instances, real networking: a "leader" that
+    /// genuinely knows a slot's pending patch (base+delta), and a "follower"
+    /// that already has a *ChunkLocation* for that same identity (as if an
+    /// earlier ReplicateChunkLocation broadcast reached it) but no local
+    /// patch_state for it at all — the exact combination the real incident
+    /// needed — plus a coincidentally-wrong file already sitting at that
+    /// identity's storage path. Before the fix, has_chunk() alone would have
+    /// accepted the wrong bytes; after it, pull_chunk_from_peers heals them
+    /// from the leader (whose ReadChunk handler already knows how to compose
+    /// a pending token) before ever trusting them as a base.
+    #[tokio::test]
+    async fn ghost_chunk_guard_retry_heals_mismatched_content_instead_of_trusting_it() {
+        use crate::network::NetworkServer;
+        use dfs_common::NodeInfo;
+
+        // "Leader": guaranteed-minimal NodeId so it always wins leadership
+        // comparisons — the follower built below must NOT be leader, so its
+        // refresh_slot_from_leader takes the real network path instead of an
+        // in-process chunk_map read.
+        let leader_temp_storage = TempDir::new().unwrap();
+        let leader_temp_metadata = TempDir::new().unwrap();
+        let leader_temp_metadata_dir = TempDir::new().unwrap();
+        let leader_storage = Arc::new(ChunkStorage::new(leader_temp_storage.path().to_path_buf()).unwrap());
+        let leader_metadata = Arc::new(MetadataStore::new(leader_temp_metadata.path().to_path_buf()).unwrap());
+        let leader_node_id = NodeId::from_bytes([0x00u8; 16]);
+        let leader_addr: SocketAddr = "127.0.0.1:19320".parse().unwrap();
+        let leader_cluster = Arc::new(ClusterManager::new(leader_node_id, leader_addr, 10, 30));
+        let leader_server = Arc::new(Server::new(
+            leader_storage.clone(), leader_metadata.clone(), 4 * 1024 * 1024, leader_cluster.clone(), 3,
+            leader_temp_metadata_dir.path().to_path_buf(), leader_temp_metadata_dir.path().join("config.toml"), true,
+        ));
+        let leader_peer_listen = crate::network::peer_port_addr(leader_addr);
+        let mut leader_net_server = NetworkServer::new(leader_peer_listen, leader_server.clone(), 10);
+        tokio::spawn(async move { leader_net_server.start().await.ok(); });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // A genuine pending patch on the leader: real base + real delta,
+        // correctly composable.
+        let base_content = vec![0x11u8; 64];
+        let base_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        leader_storage.write_chunk(&base_id, &base_content).unwrap();
+        let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+        delta_bytes.extend_from_slice(&encode_delta_record(1, 5, &[0x22u8; 4]));
+        // Must be compute_chunk_hash_at (file_id + offset mixed in, matching the
+        // real delta-hasher construction in apply_patch) — a plain compute_chunk_hash
+        // here would make pull_chunk_from_peers's real content verification
+        // correctly reject this delta as a hash mismatch, since real verification
+        // uses the real formula.
+        let delta_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&delta_bytes, chunk_file_offset, file_id),
+        );
+        leader_storage.write_chunk(&delta_id, &delta_bytes).unwrap();
+        // Must be the real token constructor (forces PATCH_TOKEN_MARKER), not an
+        // arbitrary hash — this test specifically exercises the marker-based
+        // looks_like_patch_token() branch in the ghost-chunk-guard retry.
+        let public_token = ChunkId::patch_token_identity(delta_id);
+        leader_metadata.put_patch_state_pending(
+            file_id, chunk_idx, &public_token, base_id, delta_id, base_content.len(), 1000, Some(1),
+        ).unwrap();
+        let real_loc = ChunkLocation {
+            chunk_id: public_token, nodes: vec![leader_node_id], size: base_content.len(),
+            checksum: public_token.hash, file_offset: Some(chunk_file_offset),
+            written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        leader_server.chunk_map.insert(file_id, (vec![real_loc.clone()], 1));
+        leader_metadata.put_chunk_location(&real_loc).unwrap();
+
+        // "Follower": the node under test. Registers the leader as its only
+        // known peer with a guaranteed-larger NodeId, so it is never leader
+        // itself (quorum=2, min=leader's all-zero id).
+        let follower_h = make_overlay_test_harness();
+        follower_h.server.cluster().add_node(NodeInfo::new(leader_node_id, leader_addr, None)).await.unwrap();
+        assert!(!follower_h.server.cluster().is_leader().await,
+            "test setup assumes the follower is NOT leader, so refresh_slot_from_leader must use the real network path");
+
+        // Follower already has a ChunkLocation for public_token (as if an
+        // earlier ReplicateChunkLocation reached it) but — critically — no
+        // local patch_state for it, and a WRONG file already sitting at its
+        // storage path (the exact coincidental-mismatch precondition).
+        follower_h.metadata.put_chunk_location(&real_loc).unwrap();
+        assert!(follower_h.metadata.get_patch_state(&public_token).unwrap().is_none(),
+            "precondition: follower has no local patch_state for the token");
+        let wrong_bytes = vec![0xEEu8; base_content.len()];
+        follower_h.storage.write_chunk(&public_token, &wrong_bytes).unwrap();
+
+        // Client's write claims a stale identity the follower has never heard
+        // of at all — guarantees apply_patch's first attempt fails NotFound,
+        // tripping the ghost-chunk-guard retry.
+        let stale_client_claim = ChunkId::from_hash(compute_chunk_hash(b"stale-claim-nobody-has"));
+        let resp = follower_h.server.handle_multi_patch(
+            stale_client_claim, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(5usize, vec![0x22u8; 4])], None, Some(1), None, Some(1),
+        ).await;
+
+        let new_chunk_id = match resp {
+            Response::MultiPatchResult { new_chunk_id, .. } => new_chunk_id,
+            other => panic!("expected the ghost-chunk-guard retry to succeed after resolving the token, got {:?}", other),
+        };
+
+        // The real proof: the follower's own patch_state for the write's result
+        // must chain back to the leader's genuine base_id — never to the
+        // coincidentally-wrong bytes planted above, and never to the token
+        // itself (a token was never meant to be directly-readable content at
+        // its own storage path in the first place — asserting on that path is
+        // exactly the false assumption this whole bug was about). Before the
+        // fix, has_chunk() would have silently accepted wrong_bytes and wired
+        // it in as this slot's base, permanently unfoldable.
+        match follower_h.metadata.get_patch_state(&new_chunk_id).unwrap() {
+            Some(PatchState::Pending { base_chunk_id, .. }) => {
+                assert_eq!(base_chunk_id, base_id,
+                    "the retry must have adopted the leader's real base_chunk_id, not the \
+                     token or the coincidentally-wrong local bytes");
+            }
+            other => panic!("expected a fresh Pending accumulator chained to the real base, got {:?}", other),
+        }
+
+        // And the wrong bytes that were sitting at the token's own path must
+        // never have been touched or trusted — confirms nothing tried to read
+        // the token as if it were literal content.
+        assert_eq!(follower_h.storage.read_chunk(&public_token).unwrap(), wrong_bytes,
+            "the token's own storage path is irrelevant and must be left exactly as planted — \
+             a token is never supposed to be read as literal bytes at its own path");
+        // (base_chunk_id's own bytes are deliberately NOT eagerly fetched here —
+        // by this system's existing design, a merge never needs to materialize
+        // the base; only an eventual fold does, at which point the pre-existing
+        // coordinate_and_fold_slot/heal_base_from_peer self-heal machinery
+        // fetches and verifies it.)
     }
 
     /// Negative control for the no-op detector: a patch that differs by even

@@ -52,6 +52,14 @@ pub trait MessageHandler: Send + Sync {
 // ProposeFold's own concurrency (mirroring write_semaphore/
 // fold_coordination_semaphore's existing pattern) rather than keep raising
 // this further.
+//
+// Overridable via DFS_MAX_CONNECTIONS (2026-08-07) — added specifically so a
+// deliberately tiny value (e.g. 2) can be used to force client-facing
+// connection exhaustion on demand in local dev, exercising the same watchdog/
+// backpressure/client-retry paths that would otherwise only trigger under a
+// real 512-connection peak. A bug that only shows up at exhaustion is a bug
+// that's latent at any capacity — this makes it reproducible without waiting
+// for one.
 pub const MAX_CONNECTIONS: usize = 512;
 
 /// Dedicated connection budget for the peer-only listener (see PEER_PORT_OFFSET)

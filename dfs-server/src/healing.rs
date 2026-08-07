@@ -1293,30 +1293,63 @@ impl HealingManager {
     async fn cleanup_stale_pending(&self) -> Result<()> {
         let max_pending_time = Duration::from_secs(self.healing_delay_secs.load(Ordering::Relaxed) * 20); // 20x healing delay
 
-        let to_remove: Vec<ChunkId> = {
+        // Cheap, sync, in-memory pass first: split into "too old, remove
+        // unconditionally" (no I/O needed) vs "needs a location check".
+        // Root-caused 2026-08-07 (staging, live): the location check used to
+        // call the SYNC get_chunk_location once per pending entry, inline in
+        // this async fn — real redb disk/mmap I/O blocking the tokio
+        // executor thread, once per entry. pending_healing can legitimately
+        // spike into the tens of thousands (see live_chunk_ids_cache's doc
+        // comment), so this could block a worker thread for a very long
+        // time — the same class of regression as queue_chunks_immediate_
+        // local's own fix (see that function's doc comment for the measured
+        // throughput impact), just with a much larger candidate count.
+        // Batched into ONE get_chunk_locations_batch_async call below
+        // instead — one redb read transaction for however many candidates
+        // need checking, not one transaction per candidate.
+        let (mut to_remove, needs_location_check): (Vec<ChunkId>, Vec<ChunkId>) = {
             let pending = self.pending_healing.read().await;
-            pending.iter()
-                .filter_map(|(chunk_id, detected_at)| {
-                    // Remove if pending for too long (likely deleted or unrecoverable)
-                    if detected_at.elapsed() > max_pending_time {
-                        debug!("Removing stale pending healing entry for chunk {} (pending for {}s)",
-                               chunk_id, detected_at.elapsed().as_secs());
-                        return Some(*chunk_id);
-                    }
-
-                    // Remove if the chunk: location record is gone — this means the file was
-                    // deleted (or the chunk was legitimately purged as an orphan).  There is
-                    // nothing left to heal regardless of whether raw chunk data still exists
-                    // on disk (stale data will be cleaned up separately).
-                    if self.metadata.get_chunk_location(chunk_id).ok().flatten().is_none() {
-                        debug!("Removing pending healing entry for chunk {} — no location record", chunk_id);
-                        return Some(*chunk_id);
-                    }
-
-                    None
-                })
-                .collect()
+            let mut too_old = Vec::new();
+            let mut to_check = Vec::new();
+            for (chunk_id, detected_at) in pending.iter() {
+                if detected_at.elapsed() > max_pending_time {
+                    debug!("Removing stale pending healing entry for chunk {} (pending for {}s)",
+                           chunk_id, detected_at.elapsed().as_secs());
+                    too_old.push(*chunk_id);
+                } else if !chunk_id.looks_like_patch_token() {
+                    // A patch-token-shaped id is exempt from the location
+                    // check for the same reason queue_chunks_immediate_local
+                    // exempts it: it's never expected to have a
+                    // ChunkLocation at all — see PATCH_TOKEN_MARKER's doc
+                    // comment. Without this, a legitimately still-pending
+                    // urgent patch-token entry would look identical to
+                    // garbage and get swept the same way.
+                    to_check.push(*chunk_id);
+                }
+            }
+            (too_old, to_check)
         };
+
+        if !needs_location_check.is_empty() {
+            match self.metadata.get_chunk_locations_batch_async(needs_location_check.clone()).await {
+                Ok(found) => {
+                    for chunk_id in needs_location_check {
+                        if !found.contains_key(&chunk_id) {
+                            debug!("Removing pending healing entry for chunk {} — no location record", chunk_id);
+                            to_remove.push(chunk_id);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Conservative on failure: skip this cycle's location-based
+                    // cleanup entirely rather than treating a transient batch-read
+                    // error as "nothing has a location" and over-removing —
+                    // there's always a next cycle.
+                    warn!("cleanup_stale_pending: batch location lookup failed for {} candidates, \
+                           skipping location-based cleanup this cycle: {}", needs_location_check.len(), e);
+                }
+            }
+        }
 
         // One transaction for the whole prune, not one per entry — see
         // clear_pending_for_deleted_chunks' doc comment for the measured churn this
@@ -5189,10 +5222,28 @@ impl HealingManager {
         // never supposed to have would silently break that path (see
         // urgent_healing_does_not_leak_after_completion).
         let chunk_ids: Vec<ChunkId> = if self.cluster.is_leader().await {
-            let filtered: Vec<ChunkId> = chunk_ids.into_iter()
-                .filter(|chunk_id| chunk_id.looks_like_patch_token()
-                    || self.metadata.get_chunk_location(chunk_id).ok().flatten().is_some())
-                .collect();
+            // get_chunk_location_async (spawn_blocking-backed), NOT the sync
+            // get_chunk_location directly — see that function's own doc
+            // comment: calling it inline on an async task runs a real redb
+            // read transaction (disk/mmap I/O) on the tokio executor thread,
+            // blocking every other task scheduled on it, not just this one.
+            // Root-caused 2026-08-07 (staging, live): this exact mistake
+            // shipped briefly, on a path that fires on every fold completion
+            // (fold_slot_now/handle_replicate_patch_fold), and measurably
+            // dropped throughput across every workload — not just healing —
+            // by starving the shared worker pool. Sequential per-chunk .await
+            // (not a concurrent fan-out like drain_heal_queue's cache-miss
+            // probing) is fine here: chunk_ids is almost always 1 item, and
+            // never bulk enough for the sequential-vs-concurrent distinction
+            // that mattered there to matter here.
+            let mut filtered = Vec::with_capacity(chunk_ids.len());
+            for chunk_id in chunk_ids {
+                let is_live = chunk_id.looks_like_patch_token()
+                    || self.metadata.get_chunk_location_async(chunk_id).await.ok().flatten().is_some();
+                if is_live {
+                    filtered.push(chunk_id);
+                }
+            }
             if filtered.is_empty() {
                 return;
             }

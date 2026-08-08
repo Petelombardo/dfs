@@ -348,6 +348,25 @@ async fn handle_connection<H: MessageHandler>(
                 // SPTIMING showed 5-25ms) is spent inside process_message/handle_request
                 // (would show up here) or purely in network/connection-layer transit
                 // (this would be fast here despite the client seeing it slow).
+                //
+                // req_class (2026-08-08): classify BEFORE process_message consumes
+                // envelope — a real multi-hour investigation into a live 13-second
+                // NETTIMING dispatch stall found this line completely silent on WHAT
+                // was actually stuck, only which peer/how long, forcing slow, fallible
+                // reconstruction from surrounding log correlation (which produced a
+                // wrong initial conclusion — see coordinate_and_fold_slot's timing
+                // that turned out NOT to be the cause). Reuses classify_request/
+                // classify_cluster_message (server.rs, already exhaustive and already
+                // tested for the dfs-admin rpc-stats feature) rather than a second
+                // hand-rolled match — deliberately the coarse RpcClass bucket, not a
+                // raw {:?} of the request, since Debug-formatting some variants (e.g.
+                // MultiPatch's own patch bytes) would be a real cost on this hot path,
+                // not just a diagnostic nicety.
+                let req_class: crate::stats::RpcClass = match &envelope.message {
+                    Message::Request(req) => crate::server::classify_request(req),
+                    Message::Cluster(msg) => crate::server::classify_cluster_message(msg),
+                    Message::Response(_) => crate::stats::RpcClass::Admin,
+                };
                 let dispatch_start = std::time::Instant::now();
                 let response = match tokio::time::timeout(
                     HANDLER_TIMEOUT,
@@ -381,11 +400,11 @@ async fn handle_connection<H: MessageHandler>(
                 const NETTIMING_INFO_MS: u128 = 500;
                 let slow_ms = dispatch_elapsed.as_millis().max(write_elapsed.as_millis());
                 if slow_ms >= NETTIMING_INFO_MS {
-                    info!("NETTIMING peer={} read_wait={:?} dispatch={:?} write_response={:?}",
-                        peer_addr, read_elapsed, dispatch_elapsed, write_elapsed);
+                    info!("NETTIMING peer={} class={:?} read_wait={:?} dispatch={:?} write_response={:?}",
+                        peer_addr, req_class, read_elapsed, dispatch_elapsed, write_elapsed);
                 } else if slow_ms >= 5 {
-                    debug!("NETTIMING peer={} read_wait={:?} dispatch={:?} write_response={:?}",
-                        peer_addr, read_elapsed, dispatch_elapsed, write_elapsed);
+                    debug!("NETTIMING peer={} class={:?} read_wait={:?} dispatch={:?} write_response={:?}",
+                        peer_addr, req_class, read_elapsed, dispatch_elapsed, write_elapsed);
                 }
             }
             Ok(Ok(None)) => {

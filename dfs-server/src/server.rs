@@ -953,7 +953,7 @@ fn parse_delta_records_legacy(bytes: &[u8]) -> Result<Vec<(usize, Vec<u8>)>> {
 /// proportion, not a precise audit trail. Two variants carry the disambiguating
 /// data in their own fields, so those ARE classified precisely: ReplicateChunk's
 /// `background` flag and PurgeFileMetadataById's `propagate` flag.
-fn classify_request(req: &Request) -> crate::stats::RpcClass {
+pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
     use crate::stats::RpcClass::*;
     match req {
         // Peer: healing
@@ -1057,7 +1057,7 @@ fn classify_request(req: &Request) -> crate::stats::RpcClass {
 /// these are inherently peer-side (the gossip/membership layer), so this
 /// exists mainly to feed the peer_gossip bucket specifically, distinct from
 /// Request-shaped peer traffic.
-fn classify_cluster_message(_msg: &ClusterMessage) -> crate::stats::RpcClass {
+pub(crate) fn classify_cluster_message(_msg: &ClusterMessage) -> crate::stats::RpcClass {
     crate::stats::RpcClass::PeerGossip
 }
 
@@ -3696,8 +3696,27 @@ impl OverlayForkCtx {
     /// every step WITHIN an acquired permit is short-timeout bounded (~5s) so
     /// one stuck peer can't hold a permit forever.
     async fn coordinate_and_fold_slot(&self, file_id: FileId, chunk_idx: u64) -> CoordinatedFoldOutcome {
+        // Self-reporting permit-wait (2026-08-08): a live 13-second NETTIMING
+        // dispatch stall investigation had no way to confirm or rule out
+        // fold_coordination_semaphore (24 permits, held for this whole
+        // function's lifetime — see this function's own later doc comment)
+        // as a contributor, only correlate-and-guess from surrounding logs —
+        // which produced a wrong initial conclusion. If this ever fires with
+        // a meaningful wait, that's now a direct, first-hand signal instead
+        // of an inference.
+        let permit_wait_start = std::time::Instant::now();
         let _permit = self.fold_coordination_semaphore.clone().acquire_owned().await
             .expect("fold_coordination_semaphore is never closed");
+        let permit_wait = permit_wait_start.elapsed();
+        if permit_wait.as_millis() >= 100 {
+            // available_permits() is a racy snapshot taken just after our own
+            // acquire (other tasks can acquire/release concurrently) — good
+            // enough to see "was the pool visibly drained around this wait",
+            // not meant as an exact point-in-time count.
+            warn!("coordinate_and_fold_slot: fold_coordination_semaphore acquire took {:?} for file {} chunk {} \
+                   (of 24 total permits, {} available immediately after this acquire)",
+                permit_wait, file_id, chunk_idx, self.fold_coordination_semaphore.available_permits());
+        }
         let key = (file_id, chunk_idx);
 
         // 0. Already granted this exact slot to a peer — don't compete with our

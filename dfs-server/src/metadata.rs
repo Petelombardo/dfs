@@ -606,6 +606,22 @@ impl MetadataStore {
             let commit_start = std::time::Instant::now();
             store.apply_ops_group(ops);
             let commit_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
+            // Immediate outlier report (2026-08-08): the periodic [META COMMITTER]
+            // summary already tracks max_commit_ms, but only as a number folded
+            // into a 5s-interval aggregate — a live 13-second commit ([META
+            // COMMITTER] max_commit_ms=13011.44) had no way to be pinned to an
+            // exact timestamp or distinguished from "big batch, expected to be
+            // slower" vs "tiny batch, anomalously stuck" without this. batch_size
+            // here is the deciding signal: a small batch taking seconds points at
+            // something external blocking the write transaction itself (a lock,
+            // fsync stall, or similar), not at legitimate volume.
+            if commit_ms >= 1000.0 {
+                warn!("[META COMMITTER] slow commit: {:.2}ms for a {}-op batch (queue_depth={} at start) — \
+                       {}",
+                    commit_ms, batch_size, queue_depth,
+                    if batch_size <= 4 { "small batch, anomalously slow — suspect external blocking, not volume" }
+                    else { "larger batch — may simply reflect real volume" });
+            }
             store.record_committer_stats(batch_size, queue_depth, commit_ms);
         }
     }

@@ -702,6 +702,8 @@ async fn handle_healing_command(
                     heal_transfer_timeout_secs,
                     pending_patches_outstanding,
                     healing_delay_secs,
+                    dirty_fold_slots,
+                    dirty_fold_slots_escalated,
                 } => {
                     if json_output {
                         let output = serde_json::json!({
@@ -718,6 +720,8 @@ async fn handle_healing_command(
                             "heal_transfer_timeout_secs": heal_transfer_timeout_secs,
                             "pending_patches_outstanding": pending_patches_outstanding,
                             "healing_delay_secs": healing_delay_secs,
+                            "dirty_fold_slots": dirty_fold_slots,
+                            "dirty_fold_slots_escalated": dirty_fold_slots_escalated,
                         });
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
@@ -734,6 +738,15 @@ async fn handle_healing_command(
                         println!("Healing Delay: {}s", healing_delay_secs);
                         println!("Last Check:    {} seconds ago", last_check);
                         println!("Pending patches outstanding: {}", pending_patches_outstanding);
+                        // Reported by whichever node answered this request (the leader,
+                        // by default — see find_leader_addr above) — a different node's
+                        // dirty_fold_slots is invisible from here. Use --cluster to target
+                        // a specific node's address directly if you suspect the problem
+                        // is elsewhere.
+                        println!("Dirty fold slots: {} ({} escalated/backed-off)", dirty_fold_slots, dirty_fold_slots_escalated);
+                        if dirty_fold_slots_escalated > 0 {
+                            println!("  ^ this node has chronically-failing folds retrying on a 30-min backoff — see server logs for \"disk corruption detected\" or \"consolidation failed\" around these slots");
+                        }
                     }
                 }
                 Response::Error { message, .. } => {

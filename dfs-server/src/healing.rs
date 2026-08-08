@@ -1429,7 +1429,7 @@ impl HealingManager {
     /// count-triggered backoff this replaces as the primary mitigation for redb
     /// load (that backoff stays, as defense in depth, but no longer needs to
     /// carry the whole weight of the fix).
-    async fn cached_live_chunk_ids(&self) -> Result<Arc<HashSet<ChunkId>>> {
+    pub(crate) async fn cached_live_chunk_ids(&self) -> Result<Arc<HashSet<ChunkId>>> {
         let ttl = Duration::from_secs(
             std::env::var("DFS_ORPHAN_SWEEP_LIVE_SET_CACHE_SECS")
                 .ok()
@@ -1969,9 +1969,17 @@ impl HealingManager {
         if !self.disk_orphan_sweep_cluster_gate_clear(false).await {
             return;
         }
-        let chunks = match self.storage.list_chunks() {
-            Ok(v) => v,
-            Err(e) => { warn!("Disk orphan sweep: failed to list local chunks: {}", e); return; }
+        // spawn_blocking: list_chunks() is real disk I/O (a full recursive directory
+        // walk on a cache miss) — see the paginated loop's own 2026-08-08 fix for the
+        // incident this same rule already exists to prevent (2026-06-20: the inline
+        // version froze the leader for ~2.5 hours). This entry point is rare/manual-
+        // trigger-only, but a landmine of the identical, already-proven-costly shape
+        // isn't worth leaving in place just because it fires less often.
+        let storage = self.storage.clone();
+        let chunks = match tokio::task::spawn_blocking(move || storage.list_chunks()).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => { warn!("Disk orphan sweep: failed to list local chunks: {}", e); return; }
+            Err(e) => { warn!("Disk orphan sweep: list_chunks panicked: {}", e); return; }
         };
         self.run_disk_orphan_sweep_over(chunks).await;
     }
@@ -2041,6 +2049,28 @@ impl HealingManager {
             // deleted inside this blocking closure.
             let mut live_file_candidates: Vec<(ChunkId, u64)> = Vec::new();
 
+            // One redb read transaction for the whole page instead of one per
+            // chunk (up to 5000/page). Root-caused 2026-08-08 (staging,
+            // gluster3): this loop called the per-chunk get_chunk_location
+            // individually 5000 times per page — no hashing anywhere in this
+            // function, but that many separate transaction begins/B-tree
+            // walks per page, run continuously by the orphan sweep on every
+            // one of 5 nodes, was itself real, sustained CPU cost. Same fix
+            // shape as queue_chunks_immediate_local/cleanup_stale_pending/the
+            // discovery fast-path's earlier 2026-08-08 fixes — a batch lookup
+            // was already sitting right there from those. Patch-token-shaped
+            // IDs are excluded from the batch request too, same as they
+            // already skip the lookup entirely below — no point spending a
+            // redb key lookup on an ID this loop is about to ignore anyway.
+            let lookup_ids: Vec<ChunkId> = chunks.iter().copied().filter(|id| !id.looks_like_patch_token()).collect();
+            let locations = match metadata.get_chunk_locations_batch(&lookup_ids) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Disk orphan sweep: batch routing-table lookup failed, skipping this page: {}", e);
+                    return Ok::<_, anyhow::Error>((0usize, chunks.len(), Vec::new()));
+                }
+            };
+
             for chunk_id in &chunks {
                 // 2026-08-04: a chunk_id matching the reserved patch-token marker
                 // (ChunkId::looks_like_patch_token, dfs-common/types.rs) is NEVER
@@ -2060,13 +2090,7 @@ impl HealingManager {
                 }
 
                 // Determine whether this local file is still our responsibility.
-                let loc_record = match metadata.get_chunk_location(chunk_id) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!("Disk orphan sweep: routing table error for {}: {}", chunk_id, e);
-                        continue;
-                    }
-                };
+                let loc_record = locations.get(chunk_id).cloned();
 
                 // Neither a bare `None` NOR a `Some(loc)` that excludes this node is
                 // proof the chunk is safe to delete — both just as easily mean this
@@ -2298,10 +2322,32 @@ impl HealingManager {
                 continue;
             }
 
-            let page = match self.storage.list_chunks_page(cursor, page_size) {
-                Ok(v) => v,
-                Err(e) => {
+            // Must run in spawn_blocking, not called inline here: list_chunks_page
+            // uses a real std::sync::Mutex-guarded cache (list_chunks_cache), and on
+            // a cache miss — always true on the very first call after any restart —
+            // it falls through to list_chunks()'s full recursive directory walk of
+            // the chunks directory, real blocking disk I/O. Root-caused 2026-08-08:
+            // called inline here, this blocked the tokio executor thread for the
+            // walk's entire duration while ALSO holding list_chunks_cache's mutex,
+            // so every other caller of list_chunks/list_chunks_page (run_disk_
+            // orphan_sweep, phantom reconciliation, etc.) piled up behind the same
+            // lock too — a live CPU sample caught over a thousand threads blocked
+            // in Mutex::lock_contended simultaneously. Same root cause, same fix
+            // shape as the two other 2026-08-08 blocking-call fixes; this exact
+            // "list_chunks() must be spawn_blocking'd" rule was already established
+            // and documented at this function's other call site above (see its
+            // comment — a 2026-06-20 incident already paid for learning this once).
+            let storage = self.storage.clone();
+            let page = match tokio::task::spawn_blocking(move || storage.list_chunks_page(cursor, page_size)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
                     warn!("Disk orphan sweep (paginated): failed to list chunk page: {}", e);
+                    *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
+                    tokio::time::sleep(current_page_grace).await;
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Disk orphan sweep (paginated): list_chunks_page panicked: {}", e);
                     *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
                     tokio::time::sleep(current_page_grace).await;
                     continue;
@@ -2883,31 +2929,55 @@ impl HealingManager {
         // too — it now runs per-node in run_disk_orphan_sweep(), independent of
         // leadership; see that function's doc comment.)
         let scan_result = if !deep {
-            // Fast: look up only pending chunks by ID.
+            // Fast: look up only pending chunks by ID. Batched into ONE redb
+            // transaction instead of one per pending entry — see
+            // cleanup_stale_pending's identical 2026-08-07 fix for the full
+            // rationale. This loop used to call the SYNC get_chunk_location
+            // (plus a SYNC file_exists_by_id) inline, once per pending_snapshot
+            // entry — real redb disk/mmap I/O blocking the tokio executor
+            // thread on every single one. Harmless while healing was stuck
+            // (pending_snapshot was barely draining, so this rarely ran against
+            // a large set), but with healing actually working now,
+            // pending_snapshot routinely holds thousands of entries and this
+            // runs every 60s on the leader — confirmed live via OTHERTIMING:
+            // client MultiPatch calls' evict_pending (a plain HashMap remove
+            // behind a fair RwLock) stalled up to ~1.4s waiting for an executor
+            // thread this loop had pinned in a tight synchronous scan.
             let mut chunks_to_check = Vec::with_capacity(pending_snapshot.len());
-            for chunk_id in &pending_snapshot {
-                match self.metadata.get_chunk_location(chunk_id) {
-                    Ok(Some(loc)) => {
-                        // If the chunk carries a file_id, verify the file still exists.
-                        // Orphan routing table entries (file deleted but RCL entry
-                        // re-added later) would otherwise cause the fast scan to keep
-                        // trying to heal chunks that belong to deleted files.
-                        let is_orphan = if let Some(file_id) = loc.file_id {
-                            !self.metadata.file_exists_by_id(file_id).unwrap_or(true)
-                        } else {
-                            false // can't tell without file_id; defer to deep scan
-                        };
-                        if is_orphan {
-                            let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
-                            self.clear_pending(chunk_id).await;
-                        } else {
-                            chunks_to_check.push(loc);
+            let pending_ids: Vec<ChunkId> = pending_snapshot.iter().copied().collect();
+            match self.metadata.get_chunk_locations_batch_async(pending_ids).await {
+                Ok(locations) => {
+                    for chunk_id in &pending_snapshot {
+                        match locations.get(chunk_id) {
+                            Some(loc) => {
+                                // If the chunk carries a file_id, verify the file still
+                                // exists. Orphan routing table entries (file deleted but
+                                // RCL entry re-added later) would otherwise cause the
+                                // fast scan to keep trying to heal chunks that belong to
+                                // deleted files.
+                                let is_orphan = if let Some(file_id) = loc.file_id {
+                                    !self.metadata.file_exists_by_id_async(file_id).await.unwrap_or(true)
+                                } else {
+                                    false // can't tell without file_id; defer to deep scan
+                                };
+                                if is_orphan {
+                                    let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
+                                    self.clear_pending(chunk_id).await;
+                                } else {
+                                    chunks_to_check.push(loc.clone());
+                                }
+                            }
+                            // Chunk was deleted from routing table (file deleted) but
+                            // its pending_healing entry was never cleaned up. Prune it.
+                            None => { self.clear_pending(chunk_id).await; }
                         }
                     }
-                    // Chunk was deleted from routing table (file deleted) but its
-                    // pending_healing entry was never cleaned up. Prune it now.
-                    Ok(None) => { self.clear_pending(chunk_id).await; }
-                    Err(_) => {}
+                }
+                Err(e) => {
+                    // Conservative like cleanup_stale_pending: skip this cycle rather
+                    // than risk treating every pending entry as "not found" (which
+                    // would clear_pending() all of them) on a transient batch failure.
+                    warn!("run_discovery_pass (fast): batch location lookup failed, skipping this cycle: {}", e);
                 }
             }
             ScanResult { chunks_to_check, orphaned_pending: Vec::new(), slot_losers: Vec::new() }
@@ -4957,7 +5027,15 @@ impl HealingManager {
         // avoiding a full re-hash of every chunk on every scrub cycle.
         const MTIME_TOLERANCE_SECS: u64 = 300;
 
-        let chunks = self.storage.list_chunks()?;
+        // spawn_blocking: same rule as list_chunks()'s other call sites — real disk
+        // I/O (a full recursive directory walk on a cache miss), never called inline
+        // on the async executor. See run_disk_orphan_sweep_paginated_loop's
+        // 2026-08-08 fix for the incident this prevents (2026-06-20: froze the
+        // leader for ~2.5 hours).
+        let storage = self.storage.clone();
+        let chunks = tokio::task::spawn_blocking(move || storage.list_chunks())
+            .await
+            .map_err(|e| anyhow::anyhow!("list_chunks panicked: {}", e))??;
         info!("Scrubbing {} chunks (mtime heuristic)", chunks.len());
 
         let mut skipped = 0usize;

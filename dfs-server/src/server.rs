@@ -1688,6 +1688,32 @@ const MAX_FOLD_FAILURES_BEFORE_ESCALATION: u32 = 10;
 /// See that constant's doc comment.
 const FOLD_ESCALATED_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// How old a Pending patch's `written_at` has to be, at the moment
+/// start_patch_state_resume_sweep finds it, before that row is presumed
+/// chronically stuck rather than just unlucky restart timing (a normal patch
+/// resumed moments after landing, well within its usual debounce window).
+///
+/// Root-caused 2026-08-08 (staging, gluster3): dirty_patch_slots' fold_failures
+/// counter is in-memory only and the resume sweep always re-tracks a row with
+/// fold_failures=0, so a slot that fails to fold for a reason that outlives a
+/// single process (e.g. a genuinely stale/superseded base chunk that will
+/// never verify) has to re-earn all the way to MAX_FOLD_FAILURES_BEFORE_
+/// ESCALATION's threshold from scratch on every single restart before the
+/// backstop sweep's 60s-interval retries back off to the escalated 30-minute
+/// one — and if restarts happen more often than that (a live gdb sample
+/// caught exactly this: the same 38 slots re-appearing in back-to-back 60s
+/// backstop cycles, with average RPC dispatch time across the whole node
+/// climbing past 2 seconds under the resulting sustained CPU load), the
+/// counter never gets the chance to escalate at all. A patch still Pending
+/// this long after it was written couldn't have gotten here by bad luck —
+/// PATCH_DEBOUNCE_IDLE plus a full MAX_FOLD_FAILURES_BEFORE_ESCALATION
+/// retry cycle at the backstop's own cadence is on the order of ~10 minutes,
+/// so this is set comfortably longer than that (not equal to it) specifically
+/// so a slot that's still working through its first, legitimate escalation
+/// cycle within the current process's own uptime is never mistaken for a
+/// chronic one.
+const RESUME_SWEEP_PRESUMED_CHRONIC_AGE_SECS: u64 = 15 * 60;
+
 /// Number of independent locks chunk_ring/delta_ring are split across.
 /// Added 2026-07-13: a single shared Mutex<LruCache> serializes every
 /// consult/seed across every concurrent operation touching *any* chunk, not
@@ -2082,6 +2108,62 @@ impl OverlayForkCtx {
                 false
             }
         }
+    }
+
+    /// Abandon and clean up a Pending patch whose slot has already been
+    /// resolved by a different path — chunk_map's CURRENT entry for
+    /// (file_id, chunk_idx) either names a different chunk_id than this
+    /// patch's own public_token, or has no entry at all (the slot became a
+    /// sparse hole, e.g. a guest discard/TRIM). Either way this patch's fold
+    /// can never matter again: even a successful fold would produce a result
+    /// for an identity nothing still references. A genuinely-still-pending,
+    /// not-yet-superseded patch's slot is expected to show its own
+    /// public_token as chunk_map's current occupant (apply_patch registers it
+    /// there the instant the patch lands) — see handle_confirm_chunks_live's
+    /// doc comment for the same invariant used elsewhere.
+    ///
+    /// Root-caused 2026-08-08 (staging, gluster3): confirmed via direct
+    /// inspection that every one of a batch of chronically-failing Pending
+    /// patches (see RESUME_SWEEP_PRESUMED_CHRONIC_AGE_SECS) belonged to a
+    /// slot chunk_map had already moved past — some superseded by a
+    /// different, already-live chunk_id (another replica's fold won and got
+    /// broadcast; this node's own attempt at the same generation was simply
+    /// late), some fully discarded to a sparse hole. In both cases the "disk
+    /// corruption detected" fold-verification failure these kept hitting was
+    /// a correct, safe refusal to trust a stale base — but nothing was ever
+    /// telling the slot to stop retrying a fold that could never matter
+    /// again, which is exactly the sustained CPU cost that investigation
+    /// traced back to this.
+    ///
+    /// Same age-gate requirement as abandon_patch_if_file_gone and for the
+    /// same reason: a node that just restarted, or a slot mid-genuinely-in-
+    /// flight resolution, can have a chunk_map that hasn't caught up yet —
+    /// see MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK's doc comment. Caller
+    /// gates on age; this function trusts whatever it's told.
+    ///
+    /// Returns true if the patch was abandoned (caller should return early
+    /// without attempting any chunk read/hash work for it).
+    async fn abandon_patch_if_slot_superseded(
+        &self,
+        file_id: FileId,
+        chunk_idx: u64,
+        public_token: ChunkId,
+    ) -> bool {
+        let current = self.chunk_map.get(&file_id).and_then(|entry| {
+            let (locs, _) = entry.value();
+            Server::chunk_map_find_by_idx(locs, chunk_idx).map(|pos| locs[pos].chunk_id)
+        });
+        if current == Some(public_token) {
+            return false; // still the current occupant — genuinely needs folding
+        }
+        warn!("single fold: file {} chunk_idx {} slot's current chunk_map entry ({:?}) no longer matches \
+               Pending patch {} — slot was superseded by a different path; abandoning unfoldable patch",
+            file_id, chunk_idx, current, public_token);
+        self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+        if let Err(e) = self.metadata.delete_patch_state_abandoned_async(public_token, file_id, chunk_idx).await {
+            warn!("single fold: failed to delete abandoned patch_state for {}: {}", public_token, e);
+        }
+        true
     }
 
     /// The other nodes that currently hold this slot, from chunk_map — i.e. the
@@ -2775,10 +2857,18 @@ impl OverlayForkCtx {
         // abandon_patch_if_file_gone's doc comment for the gap this closes —
         // and for why this is gated on patch age (MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK).
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        if now_secs.saturating_sub(patch_written_at) >= MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK.as_secs()
-            && self.abandon_patch_if_file_gone(file_id, chunk_idx, public_token).await
-        {
-            return None;
+        if now_secs.saturating_sub(patch_written_at) >= MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK.as_secs() {
+            if self.abandon_patch_if_file_gone(file_id, chunk_idx, public_token).await {
+                return None;
+            }
+            // Same age gate, same "cheapest check first" placement — see
+            // abandon_patch_if_slot_superseded's doc comment. Independent of
+            // the file-gone check above: a slot can be superseded on a file
+            // that's still very much alive (a normal fold-generation race),
+            // so neither check can substitute for the other.
+            if self.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token).await {
+                return None;
+            }
         }
 
         // Cancel base_chunk_id's healing in the background, right away — base_chunk_id
@@ -8137,14 +8227,56 @@ impl Server {
     /// this exact gap let two untouched nodes delete live VM-disk chunks within
     /// seconds of an unrelated node rejoining the cluster).
     async fn handle_confirm_chunks_live(&self, chunk_ids: Vec<ChunkId>) -> Response {
-        let metadata = self.metadata.clone();
-        let result = tokio::task::spawn_blocking(move || metadata.live_chunk_ids()).await;
-        match result {
-            Ok(Ok(mut live_set)) => {
-                for entry in self.chunk_map.iter() {
-                    let (locs, _) = entry.value();
-                    for loc in locs {
-                        live_set.insert(loc.chunk_id);
+        // Cache-aware wrapper around MetadataStore::live_chunk_ids() (a full
+        // FILE_TABLE+CHUNK_TABLE scan-and-deserialize) instead of rebuilding it
+        // fresh on every call. Root-caused 2026-08-08: alongside the chunk_map
+        // walk below, this was the other hot, uncached full-cluster scan a live
+        // CPU sample on the leader caught repeatedly — this RPC is the live-file
+        // orphan sweep's per-node authorization check against the leader, and
+        // with orphan-sweep actually running now (as opposed to stuck,
+        // pre-2026-08-07) it fires often enough that two independent O(total
+        // cluster data) rebuilds per call became the leader's dominant CPU cost.
+        // Reusing HealingManager's existing cached_live_chunk_ids() (60s TTL,
+        // already used by the orphan sweep's own local check) is safe here for
+        // exactly the reason its own doc comment gives: this RPC *is* the
+        // "leader-confirm gate" that comment already accounts for as one of the
+        // staleness tolerances the cache sits well inside of — a stale hit only
+        // ever delays detecting a real orphan by up to one TTL, never causes an
+        // incorrect "not live" answer for something that only just went stale.
+        // Falls back to the direct (uncached) scan if healing isn't running on
+        // this node — should never happen in practice, but never silently skips
+        // a liveness source over it.
+        let cached_live = match self.healing.read().await.as_ref() {
+            Some(healing) => healing.cached_live_chunk_ids().await,
+            None => {
+                let metadata = self.metadata.clone();
+                tokio::task::spawn_blocking(move || metadata.live_chunk_ids().map(std::sync::Arc::new)).await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {}", e)))
+            }
+        };
+        match cached_live {
+            Ok(cached_live) => {
+                // Everything below is a small, bounded-size supplementary source
+                // (candidates, pending patches, tokens, one online-peer response
+                // each) — NOT a rebuild of the whole cluster's live set — so it's
+                // kept as its own owned HashSet rather than trying to mutate the
+                // shared, cached Arc<HashSet> above.
+                let mut live_set: std::collections::HashSet<ChunkId> = std::collections::HashSet::new();
+                // chunk_to_file (reverse index, chunk_id -> file_id) instead of
+                // walking the entire in-memory chunk_map (every file, every chunk,
+                // cluster-wide) on every single call. chunk_to_file is maintained
+                // in exact lockstep with chunk_map at every mutation site
+                // (verified 2026-08-08 — see the two sites in
+                // handle_get_file_chunk_map that were missing this sync, fixed the
+                // same day), so its key set is equivalent to what a full chunk_map
+                // walk would find, just O(1) per lookup instead of O(total
+                // chunks) per call. Only checking the actual candidates (never
+                // more than one orphan-sweep page's worth) instead of unioning
+                // the whole cluster's chunk set keeps this correct: a candidate
+                // is live via chunk_map iff chunk_to_file has an entry for it.
+                for candidate in &chunk_ids {
+                    if self.chunk_to_file.contains_key(candidate) {
+                        live_set.insert(*candidate);
                     }
                 }
                 // Third liveness source: base_chunk_id and delta_chunk_id for every
@@ -8215,16 +8347,14 @@ impl Server {
                         }
                     }
                 }
-                let live: Vec<ChunkId> = chunk_ids.into_iter().filter(|id| live_set.contains(id)).collect();
+                let live: Vec<ChunkId> = chunk_ids.into_iter()
+                    .filter(|id| cached_live.contains(id) || live_set.contains(id))
+                    .collect();
                 Response::ChunkLiveness { live }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 warn!("handle_confirm_chunks_live: failed to build live_chunk_ids: {}", e);
                 Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError }
-            }
-            Err(e) => {
-                warn!("handle_confirm_chunks_live: spawn_blocking panicked: {}", e);
-                Response::Error { message: "Internal error".to_string(), code: ErrorCode::InternalError }
             }
         }
     }
@@ -10816,7 +10946,7 @@ impl Server {
     pub fn start_patch_state_resume_sweep(self: Arc<Self>) {
         let server = self;
         tokio::spawn(async move {
-            let pending = match server.metadata.all_pending_patch_slots_async().await {
+            let pending = match server.metadata.all_pending_patch_slots_with_age_async().await {
                 Ok(p) => p,
                 Err(e) => {
                     warn!("patch_state resume sweep: failed to scan for orphaned Pending rows: {}", e);
@@ -10828,7 +10958,22 @@ impl Server {
             }
             info!("patch_state resume sweep: found {} Pending row(s) from before this process started — resuming",
                 pending.len());
-            for (file_id, chunk_idx, token) in pending {
+            // A slot old enough to have missed this whole window couldn't have
+            // gotten there by ordinary bad luck — see the constant's own doc
+            // comment for the full reasoning (dirty_patch_slots' fold_failures
+            // counter resets to 0 on every restart, so a chronically-broken
+            // slot never accumulates enough consecutive failures to escalate
+            // if restarts happen more often than that).
+            let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            for (file_id, chunk_idx, token, written_at) in pending {
+                let age_secs = now_secs.saturating_sub(written_at);
+                let presumed_chronic = age_secs >= RESUME_SWEEP_PRESUMED_CHRONIC_AGE_SECS;
+                if presumed_chronic {
+                    warn!("patch_state resume sweep: file={} chunk={} has been Pending for {}s — presuming \
+                           chronically stuck rather than merely unlucky restart timing, starting pre-escalated \
+                           so the 60s backstop doesn't re-earn another ~10 minutes of unthrottled retries",
+                        file_id, chunk_idx, age_secs);
+                }
                 // entry().or_insert_with(), not a blind insert: real write
                 // traffic may have already started by the time this sweep
                 // runs and created its own fresh (newer) entry for this exact
@@ -10840,7 +10985,7 @@ impl Server {
                     delta_hasher: blake3::Hasher::new(),
                     verified: false, // unknown until a merge cold-reads this accumulator
                     legacy_delta_format: false, // unused while verified is false
-                    fold_failures: 0,
+                    fold_failures: if presumed_chronic { MAX_FOLD_FAILURES_BEFORE_ESCALATION } else { 0 },
                     last_fold_attempt_at: std::time::Instant::now(),
                     // materialized_ring is in-memory-only and empty after every
                     // restart, so it always misses on this slot's first
@@ -12864,7 +13009,19 @@ impl Server {
         // See write_semaphore's doc comment: this is the other foreground
         // client-write path (small/random writes go through the delta
         // accumulator here, not handle_write_chunk) that needs the same cap.
+        //
+        // permit_wait split out (2026-08-08): write_semaphore is a single
+        // 48-permit pool shared by EVERY foreground client-write path on this
+        // node (this delta accumulator AND handle_write_chunk's full-chunk
+        // writes) — not per-connection. Before this split, t_write bundled
+        // queueing time for that shared pool together with actual disk I/O,
+        // so a Q1T1 (zero client-side concurrency) run could still show wild
+        // pass-to-pass variance with no way to tell whether it came from
+        // contention with other traffic on this node (background DVR folds,
+        // healing pushes, replication) or from real I/O slowing down.
+        let t_permit_wait_start = std::time::Instant::now();
         let _write_permit = self.write_semaphore.acquire().await.ok();
+        let t_permit_wait = t_permit_wait_start.elapsed();
         match prior_delta {
             Some(prior_delta_id) => {
                 let append_bytes = new_record_bytes.clone();
@@ -13105,11 +13262,11 @@ impl Server {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100);
             if total.as_millis() >= aptiming_info_ms {
-                info!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} state={:?} loc={:?}",
-                    file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_state, t_loc);
+                info!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} permit_wait={:?} state={:?} loc={:?}",
+                    file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_permit_wait, t_state, t_loc);
             } else {
-                debug!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} state={:?} loc={:?}",
-                    file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_state, t_loc);
+                debug!("APTIMING file={} chunk={} is_merge={} total={:?} resolve={:?} base={:?} hash={:?} write={:?} permit_wait={:?} state={:?} loc={:?}",
+                    file_id, cidx, is_merge, total, t_resolve, t_base, t_hash, t_write, t_permit_wait, t_state, t_loc);
             }
         }
 
@@ -13291,6 +13448,13 @@ impl Server {
         };
         let lock_wait_elapsed = lock_wait_start.elapsed();
 
+        // OTHERTIMING (2026-08-07): breaks the SPTIMING "other" bucket down into its
+        // named sub-phases — added specifically to chase a live staging throughput
+        // regression where "other" was dominating total handler time (100-300ms) while
+        // apply_patch itself stayed fast (single-digit-to-low-double-digit ms), and no
+        // existing metric explained where the rest went. See each checkpoint site below.
+        let mut cp = std::time::Instant::now();
+
         // Fast pre-check using the per-slot chunk_seq (see CHUNK_SEQ_TABLE's doc
         // comment) — now that chunk_patch_locks is held for this exact slot, so this
         // read is consistent with nothing else able to change it underneath us.
@@ -13323,6 +13487,8 @@ impl Server {
                 }
             }
         }
+        let chunk_seq_elapsed = cp.elapsed();
+        cp = std::time::Instant::now();
 
         if let Some(cidx) = chunk_idx {
             // See the matching comment in handle_patch_chunk: clone the candidate
@@ -13385,10 +13551,14 @@ impl Server {
                 }
             }
         }
+        let staleness_check_elapsed = cp.elapsed();
+        cp = std::time::Instant::now();
 
         if let Some(healing) = self.healing.read().await.as_ref() {
             healing.evict_from_pending(&chunk_id).await;
         }
+        let evict_pending_elapsed = cp.elapsed();
+        cp = std::time::Instant::now();
 
         // Kick off disk reads for the next 2 chunks the client flagged as incoming.
         // Capped at 2 to avoid stacking too many concurrent prefetch reads on top of
@@ -13424,6 +13594,7 @@ impl Server {
         } else {
             None
         };
+        let prefetch_wait_elapsed = cp.elapsed();
 
         let apply_patch_start = std::time::Instant::now();
         let mut result = self.apply_patch(
@@ -13447,6 +13618,7 @@ impl Server {
         // once — it's always one of the two nodes any MultiPatch fans out to (the
         // client's deterministic sort always puts it first), so it processes every
         // patch to a slot first-hand and never depends on this same broadcast path.
+        let ghost_retry_start = std::time::Instant::now();
         if let (Err((_, ErrorCode::NotFound)), Some(cidx)) = (&result, chunk_idx) {
             if let Some(fresh_loc) = self.refresh_slot_from_leader(file_id, cidx, chunk_id).await {
                 info!("MultiPatch: ghost-chunk guard tripped for file {} chunk {} (tried {}) — leader reports {} is current, retrying",
@@ -13543,6 +13715,7 @@ impl Server {
                 ).await;
             }
         }
+        let ghost_retry_elapsed = ghost_retry_start.elapsed();
 
         // SPTIMING: unconditional server-side per-op timing breakdown, added 2026-07-12
         // to test whether chunk_patch_locks (held for this whole function, including
@@ -13559,15 +13732,29 @@ impl Server {
         // (info! for slow ops, debug! otherwise) for the same reason as NETTIMING — see
         // that gate's comment. The lock_wait question above is settled, incidentally: it
         // fired twice in a 30MB sample, so chunk_patch_locks is NOT the bottleneck.
+        //
+        // OTHERTIMING (2026-08-07): `other` used to be one opaque bucket. Now broken
+        // into its named sub-phases (chunk_seq check, staleness/rebase check, healing's
+        // evict_from_pending, prefetch/ring wait, ghost-chunk retry) so a regression
+        // inside "other" points at a specific phase instead of just "somewhere". `unacct`
+        // is whatever's left after subtracting every named phase — should stay near-zero;
+        // a growing unacct means a gap in this breakdown itself, not the code being timed.
         let total_handle = handle_start.elapsed();
+        let named_sum = lock_wait_elapsed + apply_patch_elapsed + chunk_seq_elapsed
+            + staleness_check_elapsed + evict_pending_elapsed + prefetch_wait_elapsed + ghost_retry_elapsed;
         let other_handle = total_handle.saturating_sub(lock_wait_elapsed + apply_patch_elapsed);
+        let unacct_handle = total_handle.saturating_sub(named_sum);
         const SPTIMING_INFO_MS: u128 = 100;
         if total_handle.as_millis() < SPTIMING_INFO_MS {
-            debug!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?}",
-                file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle);
+            debug!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?} \
+                    chunk_seq={:?} staleness={:?} evict_pending={:?} prefetch_wait={:?} ghost_retry={:?} unacct={:?}",
+                file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle,
+                chunk_seq_elapsed, staleness_check_elapsed, evict_pending_elapsed, prefetch_wait_elapsed, ghost_retry_elapsed, unacct_handle);
         } else {
-            info!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?}",
-                file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle);
+            info!("SPTIMING file={} chunk={:?} total={:?} lock_wait={:?} apply_patch={:?} other={:?} \
+                   chunk_seq={:?} staleness={:?} evict_pending={:?} prefetch_wait={:?} ghost_retry={:?} unacct={:?}",
+                file_id, chunk_idx, total_handle, lock_wait_elapsed, apply_patch_elapsed, other_handle,
+                chunk_seq_elapsed, staleness_check_elapsed, evict_pending_elapsed, prefetch_wait_elapsed, ghost_retry_elapsed, unacct_handle);
         }
         match result {
             Ok((new_chunk_id, final_size, patch_ts, final_buf)) => {
@@ -14336,6 +14523,10 @@ impl Server {
     /// actually applied without a second round trip).
     async fn healing_status_response(&self) -> Response {
         let pending_patches_outstanding = self.metadata.count_pending_patch_entries_async().await.unwrap_or(0);
+        let dirty_fold_slots = self.dirty_patch_slots.len();
+        let dirty_fold_slots_escalated = self.dirty_patch_slots.iter()
+            .filter(|e| e.value().fold_failures >= MAX_FOLD_FAILURES_BEFORE_ESCALATION)
+            .count();
         let healing_guard = self.healing.read().await;
         match healing_guard.as_ref() {
             Some(healing) => {
@@ -14354,6 +14545,8 @@ impl Server {
                     heal_transfer_timeout_secs: stats.tuning.heal_transfer_timeout_secs,
                     pending_patches_outstanding,
                     healing_delay_secs: stats.tuning.healing_delay_secs,
+                    dirty_fold_slots,
+                    dirty_fold_slots_escalated,
                 }
             }
             None => Response::HealingStatus {
@@ -14370,6 +14563,8 @@ impl Server {
                 heal_transfer_timeout_secs: 0,
                 pending_patches_outstanding,
                 healing_delay_secs: 0,
+                dirty_fold_slots,
+                dirty_fold_slots_escalated,
             },
         }
     }
@@ -15618,7 +15813,20 @@ impl Server {
                        instead of serving the stale identity", file_id);
                 match self.chunk_locations_for_info_async(file_id).await {
                     Ok(fresh_locations) if !fresh_locations.is_empty() => {
-                        self.chunk_map.insert(file_id, (fresh_locations.clone(), write_seq));
+                        // Keep chunk_to_file (the reverse index handle_confirm_chunks_live
+                        // now trusts as authoritative — see that function's doc comment)
+                        // in lockstep: drop the old entry's chunk_ids before adding the
+                        // freshly-re-derived ones, same pattern as every other chunk_map
+                        // mutation site.
+                        let old = self.chunk_map.insert(file_id, (fresh_locations.clone(), write_seq));
+                        if let Some((old_locs, _)) = old {
+                            for loc in &old_locs {
+                                self.chunk_to_file.remove(&loc.chunk_id);
+                            }
+                        }
+                        for loc in &fresh_locations {
+                            self.chunk_to_file.insert(loc.chunk_id, file_id);
+                        }
                         return slice_response(&fresh_locations, write_seq);
                     }
                     Ok(_) => {
@@ -15659,8 +15867,21 @@ impl Server {
         }).await;
         match result {
             Ok(Ok(Some((locations, write_seq)))) if !locations.is_empty() => {
-                // Populate cache for future lookups.
-                self.chunk_map.insert(file_id, (locations.clone(), write_seq));
+                // Populate cache for future lookups. Keep chunk_to_file in lockstep —
+                // see the matching comment at this function's other chunk_map.insert
+                // site above. This is a genuine cache-miss path (chunk_map.get()
+                // already returned None above), so `old` is expected to normally be
+                // None, but insert's return value is used defensively in case a
+                // concurrent writer raced this same file_id in between.
+                let old = self.chunk_map.insert(file_id, (locations.clone(), write_seq));
+                if let Some((old_locs, _)) = old {
+                    for loc in &old_locs {
+                        self.chunk_to_file.remove(&loc.chunk_id);
+                    }
+                }
+                for loc in &locations {
+                    self.chunk_to_file.insert(loc.chunk_id, file_id);
+                }
                 slice_response(&locations, write_seq)
             }
             // The file itself exists (get_file found it) but a full CHUNK_TABLE scan

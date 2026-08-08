@@ -2569,6 +2569,60 @@ impl MetadataStore {
             .context("spawn_blocking panicked in all_pending_patch_slots_async")?
     }
 
+    /// Same shape as all_pending_patch_slots but also returns each row's
+    /// `written_at` — a separate function rather than widening the shared one,
+    /// since all_pending_patch_slots' other caller (run_pending_patch_
+    /// reconciliation) destructures its tuple positionally and has no use for
+    /// the extra field. Used by start_patch_state_resume_sweep (2026-08-08) to
+    /// tell a genuinely-fresh-but-unlucky-timing Pending row (process happened
+    /// to restart moments after a normal patch landed) apart from one that's
+    /// been stuck failing to fold for a long time, possibly across several
+    /// prior restarts — dirty_patch_slots' fold_failures counter is in-memory
+    /// only and always resets to 0 on resume, so without this, a chronically-
+    /// broken slot re-earns the same ~10 minutes of unthrottled 60s-interval
+    /// retries every single restart, forever, instead of ever reaching
+    /// MAX_FOLD_FAILURES_BEFORE_ESCALATION's backoff.
+    pub fn all_pending_patch_slots_with_age(&self) -> Result<Vec<(FileId, u64, ChunkId, u64)>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let slot_table = match txn.open_table(PATCH_STATE_SLOT_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let state_table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut out = Vec::new();
+        for item in slot_table.range::<&str>(..)? {
+            let (slot_key, token_bytes) = item?;
+            let Some((file_id_str, chunk_idx_str)) = slot_key.value().rsplit_once(':') else { continue };
+            let Ok(file_uuid) = uuid::Uuid::parse_str(file_id_str) else { continue };
+            let Ok(chunk_idx) = chunk_idx_str.parse::<u64>() else { continue };
+            let Ok(token_str) = std::str::from_utf8(token_bytes.value()) else { continue };
+            let Some(token_hash) = decode_hex_32(token_str) else { continue };
+            let token = ChunkId::from_hash(token_hash);
+
+            if let Some(v) = state_table.get(token_str)? {
+                if let Ok(PatchState::Pending { written_at, .. }) = bincode::deserialize::<PatchState>(v.value()) {
+                    out.push((FileId::from_uuid(file_uuid), chunk_idx, token, written_at));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Async wrapper for all_pending_patch_slots_with_age.
+    pub async fn all_pending_patch_slots_with_age_async(self: &Arc<Self>) -> Result<Vec<(FileId, u64, ChunkId, u64)>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.all_pending_patch_slots_with_age())
+            .await
+            .context("spawn_blocking panicked in all_pending_patch_slots_with_age_async")?
+    }
+
     /// Same shape as all_pending_patch_slots but for slots whose token has already
     /// Folded — used by run_pending_patch_reconciliation's fold-announcement backstop
     /// (2026-08-04) to close the notify_leader_of_fold gap (see that field's doc

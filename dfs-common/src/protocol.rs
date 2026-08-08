@@ -1147,6 +1147,30 @@ pub enum Response {
         /// Appended at the end for the same bincode-positional reason as the field above.
         #[serde(default)]
         healing_delay_secs: u64,
+        /// Live count of dirty_patch_slots — chunk-patch accumulators actively
+        /// tracked for a background fold on THIS node right now, distinct from
+        /// pending_patches_outstanding above (a durable PATCH_STATE_TABLE row
+        /// count, unaffected by process restarts). dirty_patch_slots is in-
+        /// memory-only and this is what was missing 2026-08-08 when a node's
+        /// sustained CPU load from a stuck-fold retry storm was invisible in
+        /// this same status output — pending_patches_outstanding read 0 on the
+        /// leader (a different node) while the actual backlog sat on a
+        /// follower, and nothing here showed dirty_patch_slots at all.
+        /// Appended at the end for the same bincode-positional reason as the
+        /// fields above.
+        #[serde(default)]
+        dirty_fold_slots: usize,
+        /// Of dirty_fold_slots, how many have crossed
+        /// MAX_FOLD_FAILURES_BEFORE_ESCALATION — i.e. are backed off to the
+        /// 30-minute escalated retry interval rather than genuinely fresh or
+        /// recently-touched. A nonzero count here on a healthy-looking node is
+        /// exactly the signal that was missing: chronically-failing folds
+        /// consuming real CPU on every retry, invisible in pending_count/
+        /// in_flight_count/stalled_count (all of which are about under-
+        /// replication healing, a completely different subsystem from fold
+        /// coalescing). Appended at the end for the same reason as above.
+        #[serde(default)]
+        dirty_fold_slots_escalated: usize,
     },
 
     /// File info with chunk locations

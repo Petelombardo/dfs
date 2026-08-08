@@ -9151,23 +9151,31 @@ impl Server {
         // back to the two dual-RF patched replicas before metadata is committed.
         //
         // Bulk discovery/reconciliation scans send a node its entire assignment in
-        // one request — tens of thousands of chunk_ids at cluster scale. One
-        // list_chunks() directory walk plus HashSet lookups is far cheaper than
-        // that many individual has_chunk() stat() calls, and (like the per-chunk
-        // loop this replaced) still runs in spawn_blocking since it's real disk
-        // I/O — running it inline on the async runtime blocks a tokio worker
-        // thread with no yield points (the same class of bug fixed in 67b4d12 and
-        // in run_phantom_reconciliation_pass / the deep discovery scan), this time
-        // on the *receiving* end, where it can stall the responding node and make
-        // the caller's RPC look hung.
+        // one request — tens of thousands of chunk_ids at cluster scale — so this
+        // still checks against the live-maintained index rather than doing that
+        // many individual has_chunk() stat() calls, and (like the per-chunk loop
+        // this originally replaced) still runs in spawn_blocking since a cold-cache
+        // hit means real disk I/O — running it inline on the async runtime blocks a
+        // tokio worker thread with no yield points (the same class of bug fixed in
+        // 67b4d12 and in run_phantom_reconciliation_pass / the deep discovery
+        // scan), this time on the *receiving* end, where it can stall the
+        // responding node and make the caller's RPC look hung.
+        //
+        // Root-caused 2026-08-08 chasing sustained gluster2/3/4/5 CPU:
+        // chunks_present_batch checks directly against the live index (O(log n)
+        // per id) instead of the old approach of collecting the ENTIRE local
+        // chunk set into a fresh HashSet on every single call regardless of how
+        // few ids this particular request actually asked about — this handler is
+        // peer-triggered with no rate limit, and under real cluster traffic
+        // (dozens of calls/sec) that per-call full-set materialization was live
+        // gdb-confirmed as the dominant CPU cost on the process.
         let storage = self.storage.clone();
         let tombstones = self.chunk_tombstones.clone();
         let values = tokio::task::spawn_blocking(move || {
-            let present: std::collections::HashSet<ChunkId> = storage.list_chunks()
-                .map(|v| v.into_iter().collect())
-                .unwrap_or_default();
-            chunk_ids.iter()
-                .map(|id| !tombstones.contains(id) && present.contains(id))
+            let present = storage.chunks_present_batch(&chunk_ids)
+                .unwrap_or_else(|_| vec![false; chunk_ids.len()]);
+            chunk_ids.iter().zip(present.iter())
+                .map(|(id, &has)| !tombstones.contains(id) && has)
                 .collect()
         }).await.unwrap_or_else(|e| {
             warn!("handle_has_chunks: spawn_blocking panicked: {}", e);

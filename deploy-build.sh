@@ -1,10 +1,14 @@
 if [ "$1" == "" ]; then
-	echo "Usage: deploy-build.sh [all|client|server]"
+	echo "Usage: deploy-build.sh [all|client|server] | deploy-build.sh server rollback"
 	echo ""
-	echo "  server  - rolling update of all 5 storage nodes (safe for non-protocol changes)"
-	echo "  client  - update client nodes (nanopir3, rock5b)"
-	echo "  all     - stop clients first, rolling update servers, then restart clients"
-	echo "            (correct order for protocol-changing deploys)"
+	echo "  server           - rolling update of all 5 storage nodes (safe for non-protocol changes)"
+	echo "  client           - update client nodes (nanopir3, rock5b)"
+	echo "  all              - stop clients first, rolling update servers, then restart clients"
+	echo "                     (correct order for protocol-changing deploys)"
+	echo "  server rollback  - rolling restore of dfs-server/dfs-admin/dfs-client on all 5 storage"
+	echo "                     nodes from the .old backup left by the last 'server' or 'all' deploy"
+	echo "                     (see backup_remote_binaries) — for undoing a bad server deploy without"
+	echo "                     needing a fresh build. No .old on a node leaves it untouched, with a warning."
 	exit
 fi
 
@@ -49,6 +53,24 @@ backup_remote_binaries() {
 	for bin in "$@"; do
 		echo "  [$host] Backing up /usr/bin/$bin -> /usr/bin/$bin.old"
 		ssh root@"$host" "[ -f /usr/bin/$bin ] && cp -f /usr/bin/$bin /usr/bin/$bin.old || true"
+	done
+}
+
+# rollback_remote_binaries <host> <binary> [binary ...]
+# Inverse of backup_remote_binaries: restores each /usr/bin/<binary> from
+# /usr/bin/<binary>.old on the remote host. A missing .old (never deployed
+# from this script, or already rolled back once with nothing redeployed
+# since) is a warning, not a fatal error — every other host/binary in the
+# same rollback run should still proceed.
+rollback_remote_binaries() {
+	local host="$1"; shift
+	for bin in "$@"; do
+		if ssh root@"$host" "[ -f /usr/bin/$bin.old ]"; then
+			echo "  [$host] Rolling back /usr/bin/$bin.old -> /usr/bin/$bin"
+			ssh root@"$host" "cp -f /usr/bin/$bin.old /usr/bin/$bin"
+		else
+			echo "  [$host] WARNING: no /usr/bin/$bin.old found — $bin left as-is"
+		fi
 	done
 }
 
@@ -139,6 +161,30 @@ if [ "$1" == "all" ]; then
 	done
 	echo ""
 	sleep 3
+fi
+
+# ─── server rollback ───────────────────────────────────────────────────────────
+# Restores the .old binaries backup_remote_binaries left from the last server
+# deploy — same rolling order and same convergence check as a normal server
+# deploy, just restoring instead of copying a fresh build. Exits afterward so
+# this never falls through into the normal deploy logic below.
+if [ "$1" == "server" ] && [ "$2" == "rollback" ]; then
+	baseline_ip=$(resolve_ip gluster1)
+	baseline_count=$(target/release/dfs-admin --cluster "${baseline_ip}:8900" --format json file list 2>/dev/null \
+		| python3 -c "import json,sys; print(json.load(sys.stdin).get('total_count', 0))" 2>/dev/null || echo 0)
+	echo "Baseline file count before server rollback: $baseline_count"
+	echo ""
+
+	for i in gluster2 gluster3 gluster4 gluster5 gluster1; do
+		echo "Rolling back $i"
+		ssh root@$i systemctl stop dfs-server
+		sleep 1
+		rollback_remote_binaries "$i" dfs-server dfs-admin dfs-client
+		ssh root@$i systemctl start dfs-server
+		wait_for_convergence "$(resolve_ip $i)" "$baseline_count" "$i"
+		echo ""
+	done
+	exit 0
 fi
 
 # ─── server rolling update ────────────────────────────────────────────────────

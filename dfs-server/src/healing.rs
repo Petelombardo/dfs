@@ -1990,11 +1990,17 @@ impl HealingManager {
     /// itself, so a caller can pass either "every chunk on disk" or just one page of
     /// them. Caller is responsible for the cluster-gate check
     /// (disk_orphan_sweep_cluster_gate_clear) — this function assumes it already passed.
-    /// Returns the number of real orphan-deletion candidates found in `chunks` —
-    /// consulted by run_disk_orphan_sweep_paginated_loop's adaptive backoff (an
-    /// empty page is the signal it's safe to slow down; the manual full-sweep
-    /// entry point above ignores it).
-    async fn run_disk_orphan_sweep_over(&self, chunks: Vec<ChunkId>) -> usize {
+    /// Returns the chunk_ids of every real orphan-deletion candidate found in
+    /// `chunks` — i.e. every chunk that failed the "kept" liveness check above,
+    /// the same set logged as "N candidates routed to leader-confirm gate" and
+    /// handed to reconcile_live_file_candidates below (which then applies its own
+    /// two-pass debounce/leader-confirm gate on top). The *ids*, not just a count,
+    /// so run_disk_orphan_sweep_paginated_loop's adaptive backoff can tell a
+    /// persistently-recurring stuck set (see reconcile_live_file_candidates:
+    /// authorized-but-refused candidates re-enter as "first sighting" next cycle)
+    /// apart from genuinely new work — see that loop's net-new tracking. The manual
+    /// full-sweep entry point above ignores the result.
+    async fn run_disk_orphan_sweep_over(&self, chunks: Vec<ChunkId>) -> Vec<ChunkId> {
         // 2x the periodic full-reconciliation interval (server.rs RECONCILE_INTERVAL =
         // 300s) — that loop is the slowest *guaranteed* metadata-catchup path in the
         // system, so doubling it bounds how stale this node's live_chunk_ids() view
@@ -2030,7 +2036,7 @@ impl HealingManager {
             Ok(set) => set,
             Err(e) => {
                 warn!("Disk orphan sweep: failed to compute live_chunk_ids: {}", e);
-                return 0;
+                return Vec::new();
             }
         };
         // superseded_generation_chunk_ids is intentionally NOT consulted here anymore —
@@ -2048,28 +2054,6 @@ impl HealingManager {
             // it. Collected for the async leader-confirm/stability gate below; never
             // deleted inside this blocking closure.
             let mut live_file_candidates: Vec<(ChunkId, u64)> = Vec::new();
-
-            // One redb read transaction for the whole page instead of one per
-            // chunk (up to 5000/page). Root-caused 2026-08-08 (staging,
-            // gluster3): this loop called the per-chunk get_chunk_location
-            // individually 5000 times per page — no hashing anywhere in this
-            // function, but that many separate transaction begins/B-tree
-            // walks per page, run continuously by the orphan sweep on every
-            // one of 5 nodes, was itself real, sustained CPU cost. Same fix
-            // shape as queue_chunks_immediate_local/cleanup_stale_pending/the
-            // discovery fast-path's earlier 2026-08-08 fixes — a batch lookup
-            // was already sitting right there from those. Patch-token-shaped
-            // IDs are excluded from the batch request too, same as they
-            // already skip the lookup entirely below — no point spending a
-            // redb key lookup on an ID this loop is about to ignore anyway.
-            let lookup_ids: Vec<ChunkId> = chunks.iter().copied().filter(|id| !id.looks_like_patch_token()).collect();
-            let locations = match metadata.get_chunk_locations_batch(&lookup_ids) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Disk orphan sweep: batch routing-table lookup failed, skipping this page: {}", e);
-                    return Ok::<_, anyhow::Error>((0usize, chunks.len(), Vec::new()));
-                }
-            };
 
             for chunk_id in &chunks {
                 // 2026-08-04: a chunk_id matching the reserved patch-token marker
@@ -2090,24 +2074,34 @@ impl HealingManager {
                 }
 
                 // Determine whether this local file is still our responsibility.
-                let loc_record = locations.get(chunk_id).cloned();
-
-                // Neither a bare `None` NOR a `Some(loc)` that excludes this node is
-                // proof the chunk is safe to delete — both just as easily mean this
-                // node's own local metadata hasn't caught up (e.g. after a leadership
-                // change, a metadata-replication backlog, or — confirmed live,
-                // 2026-07-10, staging gluster3 — a ChunkLocation record whose node
-                // list is simply stale relative to the leader's) while the chunk is
-                // still legitimately live, including on THIS node. A previous version
-                // of this function fast-path-deleted the `Some(loc) not listing us`
-                // case locally, trusting its own possibly-stale record as
-                // authoritative with no leader round trip — same node-local-view-as-
-                // cluster-truth disease as bugs 6/8/9, just unaudited here. Caught
-                // deleting a real, needed 2nd-of-2 replica the leader's own record
-                // still listed this exact node as holding, dropping it to
-                // under-replicated. Route every case uniformly through the same
-                // leader-confirm + cluster-stability gate below instead of deleting
-                // on local metadata alone.
+                //
+                // Trust live_from_metadata / live_from_chunk_map standalone — no
+                // additional requirement that a ChunkLocation routing-table record
+                // also exist. chunk_map is kept synchronously fresh by every patch/
+                // replicate-location handler (see the doc comment above this
+                // function) and is already trusted standalone everywhere else in
+                // this file (classify_zero_replica_chunk, the phantom-reconciliation
+                // pass). Previously this also required `get_chunk_locations_batch`
+                // to return a record before trusting either liveness source —
+                // root-caused 2026-08-08 chasing sustained gluster2/3/4/5 CPU: a
+                // chunk_map-live chunk that simply never got a location record
+                // written (the same VM-108/VM-111-shaped dissemination gap the rest
+                // of this file guards against elsewhere) fell through this AND into
+                // candidacy. On a follower the leader-confirm round trip below
+                // usually still saves it, at the cost of perpetually re-flagging it
+                // as a "candidate" every single sweep cycle forever (never actually
+                // clearing, and defeating disk_sweep_next_backoff's pacing since it
+                // never reads as an empty page). On the LEADER, nothing downstream
+                // re-checks liveness before authorize_live_file_orphan_deletes
+                // deletes it — proven via a local repro
+                // (test_disk_orphan_sweep_chunk_map_live_chunk_missing_location_record_must_survive)
+                // that physically deleted a genuinely-live chunk after two passes
+                // with the old AND-gated condition. Requiring a location record
+                // in addition to liveness was never a safety margin, only an extra
+                // way for a real live chunk to slip through as a false-positive
+                // candidate — the two liveness sources are already the actual
+                // liveness signal.
+                //
                 // NOTE (2026-07-26): superseded_generations deliberately does NOT gate
                 // deletion here anymore. It's derived from this node's own in-memory
                 // chunk_generations/fold_result_chunk_ids (location_supersedes), which
@@ -2125,7 +2119,7 @@ impl HealingManager {
                 // gating (pre-739435c behavior) until generation state has a real
                 // cluster-reconciled source of truth. The heal-queue-exclusion half of
                 // 739435c (slot_losers skip below, non-destructive) is unaffected and stays.
-                if loc_record.is_some() && (live_from_metadata.contains(chunk_id) || live_from_chunk_map.contains(chunk_id)) {
+                if live_from_metadata.contains(chunk_id) || live_from_chunk_map.contains(chunk_id) {
                     kept += 1;
                     continue;
                 }
@@ -2167,11 +2161,12 @@ impl HealingManager {
 
         let (kept, total, live_file_candidates) = match result {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => { warn!("Disk orphan sweep error: {}", e); return 0; }
-            Err(e) => { warn!("Disk orphan sweep panicked: {}", e); return 0; }
+            Ok(Err(e)) => { warn!("Disk orphan sweep error: {}", e); return Vec::new(); }
+            Err(e) => { warn!("Disk orphan sweep panicked: {}", e); return Vec::new(); }
         };
 
-        let candidate_count = live_file_candidates.len();
+        let candidate_ids: Vec<ChunkId> = live_file_candidates.iter().map(|(id, _)| *id).collect();
+        let candidate_count = candidate_ids.len();
         if candidate_count > 0 {
             info!("Disk orphan sweep: {} local chunks checked — {} kept (legitimately ours), {} candidates routed to leader-confirm gate",
                   total, kept, candidate_count);
@@ -2180,7 +2175,7 @@ impl HealingManager {
         }
 
         self.reconcile_live_file_candidates(live_file_candidates, live_file_grace_secs).await;
-        candidate_count
+        candidate_ids
     }
 
     /// Pure arithmetic for the paginated sweep's rate limiter — split out so it can be
@@ -2307,6 +2302,25 @@ impl HealingManager {
         let mut cursor: Option<ChunkId> = None;
         let mut current_page_grace = base_page_grace;
         let mut consecutive_empty_pages: u32 = 0;
+        // Cycle-over-cycle repeat detection: disk_sweep_next_backoff only ever saw
+        // disk_orphan_sweep_over's raw candidate count, which conflates "found real
+        // new work" with "found the same stuck set we already flagged last
+        // rotation" — root-caused 2026-08-08 chasing sustained gluster2/3/4/5 CPU:
+        // a non-draining backlog (candidates authorized-then-refused by the
+        // leader-confirm gate re-enter reconcile_live_file_candidates as "first
+        // sighting" every single cycle, see that function) kept every page's raw
+        // count above SIGNIFICANT_CANDIDATES_THRESHOLD forever, so backoff never
+        // engaged even though zero net progress was being made. previous_cycle
+        // holds every candidate id seen during the last full rotation (cursor
+        // wrapping to None is "end of rotation"); current_cycle accumulates this
+        // rotation's ids to become the next previous_cycle. Comparing by id set
+        // membership rather than raw count is deliberately fuzzy: a handful of
+        // genuine new stragglers alongside a large recurring stuck set still nets
+        // out as a small "new" count and correctly allows backoff to proceed, the
+        // same tolerance already established for the routine low-level trickle (see
+        // SIGNIFICANT_CANDIDATES_THRESHOLD's doc comment).
+        let mut previous_cycle_candidates: HashSet<ChunkId> = HashSet::new();
+        let mut current_cycle_candidates: HashSet<ChunkId> = HashSet::new();
         loop {
             let iter_start = Instant::now();
 
@@ -2354,16 +2368,22 @@ impl HealingManager {
                 }
             };
 
-            let candidates_found = if page.is_empty() {
-                // End of rotation — wrap the cursor and wait a beat before starting over.
+            let net_new_candidates = if page.is_empty() {
+                // End of rotation — wrap the cursor, swap this rotation's
+                // accumulated candidate set in as the baseline for the next one,
+                // and wait a beat before starting over.
                 cursor = None;
+                previous_cycle_candidates = std::mem::take(&mut current_cycle_candidates);
                 0
             } else {
                 cursor = page.last().copied();
-                self.run_disk_orphan_sweep_over(page).await
+                let candidate_ids = self.run_disk_orphan_sweep_over(page).await;
+                let net_new = candidate_ids.iter().filter(|id| !previous_cycle_candidates.contains(id)).count();
+                current_cycle_candidates.extend(candidate_ids);
+                net_new
             };
             (current_page_grace, consecutive_empty_pages) = Self::disk_sweep_next_backoff(
-                candidates_found, consecutive_empty_pages, current_page_grace, base_page_grace, max_page_grace,
+                net_new_candidates, consecutive_empty_pages, current_page_grace, base_page_grace, max_page_grace,
             );
 
             *self.disk_sweep_last_page_at.lock().unwrap() = Instant::now();
@@ -7012,6 +7032,71 @@ mod tests {
 
         healing.run_disk_orphan_sweep().await;
         assert!(!storage.get_chunk_path(&chunk_id).exists(), "must be evicted on second pass once old enough and authorized");
+    }
+
+    /// Root-caused 2026-08-08 chasing sustained high CPU on gluster3/gluster5: a
+    /// chunk genuinely referenced by a live file's chunk_map entry, but with no
+    /// ChunkLocation record in CHUNK_TABLE at all (loc_record is None — e.g. a
+    /// dissemination gap, or simply never written), fails run_disk_orphan_sweep_over's
+    /// "kept" short-circuit at its `loc_record.is_some() && (...)` check even though
+    /// live_from_chunk_map already proves it's needed. On a non-leader node this
+    /// "only" wastes CPU forever (the leader's ConfirmChunksLive correctly says
+    /// "still live", so nothing is deleted, but nothing ever creates the missing
+    /// location record either, so it's rediscovered as a fresh candidate every single
+    /// sweep cycle, forever — see disk_sweep_next_backoff's threshold treating any
+    /// page over SIGNIFICANT_CANDIDATES_THRESHOLD as "real work", so backoff never
+    /// engages on this permanently-recurring set).
+    ///
+    /// On the LEADER node, this is not just wasted CPU: authorize_live_file_orphan_deletes'
+    /// leader branch only excludes candidates that are current pending-patch/token ids —
+    /// it does NOT independently re-check live_from_chunk_map/live_from_metadata, because
+    /// it trusts run_disk_orphan_sweep_over's own classification already did that. If that
+    /// classification is wrong (this exact loc_record gap), the leader has a live path to
+    /// physically delete a chunk that is genuinely still needed. This test proves which of
+    /// the two it is — data survives only if the classification gate is fixed to trust
+    /// live_from_chunk_map/live_from_metadata on their own, independent of loc_record.
+    #[tokio::test]
+    async fn test_disk_orphan_sweep_chunk_map_live_chunk_missing_location_record_must_survive() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let (storage, metadata, mut healing, _t1, _t2) = make_healing(node_id, addr);
+        healing.local_started_at = Instant::now() - Duration::from_secs(SELF_RESTART_GRACE_SECS + 1);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"chunk-map-live-no-location-record"));
+        storage.write_chunk(&chunk_id, b"still needed data").unwrap();
+        let old_ts = dfs_common::types::current_timestamp().saturating_sub(700);
+        storage.set_chunk_mtime(&chunk_id, old_ts);
+
+        // Genuinely live: referenced by a real file's chunk_map entry, exactly as
+        // every committed write leaves it. Deliberately NOT calling
+        // metadata.put_chunk_location for this chunk_id, simulating the gap where a
+        // location record never landed even though the chunk is still needed.
+        let mut file_meta = FileMetadata::new("/still-live-file".to_string(), FileType::RegularFile);
+        let file_id = file_meta.id;
+        let location = ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: 18,
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: Some(old_ts * 1000),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        };
+        file_meta.chunk_locations = Arc::new(vec![location.clone()]);
+        metadata.put_file(&file_meta).unwrap();
+        healing.chunk_map.insert(file_id, (vec![location], 1));
+
+        for _ in 0..3 {
+            healing.run_disk_orphan_sweep().await;
+        }
+
+        assert!(
+            storage.get_chunk_path(&chunk_id).exists(),
+            "chunk is genuinely live (referenced by chunk_map) even though it has no \
+             ChunkLocation record in CHUNK_TABLE — must never be deleted just because \
+             a location record happens to be missing"
+        );
     }
 
     /// A live-file-orphan candidate younger than LIVE_FILE_GRACE_SECS must never be

@@ -241,7 +241,45 @@ pub struct ChunkStorage {
     /// None until the first list_chunks() call populates it via a real directory
     /// walk; Some(set) thereafter, kept correct incrementally by write_chunk /
     /// delete_chunk rather than ever being invalidated wholesale.
-    list_chunks_cache: Mutex<Option<std::collections::BTreeSet<ChunkId>>>,
+    ///
+    /// parking_lot::RwLock, not std::sync::Mutex — root-caused 2026-08-08 chasing
+    /// sustained gluster2/3/4/5 CPU: every list_chunks()/list_chunks_page() call
+    /// (write-path handle_has_chunks — peer-triggered, no rate limit — plus
+    /// several periodic healing scans) took a plain Mutex and, on the warm-cache
+    /// fast path, held it for the entire O(n) `.iter().copied().collect()` clone
+    /// of the whole index. A Mutex makes even two concurrent readers serialize
+    /// behind that clone. RwLock lets concurrent readers (e.g. several peers'
+    /// HasChunks requests landing close together) run their clones in parallel;
+    /// parking_lot specifically for the same fairness reason already documented
+    /// on MetadataStore.db in Cargo.toml.
+    ///
+    /// See `list_chunks_population_lock` below for why the cold-start walk still
+    /// needs its own, separate serialization — an RwLock alone is not enough.
+    list_chunks_cache: parking_lot::RwLock<Option<std::collections::BTreeSet<ChunkId>>>,
+
+    /// Serializes ONLY the cold-start "walk the chunks directory and populate
+    /// list_chunks_cache" path — a real incident, not a hypothetical. A first
+    /// attempt at the RwLock change above used just a read-check/write-populate
+    /// sequence on list_chunks_cache with no separate lock: every thread that
+    /// observed the cache as `None` under a read lock would independently start
+    /// its own full recursive directory walk, since a read lock doesn't exclude
+    /// other readers from doing the same. Deployed cluster-wide, a rolling
+    /// restart (cache empty on every node at once, plus handle_has_chunks being
+    /// peer-triggered with no rate limit) produced hundreds of concurrent walks
+    /// at once — confirmed live via gdb: 524 threads on one node, nearly all in
+    /// statx/getdents64/collect_chunks_recursive, load average briefly over 450
+    /// on a 4-core box. Reverted within the hour.
+    ///
+    /// This mutex restores the single-flight guarantee a plain Mutex on the
+    /// whole cache used to provide by accident: whichever thread gets here first
+    /// does the walk and populates the cache while holding this lock; every
+    /// other concurrent caller just blocks on it, then re-checks the
+    /// (now-populated) cache instead of assuming it still needs to walk
+    /// (double-checked locking). Only ever touched by the cold-start path in
+    /// list_chunks() — the warm read path and the incremental
+    /// insert/remove in write_chunk/delete_chunk never take it, so it adds no
+    /// contention once the cache is populated.
+    list_chunks_population_lock: parking_lot::Mutex<()>,
 
     /// Present only when `DFS_DURABILITY_COALESCE` is set: routes every durable
     /// chunk write through one per-device syncfs worker instead of a per-write
@@ -255,6 +293,17 @@ pub struct ChunkStorage {
     /// only, not durable — see delete_chunk's own doc comment for why these
     /// tags exist in the first place.
     delete_reason_counts: DashMap<String, AtomicU64>,
+
+    /// Test-only: counts actual cold-start directory-walk invocations inside
+    /// list_chunks(), incremented only once list_chunks_population_lock is held
+    /// and the double-check has re-confirmed the cache is still empty. Lets
+    /// list_chunks_cold_start_is_single_flight_under_concurrent_callers assert
+    /// deterministically (walk_count() == 1 no matter how many concurrent
+    /// callers raced the cold cache) instead of relying on wall-clock timing,
+    /// which proved too environment-dependent to reliably catch the regression
+    /// this test exists for — see that test's doc comment.
+    #[cfg(test)]
+    walk_count: AtomicU64,
 }
 
 impl ChunkStorage {
@@ -301,9 +350,12 @@ impl ChunkStorage {
             data_dir,
             cache,
             cache_capacity_chunks,
-            list_chunks_cache: Mutex::new(None),
+            list_chunks_cache: parking_lot::RwLock::new(None),
+            list_chunks_population_lock: parking_lot::Mutex::new(()),
             coalescer,
             delete_reason_counts: DashMap::new(),
+            #[cfg(test)]
+            walk_count: AtomicU64::new(0),
         })
     }
 
@@ -451,7 +503,7 @@ impl ChunkStorage {
         // HasChunks check right after this write completes as part of a heal), so
         // it's inserted directly rather than invalidating the whole index (which,
         // under sustained write load, would defeat it almost as fast as it's built).
-        if let Some(index) = self.list_chunks_cache.lock().unwrap().as_mut() {
+        if let Some(index) = self.list_chunks_cache.write().as_mut() {
             index.insert(*chunk_id);
         }
 
@@ -705,7 +757,7 @@ impl ChunkStorage {
         // update and list_chunks' doc comment for why this is an incremental
         // remove, not a wholesale invalidation. Also a no-op if the index isn't
         // built yet, and harmless if chunk_id was never in it (path didn't exist).
-        if let Some(index) = self.list_chunks_cache.lock().unwrap().as_mut() {
+        if let Some(index) = self.list_chunks_cache.write().as_mut() {
             index.remove(chunk_id);
         }
 
@@ -795,17 +847,36 @@ impl ChunkStorage {
     /// motivated the fix.
     ///
     /// Now a live-maintained index instead of a cache: scanned from disk once (lazily,
-    /// on first call after startup — this function still blocks concurrent callers
-    /// behind that one scan the same way the TTL version did, via the same
-    /// std::sync::Mutex), then kept correct incrementally by write_chunk/delete_chunk
-    /// inserting/removing exactly the one chunk_id that changed. No TTL, so it's never
-    /// stale; no periodic rescans after the first, so none of the 6 call sites ever
-    /// pays the full directory-walk cost again for the life of the process.
+    /// on first call after startup), then kept correct incrementally by
+    /// write_chunk/delete_chunk inserting/removing exactly the one chunk_id that
+    /// changed. No TTL, so it's never stale; no periodic rescans after the first,
+    /// so none of the 6 call sites ever pays the full directory-walk cost again
+    /// for the life of the process.
+    ///
+    /// Warm-cache fast path takes only a read lock (list_chunks_cache is a
+    /// parking_lot::RwLock — see its field doc comment), so concurrent callers
+    /// run their O(n) `.collect()` in parallel instead of serializing behind one
+    /// exclusive lock. The cold-start walk-and-populate path below is gated by
+    /// the SEPARATE list_chunks_population_lock — see that field's doc comment
+    /// for why a plain read/write check on list_chunks_cache alone is not
+    /// enough to keep this single-flight.
     pub fn list_chunks(&self) -> Result<Vec<ChunkId>> {
-        let mut guard = self.list_chunks_cache.lock().unwrap();
-        if let Some(index) = guard.as_ref() {
+        if let Some(index) = self.list_chunks_cache.read().as_ref() {
             return Ok(index.iter().copied().collect());
         }
+
+        // Cold (or believed-cold) — serialize the walk-and-populate path itself
+        // so only one thread ever performs it concurrently, no matter how many
+        // threads observed `None` above at once. Everything else queues on this
+        // lock and, once unblocked, re-checks the cache (double-checked locking)
+        // rather than assuming it still needs to walk.
+        let _population_guard = self.list_chunks_population_lock.lock();
+        if let Some(index) = self.list_chunks_cache.read().as_ref() {
+            return Ok(index.iter().copied().collect());
+        }
+
+        #[cfg(test)]
+        self.walk_count.fetch_add(1, Ordering::Relaxed);
 
         let mut chunk_ids = Vec::new();
         let chunks_dir = self.data_dir.join("chunks");
@@ -815,28 +886,62 @@ impl ChunkStorage {
 
         let index: std::collections::BTreeSet<ChunkId> = chunk_ids.iter().copied().collect();
         let result = chunk_ids;
-        *guard = Some(index);
+        *self.list_chunks_cache.write() = Some(index);
         Ok(result)
+    }
+
+    /// Test-only: number of times list_chunks() has actually performed the
+    /// cold-start directory walk on this instance — see walk_count's field doc
+    /// comment.
+    #[cfg(test)]
+    fn walk_count(&self) -> u64 {
+        self.walk_count.load(Ordering::Relaxed)
     }
 
     /// Return up to `limit` chunk ids strictly greater than `after` (or the first
     /// `limit` if `after` is None), in ascending order, using the same live-maintained
     /// index as list_chunks(). Builds the index via a directory walk on first call,
-    /// same as list_chunks(). An empty result means the cursor has reached the end of
-    /// the set — callers rotate by passing None again on the next call.
+    /// same as list_chunks() (and via the same single-flight path — see that
+    /// method's doc comment). An empty result means the cursor has reached the end
+    /// of the set — callers rotate by passing None again on the next call.
     pub fn list_chunks_page(&self, after: Option<ChunkId>, limit: usize) -> Result<Vec<ChunkId>> {
-        let mut guard = self.list_chunks_cache.lock().unwrap();
-        if guard.is_none() {
-            drop(guard);
+        if self.list_chunks_cache.read().is_none() {
+            // list_chunks() re-checks under list_chunks_population_lock before
+            // walking, so calling it redundantly here (e.g. two threads both see
+            // `None` at this point) is harmless — only one of them ever actually
+            // walks the directory.
             self.list_chunks()?;
-            guard = self.list_chunks_cache.lock().unwrap();
         }
+        let guard = self.list_chunks_cache.read();
         let index = guard.as_ref().expect("index populated above");
         let iter = match after {
             Some(cursor) => index.range((std::ops::Bound::Excluded(cursor), std::ops::Bound::Unbounded)),
             None => index.range(..),
         };
         Ok(iter.take(limit).copied().collect())
+    }
+
+    /// For each of `chunk_ids`, whether it's present in this node's
+    /// live-maintained chunk index — checked directly against the index
+    /// (O(log n) per id, one lock acquisition for the whole batch) instead of
+    /// materializing a full copy of every local chunk id into a throwaway
+    /// HashSet first, the way handle_has_chunks used to via list_chunks().
+    /// Root-caused 2026-08-08 chasing sustained gluster2/3/4/5 CPU:
+    /// handle_has_chunks is peer-triggered with no rate limit, and under real
+    /// cluster traffic (dozens of calls/sec) was paying list_chunks()'s full
+    /// O(n) walk-the-index-into-a-Vec-then-collect-into-a-HashSet cost on
+    /// every single call — live gdb sampling caught it as the dominant
+    /// hashbrown::HashMap::insert cost on the process — regardless of how few
+    /// ids were actually being asked about in that call. Same single-flight
+    /// cold-start population as list_chunks()/list_chunks_page() (see
+    /// list_chunks_population_lock's doc comment).
+    pub fn chunks_present_batch(&self, chunk_ids: &[ChunkId]) -> Result<Vec<bool>> {
+        if self.list_chunks_cache.read().is_none() {
+            self.list_chunks()?;
+        }
+        let guard = self.list_chunks_cache.read();
+        let index = guard.as_ref().expect("index populated above");
+        Ok(chunk_ids.iter().map(|id| index.contains(id)).collect())
     }
 
     /// Get cache statistics for flow control
@@ -995,6 +1100,113 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert!(chunks.contains(&chunk1));
         assert!(chunks.contains(&chunk2));
+    }
+
+    /// Root-caused 2026-08-08 alongside the list_chunks single-flight fix:
+    /// handle_has_chunks used to build a full HashSet from list_chunks()'s
+    /// entire Vec on every call just to check a handful of ids — this proves
+    /// the direct-index replacement (chunks_present_batch) returns correct
+    /// answers, including for ids never written at all, and works correctly
+    /// against both a cold (never-populated) and warm cache.
+    #[test]
+    fn test_chunks_present_batch() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = ChunkStorage::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let data1 = b"present-1";
+        let data2 = b"present-2";
+        let chunk1 = ChunkId::from_hash(compute_chunk_hash(data1));
+        let chunk2 = ChunkId::from_hash(compute_chunk_hash(data2));
+        let never_written = ChunkId::from_hash(compute_chunk_hash(b"never-written"));
+
+        storage.write_chunk(&chunk1, data1).unwrap();
+        storage.write_chunk(&chunk2, data2).unwrap();
+
+        // Cold cache (never called list_chunks/list_chunks_page before) — must
+        // still populate correctly, same single-flight path as the others.
+        let result = storage.chunks_present_batch(&[chunk1, never_written, chunk2]).unwrap();
+        assert_eq!(result, vec![true, false, true]);
+
+        // Warm cache — same answers, and reflects an incremental insert made
+        // since the index was populated.
+        let data3 = b"present-3";
+        let chunk3 = ChunkId::from_hash(compute_chunk_hash(data3));
+        storage.write_chunk(&chunk3, data3).unwrap();
+        let result = storage.chunks_present_batch(&[chunk3, never_written]).unwrap();
+        assert_eq!(result, vec![true, false]);
+
+        // Empty query — no panic, no spurious entries.
+        assert_eq!(storage.chunks_present_batch(&[]).unwrap(), Vec::<bool>::new());
+    }
+
+    /// Regression for a real production incident (2026-08-08): many threads
+    /// calling list_chunks()/list_chunks_page() concurrently against a COLD
+    /// cache (list_chunks_cache is None) must never each independently perform
+    /// their own full recursive directory walk. A first attempt at converting
+    /// list_chunks_cache from a plain Mutex to a parking_lot::RwLock (to let
+    /// concurrent warm-cache readers run in parallel) used only a
+    /// read-check/write-populate sequence with no dedicated lock serializing the
+    /// walk itself — multiple threads could all observe `None` under a read
+    /// lock and all start walking at once, since a read lock doesn't exclude
+    /// other readers. Deployed cluster-wide, a rolling restart (cache empty on
+    /// every node, handle_has_chunks peer-triggered with no rate limit)
+    /// produced hundreds of concurrent walks on one node at once — confirmed
+    /// live via gdb (524 threads, nearly all in statx/getdents64/
+    /// collect_chunks_recursive), load average briefly over 450 on a 4-core
+    /// box. Reverted within the hour; list_chunks_population_lock is the fix.
+    ///
+    /// Asserts deterministically via walk_count() (see that method's doc
+    /// comment) — an earlier version of this test tried to infer single-flight
+    /// from wall-clock timing (concurrent callers should complete close to the
+    /// cost of one walk, not scale with caller count) and it was NOT reliable:
+    /// on a small tmpfs-backed test with only a few thousand files, the buggy
+    /// no-population-lock version still passed the timing bound, because the
+    /// real incident's severity came from factors this single-process test
+    /// can't replicate (tens of thousands of real files on real disk, and
+    /// concurrent load arriving from 4 other physical peer nodes, not just
+    /// in-process threads). Counting actual walk invocations catches the bug
+    /// regardless of environment speed.
+    #[test]
+    fn list_chunks_cold_start_is_single_flight_under_concurrent_callers() {
+        const CHUNK_COUNT: u32 = 500;
+        const CONCURRENT_CALLERS: usize = 40;
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_dir.path().to_path_buf()).unwrap());
+        let mut expected = std::collections::BTreeSet::new();
+        for i in 0..CHUNK_COUNT {
+            let data = format!("chunk-{}", i).into_bytes();
+            let chunk_id = ChunkId::from_hash(compute_chunk_hash(&data));
+            storage.write_chunk(&chunk_id, &data).unwrap();
+            expected.insert(chunk_id);
+        }
+        assert_eq!(storage.walk_count(), 0, "writes alone must never trigger a walk");
+
+        let barrier = Arc::new(std::sync::Barrier::new(CONCURRENT_CALLERS));
+        let handles: Vec<_> = (0..CONCURRENT_CALLERS)
+            .map(|_| {
+                let storage = storage.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait(); // maximize the chance every thread races the cold cache together
+                    storage.list_chunks().unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<Vec<ChunkId>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        for result in &results {
+            let result_set: std::collections::BTreeSet<_> = result.iter().copied().collect();
+            assert_eq!(result_set, expected, "every concurrent caller must see the exact same, correct chunk set");
+        }
+
+        assert_eq!(
+            storage.walk_count(), 1,
+            "{} concurrent cold-start callers triggered {} directory walks, expected exactly 1 — \
+             this is the thundering-herd regression: every caller independently re-walking the \
+             chunks directory instead of one walk serving all of them",
+            CONCURRENT_CALLERS, storage.walk_count(),
+        );
     }
 
     #[test]

@@ -2153,7 +2153,19 @@ impl OverlayForkCtx {
             let (locs, _) = entry.value();
             Server::chunk_map_find_by_idx(locs, chunk_idx).map(|pos| locs[pos].chunk_id)
         });
-        if current == Some(public_token) {
+        // Only a CONFIRMED different occupant counts as superseded. `current == None`
+        // (no chunk_map entry for this file/slot at all) is ambiguous, not negative
+        // evidence — it also covers a slot chunk_map genuinely hasn't caught up on yet
+        // (e.g. mid startup-rebuild-from-scan right after a restart, or a brand-new
+        // file/first-ever write to this slot), where the Pending patch is very much
+        // still real and must not be abandoned just because this in-memory, rebuilt-
+        // from-scratch map hasn't been populated for it yet. Only unconditionally
+        // ungating this check (see this function's call site) surfaced the gap — it
+        // was always present, just unreachable behind the old 600s age gate.
+        let Some(current) = current else {
+            return false; // unknown, not superseded — proceed, don't abandon on ambiguity
+        };
+        if current == public_token {
             return false; // still the current occupant — genuinely needs folding
         }
         warn!("single fold: file {} chunk_idx {} slot's current chunk_map entry ({:?}) no longer matches \
@@ -2855,20 +2867,38 @@ impl OverlayForkCtx {
         // deleted file's Pending patch can never matter again regardless of
         // what state its base/delta chunks are in. See
         // abandon_patch_if_file_gone's doc comment for the gap this closes —
-        // and for why this is gated on patch age (MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK).
+        // and for why THIS check specifically is gated on patch age
+        // (MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK): file_exists_by_id_async
+        // can false-negative on a very recently created file whose metadata
+        // hasn't finished gossiping to this node yet.
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         if now_secs.saturating_sub(patch_written_at) >= MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK.as_secs() {
             if self.abandon_patch_if_file_gone(file_id, chunk_idx, public_token).await {
                 return None;
             }
-            // Same age gate, same "cheapest check first" placement — see
-            // abandon_patch_if_slot_superseded's doc comment. Independent of
-            // the file-gone check above: a slot can be superseded on a file
-            // that's still very much alive (a normal fold-generation race),
-            // so neither check can substitute for the other.
-            if self.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token).await {
-                return None;
-            }
+        }
+        // UNGATED (2026-08-09): abandon_patch_if_slot_superseded used to share
+        // the same 600s age gate as abandon_patch_if_file_gone above, purely for
+        // "cheapest check first" code-locality — but its rationale doesn't apply
+        // here. It's a local, in-memory chunk_map lookup, synchronously updated by
+        // this node's own apply_patch before responding to any client — there is
+        // no cross-node gossip-delay window for it to false-negative on, unlike
+        // file_exists_by_id_async. Gating it behind 600s meant a fold that
+        // executes normally-fast (seconds, not minutes) after being dispatched
+        // NEVER got this freshness check at all: root-caused live (2026-08-09,
+        // VM-100 kdiskmark run) to a fold consolidating chunk_idx 1022's base+delta
+        // ~11s after two newer LOCAL patches (via the ordinary MultiPatch path) had
+        // already advanced that same slot past the fold's base — the fold's stale
+        // result then won the generation-ordering race (Fix S, 2026-07-24) and
+        // became authoritative, silently dropping both newer patches' bytes. The
+        // ~11s dispatch-to-execution gap is consistent with fold_hash_semaphore
+        // contention (as low as 2 permits on a 4-core node) under the breadth of
+        // concurrently-hot chunks a real disk-benchmark write burst produces — see
+        // this function's fold_hash_semaphore acquire instrumentation just below.
+        // The check itself is a single DashMap lookup — cheap enough to run on
+        // every fold, not just ones that already waited 10 minutes.
+        if self.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token).await {
+            return None;
         }
 
         // Cancel base_chunk_id's healing in the background, right away — base_chunk_id
@@ -2947,11 +2977,29 @@ impl OverlayForkCtx {
         // it the same way measurably serialized ForceFold RPCs behind
         // unrelated background folds under concurrent load (see this
         // function's doc comment).
+        // Self-reporting permit-wait (2026-08-09), mirroring coordinate_and_fold_slot's
+        // fold_coordination_semaphore instrumentation added the day before: a live
+        // stale-base-fold investigation (VM-100 kdiskmark run, chunk_idx 1022 folded
+        // against an ~11s-stale base) needed to know whether fold_hash_semaphore
+        // contention was the reason this fold's execution lagged that far behind its
+        // dispatch, and had no direct signal — only the semaphore's small size
+        // (available_parallelism()/2, as low as 2 permits on a 4-core node) as
+        // circumstantial evidence. If this ever fires with a meaningful wait, that's
+        // now a direct signal instead of an inference.
         let _fold_hash_permit = if is_client_initiated {
             None
         } else {
-            Some(self.fold_hash_semaphore.acquire().await
-                .expect("fold_hash_semaphore is never closed"))
+            let permit_wait_start = std::time::Instant::now();
+            let permit = self.fold_hash_semaphore.acquire().await
+                .expect("fold_hash_semaphore is never closed");
+            let permit_wait = permit_wait_start.elapsed();
+            if permit_wait.as_millis() >= 100 {
+                warn!("run_single_fold: fold_hash_semaphore acquire took {:?} for file {} chunk {} \
+                       ({} available immediately after this acquire) — base_chunk_id may be stale \
+                       by the time this fold actually executes",
+                    permit_wait, file_id, chunk_idx, self.fold_hash_semaphore.available_permits());
+            }
+            Some(permit)
         };
         let fold_result = full_rewrite_chunk(
             self.storage.clone(),
@@ -17702,6 +17750,123 @@ mod tests {
              chunk either) — a permanent dangling pointer, exactly the 2026-07-28 VM-108 \
              incident"
         );
+    }
+
+    /// Root-caused live 2026-08-09 (VM-100 kdiskmark run, file 039e5c9f, chunk_idx
+    /// 1022): a background fold's `base_chunk_id`/`public_token` are fixed at
+    /// dispatch time and never re-validated against the live chunk_map before doing
+    /// the expensive read+hash work — the ONLY such check,
+    /// `abandon_patch_if_slot_superseded`, was gated behind
+    /// `MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK` (600s), sharing a gate whose
+    /// actual rationale (file_exists_by_id_async's cross-node gossip-delay false
+    /// negatives) has nothing to do with this check (a local, always-current,
+    /// synchronously-updated chunk_map lookup). Confirmed live: two ordinary
+    /// MultiPatch writes landed on the same node ~1.6s apart via the normal fast
+    /// path, advancing chunk_idx 1022 well past the fold's dispatch-time base —
+    /// then, ~11s after the fold was dispatched (consistent with fold_hash_semaphore
+    /// contention: as low as 2 permits on a 4-core node under the breadth of
+    /// concurrently-hot chunks a real write burst produces), the fold finally
+    /// executed against its now-stale base anyway, and its result won
+    /// location_supersedes' generation-ordering race — silently dropping both
+    /// newer writes' bytes from the authoritative chain. This test reproduces the
+    /// dispatch-vs-execution gap directly (no timing/load dependency): a Pending
+    /// patch's public_token is no longer chunk_map's current occupant by the time
+    /// its fold actually runs, with patch_written_at only seconds old — well under
+    /// the old 600s gate.
+    #[tokio::test]
+    async fn test_run_single_fold_abandons_when_slot_superseded_before_execution() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let client = Arc::new(NetworkClient::new());
+        let healing = Arc::new(HealingManager::new(
+            storage.clone(), metadata.clone(), cluster.clone(), client,
+            Arc::new(std::sync::atomic::AtomicUsize::new(3)), 300, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            100, 60.0, 8, 3, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        server.set_healing_manager(healing.clone()).await;
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // base_chunk_id: what this fold was dispatched against.
+        let base_content = vec![0u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        server.record_chunk_generation(base_chunk_id, 5);
+
+        // The Pending patch this fold is meant to consolidate — chunk_map was
+        // pointed here when the fold was dispatched.
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"pending-patch-token"));
+        server.record_chunk_generation(public_token, 500);
+
+        // BUT: two more ordinary writes have already landed on this exact slot via
+        // the normal fast path since then (matching the real incident's two local
+        // MultiPatch calls) — chunk_map now points somewhere else entirely.
+        let superseding_token = ChunkId::from_hash(compute_chunk_hash(b"newer-write-token"));
+        server.record_chunk_generation(superseding_token, 502);
+        server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
+            chunk_id: superseding_token,
+            nodes: vec![node_id],
+            size: base_content.len(),
+            checksum: [0u8; 32],
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(502),
+            file_id: Some(file_id),
+        }], 1));
+
+        let mut delta_record = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+        delta_record.extend_from_slice(&encode_delta_record(500, 0, &[0xABu8]));
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_record));
+        storage.write_chunk(&delta_chunk_id, &delta_record).unwrap();
+
+        // patch_written_at = now: this fold is executing only seconds after
+        // dispatch, exactly like the real incident (~11s) — nowhere near the old
+        // 600s gate abandon_patch_if_slot_superseded used to require.
+        let ctx = server.overlay_ctx();
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let result = ctx.run_single_fold(
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), now_secs, false, true,
+        ).await;
+
+        assert!(
+            result.is_none(),
+            "a fold whose Pending patch has already been superseded by a newer write \
+             must be abandoned before doing any read/hash work, not folded against a \
+             stale base that could then win the generation-ordering race and silently \
+             drop the newer write's bytes"
+        );
+
+        // The superseding write's location must be completely untouched — this is
+        // the actual data-loss check: a buggy fold could still clobber chunk_map
+        // with its stale result even after computing it.
+        let chunk_map = server.chunk_map_ref();
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        let current = Server::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id);
+        assert_eq!(current, Some(superseding_token),
+            "the newer write's location must survive untouched — an abandoned stale \
+             fold must never overwrite a slot it no longer has authority over");
     }
 
     /// 2026-08-03 fix: coordinate_and_fold_slot's fingerprint read must not tear

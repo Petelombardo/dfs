@@ -2862,6 +2862,7 @@ impl OverlayForkCtx {
         patch_written_at: u64,
         is_client_initiated: bool,
         broadcast_to_peers: bool,
+        pre_acquired_fold_hash_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Option<(ChunkId, usize, Arc<Vec<u8>>, Option<u64>)> {
         // Cheapest possible check first, before any chunk read/hash work: a
         // deleted file's Pending patch can never matter again regardless of
@@ -2986,11 +2987,24 @@ impl OverlayForkCtx {
         // (available_parallelism()/2, as low as 2 permits on a 4-core node) as
         // circumstantial evidence. If this ever fires with a meaningful wait, that's
         // now a direct signal instead of an inference.
-        let _fold_hash_permit = if is_client_initiated {
+        //
+        // Prefer a permit the caller already acquired BEFORE taking chunk_patch_locks
+        // (fold_slot_now's own pre-lock acquisition, added 2026-08-09) — see that call
+        // site's doc comment for the mechanism this closes: acquiring the permit here,
+        // AFTER fold_slot_now already holds chunk_patch_locks, meant every OTHER writer
+        // to this exact slot was blocked for this fold's full semaphore queue time, not
+        // just its actual execution — confirmed live via a real kdiskmark run where
+        // widening the semaphore measurably unlocked client write throughput despite
+        // clients never touching this semaphore themselves. Only direct callers that
+        // bypass fold_slot_now's locking (test call sites exercising run_single_fold in
+        // isolation) fall through to acquiring here.
+        let _fold_hash_permit = if let Some(permit) = pre_acquired_fold_hash_permit {
+            Some(permit)
+        } else if is_client_initiated {
             None
         } else {
             let permit_wait_start = std::time::Instant::now();
-            let permit = self.fold_hash_semaphore.acquire().await
+            let permit = self.fold_hash_semaphore.clone().acquire_owned().await
                 .expect("fold_hash_semaphore is never closed");
             let permit_wait = permit_wait_start.elapsed();
             if permit_wait.as_millis() >= 100 {
@@ -3965,6 +3979,34 @@ impl OverlayForkCtx {
     /// after); true from every other caller.
     async fn fold_slot_now(&self, file_id: FileId, chunk_idx: u64, is_client_initiated: bool, broadcast_to_peers: bool) -> FoldSlotOutcome {
         self.wait_if_compaction_quiescing().await;
+
+        // Acquire fold_hash_semaphore BEFORE chunk_patch_locks, not after (2026-08-09).
+        // This used to happen inside run_single_fold, well after the chunk_patch_locks
+        // guard below was already held — so a background fold queued for a permit was
+        // blocking every OTHER writer to this exact slot (apply_patch takes the same
+        // lock for its entire merge) for the fold's full queue time, not just its
+        // actual work. Confirmed live: widening fold_hash_semaphore measurably
+        // unlocked client write throughput on a real kdiskmark run even though client
+        // writes never touch this semaphore themselves — the lock, not the semaphore,
+        // was the client-visible bottleneck. Skipped for client-initiated folds, same
+        // as before (handle_force_fold's caller is already synchronously blocked on
+        // this RPC, so gating it here would only add queueing with no one else to
+        // protect from it).
+        let fold_hash_permit = if is_client_initiated {
+            None
+        } else {
+            let permit_wait_start = std::time::Instant::now();
+            let permit = self.fold_hash_semaphore.clone().acquire_owned().await
+                .expect("fold_hash_semaphore is never closed");
+            let permit_wait = permit_wait_start.elapsed();
+            if permit_wait.as_millis() >= 100 {
+                warn!("fold_slot_now: fold_hash_semaphore acquire (pre-lock) took {:?} for file {} chunk {} \
+                       ({} available immediately after this acquire)",
+                    permit_wait, file_id, chunk_idx, self.fold_hash_semaphore.available_permits());
+            }
+            Some(permit)
+        };
+
         let lock = self.chunk_patch_locks
             .entry((file_id, chunk_idx))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -4041,7 +4083,7 @@ impl OverlayForkCtx {
         self.active_fold_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = self.run_single_fold(
             file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, client_write_seq,
-            patch_written_at, is_client_initiated, broadcast_to_peers,
+            patch_written_at, is_client_initiated, broadcast_to_peers, fold_hash_permit,
         ).await;
         self.active_fold_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         match result {
@@ -4564,9 +4606,21 @@ impl Server {
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or_else(|| {
+                        // Floor raised 2 -> 4 (2026-08-09): validated live on staging's
+                        // 4-core nodes (DFS_FOLD_HASH_CONCURRENCY=4 override) after
+                        // fold_slot_now was fixed to acquire this permit BEFORE
+                        // chunk_patch_locks instead of after — see that call site's
+                        // doc comment. Before that fix, a wider semaphore only helped
+                        // by accident (shorter queue -> shorter time some OTHER
+                        // writer's chunk_patch_locks wait was blocked on this fold);
+                        // after it, this is purely a CPU/disk throttle again, same as
+                        // its original design intent, just re-measured with a higher
+                        // floor now that 2 (half of a 4-core box) proved too tight
+                        // even for that narrower purpose. Still `cores/2` on anything
+                        // bigger than 8 cores, so it keeps scaling on larger boxes.
                         std::thread::available_parallelism()
-                            .map(|n| (n.get() / 2).max(2))
-                            .unwrap_or(2)
+                            .map(|n| (n.get() / 2).max(4))
+                            .unwrap_or(4)
                     })
             )),
             last_fold_leader_confirm: Arc::new(DashMap::new()),
@@ -17702,7 +17756,7 @@ mod tests {
         let ctx = server.overlay_ctx();
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let result = ctx.run_single_fold(
-            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), now_secs, false, true,
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), now_secs, false, true, None,
         ).await;
         let (new_chunk_id, ..) = result.expect("fold should succeed: base and delta are both valid");
         assert_ne!(new_chunk_id, base_chunk_id, "the delta changes content, so this must not be a no-op fold");
@@ -17846,7 +17900,7 @@ mod tests {
         let ctx = server.overlay_ctx();
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let result = ctx.run_single_fold(
-            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), now_secs, false, true,
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(500), now_secs, false, true, None,
         ).await;
 
         assert!(
@@ -17867,6 +17921,109 @@ mod tests {
         assert_eq!(current, Some(superseding_token),
             "the newer write's location must survive untouched — an abandoned stale \
              fold must never overwrite a slot it no longer has authority over");
+    }
+
+    /// 2026-08-09: fold_slot_now used to acquire chunk_patch_locks for a slot FIRST,
+    /// then call run_single_fold, which only THEN queued for fold_hash_semaphore —
+    /// so a background fold stuck waiting for a permit was blocking every OTHER
+    /// writer to that exact slot (apply_patch takes the same lock for its entire
+    /// merge) for the fold's full queue time, not just its actual work. Confirmed
+    /// live: widening fold_hash_semaphore measurably unlocked client write
+    /// throughput on a real kdiskmark run even though client writes never touch
+    /// that semaphore themselves — proof the lock, not the semaphore, was the
+    /// client-visible bottleneck. Fixed by acquiring the permit in fold_slot_now
+    /// BEFORE taking chunk_patch_locks.
+    ///
+    /// Direct proof: exhaust fold_hash_semaphore's permits from the test itself
+    /// (default capacity, no env var mutation — avoids any parallel-test-binary
+    /// hazard), then spawn a background (is_client_initiated=false) fold_slot_now
+    /// call that's guaranteed to block on the semaphore. While it's blocked, the
+    /// test must be able to acquire chunk_patch_locks for that exact slot
+    /// immediately (uncontended) — proving fold_slot_now hasn't touched the lock
+    /// yet. Releasing the permits then lets the fold proceed and succeed normally.
+    #[tokio::test]
+    async fn fold_slot_now_does_not_hold_chunk_patch_locks_while_queued_for_fold_hash_semaphore() {
+        let h = make_overlay_test_harness();
+        let ctx = h.server.overlay_ctx();
+
+        let file_id = FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        let base_content = vec![7u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        h.storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+
+        let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+        delta_bytes.extend_from_slice(&encode_delta_record(1, 0, &[9u8; 8]));
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
+        h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
+
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"lock-order-test-token"));
+        h.metadata.put_patch_state_pending(
+            file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id, 64, 1000, Some(1),
+        ).unwrap();
+        let mut file_meta = dfs_common::FileMetadata::new("/lock-order-test".to_string(), dfs_common::types::FileType::RegularFile);
+        file_meta.id = file_id;
+        h.metadata.put_file(&file_meta).unwrap();
+        // fold_slot_now reads its target token from dirty_patch_slots (an in-memory
+        // index apply_patch would normally have populated) — set it directly since
+        // this test built the Pending row by hand.
+        h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            token: public_token,
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
+        });
+
+        // Exhaust every currently-available permit — held in this Vec, not dropped
+        // until we're done proving the lock is free.
+        let available = ctx.fold_hash_semaphore.available_permits();
+        assert!(available > 0, "test assumes the semaphore starts with spare capacity");
+        let mut hog_permits = Vec::new();
+        for _ in 0..available {
+            hog_permits.push(ctx.fold_hash_semaphore.clone().try_acquire_owned().unwrap());
+        }
+        assert_eq!(ctx.fold_hash_semaphore.available_permits(), 0);
+
+        // Spawn the fold in the background — is_client_initiated=false, so it must
+        // queue for the now-fully-exhausted semaphore.
+        let ctx_clone = ctx.clone();
+        let fold_task = tokio::spawn(async move {
+            ctx_clone.fold_slot_now(file_id, chunk_idx, false, true).await
+        });
+
+        // Give the spawned task a real chance to reach (and block on) the semaphore
+        // acquire before we check the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!fold_task.is_finished(), "fold must still be queued on the exhausted semaphore, not already done");
+
+        // The actual proof: chunk_patch_locks for this exact slot must be
+        // immediately acquirable — fold_slot_now cannot have taken it yet.
+        let lock = ctx.chunk_patch_locks
+            .entry((file_id, chunk_idx))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let acquired = tokio::time::timeout(std::time::Duration::from_millis(50), lock.lock()).await;
+        assert!(acquired.is_ok(),
+            "chunk_patch_locks for this slot must be free while the fold is only queued on \
+             fold_hash_semaphore — if this times out, the fold acquired the lock before the \
+             permit, exactly the regression this test guards against");
+        drop(acquired);
+
+        // Let the fold actually proceed and confirm it still completes correctly.
+        drop(hog_permits);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), fold_task).await
+            .expect("fold must complete promptly once the semaphore is free")
+            .unwrap();
+        assert!(matches!(outcome, FoldSlotOutcome::FoldedHere(..)),
+            "fold must still succeed normally once it can acquire both the permit and the lock");
     }
 
     /// 2026-08-03 fix: coordinate_and_fold_slot's fingerprint read must not tear
@@ -21760,7 +21917,7 @@ mod tests {
 
             let result = h.server.overlay_ctx().run_single_fold(
                 file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id,
-                Some(1), now_secs, false, true,
+                Some(1), now_secs, false, true, None,
             ).await;
             assert!(result.is_some(), "fold must succeed for this test to mean anything");
 
@@ -21785,7 +21942,7 @@ mod tests {
 
             let result = h.server.overlay_ctx().run_single_fold(
                 file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id,
-                Some(1), now_secs, false, false,
+                Some(1), now_secs, false, false, None,
             ).await;
             assert!(result.is_some(), "fold must succeed for this test to mean anything");
 

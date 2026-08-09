@@ -206,6 +206,18 @@ impl InodeReadEngine {
     /// no concurrent reads), make_mut skips the clone entirely. If a concurrent reader
     /// holds a snapshot Arc, make_mut clones — but that reader continues from its own
     /// Arc unaffected. Either way, correctness is maintained.
+    ///
+    /// Guarded by the same client_write_seq staleness check update_chunk_map_window
+    /// already has (see that function's doc comment for the L4 2026-07-22 fold-mapping
+    /// incident this class of guard closes) — this function used to have none. That was
+    /// safe only under the assumption that write-path calls for the same chunk_idx are
+    /// always strictly ordered; ForceFold breaks it: its cross-replica RPC can take
+    /// multiple seconds under load (2.58s / 1.26s observed in the 2026-08-08 VM-108
+    /// restore-corruption investigation), so a slow fold's own feed_chunk_locations_to_
+    /// read_engine call can land AFTER a faster, logically-later flush to the same
+    /// chunk_idx already updated this engine — silently reverting the read engine's view
+    /// of that chunk back to older content, with nothing to indicate a real write just
+    /// got shadowed for any read landing before the next full refresh.
     pub fn update_single_chunk(
         &self,
         loc: ChunkLocation,
@@ -223,31 +235,46 @@ impl InodeReadEngine {
             file_offset: None, written_at: None, client_write_seq: None, file_id: None,
         };
 
+        let incoming_seq = loc.client_write_seq;
         let map_len = {
             let mut s = self.chunk_state.write().unwrap();
             let map = Arc::make_mut(&mut s.map);
             if idx >= map.len() {
                 map.resize(idx + 1, nil_loc);
             }
-            map[idx] = loc;
-            // Trim trailing nil entries (sequential writes never leave nils at the end)
-            while map.last().map(|l| l.chunk_id.hash == [0u8; 32]).unwrap_or(false) {
-                map.pop();
+            let should_update = match (incoming_seq, map[idx].client_write_seq) {
+                (Some(inc), Some(ext)) => inc >= ext,
+                _ => true,
+            };
+            if !should_update {
+                None
+            } else {
+                map[idx] = loc;
+                // Trim trailing nil entries (sequential writes never leave nils at the end)
+                while map.last().map(|l| l.chunk_id.hash == [0u8; 32]).unwrap_or(false) {
+                    map.pop();
+                }
+                let map_len = map.len();
+                let offsets = Arc::make_mut(&mut s.offsets);
+                let old_len = offsets.len();
+                if old_len < map_len {
+                    // Fill new nil slots with logical positions to keep the array
+                    // non-decreasing for partition_point in chunks_for_range.
+                    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+                    offsets.extend((old_len..map_len).map(|i| (i * CHUNK_SIZE, 0usize)));
+                }
+                if idx < offsets.len() {
+                    offsets[idx] = offset_entry;
+                }
+                offsets.truncate(map_len);
+                Some(map_len)
             }
-            let map_len = map.len();
-            let offsets = Arc::make_mut(&mut s.offsets);
-            let old_len = offsets.len();
-            if old_len < map_len {
-                // Fill new nil slots with logical positions to keep the array
-                // non-decreasing for partition_point in chunks_for_range.
-                const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-                offsets.extend((old_len..map_len).map(|i| (i * CHUNK_SIZE, 0usize)));
-            }
-            if idx < offsets.len() {
-                offsets[idx] = offset_entry;
-            }
-            offsets.truncate(map_len);
-            map_len
+        };
+
+        let Some(map_len) = map_len else {
+            debug!("Engine inode={}: rejected stale write-path update for chunk_idx={} \
+                    (incoming client_write_seq older than what's already cached)", self.inode, idx);
+            return;
         };
 
         *self.node_id_to_addr.write().unwrap() = node_map;
@@ -741,5 +768,78 @@ mod tests {
         assert_eq!(map2[0].chunk_id, fold_result.chunk_id,
             "an equal-seq server refresh must be adopted, not rejected — the leader's answer \
              is already origin-resolved, so the client must trust it at equal seq");
+    }
+
+    /// 2026-08-08/09 VM-108 restore-corruption investigation: update_single_chunk (the
+    /// write-path fast-update feed_chunk_locations_to_read_engine uses) had NO
+    /// client_write_seq staleness guard, unlike update_chunk_map_window's — it just
+    /// unconditionally did `map[idx] = loc`. A slow ForceFold (observed 2.58s/1.26s
+    /// cross-replica RPCs under load) can finish and call this AFTER a faster, later
+    /// write-path update for the same chunk_idx already landed, silently reverting the
+    /// engine to older content. Reproduces the exact "boot right after restore reads
+    /// stale header/refcount-table bytes" shape locally, deterministically, without
+    /// needing real timing/load — a strictly-older incoming client_write_seq must be
+    /// rejected, not blindly applied.
+    #[test]
+    fn update_single_chunk_rejects_out_of_order_stale_write() {
+        let engine = InodeReadEngine::new(1);
+
+        // Newer write (seq=105) lands first — e.g. a fast ordinary patch flush.
+        let newer = ChunkLocation {
+            client_write_seq: Some(105),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(2), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_single_chunk(newer.clone(), 4 * 1024 * 1024, Arc::new(HashMap::new()));
+        let (map, _, _) = engine.snapshot();
+        assert_eq!(map[0].chunk_id, newer.chunk_id, "sanity: engine starts on the newer chunk_id");
+
+        // Older write (seq=104) — e.g. a slow ForceFold's result for a patch batch
+        // that logically predates the one above — arrives AFTER it, out of order.
+        let older = ChunkLocation {
+            client_write_seq: Some(104),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(1), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_single_chunk(older, 4 * 1024 * 1024, Arc::new(HashMap::new()));
+
+        let (map2, _, _) = engine.snapshot();
+        assert_eq!(map2[0].chunk_id, newer.chunk_id,
+            "a strictly-older client_write_seq write-path update must not overwrite a \
+             newer one already cached — a stale/slow fold landing late must not revert \
+             the read engine to older content");
+    }
+
+    /// Companion to the rejection test above: an equal-or-newer seq (the normal case —
+    /// a genuinely later write, or a first-ever write with no prior seq to compare
+    /// against) must still be applied, so the guard only blocks true regressions.
+    #[test]
+    fn update_single_chunk_applies_equal_or_newer_write() {
+        let engine = InodeReadEngine::new(1);
+
+        let first = ChunkLocation {
+            client_write_seq: Some(10),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(1), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_single_chunk(first, 4 * 1024 * 1024, Arc::new(HashMap::new()));
+
+        let newer = ChunkLocation {
+            client_write_seq: Some(11),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(2), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_single_chunk(newer.clone(), 4 * 1024 * 1024, Arc::new(HashMap::new()));
+        let (map, _, _) = engine.snapshot();
+        assert_eq!(map[0].chunk_id, newer.chunk_id, "strictly-newer seq must be applied");
+
+        let equal = ChunkLocation {
+            client_write_seq: Some(11),
+            file_offset: Some(0),
+            ..loc_with_nodes(chunk_id_with_hash0(3), vec![dfs_common::NodeId::new()])
+        };
+        engine.update_single_chunk(equal.clone(), 4 * 1024 * 1024, Arc::new(HashMap::new()));
+        let (map2, _, _) = engine.snapshot();
+        assert_eq!(map2[0].chunk_id, equal.chunk_id, "equal seq must still be applied");
     }
 }

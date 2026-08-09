@@ -150,6 +150,21 @@ impl BandwidthLimiter {
     }
 }
 
+/// A slot-loser whose supersession is HARD-confirmed by this node's own
+/// generation data — see HealingManager::hard_confirmed_superseded's doc
+/// comment. `loser_gen`/`winner_gen` are recorded (not just the fact that a
+/// hard comparison was possible) so a cluster-wide cross-check can compare
+/// against a peer's own reported generation without a second local lookup.
+#[derive(Clone, Copy, Debug)]
+struct HardSupersededSlot {
+    loser: ChunkId,
+    winner: ChunkId,
+    file_id: FileId,
+    chunk_idx: u64,
+    loser_gen: u64,
+    winner_gen: u64,
+}
+
 /// Healing manager - monitors and repairs chunk replication
 /// Optimized for SBC environments (batched operations, configurable intervals)
 pub struct HealingManager {
@@ -193,6 +208,21 @@ pub struct HealingManager {
     /// reader: both consumers would otherwise pay for their own full CHUNK_TABLE
     /// scan+group every cycle for data the deep pass already produced.
     superseded_generation_chunk_ids: Arc<RwLock<HashSet<ChunkId>>>,
+
+    /// Additive, stricter subset of superseded_generation_chunk_ids (2026-08-09):
+    /// slot losers whose supersession is HARD-confirmed — both the loser and its
+    /// slot's winner have a known chunk_generations entry, and they differ. This
+    /// deliberately excludes every case that would fall back to the cws/written_at
+    /// tiebreak (either side's generation unknown, or a same-generation tie) —
+    /// exactly the class of "misjudged as retired" evidence the NOTE at this
+    /// file's run_disk_orphan_sweep_over cites as why superseded_generation_chunk_ids
+    /// itself was pulled from gating deletion on 2026-07-26. This narrower set is
+    /// what's actually eligible to become an orphan-sweep candidate (see
+    /// run_disk_orphan_sweep_over's kept-gate) — and even then, ONLY after
+    /// surviving a new cluster-wide cross-check (confirm_hard_superseded_cluster_wide)
+    /// before physical deletion, never on this cache's say-so alone. Recomputed
+    /// once per deep discovery pass, same cadence as superseded_generation_chunk_ids.
+    hard_confirmed_superseded: Arc<RwLock<HashMap<ChunkId, HardSupersededSlot>>>,
 
     /// Cluster manager
     cluster: Arc<ClusterManager>,
@@ -618,6 +648,7 @@ impl HealingManager {
             fold_result_chunk_ids,
             chunk_generations,
             superseded_generation_chunk_ids: Arc::new(RwLock::new(HashSet::new())),
+            hard_confirmed_superseded: Arc::new(RwLock::new(HashMap::new())),
             cluster,
             client,
             replication_factor,
@@ -2940,6 +2971,11 @@ impl HealingManager {
             /// slot, keep only the location_supersedes winner) rather than a
             /// second CHUNK_TABLE pass.
             slot_losers: Vec<ChunkId>,
+            /// Strict subset of slot_losers (2026-08-09): losers whose supersession
+            /// is HARD-confirmed (both sides' chunk_generations known and differing),
+            /// not merely tiebreak-derived. See HardSupersededSlot's doc comment.
+            /// Always empty on the shallow pass, same as slot_losers.
+            hard_confirmed_losers: Vec<HardSupersededSlot>,
         }
 
         // Fast path: no sled scan at all. We fetch locations only for chunks already
@@ -3000,7 +3036,7 @@ impl HealingManager {
                     warn!("run_discovery_pass (fast): batch location lookup failed, skipping this cycle: {}", e);
                 }
             }
-            ScanResult { chunks_to_check, orphaned_pending: Vec::new(), slot_losers: Vec::new() }
+            ScanResult { chunks_to_check, orphaned_pending: Vec::new(), slot_losers: Vec::new(), hard_confirmed_losers: Vec::new() }
         } else {
             let pending_snapshot_for_orphans = pending_snapshot.clone();
             let fold_result_chunk_ids = self.fold_result_chunk_ids.clone();
@@ -3062,12 +3098,37 @@ impl HealingManager {
                     }
                 }
                 let slot_winner_ids: HashSet<ChunkId> = slot_winners.values().map(|l| l.chunk_id).collect();
-                let slot_losers: Vec<ChunkId> = chunks_to_check.iter()
+                let losers: Vec<&ChunkLocation> = chunks_to_check.iter()
                     .filter(|loc| loc.file_offset.is_some() && !slot_winner_ids.contains(&loc.chunk_id))
-                    .map(|loc| loc.chunk_id)
                     .collect();
+                let slot_losers: Vec<ChunkId> = losers.iter().map(|loc| loc.chunk_id).collect();
 
-                Ok::<_, anyhow::Error>(ScanResult { chunks_to_check, orphaned_pending, slot_losers })
+                // Hard-confirmed subset (2026-08-09) — see HardSupersededSlot's doc
+                // comment. Re-derive each loser's OWN slot's final winner (not
+                // whatever it lost to mid-fold, which may itself have since lost to
+                // something else) and only classify as hard-confirmed when BOTH
+                // sides have a known, differing chunk_generations entry — anything
+                // generation-unknown or same-generation-tied stays soft/tiebreak-
+                // derived (present in slot_losers, absent from hard_confirmed_losers)
+                // and is never eligible for what consumes this set.
+                let mut hard_confirmed_losers: Vec<HardSupersededSlot> = Vec::new();
+                for loc in &losers {
+                    let (Some(file_id), Some(offset)) = (loc.file_id, loc.file_offset) else { continue };
+                    let key = (file_id, offset / CHUNK_SIZE);
+                    let Some(&winner) = slot_winners.get(&key) else { continue };
+                    let loser_gen = chunk_generations.get(&loc.chunk_id).map(|v| *v);
+                    let winner_gen = chunk_generations.get(&winner.chunk_id).map(|v| *v);
+                    if let (Some(lg), Some(wg)) = (loser_gen, winner_gen) {
+                        if wg > lg {
+                            hard_confirmed_losers.push(HardSupersededSlot {
+                                loser: loc.chunk_id, winner: winner.chunk_id,
+                                file_id, chunk_idx: key.1, loser_gen: lg, winner_gen: wg,
+                            });
+                        }
+                    }
+                }
+
+                Ok::<_, anyhow::Error>(ScanResult { chunks_to_check, orphaned_pending, slot_losers, hard_confirmed_losers })
             })
             .await
             .context("spawn_blocking for chunk scan panicked")??
@@ -3081,7 +3142,7 @@ impl HealingManager {
             return Ok(());
         }
 
-        let ScanResult { chunks_to_check, orphaned_pending, slot_losers } = scan_result;
+        let ScanResult { chunks_to_check, orphaned_pending, slot_losers, hard_confirmed_losers } = scan_result;
         // Modest additional settle floor (process uptime), defense-in-depth alongside
         // the live-set-trustworthiness check above — cheap, and this node's own recent
         // restart is exactly when its local metadata is least likely to have finished
@@ -3103,8 +3164,18 @@ impl HealingManager {
         // ScanResult's doc comment history), but this keeps the cache correct even
         // if a shallow caller is reintroduced later.
         let slot_losers: HashSet<ChunkId> = slot_losers.into_iter().collect();
+        let hard_confirmed_count = hard_confirmed_losers.len();
         if deep {
             *self.superseded_generation_chunk_ids.write().await = slot_losers.clone();
+            // A.1 (2026-08-09, observe-only stage): cache the hard-confirmed subset
+            // alongside the existing soft/tiebreak-inclusive set. Not yet consulted
+            // by anything — see hard_confirmed_superseded's doc comment for the
+            // staged rollout this is the first step of. Logged separately below so
+            // the actionable fraction of the backlog is visible before any
+            // candidacy/deletion logic is built on top of it.
+            *self.hard_confirmed_superseded.write().await = hard_confirmed_losers.into_iter()
+                .map(|s| (s.loser, s))
+                .collect();
         }
 
         // work carries (chunk_id, status, confirmed_alive_node_ids) from the bulk scan.
@@ -3683,10 +3754,18 @@ impl HealingManager {
         if deep && !slot_losers.is_empty() {
             info!(
                 "Discovery: found {} superseded-generation chunk(s) this pass — file-live but not \
-                 their slot's current generation, excluded from healing and queued as disk-orphan \
-                 sweep candidates",
+                 their slot's current generation, excluded from healing; not yet consumed by \
+                 disk-orphan sweep (see hard-confirmed count below for the actionable subset)",
                 slot_losers.len()
             );
+            if hard_confirmed_count > 0 {
+                info!(
+                    "Discovery: {} of those {} are HARD-confirmed superseded (both sides' generation \
+                     known and differing, not tiebreak-derived) — the subset eligible for future \
+                     candidacy once a cluster-wide cross-check gate lands (A.2/A.3, not yet shipped)",
+                    hard_confirmed_count, slot_losers.len()
+                );
+            }
         }
 
         // Apply all accumulated metadata writes in a single spawn_blocking call.
@@ -3858,6 +3937,79 @@ impl HealingManager {
         alive
     }
 
+    /// Batched replacement for drain_heal_queue's cache-miss classification path —
+    /// see that call site's doc comment for the RPC-volume incident this closes
+    /// (2026-08-09: 608K cumulative healing-class RPCs vs ~8K real client writes
+    /// on one staging node, ~74x — traced to probe_single_chunk_alive_nodes
+    /// firing once per (chunk, node) pair under sustained churn instead of once
+    /// per node for the whole cache-miss batch). One HasChunks RPC per online
+    /// peer, carrying every cache-miss chunk_id from this drain cycle, instead
+    /// of one singleton RPC per chunk per peer — mirrors the batch-then-fan-out-
+    /// once-per-peer shape flush_heal_outcomes already uses for location
+    /// broadcasts. probe_single_chunk_alive_nodes itself is left unchanged for
+    /// its existing on-demand single-chunk callers (per its own doc comment) —
+    /// only drain_heal_queue's cache-miss path moves to this batched variant.
+    async fn probe_chunks_alive_nodes_batch(&self, chunk_ids: &[ChunkId]) -> HashMap<ChunkId, Vec<NodeId>> {
+        let local_id = self.cluster.local_node_id();
+        let online_nodes = self.cluster.get_all_nodes().await;
+        let mut alive: HashMap<ChunkId, Vec<NodeId>> =
+            chunk_ids.iter().map(|id| (*id, Vec::new())).collect();
+
+        if let Ok(present) = self.storage.chunks_present_batch(chunk_ids) {
+            for (id, present) in chunk_ids.iter().zip(present) {
+                if present {
+                    alive.get_mut(id).expect("seeded above").push(local_id);
+                }
+            }
+        }
+
+        // Bounded so one pathological cycle (a huge cache-miss burst under sustained
+        // churn) can't produce one unbounded wire message or block a peer's
+        // request-handling thread deserializing an enormous Vec — trades "many
+        // small RPCs" for "a few bounded RPCs", not "one unbounded RPC".
+        const PROBE_BATCH_MAX: usize = 512;
+
+        let peers: Vec<_> = online_nodes.iter()
+            .filter(|n| n.status == dfs_common::NodeStatus::Online && n.id != local_id)
+            .cloned()
+            .collect();
+
+        let results = futures::future::join_all(peers.iter().map(|node| async move {
+            let mut node_alive = Vec::new();
+            for batch in chunk_ids.chunks(PROBE_BATCH_MAX) {
+                let request = Request::HasChunks { chunk_ids: batch.to_vec() };
+                match tokio::time::timeout(Duration::from_secs(3), self.client.send_message(node.addr, Message::Request(request))).await {
+                    Ok(Ok(envelope)) => {
+                        if let Message::Response(Response::BoolVec { values }) = envelope.message {
+                            for (id, present) in batch.iter().zip(values) {
+                                if present {
+                                    node_alive.push(*id);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!("probe_chunks_alive_nodes_batch: HasChunks failed for node {} ({}): treating {} chunk(s) as absent this probe", node.id, e, batch.len());
+                    }
+                    Err(_) => {
+                        debug!("probe_chunks_alive_nodes_batch: HasChunks timed out for node {}: treating {} chunk(s) as absent this probe", node.id, batch.len());
+                    }
+                }
+            }
+            (node.id, node_alive)
+        })).await;
+
+        for (node_id, node_alive) in results {
+            for chunk_id in node_alive {
+                if let Some(entry) = alive.get_mut(&chunk_id) {
+                    entry.push(node_id);
+                }
+            }
+        }
+
+        alive
+    }
+
     /// Sort key for drain_heal_queue's per-cycle ordering — see that function's sort
     /// comment for the incident this closes. Pure and independently testable:
     /// `is_urgent` (see urgent_healing's doc comment) ranks first — a genuine
@@ -3961,36 +4113,26 @@ impl HealingManager {
 
             if !cache_misses.is_empty() {
                 let replication_factor = self.replication_factor.load(Ordering::Relaxed);
-                // Concurrent, not sequential — root-caused 2026-08-07 (staging: heal
-                // backlog stuck at ~8,600 with 0 in-flight for 40+ minutes despite
-                // full concurrency/bandwidth headroom, only ever moving after a
-                // manual trigger). probe_single_chunk_alive_nodes can cost up to
-                // ~cluster_size peer RPCs at a 3s timeout apiece, and a purely
-                // sequential loop here paid that cost once PER cache-miss chunk,
-                // one at a time. Under sustained churn (a hot, continuously-
-                // refolding file feeding a steady stream of freshly-queued
-                // "immediate heal" chunks — each a guaranteed cache miss on its
-                // first cycle, since nothing has classified it yet), a single
-                // drain_heal_queue call could take many times longer than its own
-                // 15s run_heal_loop cadence, so it never meaningfully progressed
-                // on its own — confirmed live: dispatch only ever happened right
-                // after a manual trigger's paired discovery-then-drain call,
-                // never from the automatic loop alone. Bounded fan-out
-                // (buffer_unordered) turns cycle cost into roughly the slowest
-                // single probe instead of the sum of all of them, while still
-                // capping concurrent peer RPCs one drain cycle can generate —
-                // same order of magnitude as this codebase's other fan-out caps
-                // (MAX_CONCURRENT=16, prefetch capped at 2, etc.), not unbounded.
-                const CACHE_MISS_PROBE_CONCURRENCY: usize = 32;
-                use futures::stream::StreamExt;
-                let probed: Vec<(ChunkId, Vec<NodeId>)> = futures::stream::iter(cache_misses)
-                    .map(|chunk_id| async move {
-                        let confirmed_alive = self.probe_single_chunk_alive_nodes(&chunk_id).await;
-                        (chunk_id, confirmed_alive)
-                    })
-                    .buffer_unordered(CACHE_MISS_PROBE_CONCURRENCY)
-                    .collect()
-                    .await;
+                // Batched, not one-RPC-per-chunk-per-peer — root-caused 2026-08-07
+                // (staging: heal backlog stuck at ~8,600 with 0 in-flight for 40+
+                // minutes despite full concurrency/bandwidth headroom, only ever
+                // moving after a manual trigger) AND 2026-08-09 (608K cumulative
+                // healing-class RPCs vs ~8K real client writes, ~74x, on a
+                // production kdiskmark run). probe_single_chunk_alive_nodes costs up
+                // to ~cluster_size peer RPCs at a 3s timeout apiece, and this call
+                // site used to pay that cost once PER cache-miss chunk (originally
+                // sequential, then fanned out via buffer_unordered across chunks —
+                // which fixed the 08-07 stall but not the RPC volume, since each of
+                // the N concurrent probes still issued its own singleton HasChunks
+                // per peer). Under sustained churn (a hot, continuously-refolding
+                // file feeding a steady stream of freshly-queued "immediate heal"
+                // chunks — each a guaranteed cache miss on its first cycle, since
+                // nothing has classified it yet), that's cache_misses.len() ×
+                // (peers) RPCs every cycle. probe_chunks_alive_nodes_batch collapses
+                // this to one HasChunks per peer carrying every cache-miss chunk_id
+                // in the cycle — see its own doc comment.
+                let probed: HashMap<ChunkId, Vec<NodeId>> =
+                    self.probe_chunks_alive_nodes_batch(&cache_misses).await;
 
                 {
                     let mut cache = self.alive_nodes_cache.write().await;
@@ -6485,6 +6627,215 @@ mod tests {
              probe's worth of wall time (concurrent), not ~8x that (sequential)", elapsed);
     }
 
+    /// Counts HasChunks arrivals and answers every id present — stands in for a
+    /// real peer for probe_chunks_alive_nodes_batch's RPC-count proof below.
+    struct CountingHasChunksHandler {
+        has_chunks_calls: Arc<AtomicUsize>,
+        last_batch_len: Arc<AtomicUsize>,
+    }
+
+    impl crate::network::MessageHandler for CountingHasChunksHandler {
+        fn handle_request(
+            &self,
+            request: Request,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                match request {
+                    Request::HasChunks { chunk_ids } => {
+                        self.has_chunks_calls.fetch_add(1, Ordering::Relaxed);
+                        self.last_batch_len.store(chunk_ids.len(), Ordering::Relaxed);
+                        Response::BoolVec { values: vec![true; chunk_ids.len()] }
+                    }
+                    _ => Response::Ok { data: None },
+                }
+            })
+        }
+        fn handle_cluster_message(
+            &self,
+            _message: dfs_common::ClusterMessage,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move { Response::Ok { data: None } })
+        }
+    }
+
+    /// Direct RPC-count proof for the 2026-08-09 fix (608K cumulative healing
+    /// RPCs vs ~8K real client writes, ~74x, traced to one HasChunks per
+    /// (chunk, peer) pair). N cache-miss chunks against one real, responsive
+    /// peer must cost that peer exactly ONE HasChunks call carrying all N ids —
+    /// not N separate singleton calls. This is a strictly stronger assertion
+    /// than the wall-clock test above (which only proves probes overlap in
+    /// time, not that they collapsed into fewer RPCs).
+    #[tokio::test]
+    async fn drain_heal_queue_batches_cache_miss_probes_into_one_haschunks_per_peer() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8905".parse().unwrap();
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
+        let healing = HealingManager::new(
+            storage.clone(), metadata.clone(), cluster.clone(), client, Arc::new(AtomicUsize::new(3)),
+            0, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 16, 8, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        let has_chunks_calls = Arc::new(AtomicUsize::new(0));
+        let last_batch_len = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingHasChunksHandler {
+            has_chunks_calls: has_chunks_calls.clone(),
+            last_batch_len: last_batch_len.clone(),
+        });
+        let peer_addr: SocketAddr = "127.0.0.1:19398".parse().unwrap();
+        let mut net_server = crate::network::NetworkServer::new(peer_addr, handler, 10);
+        tokio::spawn(async move { net_server.start().await.ok(); });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let peer = dfs_common::NodeInfo::new(NodeId::new(), peer_addr, None);
+        cluster.add_node(peer).await.unwrap();
+
+        const N: usize = 50;
+        let chunk_ids: Vec<ChunkId> = (0..N)
+            .map(|i| ChunkId::from_hash(compute_chunk_hash(format!("batch-probe-{}", i).as_bytes())))
+            .collect();
+        for &id in &chunk_ids {
+            healing.mark_pending(id).await;
+        }
+
+        healing.drain_heal_queue().await.unwrap();
+
+        assert_eq!(has_chunks_calls.load(Ordering::Relaxed), 1,
+            "expected exactly one HasChunks call to the peer for {} cache-miss chunks — got {}",
+            N, has_chunks_calls.load(Ordering::Relaxed));
+        assert_eq!(last_batch_len.load(Ordering::Relaxed), N,
+            "the single HasChunks call must carry all {} chunk_ids, not a subset", N);
+    }
+
+    /// Correctness companion to the RPC-count test above: with two peers each
+    /// holding a different subset of chunks, the batched probe must still
+    /// assemble the exact right per-chunk alive-node set — guards against an
+    /// off-by-one/misalignment bug in zipping a peer's BoolVec back to the
+    /// chunk_ids it was requested against.
+    #[tokio::test]
+    async fn probe_chunks_alive_nodes_batch_assembles_correct_per_chunk_results() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8906".parse().unwrap();
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
+        let healing = HealingManager::new(
+            storage, metadata, cluster.clone(), client, Arc::new(AtomicUsize::new(3)),
+            0, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 16, 8, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        let chunk_a = ChunkId::from_hash(compute_chunk_hash(b"assemble-a"));
+        let chunk_b = ChunkId::from_hash(compute_chunk_hash(b"assemble-b"));
+        let chunk_c = ChunkId::from_hash(compute_chunk_hash(b"assemble-c"));
+
+        // Peer 1 holds {a, c}; peer 2 holds {b, c}.
+        struct SubsetHandler { holds: Vec<ChunkId> }
+        impl crate::network::MessageHandler for SubsetHandler {
+            fn handle_request(&self, request: Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                let holds = self.holds.clone();
+                Box::pin(async move {
+                    match request {
+                        Request::HasChunks { chunk_ids } => Response::BoolVec {
+                            values: chunk_ids.iter().map(|id| holds.contains(id)).collect(),
+                        },
+                        _ => Response::Ok { data: None },
+                    }
+                })
+            }
+            fn handle_cluster_message(&self, _message: dfs_common::ClusterMessage) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+                Box::pin(async move { Response::Ok { data: None } })
+            }
+        }
+
+        let peer1_addr: SocketAddr = "127.0.0.1:19396".parse().unwrap();
+        let peer1 = Arc::new(SubsetHandler { holds: vec![chunk_a, chunk_c] });
+        let mut server1 = crate::network::NetworkServer::new(peer1_addr, peer1, 10);
+        tokio::spawn(async move { server1.start().await.ok(); });
+
+        let peer2_addr: SocketAddr = "127.0.0.1:19397".parse().unwrap();
+        let peer2 = Arc::new(SubsetHandler { holds: vec![chunk_b, chunk_c] });
+        let mut server2 = crate::network::NetworkServer::new(peer2_addr, peer2, 10);
+        tokio::spawn(async move { server2.start().await.ok(); });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let peer1_id = NodeId::new();
+        let peer2_id = NodeId::new();
+        cluster.add_node(dfs_common::NodeInfo::new(peer1_id, peer1_addr, None)).await.unwrap();
+        cluster.add_node(dfs_common::NodeInfo::new(peer2_id, peer2_addr, None)).await.unwrap();
+
+        let result = healing.probe_chunks_alive_nodes_batch(&[chunk_a, chunk_b, chunk_c]).await;
+
+        let mut a_holders = result.get(&chunk_a).cloned().unwrap_or_default();
+        a_holders.sort();
+        assert_eq!(a_holders, { let mut v = vec![peer1_id]; v.sort(); v }, "chunk a must resolve to exactly peer1");
+
+        let mut b_holders = result.get(&chunk_b).cloned().unwrap_or_default();
+        b_holders.sort();
+        assert_eq!(b_holders, { let mut v = vec![peer2_id]; v.sort(); v }, "chunk b must resolve to exactly peer2");
+
+        let mut c_holders = result.get(&chunk_c).cloned().unwrap_or_default();
+        c_holders.sort();
+        let mut expected_c = vec![peer1_id, peer2_id];
+        expected_c.sort();
+        assert_eq!(c_holders, expected_c, "chunk c must resolve to both peers");
+    }
+
+    /// Failure isolation: one unreachable peer must not prevent correct results
+    /// from a healthy peer in the same batched probe call.
+    #[tokio::test]
+    async fn probe_chunks_alive_nodes_batch_isolates_unreachable_peer_failure() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8907".parse().unwrap();
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+        let client = Arc::new(NetworkClient::new());
+        let healing = HealingManager::new(
+            storage, metadata, cluster.clone(), client, Arc::new(AtomicUsize::new(3)),
+            0, 24, true,
+            Arc::new(DashMap::new()), Arc::new(dashmap::DashSet::new()), Arc::new(DashMap::new()),
+            Arc::new(AtomicU64::new(0)), 100, 60.0, 16, 8, 120,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"isolate-failure"));
+
+        // Healthy peer: really holds the chunk.
+        let healthy_addr: SocketAddr = "127.0.0.1:19395".parse().unwrap();
+        let handler = Arc::new(CountingHasChunksHandler {
+            has_chunks_calls: Arc::new(AtomicUsize::new(0)),
+            last_batch_len: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut healthy_server = crate::network::NetworkServer::new(healthy_addr, handler, 10);
+        tokio::spawn(async move { healthy_server.start().await.ok(); });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let healthy_id = NodeId::new();
+        cluster.add_node(dfs_common::NodeInfo::new(healthy_id, healthy_addr, None)).await.unwrap();
+
+        // Unreachable peer: nothing listening on this port.
+        let dead_addr: SocketAddr = "127.0.0.1:19394".parse().unwrap();
+        cluster.add_node(dfs_common::NodeInfo::new(NodeId::new(), dead_addr, None)).await.unwrap();
+
+        let result = healing.probe_chunks_alive_nodes_batch(&[chunk_id]).await;
+        let holders = result.get(&chunk_id).cloned().unwrap_or_default();
+        assert_eq!(holders, vec![healthy_id],
+            "healthy peer's result must still be correct despite the other peer being unreachable");
+    }
+
     /// Root-caused 2026-08-07 (staging): queue_chunks_immediate's callers
     /// (fold_slot_now, handle_replicate_patch_fold) queue a chunk based on a
     /// point-in-time belief with no guarantee it's still the current identity
@@ -7254,6 +7605,82 @@ mod tests {
             Some(true),
             "chunk_map now points at a different chunk at this offset — superseded, not data loss"
         );
+    }
+
+    /// A.1 (2026-08-09, observe-only stage of the superseded-generation backlog
+    /// cleanup): proves the hard-confirmed classification itself is correct
+    /// before anything consumes it. Two slots, each with a winner + a loser at
+    /// the same (file_id, chunk_idx): slot 1's pair has known, differing
+    /// chunk_generations (hard-confirmed); slot 2's pair has NO recorded
+    /// generation on either side (soft/tiebreak-derived, per location_supersedes'
+    /// fallback). Both losers must land in the existing, unchanged
+    /// superseded_generation_chunk_ids set — but only slot 1's loser may land in
+    /// the new hard_confirmed_superseded set. Nothing consumes the new set yet
+    /// (candidacy/deletion is A.2/A.3, not shipped here) — this only proves the
+    /// classification everything else will be built on.
+    #[tokio::test]
+    async fn discovery_pass_classifies_hard_confirmed_vs_soft_superseded_correctly() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8908".parse().unwrap();
+        let (_storage, metadata, healing, _t1, _t2) = make_healing(node_id, addr);
+
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+
+        let mut file1 = FileMetadata::new("/hard-confirmed-file".to_string(), FileType::RegularFile);
+        let file1_id = file1.id;
+        let hard_winner = ChunkId::from_hash(compute_chunk_hash(b"hard-winner"));
+        let hard_loser = ChunkId::from_hash(compute_chunk_hash(b"hard-loser"));
+        let hard_winner_loc = ChunkLocation {
+            chunk_id: hard_winner, nodes: vec![node_id], size: 4096, checksum: hard_winner.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: None, file_id: Some(file1_id),
+        };
+        let hard_loser_loc = ChunkLocation {
+            chunk_id: hard_loser, nodes: vec![node_id], size: 4096, checksum: hard_loser.hash,
+            file_offset: Some(0), written_at: None, client_write_seq: None, file_id: Some(file1_id),
+        };
+        file1.chunk_locations = Arc::new(vec![hard_winner_loc.clone()]);
+        metadata.put_file(&file1).unwrap();
+        metadata.put_chunk_location(&hard_winner_loc).unwrap();
+        metadata.put_chunk_location(&hard_loser_loc).unwrap();
+        // Known, differing generations — this is what makes it HARD-confirmed.
+        healing.chunk_generations.insert(hard_winner, 10);
+        healing.chunk_generations.insert(hard_loser, 5);
+
+        let mut file2 = FileMetadata::new("/soft-superseded-file".to_string(), FileType::RegularFile);
+        let file2_id = file2.id;
+        let soft_winner = ChunkId::from_hash(compute_chunk_hash(b"soft-winner"));
+        let soft_loser = ChunkId::from_hash(compute_chunk_hash(b"soft-loser"));
+        let soft_winner_loc = ChunkLocation {
+            chunk_id: soft_winner, nodes: vec![node_id], size: 4096, checksum: soft_winner.hash,
+            file_offset: Some(0), written_at: Some(200), client_write_seq: Some(2), file_id: Some(file2_id),
+        };
+        let soft_loser_loc = ChunkLocation {
+            chunk_id: soft_loser, nodes: vec![node_id], size: 4096, checksum: soft_loser.hash,
+            file_offset: Some(0), written_at: Some(100), client_write_seq: Some(1), file_id: Some(file2_id),
+        };
+        file2.chunk_locations = Arc::new(vec![soft_winner_loc.clone()]);
+        metadata.put_file(&file2).unwrap();
+        metadata.put_chunk_location(&soft_winner_loc).unwrap();
+        metadata.put_chunk_location(&soft_loser_loc).unwrap();
+        // Deliberately NO chunk_generations entries for either side — falls back
+        // to the written_at/client_write_seq tiebreak, same as production would.
+
+        healing.trigger_heal_now().await.unwrap();
+
+        let soft_set = healing.superseded_generation_chunk_ids.read().await.clone();
+        assert!(soft_set.contains(&hard_loser), "hard_loser must still be in the unchanged soft set");
+        assert!(soft_set.contains(&soft_loser), "soft_loser must be in the soft set (tiebreak-derived supersession is still real supersession)");
+
+        let hard_set = healing.hard_confirmed_superseded.read().await.clone();
+        assert!(hard_set.contains_key(&hard_loser), "hard_loser has known, differing generations — must be hard-confirmed");
+        assert!(!hard_set.contains_key(&soft_loser), "soft_loser has no recorded generation on either side — must NOT be hard-confirmed, only tiebreak-derived");
+
+        let slot = hard_set.get(&hard_loser).unwrap();
+        assert_eq!(slot.winner, hard_winner);
+        assert_eq!(slot.loser_gen, 5);
+        assert_eq!(slot.winner_gen, 10);
+        assert_eq!(slot.file_id, file1_id);
+        assert_eq!(slot.chunk_idx, 0 / CHUNK_SIZE);
     }
 
     /// A chunk_id that is still exactly what the file's metadata references at this

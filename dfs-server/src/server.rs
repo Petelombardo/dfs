@@ -4496,8 +4496,9 @@ impl Server {
                     if !buf.is_empty() {
                         if metadata_batch_drain_enabled {
                             let folded = fold_metadata_batch(buf);
-                            if let Err(e) = meta_bg.put_files_batch(&folded) {
-                                warn!("sled_write_worker: put_files_batch failed for {} files: {}", folded.len(), e);
+                            let folded_len = folded.len();
+                            if let Err(e) = meta_bg.put_files_batch_via_committer(folded) {
+                                warn!("sled_write_worker: put_files_batch failed for {} files: {}", folded_len, e);
                             }
                         } else {
                             for m in &buf {

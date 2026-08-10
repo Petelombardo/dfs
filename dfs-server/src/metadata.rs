@@ -224,8 +224,20 @@ pub(crate) struct CompactionPrep {
 /// per-heal record updates measured as the dominant transaction sites in the
 /// 2026-07-15 DB-growth baselines (put/delete_chunk_location, put_chunk_seq, and
 /// the patch-state trio each fired >1000 single-record commits/min under RND4K
-/// load). Bulk paths (put_files_batch, batch_update_chunk_locations, meta queue)
-/// already amortize their own transactions and stay on their direct path.
+/// load). Bulk paths (batch_update_chunk_locations, meta queue) already amortize
+/// their own transactions well enough to stay on their direct path.
+///
+/// put_files_batch is the one exception (2026-08-10): it USED to stay on its own
+/// direct path on the same "already amortizes its own transaction" reasoning
+/// above, via its own dedicated committer thread (server.rs's
+/// spawn_sled_write_worker) — but that's exactly the bug. redb allows only ONE
+/// write transaction open database-wide at a time, so two independently
+/// well-batched committer threads still fully serialize against each other's
+/// begin_write() just as badly as any other pair of competing solo
+/// transactions would — this was found still causing multi-second "[META
+/// COMMITTER] slow commit" stalls (1-op batches blocked acquiring the write
+/// lock) even after full_rewrite_chunk's and do_cleanup_excess_inner's own
+/// direct-write bypasses were fixed the same day. See PutFilesBatch below.
 enum MetaWriteOp {
     PutChunkLocation {
         location: ChunkLocation,
@@ -302,6 +314,14 @@ enum MetaWriteOp {
         entries: Vec<(ChunkId, u64)>,
         reply: tokio::sync::oneshot::Sender<Result<()>>,
     },
+    /// spawn_sled_write_worker's committed batch (see this enum's doc comment for
+    /// why this moved here from its own independent solo-transaction committer
+    /// thread). One reply per input item, same order, same semantics as
+    /// put_files_batch's own doc comment.
+    PutFilesBatch {
+        items: Vec<FileMetadata>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<PutFileResult>>>,
+    },
 }
 
 impl MetaWriteOp {
@@ -314,6 +334,7 @@ impl MetaWriteOp {
                 (puts.len() + deletes.len() + pending_healing_deletes.len()).max(1) as u64
             }
             MetaWriteOp::PutPendingHealingBatch { entries, .. } => entries.len().max(1) as u64,
+            MetaWriteOp::PutFilesBatch { items, .. } => items.len().max(1) as u64,
             _ => 1,
         }
     }
@@ -327,6 +348,7 @@ enum PendingReply {
     Unit(tokio::sync::oneshot::Sender<Result<()>>, Result<()>),
     RetiredToken(tokio::sync::oneshot::Sender<Result<Option<ChunkId>>>, Result<Option<ChunkId>>),
     ChunkSeq(tokio::sync::oneshot::Sender<Result<u64>>, Result<u64>),
+    FilesBatch(tokio::sync::oneshot::Sender<Result<Vec<PutFileResult>>>, Result<Vec<PutFileResult>>),
 }
 
 /// Metadata storage using redb embedded database.
@@ -689,6 +711,11 @@ impl MetadataStore {
 
         let mut replies: Vec<PendingReply> = Vec::with_capacity(ops.len());
         let mut payload_bytes: usize = 0;
+        // Only populated by PutFilesBatch ops — see the dirty-marking block right
+        // after commit below, which mirrors put_files_batch's own "must happen
+        // while _db is still held" comment.
+        let mut touched_file_ids: Vec<String> = Vec::new();
+        let mut touched_paths: Vec<String> = Vec::new();
         for op in ops {
             match op {
                 MetaWriteOp::PutChunkLocation { location, reply } => {
@@ -823,6 +850,27 @@ impl MetadataStore {
                     self.note_txn("op:put_pending_healing_batch", 0);
                     replies.push(PendingReply::Unit(reply, result));
                 }
+                MetaWriteOp::PutFilesBatch { items, reply } => {
+                    let result = (|| -> Result<Vec<PutFileResult>> {
+                        let mut results = Vec::with_capacity(items.len());
+                        let mut file_table = txn.open_table(FILE_TABLE)?;
+                        let mut path_table = txn.open_table(PATH_TABLE)?;
+                        for metadata in &items {
+                            let (r, old_id_str, item_bytes) =
+                                Self::put_file_in_txn(&mut file_table, &mut path_table, metadata)?;
+                            touched_file_ids.push(format!("{}", metadata.id));
+                            touched_paths.push(metadata.path.clone());
+                            if let Some(old_id) = old_id_str {
+                                touched_file_ids.push(old_id);
+                            }
+                            payload_bytes += item_bytes;
+                            results.push(r);
+                        }
+                        Ok(results)
+                    })();
+                    self.note_txn("op:put_files_batch", 0);
+                    replies.push(PendingReply::FilesBatch(reply, result));
+                }
             }
         }
 
@@ -835,6 +883,15 @@ impl MetadataStore {
         };
         if let Some(msg) = &commit_error {
             warn!("{}", msg);
+        }
+
+        // Mark FILE_TABLE/PATH_TABLE keys dirty for compact_db_with_budget's
+        // incremental catch-up, same as put_file/put_files_batch — only when the
+        // commit actually succeeded (an aborted transaction persisted nothing),
+        // and still while `_db` is held (see put_file's matching comment).
+        if commit_error.is_none() && !touched_file_ids.is_empty() {
+            self.dirty_files.lock().unwrap().extend(touched_file_ids);
+            self.dirty_paths.lock().unwrap().extend(touched_paths);
         }
 
         for pending in replies {
@@ -864,6 +921,14 @@ impl MetadataStore {
                     };
                     let _ = reply.send(final_result);
                 }
+                PendingReply::FilesBatch(reply, result) => {
+                    let final_result = match (&commit_error, result) {
+                        (_, Err(e)) => Err(e),
+                        (Some(msg), Ok(_)) => Err(anyhow::anyhow!("{}", msg)),
+                        (None, Ok(results)) => Ok(results),
+                    };
+                    let _ = reply.send(final_result);
+                }
             }
         }
     }
@@ -887,6 +952,9 @@ impl MetadataStore {
                 let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
             }
             MetaWriteOp::PutPatchStatePending { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+            }
+            MetaWriteOp::PutFilesBatch { reply, .. } => {
                 let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
             }
         }
@@ -1528,6 +1596,31 @@ impl MetadataStore {
         self.dirty_paths.lock().unwrap().extend(touched_paths);
 
         Ok(results)
+    }
+
+    /// Blocking (non-async) entry point for server.rs's spawn_sled_write_worker —
+    /// that worker is a dedicated std::thread, not a tokio task, so it needs
+    /// blocking_send/blocking_recv rather than .await (same class of call this
+    /// thread already makes via rx.blocking_recv() on its own input channel).
+    ///
+    /// Routes through the same group-commit queue as put_chunk_location_async
+    /// instead of calling put_files_batch's own independent begin_write() —
+    /// see MetaWriteOp's doc comment on PutFilesBatch for why running two
+    /// separately-batched solo-transaction committers side by side (this one
+    /// and metadata's own group committer) still serializes them against each
+    /// other on redb's single writer slot, just as badly as any other pair of
+    /// competing direct-write callers.
+    pub fn put_files_batch_via_committer(self: &Arc<Self>, items: Vec<FileMetadata>) -> Result<Vec<PutFileResult>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !Self::group_commit_enabled() {
+            return self.put_files_batch(&items);
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.committer_tx().blocking_send(MetaWriteOp::PutFilesBatch { items, reply })
+            .map_err(|_| anyhow::anyhow!("metadata group-commit thread is gone"))?;
+        rx.blocking_recv().context("metadata group-commit thread dropped its reply")?
     }
 
     /// Get file metadata by ID.
@@ -4918,6 +5011,113 @@ mod tests {
             "{} concurrent single-record writes should group-commit into fewer \
              transactions ({} observed) — if this is ~N, coalescing is broken",
             N, commits
+        );
+    }
+
+    /// Regression test for the 2026-08-10 fix: server.rs's spawn_sled_write_worker
+    /// used to call put_files_batch directly — its own independent solo redb write
+    /// transaction, competing with the shared group-commit committer thread for
+    /// redb's single writer slot on every batch (confirmed live on staging via the
+    /// [META TXN] periodic log: put_files_batch was still firing as a bare,
+    /// non-"op:"-prefixed site well after full_rewrite_chunk's and
+    /// do_cleanup_excess_inner's own direct-write bypasses were fixed the same
+    /// day). put_files_batch_via_committer must route through the same committer
+    /// instead. Uses spawn_blocking to call it, mirroring spawn_sled_write_worker's
+    /// own std::thread — blocking_send/blocking_recv panic if called from a tokio
+    /// async task directly.
+    #[tokio::test]
+    async fn put_files_batch_via_committer_uses_group_commit_not_solo_transaction() {
+        use dfs_common::FileType;
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+
+        let items: Vec<FileMetadata> = (0..5)
+            .map(|i| FileMetadata::new(format!("/sled-worker-{}", i), FileType::RegularFile))
+            .collect();
+        let ids: Vec<FileId> = items.iter().map(|m| m.id).collect();
+
+        let store2 = Arc::clone(&store);
+        let results = tokio::task::spawn_blocking(move || store2.put_files_batch_via_committer(items))
+            .await.unwrap().unwrap();
+        assert_eq!(results.len(), 5);
+
+        for id in &ids {
+            assert!(store.file_exists_by_id(*id).unwrap(), "every item must be persisted");
+        }
+
+        let stats = store.txn_stats_snapshot();
+        let count_of = |site: &str| stats.iter()
+            .find(|(s, _, _)| s == site)
+            .map(|(_, count, _)| *count)
+            .unwrap_or(0);
+        assert_eq!(count_of("op:put_files_batch"), 1,
+            "the batch must go through the group-commit queue exactly once");
+        assert_eq!(count_of("put_files_batch"), 0,
+            "must NOT open a solo redb write transaction competing with the group committer");
+    }
+
+    /// Companion to the test above: put_files_batch_via_committer running
+    /// concurrently with ordinary put_chunk_location_async callers must still
+    /// coalesce into far fewer transactions than the total op count — proving
+    /// FileMetadata writes now share the same committer as everything else,
+    /// instead of running as a second, independently-serializing solo committer
+    /// (spawn_sled_write_worker's original design) that would still fully
+    /// serialize against commit_worker_loop on redb's single writer lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn put_files_batch_via_committer_coalesces_with_concurrent_chunk_writers() {
+        use dfs_common::FileType;
+        let temp_dir = TempDir::new().unwrap();
+        let store = Arc::new(MetadataStore::new(temp_dir.path().to_path_buf()).unwrap());
+        let node = NodeId::new();
+
+        const N: usize = 100;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let store = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let hash = dfs_common::hash::compute_chunk_hash(format!("mix-{}", i).as_bytes());
+                let loc = ChunkLocation {
+                    chunk_id: ChunkId::from_hash(hash), nodes: vec![node], size: 4096, checksum: hash,
+                    file_offset: Some(0), written_at: Some(1000 + i as u64),
+                    client_write_seq: Some(i as u64), file_id: None,
+                };
+                store.put_chunk_location_async(loc).await.unwrap();
+            }));
+        }
+
+        const BATCHES: usize = 10;
+        const ITEMS_PER_BATCH: usize = 5;
+        for b in 0..BATCHES {
+            let store = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let items: Vec<FileMetadata> = (0..ITEMS_PER_BATCH)
+                    .map(|i| FileMetadata::new(format!("/mix-batch-{}-{}", b, i), FileType::RegularFile))
+                    .collect();
+                tokio::task::spawn_blocking(move || store.put_files_batch_via_committer(items))
+                    .await.unwrap().unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let stats = store.txn_stats_snapshot();
+        let count_of = |site: &str| stats.iter()
+            .find(|(s, _, _)| s == site)
+            .map(|(_, count, _)| *count)
+            .unwrap_or(0);
+        assert_eq!(count_of("put_files_batch"), 0,
+            "no participant may open a solo transaction");
+        assert_eq!(count_of("op:put_chunk_location"), N as u64);
+        assert_eq!(count_of("op:put_files_batch"), BATCHES as u64);
+        let commits = count_of("group_commit");
+        assert!(commits >= 1, "at least one commit must have happened");
+        assert!(
+            commits < ((N + BATCHES) as u64) * 3 / 4,
+            "{} chunk-location writers plus {} file batches should group-commit into fewer \
+             transactions ({} observed) — if this is ~N+BATCHES, coalescing is broken",
+            N, BATCHES, commits
         );
     }
 

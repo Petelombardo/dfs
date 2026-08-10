@@ -5157,17 +5157,20 @@ impl HealingManager {
                 client_write_seq: location.client_write_seq,
                 file_id: location.file_id,
             };
-            let meta = Arc::clone(metadata);
             let loc = updated_location.clone();
-            let store_result = tokio::task::spawn_blocking(move || meta.put_chunk_location(&loc)).await;
-            match store_result {
-                Ok(Ok(())) => {
+            // Routed through put_chunk_location_async (2026-08-09) instead of a
+            // direct spawn_blocking(put_chunk_location) call — the direct call
+            // opened its own solo redb write transaction, competing with the
+            // shared group-commit committer for redb's single-writer slot. See
+            // full_rewrite_chunk's identical fix in server.rs for the traced
+            // "[META COMMITTER] slow commit" mechanism this closes.
+            match metadata.put_chunk_location_async(loc).await {
+                Ok(()) => {
                     Self::broadcast_chunk_location_shared(&updated_location, cluster, client).await;
                     info!("Excess replica cleanup complete for chunk {} ({} node(s) removed)",
                           chunk_id, removed_nodes.len());
                 }
-                Ok(Err(e)) => warn!("Failed to update chunk location after cleanup of {}: {}", chunk_id, e),
-                Err(e) => warn!("put_chunk_location spawn_blocking panicked for {}: {}", chunk_id, e),
+                Err(e) => warn!("Failed to update chunk location after cleanup of {}: {}", chunk_id, e),
             }
         }
 
@@ -6879,6 +6882,61 @@ mod tests {
         assert_eq!(sample.len(), 1);
         assert_eq!(sample[0].chunk_id, live_chunk_id,
             "the queued entry must be the live chunk, not the orphaned one");
+    }
+
+    /// Regression test for the 2026-08-09 fix: do_cleanup_excess_inner's metadata
+    /// update after trimming an excess replica used to call metadata.put_chunk_location
+    /// inside a spawn_blocking closure, opening its own solo redb write transaction
+    /// competing with the shared group-commit committer thread — same class of bug
+    /// as full_rewrite_chunk's (see server.rs's identical fix and its comment on the
+    /// traced "[META COMMITTER] slow commit" mechanism). Also closes a real coverage
+    /// gap: no test previously exercised this function's metadata update at all.
+    #[tokio::test]
+    async fn do_cleanup_excess_registers_via_group_commit_not_solo_transaction() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8902".parse().unwrap();
+        let (storage, metadata, healing, _temp_storage, _temp_metadata) = make_healing(node_id, addr);
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"excess-replica-chunk"));
+        let data = vec![9u8; 128];
+        storage.write_chunk(&chunk_id, &data).unwrap();
+        let file_id = dfs_common::FileId::new();
+        metadata.put_chunk_location(&ChunkLocation {
+            chunk_id,
+            nodes: vec![node_id],
+            size: data.len(),
+            checksum: chunk_id.hash,
+            file_offset: Some(0),
+            written_at: Some(1000),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        }).unwrap();
+
+        // Baseline AFTER the setup seed above (which itself is a legitimate solo
+        // put_chunk_location call, not part of the code under test) so the
+        // assertions below measure only what do_cleanup_excess_inner itself does.
+        let count_of = |stats: &[(String, u64, u64)], site: &str| stats.iter()
+            .find(|(s, _, _)| s == site)
+            .map(|(_, count, _)| *count)
+            .unwrap_or(0);
+        let baseline = metadata.txn_stats_snapshot();
+        let base_group = count_of(&baseline, "op:put_chunk_location");
+        let base_solo = count_of(&baseline, "put_chunk_location");
+
+        // Only the local node is "alive" and replication_factor=0, so excess=1 and
+        // the local node itself is the deterministic trim target — this stays a
+        // pure single-process unit test (no peer RPC needed) while still exercising
+        // the real metadata-update path at the end of do_cleanup_excess_inner.
+        let result = HealingManager::do_cleanup_excess_inner(
+            &chunk_id, vec![node_id], &storage, &metadata, &healing.cluster, &healing.client, 0,
+        ).await;
+        assert!(result.is_ok(), "cleanup must succeed: {:?}", result);
+
+        let stats = metadata.txn_stats_snapshot();
+        assert_eq!(count_of(&stats, "op:put_chunk_location") - base_group, 1,
+            "the post-trim metadata update must go through the group-commit queue exactly once");
+        assert_eq!(count_of(&stats, "put_chunk_location") - base_solo, 0,
+            "must NOT open a solo redb write transaction competing with the group committer");
     }
 
     fn make_healing(node_id: NodeId, addr: SocketAddr) -> (Arc<ChunkStorage>, Arc<MetadataStore>, HealingManager, TempDir, TempDir) {

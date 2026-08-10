@@ -1117,11 +1117,9 @@ async fn full_rewrite_chunk(
     // Narrowing the guard to just the unlink keeps that window closed exactly as
     // before, while dropping the hold time from ~438ms to a single filesystem op.
     let storage_inner = storage.clone();
-    let metadata_inner = metadata.clone();
     let result = tokio::task::spawn_blocking(move || {
         use std::fs;
         let storage = storage_inner;
-        let metadata = metadata_inner;
 
         let mut buf = if let Some(arc_data) = prefetched {
             match Arc::try_unwrap(arc_data) {
@@ -1213,93 +1211,101 @@ async fn full_rewrite_chunk(
             storage.invalidate_cache(&new_chunk_id);
         }
 
-        // (Re-)register new_chunk_id's ChunkLocation unconditionally — even when the
-        // patch was a content no-op (new_chunk_id == old_chunk_id). apply_patch always
-        // deletes real_base's ChunkLocation synchronously before handing off to us (see
-        // PATCH_STATE_TABLE), trusting this function to restore it. That's fine when
-        // content genuinely changes (handled above, under a fresh chunk_id). But when a
-        // patch reproduces byte-identical content — e.g. concurrent writers repeatedly
-        // patching the same fixed pattern, as T34 does — new_chunk_id == old_chunk_id and
-        // this registration used to live inside the `if new_chunk_id != old_chunk_id`
-        // block above, so it never ran: real_base's ChunkLocation stayed deleted forever,
-        // orphaned, even though its file was untouched and correct on disk. Every later
-        // patch resolving its base straight to that now-metadata-less chunk_id then had
-        // its own base_size lookup silently fall back to 0, corrupting `size` on every
-        // subsequent patch's ChunkLocation (and ultimately the persisted FileMetadata)
-        // from that point on.
+        Ok((new_chunk_id, final_size, Arc::new(buf)))
+    }).await;
+
+    // (Re-)register new_chunk_id's ChunkLocation unconditionally — even when the
+    // patch was a content no-op (new_chunk_id == old_chunk_id). apply_patch always
+    // deletes real_base's ChunkLocation synchronously before handing off to us (see
+    // PATCH_STATE_TABLE), trusting this function to restore it. That's fine when
+    // content genuinely changes (handled above, under a fresh chunk_id). But when a
+    // patch reproduces byte-identical content — e.g. concurrent writers repeatedly
+    // patching the same fixed pattern, as T34 does — new_chunk_id == old_chunk_id and
+    // this registration used to live inside the `if new_chunk_id != old_chunk_id`
+    // block above, so it never ran: real_base's ChunkLocation stayed deleted forever,
+    // orphaned, even though its file was untouched and correct on disk. Every later
+    // patch resolving its base straight to that now-metadata-less chunk_id then had
+    // its own base_size lookup silently fall back to 0, corrupting `size` on every
+    // subsequent patch's ChunkLocation (and ultimately the persisted FileMetadata)
+    // from that point on.
+    //
+    // Moved out of the spawn_blocking closure above (2026-08-09) and onto
+    // put_chunk_location_async — the direct metadata.put_chunk_location call here
+    // used to open its own solo redb write transaction, competing with the shared
+    // group-commit committer thread for redb's single-writer slot on every fold,
+    // which is what produced the "[META COMMITTER] slow commit" stalls (1.2s-11.7s)
+    // traced via gdb sampling during a kdiskmark benchmark. See
+    // put_chunk_location_async's own doc comment for why this path exists.
+    if let Ok(Ok((new_chunk_id, final_size, _))) = &result {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        {
-            // Register unconditionally — do NOT gate this on finding old_chunk_id's
-            // own ChunkLocation (previously via `metadata.get_chunk_location(&old_chunk_id)
-            // .ok().flatten().or(loc_seed)`, both of which can legitimately come back
-            // None: apply_patch always deletes real_base's ChunkLocation synchronously
-            // before handing off here, per this function's own doc comment above, and
-            // loc_seed isn't guaranteed on every call path). Every field new_loc needs
-            // below is already independently available — chunk_file_offset is this
-            // function's own parameter — so there's no remaining reason to skip
-            // registration when that lookup fails. Confirmed live (2026-07-11): a fold
-            // output chunk with this exact shape had zero CHUNK_TABLE records on any of
-            // 5 nodes (registration never ran at all), causing a real VM disk read EIO.
-            //
-            // nodes: [local_node_id] only — NOT old_loc.nodes carried forward
-            // (tried 2026-07-10, reverted same day after it caused a real T28
-            // data-loss regression: appending onto whatever the prior token's
-            // registration said makes the list grow monotonically across every
-            // generation this slot ever passes through, including nodes that
-            // only ever held some now-irrelevant earlier generation — a later
-            // patch's deterministic dual-RF node selection can then pick one of
-            // those stale entries as a write target, corrupting the file).
-            //
-            // A single-node list is deliberately correct-by-construction here:
-            // this node just wrote new_chunk_id's bytes locally, so it
-            // unambiguously holds it, and nothing else can be claimed with the
-            // same certainty. This is not the final, authoritative multi-node
-            // record — see handle_replicate_chunk_location's "Both sides are
-            // under-RF — union the node sets" merge rule, which is explicitly
-            // designed for exactly this: each node that independently processes
-            // the same generation (this fold runs once per replica that got the
-            // triggering patch) broadcasts its own single-node view, and every
-            // receiver unions them into the complete set as they arrive — the
-            // same convergence path already used for the ordinary write case
-            // ("followers each push their single-node record").
-            //
-            // The previous bug this replaced (a fold not listing the node that
-            // performed it) is still fixed by this: local_node_id is always in
-            // the registered set, never dropped.
-            let new_loc = ChunkLocation {
-                chunk_id: new_chunk_id,
-                nodes: vec![local_node_id],
-                size: final_size,
-                checksum: new_chunk_id.hash,
-                // Use the caller-supplied chunk_file_offset directly rather than
-                // inheriting old_loc.file_offset. old_loc's own lookup can come
-                // back with file_offset already None (e.g. it was itself a prior
-                // fold generation that hit this same gap, or loc_seed didn't carry
-                // one) — inheriting None here produces a ChunkLocation with no
-                // reliable chunk_idx, which chunk_map_update_location_for_file's
-                // index-based fast path can never find-and-replace later. It just
-                // gets pushed as an unfindable floating entry (see its "legacy
-                // path" fallback), silently orphaning this fold's real, newer
-                // content behind whatever stale entry the file's chunk_idx slot
-                // still holds. chunk_file_offset is always the correct,
-                // boundary-aligned position for this chunk — it's this function's
-                // own parameter, not a derived/optional value, so there's no
-                // reason to route through a lookup that can fail.
-                file_offset: Some(chunk_file_offset),
-                written_at: Some(now_secs),
-                client_write_seq: None,
-                file_id: Some(file_id),
-            };
-            if let Err(e) = metadata.put_chunk_location(&new_loc) {
-                warn!("full_rewrite_chunk: failed to register {} in metadata: {}", new_chunk_id, e);
-            }
+        // Register unconditionally — do NOT gate this on finding old_chunk_id's
+        // own ChunkLocation (previously via `metadata.get_chunk_location(&old_chunk_id)
+        // .ok().flatten().or(loc_seed)`, both of which can legitimately come back
+        // None: apply_patch always deletes real_base's ChunkLocation synchronously
+        // before handing off here, per this function's own doc comment above, and
+        // loc_seed isn't guaranteed on every call path). Every field new_loc needs
+        // below is already independently available — chunk_file_offset is this
+        // function's own parameter — so there's no remaining reason to skip
+        // registration when that lookup fails. Confirmed live (2026-07-11): a fold
+        // output chunk with this exact shape had zero CHUNK_TABLE records on any of
+        // 5 nodes (registration never ran at all), causing a real VM disk read EIO.
+        //
+        // nodes: [local_node_id] only — NOT old_loc.nodes carried forward
+        // (tried 2026-07-10, reverted same day after it caused a real T28
+        // data-loss regression: appending onto whatever the prior token's
+        // registration said makes the list grow monotonically across every
+        // generation this slot ever passes through, including nodes that
+        // only ever held some now-irrelevant earlier generation — a later
+        // patch's deterministic dual-RF node selection can then pick one of
+        // those stale entries as a write target, corrupting the file).
+        //
+        // A single-node list is deliberately correct-by-construction here:
+        // this node just wrote new_chunk_id's bytes locally, so it
+        // unambiguously holds it, and nothing else can be claimed with the
+        // same certainty. This is not the final, authoritative multi-node
+        // record — see handle_replicate_chunk_location's "Both sides are
+        // under-RF — union the node sets" merge rule, which is explicitly
+        // designed for exactly this: each node that independently processes
+        // the same generation (this fold runs once per replica that got the
+        // triggering patch) broadcasts its own single-node view, and every
+        // receiver unions them into the complete set as they arrive — the
+        // same convergence path already used for the ordinary write case
+        // ("followers each push their single-node record").
+        //
+        // The previous bug this replaced (a fold not listing the node that
+        // performed it) is still fixed by this: local_node_id is always in
+        // the registered set, never dropped.
+        let new_loc = ChunkLocation {
+            chunk_id: *new_chunk_id,
+            nodes: vec![local_node_id],
+            size: *final_size,
+            checksum: new_chunk_id.hash,
+            // Use the caller-supplied chunk_file_offset directly rather than
+            // inheriting old_loc.file_offset. old_loc's own lookup can come
+            // back with file_offset already None (e.g. it was itself a prior
+            // fold generation that hit this same gap, or loc_seed didn't carry
+            // one) — inheriting None here produces a ChunkLocation with no
+            // reliable chunk_idx, which chunk_map_update_location_for_file's
+            // index-based fast path can never find-and-replace later. It just
+            // gets pushed as an unfindable floating entry (see its "legacy
+            // path" fallback), silently orphaning this fold's real, newer
+            // content behind whatever stale entry the file's chunk_idx slot
+            // still holds. chunk_file_offset is always the correct,
+            // boundary-aligned position for this chunk — it's this function's
+            // own parameter, not a derived/optional value, so there's no
+            // reason to route through a lookup that can fail.
+            file_offset: Some(chunk_file_offset),
+            written_at: Some(now_secs),
+            client_write_seq: None,
+            file_id: Some(file_id),
+        };
+        if let Err(e) = metadata.put_chunk_location_async(new_loc).await {
+            warn!("full_rewrite_chunk: failed to register {} in metadata: {}", new_chunk_id, e);
         }
-
-        Ok((new_chunk_id, final_size, Arc::new(buf)))
-    }).await;
+    }
 
     // Reclaim old_chunk_id — moved out of the blocking closure above so it can run
     // under the chunk_io_locks write guard without that guard also covering the
@@ -20821,6 +20827,115 @@ mod tests {
             assert_eq!(persisted.client_write_seq, Some(2),
                 "fold must seed client_write_seq from the patch's own seq, not leave it at None — \
                  otherwise it can never win against the client's own RCL for the pre-fold identity");
+        }
+
+        /// Regression test for the 2026-08-09 fix: full_rewrite_chunk's ChunkLocation
+        /// registration used to call metadata.put_chunk_location directly inside its
+        /// spawn_blocking closure, opening its own solo redb write transaction that
+        /// competed with the shared group-commit committer thread for redb's single
+        /// writer slot — traced via gdb sampling as the root cause of repeated "[META
+        /// COMMITTER] slow commit" stalls (1.2s-11.7s) observed on staging during a
+        /// kdiskmark run. It must now go through put_chunk_location_async instead, so
+        /// the "op:put_chunk_location" (group-commit) label increments and the bare
+        /// "put_chunk_location" (solo-transaction) label never does.
+        #[tokio::test]
+        async fn full_rewrite_chunk_registers_via_group_commit_not_solo_transaction() {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(ChunkStorage::new(dir.path().join("storage")).unwrap());
+            let metadata = Arc::new(MetadataStore::new(dir.path().join("metadata")).unwrap());
+            let chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>> = Arc::new(DashMap::new());
+            let file_id = dfs_common::FileId::new();
+            let chunk_file_offset = 0u64;
+            let original_data = vec![0u8; 4096];
+            let original_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id));
+            storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+            let (new_chunk_id, _size, _buf) = full_rewrite_chunk(
+                storage.clone(), metadata.clone(), chunk_io_locks,
+                Arc::new(ShardedAliasMap::new(16)),
+                file_id, chunk_file_offset, original_chunk_id,
+                vec![(0usize, vec![7u8; 64])], None, NodeId::new(),
+            ).await.unwrap();
+            assert_ne!(new_chunk_id, original_chunk_id, "precondition: patch must actually change content");
+
+            assert!(metadata.get_chunk_location(&new_chunk_id).unwrap().is_some(),
+                "fold output must be registered");
+
+            let stats = metadata.txn_stats_snapshot();
+            let count_of = |site: &str| stats.iter()
+                .find(|(s, _, _)| s == site)
+                .map(|(_, count, _)| *count)
+                .unwrap_or(0);
+            assert_eq!(count_of("op:put_chunk_location"), 1,
+                "the registration must go through the group-commit queue exactly once");
+            assert_eq!(count_of("put_chunk_location"), 0,
+                "must NOT open a solo redb write transaction competing with the group committer");
+        }
+
+        /// Companion to the test above: a fold running concurrently with a flood of
+        /// ordinary put_chunk_location_async callers must still coalesce into far
+        /// fewer transactions than the total op count — proving the fold's own
+        /// registration isn't opening a competing solo transaction that would defeat
+        /// the group committer's batching for everyone else on the same node.
+        #[tokio::test]
+        async fn full_rewrite_chunk_registration_coalesces_with_concurrent_writers() {
+            let dir = TempDir::new().unwrap();
+            let storage = Arc::new(ChunkStorage::new(dir.path().join("storage")).unwrap());
+            let metadata = Arc::new(MetadataStore::new(dir.path().join("metadata")).unwrap());
+            let chunk_io_locks: Arc<DashMap<ChunkId, Arc<tokio::sync::RwLock<()>>>> = Arc::new(DashMap::new());
+            let file_id = dfs_common::FileId::new();
+            let chunk_file_offset = 0u64;
+            let original_data = vec![0u8; 4096];
+            let original_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, chunk_file_offset, file_id));
+            storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+            const N: usize = 100;
+            let mut handles = Vec::new();
+            for i in 0..N {
+                let store = Arc::clone(&metadata);
+                let node = NodeId::new();
+                handles.push(tokio::spawn(async move {
+                    let hash = compute_chunk_hash(format!("concurrent-{}", i).as_bytes());
+                    let loc = ChunkLocation {
+                        chunk_id: ChunkId::from_hash(hash), nodes: vec![node], size: 4096, checksum: hash,
+                        file_offset: Some(0), written_at: Some(1000 + i as u64),
+                        client_write_seq: Some(i as u64), file_id: None,
+                    };
+                    store.put_chunk_location_async(loc).await.unwrap();
+                }));
+            }
+
+            let (new_chunk_id, _size, _buf) = full_rewrite_chunk(
+                storage.clone(), metadata.clone(), chunk_io_locks,
+                Arc::new(ShardedAliasMap::new(16)),
+                file_id, chunk_file_offset, original_chunk_id,
+                vec![(0usize, vec![7u8; 64])], None, NodeId::new(),
+            ).await.unwrap();
+            assert_ne!(new_chunk_id, original_chunk_id);
+
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            let stats = metadata.txn_stats_snapshot();
+            let count_of = |site: &str| stats.iter()
+                .find(|(s, _, _)| s == site)
+                .map(|(_, count, _)| *count)
+                .unwrap_or(0);
+            assert_eq!(count_of("put_chunk_location"), 0,
+                "no participant (fold or ordinary writer) may open a solo transaction");
+            let total_ops = count_of("op:put_chunk_location");
+            assert_eq!(total_ops, (N + 1) as u64, "every op (N writers + 1 fold) must be applied exactly once");
+            let commits = count_of("group_commit");
+            assert!(commits >= 1, "at least one commit must have happened");
+            assert!(
+                commits < total_ops * 3 / 4,
+                "{} concurrent single-record writes plus one fold should group-commit into fewer \
+                 transactions ({} observed) — if this is ~N, coalescing is broken",
+                total_ops, commits
+            );
         }
 
         /// Repro for the 2026-07-19 VM-111 install EIO (file 2abc8ad2 chunk 2876):

@@ -317,7 +317,33 @@ pub struct Server {
     /// actual disk I/O per permit is still genuinely more expensive than
     /// write_semaphore (48) or global_flush_semaphore (64)'s work — while
     /// giving real network latency much more headroom than 8 ever did.
+    ///
+    /// Real incident (2026-08-10, VM-100 corruption): a much higher fold-
+    /// attempt rate (adaptive cold-start debounce, reverted the same day —
+    /// see debounce_fold_slot's history) fully saturated this semaphore
+    /// under real bulk-write load (0/24 available, multi-second acquire
+    /// waits) and forced repeated fold attempts through
+    /// coordinate_and_fold_slot's uncoordinated fallback path — the exact
+    /// pre-adf3faf mechanism this semaphore's sizing comment above already
+    /// identifies as a real throughput ceiling, now also confirmed as a real
+    /// correctness/corruption risk once actually hit. `DFS_FOLD_COORDINATION_
+    /// CONCURRENCY` overrides this default for live tuning (matching
+    /// fold_hash_semaphore's DFS_FOLD_HASH_CONCURRENCY) and — deliberately
+    /// set very low — to make this exact choke point reproducible on demand
+    /// in a local test instead of only observable after the fact on a real
+    /// cluster under real load.
     fold_coordination_semaphore: Arc<tokio::sync::Semaphore>,
+
+    /// Counters for coordinate_and_fold_slot's three fallback branches to the
+    /// old, uncoordinated fold_slot_coordinated(Wave) path — added 2026-08-10
+    /// alongside DFS_FOLD_COORDINATION_CONCURRENCY (see fold_coordination_
+    /// semaphore's doc comment) so this choke point is a deterministic,
+    /// programmatically-assertable signal instead of only a log line to grep
+    /// for after the fact. Each is incremented at the exact `return` site in
+    /// coordinate_and_fold_slot that takes that fallback.
+    fold_coord_fallback_fingerprint_unavailable: Arc<std::sync::atomic::AtomicU64>,
+    fold_coord_fallback_no_peer: Arc<std::sync::atomic::AtomicU64>,
+    fold_coord_fallback_hard_failure: Arc<std::sync::atomic::AtomicU64>,
 
     /// Bounds how many fold-triggered CPU-bound hash/replay operations
     /// (full_rewrite_chunk's buffer replay + content hash inside
@@ -1021,6 +1047,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::DeleteFile { .. }
         | Request::RenameFile { .. }
         | Request::GetFileChunkMap { .. }
+        | Request::RevalidateChunkSlot { .. }
         | Request::HealChunkToNode { .. }
         | Request::GetFileMetadata { .. }
         | Request::UpdateFileMetadata { .. } => ClientOther,
@@ -1395,6 +1422,11 @@ struct OverlayForkCtx {
     fold_lock_grants: Arc<DashMap<(FileId, u64), FoldLockGrant>>,
     outbound_fold_claims: Arc<DashMap<(FileId, u64), OutboundFoldClaim>>,
     fold_coordination_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Same Arc instances as Server's fields of the same name — see
+    /// fold_coordination_semaphore's doc comment there.
+    fold_coord_fallback_fingerprint_unavailable: Arc<std::sync::atomic::AtomicU64>,
+    fold_coord_fallback_no_peer: Arc<std::sync::atomic::AtomicU64>,
+    fold_coord_fallback_hard_failure: Arc<std::sync::atomic::AtomicU64>,
     fold_hash_semaphore: Arc<tokio::sync::Semaphore>,
     last_fold_leader_confirm: Arc<DashMap<(FileId, u64), bool>>,
     chunk_ring: Arc<ShardedChunkRing>,
@@ -3835,6 +3867,7 @@ impl OverlayForkCtx {
             info!("coordinate_and_fold_slot: local_fold_fingerprint unavailable for file {} chunk {} (dirty_patch_slots present: {}) \
                    — skipping ProposeFold coordination, folding via the uncoordinated path",
                 file_id, chunk_idx, self.dirty_patch_slots.get(&(file_id, chunk_idx)).is_some());
+            self.fold_coord_fallback_fingerprint_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
                 true => CoordinatedFoldOutcome::Done,
                 false => CoordinatedFoldOutcome::Failed,
@@ -3847,6 +3880,7 @@ impl OverlayForkCtx {
         if peers.is_empty() {
             warn!("coordinate_and_fold_slot: no reachable peer for file {} chunk {} — folding solo, uncoordinated \
                    (this reintroduces the pre-fix race for the duration of this outage)", file_id, chunk_idx);
+            self.fold_coord_fallback_no_peer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
                 true => CoordinatedFoldOutcome::Done,
                 false => CoordinatedFoldOutcome::Failed,
@@ -3935,6 +3969,7 @@ impl OverlayForkCtx {
             if hard_failure {
                 warn!("coordinate_and_fold_slot: peer unreachable/misbehaving for file {} chunk {} — falling back to \
                        solo fold (loud, not silent; this is the exact condition the fix is most needed for)", file_id, chunk_idx);
+                self.fold_coord_fallback_hard_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
                     true => CoordinatedFoldOutcome::Done,
                     false => CoordinatedFoldOutcome::Failed,
@@ -4607,7 +4642,15 @@ impl Server {
             chunk_patch_locks: Arc::new(DashMap::new()),
             fold_lock_grants: Arc::new(DashMap::new()),
             outbound_fold_claims: Arc::new(DashMap::new()),
-            fold_coordination_semaphore: Arc::new(tokio::sync::Semaphore::new(24)),
+            fold_coordination_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                std::env::var("DFS_FOLD_COORDINATION_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(24)
+            )),
+            fold_coord_fallback_fingerprint_unavailable: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fold_coord_fallback_no_peer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fold_coord_fallback_hard_failure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fold_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 std::env::var("DFS_FOLD_HASH_CONCURRENCY")
                     .ok()
@@ -6673,6 +6716,9 @@ impl Server {
             }
             Request::GetFileChunkMap { file_id, from_chunk, count } => {
                 self.handle_get_file_chunk_map(file_id, from_chunk, count).await
+            }
+            Request::RevalidateChunkSlot { file_id, chunk_idx, distrust_chunk_id } => {
+                self.handle_revalidate_chunk_slot(file_id, chunk_idx, distrust_chunk_id).await
             }
 
             Request::GetPatchState { public_token } => {
@@ -12334,6 +12380,9 @@ impl Server {
             fold_lock_grants: self.fold_lock_grants.clone(),
             outbound_fold_claims: self.outbound_fold_claims.clone(),
             fold_coordination_semaphore: self.fold_coordination_semaphore.clone(),
+            fold_coord_fallback_fingerprint_unavailable: self.fold_coord_fallback_fingerprint_unavailable.clone(),
+            fold_coord_fallback_no_peer: self.fold_coord_fallback_no_peer.clone(),
+            fold_coord_fallback_hard_failure: self.fold_coord_fallback_hard_failure.clone(),
             fold_hash_semaphore: self.fold_hash_semaphore.clone(),
             last_fold_leader_confirm: self.last_fold_leader_confirm.clone(),
             chunk_ring: self.chunk_ring.clone(),
@@ -15708,6 +15757,91 @@ impl Server {
             .context("spawn_blocking panicked in chunk_locations_for_info_async")?
     }
 
+    /// Re-derive a file's full chunk list from authoritative CHUNK_TABLE truth
+    /// (via chunk_locations_for_info_async, which already picks the correct
+    /// per-slot winner via location_supersedes — see that function's own doc
+    /// comment) and repair chunk_map/chunk_to_file to match. Shared by
+    /// handle_get_file_chunk_map's purged-chunk_id self-heal and
+    /// handle_revalidate_chunk_slot's on-demand single-slot recheck (2026-08-10
+    /// — see that handler's doc comment for the incident this closes).
+    ///
+    /// Returns (locations, write_seq) — write_seq is read from the current
+    /// chunk_map entry if one exists (0 otherwise), matching what every other
+    /// chunk_map mutation site in this file treats as the seed value. Does NOT
+    /// touch chunk_map if the scan comes back empty or fails — same "don't
+    /// replace a real cache with an empty one on a possibly-transient scan
+    /// issue" caution the code this was extracted from already had.
+    async fn re_derive_and_repair_chunk_map(&self, file_id: FileId) -> (Vec<ChunkLocation>, u64) {
+        let fresh_locations = match self.chunk_locations_for_info_async(file_id).await {
+            Ok(locs) => locs,
+            Err(e) => {
+                warn!("re_derive_and_repair_chunk_map: CHUNK_TABLE scan for file {} failed: {}", file_id, e);
+                Vec::new()
+            }
+        };
+        let write_seq = self.chunk_map.get(&file_id).map(|e| e.value().1).unwrap_or(0);
+        if fresh_locations.is_empty() {
+            return (fresh_locations, write_seq);
+        }
+        // Keep chunk_to_file (the reverse index handle_confirm_chunks_live now
+        // trusts as authoritative — see that function's doc comment) in
+        // lockstep: drop the old entry's chunk_ids before adding the
+        // freshly-re-derived ones, same pattern as every other chunk_map
+        // mutation site.
+        let old = self.chunk_map.insert(file_id, (fresh_locations.clone(), write_seq));
+        if let Some((old_locs, _)) = old {
+            for loc in &old_locs {
+                self.chunk_to_file.remove(&loc.chunk_id);
+            }
+        }
+        for loc in &fresh_locations {
+            self.chunk_to_file.insert(loc.chunk_id, file_id);
+        }
+        (fresh_locations, write_seq)
+    }
+
+    /// Handler for Request::RevalidateChunkSlot — see that variant's doc
+    /// comment in dfs-common/src/protocol.rs for the full incident this
+    /// closes. The client sends this after a real read failure (every replica
+    /// said "not found" for `distrust_chunk_id`), when a plain GetFileChunkMap
+    /// refresh still answered the same, possibly-stale, chunk_id from this
+    /// node's own chunk_map cache. Forces an authoritative CHUNK_TABLE-derived
+    /// re-check for just this one slot instead of trusting that cache.
+    ///
+    /// If the freshly-arbitrated answer still equals `distrust_chunk_id`,
+    /// that's a genuine, double-checked confirmation — the client's own
+    /// stale-retry loop uses this to stop retrying immediately instead of
+    /// waiting out its full backoff schedule. If it differs, the client
+    /// applies the correction and retries the read with the new identity.
+    async fn handle_revalidate_chunk_slot(&self, file_id: FileId, chunk_idx: u64, distrust_chunk_id: ChunkId) -> Response {
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let (fresh_locations, write_seq) = self.re_derive_and_repair_chunk_map(file_id).await;
+        let total_chunks = fresh_locations.iter()
+            .filter_map(|l| l.file_offset.map(|o| (o / CHUNK_SIZE) as u32))
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let loc = fresh_locations.into_iter()
+            .find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx));
+        match loc {
+            Some(l) => {
+                if l.chunk_id == distrust_chunk_id {
+                    debug!("RevalidateChunkSlot: file={} chunk_idx={} confirmed unchanged ({}) — genuinely current",
+                        file_id, chunk_idx, distrust_chunk_id);
+                } else {
+                    info!("RevalidateChunkSlot: file={} chunk_idx={} corrected {} -> {}",
+                        file_id, chunk_idx, distrust_chunk_id, l.chunk_id);
+                }
+                Response::FileChunkMap { file_id, locations: vec![l], from_chunk: chunk_idx as u32, total_chunks, write_seq }
+            }
+            None => {
+                warn!("RevalidateChunkSlot: file={} chunk_idx={} has no CHUNK_TABLE record at all \
+                       (distrusted {})", file_id, chunk_idx, distrust_chunk_id);
+                Response::FileChunkMap { file_id, locations: Vec::new(), from_chunk: chunk_idx as u32, total_chunks, write_seq }
+            }
+        }
+    }
+
     /// EVERY CHUNK_TABLE row for this file — including superseded patch/rotation
     /// generations at an already-covered chunk_idx. The deliberate opposite of
     /// chunk_locations_for_info's one-row-per-slot dedup.
@@ -15947,33 +16081,12 @@ impl Server {
                 warn!("GetFileChunkMap: file {} had a chunk_map entry naming a chunk_id with \
                        no CHUNK_TABLE record — re-deriving from authoritative CHUNK_TABLE truth \
                        instead of serving the stale identity", file_id);
-                match self.chunk_locations_for_info_async(file_id).await {
-                    Ok(fresh_locations) if !fresh_locations.is_empty() => {
-                        // Keep chunk_to_file (the reverse index handle_confirm_chunks_live
-                        // now trusts as authoritative — see that function's doc comment)
-                        // in lockstep: drop the old entry's chunk_ids before adding the
-                        // freshly-re-derived ones, same pattern as every other chunk_map
-                        // mutation site.
-                        let old = self.chunk_map.insert(file_id, (fresh_locations.clone(), write_seq));
-                        if let Some((old_locs, _)) = old {
-                            for loc in &old_locs {
-                                self.chunk_to_file.remove(&loc.chunk_id);
-                            }
-                        }
-                        for loc in &fresh_locations {
-                            self.chunk_to_file.insert(loc.chunk_id, file_id);
-                        }
-                        return slice_response(&fresh_locations, write_seq);
-                    }
-                    Ok(_) => {
-                        warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
-                               rows — serving the stale response rather than an empty one", file_id);
-                    }
-                    Err(e) => {
-                        warn!("GetFileChunkMap: self-heal scan for file {} failed ({}) — serving \
-                               the stale response rather than failing the read outright", file_id, e);
-                    }
+                let (fresh_locations, fresh_write_seq) = self.re_derive_and_repair_chunk_map(file_id).await;
+                if !fresh_locations.is_empty() {
+                    return slice_response(&fresh_locations, fresh_write_seq);
                 }
+                warn!("GetFileChunkMap: self-heal scan for file {} found zero CHUNK_TABLE \
+                       rows — serving the stale response rather than an empty one", file_id);
             }
             return response;
         }
@@ -20164,6 +20277,119 @@ mod tests {
             "chunk_map's cached entry must be corrected in place, not just the one response");
     }
 
+    /// Regression test for the 2026-08-10 fix (real ~13min VM-108 read failure on
+    /// staging): handle_revalidate_chunk_slot must authoritatively re-derive one
+    /// slot's current chunk_id from CHUNK_TABLE (via chunk_locations_for_info's
+    /// existing location_supersedes arbitration) when a client reports that
+    /// chunk_map's cached answer was proven wrong by a real read failure — even
+    /// though the stale chunk_id's own CHUNK_TABLE row still exists (the case the
+    /// purged-chunk_id self-heal above does NOT cover, since it only fires when a
+    /// chunk_id has NO CHUNK_TABLE record at all).
+    #[tokio::test]
+    async fn test_revalidate_chunk_slot_corrects_stale_chunk_map_entry() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+
+        // Two real CHUNK_TABLE rows for the SAME chunk_idx (0) — an old,
+        // superseded generation and the true current one — mirroring the real
+        // incident: both rows genuinely exist, redb's iteration order between
+        // them is arbitrary, only client_write_seq-based arbitration picks the
+        // correct winner.
+        let old_hash = compute_chunk_hash(b"revalidate-old-generation");
+        let old_chunk_id = ChunkId::from_hash(old_hash);
+        let old_loc = ChunkLocation {
+            chunk_id: old_chunk_id, nodes: vec![node_id], size: 4194304, checksum: old_hash,
+            file_offset: Some(0), written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&old_loc).unwrap();
+
+        let current_hash = compute_chunk_hash(b"revalidate-current-generation");
+        let current_chunk_id = ChunkId::from_hash(current_hash);
+        let current_loc = ChunkLocation {
+            chunk_id: current_chunk_id, nodes: vec![node_id], size: 4194304, checksum: current_hash,
+            file_offset: Some(0), written_at: Some(2000), client_write_seq: Some(2), file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&current_loc).unwrap();
+
+        // chunk_map is stuck on the OLD generation — simulating a fold broadcast
+        // this node's location_supersedes arbitration never accepted.
+        server.chunk_map.insert(file_id, (vec![old_loc.clone()], 1));
+
+        let response = server.handle_revalidate_chunk_slot(file_id, 0, old_chunk_id).await;
+        match response {
+            Response::FileChunkMap { locations, .. } => {
+                assert_eq!(locations.len(), 1);
+                assert_eq!(locations[0].chunk_id, current_chunk_id,
+                    "RevalidateChunkSlot must return the true current generation, not the \
+                     distrusted stale one, even though the stale chunk_id's own CHUNK_TABLE \
+                     row still exists");
+            }
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        }
+
+        // Must also repair chunk_map, closing the loop for every future ordinary
+        // GetFileChunkMap caller, not just this one revalidation request.
+        let entry = server.chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].chunk_id, current_chunk_id,
+            "chunk_map's stuck-stale entry must be corrected in place");
+    }
+
+    /// Negative-control companion: revalidating a chunk_id that IS genuinely
+    /// current must confirm it unchanged, not spuriously "correct" it to
+    /// something else — proves the confirmed-unchanged signal the client's
+    /// stale-retry loop relies on to stop retrying is trustworthy.
+    #[tokio::test]
+    async fn test_revalidate_chunk_slot_confirms_unchanged_when_genuinely_current() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(storage, metadata, 4 * 1024 * 1024, cluster, 3, temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true);
+
+        let file_id = dfs_common::FileId::new();
+        let hash = compute_chunk_hash(b"revalidate-genuinely-current");
+        let chunk_id = ChunkId::from_hash(hash);
+        let loc = ChunkLocation {
+            chunk_id, nodes: vec![node_id], size: 4194304, checksum: hash,
+            file_offset: Some(0), written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        server.metadata.put_chunk_location(&loc).unwrap();
+        server.chunk_map.insert(file_id, (vec![loc.clone()], 1));
+
+        let response = server.handle_revalidate_chunk_slot(file_id, 0, chunk_id).await;
+        match response {
+            Response::FileChunkMap { locations, .. } => {
+                assert_eq!(locations.len(), 1);
+                assert_eq!(locations[0].chunk_id, chunk_id,
+                    "a genuinely-current chunk_id must be confirmed unchanged, not replaced — \
+                     the client's stale-retry loop treats an unchanged answer as conclusive \
+                     proof the read failure is real, not a staleness artifact");
+            }
+            other => panic!("expected FileChunkMap response, got {:?}", other),
+        }
+    }
+
     /// handle_replicate_chunk_locations (the batch self-report path a follower uses
     /// to periodically push its own locally-held chunk locations to the leader) must
     /// not let a stale, larger incoming node list overwrite an already-healthy
@@ -22252,6 +22478,126 @@ mod tests {
                  coordination, not just the synthetic direct-call test");
             assert_eq!(fold_count.load(Ordering::Relaxed), 1,
                 "a coordinated fold must reach the peer with exactly ONE ReplicatePatchFold");
+        }
+
+        /// Regression/reachability test for the 2026-08-10 VM-100 corruption
+        /// incident: coordinate_and_fold_slot's "fingerprint unavailable" branch
+        /// (server.rs, the ONLY branch that skips ProposeFold entirely and falls
+        /// through to the pre-coordination uncoordinated fold path) must be a
+        /// deterministic, directly-triggerable, and countable condition — not
+        /// something only observable after the fact via a log grep on a real
+        /// cluster. This is the exact branch the real incident's logs showed
+        /// firing right before a genuinely corrupt chunk appeared.
+        #[tokio::test]
+        async fn coordinate_and_fold_slot_fingerprint_unavailable_fallback_is_countable() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+            // Deliberately nothing set up: no patch_state, no dirty_patch_slots
+            // entry — fold_fingerprint_serialized must return None, which is
+            // exactly the condition this fallback branch exists to handle.
+
+            let ctx = h.server.overlay_ctx();
+            let (fp_before, np_before, hf_before) = (
+                ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed),
+                ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed),
+                ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed),
+            );
+            let _ = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
+            let ctx = h.server.overlay_ctx();
+
+            assert_eq!(ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed) - fp_before, 1,
+                "coordinate_and_fold_slot must take (and count) the fingerprint-unavailable \
+                 fallback when nothing is pending for the slot — this is the exact choke point \
+                 that let an uncoordinated fold produce genuine data corruption in the real \
+                 2026-08-10 incident when hit at high frequency under real load");
+            assert_eq!(ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed), np_before,
+                "must not also take the no-peer fallback — branches are mutually exclusive");
+            assert_eq!(ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed), hf_before,
+                "must not also take the hard-failure fallback — branches are mutually exclusive");
+        }
+
+        /// Companion reachability test for the "no reachable peer" fallback branch —
+        /// the second of coordinate_and_fold_slot's three routes to the
+        /// uncoordinated fold path.
+        #[tokio::test]
+        async fn coordinate_and_fold_slot_no_peer_fallback_is_countable() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+            // A real pending patch (so fold_fingerprint_serialized succeeds and we
+            // reach branch 2), but no peer nodes registered in the cluster at all —
+            // slot_replica_peers must come back empty.
+            setup_coordinated_patch(&h, file_id, chunk_idx, "no-peer-case");
+
+            let ctx = h.server.overlay_ctx();
+            let (fp_before, np_before, hf_before) = (
+                ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed),
+                ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed),
+                ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed),
+            );
+            let _ = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
+            let ctx = h.server.overlay_ctx();
+
+            assert_eq!(ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed) - np_before, 1,
+                "coordinate_and_fold_slot must take (and count) the no-reachable-peer fallback \
+                 when the slot has a real pending patch but no online peer to propose to");
+            assert_eq!(ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed), fp_before,
+                "must not also take the fingerprint-unavailable fallback — a real patch is pending");
+            assert_eq!(ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed), hf_before,
+                "must not also take the hard-failure fallback — branches are mutually exclusive");
+        }
+
+        /// Companion reachability test for the "hard failure" (peer unreachable/
+        /// misbehaving during ProposeFold) fallback branch — the third and last
+        /// route to the uncoordinated fold path.
+        #[tokio::test]
+        async fn coordinate_and_fold_slot_hard_failure_fallback_is_countable() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+
+            let original_data = vec![0u8; 4096];
+            let base_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, 0, file_id)
+            );
+            // Register a peer in chunk_map/cluster so slot_replica_peers finds one
+            // (passing branch 2), but never bind a listener on its address — the
+            // ProposeFold RPC will fail to connect, a hard failure.
+            let peer_addr: SocketAddr = "127.0.0.1:19314".parse().unwrap();
+            let peer_id = NodeId::from_bytes([0xfeu8; 16]);
+            h.server.cluster().add_node(NodeInfo::new(peer_id, peer_addr, None)).await.unwrap();
+            let local_id = h.server.cluster().local_node_id();
+            let loc = ChunkLocation {
+                chunk_id: base_chunk_id,
+                nodes: vec![local_id, peer_id],
+                size: 4096,
+                checksum: base_chunk_id.hash,
+                file_offset: Some(0),
+                written_at: Some(1000),
+                client_write_seq: Some(1),
+                file_id: Some(file_id),
+            };
+            h.server.chunk_map.insert(file_id, (vec![loc], 1));
+
+            setup_coordinated_patch(&h, file_id, chunk_idx, "hard-failure-case");
+
+            let ctx = h.server.overlay_ctx();
+            let (fp_before, np_before, hf_before) = (
+                ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed),
+                ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed),
+                ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed),
+            );
+            let _ = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
+            let ctx = h.server.overlay_ctx();
+
+            assert_eq!(ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed) - hf_before, 1,
+                "coordinate_and_fold_slot must take (and count) the hard-failure fallback when \
+                 a registered peer is unreachable during ProposeFold");
+            assert_eq!(ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed), fp_before,
+                "must not also take the fingerprint-unavailable fallback — a real patch is pending");
+            assert_eq!(ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed), np_before,
+                "must not also take the no-peer fallback — a peer is registered, just unreachable");
         }
     }
 }

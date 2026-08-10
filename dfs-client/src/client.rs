@@ -3631,10 +3631,83 @@ leader_addr: Arc::new(RwLock::new(None)),
                         // --- Source 2: leader chunk_map refresh ---
                         if let Some(fresh_loc) = fresh_map.get(idx) {
                             let fresh_cid = fresh_loc.chunk_id;
-                            // Same chunk_id as the one that failed — leader hasn't
-                            // updated yet; queue for the next backoff round.
-                            if fresh_cid == stale_cid && attempt + 1 < STALE_RETRY_DELAYS_MS.len() {
-                                still_stale.push((idx, stale_cid));
+                            // Same chunk_id as the one that failed — a plain refresh
+                            // is still serving this node's own possibly-stale
+                            // chunk_map cache entry for this slot (see
+                            // RevalidateChunkSlot's doc comment in protocol.rs for
+                            // why nothing else corrects that). Ask the leader to
+                            // authoritatively re-derive just this one slot instead
+                            // of blindly waiting for a future plain refresh to
+                            // happen to catch an update.
+                            if fresh_cid == stale_cid {
+                                match self.revalidate_chunk_slot(file_id, idx as u64, stale_cid).await {
+                                    Ok(Some(revalidated)) if revalidated.chunk_id != stale_cid => {
+                                        // Corrected — apply it to the engine and fetch
+                                        // with the new identity right away, no need to
+                                        // wait out the rest of the backoff schedule now
+                                        // that we have a fresh authoritative answer.
+                                        engine.update_single_chunk(revalidated.clone(), file_size, fresh_nim.clone());
+                                        let revalidated_cid = revalidated.chunk_id;
+                                        let (fp, ffb) = match InodeReadEngine::resolve_primary(
+                                            &revalidated, &fresh_nim, &fresh_nodes, selector + idx as u64,
+                                        ) {
+                                            Some(pf) => pf,
+                                            None => {
+                                                let p = fresh_nodes[selector as usize % fresh_nodes.len()];
+                                                (p, fresh_nodes.iter().filter(|&&a| a != p).copied().collect())
+                                            }
+                                        };
+                                        match self.fetch_chunk_with_fallback(revalidated_cid, fp, &ffb, None).await {
+                                            Ok(data) => {
+                                                let arc = Arc::new(data);
+                                                if !bypass_cache {
+                                                    self.chunk_cache.insert(revalidated_cid, Arc::clone(&arc));
+                                                    self.chunk_landed.notify_waiters();
+                                                }
+                                                resolved.push((idx, arc));
+                                            }
+                                            Err(e) => {
+                                                if attempt + 1 < STALE_RETRY_DELAYS_MS.len() {
+                                                    still_stale.push((idx, revalidated_cid));
+                                                } else {
+                                                    last_err = Some(e);
+                                                    break 'stale;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(Some(_confirmed_unchanged)) => {
+                                        // The leader double-checked via authoritative
+                                        // CHUNK_TABLE re-derivation and confirmed the
+                                        // SAME chunk_id — this is genuinely the current,
+                                        // correct identity, not a staleness artifact.
+                                        // Fail now rather than exhausting the remaining
+                                        // backoff schedule pointlessly.
+                                        last_err = Some(anyhow::anyhow!(
+                                            "Chunk {} at index {} confirmed current by leader \
+                                             revalidation but missing on all replicas", stale_cid, idx));
+                                        break 'stale;
+                                    }
+                                    Ok(None) => {
+                                        // Slot has no CHUNK_TABLE record at all — same
+                                        // "nothing more to try here" outcome.
+                                        last_err = Some(anyhow::anyhow!(
+                                            "Chunk {} at index {} has no record on the leader \
+                                             after revalidation", stale_cid, idx));
+                                        break 'stale;
+                                    }
+                                    Err(e) => {
+                                        // Revalidation RPC itself failed (leader
+                                        // unreachable, etc.) — fall back to the old
+                                        // behavior: queue for another backoff round.
+                                        if attempt + 1 < STALE_RETRY_DELAYS_MS.len() {
+                                            still_stale.push((idx, stale_cid));
+                                        } else {
+                                            last_err = Some(e);
+                                            break 'stale;
+                                        }
+                                    }
+                                }
                                 continue;
                             }
                             let (fp, ffb) = match InodeReadEngine::resolve_primary(
@@ -4960,6 +5033,39 @@ leader_addr: Arc::new(RwLock::new(None)),
             }
             Response::Error { message, .. } => anyhow::bail!("GetFileChunkMap error: {}", message),
             _ => anyhow::bail!("Unexpected response to GetFileChunkMap"),
+        }
+    }
+
+    /// Ask the leader to authoritatively re-derive the current chunk_id for
+    /// one (file_id, chunk_idx) slot, because `distrust_chunk_id` was just
+    /// proven wrong by a real read failure — see RevalidateChunkSlot's doc
+    /// comment in dfs-common/src/protocol.rs for the full incident this
+    /// closes (a leader's own chunk_map cache entry for one slot can be
+    /// stuck stale indefinitely with nothing else to correct it). Returns
+    /// `Ok(None)` only if the slot has no CHUNK_TABLE record at all;
+    /// otherwise `Ok(Some(loc))` where `loc.chunk_id` may equal
+    /// `distrust_chunk_id` (a genuine, double-checked confirmation — not a
+    /// staleness artifact) or differ from it (a real correction to apply).
+    pub async fn revalidate_chunk_slot(
+        &self, file_id: FileId, chunk_idx: u64, distrust_chunk_id: dfs_common::ChunkId,
+    ) -> Result<Option<dfs_common::ChunkLocation>> {
+        let target = {
+            let leader = self.leader_addr.read().await;
+            match *leader {
+                Some(addr) => addr,
+                None => {
+                    let nodes = self.cluster_nodes.read().await;
+                    *nodes.first().context("No cluster nodes available")?
+                }
+            }
+        };
+        let request = Request::RevalidateChunkSlot { file_id, chunk_idx, distrust_chunk_id };
+        let response = self.send_request(target, request).await
+            .context("RevalidateChunkSlot request failed")?;
+        match response {
+            Response::FileChunkMap { locations, .. } => Ok(locations.into_iter().next()),
+            Response::Error { message, .. } => anyhow::bail!("RevalidateChunkSlot error: {}", message),
+            _ => anyhow::bail!("Unexpected response to RevalidateChunkSlot"),
         }
     }
 

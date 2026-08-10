@@ -598,6 +598,28 @@ pub enum Request {
         count: u32,
     },
 
+    /// Ask the leader to authoritatively re-derive the current chunk_id for one
+    /// (file_id, chunk_idx) slot from CHUNK_TABLE, bypassing its own possibly-
+    /// stale in-memory chunk_map cache for that lookup — because
+    /// `distrust_chunk_id` was just proven wrong by a real read failure (every
+    /// replica the client tried said "not found"). A new variant rather than a
+    /// field added to GetFileChunkMap above: wire messages are bincode-
+    /// serialized (positional, non-self-describing), so a new field on an
+    /// existing, already-widely-used variant carries the same backward-
+    /// compatibility hazard documented for persisted structs (see
+    /// feedback_bincode_field_addition_not_backward_compatible in project
+    /// memory) — a new variant doesn't change any existing variant's shape.
+    ///
+    /// Answered via Response::FileChunkMap (0-or-1-element `locations`, empty
+    /// only if the slot has no CHUNK_TABLE record at all) — same response type
+    /// GetFileChunkMap uses, no new response shape needed. Leader-only, same
+    /// as GetFileChunkMap (chunk_map only exists there).
+    RevalidateChunkSlot {
+        file_id: FileId,
+        chunk_idx: u64,
+        distrust_chunk_id: ChunkId,
+    },
+
     /// Append data to an existing file. The server handles chunk alignment:
     /// if the file's last chunk is partial (< 4MB), the server reads it back,
     /// prepends it to `data`, writes complete 4MB chunks + new partial tail,

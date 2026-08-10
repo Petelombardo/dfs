@@ -9165,6 +9165,195 @@ mod tests {
         }
     }
 
+    async fn write_envelope(stream: &mut tokio::net::TcpStream, request_id: RequestId, response: Response) {
+        use tokio::io::AsyncWriteExt;
+        let envelope = MessageEnvelope::new(request_id, Message::Response(response));
+        let encoded = envelope.to_bytes().unwrap();
+        let len = encoded.len() as u32;
+        let _ = stream.write_all(&len.to_be_bytes()).await;
+        let _ = stream.write_all(&encoded).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Writes a successful split-frame ChunkData response — envelope with an
+    /// EMPTY `data` field (matching what a real server sends, see
+    /// write_chunk_response's doc comment in dfs-common/src/protocol.rs),
+    /// followed by the real bytes as the split-frame payload
+    /// (read_chunk_payload's expected format).
+    async fn write_chunk_data_response(stream: &mut tokio::net::TcpStream, request_id: RequestId, chunk_id: ChunkId, data: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let envelope = MessageEnvelope::new(request_id, Message::Response(Response::ChunkData {
+            chunk_id, data: Vec::new(), cache_stats: None, arc_data: None, arc_range: None,
+        }));
+        let encoded = envelope.to_bytes().unwrap();
+        let len = encoded.len() as u32;
+        let _ = stream.write_all(&len.to_be_bytes()).await;
+        let _ = stream.write_all(&encoded).await;
+        let data_len = data.len() as u32;
+        let _ = stream.write_all(&data_len.to_be_bytes()).await;
+        let _ = stream.write_all(data).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Minimal single-node mock "leader" for RevalidateChunkSlot integration
+    /// tests: answers GetFileChunkMap with `stale_chunk_id` (simulating this
+    /// node's own stuck chunk_map cache entry — see RevalidateChunkSlot's doc
+    /// comment in dfs-common/src/protocol.rs for the real incident this
+    /// mirrors), counts RevalidateChunkSlot calls, and answers them with
+    /// `revalidate_answer` every time. ReadChunk succeeds (with trivial data)
+    /// only for `readable_chunk_id`, and NotFound for everything else — so a
+    /// test can prove whether the client ever asked to read the corrected
+    /// identity.
+    fn spawn_mock_leader(
+        addr: SocketAddr,
+        node_id: NodeId,
+        stale_chunk_id: ChunkId,
+        revalidate_answer: ChunkId,
+        readable_chunk_id: Option<ChunkId>,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+        let revalidate_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = revalidate_calls.clone();
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(_) => return, // address already in use by a previous test run — that test's own bind already failed loudly
+            };
+            loop {
+                let (mut stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                let calls = calls.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; len];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                        let request_id = envelope.request_id;
+                        let Message::Request(req) = envelope.message else { return };
+                        match req {
+                            Request::GetFileChunkMap { file_id, .. } => {
+                                let loc = ChunkLocation {
+                                    chunk_id: stale_chunk_id, nodes: vec![node_id], size: 4096,
+                                    checksum: stale_chunk_id.hash, file_offset: Some(0),
+                                    written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+                                };
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id, locations: vec![loc], from_chunk: 0, total_chunks: 1, write_seq: 1,
+                                }).await;
+                            }
+                            Request::RevalidateChunkSlot { file_id, .. } => {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                let loc = ChunkLocation {
+                                    chunk_id: revalidate_answer, nodes: vec![node_id], size: 4096,
+                                    checksum: revalidate_answer.hash, file_offset: Some(0),
+                                    written_at: Some(2000), client_write_seq: Some(2), file_id: Some(file_id),
+                                };
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id, locations: vec![loc], from_chunk: 0, total_chunks: 1, write_seq: 2,
+                                }).await;
+                            }
+                            Request::ReadChunk { chunk_id, .. } => {
+                                if Some(chunk_id) == readable_chunk_id {
+                                    write_chunk_data_response(&mut stream, request_id, chunk_id, b"real-corrected-data").await;
+                                } else {
+                                    write_envelope(&mut stream, request_id, Response::Error {
+                                        message: format!("Chunk {} not found on this node", chunk_id),
+                                        code: ErrorCode::NotFound,
+                                    }).await;
+                                }
+                            }
+                            _ => {
+                                write_envelope(&mut stream, request_id, Response::Error {
+                                    message: "unhandled in mock".to_string(), code: ErrorCode::InternalError,
+                                }).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        revalidate_calls
+    }
+
+    /// Regression test for the 2026-08-10 RevalidateChunkSlot fix (real ~13min
+    /// VM-108 stale-chunk-map read failure on staging): when a plain
+    /// GetFileChunkMap refresh still answers the same stale chunk_id that just
+    /// failed on every replica, the client must send RevalidateChunkSlot and,
+    /// on receiving a genuinely different answer, apply it and successfully
+    /// complete the read with the corrected identity — not exhaust the full
+    /// bounded backoff schedule hoping a future plain refresh happens to catch
+    /// the update.
+    #[tokio::test]
+    async fn read_file_applies_revalidate_correction_and_completes() {
+        let addr: SocketAddr = "127.0.0.1:19401".parse().unwrap();
+        let node_id = NodeId::new();
+        let file_id = FileId::new();
+        let stale_id = chunk_id_with_hash0(0xAA);
+        let corrected_id = chunk_id_with_hash0(0xBB);
+
+        let revalidate_calls = spawn_mock_leader(addr, node_id, stale_id, corrected_id, Some(corrected_id));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = DfsClient::new(vec![addr]).unwrap();
+        *client.leader_addr.write().await = Some(addr);
+        client.addr_to_node_id.write().await.insert(addr, node_id);
+        client.cluster_nodes.write().await.push(addr);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_file(1, 4 * 1024 * 1024, file_id, "/revalidate-test", 0, "real-corrected-data".len(), false, None),
+        ).await;
+
+        assert!(result.is_ok(), "read_file must not hang — it should resolve well within the 10s test timeout");
+        assert_eq!(result.unwrap().unwrap(), b"real-corrected-data",
+            "must complete the read using the corrected identity RevalidateChunkSlot returned");
+        assert!(revalidate_calls.load(Ordering::SeqCst) >= 1,
+            "must have called RevalidateChunkSlot at least once to discover the correction");
+    }
+
+    /// Companion negative control: when RevalidateChunkSlot confirms the SAME
+    /// chunk_id that just failed (a genuine, double-checked "this really is
+    /// current" answer, not a staleness artifact), the client must stop
+    /// retrying promptly instead of exhausting the full ~6.7s bounded backoff
+    /// schedule (STALE_RETRY_DELAYS_MS) pointlessly.
+    #[tokio::test]
+    async fn read_file_stops_retrying_when_revalidate_confirms_unchanged() {
+        let addr: SocketAddr = "127.0.0.1:19402".parse().unwrap();
+        let node_id = NodeId::new();
+        let file_id = FileId::new();
+        let stale_id = chunk_id_with_hash0(0xCC);
+
+        // revalidate_answer == stale_id: the leader double-checks and confirms
+        // the same identity is genuinely current. readable_chunk_id: None —
+        // nothing is ever readable, matching "this data really is gone".
+        let revalidate_calls = spawn_mock_leader(addr, node_id, stale_id, stale_id, None);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = DfsClient::new(vec![addr]).unwrap();
+        *client.leader_addr.write().await = Some(addr);
+        client.addr_to_node_id.write().await.insert(addr, node_id);
+        client.cluster_nodes.write().await.push(addr);
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_file(1, 4 * 1024 * 1024, file_id, "/revalidate-confirm-test", 0, 4096, false, None),
+        ).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "read_file must not hang past the 10s test timeout");
+        assert!(result.unwrap().is_err(),
+            "a confirmed-unchanged, genuinely-missing chunk must surface as a read error, not silently succeed");
+        assert_eq!(revalidate_calls.load(Ordering::SeqCst), 1,
+            "must call RevalidateChunkSlot exactly once and trust its confirmed-unchanged answer immediately, \
+             not loop calling it again on every subsequent backoff round");
+        assert!(elapsed < std::time::Duration::from_millis(5000),
+            "must fail fast on a confirmed-unchanged answer, not exhaust the full ~6.7s STALE_RETRY_DELAYS_MS \
+             schedule (observed: {:?})", elapsed);
+    }
+
     /// An empty batch must be a no-op — no network call, no error — since callers
     /// (e.g. write_chunk_to_replicas with zero chunks, or a queue drain that found
     /// nothing pending) shouldn't need to special-case this themselves.

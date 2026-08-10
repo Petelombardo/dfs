@@ -1517,6 +1517,43 @@ struct DirtyPatchSlot {
 /// almost always beat it under any real write pattern.
 const PATCH_DEBOUNCE_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long debounce_fold_slot waits on a slot's *very first* idle-check
+/// before attempting a fold, instead of the full PATCH_DEBOUNCE_IDLE — see
+/// debounce_fold_slot's doc comment for the full rationale (2026-08-10).
+/// PATCH_DEBOUNCE_IDLE's own doc comment above assumed a slot that never
+/// gets client-driven ForceFold "doesn't matter" because nothing depends on
+/// it folding promptly — true for correctness, but not for background load:
+/// a workload whose writes never make any single chunk "hot" (client.rs's
+/// HOT_CLASSIFY_SAMPLES/HOT_RATE_THRESHOLD_PER_SEC gate) leaves EVERY touched
+/// chunk waiting the full 20s, and since those chunks were all written around
+/// the same time, their 20s timers converge into one synchronized wave of
+/// full-chunk fold operations right as write activity stops. This constant
+/// lets a slot that's still idle almost immediately fold right away instead
+/// of waiting — same total fold count, just not deferred-then-bunched.
+///
+/// If a SECOND patch lands within this window, that's this design's signal
+/// that the slot is actually hot (or on its way to being classified hot by
+/// the client) — debounce_fold_slot escalates to the standard
+/// PATCH_DEBOUNCE_IDLE coalescing behavior for the rest of that dirty
+/// period, unchanged from today. See debounce_fold_slot for why this is safe
+/// against the two historical fold-trigger regressions in this file
+/// (DFS_PATCH_FOLD_IMMEDIATE, PATCH_FOLD_COUNT_THRESHOLD).
+///
+/// Deliberately short enough to matter, deliberately not zero (to still
+/// desynchronize a burst of simultaneously-spawned cold-start tasks — see
+/// jittered_cold_start_sleep). Env-tunable for staging experimentation the
+/// same way DFS_FOLD_HASH_CONCURRENCY is.
+fn patch_debounce_cold_start() -> std::time::Duration {
+    static COLD_START_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *COLD_START_MS.get_or_init(|| {
+        std::env::var("DFS_PATCH_DEBOUNCE_COLD_START_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200)
+    });
+    std::time::Duration::from_millis(ms)
+}
+
 /// Minimum time a Pending patch must have existed before a local "file
 /// doesn't exist" reading is trusted enough to abandon it (see
 /// OverlayForkCtx::abandon_patch_if_file_gone).
@@ -1927,6 +1964,28 @@ fn jittered_debounce_sleep(base: std::time::Duration, active_fold_count: u64, fi
         .unwrap_or(0) as u64;
     let mixed = nanos ^ chunk_idx.wrapping_mul(0x9E3779B97F4A7C15) ^ (file_id.as_bytes()[0] as u64);
     let jitter_ms = mixed % (jitter_ceiling_ms + 1);
+    base + std::time::Duration::from_millis(jitter_ms)
+}
+
+/// Small-ceiling sibling of jittered_debounce_sleep, for debounce_fold_slot's
+/// cold-start probe only. Deliberately does NOT scale with active_fold_count
+/// (unlike jittered_debounce_sleep, whose ceiling can reach +15s) — a slot's
+/// first idle-check is supposed to be fast specifically during periods of
+/// elevated fold activity (a benchmark's write phase), so a jitter ceiling
+/// that grows with that same activity would silently defeat the point. Just
+/// enough desync (a fixed small cap) to avoid a burst of simultaneously-
+/// spawned cold-start tasks (e.g. one large multi-chunk write touching many
+/// fresh slots at once) all attempting to fold in the same instant — not
+/// meant to solve the same "large outstanding backlog" problem
+/// jittered_debounce_sleep's scaling ceiling exists for.
+fn jittered_cold_start_sleep(base: std::time::Duration, file_id: FileId, chunk_idx: u64) -> std::time::Duration {
+    const COLD_START_JITTER_CEILING_MS: u64 = 50;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as u64;
+    let mixed = nanos ^ chunk_idx.wrapping_mul(0x9E3779B97F4A7C15) ^ (file_id.as_bytes()[0] as u64);
+    let jitter_ms = mixed % (COLD_START_JITTER_CEILING_MS + 1);
     base + std::time::Duration::from_millis(jitter_ms)
 }
 
@@ -4124,6 +4183,23 @@ impl OverlayForkCtx {
     /// idle cluster (no client, no writes) still had 3 patches stuck in Pending
     /// indefinitely. Now retries with capped backoff until it succeeds.
     async fn debounce_fold_slot(&self, file_id: FileId, chunk_idx: u64) {
+        // Cold-start probe (2026-08-10): the very first idle-check uses a much
+        // shorter window (PATCH_DEBOUNCE_COLD_START) than the standard
+        // PATCH_DEBOUNCE_IDLE — see that constant's doc comment for why a flat
+        // 20s wait for EVERY dirty slot, regardless of patch count, produces a
+        // synchronized wave of fold work whenever a workload's writes never
+        // make any single chunk "hot" (RND4K-shaped access patterns). If this
+        // slot is still idle at the short probe, fold now — same total fold
+        // count as the old flat design, just not deferred and bunched. If a
+        // second patch lands before the probe elapses, that's this slot
+        // showing it's actually hot: `is_cold_start` flips to false and every
+        // iteration from here on is byte-for-byte the same flat
+        // PATCH_DEBOUNCE_IDLE loop this function has always run — `retry_backoff`
+        // is initialized to PATCH_DEBOUNCE_IDLE and is never touched while
+        // `is_cold_start` is true, so the failure-doubling math below always
+        // starts from the same basis it always has, whether the fold attempt
+        // that failed came from the cold-start probe or the standard loop.
+        let mut is_cold_start = true;
         let mut retry_backoff = PATCH_DEBOUNCE_IDLE;
         const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
         loop {
@@ -4137,9 +4213,18 @@ impl OverlayForkCtx {
             // are already outstanding (active_fold_count) means the
             // desynchronization gets stronger exactly when it's needed most
             // (a real burst in progress), while staying tight-to-zero when
-            // fold activity is already quiet.
-            let active = self.active_fold_count.load(std::sync::atomic::Ordering::Relaxed);
-            let sleep_for = jittered_debounce_sleep(retry_backoff, active, file_id, chunk_idx);
+            // fold activity is already quiet. The cold-start probe uses its
+            // own small fixed-ceiling jitter instead (jittered_cold_start_sleep)
+            // — see PATCH_DEBOUNCE_COLD_START's doc comment for why reusing
+            // this function's active_fold_count-scaled ceiling here would
+            // silently defeat the point during exactly the periods (elevated
+            // fold activity) it matters most.
+            let sleep_for = if is_cold_start {
+                jittered_cold_start_sleep(patch_debounce_cold_start(), file_id, chunk_idx)
+            } else {
+                let active = self.active_fold_count.load(std::sync::atomic::Ordering::Relaxed);
+                jittered_debounce_sleep(retry_backoff, active, file_id, chunk_idx)
+            };
             tokio::time::sleep(sleep_for).await;
 
             let Some(last_patch_at) = self.dirty_patch_slots
@@ -4149,7 +4234,11 @@ impl OverlayForkCtx {
                 return; // already folded elsewhere (e.g. a forced read) — nothing to do
             };
 
-            if last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE {
+            let idle_threshold = if is_cold_start { patch_debounce_cold_start() } else { PATCH_DEBOUNCE_IDLE };
+            if last_patch_at.elapsed() >= idle_threshold {
+                // An attempt is happening now either way — the cold-start
+                // phase (if any) is over regardless of this attempt's outcome.
+                is_cold_start = false;
                 // Fold the slot's whole replica set, peers FIRST, then locally.
                 //
                 // A fold mints a NEW chunk identity, so the only nodes that can
@@ -4226,8 +4315,19 @@ impl OverlayForkCtx {
                     file_id, chunk_idx, failures, retry_backoff);
                 continue;
             }
-            // Else: a patch landed within the last debounce window — loop and
-            // sleep again rather than folding yet.
+            // Else: a patch landed within the last debounce window.
+            if is_cold_start {
+                // A second patch landed before the cold-start probe elapsed —
+                // this slot just showed evidence of being hot (or on its way
+                // to being classified hot by the client's own active-fold
+                // timer): escalate to the standard PATCH_DEBOUNCE_IDLE
+                // coalescing loop for the rest of this dirty period.
+                // retry_backoff is still its untouched initial value
+                // (PATCH_DEBOUNCE_IDLE), so this is byte-for-byte the same
+                // starting state today's flat design always had.
+                is_cold_start = false;
+            }
+            // Loop and sleep again rather than folding yet.
         }
     }
 }
@@ -22252,6 +22352,90 @@ mod tests {
                  coordination, not just the synthetic direct-call test");
             assert_eq!(fold_count.load(Ordering::Relaxed), 1,
                 "a coordinated fold must reach the peer with exactly ONE ReplicatePatchFold");
+        }
+
+        /// Regression test for the 2026-08-10 adaptive cold-start debounce fix:
+        /// a slot that receives exactly one patch and then goes quiet must fold
+        /// within roughly one PATCH_DEBOUNCE_COLD_START window, not wait out the
+        /// full PATCH_DEBOUNCE_IDLE (20s). This is only feasible as a real-timer
+        /// test because the cold-start window is short — nothing in this codebase
+        /// mocks/pauses tokio time, and a real 20s test would be impractical.
+        #[tokio::test]
+        async fn debounce_fold_slot_folds_isolated_patch_quickly_not_after_full_idle_window() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+
+            let original_data = vec![0u8; 4096];
+            let base_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, 0, file_id)
+            );
+            let peer_addr: SocketAddr = "127.0.0.1:19312".parse().unwrap();
+            let (propose_count, _loc_count, _fold_count) =
+                spawn_coordinating_peer(&h, peer_addr, file_id, chunk_idx, base_chunk_id).await;
+
+            setup_coordinated_patch(&h, file_id, chunk_idx, "cold-start-fast-fold");
+
+            let ctx = h.server.overlay_ctx();
+            tokio::spawn(async move { ctx.debounce_fold_slot(file_id, chunk_idx).await; });
+
+            // Comfortably longer than the default 200ms cold-start window (plus
+            // its small jitter) but far, far short of PATCH_DEBOUNCE_IDLE (20s) —
+            // if the fix regressed back to the flat 20s wait, this would still
+            // find the slot dirty and propose_count at 0.
+            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
+            assert_eq!(propose_count.load(Ordering::Relaxed), 1,
+                "an isolated single patch must fold via the cold-start probe, \
+                 not wait out the full PATCH_DEBOUNCE_IDLE window");
+            assert!(h.server.overlay_ctx().dirty_patch_slots.get(&(file_id, chunk_idx)).is_none(),
+                "the slot must no longer be dirty once the cold-start fold has landed");
+        }
+
+        /// Companion negative control: a second patch landing within the
+        /// cold-start window must suppress the fast fold and escalate the slot
+        /// to the standard PATCH_DEBOUNCE_IDLE coalescing behavior — proves the
+        /// adaptive debounce doesn't regress into folding every patch
+        /// immediately (the exact shape of the 2026-07-10 DFS_PATCH_FOLD_IMMEDIATE
+        /// throughput collapse).
+        #[tokio::test]
+        async fn debounce_fold_slot_suppresses_fast_fold_when_second_patch_lands_in_cold_start_window() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+
+            let original_data = vec![0u8; 4096];
+            let base_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, 0, file_id)
+            );
+            let peer_addr: SocketAddr = "127.0.0.1:19313".parse().unwrap();
+            let (propose_count, _loc_count, _fold_count) =
+                spawn_coordinating_peer(&h, peer_addr, file_id, chunk_idx, base_chunk_id).await;
+
+            setup_coordinated_patch(&h, file_id, chunk_idx, "cold-start-escalate");
+
+            let ctx = h.server.overlay_ctx();
+            tokio::spawn(async move { ctx.debounce_fold_slot(file_id, chunk_idx).await; });
+
+            // A second patch, well inside the default 200ms cold-start window —
+            // simulates apply_patch's own last_patch_at bump without going
+            // through the full RPC path.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            if let Some(mut entry) = h.server.overlay_ctx().dirty_patch_slots.get_mut(&(file_id, chunk_idx)) {
+                entry.last_patch_at = std::time::Instant::now();
+            } else {
+                panic!("precondition: slot must still be dirty at 50ms");
+            }
+
+            // Well past the cold-start window, still far short of PATCH_DEBOUNCE_IDLE.
+            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
+            assert_eq!(propose_count.load(Ordering::Relaxed), 0,
+                "a second patch inside the cold-start window must suppress the fast \
+                 fold — folding here would reproduce the per-patch-fold throughput \
+                 collapse this design explicitly guards against");
+            assert!(h.server.overlay_ctx().dirty_patch_slots.get(&(file_id, chunk_idx)).is_some(),
+                "the slot must still be dirty, waiting on the standard idle-debounce schedule");
         }
     }
 }

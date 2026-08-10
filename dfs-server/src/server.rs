@@ -345,6 +345,26 @@ pub struct Server {
     fold_coord_fallback_no_peer: Arc<std::sync::atomic::AtomicU64>,
     fold_coord_fallback_hard_failure: Arc<std::sync::atomic::AtomicU64>,
 
+    /// How often coordinate_and_fold_slot's "fingerprint unavailable" branch
+    /// recovered by reseeding dirty_patch_slots from durable PATCH_STATE_TABLE
+    /// state instead of falling through to the uncoordinated fold — see the
+    /// fix for the 2026-08-10 VM-100 corruption on local_fold_fingerprint's
+    /// doc comment. A live count here (vs. fold_coord_fallback_fingerprint_
+    /// unavailable staying flat) is the signal this fix is actually engaging.
+    fold_coord_reseed_recovered_from_durable_state: Arc<std::sync::atomic::AtomicU64>,
+
+    /// The other two outcomes of the same durable-state check, both safe
+    /// no-ops (return Done directly, no fold attempted) but previously
+    /// completely silent — no log, no counter — which made it impossible to
+    /// tell from a real cluster's logs whether the 2026-08-10 corruption's
+    /// exact race (a fold completes and clears dirty_patch_slots; a second,
+    /// racing trigger for the same slot finds durable state already Folded)
+    /// was actually happening safely, or not happening at all. Every other
+    /// branch in coordinate_and_fold_slot is loud and countable; these
+    /// shouldn't be the exception.
+    fold_coord_noop_already_folded: Arc<std::sync::atomic::AtomicU64>,
+    fold_coord_noop_nothing_pending: Arc<std::sync::atomic::AtomicU64>,
+
     /// Bounds how many fold-triggered CPU-bound hash/replay operations
     /// (full_rewrite_chunk's buffer replay + content hash inside
     /// run_single_fold, heal_base_from_peer's peer-recovery verify hash) can
@@ -1427,6 +1447,9 @@ struct OverlayForkCtx {
     fold_coord_fallback_fingerprint_unavailable: Arc<std::sync::atomic::AtomicU64>,
     fold_coord_fallback_no_peer: Arc<std::sync::atomic::AtomicU64>,
     fold_coord_fallback_hard_failure: Arc<std::sync::atomic::AtomicU64>,
+    fold_coord_reseed_recovered_from_durable_state: Arc<std::sync::atomic::AtomicU64>,
+    fold_coord_noop_already_folded: Arc<std::sync::atomic::AtomicU64>,
+    fold_coord_noop_nothing_pending: Arc<std::sync::atomic::AtomicU64>,
     fold_hash_semaphore: Arc<tokio::sync::Semaphore>,
     last_fold_leader_confirm: Arc<DashMap<(FileId, u64), bool>>,
     chunk_ring: Arc<ShardedChunkRing>,
@@ -3863,15 +3886,91 @@ impl OverlayForkCtx {
         // trustworthy: it means genuinely nothing is pending. Held only for this
         // read; fold_slot_coordinated below re-acquires it itself when it actually
         // folds, unchanged from before.
-        let Some(fp) = self.fold_fingerprint_serialized(file_id, chunk_idx).await else {
-            info!("coordinate_and_fold_slot: local_fold_fingerprint unavailable for file {} chunk {} (dirty_patch_slots present: {}) \
-                   — skipping ProposeFold coordination, folding via the uncoordinated path",
-                file_id, chunk_idx, self.dirty_patch_slots.get(&(file_id, chunk_idx)).is_some());
-            self.fold_coord_fallback_fingerprint_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
-                true => CoordinatedFoldOutcome::Done,
-                false => CoordinatedFoldOutcome::Failed,
-            };
+        let fp = match self.fold_fingerprint_serialized(file_id, chunk_idx).await {
+            Some(fp) => fp,
+            None => {
+                // Before accepting "nothing pending" at face value: dirty_patch_slots
+                // is an in-memory cache and can simply be missing the entry (e.g.
+                // cleared by a different, just-completed fold for this same slot
+                // microseconds earlier) while durable PATCH_STATE_TABLE still holds
+                // a genuinely pending row. This is exactly the gap that produced the
+                // real 2026-08-10 VM-100 corruption: a racing second fold trigger hit
+                // this branch, fell through to the uncoordinated path, and landed a
+                // chunk whose bytes didn't hash-match its own claimed identity.
+                // start_patch_state_resume_sweep already solves this same shape of
+                // problem at startup (durable state present, cache cold) — reuse its
+                // exact reseed pattern here, live, instead of giving up immediately.
+                match self.metadata.get_patch_state_for_slot_async(file_id, chunk_idx).await {
+                    Ok(None) => {
+                        // Genuinely nothing pending anywhere, in memory or durable.
+                        debug!("coordinate_and_fold_slot: durable patch_state confirms nothing pending for file {} \
+                                chunk {} — no-op", file_id, chunk_idx);
+                        self.fold_coord_noop_nothing_pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return CoordinatedFoldOutcome::Done;
+                    }
+                    Ok(Some((_, PatchState::Folded(_)))) => {
+                        // Already resolved elsewhere — this is the exact shape of the
+                        // real 2026-08-10 VM-100 race (a fold completes and clears
+                        // dirty_patch_slots, a second trigger for the same slot arrives
+                        // and finds durable state already Folded). Confirming this fires
+                        // here, safely, is direct evidence the fix closes that gap.
+                        debug!("coordinate_and_fold_slot: durable patch_state shows file {} chunk {} already \
+                                folded (dirty_patch_slots was stale/missing) — no-op, not re-folding", file_id, chunk_idx);
+                        self.fold_coord_noop_already_folded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return CoordinatedFoldOutcome::Done;
+                    }
+                    Ok(Some((token, PatchState::Pending { .. }))) => {
+                        // Reseed both caches with no `.await` between them, matching
+                        // start_patch_state_resume_sweep's ordering exactly — a reader
+                        // between the two inserts (resolve_chunk_content's fast-path
+                        // gate) must never observe one populated without the other.
+                        self.dirty_patch_slots.entry((file_id, chunk_idx)).or_insert_with(|| DirtyPatchSlot {
+                            token,
+                            last_patch_at: std::time::Instant::now(),
+                            delta_hasher: blake3::Hasher::new(),
+                            verified: false, // unknown until a merge cold-reads this accumulator
+                            legacy_delta_format: false, // unused while verified is false
+                            // Live-traffic race reseed, not a restart resume — unlike
+                            // start_patch_state_resume_sweep, deliberately not
+                            // pre-escalating fold_failures by row age here.
+                            fold_failures: 0,
+                            last_fold_attempt_at: std::time::Instant::now(),
+                            materialized_max_seq: None,
+                        });
+                        self.pending_patch_ids.entry(token).or_insert((file_id, chunk_idx));
+
+                        match self.fold_fingerprint_serialized(file_id, chunk_idx).await {
+                            Some(fp) => {
+                                info!("coordinate_and_fold_slot: recovered fold fingerprint for file {} chunk {} by \
+                                       reseeding dirty_patch_slots from durable patch_state — avoided the uncoordinated fallback",
+                                    file_id, chunk_idx);
+                                self.fold_coord_reseed_recovered_from_durable_state.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                fp
+                            }
+                            None => {
+                                // Raced again, or the reseed didn't stick — a genuine
+                                // remaining gap. Fall back exactly as before.
+                                info!("coordinate_and_fold_slot: reseed from durable patch_state did not recover a \
+                                       fingerprint for file {} chunk {} — falling back to uncoordinated fold", file_id, chunk_idx);
+                                self.fold_coord_fallback_fingerprint_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
+                                    true => CoordinatedFoldOutcome::Done,
+                                    false => CoordinatedFoldOutcome::Failed,
+                                };
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("coordinate_and_fold_slot: durable patch_state lookup failed for file {} chunk {}: {} \
+                               — falling back to uncoordinated fold", file_id, chunk_idx, e);
+                        self.fold_coord_fallback_fingerprint_unavailable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return match self.fold_slot_coordinated(file_id, chunk_idx, FoldCoordination::Wave).await {
+                            true => CoordinatedFoldOutcome::Done,
+                            false => CoordinatedFoldOutcome::Failed,
+                        };
+                    }
+                }
+            }
         };
 
         // 2. No reachable peer to coordinate with — loud, explicit fallback to
@@ -4651,6 +4750,9 @@ impl Server {
             fold_coord_fallback_fingerprint_unavailable: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fold_coord_fallback_no_peer: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fold_coord_fallback_hard_failure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fold_coord_reseed_recovered_from_durable_state: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fold_coord_noop_already_folded: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fold_coord_noop_nothing_pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fold_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 std::env::var("DFS_FOLD_HASH_CONCURRENCY")
                     .ok()
@@ -12383,6 +12485,9 @@ impl Server {
             fold_coord_fallback_fingerprint_unavailable: self.fold_coord_fallback_fingerprint_unavailable.clone(),
             fold_coord_fallback_no_peer: self.fold_coord_fallback_no_peer.clone(),
             fold_coord_fallback_hard_failure: self.fold_coord_fallback_hard_failure.clone(),
+            fold_coord_reseed_recovered_from_durable_state: self.fold_coord_reseed_recovered_from_durable_state.clone(),
+            fold_coord_noop_already_folded: self.fold_coord_noop_already_folded.clone(),
+            fold_coord_noop_nothing_pending: self.fold_coord_noop_nothing_pending.clone(),
             fold_hash_semaphore: self.fold_hash_semaphore.clone(),
             last_fold_leader_confirm: self.last_fold_leader_confirm.clone(),
             chunk_ring: self.chunk_ring.clone(),
@@ -22480,41 +22585,164 @@ mod tests {
                 "a coordinated fold must reach the peer with exactly ONE ReplicatePatchFold");
         }
 
-        /// Regression/reachability test for the 2026-08-10 VM-100 corruption
-        /// incident: coordinate_and_fold_slot's "fingerprint unavailable" branch
-        /// (server.rs, the ONLY branch that skips ProposeFold entirely and falls
-        /// through to the pre-coordination uncoordinated fold path) must be a
-        /// deterministic, directly-triggerable, and countable condition — not
-        /// something only observable after the fact via a log grep on a real
-        /// cluster. This is the exact branch the real incident's logs showed
-        /// firing right before a genuinely corrupt chunk appeared.
+        /// Sets up a durable Pending patch_state row WITHOUT seeding
+        /// dirty_patch_slots — the live-traffic-race counterpart to
+        /// setup_coordinated_patch, which deliberately seeds both. Models the
+        /// exact gap the 2026-08-10 VM-100 corruption fix closes: durable state
+        /// present, in-memory cache cold (e.g. cleared by a different,
+        /// just-completed fold for this same slot). Returns (original_chunk_id,
+        /// public_token) — callers need the token to assert the reseed picked up
+        /// the right value.
+        fn setup_durably_pending_patch_without_dirty_slot(h: &OverlayTestHarness, file_id: FileId, chunk_idx: u64, tag: &str) -> (ChunkId, ChunkId) {
+            let original_data = vec![0u8; 4096];
+            let original_chunk_id = ChunkId::from_hash(
+                dfs_common::compute_chunk_hash_at(&original_data, chunk_idx * 4 * 1024 * 1024, file_id)
+            );
+            h.storage.write_chunk(&original_chunk_id, &original_data).unwrap();
+
+            let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+            delta_bytes.extend_from_slice(&encode_delta_record(1, 0, &[1u8; 100]));
+            let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
+            h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
+
+            let public_token = ChunkId::from_hash(compute_chunk_hash(format!("propose-fold-test-{}", tag).as_bytes()));
+            h.metadata.put_patch_state_pending(
+                file_id, chunk_idx, &public_token, original_chunk_id, delta_chunk_id, 4096, 1000, Some(1),
+            ).unwrap();
+
+            let mut file_meta = dfs_common::FileMetadata::new(format!("/propose-fold-test-{}", tag), dfs_common::types::FileType::RegularFile);
+            file_meta.id = file_id;
+            h.metadata.put_file(&file_meta).unwrap();
+
+            (original_chunk_id, public_token)
+        }
+
+        /// Negative control for the 2026-08-10 VM-100 corruption fix: when
+        /// NOTHING is pending anywhere (neither dirty_patch_slots nor durable
+        /// PATCH_STATE_TABLE), coordinate_and_fold_slot must short-circuit
+        /// straight to Done without attempting any fold at all — not fall
+        /// through to the uncoordinated path pointlessly. Before the fix this
+        /// same setup exercised (and counted) the fingerprint-unavailable
+        /// fallback; after the fix that fallback is reserved for a genuine
+        /// double-race or durable-lookup error, not ordinary "nothing pending."
         #[tokio::test]
-        async fn coordinate_and_fold_slot_fingerprint_unavailable_fallback_is_countable() {
+        async fn coordinate_and_fold_slot_genuinely_nothing_pending_returns_done_without_reseed_noise() {
             let h = make_overlay_test_harness();
             let file_id = FileId::new();
             let chunk_idx = 0u64;
-            // Deliberately nothing set up: no patch_state, no dirty_patch_slots
-            // entry — fold_fingerprint_serialized must return None, which is
-            // exactly the condition this fallback branch exists to handle.
+            // Deliberately nothing set up: no patch_state, no dirty_patch_slots.
 
             let ctx = h.server.overlay_ctx();
-            let (fp_before, np_before, hf_before) = (
+            let (fp_before, np_before, hf_before, reseed_before, noop_nothing_before) = (
                 ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed),
                 ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed),
                 ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed),
+                ctx.fold_coord_reseed_recovered_from_durable_state.load(Ordering::Relaxed),
+                ctx.fold_coord_noop_nothing_pending.load(Ordering::Relaxed),
             );
-            let _ = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
+            let outcome = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
             let ctx = h.server.overlay_ctx();
 
-            assert_eq!(ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed) - fp_before, 1,
-                "coordinate_and_fold_slot must take (and count) the fingerprint-unavailable \
-                 fallback when nothing is pending for the slot — this is the exact choke point \
-                 that let an uncoordinated fold produce genuine data corruption in the real \
-                 2026-08-10 incident when hit at high frequency under real load");
+            assert_eq!(outcome, CoordinatedFoldOutcome::Done,
+                "genuinely nothing pending must resolve as Done without attempting a fold");
+            assert_eq!(ctx.fold_coord_noop_nothing_pending.load(Ordering::Relaxed) - noop_nothing_before, 1,
+                "must count this as the nothing-pending no-op — this branch must be loud/countable, \
+                 not silent, same as every other exit of this check");
+            assert_eq!(ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed), fp_before,
+                "must NOT take the fingerprint-unavailable fallback — durable state confirms \
+                 there is truly nothing to reseed, so no fold attempt (coordinated or not) should fire");
             assert_eq!(ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed), np_before,
-                "must not also take the no-peer fallback — branches are mutually exclusive");
+                "must not take the no-peer fallback either — the function returns before reaching it");
             assert_eq!(ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed), hf_before,
-                "must not also take the hard-failure fallback — branches are mutually exclusive");
+                "must not take the hard-failure fallback — the function returns before reaching it");
+            assert_eq!(ctx.fold_coord_reseed_recovered_from_durable_state.load(Ordering::Relaxed), reseed_before,
+                "must not count a reseed recovery — there was nothing durable to recover from");
+        }
+
+        /// Regression test for the 2026-08-10 VM-100 corruption fix: a slot that
+        /// is durably Pending in PATCH_STATE_TABLE but missing from the in-memory
+        /// dirty_patch_slots cache (exactly what the real incident's logs showed
+        /// — a racing second fold trigger found the cache already cleared by a
+        /// different, just-completed fold) must be recovered via reseed and
+        /// proceed through the normal coordinated path, not fall straight
+        /// through to the uncoordinated fold.
+        #[tokio::test]
+        async fn coordinate_and_fold_slot_reseeds_from_durable_state_when_dirty_slot_missing() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+            let (_original_chunk_id, public_token) =
+                setup_durably_pending_patch_without_dirty_slot(&h, file_id, chunk_idx, "reseed-case");
+
+            assert!(h.server.overlay_ctx().dirty_patch_slots.get(&(file_id, chunk_idx)).is_none(),
+                "test setup must start with a cold in-memory cache — that's the exact gap under test");
+
+            let ctx = h.server.overlay_ctx();
+            let (fp_before, reseed_before) = (
+                ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed),
+                ctx.fold_coord_reseed_recovered_from_durable_state.load(Ordering::Relaxed),
+            );
+            // No peer registered, so after the reseed recovers a fingerprint this
+            // falls into branch 2 (no-peer) and actually folds, uncoordinated but
+            // now using the correct reseeded data — expected and fine; that's the
+            // fix working, not a gap. (The fold's own success then clears
+            // dirty_patch_slots again as its natural conclusion, so this test
+            // checks the counters and outcome, not a post-hoc cache snapshot.)
+            let outcome = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
+            let ctx = h.server.overlay_ctx();
+
+            assert_eq!(outcome, CoordinatedFoldOutcome::Done,
+                "the reseeded fingerprint must let the fold actually complete");
+            assert_eq!(ctx.fold_coord_reseed_recovered_from_durable_state.load(Ordering::Relaxed) - reseed_before, 1,
+                "must recover via the durable-state reseed — this is the exact fix for the \
+                 2026-08-10 VM-100 corruption's root cause");
+            assert_eq!(ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed), fp_before,
+                "must NOT take the old uncoordinated fallback — the reseed succeeded");
+            let final_state = h.metadata.get_patch_state(&public_token).unwrap();
+            assert!(matches!(final_state, Some(PatchState::Folded(_))),
+                "the reseed must have carried the durable state's actual token through to a real fold, \
+                 not a mismatched/fabricated one — got {:?}", final_state);
+        }
+
+        /// Companion safe-no-op test: a slot that's already Folded durably but
+        /// missing from dirty_patch_slots must resolve as a no-op Done — not
+        /// attempt to re-fold it, coordinated or not.
+        #[tokio::test]
+        async fn coordinate_and_fold_slot_durably_folded_but_dirty_slot_missing_is_safe_noop() {
+            let h = make_overlay_test_harness();
+            let file_id = FileId::new();
+            let chunk_idx = 0u64;
+            let (_original_chunk_id, public_token) =
+                setup_durably_pending_patch_without_dirty_slot(&h, file_id, chunk_idx, "folded-case");
+            let folded_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"folded-case-result"));
+            h.metadata.update_patch_state_folded(&public_token, folded_chunk_id).unwrap();
+
+            let ctx = h.server.overlay_ctx();
+            let (fp_before, np_before, hf_before, reseed_before, noop_folded_before) = (
+                ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed),
+                ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed),
+                ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed),
+                ctx.fold_coord_reseed_recovered_from_durable_state.load(Ordering::Relaxed),
+                ctx.fold_coord_noop_already_folded.load(Ordering::Relaxed),
+            );
+            let outcome = h.server.overlay_ctx().coordinate_and_fold_slot(file_id, chunk_idx).await;
+            let ctx = h.server.overlay_ctx();
+
+            assert_eq!(outcome, CoordinatedFoldOutcome::Done,
+                "an already-folded slot must resolve as a safe no-op Done");
+            assert_eq!(ctx.fold_coord_noop_already_folded.load(Ordering::Relaxed) - noop_folded_before, 1,
+                "must count this as the already-folded no-op — this is the exact shape of the real \
+                 2026-08-10 VM-100 race (a fold completes and clears dirty_patch_slots, a second \
+                 trigger for the same slot arrives and finds durable state already Folded); this \
+                 counter is the direct evidence the fix closes that gap safely instead of silently");
+            assert_eq!(ctx.fold_coord_fallback_fingerprint_unavailable.load(Ordering::Relaxed), fp_before,
+                "must not take the uncoordinated fallback — nothing needs folding");
+            assert_eq!(ctx.fold_coord_fallback_no_peer.load(Ordering::Relaxed), np_before,
+                "must not reach the no-peer branch — the function returns before reaching it");
+            assert_eq!(ctx.fold_coord_fallback_hard_failure.load(Ordering::Relaxed), hf_before,
+                "must not reach the hard-failure branch — the function returns before reaching it");
+            assert_eq!(ctx.fold_coord_reseed_recovered_from_durable_state.load(Ordering::Relaxed), reseed_before,
+                "must not count a reseed recovery — there was nothing Pending to recover, only Folded");
         }
 
         /// Companion reachability test for the "no reachable peer" fallback branch —

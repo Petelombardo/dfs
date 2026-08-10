@@ -154,27 +154,67 @@ sleep 40
 echo ""
 echo "=== Results ==="
 SATURATION_HITS=0
-FALLBACK_HITS=0
+# Split by branch (was one combined FALLBACK_HITS) — after the 2026-08-10
+# durable-state reseed fix, branch 1 (fingerprint_unavailable) should mostly
+# disappear in favor of RESEED_HITS; branches 2/3 are unrelated/legitimate
+# and unaffected by that fix. Splitting these out also gives real numbers on
+# how often the timeout-driven hard_failure branch fires under this exact
+# saturation, to check whether CPU-starvation/timeout-tuning is separately
+# worth pursuing there.
+FINGERPRINT_UNAVAILABLE_HITS=0
+NO_PEER_HITS=0
+HARD_FAILURE_HITS=0
+RESEED_HITS=0
+NOOP_ALREADY_FOLDED_HITS=0
+NOOP_NOTHING_PENDING_HITS=0
 CORRUPTION_HITS=0
 for i in 1 2 3 4 5; do
     c=$(grep -c "fold_coordination_semaphore acquire took" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
     SATURATION_HITS=$((SATURATION_HITS + c))
-    c=$(grep -cE "local_fold_fingerprint unavailable|no reachable peer for file|peer unreachable/misbehaving for file" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
-    FALLBACK_HITS=$((FALLBACK_HITS + c))
+    c=$(grep -c "local_fold_fingerprint unavailable" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
+    FINGERPRINT_UNAVAILABLE_HITS=$((FINGERPRINT_UNAVAILABLE_HITS + c))
+    c=$(grep -c "no reachable peer for file" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
+    NO_PEER_HITS=$((NO_PEER_HITS + c))
+    c=$(grep -c "peer unreachable/misbehaving for file" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
+    HARD_FAILURE_HITS=$((HARD_FAILURE_HITS + c))
+    c=$(grep -c "recovered fold fingerprint for file .* by reseeding dirty_patch_slots" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
+    RESEED_HITS=$((RESEED_HITS + c))
+    # These two are the OTHER outcomes of the same durable-state check — safe
+    # no-ops, but previously totally silent. already_folded is the exact shape
+    # of the real 2026-08-10 race (fold completes + clears dirty_patch_slots,
+    # a racing second trigger for the same slot finds durable state already
+    # Folded) — seeing this fire under saturation, with zero corruption, is
+    # the actual proof the fix closes that gap.
+    c=$(grep -c "already folded (dirty_patch_slots was stale/missing)" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
+    NOOP_ALREADY_FOLDED_HITS=$((NOOP_ALREADY_FOLDED_HITS + c))
+    c=$(grep -c "durable patch_state confirms nothing pending" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
+    NOOP_NOTHING_PENDING_HITS=$((NOOP_NOTHING_PENDING_HITS + c))
     c=$(grep -c "disk corruption detected" "$LOG/server${i}.log" 2>/dev/null); c=${c:-0}
     CORRUPTION_HITS=$((CORRUPTION_HITS + c))
 done
+FALLBACK_HITS=$((FINGERPRINT_UNAVAILABLE_HITS + NO_PEER_HITS + HARD_FAILURE_HITS))
 DISAGREEMENT_HITS=$(grep -c "REPLICA DISAGREEMENT" "$LOG/client.log" 2>/dev/null); DISAGREEMENT_HITS=${DISAGREEMENT_HITS:-0}
 
 echo "fold_coordination_semaphore slow-acquire events (saturation signal): $SATURATION_HITS"
-echo "coordinate_and_fold_slot uncoordinated-fallback events (choke point fired): $FALLBACK_HITS"
+echo "coordinate_and_fold_slot uncoordinated-fallback events, total (choke point fired): $FALLBACK_HITS"
+echo "  branch 1 - fingerprint_unavailable (the one with real corruption evidence): $FINGERPRINT_UNAVAILABLE_HITS"
+echo "  branch 2 - no_peer (legitimate, out of scope): $NO_PEER_HITS"
+echo "  branch 3 - hard_failure / ProposeFold RPC timeout (legitimate, out of scope): $HARD_FAILURE_HITS"
+echo "durable-state reseed recoveries (fix engaging instead of branch 1 falling back): $RESEED_HITS"
+echo "durable-state no-op — already folded elsewhere (the real incident's exact race, now safe): $NOOP_ALREADY_FOLDED_HITS"
+echo "durable-state no-op — genuinely nothing pending: $NOOP_NOTHING_PENDING_HITS"
 echo "\"disk corruption detected\" events (worst case — genuine content corruption): $CORRUPTION_HITS"
 echo "REPLICA DISAGREEMENT events: $DISAGREEMENT_HITS"
 
 if [ "$FALLBACK_HITS" -gt 0 ]; then
     echo ""
     echo "=== Sample fallback events, with context ==="
-    grep -hE "local_fold_fingerprint unavailable|no reachable peer for file|peer unreachable/misbehaving for file|fold_coordination_semaphore acquire took" "$LOG"/server*.log | head -20
+    grep -hE "local_fold_fingerprint unavailable|no reachable peer for file|peer unreachable/misbehaving for file|fold_coordination_semaphore acquire took|recovered fold fingerprint for file .* by reseeding" "$LOG"/server*.log | head -20
+fi
+if [ "$NOOP_ALREADY_FOLDED_HITS" -gt 0 ]; then
+    echo ""
+    echo "=== Sample already-folded no-op events (the real incident's race, resolved safely), with context ==="
+    grep -h "already folded (dirty_patch_slots was stale/missing)" "$LOG"/server*.log | head -20
 fi
 if [ "$CORRUPTION_HITS" -gt 0 ]; then
     echo ""
@@ -183,10 +223,11 @@ if [ "$CORRUPTION_HITS" -gt 0 ]; then
 fi
 
 echo ""
-if [ "$FALLBACK_HITS" -gt 0 ]; then
-    echo "REPRODUCED: the uncoordinated fallback choke point fired under real bulk-write load."
+if [ "$FALLBACK_HITS" -gt 0 ] || [ "$RESEED_HITS" -gt 0 ]; then
+    echo "REPRODUCED: the uncoordinated fallback choke point fired under real bulk-write load \
+(or was caught and recovered by the durable-state reseed fix)."
 else
-    echo "NOT REPRODUCED this run: no fallback events observed — try raising NUM_CHUNKS or lowering SEM_PERMITS."
+    echo "NOT REPRODUCED this run: no fallback or reseed events observed — try raising NUM_CHUNKS or lowering SEM_PERMITS."
 fi
 
 echo ""

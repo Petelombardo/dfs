@@ -2553,6 +2553,53 @@ impl MetadataStore {
             .context("spawn_blocking panicked in get_patch_state_async")?
     }
 
+    /// Point-lookup a slot's current patch_state directly by (file_id, chunk_idx),
+    /// without already knowing its token — unlike get_patch_state, which requires
+    /// the token as input. Goes through PATCH_STATE_SLOT_TABLE first to resolve
+    /// the token, then PATCH_STATE_TABLE, both in one read transaction. Added for
+    /// coordinate_and_fold_slot's durable-state reseed (see its doc comment for
+    /// the 2026-08-10 VM-100 corruption this closes) — before this, the only way
+    /// to find a slot's outstanding token from a cold in-memory cache was a full
+    /// PATCH_STATE_SLOT_TABLE scan (all_pending_patch_slots_with_age), too
+    /// expensive to do per-slot-per-fold-attempt.
+    pub fn get_patch_state_for_slot(&self, file_id: FileId, chunk_idx: u64) -> Result<Option<(ChunkId, PatchState)>> {
+        let slot_key = format!("{}:{}", file_id, chunk_idx);
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let slot_table = match txn.open_table(PATCH_STATE_SLOT_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(token_bytes) = slot_table.get(slot_key.as_str())? else { return Ok(None) };
+        let token_str = std::str::from_utf8(token_bytes.value())
+            .context("corrupt patch state slot entry (not utf8)")?
+            .to_string();
+        drop(token_bytes);
+        let Some(token_hash) = decode_hex_32(&token_str) else { return Ok(None) };
+        let token = ChunkId::from_hash(token_hash);
+
+        let state_table = match txn.open_table(PATCH_STATE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        match state_table.get(token_str.as_str())? {
+            Some(v) => Ok(Some((token, bincode::deserialize::<PatchState>(v.value())
+                .with_context(|| format!("Failed to deserialize patch state {}", token))?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Async wrapper for get_patch_state_for_slot — see get_chunk_location_async
+    /// for why this must go through spawn_blocking from request-handling code.
+    pub async fn get_patch_state_for_slot_async(self: &Arc<Self>, file_id: FileId, chunk_idx: u64) -> Result<Option<(ChunkId, PatchState)>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.get_patch_state_for_slot(file_id, chunk_idx))
+            .await
+            .context("spawn_blocking panicked in get_patch_state_for_slot_async")?
+    }
+
     /// Which of `tokens` currently have a PATCH_STATE_TABLE row, in one read
     /// transaction — see get_chunk_locations_batch's doc comment for the incident
     /// this closes (handle_replicate_chunk_locations called get_patch_state_async

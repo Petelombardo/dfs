@@ -729,19 +729,6 @@ pub enum Request {
     /// Returns NodeStats. Safe to call on any node at any time.
     GetNodeStats,
 
-    /// Combined request added 2026-08-11 for the live-file-orphan-sweep leader
-    /// authorization path (authorize_live_file_orphan_deletes, healing.rs):
-    /// that path used to issue GetNodeStats + GetPendingPatchChunkIds as two
-    /// separate sequential RPCs per peer, on every sweep page — real RPC-count
-    /// cost that scales with cluster size and sweep frequency. This combines
-    /// exactly the two fields that call site actually needs (peer uptime,
-    /// peer's pending patch chunk ids) into one round trip. Deliberately NOT a
-    /// change to GetNodeStats or GetPendingPatchChunkIds themselves — both have
-    /// other, unrelated callers (dfs-admin and handle_confirm_chunks_live
-    /// respectively) that don't need or want the other field bundled in.
-    /// Returns OrphanAuthInfo.
-    GetOrphanAuthInfo,
-
     /// Trigger an immediate phantom-replica reconciliation pass: verifies actual
     /// presence on every listed node for every live chunk and prunes confirmed-
     /// absent ones, queuing under-RF results for immediate healing. Independent
@@ -947,6 +934,27 @@ pub enum Request {
     GetPendingHealingSample {
         limit: usize,
     },
+
+    /// Combined request added 2026-08-11 for the live-file-orphan-sweep leader
+    /// authorization path (authorize_live_file_orphan_deletes, healing.rs):
+    /// that path used to issue GetNodeStats + GetPendingPatchChunkIds as two
+    /// separate sequential RPCs per peer, on every sweep page — real RPC-count
+    /// cost that scales with cluster size and sweep frequency. This combines
+    /// exactly the two fields that call site actually needs (peer uptime,
+    /// peer's pending patch chunk ids) into one round trip. Deliberately NOT a
+    /// change to GetNodeStats or GetPendingPatchChunkIds themselves — both have
+    /// other, unrelated callers (dfs-admin and handle_confirm_chunks_live
+    /// respectively) that don't need or want the other field bundled in.
+    /// Returns OrphanAuthInfo. APPENDED at end to preserve wire compatibility —
+    /// see GetPendingHealingSample's doc comment above for why this matters:
+    /// bincode encodes enum variants by ordinal position, so inserting a new
+    /// variant anywhere but the end shifts every later variant's wire
+    /// encoding, breaking compatibility with any peer still running older code
+    /// (a real incident, 2026-08-11: this same variant was first added right
+    /// after GetNodeStats instead of at the end, silently corrupting RPC
+    /// dispatch for the ~13 variants defined after it and breaking a live
+    /// client mount — caught only because the mount visibly broke).
+    GetOrphanAuthInfo,
 }
 
 /// See Request::ProposeFold's doc comment.
@@ -1105,15 +1113,6 @@ pub enum Response {
     /// currently-Pending row in its local PATCH_STATE_TABLE.
     PendingPatchChunkIds {
         ids: Vec<ChunkId>,
-    },
-
-    /// Response to GetOrphanAuthInfo — see that request's doc comment.
-    /// `pending_patch_chunk_ids` is the same union GetPendingPatchChunkIds
-    /// returns (base/delta inputs + outstanding tokens); `uptime_secs` is the
-    /// same field NodeStats carries.
-    OrphanAuthInfo {
-        uptime_secs: u64,
-        pending_patch_chunk_ids: Vec<ChunkId>,
     },
 
     /// Chunk IDs response (for WriteFile)
@@ -1439,6 +1438,17 @@ pub enum Response {
     PendingHealingSample {
         entries: Vec<PendingHealingEntry>,
         total_pending: usize,
+    },
+
+    /// Response to GetOrphanAuthInfo — see that request's doc comment.
+    /// `pending_patch_chunk_ids` is the same union GetPendingPatchChunkIds
+    /// returns (base/delta inputs + outstanding tokens); `uptime_secs` is the
+    /// same field NodeStats carries. APPENDED at end to preserve wire
+    /// compatibility — see Request::GetOrphanAuthInfo's doc comment for the
+    /// 2026-08-11 incident this matters for.
+    OrphanAuthInfo {
+        uptime_secs: u64,
+        pending_patch_chunk_ids: Vec<ChunkId>,
     },
 }
 

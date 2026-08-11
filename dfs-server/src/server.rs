@@ -2150,26 +2150,58 @@ impl OverlayForkCtx {
                                     // Direct mutation, not update_chunk_map_after_patch: that
                                     // helper's client_write_seq staleness guard exists to stop
                                     // an out-of-order concurrent write from clobbering a NEWER
-                                    // one — the wrong tool here. public_token's own seq is very
-                                    // likely higher than prior's (it was the more recent write),
-                                    // so that guard would reject exactly the restore this branch
-                                    // exists to perform. There's no ordering question left to
-                                    // ask: public_token has already been independently confirmed
-                                    // unrecoverable above, regardless of its seq.
+                                    // one — the wrong tool here, since `prior` is deliberately
+                                    // OLDER than public_token by construction (it's what the
+                                    // slot pointed at before public_token ever existed), so
+                                    // that guard would reject exactly the restore this branch
+                                    // exists to perform.
+                                    //
+                                    // But that doesn't mean no ordering check is needed — it
+                                    // means a DIFFERENT one is: re-verify, atomically under this
+                                    // same mutation, that the slot still names public_token
+                                    // itself before overwriting it. abandon_patch_if_base_gone
+                                    // can run a real, non-trivial amount of wall-clock time after
+                                    // public_token's own optimistic advance (it's only reached
+                                    // once a fold's own I/O has discovered the base is gone) —
+                                    // long enough for a completely independent, legitimate patch
+                                    // to land on this exact slot and advance chunk_map past
+                                    // public_token in the meantime, which is ordinary progress,
+                                    // not a race with THIS patch. Restoring to `prior`
+                                    // unconditionally clobbers that newer occupant with a
+                                    // snapshot taken before either public_token or the newer
+                                    // patch existed — a real 2026-08-11 VM-108 incident (ext4
+                                    // journal-inode + qcow2 refcount-table corruption): chunk_idx
+                                    // 222 reverted from a legitimately-current df7cc814... back
+                                    // to the stale ddd4f48d... this way, ~20s after df7cc814 had
+                                    // already become the slot's real, successful occupant. If the
+                                    // slot has moved on, this abandon has nothing left to do here
+                                    // — same invariant abandon_patch_if_slot_superseded already
+                                    // relies on elsewhere in this file.
+                                    let mut restored = false;
                                     if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
                                         let (locs, _) = entry.value_mut();
                                         if let Some(pos) = Server::chunk_map_find_by_idx(locs, chunk_idx) {
-                                            locs[pos].chunk_id = prior;
-                                            locs[pos].checksum = prior.hash;
-                                            locs[pos].size = prior_loc.size;
-                                            locs[pos].written_at = Some(dfs_common::types::current_timestamp_ms());
-                                            locs[pos].client_write_seq = prior_loc.client_write_seq;
-                                            locs[pos].nodes = prior_loc.nodes.clone();
+                                            if locs[pos].chunk_id == public_token {
+                                                locs[pos].chunk_id = prior;
+                                                locs[pos].checksum = prior.hash;
+                                                locs[pos].size = prior_loc.size;
+                                                locs[pos].written_at = Some(dfs_common::types::current_timestamp_ms());
+                                                locs[pos].client_write_seq = prior_loc.client_write_seq;
+                                                locs[pos].nodes = prior_loc.nodes.clone();
+                                                restored = true;
+                                            }
                                         }
                                     }
-                                    warn!("single fold: restored file {} chunk_idx {} to last known-good chunk {} \
-                                           after abandoning unrecoverable patch {}",
-                                        file_id, chunk_idx, prior, public_token);
+                                    if restored {
+                                        warn!("single fold: restored file {} chunk_idx {} to last known-good chunk {} \
+                                               after abandoning unrecoverable patch {}",
+                                            file_id, chunk_idx, prior, public_token);
+                                    } else {
+                                        info!("single fold: skipping restore-to-prior for file {} chunk_idx {} — \
+                                               slot has already moved past abandoned patch {} to a newer occupant \
+                                               since this patch's own optimistic advance; leaving it alone",
+                                            file_id, chunk_idx, public_token);
+                                    }
                                 }
                                 Ok(None) => {
                                     warn!("single fold: prior_chunk_id {} for file {} chunk_idx {} is also gone \
@@ -18381,6 +18413,118 @@ mod tests {
             "abandoning an unrecoverable patch must restore the slot to its last known-good \
              chunk, not leave it parked on the abandoned patch's own never-written token — \
              every future read of a slot left on the phantom token fails cluster-wide forever");
+    }
+
+    /// 2026-08-11 VM-108 restore corruption: the sibling test above proves
+    /// restore-to-prior_chunk_id is correct when nothing else has touched the
+    /// slot since B's optimistic advance. This test proves the gap in that same
+    /// fix when something else HAS: between B's optimistic advance to its own
+    /// public_token and B's own abandon actually running (real wall-clock time —
+    /// abandon_patch_if_base_gone is reached only after the fold's own I/O
+    /// discovers the base is gone), a completely independent, legitimate patch C
+    /// can land on the exact same slot and advance chunk_map past B to C's own
+    /// token — ordinary progress, nothing wrong with it.
+    ///
+    /// abandon_patch_if_base_gone's restore mutation (server.rs, inside
+    /// abandon_patch_if_base_gone) writes `prior_chunk_id` straight into
+    /// chunk_map's current slot position unconditionally — it never re-checks
+    /// that the slot still names B's own public_token before overwriting it.
+    /// So it clobbers C's already-successful, strictly newer advance with B's
+    /// stale prior_chunk_id snapshot (captured before either B or C existed),
+    /// dragging the slot backward. Every subsequent read sees C's real content
+    /// silently reverted to older bytes — a real 2026-08-11 VM-108 restore
+    /// incident (ext4 journal-inode + qcow2 refcount-table corruption, both
+    /// traced to exactly this slot-clobber via live log tracing: chunk_idx 222,
+    /// `ddd4f48d...` reinstated over `df7cc814...` ~20s after df7cc814 had
+    /// already, successfully, become the slot's current occupant).
+    ///
+    /// Fixed by re-checking, atomically under the same chunk_map mutation, that
+    /// the slot still names `public_token` (B) before restoring to `prior` —
+    /// the same invariant `abandon_patch_if_slot_superseded` already relies on
+    /// elsewhere in this file. If something else has since claimed the slot,
+    /// the restore is skipped entirely; the newer occupant is left alone.
+    #[tokio::test]
+    async fn test_abandon_base_gone_restore_does_not_clobber_newer_winner() {
+        let h = make_overlay_test_harness();
+        let ctx = h.server.overlay_ctx();
+
+        let file_id = FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // B's own base: consumed by someone else by the time B's fold runs —
+        // no CHUNK_TABLE record anywhere. This is what triggers
+        // abandon_patch_if_base_gone in the first place.
+        let missing_base_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"b-base-already-retired"));
+
+        // prior_chunk_id (B's own captured snapshot): real, on disk, valid —
+        // but stale. This is what the slot pointed at *before* B existed.
+        let prior_content = vec![3u8; 64];
+        let prior_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&prior_content, chunk_file_offset, file_id),
+        );
+        h.storage.write_chunk(&prior_chunk_id, &prior_content).unwrap();
+        h.metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: prior_chunk_id, nodes: vec![h.server.cluster.local_node_id()],
+            size: prior_content.len(), checksum: prior_chunk_id.hash,
+            file_offset: Some(chunk_file_offset), written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(1), file_id: Some(file_id),
+        }).unwrap();
+
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"b-own-token"));
+
+        // C: an entirely independent, later, legitimate patch that has ALREADY
+        // claimed the slot by the time B's abandon runs — chunk_map's current
+        // occupant right now. Real content, on disk, exactly like any
+        // successful apply_patch advance.
+        let newer_content = vec![9u8; 64];
+        let newer_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&newer_content, chunk_file_offset, file_id),
+        );
+        h.storage.write_chunk(&newer_chunk_id, &newer_content).unwrap();
+        h.metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: newer_chunk_id, nodes: vec![h.server.cluster.local_node_id()],
+            size: newer_content.len(), checksum: newer_chunk_id.hash,
+            file_offset: Some(chunk_file_offset), written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(3), file_id: Some(file_id),
+        }).unwrap();
+        h.server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
+            chunk_id: newer_chunk_id, nodes: vec![h.server.cluster.local_node_id()],
+            size: newer_content.len(), checksum: [0u8; 32],
+            file_offset: Some(chunk_file_offset), written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(3), file_id: Some(file_id),
+        }], 1));
+
+        // B's own bookkeeping, exactly as apply_patch's optimistic advance would
+        // have left it back when B was created (before C ever existed) —
+        // dirty_patch_slots reflects B, not the since-superseded chunk_map.
+        h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            token: public_token,
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
+            prior_chunk_id: Some(prior_chunk_id),
+        });
+
+        // B's fold discovers its base is gone cluster-wide — call the abandon
+        // path directly (this is what run_single_fold's failure path reaches
+        // once it already got past the slot-superseded pre-check earlier in
+        // its own execution, before C landed).
+        ctx.abandon_patch_if_base_gone(file_id, chunk_idx, public_token, missing_base_chunk_id, "base").await;
+
+        let chunk_map = h.server.chunk_map_ref();
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        let current = Server::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id);
+        assert_eq!(current, Some(newer_chunk_id),
+            "abandoning a stale patch must never clobber a slot that's already moved on to a \
+             newer, legitimate occupant — restoring to a stale prior_chunk_id here silently \
+             reverts real, current content back to older bytes (2026-08-11 VM-108 restore \
+             corruption: chunk_idx 222 reverted from df7cc814... back to ddd4f48d... this way)");
     }
 
     /// 2026-08-09: fold_slot_now used to acquire chunk_patch_locks for a slot FIRST,

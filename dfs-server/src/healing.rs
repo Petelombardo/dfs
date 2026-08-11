@@ -401,6 +401,11 @@ pub struct HealingManager {
     /// The heal loop never touches this set directly.
     stalled_healing: Arc<RwLock<HashSet<ChunkId>>>,
 
+    /// Cache for authorize_live_file_orphan_deletes' leader-side cluster-wide
+    /// pending-id union — see ORPHAN_AUTH_CACHE_TTL's doc comment. None until the
+    /// first fetch; (fetched_at, unioned pending_patch_chunk_ids) after.
+    orphan_auth_cache: tokio::sync::Mutex<Option<(Instant, HashSet<ChunkId>)>>,
+
     /// Chunks whose most recent heal attempt reached ≥1 confirmed-alive source but
     /// still failed to replicate to ANY target (source-side corruption, all targets
     /// rejecting, etc.) — distinct from stalled_healing's "0 alive nodes" case, whose
@@ -676,6 +681,7 @@ impl HealingManager {
             cancelled_heals: Arc::new(DashMap::new()),
             alive_nodes_cache: Arc::new(RwLock::new(HashMap::new())),
             stalled_healing: Arc::new(RwLock::new(HashSet::new())),
+            orphan_auth_cache: tokio::sync::Mutex::new(None),
             heal_push_failure: Arc::new(DashMap::new()),
             requeue_priority: Arc::new(DashMap::new()),
             orphan_candidates: Arc::new(RwLock::new(HashSet::new())),
@@ -1085,6 +1091,38 @@ impl HealingManager {
     async fn clear_pending(&self, chunk_id: &ChunkId) {
         Self::clear_pending_static(&self.pending_healing, &self.urgent_healing, &self.metadata, chunk_id).await;
         self.requeue_priority.remove(chunk_id);
+    }
+
+    /// Batched form of clear_pending's in-memory effects: removes every given
+    /// chunk_id from pending_healing and stalled_healing with ONE write() lock
+    /// acquisition each, instead of one pair of acquisitions per chunk_id.
+    /// Deliberately does NOT touch the durable PENDING_HEALING_TABLE (callers
+    /// already batch that separately via deferred_pending_clears +
+    /// batch_update_chunk_locations) or heal_push_failure/requeue_priority
+    /// (DashMaps — already lock-free per-entry, no benefit to batching).
+    ///
+    /// Added 2026-08-11: run_discovery_pass's classification loop used to call
+    /// the single-chunk clear_pending (or a bare pending_healing.write().await.
+    /// remove(...)) once per healthy chunk it found — pending_healing "can
+    /// legitimately spike into the tens of thousands" of entries (see its field
+    /// doc comment), so a pass touching a large slice of them reacquired this
+    /// same RwLock thousands of times in quick succession. That contended with
+    /// apply_patch's own foreground pending_healing.write() (evict_from_pending)
+    /// — confirmed live via gdb backtrace sampling during a kdiskmark run:
+    /// several concurrent apply_patch calls stalled up to ~850ms, all resolving
+    /// together right as a discovery pass's classification loop moved on. Q8T1
+    /// (8 concurrent writers) showed real throughput decay pass-over-pass;
+    /// Q1T1 (1 writer, nothing to queue behind) didn't.
+    async fn clear_pending_batch(&self, chunk_ids: &[ChunkId]) {
+        if chunk_ids.is_empty() {
+            return;
+        }
+        let mut pending = self.pending_healing.write().await;
+        let mut stalled = self.stalled_healing.write().await;
+        for id in chunk_ids {
+            pending.remove(id);
+            stalled.remove(id);
+        }
     }
 
     /// A fold is about to retire `chunk_id` as the base it's consolidating —
@@ -2209,12 +2247,36 @@ impl HealingManager {
         candidate_ids
     }
 
+    /// Floor for disk_sweep_next_delay — see that function's doc comment for why a
+    /// page's own processing time can no longer be allowed to zero out its pause
+    /// entirely. Small on purpose: this is a minimum breathing room guarantee, not
+    /// a real pacing control (base_page_grace/disk_sweep_next_backoff already own
+    /// that) — just enough that the write path always gets *some* gap between
+    /// sweep pages, even during a genuine backlog where per-page work is heavy.
+    const MIN_PAGE_DELAY: Duration = Duration::from_secs(2);
+
     /// Pure arithmetic for the paginated sweep's rate limiter — split out so it can be
     /// unit-tested without real sleeps. Returns how long to sleep before the next page:
     /// the grace floor minus however much of it this page's own work already consumed,
-    /// clamped to zero so a run of slow pages never oversleeps into negative territory.
+    /// floored at MIN_PAGE_DELAY rather than zero.
+    ///
+    /// Changed 2026-08-11: unconditionally subtracting elapsed work time — with no
+    /// floor — meant a page expensive enough to consume the whole grace period (a
+    /// large page_size scan, many candidates each needing a leader-confirm round
+    /// trip) got NO pause at all before the next one started, back-to-back,
+    /// regardless of how high base_page_grace/DFS_ORPHAN_SWEEP_PAGE_GRACE_MS was
+    /// set — confirmed live on staging: two nodes seeing high candidate volume
+    /// during a kdiskmark run logged sweep pages 1-6s apart even with the grace
+    /// floor raised to 20s, because disk_sweep_next_backoff correctly reset grace
+    /// to the (raised) floor on every high-candidate page, but this function's old
+    /// zero-floor subtraction ate nearly all of it back. Exactly backwards: the
+    /// busier the sweep gets, the more pause the write path needs from it, not
+    /// less. A small unconditional floor guarantees that regardless of how
+    /// expensive any single page turns out to be, without weakening
+    /// disk_sweep_next_backoff's own responsiveness-under-real-backlog guarantee
+    /// (that's still governed by base_grace/max_grace, untouched here).
     fn disk_sweep_next_delay(grace: Duration, elapsed_this_iteration: Duration) -> Duration {
-        grace.saturating_sub(elapsed_this_iteration)
+        grace.saturating_sub(elapsed_this_iteration).max(Self::MIN_PAGE_DELAY)
     }
 
     /// Whether cleanup_stale_pending is due, given when it last ran this
@@ -2317,11 +2379,21 @@ impl HealingManager {
         // Fast/responsive floor — used immediately whenever a page finds real
         // work. See disk_sweep_next_backoff's doc comment for the adaptive
         // pacing this now drives, rather than being used as a flat constant.
+        //
+        // Raised 3000 -> 30000 (2026-08-11): validated live on staging
+        // (DFS_ORPHAN_SWEEP_PAGE_GRACE_MS=20000 override) during a kdiskmark
+        // run — peak iowait on the busiest node dropped from 84.7% to 5.6%,
+        // and pass-to-pass throughput variance on the worst-affected test
+        // (RND4K Q1T1) collapsed from a ~40% swing to identical results
+        // (8/8 MB/s) across both passes. 3000ms was tuned for the original
+        // single-unbounded-pass design (pre-2026-08-04 pagination); it never
+        // got re-tuned after pagination bounded each page's own cost, so it
+        // was polling far faster than a bounded-cost design actually needs.
         let base_page_grace = Duration::from_millis(
             std::env::var("DFS_ORPHAN_SWEEP_PAGE_GRACE_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(3000),
+                .unwrap_or(30_000),
         );
         let max_page_grace = Duration::from_millis(
             std::env::var("DFS_ORPHAN_SWEEP_MAX_PAGE_GRACE_MS")
@@ -2544,7 +2616,13 @@ impl HealingManager {
             return;
         }
 
-        let mut evicted = 0usize;
+        // Physical delete stays per-chunk (a real local unlink, cheap and
+        // synchronous — nothing to batch there). The metadata ChunkLocation
+        // delete is the part that used to pay one full redb write transaction
+        // per chunk here; collected instead and flushed as a single batch below
+        // via the same batch_update_chunk_locations_async path the rest of the
+        // healing subsystem already uses for exactly this reason.
+        let mut physically_evicted: Vec<ChunkId> = Vec::new();
         for chunk_id in &authorized {
             // Last-line-of-defense: never physically delete anything marker-shaped
             // here, no matter how it got this far — see the earlier gate's comment.
@@ -2557,14 +2635,32 @@ impl HealingManager {
                 debug!("Live-file orphan sweep: failed to delete {}: {}", chunk_id, e);
                 continue;
             }
-            let _ = self.metadata.delete_chunk_location_async(*chunk_id).await;
-            evicted += 1;
+            physically_evicted.push(*chunk_id);
         }
-        if evicted > 0 {
+        if !physically_evicted.is_empty() {
+            if let Err(e) = self.metadata.batch_update_chunk_locations_async(Vec::new(), physically_evicted.clone(), Vec::new()).await {
+                warn!("Live-file orphan sweep: batched ChunkLocation delete failed for {} chunk(s): {}",
+                      physically_evicted.len(), e);
+            }
             info!("Live-file orphan sweep: evicted {}/{} authorized chunk(s) (patch-superseded, missed by inline fast-evict)",
-                  evicted, authorized.len());
+                  physically_evicted.len(), authorized.len());
         }
     }
+
+    /// How long the leader's cluster-wide pending-id union (the expensive part of
+    /// authorize_live_file_orphan_deletes — see that function's doc comment) stays
+    /// valid before it must be re-fetched from every peer. Added 2026-08-11 to close
+    /// a real cost-scaling problem: this fetch used to run fresh on every single
+    /// sweep page, and disk_sweep_next_backoff resets page pacing to its fastest
+    /// setting whenever a page finds real work — meaning the busiest, most-orphan-
+    /// heavy moments (exactly when this authorization gate matters most) were also
+    /// the moments it got re-run most often. Short on purpose: this cache only ever
+    /// gates the coarser "is deletion even worth considering right now" question —
+    /// reconcile_live_file_candidates's mandatory PATCH_STATE_TABLE re-check
+    /// immediately before the actual irreversible delete is untouched and always
+    /// fresh, so a stale cache here can delay a legitimate deletion by up to this
+    /// TTL, never cause an incorrect one.
+    const ORPHAN_AUTH_CACHE_TTL: Duration = Duration::from_secs(10);
 
     /// Decide which of `candidates` are safe to actually delete right now.
     ///
@@ -2574,31 +2670,40 @@ impl HealingManager {
     ///   (fail safe — retried next sweep, no data loss risk from being conservative).
     /// - Is the leader (no one more authoritative to ask): require every other known
     ///   node to be Online AND to report at least STABILITY_SECS of continuous
-    ///   process uptime via GetNodeStats. A node that recently restarted may not have
-    ///   finished catching up its own metadata replica yet — proceeding before that
-    ///   settles is exactly the "split-brain mass delete" scenario this guards
-    ///   against. Any node failing either check authorizes NOTHING this cycle.
+    ///   process uptime. A node that recently restarted may not have finished
+    ///   catching up its own metadata replica yet — proceeding before that settles
+    ///   is exactly the "split-brain mass delete" scenario this guards against. Any
+    ///   node failing either check authorizes NOTHING this cycle. This cluster-wide
+    ///   fetch is the expensive part (queries every peer) and is cached for
+    ///   ORPHAN_AUTH_CACHE_TTL — see that constant's doc comment.
     async fn authorize_live_file_orphan_deletes(&self, candidates: &[ChunkId]) -> Vec<ChunkId> {
         const STABILITY_SECS: u64 = 300;
         const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
         if self.cluster.is_leader().await {
+            if let Some((cached_at, pending_ids)) = self.orphan_auth_cache.lock().await.as_ref() {
+                if cached_at.elapsed() < Self::ORPHAN_AUTH_CACHE_TTL {
+                    return candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect();
+                }
+            }
+
             let nodes = self.cluster.get_all_nodes().await;
             let local_id = self.cluster.local_node_id();
             // Started from this node's own local set; every online peer's own set
-            // (queried below, same loop as the stability check) gets unioned in.
-            // PATCH_STATE_TABLE is node-local and never disseminated, and a patch
-            // can land on any node in the cluster, not just the leader — trusting
-            // only this node's own view here is exactly what let a real 2026-07-10
-            // data-loss incident through (VM-111 install): gluster4 asked leader
-            // gluster1 to authorize a candidate that gluster1 itself had already
-            // moved past locally, but gluster3 — never asked — still held it as a
-            // live Pending base. gluster1 said "not live" from pure local
-            // ignorance, gluster4 deleted its own copy for real, RF dropped from 3
-            // to 2 on exactly the two nodes the client's deterministic replica
-            // selection kept picking. Non-leader nodes always got this union via
-            // handle_confirm_chunks_live; the leader was taking a shortcut around
-            // it by answering its own candidates directly. Same fix, same place.
+            // (fetched below, one combined RPC per peer, concurrently) gets unioned
+            // in. PATCH_STATE_TABLE is node-local and never disseminated, and a
+            // patch can land on any node in the cluster, not just the leader —
+            // trusting only this node's own view here is exactly what let a real
+            // 2026-07-10 data-loss incident through (VM-111 install): gluster4
+            // asked leader gluster1 to authorize a candidate that gluster1 itself
+            // had already moved past locally, but gluster3 — never asked — still
+            // held it as a live Pending base. gluster1 said "not live" from pure
+            // local ignorance, gluster4 deleted its own copy for real, RF dropped
+            // from 3 to 2 on exactly the two nodes the client's deterministic
+            // replica selection kept picking. Non-leader nodes always got this
+            // union via handle_confirm_chunks_live; the leader was taking a
+            // shortcut around it by answering its own candidates directly. Same
+            // fix, same place.
             let mut pending_ids = match self.metadata.all_pending_patch_chunk_ids_async().await {
                 Ok(ids) => ids,
                 Err(e) => {
@@ -2616,49 +2721,50 @@ impl HealingManager {
                     return Vec::new();
                 }
             }
-            for node in &nodes {
-                if node.id == local_id {
-                    continue;
-                }
-                if node.status != dfs_common::NodeStatus::Online {
-                    debug!("Live-file orphan sweep: deferring — node {} is not online", node.id);
-                    return Vec::new();
-                }
-                let req = Request::GetNodeStats;
+
+            let peers: Vec<_> = nodes.iter().filter(|n| n.id != local_id).cloned().collect();
+            if peers.iter().any(|n| n.status != dfs_common::NodeStatus::Online) {
+                debug!("Live-file orphan sweep: deferring — at least one known node is not online");
+                return Vec::new();
+            }
+            // One combined GetOrphanAuthInfo RPC per peer (was two, GetNodeStats +
+            // GetPendingPatchChunkIds) issued concurrently (was sequential, one
+            // peer at a time) — see Request::GetOrphanAuthInfo's doc comment. Each
+            // future resolves to None on any failure/timeout/unexpected response/
+            // instability, so the fold below can defer the whole cycle exactly like
+            // the old sequential version did on the first failing peer.
+            let results = futures::future::join_all(peers.iter().map(|node| async move {
+                let req = Request::GetOrphanAuthInfo;
                 match tokio::time::timeout(RPC_TIMEOUT, self.client.send_message(node.addr, Message::Request(req))).await {
                     Ok(Ok(envelope)) => match envelope.message {
-                        Message::Response(Response::NodeStats { uptime_secs, .. }) => {
+                        Message::Response(Response::OrphanAuthInfo { uptime_secs, pending_patch_chunk_ids }) => {
                             if uptime_secs < STABILITY_SECS {
                                 debug!("Live-file orphan sweep: deferring — node {} uptime {}s < {}s stability requirement",
                                        node.id, uptime_secs, STABILITY_SECS);
-                                return Vec::new();
+                                None
+                            } else {
+                                Some(pending_patch_chunk_ids)
                             }
                         }
                         _ => {
-                            debug!("Live-file orphan sweep: deferring — unexpected response to GetNodeStats from {}", node.id);
-                            return Vec::new();
+                            debug!("Live-file orphan sweep: deferring — unexpected response to GetOrphanAuthInfo from {}", node.id);
+                            None
                         }
                     },
                     _ => {
-                        debug!("Live-file orphan sweep: deferring — GetNodeStats failed/timed out for node {}", node.id);
-                        return Vec::new();
+                        debug!("Live-file orphan sweep: deferring — GetOrphanAuthInfo failed/timed out for node {}", node.id);
+                        None
                     }
                 }
-                let req = Request::GetPendingPatchChunkIds;
-                match tokio::time::timeout(RPC_TIMEOUT, self.client.send_message(node.addr, Message::Request(req))).await {
-                    Ok(Ok(envelope)) => match envelope.message {
-                        Message::Response(Response::PendingPatchChunkIds { ids }) => pending_ids.extend(ids),
-                        _ => {
-                            debug!("Live-file orphan sweep: deferring — unexpected response to GetPendingPatchChunkIds from {}", node.id);
-                            return Vec::new();
-                        }
-                    },
-                    _ => {
-                        debug!("Live-file orphan sweep: deferring — GetPendingPatchChunkIds failed/timed out for node {}", node.id);
-                        return Vec::new();
-                    }
+            })).await;
+            for result in results {
+                match result {
+                    Some(ids) => pending_ids.extend(ids),
+                    None => return Vec::new(),
                 }
             }
+
+            *self.orphan_auth_cache.lock().await = Some((Instant::now(), pending_ids.clone()));
             candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect()
         } else {
             let leader_addr = match self.cluster.get_leader_addr().await {
@@ -3194,6 +3300,17 @@ impl HealingManager {
         // batches alongside db_puts/db_deletes instead of one transaction per chunk.
         let mut deferred_pending_marks: Vec<(ChunkId, u64)> = Vec::new();
         let mut deferred_pending_clears: Vec<ChunkId> = Vec::new();
+        // Chunks confirmed healthy this pass (ReplicationStatus::Ok, no ghost
+        // nodes) whose in-memory pending_healing/stalled_healing entries need
+        // clearing — collected during the loop below and drained via ONE
+        // clear_pending_batch call after it, instead of one pending_healing.write()
+        // per healthy chunk. See clear_pending_batch's doc comment for why: this
+        // loop can run over tens of thousands of chunks, and the old per-chunk
+        // acquisition contended with apply_patch's own foreground
+        // pending_healing.write() (evict_from_pending), observed live
+        // (2026-08-11) stalling foreground writes up to ~850ms in bursts during
+        // a kdiskmark run.
+        let mut healthy_now_clears: Vec<ChunkId> = Vec::new();
 
         // Orphan detection/purging used to live here (leader-only, gated on
         // destructive_allowed + a 30-minute age grace + two-pass confirmation). It now
@@ -3717,31 +3834,38 @@ impl HealingManager {
                     // If nodes_without_chunk is non-empty we need the pending_healing
                     // entry to persist as the ghost-pruning delay timer.
                     if nodes_without_chunk.is_empty() {
-                        // Same two effects as clear_pending, but the PENDING_HEALING_TABLE
-                        // delete is deferred into the batched flush below instead of
-                        // paying one transaction per now-healthy chunk.
-                        self.pending_healing.write().await.remove(&chunk_id);
+                        // Same two effects as clear_pending, but both the in-memory
+                        // pending_healing/stalled_healing removal AND the
+                        // PENDING_HEALING_TABLE delete are deferred into batched
+                        // flushes below instead of paying one lock acquisition (and
+                        // one transaction) per now-healthy chunk — see
+                        // healthy_now_clears' doc comment.
+                        healthy_now_clears.push(chunk_id);
                         deferred_pending_clears.push(chunk_id);
-                        self.stalled_healing.write().await.remove(&chunk_id);
                         self.heal_push_failure.remove(&chunk_id);
                     }
                 }
             }
         }
 
-        // Drain orphan de-queues (collected above): remove from the in-memory queues so
-        // the reported Pending count drops immediately, clear the push-failure backoff,
-        // and fold the routing-row/pending-table cleanup into the batched write below.
+        // Drain this pass's healthy-now clears (collected in the classification loop
+        // above) and orphan de-queues together in ONE pending_healing/stalled_healing
+        // lock acquisition each, via clear_pending_batch — not two per-chunk
+        // acquisitions per chunk across two separate loops. See healthy_now_clears'
+        // and clear_pending_batch's doc comments for the incident this fixes.
+        if !healthy_now_clears.is_empty() || !orphan_dequeues.is_empty() {
+            let combined: Vec<ChunkId> = healthy_now_clears.iter().copied()
+                .chain(orphan_dequeues.iter().copied())
+                .collect();
+            self.clear_pending_batch(&combined).await;
+        }
+        // Orphan de-queues also need the push-failure backoff cleared and the
+        // routing-row/pending-table cleanup folded into the batched write below —
+        // effects healthy_now_clears doesn't need (it was never in either).
         if !orphan_dequeues.is_empty() {
-            {
-                let mut pending = self.pending_healing.write().await;
-                let mut stalled = self.stalled_healing.write().await;
-                for id in &orphan_dequeues {
-                    pending.remove(id);
-                    stalled.remove(id);
-                    self.heal_push_failure.remove(id);
-                    self.requeue_priority.remove(id);
-                }
+            for id in &orphan_dequeues {
+                self.heal_push_failure.remove(id);
+                self.requeue_priority.remove(id);
             }
             deferred_pending_clears.extend(orphan_dequeues.iter().copied());
             info!(
@@ -6248,23 +6372,34 @@ mod tests {
     /// Pure arithmetic for the paginated sweep's rate limiter — tested directly
     /// rather than via real sleeps to avoid timing flakiness.
     #[test]
-    fn disk_sweep_next_delay_floors_at_zero_and_subtracts_elapsed_work() {
+    fn disk_sweep_next_delay_floors_at_min_page_delay_and_subtracts_elapsed_work() {
         // Cheap page: most of the grace period is still owed.
         assert_eq!(
             HealingManager::disk_sweep_next_delay(Duration::from_millis(3000), Duration::from_millis(200)),
             Duration::from_millis(2800),
         );
-        // A page whose own work exactly consumed the grace period: nothing left to wait.
+        // A page whose own work exactly consumed the grace period: subtraction alone
+        // would yield zero, but MIN_PAGE_DELAY guarantees real breathing room
+        // regardless — see disk_sweep_next_delay's 2026-08-11 doc comment for the
+        // live incident (busy pages getting zero pause) this floor exists to close.
         assert_eq!(
             HealingManager::disk_sweep_next_delay(Duration::from_millis(3000), Duration::from_millis(3000)),
-            Duration::from_millis(0),
+            HealingManager::MIN_PAGE_DELAY,
         );
-        // A slow page that overran the grace period must floor at zero, not go
-        // negative (Duration can't represent negative — this is the saturating_sub
-        // behavior the fix relies on to avoid a panic/wraparound).
+        // A slow page that overran the grace period must still floor at
+        // MIN_PAGE_DELAY, not zero and not go negative (Duration can't represent
+        // negative — saturating_sub avoids the panic/wraparound, .max() adds the
+        // guaranteed minimum on top).
         assert_eq!(
             HealingManager::disk_sweep_next_delay(Duration::from_millis(3000), Duration::from_millis(5000)),
-            Duration::from_millis(0),
+            HealingManager::MIN_PAGE_DELAY,
+        );
+        // A grace period already below MIN_PAGE_DELAY (e.g. a test override) must
+        // still floor at MIN_PAGE_DELAY, not the smaller grace value — the floor is
+        // an unconditional guarantee, not merely a fallback for the zero case.
+        assert_eq!(
+            HealingManager::disk_sweep_next_delay(Duration::from_millis(500), Duration::from_millis(0)),
+            HealingManager::MIN_PAGE_DELAY,
         );
     }
 
@@ -6550,6 +6685,43 @@ mod tests {
         // 8s (carried over) + 3s (elapsed since restart) = 11s >= 10s.
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(healing.should_heal(&chunk_id, &mut deferred).await);
+    }
+
+    /// clear_pending_batch must remove every given chunk_id from both
+    /// pending_healing and stalled_healing, same end state as calling
+    /// single-chunk clear_pending once per id — just via one lock acquisition
+    /// each instead of one pair per chunk. See clear_pending_batch's doc
+    /// comment for the run_discovery_pass contention this exists to fix.
+    #[tokio::test]
+    async fn clear_pending_batch_removes_every_chunk_from_both_maps() {
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8904".parse().unwrap();
+        let (_storage, _metadata, healing, _temp_storage, _temp_metadata) = make_healing(node_id, addr);
+
+        let chunk_ids: Vec<ChunkId> = (0..500)
+            .map(|i| ChunkId::from_hash(compute_chunk_hash(format!("batch-clear-{}", i).as_bytes())))
+            .collect();
+
+        for id in &chunk_ids {
+            healing.mark_pending(*id).await;
+            healing.stalled_healing.write().await.insert(*id);
+        }
+        assert_eq!(healing.pending_healing.read().await.len(), 500, "sanity: all seeded into pending_healing");
+        assert_eq!(healing.stalled_healing.read().await.len(), 500, "sanity: all seeded into stalled_healing");
+
+        // A chunk NOT in the batch must survive untouched.
+        let untouched = ChunkId::from_hash(compute_chunk_hash(b"batch-clear-untouched"));
+        healing.mark_pending(untouched).await;
+
+        healing.clear_pending_batch(&chunk_ids).await;
+
+        assert_eq!(healing.pending_healing.read().await.len(), 1, "every batched id must be gone from pending_healing");
+        assert!(healing.pending_healing.read().await.contains_key(&untouched), "untouched id must survive");
+        assert_eq!(healing.stalled_healing.read().await.len(), 0, "every batched id must be gone from stalled_healing");
+
+        // Empty batch must be a safe no-op, not a panic on empty-lock semantics.
+        healing.clear_pending_batch(&[]).await;
+        assert_eq!(healing.pending_healing.read().await.len(), 1, "empty batch must not touch pending_healing");
     }
 
     /// Root-caused 2026-08-07 (staging: heal backlog stuck at ~8,600 chunks with
@@ -7170,6 +7342,123 @@ mod tests {
         let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"d"))];
         let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
         assert!(authorized.is_empty(), "unreachable leader must defer, never authorize blindly");
+    }
+
+    /// Answers GetOrphanAuthInfo with a stable, no-pending-ids response, counting
+    /// calls — stands in for a real peer proving authorize_live_file_orphan_deletes'
+    /// leader-side cache (ORPHAN_AUTH_CACHE_TTL) actually avoids re-fetching.
+    struct CountingOrphanAuthHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::network::MessageHandler for CountingOrphanAuthHandler {
+        fn handle_request(
+            &self,
+            request: Request,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move {
+                match request {
+                    Request::GetOrphanAuthInfo => {
+                        self.calls.fetch_add(1, Ordering::Relaxed);
+                        Response::OrphanAuthInfo { uptime_secs: 999_999, pending_patch_chunk_ids: vec![] }
+                    }
+                    _ => Response::Ok { data: None },
+                }
+            })
+        }
+        fn handle_cluster_message(
+            &self,
+            _message: dfs_common::ClusterMessage,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + '_>> {
+            Box::pin(async move { Response::Ok { data: None } })
+        }
+    }
+
+    /// Direct RPC-count proof for the 2026-08-11 fix: two authorize_live_file_
+    /// orphan_deletes calls close together (within ORPHAN_AUTH_CACHE_TTL) must
+    /// cost the peer exactly ONE GetOrphanAuthInfo call, not two — the second
+    /// call must reuse the cached cluster-wide pending-id union. Stronger than a
+    /// wall-clock proof: directly shows the RPC was skipped, not just fast.
+    #[tokio::test]
+    async fn authorize_live_file_orphan_deletes_reuses_cached_result_within_ttl() {
+        let (local_id, peer_id) = {
+            let a = NodeId::new();
+            let b = NodeId::new();
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let addr: SocketAddr = "127.0.0.1:8906".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(local_id, addr);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingOrphanAuthHandler { calls: calls.clone() });
+        let peer_addr: SocketAddr = "127.0.0.1:19397".parse().unwrap();
+        let mut net_server = crate::network::NetworkServer::new(peer_addr, handler, 10);
+        tokio::spawn(async move { net_server.start().await.ok(); });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let peer = dfs_common::NodeInfo::new(peer_id, peer_addr, None);
+        healing.cluster.add_node(peer).await.unwrap();
+        assert!(healing.cluster.is_leader().await, "local node (min id by construction) must be leader");
+
+        let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"e"))];
+
+        let first = healing.authorize_live_file_orphan_deletes(&candidates).await;
+        assert_eq!(first, candidates, "first call: peer is stable and reachable, must authorize");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "first call must fetch from the peer");
+
+        let second = healing.authorize_live_file_orphan_deletes(&candidates).await;
+        assert_eq!(second, candidates, "second call must return the same authorization, from cache");
+        assert_eq!(calls.load(Ordering::Relaxed), 1,
+            "second call within the TTL must reuse the cached result — expected still 1 peer call, got {}",
+            calls.load(Ordering::Relaxed));
+    }
+
+    /// Direct wall-clock proof that the leader's peer fan-out in
+    /// authorize_live_file_orphan_deletes runs concurrently, not sequentially —
+    /// same technique as drain_heal_queue_probes_cache_misses_concurrently_not_
+    /// sequentially. N peers that accept the connection but never answer must all
+    /// hit the same ~5s RPC_TIMEOUT in parallel; sequential would take N * 5s.
+    #[tokio::test]
+    async fn authorize_live_file_orphan_deletes_queries_peers_concurrently_not_sequentially() {
+        // Guarantee the local node is the minimum id (and therefore leader) —
+        // same reasoning as the single-peer tests above: NodeId::new() is
+        // random, so this can't just assume construction order matches id order.
+        let mut ids: Vec<NodeId> = (0..5).map(|_| NodeId::new()).collect();
+        ids.sort();
+        let local_id = ids[0];
+        let peer_ids = &ids[1..];
+
+        let addr: SocketAddr = "127.0.0.1:8907".parse().unwrap();
+        let (_storage, _metadata, healing, _t1, _t2) = make_healing(local_id, addr);
+
+        for (i, &peer_id) in peer_ids.iter().enumerate() {
+            let peer_addr: SocketAddr = format!("127.0.0.1:{}", 19390 + i).parse().unwrap();
+            let listener = tokio::net::TcpListener::bind(peer_addr).await.unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else { break };
+                    tokio::spawn(async move {
+                        let _stream = stream;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            });
+            let peer = dfs_common::NodeInfo::new(peer_id, peer_addr, None);
+            healing.cluster.add_node(peer).await.unwrap();
+        }
+        assert!(healing.cluster.is_leader().await, "local node (min id by construction) must be leader");
+
+        let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"f"))];
+        let start = std::time::Instant::now();
+        let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
+        let elapsed = start.elapsed();
+
+        assert!(authorized.is_empty(), "every peer times out — must defer, not authorize");
+        // Sequential (old: 2 RPCs/peer, one peer at a time) would be up to
+        // 4 * 2 * 5s = 40s; concurrent (new: 1 RPC/peer, all peers at once)
+        // should land close to one timeout's worth. Generous margin for CI.
+        assert!(elapsed < Duration::from_secs(15),
+            "authorize_live_file_orphan_deletes took {:?} for 4 unreachable peers — expected roughly \
+             one RPC timeout's worth of wall time (concurrent), not up to 8x that (sequential)", elapsed);
     }
 
     /// Leader case: queue_chunks_immediate must queue locally and return promptly —

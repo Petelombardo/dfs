@@ -1046,6 +1046,7 @@ pub(crate) fn classify_request(req: &Request) -> crate::stats::RpcClass {
         | Request::ReplicateChunkLocations { .. }
         | Request::ConfirmChunksLive { .. }
         | Request::GetPendingPatchChunkIds { .. }
+        | Request::GetOrphanAuthInfo
         | Request::GetPatchState { .. } => PeerOther,
 
         // Client: the three buckets asked about specifically
@@ -6792,6 +6793,7 @@ impl Server {
             }
             Request::GetPatchTokenIds => self.handle_get_patch_token_ids().await,
             Request::GetPendingPatchChunkIds => self.handle_get_pending_patch_chunk_ids().await,
+            Request::GetOrphanAuthInfo => self.handle_get_orphan_auth_info().await,
             Request::TriggerOrphanCleanup => {
                 self.handle_trigger_orphan_cleanup().await
             }
@@ -8751,6 +8753,30 @@ impl Server {
             }
         }
         Response::PendingPatchChunkIds { ids: ids.into_iter().collect() }
+    }
+
+    /// See Request::GetOrphanAuthInfo's doc comment — combines what
+    /// handle_get_pending_patch_chunk_ids and the GetNodeStats arm above compute
+    /// separately, for authorize_live_file_orphan_deletes' single-RPC-per-peer
+    /// use. Same union logic as handle_get_pending_patch_chunk_ids for the ids
+    /// field; same uptime_secs source as the GetNodeStats arm.
+    async fn handle_get_orphan_auth_info(&self) -> Response {
+        let mut ids = match self.metadata.all_pending_patch_chunk_ids_async().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!("handle_get_orphan_auth_info: failed to read local patch_state table: {}", e);
+                return Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError };
+            }
+        };
+        match self.metadata.all_patch_token_ids_async().await {
+            Ok(token_ids) => ids.extend(token_ids),
+            Err(e) => {
+                warn!("handle_get_orphan_auth_info: failed to read local patch token ids: {}", e);
+                return Response::Error { message: "Failed to read local metadata".to_string(), code: ErrorCode::InternalError };
+            }
+        }
+        let uptime_secs = self.ops_tracker.get_stats().uptime_secs;
+        Response::OrphanAuthInfo { uptime_secs, pending_patch_chunk_ids: ids.into_iter().collect() }
     }
 
     /// Run this node's local orphan reconciliation sweep right now instead of

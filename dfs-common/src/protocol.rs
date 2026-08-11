@@ -729,6 +729,19 @@ pub enum Request {
     /// Returns NodeStats. Safe to call on any node at any time.
     GetNodeStats,
 
+    /// Combined request added 2026-08-11 for the live-file-orphan-sweep leader
+    /// authorization path (authorize_live_file_orphan_deletes, healing.rs):
+    /// that path used to issue GetNodeStats + GetPendingPatchChunkIds as two
+    /// separate sequential RPCs per peer, on every sweep page — real RPC-count
+    /// cost that scales with cluster size and sweep frequency. This combines
+    /// exactly the two fields that call site actually needs (peer uptime,
+    /// peer's pending patch chunk ids) into one round trip. Deliberately NOT a
+    /// change to GetNodeStats or GetPendingPatchChunkIds themselves — both have
+    /// other, unrelated callers (dfs-admin and handle_confirm_chunks_live
+    /// respectively) that don't need or want the other field bundled in.
+    /// Returns OrphanAuthInfo.
+    GetOrphanAuthInfo,
+
     /// Trigger an immediate phantom-replica reconciliation pass: verifies actual
     /// presence on every listed node for every live chunk and prunes confirmed-
     /// absent ones, queuing under-RF results for immediate healing. Independent
@@ -1092,6 +1105,15 @@ pub enum Response {
     /// currently-Pending row in its local PATCH_STATE_TABLE.
     PendingPatchChunkIds {
         ids: Vec<ChunkId>,
+    },
+
+    /// Response to GetOrphanAuthInfo — see that request's doc comment.
+    /// `pending_patch_chunk_ids` is the same union GetPendingPatchChunkIds
+    /// returns (base/delta inputs + outstanding tokens); `uptime_secs` is the
+    /// same field NodeStats carries.
+    OrphanAuthInfo {
+        uptime_secs: u64,
+        pending_patch_chunk_ids: Vec<ChunkId>,
     },
 
     /// Chunk IDs response (for WriteFile)

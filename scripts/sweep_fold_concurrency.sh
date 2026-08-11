@@ -29,6 +29,14 @@ CLUSTER="127.0.0.1:8980,127.0.0.1:8981,127.0.0.1:8982,127.0.0.1:8983,127.0.0.1:8
 BIN="$REPO/target/release"
 DURATION="${1:-30}"
 FILE_SIZE_MB="${2:-256}"
+# Overridable via env — default 32 assumed a box that isn't also running the
+# 5-node cluster itself. On an 8-core dev box, 32 concurrent fsync-per-write
+# Python processes alone can oversubscribe every core regardless of what
+# fold_concurrency is set to, swamping the very signal this sweep exists to
+# measure (confirmed live 2026-08-11: load average hit 15.99 on 8 cores,
+# throughput flat-lined identically across widths 4-64). Lower this to
+# roughly nproc when running alongside the 5 server processes on the same box.
+NUM_WRITERS="${NUM_WRITERS:-32}"
 shift 2 2>/dev/null || shift $# 2>/dev/null || true
 WIDTHS=("$@")
 if [ "${#WIDTHS[@]}" -eq 0 ]; then
@@ -79,7 +87,7 @@ run_one_width() {
     FILE_SIZE_BYTES=$((FILE_SIZE_MB * 1024 * 1024))
     local start_ts=$(date +%s.%N)
     writer_pids=()
-    for w in $(seq 1 32); do
+    for w in $(seq 1 "$NUM_WRITERS"); do
         python3 - "$IMG" "$DURATION" "$FILE_SIZE_BYTES" "$w" > "$run_log/writer${w}.log" 2>&1 <<'PYEOF' &
 import os, sys, random, time
 img, duration, file_size, wid = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
@@ -107,7 +115,7 @@ PYEOF
 
     local total_ops=0
     local total_bytes=0
-    for w in $(seq 1 32); do
+    for w in $(seq 1 "$NUM_WRITERS"); do
         read -r ops bytes < "$run_log/writer${w}.log"
         total_ops=$((total_ops + ops))
         total_bytes=$((total_bytes + bytes))

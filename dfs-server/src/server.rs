@@ -1552,6 +1552,27 @@ struct DirtyPatchSlot {
     /// wrongly green-light the fast path. Added 2026-08-05 for merge-time
     /// patch no-op detection — see materialized_ring's doc comment.
     materialized_max_seq: Option<u64>,
+    /// Live chunk_map snapshot of this slot's occupant taken by apply_patch
+    /// immediately before it optimistically advances chunk_map to this
+    /// patch's own `token` — i.e. the chunk this patch is superseding, if any.
+    /// Added 2026-08-11 after a real VM-100 kdiskmark incident:
+    /// abandon_patch_if_base_gone deleted this patch's bookkeeping when its
+    /// base turned out already-consumed by a concurrent winning patch, but
+    /// left chunk_map parked on `token` — which was never folded, so every
+    /// future read of the slot failed cluster-wide forever. `token` itself is
+    /// NOT a safe substitute for this: it's whatever the client claimed as its
+    /// base, which can already be stale by apply time. This field is the
+    /// actual, freshly-read prior occupant, letting abandonment fall back to
+    /// it instead of leaving the slot on a phantom.
+    ///
+    /// In-memory-only, deliberately: reconstruction paths (resume sweep,
+    /// live-traffic reseed, merge-continuation fallbacks) have no live
+    /// snapshot to offer and set this None — same as `verified: false`, an
+    /// abandon that lands on one of those slots just can't fall back to a
+    /// prior chunk and leaves today's behavior unchanged, no worse than
+    /// before this field existed. A restart between apply and abandon loses
+    /// this hint the same way; a known, bounded gap, not a regression.
+    prior_chunk_id: Option<ChunkId>,
 }
 
 /// How long a slot's accumulator must sit fully idle (zero patches from
@@ -2102,9 +2123,66 @@ impl OverlayForkCtx {
                 warn!("single fold: {} chunk {} for file {} chunk_idx {} has no CHUNK_TABLE record anywhere \
                        (not just locally) — abandoning unrecoverable patch {}",
                     which, missing_chunk_id, file_id, chunk_idx, public_token);
-                self.dirty_patch_slots.remove(&(file_id, chunk_idx));
+                let removed = self.dirty_patch_slots.remove(&(file_id, chunk_idx));
                 if let Err(e) = self.metadata.delete_patch_state_abandoned_async(public_token, file_id, chunk_idx).await {
                     warn!("single fold: failed to delete abandoned patch_state for {}: {}", public_token, e);
+                }
+                // chunk_map still points at public_token (that's why this patch was
+                // even reachable to abandon — see abandon_patch_if_slot_superseded,
+                // which already handles the case where something else has since
+                // claimed the slot). public_token was never folded, so leaving it
+                // there strands the slot: unreadable on every node, forever. Fall
+                // back to prior_chunk_id — the live occupant apply_patch snapshotted
+                // right before optimistically advancing to public_token — but only
+                // if it actually resolves to a real, folded chunk: not itself gone
+                // (the same fate as missing_chunk_id, common when prior_chunk_id ==
+                // missing_chunk_id, i.e. no race actually happened) and not still a
+                // pending, never-folded token from some other in-flight accumulator
+                // (pending_patch_ids is the authoritative check — a public token is
+                // never itself a real file on disk, so restoring chunk_map to one
+                // would just trade today's phantom for a different one).
+                if let Some((_, slot)) = removed {
+                    if let Some(prior) = slot.prior_chunk_id {
+                        if prior != missing_chunk_id && !self.pending_patch_ids.contains_key(&prior) {
+                            match self.metadata.get_chunk_location_async(prior).await {
+                                Ok(Some(prior_loc)) => {
+                                    // Direct mutation, not update_chunk_map_after_patch: that
+                                    // helper's client_write_seq staleness guard exists to stop
+                                    // an out-of-order concurrent write from clobbering a NEWER
+                                    // one — the wrong tool here. public_token's own seq is very
+                                    // likely higher than prior's (it was the more recent write),
+                                    // so that guard would reject exactly the restore this branch
+                                    // exists to perform. There's no ordering question left to
+                                    // ask: public_token has already been independently confirmed
+                                    // unrecoverable above, regardless of its seq.
+                                    if let Some(mut entry) = self.chunk_map.get_mut(&file_id) {
+                                        let (locs, _) = entry.value_mut();
+                                        if let Some(pos) = Server::chunk_map_find_by_idx(locs, chunk_idx) {
+                                            locs[pos].chunk_id = prior;
+                                            locs[pos].checksum = prior.hash;
+                                            locs[pos].size = prior_loc.size;
+                                            locs[pos].written_at = Some(dfs_common::types::current_timestamp_ms());
+                                            locs[pos].client_write_seq = prior_loc.client_write_seq;
+                                            locs[pos].nodes = prior_loc.nodes.clone();
+                                        }
+                                    }
+                                    warn!("single fold: restored file {} chunk_idx {} to last known-good chunk {} \
+                                           after abandoning unrecoverable patch {}",
+                                        file_id, chunk_idx, prior, public_token);
+                                }
+                                Ok(None) => {
+                                    warn!("single fold: prior_chunk_id {} for file {} chunk_idx {} is also gone \
+                                           cluster-wide — cannot restore, slot left on abandoned patch {}",
+                                        prior, file_id, chunk_idx, public_token);
+                                }
+                                Err(e) => {
+                                    warn!("single fold: failed to verify prior_chunk_id {} for file {} chunk_idx {}: {} \
+                                           — not restoring on an inconclusive check",
+                                        prior, file_id, chunk_idx, e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Ok(Some(_)) => {
@@ -3936,6 +4014,7 @@ impl OverlayForkCtx {
                             fold_failures: 0,
                             last_fold_attempt_at: std::time::Instant::now(),
                             materialized_max_seq: None,
+                            prior_chunk_id: None, // reseed, no live snapshot available
                         });
                         self.pending_patch_ids.entry(token).or_insert((file_id, chunk_idx));
 
@@ -11276,6 +11355,7 @@ impl Server {
                     // post-restart merge regardless of this value — nothing to
                     // get wrong here.
                     materialized_max_seq: None,
+                    prior_chunk_id: None, // resume sweep, no live snapshot available
                 });
                 // Restore the in-memory pending_patch_ids entry too. It is
                 // populated only by apply_patch (this process's own writes) and
@@ -13175,6 +13255,7 @@ impl Server {
                                         fold_failures: 0,
                                         last_fold_attempt_at: std::time::Instant::now(),
                                         materialized_max_seq: Some(true_max_seq),
+                                        prior_chunk_id: None, // continuation of an already-current token, not a supersession
                                     });
                                 (Some(buf_arc), Some(true_max_seq))
                             }
@@ -13242,6 +13323,7 @@ impl Server {
                                 fold_failures: 0,
                                 last_fold_attempt_at: std::time::Instant::now(),
                                 materialized_max_seq: Some(record_seq),
+                                prior_chunk_id: None, // continuation of an already-current token, not a supersession
                             });
                         drop(patch_guard);
                         return Ok((chunk_id, base_size, None, None));
@@ -13463,6 +13545,22 @@ impl Server {
             }
             let _ = self.metadata.delete_chunk_location_async(chunk_id).await;
         }
+        // Live snapshot, taken strictly before update_chunk_map_after_patch below
+        // overwrites it — see DirtyPatchSlot::prior_chunk_id's doc comment. Only
+        // meaningful for a fresh accumulator (!is_merge): chunk_map's occupant
+        // here is base_chunk_id itself, a real folded chunk, safe to fall back
+        // to. For a merge continuation (is_merge), the occupant is the existing
+        // chain's own pending token — never folded, never safe to restore to —
+        // so this stays None and an abandon deep in a merge chain keeps today's
+        // (unfixed) behavior for that narrower case.
+        let live_prior_chunk_id = if !is_merge {
+            self.chunk_map.get(&file_id).and_then(|entry| {
+                let (locs, _) = entry.value();
+                Server::chunk_map_find_by_idx(locs, cidx).map(|i| locs[i].chunk_id)
+            })
+        } else {
+            None
+        };
         update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_map_old_id, public_token, needed_len, now_ms, client_write_seq);
 
         self.pending_patch_ids.insert(public_token, (file_id, cidx));
@@ -13488,6 +13586,7 @@ impl Server {
             fold_failures: 0,
             last_fold_attempt_at: std::time::Instant::now(),
             materialized_max_seq: if had_materialized_buf { Some(record_seq) } else { None },
+            prior_chunk_id: live_prior_chunk_id,
         });
         if !is_merge {
             // Fresh accumulator: this is the one patch in this cycle responsible
@@ -18148,6 +18247,116 @@ mod tests {
              fold must never overwrite a slot it no longer has authority over");
     }
 
+    /// 2026-08-11: real VM-100 kdiskmark I/O errors (both the original disk's
+    /// corruption and a freshly-recreated disk's later `dd` EIO) traced to this
+    /// exact shape — no exotic race, just two ordinary concurrent writes to the
+    /// same slot:
+    ///
+    ///   1. patch A is applied against base X, chunk_map advances to A's token.
+    ///   2. patch A's fold succeeds: X + delta -> winner. chunk_map now points
+    ///      at `winner`. X is retired (this is normal fold cleanup).
+    ///   3. patch B is applied — also against base X (it read the slot before
+    ///      step 2's fold retired X) — chunk_map optimistically advances to B's
+    ///      own public_token, *superseding* `winner`.
+    ///   4. patch B's fold finally runs, finds X has no CHUNK_TABLE record
+    ///      anywhere (legitimately consumed by step 2), and correctly refuses
+    ///      to fold — `abandon_patch_if_slot_superseded` doesn't catch this
+    ///      (chunk_map's current occupant IS still B's token, nothing else has
+    ///      superseded B), so it falls through to `abandon_patch_if_base_gone`.
+    ///
+    /// `abandon_patch_if_base_gone` cleans up `dirty_patch_slots` and the
+    /// PATCH_STATE_TABLE row for B's token — but never touches chunk_map. The
+    /// slot is left pointing at B's public_token, which was never physically
+    /// written (the fold that would have created it aborted) — instead of
+    /// falling back to `winner`, which is sitting right there on disk, valid.
+    /// Every future read of this slot fails cluster-wide ("chunk missing on
+    /// all replicas"), forever, until some unrelated later write happens to
+    /// land on the same slot again.
+    ///
+    /// This test reproduces steps 3-4 directly (no timing/load dependency):
+    /// chunk_map is seeded exactly as apply_patch would leave it mid-race,
+    /// `winner` exists on disk with a committed ChunkLocation (step 2's real
+    /// output), base X does not exist anywhere. Expected/fixed behavior: after
+    /// abandoning, the slot must resolve back to `winner`, not stay parked on
+    /// B's phantom token.
+    #[tokio::test]
+    async fn test_run_single_fold_abandon_base_gone_restores_slot_to_prior_chunk() {
+        let h = make_overlay_test_harness();
+        let ctx = h.server.overlay_ctx();
+
+        let file_id = FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // base_chunk_id (X): what patch B's fold was dispatched against. Already
+        // consumed by patch A's successful fold by the time B's fold runs —
+        // never written to storage, no ChunkLocation anywhere.
+        let base_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"already-retired-base"));
+
+        // winner_chunk_id: patch A's real, successful fold output — the slot's
+        // actual last-known-good content. On disk, with a committed location,
+        // exactly like any successful fold's own commit.
+        let winner_content = vec![7u8; 64];
+        let winner_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&winner_content, chunk_file_offset, file_id),
+        );
+        h.storage.write_chunk(&winner_chunk_id, &winner_content).unwrap();
+        h.metadata.put_chunk_location(&ChunkLocation {
+            chunk_id: winner_chunk_id, nodes: vec![h.server.cluster.local_node_id()],
+            size: winner_content.len(), checksum: winner_chunk_id.hash,
+            file_offset: Some(chunk_file_offset), written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(1), file_id: Some(file_id),
+        }).unwrap();
+
+        // public_token (B): the losing patch's own target identity. chunk_map is
+        // seeded here exactly as apply_patch's optimistic advance would leave it
+        // — superseding `winner` — mid-race, before B's own fold has run.
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"losing-patch-token"));
+        h.server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
+            chunk_id: public_token, nodes: vec![h.server.cluster.local_node_id()],
+            size: winner_content.len(), checksum: [0u8; 32],
+            file_offset: Some(chunk_file_offset), written_at: Some(dfs_common::types::current_timestamp()),
+            client_write_seq: Some(2), file_id: Some(file_id),
+        }], 1));
+
+        let mut delta_record = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+        delta_record.extend_from_slice(&encode_delta_record(2, 0, &[0xCDu8]));
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_record));
+        h.storage.write_chunk(&delta_chunk_id, &delta_record).unwrap();
+
+        // dirty_patch_slots, seeded exactly as apply_patch's own insert (server.rs,
+        // the !is_merge branch) would have left it: prior_chunk_id is the live
+        // chunk_map snapshot taken right before the optimistic advance above —
+        // `winner`, since that was the slot's real occupant at that moment.
+        h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            token: public_token,
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
+            prior_chunk_id: Some(winner_chunk_id),
+        });
+
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let result = ctx.run_single_fold(
+            file_id, chunk_idx, chunk_file_offset, public_token, base_chunk_id, delta_chunk_id, Some(2), now_secs, false, true, None,
+        ).await;
+
+        assert!(result.is_none(), "a fold whose base was legitimately consumed by a concurrent winner must abandon, not fold");
+
+        let chunk_map = h.server.chunk_map_ref();
+        let entry = chunk_map.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        let current = Server::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id);
+        assert_eq!(current, Some(winner_chunk_id),
+            "abandoning an unrecoverable patch must restore the slot to its last known-good \
+             chunk, not leave it parked on the abandoned patch's own never-written token — \
+             every future read of a slot left on the phantom token fails cluster-wide forever");
+    }
+
     /// 2026-08-09: fold_slot_now used to acquire chunk_patch_locks for a slot FIRST,
     /// then call run_single_fold, which only THEN queued for fold_hash_semaphore —
     /// so a background fold stuck waiting for a permit was blocking every OTHER
@@ -18205,6 +18414,7 @@ mod tests {
             fold_failures: 0,
             last_fold_attempt_at: std::time::Instant::now(),
             materialized_max_seq: None,
+            prior_chunk_id: None, // test setup
         });
 
         // Exhaust every currently-available permit — held in this Vec, not dropped
@@ -18300,6 +18510,7 @@ mod tests {
             fold_failures: 0,
             last_fold_attempt_at: std::time::Instant::now(),
             materialized_max_seq: None,
+            prior_chunk_id: None, // test setup
         });
 
         // Negative control: the UNLOCKED read (local_fold_fingerprint — what
@@ -18368,6 +18579,7 @@ mod tests {
             fold_failures: 0,
             last_fold_attempt_at: std::time::Instant::now(),
             materialized_max_seq: None,
+            prior_chunk_id: None, // test setup
         });
         drop(guard);
 
@@ -21794,6 +22006,7 @@ mod tests {
                 fold_failures: 0,
                 last_fold_attempt_at: std::time::Instant::now(),
                 materialized_max_seq: None,
+            prior_chunk_id: None, // test setup
             });
 
             // Now actually run the fold to completion and confirm it succeeds cleanly
@@ -21848,6 +22061,7 @@ mod tests {
                 fold_failures: 0,
                 last_fold_attempt_at: std::time::Instant::now(),
                 materialized_max_seq: None,
+            prior_chunk_id: None, // test setup
             });
 
             let outcome = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false, true).await;
@@ -21904,6 +22118,7 @@ mod tests {
                 fold_failures: 0,
                 last_fold_attempt_at: std::time::Instant::now(),
                 materialized_max_seq: None,
+            prior_chunk_id: None, // test setup
             });
 
             let outcome = h.server.overlay_ctx().fold_slot_now(file_id, chunk_idx, false, true).await;
@@ -22542,6 +22757,7 @@ mod tests {
                 fold_failures: 0,
                 last_fold_attempt_at: std::time::Instant::now(),
                 materialized_max_seq: None,
+            prior_chunk_id: None, // test setup
             });
 
             original_chunk_id

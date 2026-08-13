@@ -281,7 +281,38 @@ struct ChunkSlot {
     /// 2000ms STALE_FLUSH_MS fallback, forcing a multi-GB write-buffer cap just to
     /// avoid back-pressure on the resulting backlog.
     abandoned: bool,
+    /// Wall-clock timestamp of this slot's FIRST terminal failure — set once,
+    /// never overwritten (unlike retry_backoff_until, which moves every time).
+    /// terminal_failure_count alone can't safely gate a give-up decision: the
+    /// backoff schedule caps at 30s after only ~6 failures, so "N failures"
+    /// stops meaning a stable amount of elapsed time once a slot has been
+    /// stuck for a while — this field is what TERMINAL_GIVE_UP_AFTER actually
+    /// measures against. See give_up_after_terminal_failures' doc comment for
+    /// the incident (24+ hours of silent 30s retries) this closes.
+    first_terminal_failure_at: Option<std::time::Instant>,
 }
+
+/// How long a slot may sit in terminal-failure backoff before the background
+/// ticker gives up on it entirely and discards its buffered dirty bytes —
+/// see give_up_after_terminal_failures' doc comment for the real incident
+/// this closes and why 10 minutes (600 real retries at the steady-state 30s
+/// cadence's neighborhood, ~24 total attempts including the exponential
+/// ramp-up) was chosen: long enough that it cannot plausibly cut off a write
+/// that would have succeeded given more time (every legitimate case observed
+/// in the real incident logs settled within seconds to tens of seconds, not
+/// minutes), while finite enough to actually close the "retries forever"
+/// bug instead of just relabeling it. Shortened under #[cfg(test)] per this
+/// project's standing practice of not writing multi-minute-long tests —
+/// see feedback_timing_based_concurrency_tests_unreliable memory.
+#[cfg(not(test))]
+const TERMINAL_GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+#[cfg(test)]
+const TERMINAL_GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_millis(150);
+/// Require at least this many terminal failures before giving up, even if
+/// TERMINAL_GIVE_UP_AFTER has elapsed — cheap insurance against a single
+/// unlucky failure landing right at the wall-clock boundary from discarding
+/// data after essentially one attempt.
+const TERMINAL_GIVE_UP_MIN_FAILURES: u32 = 5;
 
 impl ChunkSlot {
     fn new() -> Self {
@@ -300,6 +331,7 @@ impl ChunkSlot {
             terminal_failure_count: 0,
             retry_backoff_until: None,
             abandoned: false,
+            first_terminal_failure_at: None,
         }
     }
 
@@ -308,11 +340,24 @@ impl ChunkSlot {
         self.terminal_failure_count = self.terminal_failure_count.saturating_add(1);
         let secs = 1u64 << self.terminal_failure_count.saturating_sub(1).min(5);
         self.retry_backoff_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(secs.min(30)));
+        if self.first_terminal_failure_at.is_none() {
+            self.first_terminal_failure_at = Some(std::time::Instant::now());
+        }
     }
 
     /// True if a prior terminal failure's backoff hasn't elapsed yet.
     fn in_backoff(&self) -> bool {
         self.retry_backoff_until.is_some_and(|t| std::time::Instant::now() < t)
+    }
+
+    /// True once this slot has failed the same terminal way for long enough,
+    /// and often enough, that continuing to retry it is pure cost with no
+    /// realistic chance of success — see give_up_after_terminal_failures'
+    /// doc comment for what happens when this fires and why it's safe.
+    fn give_up_after_terminal_failures(&self) -> bool {
+        self.terminal_failure_count >= TERMINAL_GIVE_UP_MIN_FAILURES
+            && self.first_terminal_failure_at
+                .is_some_and(|t| t.elapsed() >= TERMINAL_GIVE_UP_AFTER)
     }
 
     /// Record a write at [start, end) into dirty_ranges, merging with adjacent ranges.
@@ -2409,20 +2454,43 @@ impl FlushHandle {
             Ok(())
         } else {
             let mut backoff_secs = 0u64;
+            let mut gave_up = false;
             if let Some(buf) = self.write_buffers.get(&ino).map(|e| e.clone()) {
                 if let Some(shard) = buf.chunk_get(chunk_idx) {
                     let mut cs = shard.lock().await;
                     cs.slot.flushing = false;
                     cs.slot.consecutive_patch_failures = 0;
                     cs.slot.record_terminal_failure();
-                    backoff_secs = cs.slot.retry_backoff_until
-                        .map(|t| t.saturating_duration_since(std::time::Instant::now()).as_secs())
-                        .unwrap_or(0);
+                    if cs.slot.give_up_after_terminal_failures() {
+                        gave_up = true;
+                        let discarded_bytes = cs.slot.resident();
+                        let failure_count = cs.slot.terminal_failure_count;
+                        let stuck_for = cs.slot.first_terminal_failure_at
+                            .map(|t| t.elapsed()).unwrap_or_default();
+                        cs.slot = ChunkSlot::new();
+                        buf.active_chunks.remove(&chunk_idx);
+                        self.global_buffered_bytes.fetch_sub(
+                            discarded_bytes.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        error!("flush_buffer_async_one: ino={} chunk={} GIVING UP after {} terminal failures over \
+                               {:?} (base not in cache and unreadable from any replica each time) — discarding \
+                               {} buffered dirty bytes, this data is LOST. The application was already told about \
+                               this failure via the EIO from the write that triggered the first terminal failure; \
+                               this only stops the background ticker from retrying an unrecoverable write forever.",
+                            ino, chunk_idx, failure_count, stuck_for, discarded_bytes);
+                    } else {
+                        backoff_secs = cs.slot.retry_backoff_until
+                            .map(|t| t.saturating_duration_since(std::time::Instant::now()).as_secs())
+                            .unwrap_or(0);
+                    }
                 }
             }
-            warn!("flush_buffer_async_one: ino={} chunk={} base not in cache and unreadable from any replica — aborting \
-                   to prevent zeroing untouched chunk regions (returning EIO, backing off retries for this chunk {}s)",
-                ino, chunk_idx, backoff_secs);
+            if !gave_up {
+                warn!("flush_buffer_async_one: ino={} chunk={} base not in cache and unreadable from any replica — aborting \
+                       to prevent zeroing untouched chunk regions (returning EIO, backing off retries for this chunk {}s)",
+                    ino, chunk_idx, backoff_secs);
+            }
             self.notify_chunk_flush_complete(ino, chunk_idx).await;
             Err(anyhow::anyhow!(
                 "chunk {} cache miss: cannot safely fresh-write without zeroing untouched real data", chunk_idx
@@ -3714,6 +3782,24 @@ impl FlushHandle {
                     let mut cs = shard.lock().await;
                     cs.slot.flushing = false;
                     cs.slot.record_terminal_failure();
+                    if cs.slot.give_up_after_terminal_failures() {
+                        let discarded_bytes = cs.slot.resident();
+                        let failure_count = cs.slot.terminal_failure_count;
+                        let stuck_for = cs.slot.first_terminal_failure_at
+                            .map(|t| t.elapsed()).unwrap_or_default();
+                        cs.slot = ChunkSlot::new();
+                        if let Some(b) = buf.as_ref() { b.active_chunks.remove(&chunk_idx); }
+                        self.global_buffered_bytes.fetch_sub(
+                            discarded_bytes.min(self.global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        error!("flush_buffer_async_one: ino={} chunk={} GIVING UP after {} terminal failures over \
+                               {:?} (last error: {}) — discarding {} buffered dirty bytes, this data is LOST. The \
+                               application was already told about this failure via the EIO from the write that \
+                               triggered the first terminal failure; this only stops the background ticker from \
+                               retrying an unrecoverable write forever.",
+                            ino, chunk_idx, failure_count, stuck_for, e, discarded_bytes);
+                    }
                 }
                 self.notify_chunk_flush_complete(ino, chunk_idx).await;
                 Err(e)
@@ -9801,5 +9887,136 @@ mod reconstruct_fallback_tests {
             vec![0, 0, 9, 9, 0, 0, 0, 0],
             "untouched regions from base, dirty range from slot_data",
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_give_up_tests {
+    use super::*;
+
+    /// Gap: a slot that fails the same terminal way (base not in cache, not
+    /// readable from any replica) over and over previously had NO give-up
+    /// state — terminal_failure_count grew, retry_backoff_until capped at
+    /// 30s, but the buffered dirty bytes and the slot itself lived in
+    /// write_buffers forever, retried by the background ticker indefinitely.
+    /// Empirically confirmed on real staging: the same chunk retried every
+    /// ~30s for 24+ hours straight. This test drives the REAL entry point
+    /// (reconstruct_or_abort_for_fresh_write) repeatedly with a client that
+    /// can never find the base (empty cluster_nodes list — read_chunk_by_id
+    /// fails instantly, no network I/O, no chunk_cache entry) and proves:
+    /// while under TERMINAL_GIVE_UP_MIN_FAILURES/TERMINAL_GIVE_UP_AFTER
+    /// (shortened to 150ms under #[cfg(test)]), the dirty bytes survive every
+    /// failed attempt (the pre-fix behavior — this part passes unmodified
+    /// either way); once both are crossed, the slot must be discarded and its
+    /// resident bytes actually leave global_buffered_bytes.
+    #[tokio::test]
+    async fn stuck_slot_is_eventually_discarded_not_retried_forever() {
+        let client = Arc::new(DfsClient::new(vec!["127.0.0.1:1".parse().unwrap()]).unwrap());
+        // Guarantee read_chunk_by_id has nothing to try — no node_ids passed in
+        // (candidate lookup path), and cluster_nodes empty means no fallback
+        // list either, so it fails instantly with no network I/O.
+        *client.cluster_nodes.write().await = vec![];
+
+        let write_buffers: Arc<DashMap<u64, Arc<InodeWriteBuffer>>> = Arc::new(DashMap::new());
+        let ino = 42u64;
+        let chunk_idx = 0u64;
+        let file_id = dfs_common::FileId::new();
+        let buf = Arc::new(InodeWriteBuffer::new(false));
+        write_buffers.insert(ino, buf.clone());
+
+        // Seed the slot with real buffered dirty data — exactly what must
+        // eventually be discarded (or, before the fix, would be held forever).
+        let dirty_bytes = vec![0xABu8; 4096];
+        {
+            let shard = buf.chunk_entry(chunk_idx);
+            let mut cs = shard.lock().await;
+            cs.slot.extents.push((0, dirty_bytes.clone()));
+            cs.slot.span_end = dirty_bytes.len();
+            cs.slot.real_data_end = dirty_bytes.len();
+            cs.slot.dirty_ranges = vec![(0, dirty_bytes.len())];
+            buf.active_chunks.insert(chunk_idx);
+        }
+        let resident = {
+            let shard = buf.chunk_get(chunk_idx).unwrap();
+            let guard = shard.lock().await;
+            guard.slot.resident()
+        };
+        assert!(resident > 0, "precondition: slot has real dirty bytes buffered");
+
+        let global_buffered_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(resident));
+
+        let handle = FlushHandle {
+            client: client.clone(),
+            write_buffers: write_buffers.clone(),
+            metadata_cache: Arc::new(DashMap::new()),
+            chunk_write_locks: Arc::new(DashMap::new()),
+            flush_in_flight: Arc::new(RwLock::new(None)),
+            last_metadata_update: Arc::new(DashMap::new()),
+            last_bg_metadata_push: Arc::new(DashMap::new()),
+            dir_cache: Arc::new(DashMap::new()),
+            dir_cache_invalidated_at: Arc::new(DashMap::new()),
+            path_to_inode: Arc::new(RwLock::new(HashMap::new())),
+            inode_to_path: Arc::new(RwLock::new(HashMap::new())),
+            truncated_inodes: Arc::new(dashmap::DashSet::new()),
+            explicit_mtime_pending: Arc::new(dashmap::DashSet::new()),
+            flush_runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            global_buffered_bytes: global_buffered_bytes.clone(),
+            global_flush_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            write_tasks_in_flight: Arc::new(DashMap::new()),
+            flush_pipeline_locks: Arc::new(DashMap::new()),
+            use_dual_rf: false,
+            write_open_counts: Arc::new(DashMap::new()),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
+        };
+
+        let candidate = dfs_common::ChunkId::from_hash([0x11u8; 32]);
+
+        // Drive enough failed attempts to cross TERMINAL_GIVE_UP_MIN_FAILURES,
+        // but stay UNDER TERMINAL_GIVE_UP_AFTER (150ms in tests) — the slot
+        // must still be present and untouched. This is the part that was
+        // already true before this fix and must remain true: an ordinary
+        // transient run of failures must not discard data prematurely.
+        for _ in 0..(TERMINAL_GIVE_UP_MIN_FAILURES - 1) {
+            let mut slot_data = dirty_bytes.clone();
+            let result = handle.reconstruct_or_abort_for_fresh_write(
+                ino, file_id, chunk_idx, &mut slot_data, &[(0, dirty_bytes.len())], &[candidate],
+            ).await;
+            assert!(result.is_err(), "every attempt must fail — no base is ever reachable");
+        }
+        {
+            let shard = write_buffers.get(&ino).unwrap().chunk_get(chunk_idx).unwrap();
+            let cs = shard.lock().await;
+            assert!(!cs.slot.is_empty(),
+                "must NOT have given up yet — under TERMINAL_GIVE_UP_MIN_FAILURES attempts");
+        }
+
+        // Cross the wall-clock bound, then drive attempts until give-up fires
+        // (min-failures may already be satisfied, or need one more attempt).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for _ in 0..3 {
+            let mut slot_data = dirty_bytes.clone();
+            let _ = handle.reconstruct_or_abort_for_fresh_write(
+                ino, file_id, chunk_idx, &mut slot_data, &[(0, dirty_bytes.len())], &[candidate],
+            ).await;
+        }
+
+        // Dispose of handle's owned flush_runtime on a blocking thread — dropping an
+        // owned tokio::runtime::Runtime from inside another runtime's async context
+        // (this #[tokio::test]) panics ("Cannot drop a runtime..."). Nothing below
+        // this point needs `handle`, only the shared write_buffers/global_buffered_bytes.
+        tokio::task::spawn_blocking(move || drop(handle)).await.unwrap();
+
+        let shard = write_buffers.get(&ino).unwrap().chunk_get(chunk_idx).unwrap();
+        let cs = shard.lock().await;
+        assert!(cs.slot.is_empty(),
+            "BUG REPRODUCED: slot still holds buffered dirty bytes after crossing both the \
+             min-failure count and the wall-clock bound — the background ticker would retry \
+             this unrecoverable write forever, exactly as observed on real staging (24+ hours \
+             of ~30s retries on CT-119)");
+        assert!(!buf.active_chunks.contains(&chunk_idx),
+            "gave-up slot must be removed from active_chunks, not linger as a phantom entry");
+        assert_eq!(global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "discarded bytes must actually leave global_buffered_bytes accounting");
     }
 }

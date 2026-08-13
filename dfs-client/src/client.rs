@@ -6862,12 +6862,16 @@ leader_addr: Arc::new(RwLock::new(None)),
         patch_data: Vec<u8>,
         old_location: &dfs_common::ChunkLocation,
     ) -> Result<dfs_common::ChunkLocation> {
-        // On ChunkStale, the server tells us the current chunk_id — retry once with it.
+        // On ChunkStale, the server tells us the current chunk_id — retry with it.
         let mut current_location = old_location.clone();
         // Computed once outside the retry loop below: a ChunkStale retry is the same
         // logical operation, not a new one, so it must reuse the same target sequence.
         let new_chunk_seq = chunk_idx.map(|cidx| self.next_chunk_seq(file_id, cidx));
-        for attempt in 0u8..2 {
+        // Gap B — see the identical MAX_STALE_RETRY_ATTEMPTS comment in
+        // multi_patch_chunk_on_replicas_inner. Was 2 (exactly one retry).
+        const PATCH_CHUNK_MAX_ATTEMPTS: u8 = 5;
+        const STALE_RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(25);
+        for attempt in 0u8..PATCH_CHUNK_MAX_ATTEMPTS {
         // Resolve NodeId -> SocketAddr for the replica nodes
         let node_id_to_addr: HashMap<dfs_common::NodeId, SocketAddr> = {
             let addr_map = self.addr_to_node_id.read().await;
@@ -6964,7 +6968,7 @@ leader_addr: Arc::new(RwLock::new(None)),
         // If any replica said stale and none succeeded, retry with corrected chunk_id.
         if new_chunk_id.is_none() {
             if let Some((corrected_id, corrected_nodes)) = stale_response {
-                if attempt == 0 {
+                if attempt + 1 < PATCH_CHUNK_MAX_ATTEMPTS {
                     warn!("PatchChunk: client chunk_id {} is stale, retrying with server's {} (attempt {})",
                         old_chunk_id, corrected_id, attempt + 1);
                     old_chunk_id = corrected_id;
@@ -6978,6 +6982,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                         client_write_seq: self.write_seq.get(&file_id).map(|e| *e),
                         file_id: Some(file_id),
                     };
+                    tokio::time::sleep(STALE_RETRY_BACKOFF_BASE * (attempt as u32 + 1)).await;
                     continue;
                 }
             }
@@ -7141,10 +7146,24 @@ leader_addr: Arc::new(RwLock::new(None)),
         // a transient one first).
         const CONNECT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
         const CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(750);
-        // Original behavior preserved: a stale-base response got one immediate retry
-        // (attempt 0 -> 1) before falling through to "all replicas failed" — matches
-        // the original `0u8..2` loop bound's effective stale-retry allowance.
-        const MAX_STALE_RETRY_ATTEMPTS: u8 = 1;
+        // Gap B (raised 2026-08-13, CT-119/VM-108 write-path EIO investigation):
+        // was 1 (a single immediate retry, matching the original `0u8..2` loop
+        // bound) — under real observed chunk_map churn (a hot slot rewriting
+        // multiple times per second, confirmed via staging logs), a single retry
+        // against a single snapshot can easily still be stale by the time it
+        // lands, and the write hard-fails into a guest EIO even though the slot
+        // would have settled a moment later. Raised to give real convergence a
+        // chance; still a hard cap, not unbounded — a stale response recurring
+        // past this many retries indicates a genuinely broken invariant, not
+        // ordinary contention.
+        const MAX_STALE_RETRY_ATTEMPTS: u8 = 4;
+        // Short, escalating pause before each stale-retry — the original 1-retry
+        // design never needed one (it only ever fired once), but hammering a
+        // contested slot with zero delay across several retries is unlikely to
+        // help it converge any faster and just adds load. Deliberately much
+        // shorter than CONNECT_RETRY_BACKOFF: this is chasing routine chunk_map
+        // churn (expected to settle in milliseconds), not riding out a node outage.
+        const STALE_RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(25);
         let mut stale_retry_attempts: u8 = 0;
         let retry_started = std::time::Instant::now();
         // Attempt count is now just a hard safety backstop against a genuine infinite
@@ -7420,6 +7439,7 @@ leader_addr: Arc::new(RwLock::new(None)),
                     // still hit the same predictable 2 nodes.
                     old_chunk_id = fresh_id;
                     current_location = fresh_loc;
+                    tokio::time::sleep(STALE_RETRY_BACKOFF_BASE * stale_retry_attempts as u32).await;
                     continue 'retry;
                 }
                 warn!("MultiPatch: chunk {} still stale after {} retries — giving up",
@@ -9352,6 +9372,102 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_millis(5000),
             "must fail fast on a confirmed-unchanged answer, not exhaust the full ~6.7s STALE_RETRY_DELAYS_MS \
              schedule (observed: {:?})", elapsed);
+    }
+
+    /// Gap B (found 2026-08-13, CT-119/VM-108 write-path EIO investigation):
+    /// MultiPatch's stale-retry cap (MAX_STALE_RETRY_ATTEMPTS) allowed exactly
+    /// ONE retry before falling through to "all replicas failed" -> guest EIO.
+    /// Under real observed chunk_map churn (a hot slot rewriting multiple times
+    /// per second), a single retry against a single snapshot can easily still be
+    /// stale by the time it lands. This mock replica answers ChunkStale twice in
+    /// a row, then finally accepts the write on the third attempt — a single
+    /// retry cannot survive this, a bounded multi-retry can.
+    #[tokio::test]
+    async fn multipatch_survives_two_consecutive_stale_responses() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+
+        let addr: SocketAddr = "127.0.0.1:19403".parse().unwrap();
+        let node_id = NodeId::new();
+        let file_id = FileId::new();
+        let chunk_idx = 0u64;
+
+        let stale_id_1 = chunk_id_with_hash0(0x11);
+        let stale_id_2 = chunk_id_with_hash0(0x22);
+        let final_id = chunk_id_with_hash0(0x33);
+        let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        {
+            let attempt_count = attempt_count.clone();
+            tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                loop {
+                    let (mut stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                    let attempt_count = attempt_count.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let mut len_buf = [0u8; 4];
+                            if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                            let len = u32::from_be_bytes(len_buf) as usize;
+                            let mut buf = vec![0u8; len];
+                            if stream.read_exact(&mut buf).await.is_err() { return; }
+                            let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                            let request_id = envelope.request_id;
+                            let Message::Request(req) = envelope.message else { return };
+                            match req {
+                                Request::MultiPatch { file_id, .. } => {
+                                    let n = attempt_count.fetch_add(1, Ordering::SeqCst);
+                                    let resp = match n {
+                                        0 => Response::ChunkStale {
+                                            current_chunk_id: stale_id_1, current_nodes: vec![node_id],
+                                        },
+                                        1 => Response::ChunkStale {
+                                            current_chunk_id: stale_id_2, current_nodes: vec![node_id],
+                                        },
+                                        _ => Response::MultiPatchResult {
+                                            new_chunk_id: final_id, size: 4096, patch_ts: Some(1000), chunk_seq: Some(1),
+                                        },
+                                    };
+                                    write_envelope(&mut stream, request_id, resp).await;
+                                    let _ = file_id;
+                                }
+                                _ => {
+                                    write_envelope(&mut stream, request_id, Response::Error {
+                                        message: "unhandled in mock".to_string(), code: ErrorCode::InternalError,
+                                    }).await;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = DfsClient::new(vec![addr]).unwrap();
+        *client.leader_addr.write().await = Some(addr);
+        client.addr_to_node_id.write().await.insert(addr, node_id);
+        client.cluster_nodes.write().await.push(addr);
+
+        let old_location = loc_with_nodes(chunk_id_with_hash0(0x00), vec![node_id]);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.multi_patch_chunk_on_replicas_verified(
+                chunk_id_with_hash0(0x00), file_id, chunk_idx, 0,
+                vec![(0usize, vec![0xAB; 4])], &old_location, None, false,
+                Arc::new(HashMap::new()),
+            ),
+        ).await;
+
+        assert!(result.is_ok(), "must not hang past the 10s test timeout");
+        match result.unwrap() {
+            Ok((loc, _)) => assert_eq!(loc.chunk_id, final_id,
+                "must have adopted the eventually-successful chunk_id"),
+            Err(e) => panic!(
+                "BUG REPRODUCED (Gap B): gave up after too few stale-retries even though the \
+                 third attempt would have succeeded — got: {}", e),
+        }
+        assert!(attempt_count.load(Ordering::SeqCst) >= 3,
+            "must have actually made a third attempt, not just gotten lucky on retry count");
     }
 
     /// An empty batch must be a no-op — no network call, no error — since callers

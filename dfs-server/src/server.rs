@@ -728,6 +728,26 @@ fn fold_successor_write_seq(current_slot_seq: Option<u64>, delta_seq: Option<u64
 /// exactly one implementation — this project has been bitten before by chunk_map
 /// updates drifting out of sync across near-duplicate call sites (see the four-layer
 /// chunk_locations drop fix).
+///
+/// Returns `Some(current_location)` when the staleness guard below rejected the
+/// update — i.e. chunk_map was NOT advanced to `new_chunk_id`, and `current_location`
+/// is what it actually holds instead (the same entry the guard read to make its
+/// decision, so the caller gets it for free). Returns `None` for every other case
+/// (applied, same-id no-op, no matching entry to update) — those are all pre-existing,
+/// unrelated-to-this-fix behavior and callers should keep treating them as before.
+///
+/// 2026-08-13 fix (CT-119 incident root cause): before this, the staleness rejection
+/// below was silent — it logged a WARN and returned, but every caller proceeded as if
+/// the update had landed, and `handle_multi_patch`/`handle_patch_chunk` sent the
+/// client a plain success response regardless. A patch whose chunk_map advance got
+/// silently rejected here would still be acked as successful; the client believed its
+/// new chunk_id was current while chunk_map never actually moved — and a subsequent,
+/// entirely correct fold-abandon check (reading chunk_map and finding it didn't match
+/// the "pending" patch) would then abandon the patch with no way to ever tell the
+/// client its earlier "success" wasn't real. Confirmed as the exact mechanism behind
+/// a real 24h-stuck CT-119 slot via live log tracing (two independent replicas, same
+/// 31-36ms creation-to-abandon gap). This return value lets callers surface a
+/// retriable ChunkStale instead of a false success.
 fn update_chunk_map_after_patch(
     chunk_map: &Arc<DashMap<FileId, (Vec<ChunkLocation>, u64)>>,
     file_id: FileId,
@@ -737,11 +757,12 @@ fn update_chunk_map_after_patch(
     size: usize,
     written_at_ms: u64,
     new_client_write_seq: Option<u64>,
-) {
+) -> Option<ChunkLocation> {
     if new_chunk_id == old_chunk_id {
-        return;
+        return None;
     }
     const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+    let mut rejected: Option<ChunkLocation> = None;
     if let Some(mut entry) = chunk_map.get_mut(&file_id) {
         let (locations, _) = entry.value_mut();
         let found = match chunk_idx {
@@ -804,6 +825,7 @@ fn update_chunk_map_after_patch(
                 warn!("update_chunk_map_after_patch: rejecting stale self-computed update for file {} \
                        (incoming {} seq={:?} vs current {} seq={:?}) — a later write already advanced this slot",
                     file_id, new_chunk_id, new_client_write_seq, loc.chunk_id, loc.client_write_seq);
+                rejected = Some(loc.clone());
             } else {
                 loc.chunk_id = new_chunk_id;
                 loc.checksum = new_chunk_id.hash;
@@ -813,6 +835,7 @@ fn update_chunk_map_after_patch(
             }
         }
     }
+    rejected
 }
 
 /// On-disk format for an overlay patch delta: a plain concatenation of records,
@@ -3471,7 +3494,15 @@ impl OverlayForkCtx {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        update_chunk_map_after_patch(&self.chunk_map, file_id, Some(chunk_idx), public_token, new_chunk_id, final_size, now_ms, final_client_write_seq);
+        // Rejected-as-stale is expected and benign here (unlike the two apply_patch
+        // call sites below, there's no synchronous client response to correct): it
+        // means a genuinely newer write already advanced this slot past this fold's
+        // own result while the fold was running — exactly the scenario the staleness
+        // guard's doc comment describes. Logged for diagnostic visibility only.
+        if let Some(current) = update_chunk_map_after_patch(&self.chunk_map, file_id, Some(chunk_idx), public_token, new_chunk_id, final_size, now_ms, final_client_write_seq) {
+            debug!("single fold: chunk_map update for file {} chunk {} superseded by newer write ({} already current) — fold result {} not applied to chunk_map, no action needed",
+                file_id, chunk_idx, current.chunk_id, new_chunk_id);
+        }
 
         // The fold just changed this (file_id, chunk_idx) slot's current identity
         // WITHOUT any client-visible RPC — nothing else in the cluster would ever
@@ -4607,6 +4638,23 @@ impl Drop for FoldHealingCancelGuard {
 }
 
 impl Server {
+    /// True if this slot has crossed MAX_FOLD_FAILURES_BEFORE_ESCALATION and is
+    /// still within its escalated backoff window (FOLD_ESCALATED_RETRY_INTERVAL
+    /// since the last attempt) — i.e. ANY fold-retry trigger for this slot,
+    /// not just debounce_fold_slot's own timer, should skip this attempt
+    /// rather than hammer a chronically-failing fold. Same condition
+    /// start_patch_fold_sweep_loop already gates its own retries on; extracted
+    /// so handle_propose_fold's DeclinedStaleProposer spawn (2026-08-13 fix)
+    /// respects the identical backoff instead of bypassing it. A slot with no
+    /// dirty_patch_slots entry at all is treated as never having failed —
+    /// permissive by default, same as the sweep loop.
+    fn dirty_slot_currently_escalated(&self, file_id: FileId, chunk_idx: u64) -> bool {
+        self.dirty_patch_slots.get(&(file_id, chunk_idx))
+            .map(|e| e.value().fold_failures >= MAX_FOLD_FAILURES_BEFORE_ESCALATION
+                && e.value().last_fold_attempt_at.elapsed() < FOLD_ESCALATED_RETRY_INTERVAL)
+            .unwrap_or(false)
+    }
+
     /// Shared capacity formula for chunk_ring/delta_ring/materialized_ring, each
     /// getting an explicit fraction of `dfs_common::calculate_server_cache_budget_mb()`.
     /// ChunkStorage::calculate_cache_size takes the other 50% directly (not through
@@ -11240,12 +11288,10 @@ impl Server {
                 // exactly the waste this whole mechanism exists to stop.
                 let stale: Vec<(FileId, u64)> = server.dirty_patch_slots.iter()
                     .filter(|e| {
-                        let slot = e.value();
-                        slot.last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE
-                            && (slot.fold_failures < MAX_FOLD_FAILURES_BEFORE_ESCALATION
-                                || slot.last_fold_attempt_at.elapsed() >= FOLD_ESCALATED_RETRY_INTERVAL)
+                        e.value().last_patch_at.elapsed() >= PATCH_DEBOUNCE_IDLE
                     })
                     .map(|e| *e.key())
+                    .filter(|&(file_id, chunk_idx)| !server.dirty_slot_currently_escalated(file_id, chunk_idx))
                     .collect();
                 if stale.is_empty() {
                     continue;
@@ -12838,10 +12884,16 @@ impl Server {
     /// background task (never blocking this call, never blocking any chunk but this
     /// exact one) instead of dropping it here.
     ///
-    /// Returns (public_token, size, patch_ts_ms_if_changed, full_buffer_if_produced).
-    /// The buffer is only Some when a full rewrite actually happened inline (the
-    /// chunk_idx=None fallback) — callers that want to re-key an in-memory ring cache
-    /// (MultiPatch) can use it when present and skip that optimization otherwise.
+    /// Returns (public_token, size, patch_ts_ms_if_changed, full_buffer_if_produced,
+    /// chunk_map_rejected). The buffer is only Some when a full rewrite actually
+    /// happened inline (the chunk_idx=None fallback) — callers that want to re-key an
+    /// in-memory ring cache (MultiPatch) can use it when present and skip that
+    /// optimization otherwise. `chunk_map_rejected` is `Some(current_location)` when
+    /// update_chunk_map_after_patch's staleness guard rejected this patch's chunk_map
+    /// advance — see that function's doc comment (2026-08-13 fix). Callers MUST check
+    /// this: `Ok(...)` alone no longer means the client's write is safe to
+    /// unconditionally ack as successful — `chunk_map_rejected.is_some()` means it
+    /// should surface as a retriable ChunkStale instead.
     async fn apply_patch(
         &self,
         patch_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -12852,7 +12904,7 @@ impl Server {
         patches: Vec<(usize, Vec<u8>)>,
         client_write_seq: Option<u64>,
         prefetched: Option<Arc<Vec<u8>>>,
-    ) -> Result<(ChunkId, usize, Option<u64>, Option<Arc<Vec<u8>>>), (String, ErrorCode)> {
+    ) -> Result<(ChunkId, usize, Option<u64>, Option<Arc<Vec<u8>>>, Option<ChunkLocation>), (String, ErrorCode)> {
         let Some(cidx) = chunk_idx else {
             // No stable per-slot key to track a pending patch against — see
             // handle_multi_patch's original "No chunk_idx" comment for when this
@@ -12889,8 +12941,8 @@ impl Server {
                 warn!("apply_patch: cancel_healing_for_chunk task panicked for {}: {}", chunk_id, e);
             }
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-            update_chunk_map_after_patch(&self.chunk_map, file_id, None, chunk_id, new_chunk_id, size, now_ms, client_write_seq);
-            return Ok((new_chunk_id, size, if new_chunk_id != chunk_id { Some(now_ms) } else { None }, Some(buf)));
+            let chunk_map_rejected = update_chunk_map_after_patch(&self.chunk_map, file_id, None, chunk_id, new_chunk_id, size, now_ms, client_write_seq);
+            return Ok((new_chunk_id, size, if new_chunk_id != chunk_id { Some(now_ms) } else { None }, Some(buf), chunk_map_rejected));
         };
         let patch_guard = patch_guard.expect("chunk_idx Some implies patch_guard Some (see callers)");
 
@@ -13384,7 +13436,7 @@ impl Server {
                                 prior_chunk_id: None, // continuation of an already-current token, not a supersession
                             });
                         drop(patch_guard);
-                        return Ok((chunk_id, base_size, None, None));
+                        return Ok((chunk_id, base_size, None, None, None));
                     } else {
                         // Real change: buffer already mutated above (off the worker
                         // thread). Falls through to the existing write path
@@ -13619,7 +13671,7 @@ impl Server {
         } else {
             None
         };
-        update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_map_old_id, public_token, needed_len, now_ms, client_write_seq);
+        let chunk_map_rejected = update_chunk_map_after_patch(&self.chunk_map, file_id, Some(cidx), chunk_map_old_id, public_token, needed_len, now_ms, client_write_seq);
 
         self.pending_patch_ids.insert(public_token, (file_id, cidx));
         self.pending_patch_ids.insert(base_chunk_id, (file_id, cidx));
@@ -13717,7 +13769,7 @@ impl Server {
             }
         }
 
-        Ok((public_token, needed_len, Some(now_ms), None))
+        Ok((public_token, needed_len, Some(now_ms), None, chunk_map_rejected))
     }
 
     /// Apply a patch to an existing chunk without transferring the full chunk over the network.
@@ -13797,7 +13849,27 @@ impl Server {
         ).await;
 
         match result {
-            Ok((new_chunk_id, size, _patch_ts, _buf)) => {
+            Ok((new_chunk_id, size, _patch_ts, _buf, chunk_map_rejected)) => {
+                // 2026-08-13 fix: chunk_map's own staleness guard rejected this
+                // patch's advance — a later write already holds the slot. This is
+                // NOT a successful patch from the client's perspective even though
+                // apply_patch's local writes (delta, patch_state) landed fine —
+                // acking it as PatchChunkResult would tell the client its write is
+                // now current when chunk_map never actually moved, exactly the
+                // false-success gap that left a real slot dangling for 24+ hours on
+                // staging (see update_chunk_map_after_patch's doc comment). Return
+                // the real current location as a retriable ChunkStale instead —
+                // the client's already-bounded retry logic (Gap A/B, fixed earlier
+                // today) handles this cleanly.
+                if let Some(current) = chunk_map_rejected {
+                    info!("PatchChunk: {} -> {} chunk_map update rejected as stale (current is {}) — \
+                           returning ChunkStale instead of false success",
+                        chunk_id, new_chunk_id, current.chunk_id);
+                    return Response::ChunkStale {
+                        current_chunk_id: current.chunk_id,
+                        current_nodes: current.nodes,
+                    };
+                }
                 info!("PatchChunk: {} -> {} ({} bytes at intra_offset={})", chunk_id, new_chunk_id, patch_len, intra_offset);
                 // Record-only for now — see CHUNK_SEQ_TABLE's doc comment. Nothing
                 // rejects on this yet, so failures here are logged, not fatal.
@@ -13832,15 +13904,25 @@ impl Server {
                 // fatal Error that EIOs the guest. Same rationale as handle_multi_patch's
                 // Err arm (client bounds ChunkStale retries, so no infinite loop).
                 let stale = if code == ErrorCode::NotFound {
-                    chunk_idx.and_then(|cidx| {
-                        self.chunk_map.get(&file_id).and_then(|e| {
-                            let (locs, _) = e.value();
-                            Self::chunk_map_find_by_idx(locs, cidx).map(|i| Response::ChunkStale {
-                                current_chunk_id: locs[i].chunk_id,
-                                current_nodes: locs[i].nodes.clone(),
+                    match chunk_idx {
+                        Some(cidx) => {
+                            let local = self.chunk_map.get(&file_id).and_then(|e| {
+                                let (locs, _) = e.value();
+                                Self::chunk_map_find_by_idx(locs, cidx).map(|i| locs[i].clone())
+                            });
+                            // Gap A — see the identical comment in handle_multi_patch's
+                            // matching Err arm.
+                            let candidate = match local {
+                                Some(loc) => Some(loc),
+                                None => self.refresh_slot_from_leader(file_id, cidx, chunk_id).await,
+                            };
+                            candidate.map(|loc| Response::ChunkStale {
+                                current_chunk_id: loc.chunk_id,
+                                current_nodes: loc.nodes,
                             })
-                        })
-                    })
+                        }
+                        None => None,
+                    }
                 } else {
                     None
                 };
@@ -14204,7 +14286,20 @@ impl Server {
                 chunk_seq_elapsed, staleness_check_elapsed, evict_pending_elapsed, prefetch_wait_elapsed, ghost_retry_elapsed, unacct_handle);
         }
         match result {
-            Ok((new_chunk_id, final_size, patch_ts, final_buf)) => {
+            Ok((new_chunk_id, final_size, patch_ts, final_buf, chunk_map_rejected)) => {
+                // 2026-08-13 fix — see the identical check/comment in
+                // handle_patch_chunk's matching Ok arm, and
+                // update_chunk_map_after_patch's doc comment for the full incident
+                // this closes.
+                if let Some(current) = chunk_map_rejected {
+                    info!("MultiPatch: {} -> {} chunk_map update rejected as stale (current is {}) — \
+                           returning ChunkStale instead of false success",
+                        chunk_id, new_chunk_id, current.chunk_id);
+                    return Response::ChunkStale {
+                        current_chunk_id: current.chunk_id,
+                        current_nodes: current.nodes,
+                    };
+                }
                 info!("MultiPatch: {} -> {} (final size={}, chunk_idx={:?}, full_rewrite={})",
                     chunk_id, new_chunk_id, final_size, chunk_idx, final_buf.is_some());
 
@@ -14286,15 +14381,31 @@ impl Server {
                 // meaningful thing to hand back. With L1/L3 stopping ghosts from forming
                 // cluster-wide, this is a last-resort net for a transient local ghost.
                 let stale = if code == ErrorCode::NotFound {
-                    chunk_idx.and_then(|cidx| {
-                        self.chunk_map.get(&file_id).and_then(|e| {
-                            let (locs, _) = e.value();
-                            Self::chunk_map_find_by_idx(locs, cidx).map(|i| Response::ChunkStale {
-                                current_chunk_id: locs[i].chunk_id,
-                                current_nodes: locs[i].nodes.clone(),
+                    match chunk_idx {
+                        Some(cidx) => {
+                            let local = self.chunk_map.get(&file_id).and_then(|e| {
+                                let (locs, _) = e.value();
+                                Self::chunk_map_find_by_idx(locs, cidx).map(|i| locs[i].clone())
+                            });
+                            // Gap A (2026-08-13, CT-119/VM-108 write-path EIO): this
+                            // replica's own chunk_map may simply have no entry for the
+                            // slot at all (never received a ReplicateChunkLocation for
+                            // it) even when the leader knows the real current chunk one
+                            // hop away — the same signal apply_patch's own sibling check
+                            // already consults (refresh_slot_from_leader, ~13022-13031).
+                            // Ask before giving up, instead of hard-failing straight to
+                            // guest EIO.
+                            let candidate = match local {
+                                Some(loc) => Some(loc),
+                                None => self.refresh_slot_from_leader(file_id, cidx, chunk_id).await,
+                            };
+                            candidate.map(|loc| Response::ChunkStale {
+                                current_chunk_id: loc.chunk_id,
+                                current_nodes: loc.nodes,
                             })
-                        })
-                    })
+                        }
+                        None => None,
+                    }
                 } else {
                     None
                 };
@@ -14319,6 +14430,38 @@ impl Server {
     /// client" mismatch this whole ForceFold mechanism exists to prevent.
     async fn handle_force_fold(&self, file_id: dfs_common::FileId, chunk_idx: u64) -> Response {
         self.wait_if_compaction_quiescing().await;
+        // 2026-08-13 fix: ForceFold bypasses fold_slot_coordinated entirely (see
+        // this function's doc comment above) and previously never consulted
+        // fold_lock_grants at all — only chunk_patch_locks, which is purely
+        // local and carries no cross-node meaning. That let a client's ForceFold
+        // race a peer's independent, already-granted coordinate_and_fold_slot
+        // attempt for the exact same slot: this node could grant a peer the
+        // lease via handle_propose_fold (below) in the narrow window before its
+        // own ForceFold-triggered fold_slot_now ever acquires chunk_patch_locks,
+        // then proceed anyway, unaware it just promised the slot away. Both
+        // nodes then run real fold I/O against the same slot concurrently.
+        // fold_slot_now's own patch_state re-check under chunk_patch_locks
+        // still catches this AFTER the fact (whichever finishes first commits
+        // cleanly, the other backs off via AdoptedElsewhere) — this check adds
+        // the missing BEFORE-the-fact guard, mirroring exactly what
+        // coordinate_and_fold_slot's own step 0 already does for its callers.
+        // Cheap (a single DashMap read) and a no-op in the common case where no
+        // grant is outstanding — deliberately NOT a wait-and-retry loop, since
+        // a peer's fold can legitimately take up to ~27s (see
+        // FOLD_COORD_LOCK_TTL's doc comment) and ForceFold's caller is
+        // typically a synchronous client path (e.g. fsync) that shouldn't be
+        // blocked anywhere near that long.
+        let key = (file_id, chunk_idx);
+        if let Some(grant) = self.fold_lock_grants.get(&key) {
+            if grant.value().expires_at > std::time::Instant::now() {
+                return Response::Error {
+                    message: format!(
+                        "ForceFold: file {} chunk {} is already leased to a peer for coordinated \
+                         folding — retry shortly", file_id, chunk_idx),
+                    code: ErrorCode::InternalError,
+                };
+            }
+        }
         // ForceFold bypasses fold_slot_coordinated entirely — never reaches
         // announce_fold_result, so this is its only peer-directed broadcast.
         if matches!(self.overlay_ctx().fold_slot_now(file_id, chunk_idx, true, true).await, FoldSlotOutcome::Failed) {
@@ -14404,8 +14547,21 @@ impl Server {
                 respond(ProposeFoldOutcome::Granted)
             }
             std::cmp::Ordering::Less => {
-                let ctx = self.overlay_ctx();
-                tokio::spawn(async move { ctx.coordinate_and_fold_slot(file_id, chunk_idx).await; });
+                // Gap (found 2026-08-13, CT-119/VM-108 write-path EIO
+                // investigation): this spawn used to fire unconditionally on
+                // every losing ProposeFold comparison, completely bypassing
+                // debounce_fold_slot's own escalated backoff for a
+                // chronically-failing slot. Under a sustained write storm on
+                // one hot slot whose fold cannot currently succeed (e.g. its
+                // base is genuinely unrecoverable), every peer's incoming
+                // ProposeFold re-triggered a doomed fold attempt instantly —
+                // observed as a sub-millisecond spin on staging, hammering the
+                // cluster and burning healing cycles that debounce_fold_slot's
+                // 30-minute backoff was specifically designed to prevent.
+                if !self.dirty_slot_currently_escalated(file_id, chunk_idx) {
+                    let ctx = self.overlay_ctx();
+                    tokio::spawn(async move { ctx.coordinate_and_fold_slot(file_id, chunk_idx).await; });
+                }
                 respond(ProposeFoldOutcome::DeclinedStaleProposer)
             }
             std::cmp::Ordering::Equal => {
@@ -18415,6 +18571,64 @@ mod tests {
              every future read of a slot left on the phantom token fails cluster-wide forever");
     }
 
+    /// Gap (found 2026-08-13, CT-119/VM-108 write-path EIO investigation):
+    /// handle_propose_fold's DeclinedStaleProposer branch used to spawn
+    /// coordinate_and_fold_slot unconditionally, bypassing debounce_fold_slot's
+    /// own escalated backoff (FOLD_ESCALATED_RETRY_INTERVAL) for a
+    /// chronically-failing slot entirely — a peer's losing ProposeFold could
+    /// re-trigger a doomed fold attempt instantly, as often as it arrived,
+    /// independent of how many times that exact fold had already failed.
+    /// Exercises dirty_slot_currently_escalated directly (a plain sync
+    /// function, no need for real elapsed wall-clock time — Instant supports
+    /// exact subtraction) rather than trying to observe a fire-and-forget
+    /// tokio::spawn side effect.
+    #[test]
+    fn dirty_slot_currently_escalated_gates_correctly() {
+        let h = make_overlay_test_harness();
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+
+        assert!(!h.server.dirty_slot_currently_escalated(file_id, chunk_idx),
+            "no dirty_patch_slots entry at all must be permissive (never failed before)");
+
+        let base_slot = || DirtyPatchSlot {
+            token: ChunkId::from_hash(compute_chunk_hash(b"escalation-test-token")),
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
+            prior_chunk_id: None,
+        };
+
+        h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            fold_failures: MAX_FOLD_FAILURES_BEFORE_ESCALATION - 1,
+            ..base_slot()
+        });
+        assert!(!h.server.dirty_slot_currently_escalated(file_id, chunk_idx),
+            "below the failure threshold must never be treated as escalated, regardless of timing");
+
+        h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            fold_failures: MAX_FOLD_FAILURES_BEFORE_ESCALATION,
+            last_fold_attempt_at: std::time::Instant::now(),
+            ..base_slot()
+        });
+        assert!(h.server.dirty_slot_currently_escalated(file_id, chunk_idx),
+            "BUG REPRODUCED if false: at/past the failure threshold with a fresh last-attempt \
+             timestamp must be escalated — this is exactly the condition under which the old \
+             unconditional spawn in handle_propose_fold hammered a chronically-failing slot");
+
+        h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            fold_failures: MAX_FOLD_FAILURES_BEFORE_ESCALATION + 5,
+            last_fold_attempt_at: std::time::Instant::now() - FOLD_ESCALATED_RETRY_INTERVAL,
+            ..base_slot()
+        });
+        assert!(!h.server.dirty_slot_currently_escalated(file_id, chunk_idx),
+            "once the escalated backoff window has actually elapsed, retries must be allowed again");
+    }
+
     /// 2026-08-11 VM-108 restore corruption: the sibling test above proves
     /// restore-to-prior_chunk_id is correct when nothing else has touched the
     /// slot since B's optimistic advance. This test proves the gap in that same
@@ -18629,6 +18843,91 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, FoldSlotOutcome::FoldedHere(..)),
             "fold must still succeed normally once it can acquire both the permit and the lock");
+    }
+
+    /// 2026-08-13 fix (CT-119/VM-108 investigation): ForceFold (handle_force_fold)
+    /// bypasses fold_slot_coordinated entirely and, before this fix, never
+    /// consulted fold_lock_grants — only chunk_patch_locks, which is purely
+    /// local and carries no cross-node meaning. That let a client's ForceFold
+    /// race a peer's already-granted coordinate_and_fold_slot attempt for the
+    /// exact same slot: this node could have already promised the slot to a
+    /// peer via handle_propose_fold (fold_lock_grants.insert), yet ForceFold
+    /// would still proceed with its own uncoordinated fold, unaware. This test
+    /// proves ForceFold now respects an outstanding grant instead of running a
+    /// second, concurrent fold against the same slot.
+    #[tokio::test]
+    async fn force_fold_declines_when_slot_already_leased_to_a_peer() {
+        let h = make_overlay_test_harness();
+        let file_id = FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // Real, genuinely-foldable pending patch — if ForceFold ignores the
+        // grant below, this WOULD fold successfully, proving the bug.
+        let base_content = vec![7u8; 64];
+        let base_chunk_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        h.storage.write_chunk(&base_chunk_id, &base_content).unwrap();
+        let mut delta_bytes = DELTA_ACCUMULATOR_V2_MAGIC.to_le_bytes().to_vec();
+        delta_bytes.extend_from_slice(&encode_delta_record(1, 0, &[9u8; 8]));
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(&delta_bytes));
+        h.storage.write_chunk(&delta_chunk_id, &delta_bytes).unwrap();
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"force-fold-lease-test-token"));
+        h.metadata.put_patch_state_pending(
+            file_id, chunk_idx, &public_token, base_chunk_id, delta_chunk_id, 64, 1000, Some(1),
+        ).unwrap();
+        let mut file_meta = dfs_common::FileMetadata::new("/force-fold-lease-test".to_string(), dfs_common::types::FileType::RegularFile);
+        file_meta.id = file_id;
+        h.metadata.put_file(&file_meta).unwrap();
+        h.server.dirty_patch_slots.insert((file_id, chunk_idx), DirtyPatchSlot {
+            token: public_token,
+            last_patch_at: std::time::Instant::now(),
+            delta_hasher: blake3::Hasher::new(),
+            verified: true,
+            legacy_delta_format: false,
+            fold_failures: 0,
+            last_fold_attempt_at: std::time::Instant::now(),
+            materialized_max_seq: None,
+            prior_chunk_id: None, // test setup
+        });
+
+        // A peer already holds a valid, unexpired lease on this exact slot —
+        // as if this node's own handle_propose_fold just granted it.
+        h.server.fold_lock_grants.insert((file_id, chunk_idx), FoldLockGrant {
+            holder: NodeId::new(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        });
+
+        let resp = h.server.handle_force_fold(file_id, chunk_idx).await;
+
+        // The primary proof: the pending patch must be completely untouched —
+        // no fold attempt was made at all while the peer's lease is active.
+        // Checked first and independent of exactly which response shape a
+        // rejected attempt produces, since an uncoordinated fold that runs
+        // anyway can surface as more than one downstream error shape
+        // depending on unrelated test-setup details (e.g. this harness's
+        // minimal chunk_map wiring) — the state left behind is the
+        // unambiguous signal.
+        match h.metadata.get_patch_state(&public_token).unwrap() {
+            Some(PatchState::Pending { .. }) => {}
+            other => panic!(
+                "BUG REPRODUCED: the pending patch did not remain untouched Pending — ForceFold \
+                 ran a real fold attempt against this slot even though a peer already holds an \
+                 active fold_lock_grants lease on it (server response was {:?}). This is the \
+                 exact uncoordinated-concurrent-fold race that lets two nodes run real fold I/O \
+                 against the same slot at once. Got patch_state: {:?}", resp, other),
+        }
+
+        // Secondary check: the response itself should clearly explain why,
+        // not just silently do nothing.
+        match resp {
+            Response::Error { message, .. } => {
+                assert!(message.contains("leased") || message.contains("peer"),
+                    "expected a lease-contention message, got: {}", message);
+            }
+            other => panic!("expected a lease-contention Error, got {:?}", other),
+        }
     }
 
     /// 2026-08-03 fix: coordinate_and_fold_slot's fingerprint read must not tear
@@ -19304,7 +19603,7 @@ mod tests {
 
         // Byte-identical patch, higher seq — a genuine no-op.
         let lock_b = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
-        let (token_b, size_b, ts_b, buf_b) = server.apply_patch(
+        let (token_b, size_b, ts_b, buf_b, _rejected_b) = server.apply_patch(
             Some(lock_b), token_a, file_id, Some(chunk_idx), chunk_file_offset,
             vec![(10usize, vec![0xCCu8; 4])], Some(301), None,
         ).await.expect("no-op merge apply_patch should still succeed");
@@ -19603,6 +19902,161 @@ mod tests {
         // the base; only an eventual fold does, at which point the pre-existing
         // coordinate_and_fold_slot/heal_base_from_peer self-heal machinery
         // fetches and verifies it.)
+    }
+
+    /// Gap A (found 2026-08-13, CT-119/VM-108 write-path EIO investigation):
+    /// the 2026-07-19 fix at handle_multi_patch's Err arm (comment "B") tries
+    /// to turn a ghost/unreachable base into a retriable ChunkStale instead of
+    /// a hard Error — but only ever checks THIS node's own local chunk_map. If
+    /// that's empty (e.g. this replica has never seen a ReplicateChunkLocation
+    /// for the slot at all), it falls straight through to the hard Error, even
+    /// though the sibling check inside apply_patch's fresh-accumulator setup
+    /// (refresh_slot_from_leader, ~13022-13031) already knows how to ask the
+    /// leader when its own signal is absent. Two real Server instances, real
+    /// networking — a single-process/is-leader test can't distinguish this gap
+    /// from working code, since refresh_slot_from_leader reads the same
+    /// in-process chunk_map when this node IS the leader.
+    #[tokio::test]
+    async fn multipatch_ghost_guard_asks_leader_when_local_chunk_map_empty() {
+        use crate::network::NetworkServer;
+        use dfs_common::NodeInfo;
+
+        // "Leader": guaranteed-minimal NodeId, holds the slot's real current
+        // location. The follower built below must NOT be leader, so its
+        // ChunkStale fallback is forced onto the real network path.
+        let leader_temp_storage = TempDir::new().unwrap();
+        let leader_temp_metadata = TempDir::new().unwrap();
+        let leader_temp_metadata_dir = TempDir::new().unwrap();
+        let leader_storage = Arc::new(ChunkStorage::new(leader_temp_storage.path().to_path_buf()).unwrap());
+        let leader_metadata = Arc::new(MetadataStore::new(leader_temp_metadata.path().to_path_buf()).unwrap());
+        let leader_node_id = NodeId::from_bytes([0x00u8; 16]);
+        let leader_addr: SocketAddr = "127.0.0.1:19321".parse().unwrap();
+        let leader_cluster = Arc::new(ClusterManager::new(leader_node_id, leader_addr, 10, 30));
+        let leader_server = Arc::new(Server::new(
+            leader_storage.clone(), leader_metadata.clone(), 4 * 1024 * 1024, leader_cluster.clone(), 3,
+            leader_temp_metadata_dir.path().to_path_buf(), leader_temp_metadata_dir.path().join("config.toml"), true,
+        ));
+        let leader_peer_listen = crate::network::peer_port_addr(leader_addr);
+        let mut leader_net_server = NetworkServer::new(leader_peer_listen, leader_server.clone(), 10);
+        tokio::spawn(async move { leader_net_server.start().await.ok(); });
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // Leader genuinely knows this slot's current chunk — real, valid location.
+        let leader_current_id = ChunkId::from_hash(compute_chunk_hash(b"leader-genuinely-current"));
+        let real_loc = ChunkLocation {
+            chunk_id: leader_current_id, nodes: vec![leader_node_id], size: 4096,
+            checksum: leader_current_id.hash, file_offset: Some(chunk_file_offset),
+            written_at: Some(1000), client_write_seq: Some(1), file_id: Some(file_id),
+        };
+        leader_server.chunk_map.insert(file_id, (vec![real_loc.clone()], 1));
+        leader_metadata.put_chunk_location(&real_loc).unwrap();
+
+        // "Follower": the node under test — knows NOTHING about this file at
+        // all (no chunk_map entry, no metadata record) — the exact "never seen
+        // a ReplicateChunkLocation for this slot" precondition Gap A needs.
+        let follower_h = make_overlay_test_harness();
+        follower_h.server.cluster().add_node(NodeInfo::new(leader_node_id, leader_addr, None)).await.unwrap();
+        assert!(!follower_h.server.cluster().is_leader().await,
+            "test setup assumes the follower is NOT leader, so refresh_slot_from_leader must use the real network path");
+        assert!(follower_h.server.chunk_map.get(&file_id).is_none(),
+            "precondition: follower has no local chunk_map entry for this file at all");
+
+        // Client writes claiming a base the follower has never heard of —
+        // guarantees apply_patch fails NotFound, tripping the ghost-chunk-guard
+        // Err arm under test.
+        let stale_client_claim = ChunkId::from_hash(compute_chunk_hash(b"stale-claim-follower-never-heard-of"));
+        let resp = follower_h.server.handle_multi_patch(
+            stale_client_claim, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(0usize, vec![0x22u8; 4])], None, Some(1), None, Some(1),
+        ).await;
+
+        match resp {
+            Response::ChunkStale { current_chunk_id, .. } => {
+                assert_eq!(current_chunk_id, leader_current_id,
+                    "must surface the leader's real current chunk, not just any retriable response");
+            }
+            Response::Error { code, message } => panic!(
+                "BUG REPRODUCED (Gap A): local chunk_map was empty so no leader refresh was \
+                 attempted — hard-failed (code={:?}, msg={:?}) even though the leader has the \
+                 current chunk one network hop away. This is exactly the write-path failure \
+                 that EIOs the guest instead of retrying — the ChunkStale fallback must ask the \
+                 leader before giving up, same as apply_patch's own sibling check does.", code, message),
+            other => panic!("expected a retriable ChunkStale pointing at the leader's real current chunk, got {:?}", other),
+        }
+    }
+
+    /// 2026-08-13 fix — the actual root cause of the CT-119 24h-stuck-slot
+    /// incident, confirmed via live log tracing on two independent replicas
+    /// (same 31-36ms creation-to-abandon gap on both). update_chunk_map_after_patch
+    /// has a legitimate staleness guard (a later write already holds a higher
+    /// client_write_seq for the slot) — but before this fix, apply_patch and
+    /// handle_multi_patch/handle_patch_chunk had no way to know the guard fired,
+    /// and unconditionally acked the client with a plain success response
+    /// regardless. The client believed its new chunk_id was current while
+    /// chunk_map never actually moved; a separate, correct fold-abandon check
+    /// then found chunk_map didn't match the "pending" patch and abandoned it,
+    /// with zero mechanism to ever inform the client. This test forces exactly
+    /// the guard's rejection condition and asserts the response is a retriable
+    /// ChunkStale, not a false success.
+    #[tokio::test]
+    async fn multipatch_returns_chunkstale_when_chunk_map_update_rejected_as_stale() {
+        let h = make_overlay_test_harness();
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 0u64;
+        let chunk_file_offset = 0u64;
+
+        // Real base chunk, real bytes on disk.
+        let base_content = vec![0x11u8; 64];
+        let base_id = ChunkId::from_hash(
+            dfs_common::compute_chunk_hash_at(&base_content, chunk_file_offset, file_id),
+        );
+        h.storage.write_chunk(&base_id, &base_content).unwrap();
+
+        // chunk_map already shows this slot at client_write_seq=10 — as if a
+        // later write already advanced past whatever this patch is about to
+        // claim. Matches base_id exactly (a genuinely fresh, valid write, not
+        // itself stale by identity) so the leader-confirmation/ghost-chunk-guard
+        // steps ahead of the staleness guard all pass cleanly — isolating the
+        // staleness guard itself as the only thing that can reject this.
+        let base_loc = ChunkLocation {
+            chunk_id: base_id, nodes: vec![h.server.cluster.local_node_id()],
+            size: base_content.len(), checksum: base_id.hash, file_offset: Some(chunk_file_offset),
+            written_at: Some(1000), client_write_seq: Some(10), file_id: Some(file_id),
+        };
+        h.server.chunk_map.insert(file_id, (vec![base_loc.clone()], 10));
+        h.metadata.put_chunk_location(&base_loc).unwrap();
+
+        // Incoming patch claims base_id (matches chunk_map's current identity)
+        // but carries client_write_seq=1 — triggering the staleness guard purely
+        // on the sequence comparison, exactly like the real incident.
+        let resp = h.server.handle_multi_patch(
+            base_id, file_id, Some(chunk_idx), chunk_file_offset,
+            vec![(10usize, vec![0x22u8; 4])], None, Some(1), None, Some(1),
+        ).await;
+
+        match resp {
+            Response::ChunkStale { current_chunk_id, .. } => {
+                assert_eq!(current_chunk_id, base_id,
+                    "must point at chunk_map's real current identity, not the rejected new token");
+            }
+            Response::MultiPatchResult { new_chunk_id, .. } => panic!(
+                "BUG REPRODUCED: chunk_map's staleness guard rejected the update (a later write \
+                 already held seq=10 vs this patch's seq=1) but the client was still told success \
+                 (new_chunk_id={}) — chunk_map was never actually advanced. This is the exact \
+                 false-success gap that left a real CT-119 slot dangling for 24+ hours.", new_chunk_id),
+            other => panic!("expected a retriable ChunkStale, got {:?}", other),
+        }
+
+        // And chunk_map itself must genuinely still show the old value — the
+        // guard's rejection must have actually held, not just been reported.
+        let chunk_map_binding = h.server.chunk_map_ref();
+        let entry = chunk_map_binding.get(&file_id).unwrap();
+        let (locs, _) = entry.value();
+        assert_eq!(locs[0].chunk_id, base_id, "chunk_map must not have been advanced past the rejection");
     }
 
     /// Negative control for the no-op detector: a patch that differs by even

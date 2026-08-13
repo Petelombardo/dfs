@@ -386,6 +386,21 @@ async fn handle_cluster_command(
                     local_node_id,
                     ..
                 } => {
+                    // Service age (process uptime, not host uptime) isn't carried by
+                    // ClusterStatus/NodeInfo — fetch it per-node the same way the `stats`
+                    // subcommand does, via the existing GetNodeStats RPC's uptime_secs
+                    // (server.rs: self.ops_tracker.get_stats().uptime_secs, same source
+                    // healing's cold-start stability gate uses). Best-effort: a node that
+                    // doesn't answer just shows "?" rather than failing the whole command.
+                    let mut service_age_secs: std::collections::HashMap<dfs_common::NodeId, u64> = std::collections::HashMap::new();
+                    for node in &nodes {
+                        if let Ok(Response::NodeStats { uptime_secs, .. }) =
+                            send_request(node.addr, Request::GetNodeStats).await
+                        {
+                            service_age_secs.insert(node.id, uptime_secs);
+                        }
+                    }
+
                     if json_output {
                         let output = serde_json::json!({
                             "total_nodes": total_nodes,
@@ -399,6 +414,7 @@ async fn handle_cluster_command(
                                     "address": n.addr.to_string(),
                                     "status": format!("{:?}", n.status),
                                     "last_heartbeat": n.last_heartbeat,
+                                    "service_age_secs": service_age_secs.get(&n.id),
                                 })
                             }).collect::<Vec<_>>()
                         });
@@ -420,8 +436,8 @@ async fn handle_cluster_command(
                         }
                         println!();
                         println!("Nodes:");
-                        println!("{:<10} {:<40} {:<20} {:<12} {:<8} {:<14} {}", "Short ID", "ID", "Address", "Status", "Role", "Free Space", "Last Heartbeat");
-                        println!("{}", "-".repeat(130));
+                        println!("{:<10} {:<40} {:<20} {:<12} {:<8} {:<14} {:<12} {}", "Short ID", "ID", "Address", "Status", "Role", "Free Space", "Service Age", "Last Heartbeat");
+                        println!("{}", "-".repeat(145));
 
                         for node in nodes {
                             let id_str = node.id.to_string();
@@ -450,14 +466,18 @@ async fn handle_cluster_command(
                             } else {
                                 "?".to_string()
                             };
+                            let age_str = service_age_secs.get(&node.id)
+                                .map(|secs| format_uptime(*secs))
+                                .unwrap_or_else(|| "?".to_string());
                             println!(
-                                "{:<10} {:<40} {:<20} {:<12} {:<8} {:<14} {}",
+                                "{:<10} {:<40} {:<20} {:<12} {:<8} {:<14} {:<12} {}",
                                 short_id,
                                 id_str,
                                 node.addr,
                                 status_display,
                                 role,
                                 space_str,
+                                age_str,
                                 heartbeat_str
                             );
                         }

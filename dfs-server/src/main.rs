@@ -270,6 +270,13 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
     server.rebuild_fold_result_chunk_ids();
     info!("✓ Fold-result chunk_id set rebuilt");
 
+    // Resume any fold-announce obligations this node hadn't finished telling the
+    // leader about before its last restart — see PENDING_FOLD_ANNOUNCE_TABLE's doc
+    // comment. Must run before start_patch_fold_rebroadcast_loop is started below,
+    // which is what actually acts on the resumed entries.
+    server.rebuild_pending_patch_fold_broadcasts().await;
+    info!("✓ Pending fold-announce obligations resumed");
+
     // Rebuild in-memory chunk map from persistent metadata.
     // This is required on every startup — GetFileChunkMap is served from this
     // in-memory map, so without it every file returns "no chunk map from leader".
@@ -603,6 +610,12 @@ async fn start_server(config_path: PathBuf) -> Result<()> {
                 tokio::time::Duration::from_secs(5),
                 server.drain_sled_writes(),
             ).await;
+            // Same guarantee for any fold-announce write still in flight — see
+            // FoldAnnounceInflight's doc comment. Own bounded timeout (not folded
+            // into the drain_sled_writes call above) since these are two
+            // independent queues that can each legitimately still have work
+            // outstanding.
+            server.drain_pending_fold_announce_writes(tokio::time::Duration::from_secs(5)).await;
             info!("Shutting down...");
             server_handle.abort();
             // Clean up addr file so dfs-admin auto-discovery doesn't see a stale entry.

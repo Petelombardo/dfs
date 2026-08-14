@@ -2936,8 +2936,39 @@ done
 # Using the same lenient <2 threshold here would have silently passed the exact
 # bug this test exists to catch (root-caused 2026-07-15: a chunk stuck at 2/3
 # replicas, gated behind healing_delay_secs).
-T38_UNDER_AFTER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t38_slow.bin 2>/dev/null \
-    | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 3))")
+#
+# "Heal queue empty" (the loop above) is only a proxy for "fully converged," and
+# a lossy one for exactly the case this test hits: this file's rolling restart
+# spans all 5 nodes (including the leader, at whatever point it lands in that
+# rotation) mid-write, and any patch still an unfolded token when its restart
+# hits is deliberately skipped by healing outright (patch tokens aren't
+# independently replicable — they resolve via the fold, not a byte copy — see
+# do_heal_chunk_inner's "marker-shaped as a patch token" fast path), clearing
+# the queue almost instantly regardless of whether the fold itself, and the
+# fold's own leader-announcement, have actually finished. Before 2026-08-14,
+# the leader-announcement step could return early on a bare RPC-succeeded
+# response even when the leader hadn't actually adopted the result (see
+# Response::FoldReceipt's doc comment on dfs-common's Response enum) — fast,
+# but sometimes silently wrong, exactly the daily VM-108 EIO root cause.
+# Fixed to require a real leader acknowledgment and to keep retrying on a 10s
+# backstop cadence instead of giving up after a fixed window — genuinely
+# correct, but a rolling restart that includes the leader can now legitimately
+# take a couple of that backstop's 10s cycles (the leader's own post-restart
+# chunk_generations catch-up is part of what's being waited on) to finish
+# converging, which the old code's willingness to accept an unconfirmed
+# success was silently papering over. Poll the real signal (actual replica
+# count) instead of padding the heal-queue-drain timeout above, which mostly
+# doesn't wait on this at all once the queue itself empties quickly.
+T38_CONVERGE_DEADLINE=$(( $(date +%s) + 35 ))
+while true; do
+    T38_UNDER_AFTER=$("$BIN/dfs-admin" --cluster "$CLUSTER" --format json file info /t38_slow.bin 2>/dev/null \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for c in d['chunk_locations'] if len(c['nodes']) < 3))" 2>/dev/null || echo "?")
+    [ "$T38_UNDER_AFTER" = "0" ] && break
+    if [ "$(date +%s)" -ge "$T38_CONVERGE_DEADLINE" ]; then
+        break
+    fi
+    sleep 2
+done
 
 [ "$T38_UNDER_AFTER" = "0" ] \
     && check "T38b all chunks reach RF=3 after healing (was ${T38_UNDER_BEFORE:-?} under-replicated)" PASS \

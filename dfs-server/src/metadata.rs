@@ -82,7 +82,7 @@ const PATCH_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pa
 
 /// public_token hex string → unix seconds when that token's PATCH_STATE_TABLE row
 /// transitioned from Pending to Folded. Written alongside every
-/// PatchState::Folded update, read only by prune_stale_folded_patch_states.
+/// PatchState::Folded update, read only by find_stale_folded_patch_state_candidates.
 ///
 /// Added 2026-08-01 (VM-108 race, chunk_idx 3877): PatchState::Folded carries no
 /// timestamp of its own (see that variant's doc comment), so the GC used to infer
@@ -98,10 +98,32 @@ const PATCH_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pa
 /// server.rs and would otherwise need a versioned-legacy-fallback migration (see
 /// deserialize_file_metadata's pattern) for a change this contained. Rows missing
 /// here (any Folded row written before this fix existed) fall back to the old
-/// written_at-based estimate in prune_stale_folded_patch_states — never wrong in
+/// written_at-based estimate in find_stale_folded_patch_state_candidates — never wrong in
 /// the "prune too early" direction for those, since target written_at was already
 /// today's exact behavior for them.
 const PATCH_FOLD_TIMESTAMP_TABLE: TableDefinition<&str, u64> = TableDefinition::new("patch_fold_timestamp");
+
+/// public_token hex string → bincode(PendingFoldAnnounce) — a fold this node
+/// completed locally that the leader has not yet been confirmed (via
+/// Response::FoldReceipt{applied:true}) to have durably learned about.
+///
+/// Durable counterpart to the in-memory Server::pending_patch_fold_broadcasts
+/// (2026-08-14, VM-108 daily-EIO investigation). Before this table existed,
+/// that DashMap was the ONLY record of "the leader might still not know about
+/// this fold" — purely in-memory, so it was silently discarded on this node's
+/// own restart, and even without a restart, start_patch_fold_rebroadcast_loop
+/// gave up on an entry after a fixed 120s TTL regardless of whether the leader
+/// had ever actually acknowledged it (it only checked that the retry RPC
+/// didn't *error*, never that the leader's response said it was applied —
+/// see Response::FoldReceipt's doc comment). Both were real, silent ways to
+/// lose the one durable copy of "the leader is behind" and have nothing left
+/// to eventually catch it up. This table removes both failure modes: written
+/// here the instant a fold completes (before the first leader-notification
+/// attempt even runs), read back and rehydrated into the in-memory map on
+/// every server startup, and only ever removed once a receipt with
+/// `applied: true` is actually observed (or the slot/file becomes
+/// independently irrelevant — see start_patch_fold_rebroadcast_loop).
+const PENDING_FOLD_ANNOUNCE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_fold_announce");
 
 /// "{file_id}:{chunk_idx}" → public_token hex string (the PATCH_STATE_TABLE key
 /// currently outstanding for this slot).
@@ -204,6 +226,38 @@ pub enum PatchState {
     /// The fold completed: redirect straight to the real, standalone,
     /// content-addressed result.
     Folded(ChunkId),
+}
+
+/// Durable record backing PENDING_FOLD_ANNOUNCE_TABLE — see that table's doc
+/// comment. Mirrors the in-memory Server::PendingPatchFoldBroadcast; kept as
+/// a separate type (not shared) since this one needs to be bincode-stable on
+/// disk while the in-memory one is free to change shape.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingFoldAnnounce {
+    pub public_token: ChunkId,
+    pub real_chunk_id: ChunkId,
+    pub file_id: FileId,
+    pub chunk_idx: u64,
+    pub location: ChunkLocation,
+    /// Wall-clock ms this record was first written — diagnostic only (how
+    /// long has the leader been behind), never used to decide removal. See
+    /// this table's doc comment for why removal is receipt-based, not
+    /// time-based.
+    pub first_seen_ms: u64,
+}
+
+/// A stale-Folded PATCH_STATE_TABLE row found by
+/// find_stale_folded_patch_state_candidates. `file_id`/`chunk_idx` are None
+/// only when the target's ChunkLocation is gone entirely (nothing to derive a
+/// slot from, and also unconditionally safe to remove for the same reason).
+/// See that function's doc comment for what `safe_without_leader_check` means
+/// and why it exists.
+pub struct StaleFoldedPatchCandidate {
+    pub key: String,
+    pub token: ChunkId,
+    pub file_id: Option<FileId>,
+    pub chunk_idx: Option<u64>,
+    pub safe_without_leader_check: bool,
 }
 
 /// A fully-converged shadow database, ready for compact_db_finish's exclusive-locked
@@ -2905,7 +2959,23 @@ impl MetadataStore {
     /// the caller (which holds the ChunkStorage handle this module doesn't)
     /// delete the file in the same pass that retires the metadata row, closing
     /// the window instead of depending on the orphan sweep to notice later.
-    pub fn prune_stale_folded_patch_states(&self, min_age: std::time::Duration) -> Result<Vec<ChunkId>> {
+    ///
+    /// Split (2026-08-14, VM-108 daily-EIO root cause) into this pure
+    /// candidate-finder plus `remove_patch_state_rows` for the actual delete —
+    /// see that function's doc comment for why. `safe_without_leader_check` is
+    /// true for the two cases where age is irrelevant (the fold's own target
+    /// is already gone cluster-wide, or the file itself is gone): nothing can
+    /// ever need this row again regardless of what any leader thinks. It is
+    /// false for the ordinary age-based case, which is exactly the case that
+    /// went wrong live: this node's local Folded row aging past `min_age` says
+    /// nothing about whether the LEADER's chunk_map ever actually learned this
+    /// fold happened (see project_fold_announcement_rebroadcast_gap /
+    /// project_20260814_vm108_daily_eio_fold_leader_gap_confirmed) — a fold
+    /// whose dissemination silently failed leaves the leader still pointing at
+    /// the pre-fold token forever, and this row was the ONLY remaining record
+    /// of how to resolve it. The caller must confirm with the leader before
+    /// treating an age-based candidate as removable.
+    pub fn find_stale_folded_patch_state_candidates(&self, min_age: std::time::Duration) -> Result<Vec<StaleFoldedPatchCandidate>> {
         let now = std::time::SystemTime::now();
         let now_secs = dfs_common::types::current_timestamp();
         let candidates: Vec<(String, ChunkId, Option<u64>)> = {
@@ -2934,20 +3004,30 @@ impl MetadataStore {
             out
         };
 
-        let mut to_remove = Vec::new();
+        let mut out = Vec::new();
         for (key, target, folded_at) in candidates {
-            let safe_to_remove = match self.get_chunk_location(&target)? {
+            let Some(token) = decode_hex_32(&key).map(ChunkId::from_hash) else { continue };
+            match self.get_chunk_location(&target)? {
                 // Target already gone (superseded/deleted) — nothing can resolve
-                // through this token correctly anymore regardless of age.
-                None => true,
+                // through this token correctly anymore regardless of age or what
+                // the leader thinks.
+                None => out.push(StaleFoldedPatchCandidate {
+                    key, token, file_id: None, chunk_idx: None, safe_without_leader_check: true,
+                }),
                 Some(loc) => {
                     let file_gone = match loc.file_id {
                         Some(fid) => !self.file_exists_by_id(fid).unwrap_or(true),
                         None => false,
                     };
+                    const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+                    let chunk_idx = loc.file_offset.map(|o| o / CHUNK_SIZE);
                     if file_gone {
-                        true
-                    } else if let Some(folded_at_secs) = folded_at {
+                        out.push(StaleFoldedPatchCandidate {
+                            key, token, file_id: loc.file_id, chunk_idx, safe_without_leader_check: true,
+                        });
+                        continue;
+                    }
+                    let old_enough = if let Some(folded_at_secs) = folded_at {
                         now_secs.saturating_sub(folded_at_secs) >= min_age.as_secs()
                     } else {
                         match loc.written_at {
@@ -2959,50 +3039,152 @@ impl MetadataStore {
                             // rather than guess.
                             None => false,
                         }
+                    };
+                    if old_enough {
+                        out.push(StaleFoldedPatchCandidate {
+                            key, token, file_id: loc.file_id, chunk_idx, safe_without_leader_check: false,
+                        });
                     }
                 }
-            };
-            if safe_to_remove {
-                to_remove.push(key);
             }
         }
+        Ok(out)
+    }
 
-        if to_remove.is_empty() {
+    /// Async wrapper for find_stale_folded_patch_state_candidates.
+    pub async fn find_stale_folded_patch_state_candidates_async(self: &Arc<Self>, min_age: std::time::Duration) -> Result<Vec<StaleFoldedPatchCandidate>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.find_stale_folded_patch_state_candidates(min_age))
+            .await
+            .context("spawn_blocking panicked in find_stale_folded_patch_state_candidates_async")?
+    }
+
+    /// Physically remove the given already-vetted PATCH_STATE_TABLE keys (and
+    /// their companion PATCH_FOLD_TIMESTAMP_TABLE rows). Callers are
+    /// responsible for having already confirmed each key is safe to remove —
+    /// see find_stale_folded_patch_state_candidates's doc comment. Returns the
+    /// removed keys' own ChunkIds so the caller can also clean up each
+    /// token's on-disk file (see start_patch_state_gc_loop).
+    pub fn remove_patch_state_rows(&self, keys: &[String]) -> Result<Vec<ChunkId>> {
+        if keys.is_empty() {
             return Ok(Vec::new());
         }
-
         let _db = self.db.read();
         let mut txn = _db.begin_write()?;
         txn.set_durability(self.next_write_durability());
         {
             let mut table = txn.open_table(PATCH_STATE_TABLE)?;
-            for key in &to_remove {
+            for key in keys {
                 table.remove(key.as_str())?;
             }
             // Clean up the companion row too, else PATCH_FOLD_TIMESTAMP_TABLE grows
             // unbounded — a no-op if this token predates the table (nothing to remove).
             let mut ts_table = txn.open_table(PATCH_FOLD_TIMESTAMP_TABLE)?;
-            for key in &to_remove {
+            for key in keys {
                 ts_table.remove(key.as_str())?;
             }
         }
         txn.commit()?;
-        self.note_txn("prune_stale_folded_patch_states", 0);
-        Ok(to_remove.iter().filter_map(|key| decode_hex_32(key).map(ChunkId::from_hash)).collect())
+        self.note_txn("remove_patch_state_rows", 0);
+        Ok(keys.iter().filter_map(|key| decode_hex_32(key).map(ChunkId::from_hash)).collect())
     }
 
-    /// Async wrapper for prune_stale_folded_patch_states — see get_chunk_location_async.
-    pub async fn prune_stale_folded_patch_states_async(self: &Arc<Self>, min_age: std::time::Duration) -> Result<Vec<ChunkId>> {
+    /// Async wrapper for remove_patch_state_rows.
+    pub async fn remove_patch_state_rows_async(self: &Arc<Self>, keys: Vec<String>) -> Result<Vec<ChunkId>> {
         let store = Arc::clone(self);
-        tokio::task::spawn_blocking(move || store.prune_stale_folded_patch_states(min_age))
+        tokio::task::spawn_blocking(move || store.remove_patch_state_rows(&keys))
             .await
-            .context("spawn_blocking panicked in prune_stale_folded_patch_states_async")?
+            .context("spawn_blocking panicked in remove_patch_state_rows_async")?
+    }
+
+    /// Durably record that `announce.public_token`'s fold result still needs
+    /// to be confirmed as applied by the leader — see PENDING_FOLD_ANNOUNCE_TABLE's
+    /// doc comment. Called the instant a fold completes locally, before the
+    /// first leader-notification attempt even runs, so a crash between "fold
+    /// committed" and "leader confirmed" can never lose this obligation.
+    pub fn put_pending_fold_announce(&self, announce: &PendingFoldAnnounce) -> Result<()> {
+        let key = format!("{}", announce.public_token);
+        let value = bincode::serialize(announce).context("Failed to serialize PendingFoldAnnounce")?;
+        let _db = self.db.read();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+        txn.commit()?;
+        self.note_txn("put_pending_fold_announce", 0);
+        Ok(())
+    }
+
+    pub async fn put_pending_fold_announce_async(self: &Arc<Self>, announce: PendingFoldAnnounce) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.put_pending_fold_announce(&announce))
+            .await
+            .context("spawn_blocking panicked in put_pending_fold_announce_async")?
+    }
+
+    /// Remove a fold-announce obligation — called once a Response::FoldReceipt
+    /// with `applied: true` is actually observed, or once the slot/file
+    /// becomes independently irrelevant (see start_patch_fold_rebroadcast_loop).
+    /// A no-op (not an error) if `public_token` has no row, matching every
+    /// other delete-by-key helper in this file.
+    pub fn delete_pending_fold_announce(&self, public_token: ChunkId) -> Result<()> {
+        let key = format!("{}", public_token);
+        let _db = self.db.read();
+        let mut txn = _db.begin_write()?;
+        txn.set_durability(self.next_write_durability());
+        {
+            let mut table = txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE)?;
+            table.remove(key.as_str())?;
+        }
+        txn.commit()?;
+        self.note_txn("delete_pending_fold_announce", 0);
+        Ok(())
+    }
+
+    pub async fn delete_pending_fold_announce_async(self: &Arc<Self>, public_token: ChunkId) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.delete_pending_fold_announce(public_token))
+            .await
+            .context("spawn_blocking panicked in delete_pending_fold_announce_async")?
+    }
+
+    /// Every currently-outstanding fold-announce obligation — read at server
+    /// startup to rehydrate Server::pending_patch_fold_broadcasts (closing the
+    /// "dies on this node's own restart" gap PENDING_FOLD_ANNOUNCE_TABLE's doc
+    /// comment describes) and read by start_patch_fold_rebroadcast_loop on
+    /// every tick as the authoritative work list.
+    pub fn scan_pending_fold_announces(&self) -> Result<Vec<PendingFoldAnnounce>> {
+        let _db = self.db.read();
+        let txn = _db.begin_read()?;
+        let table = match txn.open_table(PENDING_FOLD_ANNOUNCE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for item in table.range::<&str>(..)? {
+            let (_, v) = item?;
+            match bincode::deserialize::<PendingFoldAnnounce>(v.value()) {
+                Ok(a) => out.push(a),
+                Err(e) => warn!("scan_pending_fold_announces: skipping corrupt row: {}", e),
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn scan_pending_fold_announces_async(self: &Arc<Self>) -> Result<Vec<PendingFoldAnnounce>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.scan_pending_fold_announces())
+            .await
+            .context("spawn_blocking panicked in scan_pending_fold_announces_async")?
     }
 
     /// Every chunk_id that is currently the durable *result* of a background
     /// fold — i.e. every `PatchState::Folded(target)` row's target, scanned
     /// straight from PATCH_STATE_TABLE. Same scan shape as
-    /// `prune_stale_folded_patch_states` (just collecting targets instead of
+    /// `find_stale_folded_patch_state_candidates` (just collecting targets instead of
     /// candidates for removal), used at startup to rebuild
     /// `Server::fold_result_chunk_ids` — the in-memory set that lets
     /// `location_supersedes` derive a chunk's fold-vs-client origin without a
@@ -4559,15 +4741,20 @@ mod tests {
         }
     }
 
-    /// 2026-08-03 fix: prune_stale_folded_patch_states now returns the pruned
-    /// tokens' own ChunkIds (not just a count) so the caller can delete each
-    /// token's physical overlay file in the same pass — see the function's doc
-    /// comment for the leak this closes (a patch token's chunk_id is
+    /// 2026-08-03 fix: pruning returns the pruned tokens' own ChunkIds (not
+    /// just a count) so the caller can delete each token's physical overlay
+    /// file in the same pass — see find_stale_folded_patch_state_candidates'
+    /// doc comment for the leak this closes (a patch token's chunk_id is
     /// deliberately not a content hash, so a leaked file sitting unswept can
     /// later fail a healing-time content-hash check and get misreported as
     /// disk corruption, confirmed live on gluster5 2026-08-03).
+    ///
+    /// Updated 2026-08-14 for the find/remove split (see that function's doc
+    /// comment): this candidate's target has no ChunkLocation registered at
+    /// all, so it must come back `safe_without_leader_check = true` — the one
+    /// case a caller may remove without ever consulting a leader.
     #[test]
-    fn prune_stale_folded_patch_states_returns_pruned_token_ids() {
+    fn find_and_remove_stale_folded_patch_state_prunes_unconditionally_safe_candidate() {
         let temp = TempDir::new().unwrap();
         let store = MetadataStore::new(temp.path().to_path_buf()).unwrap();
         let file_id = FileId::new();
@@ -4578,12 +4765,63 @@ mod tests {
         store.update_patch_state_folded(&token, target).unwrap();
 
         // target has no ChunkLocation registered at all (never written / already
-        // deleted) — safe_to_remove is unconditional in that case, regardless of
+        // deleted) — safe_without_leader_check is true in that case regardless of
         // min_age, so a 0-duration min_age still exercises the real "is this
         // actually safe" branch rather than trivially passing on age alone.
-        let pruned = store.prune_stale_folded_patch_states(std::time::Duration::from_secs(0)).unwrap();
+        let candidates = store.find_stale_folded_patch_state_candidates(std::time::Duration::from_secs(0)).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].token, token);
+        assert!(candidates[0].safe_without_leader_check,
+            "target ChunkLocation is entirely gone — must not require leader confirmation");
+
+        let keys: Vec<String> = candidates.into_iter().map(|c| c.key).collect();
+        let pruned = store.remove_patch_state_rows(&keys).unwrap();
         assert_eq!(pruned, vec![token], "must return the pruned token's own ChunkId, not just a count");
         assert!(store.get_patch_state(&token).unwrap().is_none(), "the PATCH_STATE_TABLE row must actually be gone");
+    }
+
+    /// The age-based case (target still has a live ChunkLocation, file still
+    /// exists) must come back `safe_without_leader_check = false` — this is
+    /// exactly the branch whose caller-side leader-confirmation gap caused the
+    /// real 2026-08-14 VM-108 daily-EIO incident: a node's local Folded row
+    /// aging out says nothing about whether the leader ever learned the fold
+    /// happened. Confirming that here at the metadata layer only tests the
+    /// candidate classification, not the leader-query itself (that lives in
+    /// server.rs's start_patch_state_gc_loop, which has cluster access this
+    /// module deliberately doesn't).
+    #[test]
+    fn stale_folded_patch_state_with_live_target_requires_leader_check() {
+        let temp = TempDir::new().unwrap();
+        let store = MetadataStore::new(temp.path().to_path_buf()).unwrap();
+        let file_id = FileId::new();
+        let token = ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(b"my-patch-token-2"));
+        let target = ChunkId::from_hash(dfs_common::hash::compute_chunk_hash(b"my-fold-target-2"));
+
+        let mut metadata = FileMetadata::new("/live-file".to_string(), FileType::RegularFile);
+        metadata.id = file_id;
+        metadata.size = 4194304;
+        store.put_file(&metadata).unwrap();
+
+        store.put_patch_state_pending(file_id, 5, &token, target, target, 4096, 1000, Some(1)).unwrap();
+        store.update_patch_state_folded(&token, target).unwrap();
+        store.put_chunk_location(&ChunkLocation {
+            chunk_id: target,
+            nodes: vec![],
+            size: 4194304,
+            checksum: target.hash,
+            file_offset: Some(5 * 4 * 1024 * 1024),
+            written_at: Some(1),
+            client_write_seq: Some(1),
+            file_id: Some(file_id),
+        }).unwrap();
+
+        let candidates = store.find_stale_folded_patch_state_candidates(std::time::Duration::from_secs(0)).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].token, token);
+        assert_eq!(candidates[0].file_id, Some(file_id));
+        assert_eq!(candidates[0].chunk_idx, Some(5));
+        assert!(!candidates[0].safe_without_leader_check,
+            "target is still live and the file still exists — must require leader confirmation before removal");
     }
 
     /// HEAD-TO-HEAD from the SAME churned starting point — the comparison the first

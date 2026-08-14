@@ -1450,6 +1450,32 @@ pub enum Response {
         uptime_secs: u64,
         pending_patch_chunk_ids: Vec<ChunkId>,
     },
+
+    /// Response to Request::ReplicatePatchFold, replacing the old bare
+    /// Response::Ok for this one request type. The sender needs to know not
+    /// just "you received this" but "did your chunk_map actually end up
+    /// reflecting it" — the receiving handler's arbitration
+    /// (Server::location_supersedes) can legitimately decide NOT to apply an
+    /// incoming update while still returning success at the RPC level, and
+    /// the old bare Ok made "received and applied" and "received and
+    /// declined" wire-identical. A fold's own leader-notification could then
+    /// report success on every retry for two minutes straight while the
+    /// leader's chunk_map silently never moved — root-caused 2026-08-14, see
+    /// project_20260814_vm108_daily_eio_fold_leader_gap_confirmed.
+    ///
+    /// `applied`: true if, immediately after processing this call, the
+    /// receiver's chunk_map for (file_id, chunk_idx) names the fold's own
+    /// `real_chunk_id` — the sender's result is now durably known there.
+    /// false means it does not: either genuinely superseded by something
+    /// newer, or the receiver couldn't apply it. `current_chunk_id` is
+    /// whatever the receiver's chunk_map shows for that slot right now (its
+    /// own token if nothing is known yet), so the sender can log exactly
+    /// what it lost the race to instead of guessing. APPENDED at end to
+    /// preserve wire compatibility.
+    FoldReceipt {
+        applied: bool,
+        current_chunk_id: ChunkId,
+    },
 }
 
 /// One entry in a Response::PendingHealingSample. See that response's doc

@@ -1,7 +1,7 @@
 use crate::chunker::Chunker;
 use crate::cluster::ClusterManager;
 use crate::healing::HealingManager;
-use crate::metadata::{MetadataStore, PatchState, PutFileResult};
+use crate::metadata::{MetadataStore, PatchState, PendingFoldAnnounce, PutFileResult};
 use crate::network::{MessageHandler, NetworkClient};
 use crate::stats::OpsTracker;
 use crate::storage::{ChunkStorage, DurabilityClass};
@@ -616,6 +616,9 @@ pub struct Server {
     /// Cumulative-since-startup RPC counts by class — see stats::RpcClassCounts'
     /// doc comment.
     rpc_class_counts: crate::stats::RpcClassCounts,
+
+    /// See FoldAnnounceInflight's doc comment and drain_pending_fold_announce_writes.
+    fold_announce_inflight: Arc<FoldAnnounceInflight>,
 }
 
 /// Fold a batch of pending metadata writes down to one `FileMetadata` per
@@ -1499,6 +1502,9 @@ struct OverlayForkCtx {
     /// to close the gap to full RF, rather than waiting on the passive discovery
     /// pass (see that function's comment for why the wait matters).
     replication_factor: Arc<std::sync::atomic::AtomicUsize>,
+    /// Same Arc as Server::fold_announce_inflight — see FoldAnnounceInflight's
+    /// doc comment. run_single_fold (the sole writer to this table) lives here.
+    fold_announce_inflight: Arc<FoldAnnounceInflight>,
 }
 
 /// One completed fold, kept around for start_patch_fold_rebroadcast_loop to
@@ -1511,6 +1517,66 @@ struct PendingPatchFoldBroadcast {
     chunk_idx: u64,
     real_chunk_id: ChunkId,
     first_seen: std::time::Instant,
+}
+
+/// Tracks PENDING_FOLD_ANNOUNCE_TABLE writes spawned off the fold hot path
+/// (see run_single_fold's PendingFoldAnnounce insert/delete) so
+/// Server::drain_pending_fold_announce_writes can wait for them to actually
+/// land before the process exits, the same guarantee drain_sled_writes
+/// already gives PutFileMetadata writes.
+///
+/// Added 2026-08-14 after initially shipping the writes detached with no
+/// shutdown tracking at all: fine under normal operation (a spawned task gets
+/// scheduled within microseconds), but a `systemctl restart`/compaction-
+/// triggered restart landing in that window could still lose the record —
+/// same failure shape as the original bug this table exists to close, just
+/// with the window narrowed from "up to 2 minutes" to "a few milliseconds."
+/// Given this codebase already treats compaction-triggered restarts as a real
+/// operational event (not hypothetical — see compact_db_blocking's own exit-
+/// and-let-systemd-restart escape hatch), narrow-but-nonzero wasn't an
+/// acceptable place to stop.
+///
+/// `notify_one` (not `notify_waiters`) deliberately: it stores a single
+/// permit if nothing is waiting yet, so a decrement-to-zero that races ahead
+/// of drain() starting to wait is never silently missed — the next
+/// `notified()` call consumes the stored permit and returns immediately, and
+/// drain()'s own loop re-checks the count regardless (a spurious wake from an
+/// intermediate decrement just costs one extra cheap loop iteration).
+#[derive(Default)]
+struct FoldAnnounceInflight {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl FoldAnnounceInflight {
+    fn begin(&self) {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn end(&self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.idle.notify_one();
+    }
+
+    /// Wait until no fold-announce write is in flight, or `timeout` elapses —
+    /// whichever comes first. Bounded the same way drain_sled_writes's caller
+    /// already bounds that drain, so a wedged write (e.g. redb itself stuck)
+    /// can't hold up shutdown indefinitely.
+    async fn drain(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                warn!("FoldAnnounceInflight::drain: {} fold-announce write(s) still in flight after {:?} — giving up, shutdown proceeding",
+                    self.count.load(std::sync::atomic::Ordering::SeqCst), timeout);
+                return;
+            }
+            let _ = tokio::time::timeout(remaining, self.idle.notified()).await;
+        }
+    }
 }
 
 /// Value type for Server::dirty_patch_slots — see its doc comment. `token` is
@@ -3526,6 +3592,57 @@ impl OverlayForkCtx {
             // synchronous push below still fails after its own retries) the
             // immediate pass misses; see pending_patch_fold_broadcasts's doc
             // comment for the incident this fixes.
+            //
+            // Durably persisted too (2026-08-14), spawned rather than awaited
+            // inline — see PENDING_FOLD_ANNOUNCE_TABLE's doc comment for why
+            // this exists: this node's own crash/restart between "fold
+            // committed" and "leader confirmed" used to silently discard the
+            // in-memory-only record of that obligation, identical in effect to
+            // the leader simply never being told. Detached (not `.await`ed
+            // before the synchronous leader push below) deliberately: an
+            // initial awaited version measurably regressed T38's fold-
+            // settlement timing margin in the local suite the same way the
+            // handle_has_chunks fix earlier this session did — an extra redb
+            // write transaction inline in this function's critical section,
+            // which already holds chunk_patch_locks for this slot, contends
+            // with the metadata db the same write is itself part of. Detaching
+            // trades a millisecond-scale crash window (between this fold
+            // returning and the spawned write actually landing) for removing
+            // that contention from the hot path — still a large improvement
+            // over the pure in-memory design's unbounded window, and the
+            // record isn't load-bearing for THIS fold's own correctness
+            // (chunk_map is already durably updated by this point via
+            // put_chunk_location_async above), only for the leader-catchup
+            // obligation a crash in that narrow window would otherwise lose.
+            // Detaching does NOT reopen the original restart-loses-it gap:
+            // fold_announce_inflight (begin()/end() below) tracks this write so
+            // drain_pending_fold_announce_writes — called from main.rs's
+            // graceful-shutdown path right alongside the pre-existing
+            // drain_sled_writes — can wait for it to actually land before the
+            // process exits. A SIGKILL (no graceful shutdown at all) is the one
+            // case nothing here can help with, same as it is for every other
+            // durable write this process ever makes.
+            let announce_first_seen_ms = dfs_common::types::current_timestamp_ms();
+            let metadata_for_announce = self.metadata.clone();
+            let announce_record = PendingFoldAnnounce {
+                public_token, real_chunk_id: new_chunk_id, file_id, chunk_idx,
+                location: new_loc.clone(), first_seen_ms: announce_first_seen_ms,
+            };
+            // begin()/end() bracket the spawn so drain_pending_fold_announce_writes
+            // (called from main.rs's graceful-shutdown path, same as the existing
+            // drain_sled_writes) can wait for this write to actually land before the
+            // process exits — see FoldAnnounceInflight's doc comment for the gap
+            // this closes.
+            self.fold_announce_inflight.begin();
+            let inflight_for_put = self.fold_announce_inflight.clone();
+            tokio::spawn(async move {
+                if let Err(e) = metadata_for_announce.put_pending_fold_announce_async(announce_record).await {
+                    warn!("single fold: failed to durably record fold-announce obligation for {} -> {}: {} \
+                           — will not survive this node's own restart until the next successful write",
+                        public_token, new_chunk_id, e);
+                }
+                inflight_for_put.end();
+            });
             self.pending_patch_fold_broadcasts.insert(public_token, PendingPatchFoldBroadcast {
                 location: new_loc.clone(),
                 file_id,
@@ -3551,7 +3668,29 @@ impl OverlayForkCtx {
             // knows" without changing this function's own return signature
             // (which 4 other, out-of-scope call sites also use).
             self.last_fold_leader_confirm.insert((file_id, chunk_idx), leader_confirmed);
-            if !leader_confirmed {
+            if leader_confirmed {
+                // Genuinely confirmed applied (notify_leader_of_fold now only
+                // returns true for is-the-leader or a real FoldReceipt{applied:
+                // true}) — the obligation is discharged, don't wait for the
+                // backstop loop's next tick to notice.
+                self.pending_patch_fold_broadcasts.remove(&public_token);
+                // Detached for the same reason as the put above — pure cleanup,
+                // never awaited on this function's own critical path. Harmless
+                // if it races the put above (delete-before-put would just leave
+                // the row for the backstop loop's own leader-ack path to clear
+                // instead — see that loop's doc comment; it's already built to
+                // tolerate stale/redundant durable rows).
+                let metadata_for_cleanup = self.metadata.clone();
+                self.fold_announce_inflight.begin();
+                let inflight_for_delete = self.fold_announce_inflight.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = metadata_for_cleanup.delete_pending_fold_announce_async(public_token).await {
+                        warn!("single fold: failed to clear durable fold-announce record for {} after leader confirmation: {}",
+                            public_token, e);
+                    }
+                    inflight_for_delete.end();
+                });
+            } else {
                 warn!("single fold: leader unreachable/unconfirmed after retries for {} -> {} — relying on backstop rebroadcast loop",
                     public_token, new_chunk_id);
             }
@@ -3763,10 +3902,31 @@ impl OverlayForkCtx {
                 loc_result,
                 Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
             );
-            let fold_ok = matches!(
-                fold_result,
-                Ok(Ok(envelope)) if matches!(envelope.message, Message::Response(Response::Ok { .. }))
-            );
+            // Response::Ok here would only mean "the RPC didn't error" — not "the
+            // leader's chunk_map now reflects this fold." Those used to be
+            // wire-identical, which is exactly how a fold's own leader-notification
+            // could report success on every retry while the leader silently never
+            // moved (see Response::FoldReceipt's doc comment). Require the explicit
+            // receipt and log precisely what the leader has instead when it declines,
+            // instead of a bare true/false that gives no next step.
+            let fold_ok = match fold_result {
+                Ok(Ok(envelope)) => match envelope.message {
+                    Message::Response(Response::FoldReceipt { applied: true, .. }) => true,
+                    Message::Response(Response::FoldReceipt { applied: false, current_chunk_id }) => {
+                        warn!("notify_leader_of_fold: leader received {} -> {} but declined to apply it — \
+                               leader's chunk_map for file {} chunk {} currently names {} instead",
+                            public_token, real_chunk_id, file_id, chunk_idx, current_chunk_id);
+                        false
+                    }
+                    // Old-protocol peer mid-rollout, still answering with bare Ok — accept
+                    // it as a best-effort success rather than treating a version skew as a
+                    // hard failure; the durable backstop (start_patch_fold_rebroadcast_loop)
+                    // still re-verifies via FoldReceipt once every node is upgraded.
+                    Message::Response(Response::Ok { .. }) => true,
+                    _ => false,
+                },
+                _ => false,
+            };
 
             if loc_ok && fold_ok {
                 return true;
@@ -5001,6 +5161,7 @@ impl Server {
             conn_semaphore: Arc::new(RwLock::new(None)),
             peer_conn_semaphore: Arc::new(RwLock::new(None)),
             rpc_class_counts: crate::stats::RpcClassCounts::new(),
+            fold_announce_inflight: Arc::new(FoldAnnounceInflight::default()),
             sled_write_done,
             sled_write_backlog,
             sled_write_tx,
@@ -5067,6 +5228,20 @@ impl Server {
         info!("drain_sled_writes: all pending metadata writes flushed to disk");
     }
 
+    /// Wait for every in-flight PENDING_FOLD_ANNOUNCE_TABLE write (see
+    /// FoldAnnounceInflight's doc comment) to land before the process exits —
+    /// called from main.rs's graceful-shutdown path alongside drain_sled_writes,
+    /// bounded the same way that call already is. Without this, a fold that
+    /// completed a moment before a graceful restart (a `systemctl restart`
+    /// during routine compaction is exactly this scenario, not hypothetical —
+    /// see compact_db_blocking's own restart-and-let-systemd-recover escape
+    /// hatch) could exit before its durable fold-announce write actually
+    /// committed, reopening — in a narrow but real window — the exact
+    /// silent-data-loss shape this table exists to close.
+    pub async fn drain_pending_fold_announce_writes(&self, timeout: std::time::Duration) {
+        self.fold_announce_inflight.drain(timeout).await;
+    }
+
     /// Rebuild `fold_result_chunk_ids` from durable PATCH_STATE_TABLE.
     /// Called once at startup, BEFORE `rebuild_chunk_map_from_metadata` — that
     /// rebuild's per-slot merge (`chunk_map_update_location_for_file_sync`)
@@ -5085,6 +5260,37 @@ impl Server {
                 info!("rebuild_fold_result_chunk_ids: seeded {} fold-result chunk_ids from PATCH_STATE_TABLE", n);
             }
             Err(e) => warn!("rebuild_fold_result_chunk_ids: failed to scan PATCH_STATE_TABLE: {}", e),
+        }
+    }
+
+    /// Called once at startup: rehydrate pending_patch_fold_broadcasts from
+    /// PENDING_FOLD_ANNOUNCE_TABLE — see that table's doc comment. Without
+    /// this, a restart between "fold committed locally" and "leader confirmed"
+    /// would silently discard the in-memory-only record of that obligation,
+    /// exactly as if the leader had simply never been told at all; the durable
+    /// table exists specifically so this node can pick the retry back up where
+    /// it left off instead. Async (unlike rebuild_fold_result_chunk_ids): this
+    /// table is expected to be tiny (in-flight folds only, not a full scan of
+    /// anything file-sized), so the ordinary spawn_blocking-backed async path
+    /// is fine rather than needing a dedicated sync fast path.
+    pub async fn rebuild_pending_patch_fold_broadcasts(&self) {
+        match self.metadata.scan_pending_fold_announces_async().await {
+            Ok(announces) => {
+                let n = announces.len();
+                for a in announces {
+                    self.pending_patch_fold_broadcasts.insert(a.public_token, PendingPatchFoldBroadcast {
+                        location: a.location,
+                        file_id: a.file_id,
+                        chunk_idx: a.chunk_idx,
+                        real_chunk_id: a.real_chunk_id,
+                        first_seen: std::time::Instant::now(),
+                    });
+                }
+                if n > 0 {
+                    info!("rebuild_pending_patch_fold_broadcasts: resuming {} fold-announce obligation(s) from a prior run", n);
+                }
+            }
+            Err(e) => warn!("rebuild_pending_patch_fold_broadcasts: failed to scan PENDING_FOLD_ANNOUNCE_TABLE: {}", e),
         }
     }
 
@@ -5761,24 +5967,35 @@ impl Server {
                 // genuinely changed (e.g. a patch produced a new hash), which is the one
                 // case that legitimately needs the client_write_seq ordering guard below to
                 // arbitrate between two competing versions.
+                let incoming_is_fold = fold_result_chunk_ids.contains(&location.chunk_id);
+                let existing_is_fold = fold_result_chunk_ids.contains(&loc.chunk_id);
+                let incoming_gen = chunk_generations.and_then(|m| m.get(&location.chunk_id).map(|v| *v));
+                let existing_gen = chunk_generations.and_then(|m| m.get(&loc.chunk_id).map(|v| *v));
                 let should_update = loc.chunk_id == location.chunk_id
                     || Self::location_supersedes(
-                        location,
-                        loc,
-                        fold_result_chunk_ids.contains(&location.chunk_id),
-                        fold_result_chunk_ids.contains(&loc.chunk_id),
-                        chunk_generations.and_then(|m| m.get(&location.chunk_id).map(|v| *v)),
-                        chunk_generations.and_then(|m| m.get(&loc.chunk_id).map(|v| *v)),
+                        location, loc, incoming_is_fold, existing_is_fold, incoming_gen, existing_gen,
                     );
                 if should_update {
                     chunk_to_file.remove(&loc.chunk_id);
                     *loc = location.clone();
                     chunk_to_file.insert(location.chunk_id, file_id);
                 } else {
-                    // Stale RCL rejected: log so we can confirm the guard is working.
-                    debug!("[RCL-stale-rejected] file={:?} chunk_idx={} kept={} (seq={:?}) dropped={} (seq={:?})",
-                        file_id, incoming_chunk_idx, loc.chunk_id, loc.client_write_seq,
-                        location.chunk_id, location.client_write_seq);
+                    // Stale RCL rejected: warn! (not debug!) and include every field
+                    // location_supersedes actually arbitrates on — generation and
+                    // fold-origin are the two the plain debug! this replaced omitted
+                    // entirely, and generation is the AUTHORITATIVE tiebreaker when
+                    // present, so its absence was the single biggest blind spot in the
+                    // 2026-08-14 VM-108 forensic investigation (a fold's own dissemination
+                    // silently rejected here, with zero trace anywhere at info level, cost
+                    // hours to reconstruct after the fact from raw chunk/disk state on 5
+                    // nodes). A rejection here is inherently rare (the common case is
+                    // should_update=true and never reaches this branch), so warn!-level
+                    // volume is not a concern the way it would be for a per-write path.
+                    warn!("[RCL-stale-rejected] file={:?} chunk_idx={} kept={} (seq={:?} gen={:?} is_fold={}) \
+                           dropped={} (seq={:?} gen={:?} is_fold={})",
+                        file_id, incoming_chunk_idx,
+                        loc.chunk_id, loc.client_write_seq, existing_gen, existing_is_fold,
+                        location.chunk_id, location.client_write_seq, incoming_gen, incoming_is_fold);
                 }
                 return;
             }
@@ -9418,7 +9635,26 @@ impl Server {
                     real_chunk_id, self.cluster.local_node_id());
             }
         }
-        Response::Ok { data: None }
+        // Ground truth, read back after every update attempt above rather than
+        // threading a bool through chunk_map_update_location_for_file's several
+        // internal branches (identity match / supersede win / reject can all be
+        // reached from different paths) — this observes the actual outcome
+        // regardless of which one fired. See Response::FoldReceipt's doc comment
+        // for why this distinction has to exist on the wire at all.
+        let current_chunk_id = self.chunk_map.get(&file_id)
+            .and_then(|e| {
+                let (locs, _) = e.value();
+                Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+            });
+        // Computed on the Option, not after collapsing it: "no entry at all found"
+        // must conservatively report applied=false (something is genuinely wrong —
+        // every success path above ends with SOME location present), never get
+        // masked as a coincidental match by whatever fallback value fills in below.
+        let applied = current_chunk_id == Some(real_chunk_id);
+        Response::FoldReceipt {
+            applied,
+            current_chunk_id: current_chunk_id.unwrap_or(real_chunk_id),
+        }
     }
 
     async fn handle_replicate_metadata_batch(&self, items: Vec<FileMetadata>) -> Response {
@@ -9611,18 +9847,83 @@ impl Server {
         // peer-triggered with no rate limit, and under real cluster traffic
         // (dozens of calls/sec) that per-call full-set materialization was live
         // gdb-confirmed as the dominant CPU cost on the process.
+        //
+        // Patch tokens never have a raw on-disk file by design (see
+        // PATCH_TOKEN_MARKER's doc comment) — resolving one goes through
+        // PATCH_STATE_TABLE (base+delta while Pending, or a Folded redirect),
+        // never a direct chunk file. Checking raw file presence for a
+        // token-shaped id therefore always says "absent" for a perfectly
+        // healthy, still-open Pending patch — this is exactly what made
+        // phantom reconciliation (the caller for most HasChunks traffic)
+        // misreport every live Pending token as "confirmed absent" on every
+        // one of its replicas (2026-08-14 VM-108 investigation, see
+        // project_20260814_vm108_daily_eio_fold_leader_gap_confirmed).
+        // Harmless in that specific caller on its own — the "never strand at
+        // zero replicas" guard already refuses to act on it — but noisy
+        // enough to bury the one real phantom in a flood of false ones, and
+        // any other caller trusting a HasChunks=false for a token at face
+        // value would be flatly wrong. Partition and check each half the way
+        // it's actually meant to be checked: raw file presence for ordinary
+        // content, token presence for tokens.
+        //
+        // Token presence checks pending_patch_ids (in-memory, zero lock
+        // contention) FIRST, the same fast-path/durable-fallback idiom
+        // resolve_push_target already uses for the identical question — see
+        // that function's doc comment for why a MISS there isn't proof of
+        // absence (pending_patch_ids is rebuilt from live activity and is
+        // empty right after a restart). Only misses fall through to a
+        // PATCH_STATE_TABLE batch read.
+        //
+        // This two-tier split isn't just an optimization: an initial version
+        // that queried PATCH_STATE_TABLE unconditionally for every token
+        // measurably regressed T38's fold-settlement timing margin in the
+        // local suite (extra read-transaction contention against the same
+        // metadata db a concurrent fold's write transaction needs, right
+        // when a patch storm is minting the most tokens) — see the test
+        // script's own top-of-file comment on why that contention is real
+        // under this box's 5-servers-on-one-host setup, not hypothetical.
+        // In the common case (a token this very node just minted or folded)
+        // every id hits the in-memory map and the durable path is never
+        // touched at all.
+        let (token_ids, raw_ids): (Vec<ChunkId>, Vec<ChunkId>) =
+            chunk_ids.iter().copied().partition(|id| id.looks_like_patch_token());
+
+        let mut present: std::collections::HashSet<ChunkId> = std::collections::HashSet::new();
+        let mut token_misses: Vec<ChunkId> = Vec::with_capacity(token_ids.len());
+        for id in token_ids {
+            if self.pending_patch_ids.contains_key(&id) {
+                present.insert(id);
+            } else {
+                token_misses.push(id);
+            }
+        }
+
         let storage = self.storage.clone();
-        let tombstones = self.chunk_tombstones.clone();
-        let values = tokio::task::spawn_blocking(move || {
-            let present = storage.chunks_present_batch(&chunk_ids)
-                .unwrap_or_else(|_| vec![false; chunk_ids.len()]);
-            chunk_ids.iter().zip(present.iter())
-                .map(|(id, &has)| !tombstones.contains(id) && has)
-                .collect()
+        let metadata = self.metadata.clone();
+        let mut disk_present = tokio::task::spawn_blocking(move || {
+            let mut disk_present = if raw_ids.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                let raw = storage.chunks_present_batch(&raw_ids).unwrap_or_else(|_| vec![false; raw_ids.len()]);
+                raw_ids.into_iter().zip(raw).filter_map(|(id, has)| has.then_some(id)).collect()
+            };
+            if !token_misses.is_empty() {
+                match metadata.get_patch_states_present_batch(&token_misses) {
+                    Ok(tokens) => disk_present.extend(tokens),
+                    Err(e) => warn!("handle_has_chunks: patch-state batch check failed: {}", e),
+                }
+            }
+            disk_present
         }).await.unwrap_or_else(|e| {
             warn!("handle_has_chunks: spawn_blocking panicked: {}", e);
-            Vec::new()
+            Default::default()
         });
+        present.extend(disk_present.drain());
+
+        let tombstones = self.chunk_tombstones.clone();
+        let values = chunk_ids.iter()
+            .map(|id| !tombstones.contains(id) && present.contains(id))
+            .collect();
         Response::BoolVec { values }
     }
 
@@ -11016,17 +11317,47 @@ impl Server {
     }
 
     /// Periodic sweep pruning stale Folded PATCH_STATE_TABLE rows — see
-    /// prune_stale_folded_patch_states's doc comment for the leak this closes.
-    /// Runs on every node independently (PATCH_STATE_TABLE is node-local, never
-    /// disseminated — same reason the compaction loop runs per-node too), on a
-    /// much slower cadence than compaction since this is pure cleanup with no
-    /// user-visible urgency. min_age is deliberately generous (hours): the only
-    /// cost of waiting longer is a bigger table in the meantime, while removing
-    /// a token too early risks a client with genuinely stale-but-still-valid
-    /// cached metadata failing to resolve it.
+    /// find_stale_folded_patch_state_candidates' doc comment for the leak this
+    /// closes. Runs on every node independently (PATCH_STATE_TABLE is
+    /// node-local, never disseminated — same reason the compaction loop runs
+    /// per-node too), on a much slower cadence than compaction since this is
+    /// pure cleanup with no user-visible urgency. min_age is deliberately
+    /// generous (hours): the only cost of waiting longer is a bigger table in
+    /// the meantime, while removing a token too early risks a client with
+    /// genuinely stale-but-still-valid cached metadata failing to resolve it.
+    ///
+    /// Leader-confirmation gate (2026-08-14, VM-108 daily-EIO root cause):
+    /// age alone used to be sufficient to prune a candidate. That's wrong for
+    /// the ordinary case (target still live, file still exists) — this node's
+    /// local Folded row aging past MIN_AGE says nothing about whether the
+    /// LEADER's chunk_map ever actually learned this fold happened.
+    /// `notify_leader_of_fold`'s synchronous push is only a ~2.2s best-effort
+    /// (2 attempts, 1s timeout, 200ms backoff — see its own doc comment), and
+    /// the backstop `patch_fold_rebroadcast` loop only confirms the RPC didn't
+    /// error at the transport level, never that the leader's own arbitration
+    /// (`location_supersedes`) actually applied it — so a fold's dissemination
+    /// can silently fail to converge while looking, from every log this
+    /// system used to emit, completely successful. If that happens, this GC
+    /// used to delete the ONLY remaining record of how to resolve the
+    /// pre-fold token 6 hours later — converting a recoverable desync into
+    /// permanent data loss with the leader still pointing at a token nothing
+    /// can ever serve again. Confirmed live: two different chunks of the same
+    /// VM disk, both stranded this exact way, both first observably broken
+    /// ~17h after their fold (see
+    /// project_20260814_vm108_daily_eio_fold_leader_gap_confirmed).
+    ///
+    /// The fix asks the leader directly (`refresh_slot_from_leader`, the same
+    /// call the ordinary write path already uses to resolve ChunkStale)
+    /// before physically removing an age-based candidate. Unconditionally-safe
+    /// candidates (target's ChunkLocation gone entirely, or the file itself
+    /// gone) skip the leader check — nothing can ever need those regardless of
+    /// what any leader thinks, same as before this fix. A candidate whose
+    /// leader-check comes back inconclusive (leader unreachable, no
+    /// file_id/chunk_idx to check) is left alone and re-evaluated next sweep —
+    /// conservative by construction: never destroy the last copy of something
+    /// on an unconfirmed guess.
     pub fn start_patch_state_gc_loop(self: Arc<Self>) {
-        let metadata = self.metadata.clone();
-        let storage = self.storage.clone();
+        let server = self;
         tokio::spawn(async move {
             const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
             const MIN_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -11035,26 +11366,58 @@ impl Server {
             // should start clearing right away rather than wait up to 30
             // minutes after every restart.
             loop {
-                match metadata.prune_stale_folded_patch_states_async(MIN_AGE).await {
-                    Ok(tokens) if tokens.is_empty() => {}
-                    Ok(tokens) => {
-                        info!("patch_state GC: pruned {} stale Folded row(s)", tokens.len());
-                        // Delete each token's own physical file too — see
-                        // prune_stale_folded_patch_states' doc comment for the leak
-                        // this closes (2026-08-03): a patch token's chunk_id is
-                        // deliberately not a content hash, so leaving this file
-                        // for the disk-orphan sweep to eventually notice risks a
-                        // healing-time content-hash check finding it first and
-                        // reporting a false "disk corruption" — confirmed live on
-                        // gluster5, a token from two days earlier still un-swept.
-                        let storage = storage.clone();
-                        tokio::task::spawn_blocking(move || {
-                            for token in tokens {
-                                if let Err(e) = storage.delete_chunk(&token, "patch_state_gc_stale_token_cleanup") {
-                                    warn!("patch_state GC: failed to delete stale token file {}: {}", token, e);
+                match server.metadata.find_stale_folded_patch_state_candidates_async(MIN_AGE).await {
+                    Ok(candidates) if candidates.is_empty() => {}
+                    Ok(candidates) => {
+                        let mut keys_to_remove: Vec<String> = Vec::new();
+                        let mut deferred = 0usize;
+                        for c in candidates {
+                            if c.safe_without_leader_check {
+                                keys_to_remove.push(c.key);
+                                continue;
+                            }
+                            let Some(file_id) = c.file_id else { deferred += 1; continue; };
+                            let Some(chunk_idx) = c.chunk_idx else { deferred += 1; continue; };
+                            match server.refresh_slot_from_leader(file_id, chunk_idx, c.token).await {
+                                Some(loc) if loc.chunk_id != c.token => keys_to_remove.push(c.key),
+                                _ => {
+                                    // Leader still shows this token as current (or the
+                                    // check itself couldn't be completed) — do NOT prune.
+                                    // Retried next sweep; see this fn's doc comment.
+                                    deferred += 1;
                                 }
                             }
-                        }).await.unwrap_or_else(|e| warn!("patch_state GC: file-cleanup task panicked: {}", e));
+                        }
+                        if deferred > 0 {
+                            info!("patch_state GC: deferred {} stale Folded row(s) pending leader confirmation \
+                                   (leader still shows the pre-fold token current, or was unreachable)", deferred);
+                        }
+                        if keys_to_remove.is_empty() {
+                            continue;
+                        }
+                        match server.metadata.remove_patch_state_rows_async(keys_to_remove).await {
+                            Ok(tokens) => {
+                                info!("patch_state GC: pruned {} stale Folded row(s)", tokens.len());
+                                // Delete each token's own physical file too — see
+                                // find_stale_folded_patch_state_candidates' doc comment
+                                // for the leak this closes (2026-08-03): a patch token's
+                                // chunk_id is deliberately not a content hash, so leaving
+                                // this file for the disk-orphan sweep to eventually
+                                // notice risks a healing-time content-hash check finding
+                                // it first and reporting a false "disk corruption" —
+                                // confirmed live on gluster5, a token from two days
+                                // earlier still un-swept.
+                                let storage = server.storage.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    for token in tokens {
+                                        if let Err(e) = storage.delete_chunk(&token, "patch_state_gc_stale_token_cleanup") {
+                                            warn!("patch_state GC: failed to delete stale token file {}: {}", token, e);
+                                        }
+                                    }
+                                }).await.unwrap_or_else(|e| warn!("patch_state GC: file-cleanup task panicked: {}", e));
+                            }
+                            Err(e) => warn!("patch_state GC: failed to remove confirmed-safe rows: {}", e),
+                        }
                     }
                     Err(e) => warn!("patch_state GC: sweep failed: {}", e),
                 }
@@ -11489,7 +11852,6 @@ impl Server {
         let server = self;
         tokio::spawn(async move {
             const REBROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-            const PATCH_FOLD_REBROADCAST_TTL: std::time::Duration = std::time::Duration::from_secs(120);
             const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
             loop {
                 tokio::time::sleep(REBROADCAST_INTERVAL).await;
@@ -11498,10 +11860,6 @@ impl Server {
                     continue;
                 }
 
-                // Drop expired entries first so the resend pass below only touches live ones.
-                server.pending_patch_fold_broadcasts
-                    .retain(|_, entry| entry.first_seen.elapsed() < PATCH_FOLD_REBROADCAST_TTL);
-
                 // Self-retire entries this node's own view of the slot has
                 // already moved past. An entry is normally cleared early by
                 // apply_patch's retired_token cleanup, but only when THIS node
@@ -11509,8 +11867,7 @@ impl Server {
                 // backstop fold isn't on the client's active write-pair for
                 // that slot (a third replica, or a forced-fold-on-read) never
                 // sees that next patch, so its own entry just sits here,
-                // faithfully resent every 10s for up to the full 120s TTL, long
-                // after chunk_map has moved on. Each resend is a stale
+                // faithfully resent every 10s. Each resend is a stale
                 // ReplicateChunkLocation/ReplicatePatchFold for an identity
                 // that may already be several generations dead — GHOST-stale-
                 // check on the receiving end correctly rejects it, but it's
@@ -11523,24 +11880,115 @@ impl Server {
                 // guard. "No local view of this slot at all" is kept, not
                 // dropped — the conservative default, since we have no
                 // evidence either way.
-                server.pending_patch_fold_broadcasts.retain(|_, entry| {
+                //
+                // No time-based (TTL) expiry anymore (2026-08-14, VM-108
+                // daily-EIO root cause): an entry used to be dropped
+                // unconditionally after 120s regardless of whether the leader
+                // had ever actually confirmed it — the exact mechanism that let
+                // a fold's dissemination silently fail while every log looked
+                // clean. The only two ways an entry now leaves this map (and
+                // its durable PENDING_FOLD_ANNOUNCE_TABLE row) are: this node's
+                // own chunk_map shows the slot has genuinely moved on (below),
+                // or a real Response::FoldReceipt{applied:true} is observed
+                // (the send loop further down) — both are actual evidence the
+                // obligation is discharged, never a guess based on elapsed time.
+                let mut self_retired: Vec<ChunkId> = Vec::new();
+                server.pending_patch_fold_broadcasts.retain(|token, entry| {
                     let current = server.chunk_map.get(&entry.file_id).and_then(|e| {
                         let (locations, _) = e.value();
                         locations.iter()
                             .find(|loc| loc.file_offset.map(|o| o / CHUNK_SIZE) == Some(entry.chunk_idx))
                             .map(|loc| loc.chunk_id)
                     });
-                    !matches!(current, Some(id) if id != entry.real_chunk_id)
+                    let superseded = matches!(current, Some(id) if id != entry.real_chunk_id);
+                    if superseded {
+                        self_retired.push(*token);
+                    }
+                    !superseded
                 });
+                for token in self_retired {
+                    if let Err(e) = server.metadata.delete_pending_fold_announce_async(token).await {
+                        warn!("patch_fold_rebroadcast: failed to clear durable record for self-retired {}: {}", token, e);
+                    }
+                }
 
                 if server.pending_patch_fold_broadcasts.is_empty() {
                     continue;
                 }
 
-                let entries: Vec<(ChunkId, PendingPatchFoldBroadcast)> = server.pending_patch_fold_broadcasts
+                let candidates: Vec<(ChunkId, PendingPatchFoldBroadcast)> = server.pending_patch_fold_broadcasts
                     .iter()
                     .map(|e| (*e.key(), e.value().clone()))
                     .collect();
+
+                // File-gone retirement: the 3 other cleanup sites (apply_patch's
+                // retired-token path, handle_delete_file, handle_delete_chunks_batch)
+                // only clear the in-memory DashMap, not this durable table — an
+                // outstanding announce for a since-deleted file would otherwise leak
+                // in PENDING_FOLD_ANNOUNCE_TABLE forever (nothing else ever revisits
+                // it).
+                //
+                // Age-gated (2026-08-14) behind the same MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK
+                // threshold this codebase already uses for the identical question
+                // elsewhere (abandon_patch_if_file_gone) — an unconditional per-tick
+                // check here measurably regressed T38's fold-settlement timing margin
+                // in the local suite, the same class of self-inflicted contention as
+                // the handle_has_chunks fix earlier this session: almost every entry
+                // resolves via leader-ack within seconds, so paying a metadata read for
+                // every single one on every 10s tick was overwhelmingly wasted work on
+                // the hot/common path, not a rare edge case. A file getting deleted out
+                // from under a fold that's still actively retrying is itself rare, so
+                // gating this to only entries that have been outstanding unusually long
+                // costs nothing in practice for how quickly a genuinely-deleted file's
+                // leaked row gets caught.
+                let file_check_cutoff = std::time::Instant::now()
+                    .checked_sub(MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK);
+                let mut entries = Vec::with_capacity(candidates.len());
+                for (token, entry) in candidates {
+                    let old_enough = file_check_cutoff.is_some_and(|cutoff| entry.first_seen <= cutoff);
+                    if !old_enough {
+                        entries.push((token, entry));
+                        continue;
+                    }
+                    match server.metadata.file_exists_by_id_async(entry.file_id).await {
+                        Ok(false) => {
+                            server.pending_patch_fold_broadcasts.remove(&token);
+                            if let Err(e) = server.metadata.delete_pending_fold_announce_async(token).await {
+                                warn!("patch_fold_rebroadcast: failed to clear durable record for {} (file gone): {}", token, e);
+                            }
+                        }
+                        // Ok(true) genuinely live; Err inconclusive — don't withhold
+                        // retry on an uncertain check, same conservative bias as
+                        // every other "keep it" default in this loop.
+                        Ok(true) | Err(_) => entries.push((token, entry)),
+                    }
+                }
+                if entries.is_empty() {
+                    continue;
+                }
+
+                // Bounded per-tick fan-out (2026-08-14): removing the TTL above
+                // means a genuinely long leader outage (or instability, e.g. an
+                // election storm) during heavy write load can leave this map
+                // large — nothing culls entries anymore just because they're
+                // old, by design. Without a cap, one tick's RPC fan-out is
+                // O(entries × online_peers × 2 requests), which grows without
+                // bound right alongside the backlog it's trying to drain —
+                // exactly the kind of self-reinforcing slowdown that made T38
+                // (which kills/restarts nodes mid-patch-storm, the scenario
+                // most likely to produce a real backlog) measurably worse in
+                // the local suite. Oldest-first so a real backlog actually
+                // drains over successive ticks instead of the same newest
+                // entries winning every time; anything not selected this tick
+                // is simply retried on the next one 10s later — no entry is
+                // ever dropped by this cap, only deferred.
+                const MAX_ENTRIES_PER_TICK: usize = 64;
+                let mut entries = entries;
+                if entries.len() > MAX_ENTRIES_PER_TICK {
+                    entries.sort_by_key(|(_, entry)| entry.first_seen);
+                    entries.truncate(MAX_ENTRIES_PER_TICK);
+                }
+
                 let nodes = server.cluster.get_all_nodes().await;
                 let local_id = server.cluster.local_node_id();
                 let online_peers: Vec<_> = nodes.into_iter()
@@ -11549,10 +11997,12 @@ impl Server {
                 if online_peers.is_empty() {
                     continue;
                 }
+                let leader_addr = server.cluster.get_leader_addr().await;
 
                 info!("patch_fold_rebroadcast: resending {} pending fold(s) to {} online peer(s)",
                     entries.len(), online_peers.len());
 
+                let mut leader_acked: Vec<ChunkId> = Vec::new();
                 for (public_token, entry) in &entries {
                     for node in &online_peers {
                         let loc_request = Request::ReplicateChunkLocation {
@@ -11565,10 +12015,10 @@ impl Server {
                             // Was debug! (2026-08-01): this loop is the only backstop standing
                             // between a fold's result and a peer permanently stranded on a
                             // deleted patch token, and staging runs at --log-level info, so a
-                            // debug! here is completely invisible in production — every one of
-                            // these 12-attempts-over-120s windows failing left zero trace,
-                            // making "did delivery fail" indistinguishable from "did coordination
-                            // never even try" during the VM-108 chunk_idx=3877 investigation.
+                            // debug! here is completely invisible in production — an RPC
+                            // failing here left zero trace, making "did delivery fail"
+                            // indistinguishable from "did coordination never even try" during
+                            // the VM-108 chunk_idx=3877 investigation.
                             warn!("patch_fold_rebroadcast: failed to resend location {} to node {}: {}", public_token, node.id, e);
                         }
                         let fold_request = Request::ReplicatePatchFold {
@@ -11576,9 +12026,41 @@ impl Server {
                             file_id: entry.file_id, chunk_idx: entry.chunk_idx,
                             location: Some(entry.location.clone()),
                         };
-                        if let Err(e) = server.client.send_message(node.addr, Message::Request(fold_request)).await {
-                            warn!("patch_fold_rebroadcast: failed to resend fold {} -> {} to node {}: {}", public_token, entry.real_chunk_id, node.id, e);
+                        match server.client.send_message(node.addr, Message::Request(fold_request)).await {
+                            Err(e) => {
+                                warn!("patch_fold_rebroadcast: failed to resend fold {} -> {} to node {}: {}", public_token, entry.real_chunk_id, node.id, e);
+                            }
+                            // A transport-level Ok is NOT completion — see
+                            // Response::FoldReceipt's doc comment. Only a genuine
+                            // applied:true from the LEADER specifically discharges
+                            // the obligation; a non-leader peer's response (of
+                            // either kind) is still just best-effort coverage, same
+                            // as before this fix.
+                            Ok(envelope) if Some(node.addr) == leader_addr => match envelope.message {
+                                Message::Response(Response::FoldReceipt { applied: true, .. }) => {
+                                    leader_acked.push(*public_token);
+                                }
+                                Message::Response(Response::FoldReceipt { applied: false, current_chunk_id }) => {
+                                    warn!("patch_fold_rebroadcast: leader still declines {} -> {} after resend — \
+                                           leader's chunk_map for file {} chunk {} currently names {}, will keep retrying",
+                                        public_token, entry.real_chunk_id, entry.file_id, entry.chunk_idx, current_chunk_id);
+                                }
+                                // Old-protocol leader mid-rollout, still answering with bare
+                                // Ok — accept as best-effort, same as notify_leader_of_fold's
+                                // identical fallback.
+                                Message::Response(Response::Ok { .. }) => {
+                                    leader_acked.push(*public_token);
+                                }
+                                _ => {}
+                            },
+                            Ok(_) => {}
                         }
+                    }
+                }
+                for token in leader_acked {
+                    server.pending_patch_fold_broadcasts.remove(&token);
+                    if let Err(e) = server.metadata.delete_pending_fold_announce_async(token).await {
+                        warn!("patch_fold_rebroadcast: failed to clear durable record for leader-acked {}: {}", token, e);
                     }
                 }
             }
@@ -12672,6 +13154,7 @@ impl Server {
             fold_coord_reseed_recovered_from_durable_state: self.fold_coord_reseed_recovered_from_durable_state.clone(),
             fold_coord_noop_already_folded: self.fold_coord_noop_already_folded.clone(),
             fold_coord_noop_nothing_pending: self.fold_coord_noop_nothing_pending.clone(),
+            fold_announce_inflight: self.fold_announce_inflight.clone(),
             fold_hash_semaphore: self.fold_hash_semaphore.clone(),
             last_fold_leader_confirm: self.last_fold_leader_confirm.clone(),
             chunk_ring: self.chunk_ring.clone(),
@@ -18066,6 +18549,63 @@ mod tests {
             "this node is not in the chunk's real replica set per chunk_map — must not \
              queue a phantom heal for a chunk it was never assigned to hold"
         );
+    }
+
+    /// Root-caused 2026-08-14 (VM-108 daily-EIO investigation): handle_has_chunks
+    /// used to check ONLY raw on-disk file presence, which is always false for a
+    /// patch token by design (see PATCH_TOKEN_MARKER's doc comment — a token
+    /// resolves through PATCH_STATE_TABLE, never a direct file). Every peer this
+    /// RPC is sent to (phantom reconciliation's main caller) would honestly and
+    /// correctly report a perfectly healthy, still-open Pending patch as absent,
+    /// which is the false-positive flood that buried the real signal during that
+    /// investigation. This proves the fix: a token backed by a live Pending
+    /// patch_state row must report present even with zero raw bytes on disk, an
+    /// ordinary chunk_id must still go through the raw-file check as before, and
+    /// a genuinely-missing id of either shape must still report absent.
+    #[tokio::test]
+    async fn test_handle_has_chunks_reports_patch_token_present_via_patch_state() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let base_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"has-chunks-base"));
+        let delta_chunk_id = ChunkId::from_hash(compute_chunk_hash(b"has-chunks-delta"));
+        // A real, marker-shaped patch token identity — not just any content hash —
+        // so this test actually exercises looks_like_patch_token()'s true branch,
+        // the same way a live Pending accumulator's public_token does.
+        let token = dfs_common::ChunkId::patch_token_identity(delta_chunk_id);
+        metadata.put_patch_state_pending(file_id, 0, &token, base_chunk_id, delta_chunk_id, 4096, 1000, Some(1)).unwrap();
+        // Deliberately no storage.write_chunk for `token` — tokens never have one.
+
+        let present_raw = ChunkId::from_hash(compute_chunk_hash(b"has-chunks-present-raw"));
+        storage.write_chunk(&present_raw, b"real bytes on disk").unwrap();
+
+        let missing_raw = ChunkId::from_hash(compute_chunk_hash(b"has-chunks-missing-raw"));
+        let missing_token = dfs_common::ChunkId::patch_token_identity(
+            ChunkId::from_hash(compute_chunk_hash(b"has-chunks-missing-token-delta")),
+        );
+
+        let resp = server.handle_request(Request::HasChunks {
+            chunk_ids: vec![token, present_raw, missing_raw, missing_token],
+        }).await;
+        let Response::BoolVec { values } = resp else { panic!("expected BoolVec, got {:?}", resp) };
+        assert_eq!(values, vec![true, true, false, false],
+            "token backed by a live Pending patch_state row must report present with zero raw \
+             bytes on disk; ordinary chunk_ids must still go through the raw-file check; anything \
+             genuinely absent (of either shape) must still report absent");
     }
 
     /// Root-caused 2026-08-07 live on staging (a real VM disk read returning

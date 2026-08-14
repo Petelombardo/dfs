@@ -2129,7 +2129,7 @@ impl HealingManager {
                 // (ChunkId::looks_like_patch_token, dfs-common/types.rs) is NEVER
                 // a candidate for this sweep, full stop — no metadata lookup, no
                 // liveness check, nothing. Token lifecycle is the exclusive
-                // responsibility of prune_stale_folded_patch_states + patch_state_gc
+                // responsibility of find_stale_folded_patch_state_candidates + patch_state_gc
                 // (which deletes the file in the same pass it retires the row).
                 // Before this, a token's only protection here was a
                 // PATCH_STATE_TABLE lookup a few lines below — which was shown to

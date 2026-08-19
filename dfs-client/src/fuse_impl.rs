@@ -2567,8 +2567,8 @@ impl FlushHandle {
         // investigate a race or a specific corrupted offset) stays available at
         // debug!, same as everywhere else in this codebase.
         let dirty_ranges_bytes: usize = dirty_ranges.iter().map(|&(s, e)| e - s).sum();
-        info!("flush_buffer_async_one: ino={} chunk={} file_offset={} existing_chunk_size={} slot_len={} gap_prefix={} real_end={} dirty_ranges={} ranges ({} bytes) meta_file_id={:?} buf_expected_id={:?}",
-            ino, chunk_idx, file_offset, existing_chunk_size, slot_len, gap_filled_prefix, real_data_end, dirty_ranges.len(), dirty_ranges_bytes, file_id_at_flush_start, buf_expected_id);
+        info!("flush_buffer_async_one: ino={} chunk={} file_offset={} existing_chunk_size={} slot_len={} gap_prefix={} real_end={} dirty_ranges={} ranges ({} bytes) meta_file_id={:?} buf_expected_id={:?} first_flush_this_session={}",
+            ino, chunk_idx, file_offset, existing_chunk_size, slot_len, gap_filled_prefix, real_data_end, dirty_ranges.len(), dirty_ranges_bytes, file_id_at_flush_start, buf_expected_id, is_first_flush_this_session);
         debug!("flush_buffer_async_one: ino={} chunk={} dirty_ranges detail={:?}", ino, chunk_idx, dirty_ranges);
         let chunk_exists = existing_chunk_size > 0;
         let is_append_extend = chunk_exists
@@ -3420,53 +3420,49 @@ impl FlushHandle {
 
         if has_gaps && dirty_ranges.len() > 1 {
             // Sparse write: multiple non-contiguous ranges with gaps. We must NOT send the full
-            // slot with zero-filled gaps, as those zeros will overwrite data written in earlier
-            // operations within the same session (e.g., qcow2 metadata clusters).
+            // slot with zero-filled gaps as-is if real data could already sit in those gaps
+            // (e.g., qcow2 metadata clusters written at non-sequential offsets) — the safety
+            // check below (unconditional whenever has_gaps, not gated to this branch) is what
+            // actually enforces that now; see its doc comment.
             //
-            // Strategy: Write the FULL slot (including zeros in gaps) as a fresh chunk write.
-            // This ensures the chunk covers the entire range and reads from gap regions return
-            // zeros instead of EIO. The gaps contain zeros because the application never wrote
-            // to those offsets - it's sparse data, not missing data.
+            // Once verified safe, write the FULL slot (including zeros in gaps) as a fresh
+            // chunk write. This ensures the chunk covers the entire range and reads from gap
+            // regions return zeros instead of EIO — correct for a genuinely sparse write (the
+            // application never wrote those offsets), which is exactly what the check confirms
+            // before we proceed.
             info!("flush_buffer_async_one: ino={} chunk={} SPARSE WRITE: {} ranges covering {} of {} bytes - writing full slot with zero gaps",
                   ino, chunk_idx, dirty_ranges.len(),
                   dirty_ranges.iter().map(|&(s, e)| e - s).sum::<usize>(), slot_len);
             // Fall through to normal fresh write path which sends the full slot_data
         }
 
-        // Last-line-of-defense safety check: about to fabricate gap_filled_prefix bytes
-        // of zeros on the belief this chunk doesn't exist yet (chunk_exists=false). That
-        // belief comes from existing_chunk_size, sourced from metadata_cache — which can
-        // be stale specifically on a chunk's first flush in a session (see the open()
-        // synchronous-refresh fix above). Real incident, 2026-07-03 (staging nanopir3):
-        // dvr.conf's real 111 bytes were zeroed exactly this way, and reproduced even
-        // after that fix — the precise staleness cause wasn't fully pinned down, so
-        // rather than requiring perfect cache freshness everywhere, treat this as a
-        // final, authoritative check instead. Scoped to first-flush-this-session only
-        // (is_first_flush_this_session) so it doesn't add an RPC to every legitimate
-        // sparse write to a genuinely-new chunk (e.g. VM disk image creation) — only the
-        // narrow window where existing_chunk_size hasn't yet been confirmed by this
-        // session's own flush history.
-        //
-        // Instrumentation added 2026-08-01 (VM-108, chunk_idx 0, silent header-zeroing
-        // corruption): this risk condition (about to zero-fill a gap prefix on the belief
-        // a chunk doesn't exist) is logged unconditionally now, INCLUDING when
-        // is_first_flush_this_session is false and this whole safety check is therefore
-        // SKIPPED — that's the exact blind spot a chunk under sustained heavy contention
-        // (100+ patches/sec for over an hour, in the incident this is investigating) can
-        // hit well after its own first flush, with nothing left to catch it. Purely
-        // additive logging; the check's own behavior is unchanged pending what this
-        // reveals about which of the two suspected mechanisms (the check re-arming but
-        // racing the server, vs. never re-arming at all) is actually happening.
-        if !chunk_exists && gap_filled_prefix > 0 {
-            if is_first_flush_this_session {
-                info!("flush_buffer_async_one: ino={} chunk={} risk condition (chunk_exists=false, gap_filled_prefix={}) — first flush this session, safety check WILL run",
-                    ino, chunk_idx, gap_filled_prefix);
-            } else {
-                warn!("flush_buffer_async_one: ino={} chunk={} risk condition (chunk_exists=false, gap_filled_prefix={}) on a NON-first flush — safety check SKIPPED (is_first_flush_this_session=false), about to send {} bytes of fabricated zeros with no server-side verification",
-                    ino, chunk_idx, gap_filled_prefix, gap_filled_prefix);
-            }
-        }
-        if !chunk_exists && gap_filled_prefix > 0 && is_first_flush_this_session {
+        // Last-line-of-defense safety check: about to fabricate zero-filled gap bytes (a
+        // leading gap_filled_prefix, or the scattered gaps of the sparse multi-range write
+        // above) on the belief this chunk either doesn't exist yet or that our cached
+        // location for it is trustworthy (existing_chunk_size, sourced from metadata_cache
+        // or this session's own flushed_sizes). Both beliefs can be wrong independent of
+        // whether this is the slot's first flush this session — real incidents:
+        //  - 2026-07-03 (staging nanopir3): dvr.conf's real 111 bytes were zeroed by
+        //    first-flush metadata_cache staleness; this check was added, scoped to
+        //    first-flush only (is_first_flush_this_session) on the theory that a LATER
+        //    flush could trust this session's own flush history instead.
+        //  - 2026-08-01/2026-08-19 (VM-108, chunk_idx 0): that theory was wrong. A chunk
+        //    under sustained heavy contention (100+ patches/sec for over an hour) hit the
+        //    same fabricated-zeros failure on a flush well past the first — a needs_patch
+        //    attempt fell through to "no metadata or location" for the slot mid-storm, the
+        //    first-flush gate never re-armed to catch it, and the sparse-write branch above
+        //    never had this check at all. The qcow2 header at chunk_idx 0 was silently
+        //    zeroed this way, confirmed via live forensics (identical zeroed bytes 0x0-
+        //    0x14FFFF replicated correctly to all 3 nodes — a genuine write, not a stale
+        //    metadata read artifact).
+        // Fix: run this check unconditionally whenever has_gaps (not gated on
+        // gap_filled_prefix>0 alone, and not gated on is_first_flush_this_session, and not
+        // gated on chunk_exists — the "no metadata or location" fallthrough above can be
+        // reached with chunk_exists=true too). An RPC here is cheap relative to the
+        // alternative (silently destroying real chunk content), and this fresh-write
+        // fallback is not the hot path: a healthy needs_patch=true flush resolves inside
+        // 'try_patch and never reaches here at all.
+        if has_gaps {
             let path_opt = self.inode_to_path.read().unwrap().get(&ino).cloned();
             let fresh_has_chunk = if let Some(path) = path_opt.clone() {
                 match self.client.get_file_metadata(&path).await {
@@ -10018,5 +10014,182 @@ mod terminal_give_up_tests {
             "gave-up slot must be removed from active_chunks, not linger as a phantom entry");
         assert_eq!(global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed), 0,
             "discarded bytes must actually leave global_buffered_bytes accounting");
+    }
+}
+
+#[cfg(test)]
+mod fresh_write_safety_check_tests {
+    use super::*;
+    use dfs_common::{ErrorCode, Message, MessageEnvelope, NodeId, Request, Response};
+    use std::sync::atomic::Ordering;
+
+    async fn write_envelope(stream: &mut tokio::net::TcpStream, request_id: dfs_common::RequestId, response: Response) {
+        use tokio::io::AsyncWriteExt;
+        let envelope = MessageEnvelope::new(request_id, Message::Response(response));
+        let encoded = envelope.to_bytes().unwrap();
+        let len = encoded.len() as u32;
+        let _ = stream.write_all(&len.to_be_bytes()).await;
+        let _ = stream.write_all(&encoded).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Mock node for the fresh-write safety-check regression test below: answers
+    /// GetFileMetadataByPath with `fresh_meta` (simulating the server's real,
+    /// authoritative view — chunk_idx 0 already has real data), and counts every
+    /// OTHER request type it receives. A pre-fix client reaches this branch only
+    /// because it's about to send the corrupting write (WriteChunk or equivalent)
+    /// — so `other_request_count > 0` is the unambiguous "the corruption was about
+    /// to happen" signal, independent of exactly which RPC write_data_with_cache
+    /// issues internally.
+    fn spawn_fresh_write_safety_mock(addr: SocketAddr, fresh_meta: FileMetadata) -> Arc<std::sync::atomic::AtomicUsize> {
+        use tokio::io::AsyncReadExt;
+        let other_request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = other_request_count.clone();
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(_) => return, // address already in use by a previous test run
+            };
+            loop {
+                let (mut stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                let fresh_meta = fresh_meta.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; len];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                        let request_id = envelope.request_id;
+                        let Message::Request(req) = envelope.message else { return };
+                        match req {
+                            Request::GetFileMetadataByPath { .. } => {
+                                write_envelope(&mut stream, request_id, Response::FileMetadata {
+                                    metadata: fresh_meta.clone(),
+                                }).await;
+                            }
+                            _ => {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                write_envelope(&mut stream, request_id, Response::Error {
+                                    message: "unhandled in mock (would have been the corrupting write)".to_string(),
+                                    code: ErrorCode::InternalError,
+                                }).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        other_request_count
+    }
+
+    /// Regression test for the 2026-08-01/2026-08-19 VM-108 chunk_idx-0 silent
+    /// header-zeroing corruption: a sparse multi-range write (e.g. scattered qcow2
+    /// header/L1/refcount-table updates) whose needs_patch=true attempt falls
+    /// through to "no metadata or location" (metadata_cache has nothing for this
+    /// inode — exactly what heavy contention mid-storm can produce) must NOT
+    /// silently send the full slot with fabricated zero gaps over data the server
+    /// actually has. Before the fix, the safety check only fired for a leading
+    /// gap_filled_prefix > 0; this write starts at offset 0 (gap_filled_prefix ==
+    /// 0) with a gap *between* two dirty ranges instead, which the old check
+    /// never covered at all, regardless of first-flush status.
+    #[tokio::test]
+    async fn sparse_write_with_no_cached_metadata_refuses_to_fabricate_zeros_over_real_data() {
+        let addr1: SocketAddr = "127.0.0.1:19501".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:19502".parse().unwrap();
+        let node1 = NodeId::new();
+        let node2 = NodeId::new();
+        let file_id = dfs_common::FileId::new();
+        let path = "/images/108/vm-108-disk-0.qcow2";
+        let ino = 27034u64;
+        let chunk_idx = 0u64;
+
+        // The server's real, authoritative view: chunk_idx 0 already has 4MB of
+        // real data (the qcow2 header this incident zeroed).
+        let mut fresh_meta = FileMetadata::new(path.to_string(), FileType::RegularFile);
+        fresh_meta.id = file_id;
+        fresh_meta.size = 4 * 1024 * 1024;
+        fresh_meta.chunk_locations = Arc::new(vec![ChunkLocation {
+            chunk_id: ChunkId::from_hash([0x42u8; 32]),
+            nodes: vec![node1, node2],
+            size: 4 * 1024 * 1024,
+            checksum: [0x42u8; 32],
+            file_offset: Some(0),
+            written_at: Some(1_000),
+            client_write_seq: Some(57),
+            file_id: Some(file_id),
+        }]);
+
+        let count1 = spawn_fresh_write_safety_mock(addr1, fresh_meta.clone());
+        let count2 = spawn_fresh_write_safety_mock(addr2, fresh_meta);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // leader_addr and addr_to_node_id are private to DfsClient (only settable
+        // from within client.rs's own test module) — get_file_metadata_conditional
+        // falls back to send_request_with_retry over plain cluster_nodes (public)
+        // when leader_addr is unset, which is all this test needs.
+        let client = Arc::new(DfsClient::new(vec![addr1, addr2]).unwrap());
+        *client.cluster_nodes.write().await = vec![addr1, addr2];
+
+        let handle = FlushHandle {
+            client: client.clone(),
+            write_buffers: Arc::new(DashMap::new()),
+            // Empty: no cached FileMetadata for this inode at all — the exact
+            // "no metadata or location" condition that fell through mid-storm in
+            // the real incident, independent of is_first_flush_this_session.
+            metadata_cache: Arc::new(DashMap::new()),
+            chunk_write_locks: Arc::new(DashMap::new()),
+            flush_in_flight: Arc::new(RwLock::new(None)),
+            last_metadata_update: Arc::new(DashMap::new()),
+            last_bg_metadata_push: Arc::new(DashMap::new()),
+            dir_cache: Arc::new(DashMap::new()),
+            dir_cache_invalidated_at: Arc::new(DashMap::new()),
+            path_to_inode: Arc::new(RwLock::new(HashMap::new())),
+            inode_to_path: Arc::new(RwLock::new(HashMap::from([(ino, path.to_string())]))),
+            truncated_inodes: Arc::new(dashmap::DashSet::new()),
+            explicit_mtime_pending: Arc::new(dashmap::DashSet::new()),
+            flush_runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            global_buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            global_flush_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            write_tasks_in_flight: Arc::new(DashMap::new()),
+            flush_pipeline_locks: Arc::new(DashMap::new()),
+            use_dual_rf: false,
+            write_open_counts: Arc::new(DashMap::new()),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
+        };
+
+        // Sparse write: two small dirty ranges (mimicking scattered qcow2 header/
+        // table field updates) with a real gap *between* them, not before the
+        // first one — gap_filled_prefix is 0 because the first range starts at
+        // offset 0, which is exactly what let this slip past the old check.
+        let slot_len = 2000usize;
+        let mut slot_data = vec![0u8; slot_len];
+        for b in &mut slot_data[0..16] { *b = 0xAB; }
+        for b in &mut slot_data[1000..1016] { *b = 0xCD; }
+        let dirty_ranges = vec![(0usize, 16usize), (1000usize, 1016usize)];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle.flush_buffer_async_one(ino, chunk_idx, slot_data, 0, 0, 1016, dirty_ranges, SystemTime::now()),
+        ).await;
+
+        tokio::task::spawn_blocking(move || drop(handle)).await.unwrap();
+
+        assert!(result.is_ok(), "must not hang past the 10s test timeout");
+        let result = result.unwrap();
+        assert!(result.is_err(),
+            "BUG REPRODUCED: must refuse to send a fresh write with fabricated zero gaps once \
+             the server confirms real existing data at chunk_idx 0 — got Ok, meaning the qcow2 \
+             header would have been silently zeroed exactly like the real VM-108 incident");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("fresh-write safety check found real existing data"),
+            "must fail via the safety-check abort specifically, not some unrelated error: {}", msg);
+        assert_eq!(count1.load(Ordering::SeqCst), 0,
+            "must never have sent the corrupting write to node1");
+        assert_eq!(count2.load(Ordering::SeqCst), 0,
+            "must never have sent the corrupting write to node2");
     }
 }

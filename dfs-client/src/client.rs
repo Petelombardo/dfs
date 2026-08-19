@@ -3763,7 +3763,7 @@ leader_addr: Arc::new(RwLock::new(None)),
 
         // --- Wait for in-flight chunks fetched by concurrent requests ---
         for (idx, cid, loc) in to_wait {
-            let data = self.wait_for_chunk_in_cache(cid, &engine, &loc).await?;
+            let data = self.wait_for_chunk_in_cache(cid, &engine, &loc, file_id, idx as u64).await?;
             result_chunks.push((idx, data));
         }
 
@@ -4135,6 +4135,8 @@ leader_addr: Arc::new(RwLock::new(None)),
         cid: ChunkId,
         engine: &InodeReadEngine,
         loc: &ChunkLocation,
+        file_id: FileId,
+        chunk_idx: u64,
     ) -> Result<Arc<Vec<u8>>> {
         // Arm the notified() future BEFORE checking the cache so we never miss
         // a notify_waiters() that fires between the check and the wait.
@@ -4179,11 +4181,50 @@ leader_addr: Arc::new(RwLock::new(None)),
                     let p = nodes[0];
                     (p, nodes[1..].to_vec())
                 });
-        let data = Arc::new(self.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await?);
+        // (landing_cid, raw bytes) — landing_cid is whichever identity actually served the
+        // data, so the cache_put below caches under the id that's really readable, matching
+        // what the stale-retry paths above already do (they cache under the revalidated id,
+        // not the stale one).
+        let (landing_cid, raw) = match self.fetch_chunk_with_fallback(cid, primary, &fallbacks, None).await {
+            Ok(d) => (cid, d),
+            Err(orig_err) => {
+                // The fetcher we were waiting on used `cid`, and it's now confirmed missing
+                // everywhere — same "background fold/patch retired this id" class the
+                // recent_chunk_writes/revalidate_chunk_slot handling above already covers for
+                // the *owning* fetcher's own stale-retry path. This waiter path never had that
+                // recovery, so it surfaced a hard EIO for a slot whose live data was one
+                // revalidate call away — confirmed live 2026-08-18 (VM-108 dd read: two
+                // concurrent sub-reads of the same 4MB chunk, the second landed here after a
+                // background patch race retired `cid`, and gave up immediately instead of
+                // discovering the leader's actual current chunk for the slot).
+                let mut recovered: Option<(ChunkId, ChunkLocation)> = self.recent_chunk_writes
+                    .get(&(engine.inode, chunk_idx))
+                    .map(|r| r.value().0)
+                    .filter(|&rc| rc != cid)
+                    .map(|rc| (rc, loc.clone()));
+
+                if recovered.is_none() {
+                    if let Ok(Some(revalidated)) = self.revalidate_chunk_slot(file_id, chunk_idx, cid).await {
+                        if revalidated.chunk_id != cid {
+                            recovered = Some((revalidated.chunk_id, revalidated));
+                        }
+                    }
+                }
+
+                let Some((new_cid, new_loc)) = recovered else {
+                    return Err(orig_err);
+                };
+                let (rp, rf) = InodeReadEngine::resolve_primary(&new_loc, &nim, &nodes, 0)
+                    .unwrap_or_else(|| (primary, fallbacks.clone()));
+                let d = self.fetch_chunk_with_fallback(new_cid, rp, &rf, None).await?;
+                (new_cid, d)
+            }
+        };
+        let data = Arc::new(raw);
         // Cache the result so other concurrent waiters don't need their own direct fetch.
         // Without this, every waiter that timed out does a separate network fetch for the
         // same chunk — a thundering herd when the primary fetch is slow (e.g. server throttling).
-        self.chunk_cache.insert(cid, Arc::clone(&data));
+        self.chunk_cache.insert(landing_cid, Arc::clone(&data));
         self.chunk_landed.notify_waiters();
         Ok(data)
     }
@@ -9468,6 +9509,62 @@ mod tests {
         }
         assert!(attempt_count.load(Ordering::SeqCst) >= 3,
             "must have actually made a third attempt, not just gotten lucky on retry count");
+    }
+
+    /// Regression test for the 2026-08-18 VM-108 dd-read EIO: a second concurrent
+    /// reader of the same 4MB chunk finds its chunk_id already claimed by another
+    /// in-flight fetch and lands in wait_for_chunk_in_cache. If that owning fetch's
+    /// chunk_id turns out to be stale (a background patch/fold race the leader
+    /// rejected without ever telling this client), the fallback must recover via
+    /// revalidate_chunk_slot / recent_chunk_writes the same way the primary
+    /// stale-retry paths (read_file's own '`stale:` loop, the range-fetch retry)
+    /// already do — not surface a hard EIO for data that's one revalidate call
+    /// away. Traced live on staging: chunk_idx 2984 of vm-108-disk-0.qcow2 had
+    /// fully-replicated, intact data under the corrected chunk_id the whole time;
+    /// this exact fallback gave up after trying only the stale id and killed the
+    /// guest's read with EIO.
+    #[tokio::test]
+    async fn wait_for_chunk_in_cache_recovers_via_revalidate_when_owner_fetch_is_stale() {
+        let addr: SocketAddr = "127.0.0.1:19404".parse().unwrap();
+        let node_id = NodeId::new();
+        let file_id = FileId::new();
+        let inode = 42u64;
+
+        let stale_id = chunk_id_with_hash0(0xDD);
+        let corrected_id = chunk_id_with_hash0(0xEE);
+
+        let revalidate_calls = spawn_mock_leader(addr, node_id, stale_id, corrected_id, Some(corrected_id));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = DfsClient::new(vec![addr]).unwrap();
+        *client.leader_addr.write().await = Some(addr);
+        client.addr_to_node_id.write().await.insert(addr, node_id);
+        client.cluster_nodes.write().await.push(addr);
+
+        // Simulate "another concurrent request already owns this fetch": claim the
+        // stale chunk_id in the engine's in_flight set ourselves, before read_file
+        // gets a chance to. read_file's own claim attempt then finds it already
+        // taken and routes into wait_for_chunk_in_cache instead of fetching
+        // directly — exactly the path a second concurrent reader takes in
+        // production (e.g. dd's overlapping readahead requests within one 4MB
+        // chunk). Nothing ever populates chunk_cache or removes this in_flight
+        // entry, so the wait times out and falls through to the fallback under
+        // test — deterministic, no real wall-clock race between two tasks.
+        let engine = client.read_engines.get_or_create(inode);
+        engine.in_flight.insert(stale_id);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_file(inode, 4 * 1024 * 1024, file_id, "/wait-for-chunk-test", 0, "real-corrected-data".len(), false, None),
+        ).await;
+
+        assert!(result.is_ok(), "read_file must not hang — it should resolve well within the 10s test timeout");
+        assert_eq!(result.unwrap().unwrap(), b"real-corrected-data",
+            "BUG REPRODUCED: wait_for_chunk_in_cache's direct-fetch fallback must recover via \
+             revalidate_chunk_slot the same way the primary stale-retry path does, not surface \
+             a hard EIO for data that's one revalidate call away");
+        assert!(revalidate_calls.load(Ordering::SeqCst) >= 1,
+            "must have called RevalidateChunkSlot to discover the corrected identity");
     }
 
     /// An empty batch must be a no-op — no network call, no error — since callers

@@ -1191,8 +1191,8 @@ async fn handle_file_command(
                 let response = send_request(addr, Request::DebugGetRawChunkLocation { chunk_id: cid }).await;
                 match response {
                     Ok(Response::DebugRawChunkLocation { location: Some(loc) }) => {
-                        println!("{}: nodes={:?} size={} written_at={:?} client_write_seq={:?} file_id={:?}",
-                            addr, loc.nodes, loc.size, loc.written_at, loc.client_write_seq, loc.file_id);
+                        println!("{}: nodes={:?} size={} written_at={:?} client_write_seq={:?} file_id={:?} file_offset={:?}",
+                            addr, loc.nodes, loc.size, loc.written_at, loc.client_write_seq, loc.file_id, loc.file_offset);
                     }
                     Ok(Response::DebugRawChunkLocation { location: None }) => {
                         println!("{}: no CHUNK_TABLE record", addr);

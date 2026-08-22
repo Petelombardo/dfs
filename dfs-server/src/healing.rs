@@ -1853,7 +1853,7 @@ impl HealingManager {
             if !destructive_allowed {
                 info!("Phantom reconciliation: {} unreferenced zero-replica tombstone(s) found but cluster not fully healthy/settled (or this node restarted recently) — deferring", tombstone_candidates.len());
             } else {
-                let authorized = self.authorize_live_file_orphan_deletes(&tombstone_candidates).await;
+                let authorized = self.authorize_live_file_orphan_deletes(&tombstone_candidates).await.unwrap_or_default();
                 if !authorized.is_empty() {
                     let metadata = Arc::clone(&self.metadata);
                     let deletes = authorized.clone();
@@ -2589,9 +2589,29 @@ impl HealingManager {
             return;
         }
 
-        let mut authorized = self.authorize_live_file_orphan_deletes(&ready_to_delete).await;
+        let mut authorized = match self.authorize_live_file_orphan_deletes(&ready_to_delete).await {
+            Some(a) => a,
+            None => {
+                // Deferred, not refused — the previous pass's "second sighting" already
+                // confirmed these have no live reference; a peer merely being
+                // unreachable/unstable/uncached this instant says nothing about that.
+                // Re-track them so the next sweep sees them as already-confirmed rather
+                // than resetting to "first sighting" — otherwise a candidate can
+                // flicker between first-sighting and deferred-authorization forever on
+                // a cluster that's rarely two consecutive passes away from every node
+                // reporting Online at once. See authorize_live_file_orphan_deletes'
+                // doc comment for the incident this closes.
+                let mut tracked = self.orphan_candidates.write().await;
+                for chunk_id in &ready_to_delete {
+                    tracked.insert(*chunk_id);
+                }
+                debug!("Live-file orphan sweep: authorization deferred for {} candidate(s) — re-tracked as confirmed, not reset to first sighting",
+                       ready_to_delete.len());
+                return;
+            }
+        };
         if authorized.is_empty() {
-            debug!("Live-file orphan sweep: {} candidate(s) confirmed-absent locally but not authorized for deletion this cycle",
+            debug!("Live-file orphan sweep: {} candidate(s) confirmed-absent locally but confirmed still-needed (live Pending base/token) elsewhere — not deleting",
                    ready_to_delete.len());
             return;
         }
@@ -2666,24 +2686,35 @@ impl HealingManager {
     ///
     /// - Not the leader: ask the leader via ConfirmChunksLive — it's normally the
     ///   most caught-up replica. Anything the leader confirms live is excluded. Any
-    ///   RPC failure, timeout, or unexpected response authorizes NOTHING this cycle
+    ///   RPC failure, timeout, or unexpected response defers this cycle entirely
     ///   (fail safe — retried next sweep, no data loss risk from being conservative).
     /// - Is the leader (no one more authoritative to ask): require every other known
     ///   node to be Online AND to report at least STABILITY_SECS of continuous
     ///   process uptime. A node that recently restarted may not have finished
     ///   catching up its own metadata replica yet — proceeding before that settles
     ///   is exactly the "split-brain mass delete" scenario this guards against. Any
-    ///   node failing either check authorizes NOTHING this cycle. This cluster-wide
+    ///   node failing either check defers this cycle entirely. This cluster-wide
     ///   fetch is the expensive part (queries every peer) and is cached for
     ///   ORPHAN_AUTH_CACHE_TTL — see that constant's doc comment.
-    async fn authorize_live_file_orphan_deletes(&self, candidates: &[ChunkId]) -> Vec<ChunkId> {
+    ///
+    /// Returns `None` for every "couldn't get a definitive answer this cycle" case
+    /// above (RPC failure, timeout, unreachable/unstable peer, no known leader) —
+    /// deliberately distinct from `Some(vec![])`, which means "asked, and every
+    /// candidate came back still-needed." reconcile_live_file_candidates relies on
+    /// this distinction: a `None` must NOT be treated the same as "confirmed still
+    /// live," because doing so silently discarded a candidate's two-pass debounce
+    /// progress on a merely-transient defer — see that function's doc comment for
+    /// the incident this closes (2026-08-22, superseded-generation backlog stuck at
+    /// 275+ chunks indefinitely on a cluster that's rarely two consecutive sweep
+    /// passes away from every node reporting Online at once).
+    async fn authorize_live_file_orphan_deletes(&self, candidates: &[ChunkId]) -> Option<Vec<ChunkId>> {
         const STABILITY_SECS: u64 = 300;
         const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
         if self.cluster.is_leader().await {
             if let Some((cached_at, pending_ids)) = self.orphan_auth_cache.lock().await.as_ref() {
                 if cached_at.elapsed() < Self::ORPHAN_AUTH_CACHE_TTL {
-                    return candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect();
+                    return Some(candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect());
                 }
             }
 
@@ -2708,7 +2739,7 @@ impl HealingManager {
                 Ok(ids) => ids,
                 Err(e) => {
                     warn!("Live-file orphan sweep: failed to read local pending patch chunk_ids, deferring this cycle: {}", e);
-                    return Vec::new();
+                    return None;
                 }
             };
             // Also protect outstanding tokens themselves, not just their base/delta
@@ -2718,14 +2749,14 @@ impl HealingManager {
                 Ok(token_ids) => pending_ids.extend(token_ids),
                 Err(e) => {
                     warn!("Live-file orphan sweep: failed to read local patch token ids, deferring this cycle: {}", e);
-                    return Vec::new();
+                    return None;
                 }
             }
 
             let peers: Vec<_> = nodes.iter().filter(|n| n.id != local_id).cloned().collect();
             if peers.iter().any(|n| n.status != dfs_common::NodeStatus::Online) {
                 debug!("Live-file orphan sweep: deferring — at least one known node is not online");
-                return Vec::new();
+                return None;
             }
             // One combined GetOrphanAuthInfo RPC per peer (was two, GetNodeStats +
             // GetPendingPatchChunkIds) issued concurrently (was sequential, one
@@ -2760,18 +2791,18 @@ impl HealingManager {
             for result in results {
                 match result {
                     Some(ids) => pending_ids.extend(ids),
-                    None => return Vec::new(),
+                    None => return None,
                 }
             }
 
             *self.orphan_auth_cache.lock().await = Some((Instant::now(), pending_ids.clone()));
-            candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect()
+            Some(candidates.iter().copied().filter(|id| !pending_ids.contains(id)).collect())
         } else {
             let leader_addr = match self.cluster.get_leader_addr().await {
                 Some(addr) => addr,
                 None => {
                     debug!("Live-file orphan sweep: deferring — no known leader to confirm with");
-                    return Vec::new();
+                    return None;
                 }
             };
             let req = Request::ConfirmChunksLive { chunk_ids: candidates.to_vec() };
@@ -2779,16 +2810,16 @@ impl HealingManager {
                 Ok(Ok(envelope)) => match envelope.message {
                     Message::Response(Response::ChunkLiveness { live }) => {
                         let live_set: HashSet<ChunkId> = live.into_iter().collect();
-                        candidates.iter().copied().filter(|id| !live_set.contains(id)).collect()
+                        Some(candidates.iter().copied().filter(|id| !live_set.contains(id)).collect())
                     }
                     _ => {
                         debug!("Live-file orphan sweep: deferring — unexpected response to ConfirmChunksLive from leader");
-                        Vec::new()
+                        None
                     }
                 },
                 _ => {
                     debug!("Live-file orphan sweep: deferring — ConfirmChunksLive failed/timed out against leader {}", leader_addr);
-                    Vec::new()
+                    None
                 }
             }
         }
@@ -7295,7 +7326,8 @@ mod tests {
             ChunkId::from_hash(compute_chunk_hash(b"b")),
         ];
         let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
-        assert_eq!(authorized.len(), 2, "no peers to fail the stability check — must authorize everything");
+        assert_eq!(authorized.expect("no peers to fail the stability check — must return a definitive answer, not defer").len(), 2,
+            "no peers to fail the stability check — must authorize everything");
     }
 
     /// Leader with an unreachable peer: the stability check cannot confirm the peer
@@ -7319,7 +7351,7 @@ mod tests {
 
         let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"c"))];
         let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
-        assert!(authorized.is_empty(), "unreachable peer must defer the whole batch, not authorize anything");
+        assert!(authorized.is_none(), "unreachable peer must defer (None), not authorize anything");
     }
 
     /// Non-leader node with an unreachable leader: ConfirmChunksLive cannot be
@@ -7341,7 +7373,71 @@ mod tests {
 
         let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"d"))];
         let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
-        assert!(authorized.is_empty(), "unreachable leader must defer, never authorize blindly");
+        assert!(authorized.is_none(), "unreachable leader must defer (None), never authorize blindly");
+    }
+
+    /// The actual 2026-08-22 incident: a chunk that has already earned its second
+    /// sighting (no live reference, twice) must NOT lose that progress just because
+    /// authorize_live_file_orphan_deletes deferred (an unreachable peer, say) rather
+    /// than definitively confirming it still-live. Before this fix,
+    /// reconcile_live_file_candidates removed the chunk from `orphan_candidates` to
+    /// build `ready_to_delete`, then returned early on `None` without ever putting it
+    /// back — so the very next sweep saw it as a brand-new "first sighting" again.
+    /// On a cluster that rarely goes two consecutive sweeps without some node
+    /// blipping, this let genuinely-dead chunks flicker between first-sighting and
+    /// deferred forever, never actually reaching deletion (confirmed live: 275+ such
+    /// chunks stuck for three weeks on staging).
+    #[tokio::test]
+    async fn disk_orphan_sweep_candidate_survives_deferred_authorization_and_deletes_next_pass() {
+        let (id_a, id_b) = {
+            let a = NodeId::new();
+            let b = NodeId::new();
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let local_addr: SocketAddr = "127.0.0.1:8908".parse().unwrap();
+        let (storage, _metadata, healing, _t1, _t2) = make_healing(id_a, local_addr);
+
+        // id_a (local) is the leader by construction (min NodeId). The peer address
+        // is unreachable, so the leader-side stability fetch in
+        // authorize_live_file_orphan_deletes cannot complete — every candidate must
+        // defer, not get confirmed either way.
+        let peer_addr: SocketAddr = "127.0.0.1:19996".parse().unwrap();
+        healing.cluster.add_node(dfs_common::NodeInfo::new(id_b, peer_addr, None)).await.unwrap();
+        assert!(healing.cluster.is_leader().await, "local node (min id) must be leader");
+
+        let chunk_id = ChunkId::from_hash(compute_chunk_hash(b"stuck-superseded-chunk"));
+        storage.write_chunk(&chunk_id, b"orphaned fold output").unwrap();
+        let old_ts = dfs_common::types::current_timestamp().saturating_sub(700);
+        storage.set_chunk_mtime(&chunk_id, old_ts);
+
+        // Pass 1: no live reference anywhere — first sighting only, nothing to
+        // authorize yet.
+        healing.run_disk_orphan_sweep_over(vec![chunk_id]).await;
+        assert!(healing.orphan_candidates.read().await.contains(&chunk_id),
+            "first pass must record the first sighting");
+        assert!(storage.get_chunk_path(&chunk_id).exists(), "must not delete on first sighting");
+
+        // Pass 2: second sighting reaches authorize_live_file_orphan_deletes, which
+        // defers (unreachable peer) — this is the exact call this fix changes.
+        healing.run_disk_orphan_sweep_over(vec![chunk_id]).await;
+        assert!(healing.orphan_candidates.read().await.contains(&chunk_id),
+            "a deferred authorization must NOT drop the candidate's already-earned second \
+             sighting — it must stay tracked as confirmed, not reset to first-sighting");
+        assert!(storage.get_chunk_path(&chunk_id).exists(), "must not delete while deferred");
+
+        // Drop the flaky peer entirely (simplest way to make the leader-side
+        // stability fetch resolve definitively again — a single-node "cluster" has
+        // no peer to fail the check).
+        healing.cluster.remove_node(&id_b).await.unwrap();
+
+        // Pass 3: with the flaky peer gone, this must delete IMMEDIATELY — proving no
+        // sighting progress was lost. Under the old bug, this pass would only log
+        // another "first sighting" (since pass 2 wiped it out), requiring a further
+        // pass 4 to actually delete.
+        healing.run_disk_orphan_sweep_over(vec![chunk_id]).await;
+        assert!(!storage.get_chunk_path(&chunk_id).exists(),
+            "a candidate whose second sighting survived a deferred authorization must delete \
+             on the very next clean pass, not need a fresh two-pass cycle");
     }
 
     /// Answers GetOrphanAuthInfo with a stable, no-pending-ids response, counting
@@ -7402,11 +7498,11 @@ mod tests {
         let candidates = vec![ChunkId::from_hash(compute_chunk_hash(b"e"))];
 
         let first = healing.authorize_live_file_orphan_deletes(&candidates).await;
-        assert_eq!(first, candidates, "first call: peer is stable and reachable, must authorize");
+        assert_eq!(first, Some(candidates.clone()), "first call: peer is stable and reachable, must authorize");
         assert_eq!(calls.load(Ordering::Relaxed), 1, "first call must fetch from the peer");
 
         let second = healing.authorize_live_file_orphan_deletes(&candidates).await;
-        assert_eq!(second, candidates, "second call must return the same authorization, from cache");
+        assert_eq!(second, Some(candidates.clone()), "second call must return the same authorization, from cache");
         assert_eq!(calls.load(Ordering::Relaxed), 1,
             "second call within the TTL must reuse the cached result — expected still 1 peer call, got {}",
             calls.load(Ordering::Relaxed));
@@ -7452,7 +7548,7 @@ mod tests {
         let authorized = healing.authorize_live_file_orphan_deletes(&candidates).await;
         let elapsed = start.elapsed();
 
-        assert!(authorized.is_empty(), "every peer times out — must defer, not authorize");
+        assert!(authorized.is_none(), "every peer times out — must defer (None), not authorize");
         // Sequential (old: 2 RPCs/peer, one peer at a time) would be up to
         // 4 * 2 * 5s = 40s; concurrent (new: 1 RPC/peer, all peers at once)
         // should land close to one timeout's worth. Generous margin for CI.

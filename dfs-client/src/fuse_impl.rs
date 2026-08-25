@@ -3192,6 +3192,13 @@ impl FlushHandle {
                                 }
                                 }
                             }
+                            // Must notify even on this early-exit path — flush_all_pipelined
+                            // is waiting for this chunk's completion regardless of which
+                            // branch handled it, and a skipped notify here leaves it waiting
+                            // forever (see this function's earlier "CRITICAL: must notify
+                            // after cleanup" comment on the normal success path — the same
+                            // invariant applies to every return point, not just that one).
+                            self.notify_chunk_flush_complete(ino, chunk_idx).await;
                             return Ok(());
                         }
                         if let Some(loc) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
@@ -3631,9 +3638,18 @@ impl FlushHandle {
                                 );
                             }
                         }
+                        // See the patch-path's identical "file replaced" branch above for why
+                        // this must notify before returning — flush_all_pipelined waits on
+                        // this chunk's completion regardless of which branch handles it.
+                        self.notify_chunk_flush_complete(ino, chunk_idx).await;
                         return Ok(());
                     }
                     if self.truncated_inodes.contains(&ino) {
+                        // Same invariant: a caller may be waiting on this chunk's completion
+                        // even though there's nothing left to flush (truncated to zero
+                        // underneath this in-flight write) — notify or flush_all_pipelined
+                        // waits forever.
+                        self.notify_chunk_flush_complete(ino, chunk_idx).await;
                         return Ok(());
                     }
                     for loc in &locations {

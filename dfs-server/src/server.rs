@@ -578,6 +578,10 @@ pub struct Server {
     /// Count of reads served via the (file_id, chunk_idx) slot backstop — see
     /// resolve_by_slot. A high rate means clients are being handed stale chunk maps.
     slot_backstop_hits: Arc<std::sync::atomic::AtomicU64>,
+    /// Last time resolve_by_slot escalated to a CHUNK_TABLE re-derivation for a
+    /// file, to keep that spawn_blocking scan off every failed read of a slot whose
+    /// re-derived winner simply isn't on this node. See resolve_by_slot.
+    slot_rederive_attempts: Arc<DashMap<FileId, std::time::Instant>>,
 
     /// Number of run_single_fold calls currently in flight cluster-wide-per-
     /// this-node, regardless of trigger (client-driven ForceFold or the idle
@@ -5155,6 +5159,7 @@ impl Server {
             // client staleness window can reference.
             retired_chunk_aliases: Arc::new(ShardedAliasMap::new(65536)),
             slot_backstop_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            slot_rederive_attempts: Arc::new(DashMap::new()),
             active_fold_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_cluster_write_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ops_tracker: Arc::new(OpsTracker::new()),
@@ -7484,23 +7489,75 @@ impl Server {
     /// slot the client asked for by a stale id is correct, but a HIGH rate of it
     /// means something upstream is handing clients stale chunk maps, and that
     /// should be visible rather than silently absorbed.
+    ///
+    /// chunk_map is a CACHE, and the doc above overstated its authority: it can
+    /// itself be stuck on a retired identity that CHUNK_TABLE has already
+    /// arbitrated away. When that happens this backstop resolves the slot to the
+    /// very id that just failed and returns None — useless in exactly the case it
+    /// exists for. Root-caused 2026-08-25 on VM-108 chunk_idx 2984 (see
+    /// reconstruct_or_abort_for_fresh_write in the client for the full incident):
+    /// chunk_map held `df7cbe06…` (is_fold=false, physically absent everywhere)
+    /// while CHUNK_TABLE's location_supersedes arbitration had long since picked
+    /// the fold winner `467b5a3a…`, intact on three replicas throughout. So on an
+    /// unreadable cache answer, escalate to authoritative re-derivation rather
+    /// than giving up on the cache's word.
     async fn resolve_by_slot(&self, file_id: FileId, chunk_idx: u64) -> Option<Arc<Vec<u8>>> {
-        let current_id = {
-            let entry = self.chunk_map.get(&file_id)?;
+        let cached_id = self.chunk_map.get(&file_id).and_then(|entry| {
             let (locs, _) = entry.value();
-            let i = Self::chunk_map_find_by_idx(locs, chunk_idx)?;
-            locs[i].chunk_id
-        };
-        match self.resolve_chunk_content(current_id).await {
+            Self::chunk_map_find_by_idx(locs, chunk_idx).map(|i| locs[i].chunk_id)
+        });
+        if let Some(current_id) = cached_id {
+            match self.resolve_chunk_content(current_id).await {
+                Ok(arc) => {
+                    let n = self.slot_backstop_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    info!("resolve_by_slot: served current chunk {} for retired id at (file={}, chunk_idx={}) — slot backstop hit #{}",
+                        current_id, file_id, chunk_idx, n);
+                    return Some(arc);
+                }
+                Err(e) => {
+                    debug!("resolve_by_slot: cached chunk {} for (file={}, chunk_idx={}) unreadable: {} — re-deriving from CHUNK_TABLE",
+                        current_id, file_id, chunk_idx, e);
+                }
+            }
+        }
+        // Throttled per file: re_derive_and_repair_chunk_map runs a spawn_blocking
+        // CHUNK_TABLE scan and REPAIRS chunk_map, so the common case self-limits —
+        // one scan fixes the cache and every later request hits the corrected entry
+        // above. The cooldown covers the case that does NOT self-limit: when the
+        // re-derived winner is legitimately absent from THIS node (it lives on other
+        // replicas), where an unthrottled escalation would put a full scan on every
+        // failed read of that slot.
+        const REDERIVE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.slot_rederive_attempts.get(&file_id) {
+            if now.duration_since(*last.value()) < REDERIVE_COOLDOWN {
+                return None;
+            }
+        }
+        self.slot_rederive_attempts.insert(file_id, now);
+        let (fresh_locations, _) = self.re_derive_and_repair_chunk_map(file_id).await;
+        const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+        let fresh_id = fresh_locations.iter()
+            .find(|l| l.file_offset.map(|o| o / CHUNK_SIZE) == Some(chunk_idx))
+            .map(|l| l.chunk_id)?;
+        if Some(fresh_id) == cached_id {
+            // Re-derivation agrees with the cache — the content is genuinely gone
+            // from this node, not a staleness artifact. Keep the caller's error.
+            return None;
+        }
+        match self.resolve_chunk_content(fresh_id).await {
             Ok(arc) => {
                 let n = self.slot_backstop_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                info!("resolve_by_slot: served current chunk {} for retired id at (file={}, chunk_idx={}) — slot backstop hit #{}",
-                    current_id, file_id, chunk_idx, n);
+                warn!("resolve_by_slot: chunk_map was STALE for (file={}, chunk_idx={}) — cached {:?} unreadable, \
+                       CHUNK_TABLE re-derivation corrected it to {} and served it (slot backstop hit #{}). \
+                       chunk_map has been repaired; a repeat of this for the same slot means something \
+                       upstream keeps re-poisoning it.",
+                    file_id, chunk_idx, cached_id, fresh_id, n);
                 Some(arc)
             }
             Err(e) => {
-                debug!("resolve_by_slot: current chunk {} for (file={}, chunk_idx={}) unreadable: {}",
-                    current_id, file_id, chunk_idx, e);
+                debug!("resolve_by_slot: re-derived chunk {} for (file={}, chunk_idx={}) also unreadable: {}",
+                    fresh_id, file_id, chunk_idx, e);
                 None
             }
         }

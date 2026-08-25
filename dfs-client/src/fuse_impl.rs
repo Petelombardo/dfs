@@ -2439,11 +2439,70 @@ impl FlushHandle {
         // fails, so it doesn't change behavior for the common case. Candidate order is
         // preserved (old_location first) because dirty_ranges are deltas relative to
         // that base — see the caller.
-        let selected = select_reconstruction_base(
+        let mut selected = select_reconstruction_base(
             candidate_ids,
             |id| self.client.chunk_cache.get(id),
             |id| self.client.read_chunk_by_id(id, &[], Some((file_id, chunk_idx))),
         ).await;
+        // Every candidate failed. Before declaring the base unrecoverable, escalate to
+        // RevalidateChunkSlot — the ONE path that bypasses the leader's `chunk_map`
+        // cache and re-derives the slot's winner from authoritative CHUNK_TABLE
+        // arbitration (re_derive_and_repair_chunk_map).
+        //
+        // This matters because every other recovery route above funnels through that
+        // same cache, so a poisoned entry defeats all of them at once:
+        //   - the caller's leader-refresh (get_single_chunk_location → GetFileChunkMap)
+        //     re-reads chunk_map and hands back the very id that just failed;
+        //   - read_chunk_by_id's (file_id, chunk_idx) slot hint reaches the server's
+        //     resolve_by_slot backstop, which ALSO resolves the slot via chunk_map.
+        // Root-caused 2026-08-25 on VM-108 chunk_idx 2984: chunk_map was stuck on a
+        // retired, physically-absent token (`df7cbe06…`, is_fold=false) while
+        // CHUNK_TABLE arbitration had long since picked the fold winner
+        // (`467b5a3a…`), which was intact on three replicas the entire time. The flush
+        // retried 37 times over 622s, logged `leader_id == base_id` each round, then
+        // gave up and discarded the guest's dirty bytes — a real EIO that aborted the
+        // VM's filesystem over data that was never actually lost.
+        //
+        // The read path already got exactly this recovery in f6aab87
+        // (wait_for_chunk_in_cache); the write path never did, which is why reads of
+        // that disk kept succeeding while writes wedged permanently. Doing it here,
+        // rather than at the caller, covers both routes into this function (the
+        // leader-refresh retry and the MAX_PATCH_FAILURES valve) at their single
+        // convergence point.
+        if let (None, Some(&distrust)) = (&selected, candidate_ids.first()) {
+            match self.client.revalidate_chunk_slot(file_id, chunk_idx, distrust).await {
+                Ok(Some(loc)) if !candidate_ids.contains(&loc.chunk_id) => {
+                    info!("flush_buffer_async_one: ino={} chunk={} revalidate corrected slot {} -> {} — retrying reconstruction base",
+                        ino, chunk_idx, distrust, loc.chunk_id);
+                    // Repair the local cache so the next flush starts from the correct
+                    // identity instead of re-walking this whole recovery.
+                    if let Some(mut meta_entry) = self.metadata_cache.get_mut(&ino) {
+                        if let Some(existing) = meta_entry.chunk_location_for_idx_mut(chunk_idx) {
+                            *existing = loc.clone();
+                        }
+                    }
+                    selected = select_reconstruction_base(
+                        &[loc.chunk_id],
+                        |id| self.client.chunk_cache.get(id),
+                        |id| self.client.read_chunk_by_id(id, &[], Some((file_id, chunk_idx))),
+                    ).await;
+                }
+                Ok(Some(_)) => {
+                    // Re-derivation confirmed the same id we already failed on — a
+                    // genuine double-checked answer, not a staleness artifact. Fall
+                    // through to the abort below rather than retrying the same read.
+                    debug!("flush_buffer_async_one: ino={} chunk={} revalidate confirmed {} — still unreadable",
+                        ino, chunk_idx, distrust);
+                }
+                Ok(None) => {
+                    warn!("flush_buffer_async_one: ino={} chunk={} revalidate found no CHUNK_TABLE record for the slot",
+                        ino, chunk_idx);
+                }
+                Err(e) => {
+                    warn!("flush_buffer_async_one: ino={} chunk={} revalidate failed: {}", ino, chunk_idx, e);
+                }
+            }
+        }
         if let Some((base_id, base_arc)) = selected {
             // Warm the cache with whatever we ended up using (idempotent for a cache
             // hit; populates it after a cluster fetch so an immediate retry is free).
@@ -10030,6 +10089,255 @@ mod terminal_give_up_tests {
             "gave-up slot must be removed from active_chunks, not linger as a phantom entry");
         assert_eq!(global_buffered_bytes.load(std::sync::atomic::Ordering::Relaxed), 0,
             "discarded bytes must actually leave global_buffered_bytes accounting");
+    }
+}
+
+#[cfg(test)]
+mod poisoned_chunk_map_recovery_tests {
+    use super::*;
+    use dfs_common::{ErrorCode, Message, MessageEnvelope, Request, Response};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn write_envelope(stream: &mut tokio::net::TcpStream, request_id: dfs_common::RequestId, response: Response) {
+        use tokio::io::AsyncWriteExt;
+        let envelope = MessageEnvelope::new(request_id, Message::Response(response));
+        let encoded = envelope.to_bytes().unwrap();
+        let len = encoded.len() as u32;
+        let _ = stream.write_all(&len.to_be_bytes()).await;
+        let _ = stream.write_all(&encoded).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Mock storage node reproducing the 2026-08-25 VM-108 chunk_idx-2984 wedge.
+    ///
+    /// `stale_id` is the retired token the leader's poisoned `chunk_map` keeps
+    /// handing out; it is physically absent, so every ReadChunk for it 404s —
+    /// including the (file_id, chunk_idx) slot-backstop retry, because the real
+    /// server's resolve_by_slot resolves the slot through that same poisoned cache
+    /// and lands right back on `stale_id`. That is the trap: the slot hint, which
+    /// normally rescues this case, is defeated by the identical stale entry.
+    ///
+    /// Only RevalidateChunkSlot escapes it — the real handler answers from
+    /// re_derive_and_repair_chunk_map (authoritative CHUNK_TABLE arbitration), so
+    /// this mock answers it with `fresh_id`, whose content is intact and served.
+    fn spawn_poisoned_chunk_map_mock(
+        addr: SocketAddr,
+        file_id: dfs_common::FileId,
+        chunk_idx: u64,
+        stale_id: dfs_common::ChunkId,
+        fresh_id: dfs_common::ChunkId,
+        fresh_content: Vec<u8>,
+        revalidate_enabled: bool,
+    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        let revalidate_calls = Arc::new(AtomicUsize::new(0));
+        let stale_reads = Arc::new(AtomicUsize::new(0));
+        let (rc, sr) = (revalidate_calls.clone(), stale_reads.clone());
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(_) => return, // address already in use by a previous test run
+            };
+            loop {
+                let (mut stream, _) = match listener.accept().await { Ok(x) => x, Err(_) => return };
+                let fresh_content = fresh_content.clone();
+                let (rc, sr) = (rc.clone(), sr.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).await.is_err() { return; }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; len];
+                        if stream.read_exact(&mut buf).await.is_err() { return; }
+                        let Ok(envelope) = MessageEnvelope::from_bytes(&buf) else { return };
+                        let request_id = envelope.request_id;
+                        let Message::Request(req) = envelope.message else { return };
+                        match req {
+                            // The physically-present winner: served normally.
+                            Request::ReadChunk { chunk_id, .. } if chunk_id == fresh_id => {
+                                let resp = Response::ChunkData {
+                                    chunk_id: fresh_id,
+                                    data: Vec::new(),
+                                    cache_stats: None,
+                                    arc_data: None,
+                                    arc_range: None,
+                                };
+                                let env = MessageEnvelope::new(request_id, Message::Response(resp));
+                                let _ = dfs_common::protocol::write_chunk_response(
+                                    &mut stream, &env, &fresh_content,
+                                ).await;
+                            }
+                            // The retired token — gone from disk. The slot hint does
+                            // NOT save this read: resolve_by_slot consults the same
+                            // poisoned chunk_map and re-derives `stale_id` again.
+                            Request::ReadChunk { chunk_id, .. } if chunk_id == stale_id => {
+                                sr.fetch_add(1, Ordering::SeqCst);
+                                write_envelope(&mut stream, request_id, Response::Error {
+                                    message: format!("Chunk {} not found on this node", stale_id),
+                                    code: ErrorCode::NotFound,
+                                }).await;
+                            }
+                            Request::RevalidateChunkSlot { file_id: f, chunk_idx: c, .. }
+                                if revalidate_enabled && f == file_id && c == chunk_idx =>
+                            {
+                                rc.fetch_add(1, Ordering::SeqCst);
+                                let loc = dfs_common::ChunkLocation {
+                                    chunk_id: fresh_id,
+                                    nodes: vec![],
+                                    size: fresh_content.len(),
+                                    checksum: [0u8; 32],
+                                    written_at: None,
+                                    client_write_seq: None,
+                                    file_id: Some(file_id),
+                                    file_offset: Some(chunk_idx * 4 * 1024 * 1024),
+                                };
+                                write_envelope(&mut stream, request_id, Response::FileChunkMap {
+                                    file_id,
+                                    locations: vec![loc],
+                                    from_chunk: chunk_idx as u32,
+                                    total_chunks: chunk_idx as u32 + 1,
+                                    write_seq: 0,
+                                }).await;
+                            }
+                            _ => {
+                                write_envelope(&mut stream, request_id, Response::Error {
+                                    message: "unhandled in mock".to_string(),
+                                    code: ErrorCode::InternalError,
+                                }).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (revalidate_calls, stale_reads)
+    }
+
+    async fn run_reconstruction(
+        addr: SocketAddr,
+        file_id: dfs_common::FileId,
+        chunk_idx: u64,
+        stale_id: dfs_common::ChunkId,
+        dirty: &[u8],
+    ) -> (Result<()>, Vec<u8>) {
+        // leader_addr is private to DfsClient; revalidate_chunk_slot falls back to
+        // cluster_nodes.first() when it is unset, which routes to the mock here.
+        let client = Arc::new(DfsClient::new(vec![addr]).unwrap());
+        *client.cluster_nodes.write().await = vec![addr];
+
+        let ino = 27108u64;
+        let write_buffers: Arc<DashMap<u64, Arc<InodeWriteBuffer>>> = Arc::new(DashMap::new());
+        let buf = Arc::new(InodeWriteBuffer::new(false));
+        write_buffers.insert(ino, buf.clone());
+        {
+            let shard = buf.chunk_entry(chunk_idx);
+            let mut cs = shard.lock().await;
+            cs.slot.extents.push((0, dirty.to_vec()));
+            cs.slot.span_end = dirty.len();
+            cs.slot.real_data_end = dirty.len();
+            cs.slot.dirty_ranges = vec![(0, dirty.len())];
+            buf.active_chunks.insert(chunk_idx);
+        }
+
+        let handle = FlushHandle {
+            client: client.clone(),
+            write_buffers: write_buffers.clone(),
+            metadata_cache: Arc::new(DashMap::new()),
+            chunk_write_locks: Arc::new(DashMap::new()),
+            flush_in_flight: Arc::new(RwLock::new(None)),
+            last_metadata_update: Arc::new(DashMap::new()),
+            last_bg_metadata_push: Arc::new(DashMap::new()),
+            dir_cache: Arc::new(DashMap::new()),
+            dir_cache_invalidated_at: Arc::new(DashMap::new()),
+            path_to_inode: Arc::new(RwLock::new(HashMap::new())),
+            inode_to_path: Arc::new(RwLock::new(HashMap::new())),
+            truncated_inodes: Arc::new(dashmap::DashSet::new()),
+            explicit_mtime_pending: Arc::new(dashmap::DashSet::new()),
+            flush_runtime: Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            global_buffered_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(dirty.len())),
+            global_flush_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            write_tasks_in_flight: Arc::new(DashMap::new()),
+            flush_pipeline_locks: Arc::new(DashMap::new()),
+            use_dual_rf: false,
+            write_open_counts: Arc::new(DashMap::new()),
+            patch_prefetch_hints: Arc::new(std::sync::Mutex::new(Arc::new(HashMap::new()))),
+        };
+
+        let mut slot_data = dirty.to_vec();
+        let result = handle.reconstruct_or_abort_for_fresh_write(
+            ino, file_id, chunk_idx, &mut slot_data, &[(0, dirty.len())], &[stale_id],
+        ).await;
+        // Owned Runtime must not drop inside another runtime's async context.
+        tokio::task::spawn_blocking(move || drop(handle)).await.unwrap();
+        (result, slot_data)
+    }
+
+    /// Regression test for the 2026-08-25 VM-108 wedge (chunk_idx 2984).
+    ///
+    /// The leader's `chunk_map` was stuck on a retired, physically-absent token
+    /// while CHUNK_TABLE arbitration had already picked the fold winner, which was
+    /// intact on three replicas the whole time. Because BOTH of the client's
+    /// recovery routes — the caller's GetFileChunkMap leader-refresh and
+    /// read_chunk_by_id's slot-backstop hint — resolve through that same cache,
+    /// they each returned the dead id, and the flush retried 37 times over 622s
+    /// before discarding the guest's dirty bytes and returning EIO. That EIO
+    /// aborted the VM's filesystem over data that was never actually lost.
+    ///
+    /// `revalidate_enabled=false` reproduces the pre-fix world exactly (the client
+    /// never asks, so the mock never answers): reconstruction must fail. With it
+    /// enabled, the fix must escalate to RevalidateChunkSlot, get the corrected
+    /// identity, and rebuild the chunk with untouched bytes preserved.
+    #[tokio::test]
+    async fn poisoned_chunk_map_defeats_slot_hint_and_is_recovered_via_revalidate() {
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 2984u64;
+        let stale_id = dfs_common::ChunkId::from_hash([0xdfu8; 32]);
+        let fresh_id = dfs_common::ChunkId::from_hash([0x46u8; 32]);
+
+        // The real chunk content living on the replicas: 0xEE everywhere. The
+        // guest is rewriting only the first 4096 bytes; everything after must
+        // survive — fabricating zeros there is the corruption this guards.
+        let mut fresh_content = vec![0xEEu8; 4 * 1024 * 1024];
+        fresh_content[0..4096].copy_from_slice(&[0x11u8; 4096]);
+        let dirty = vec![0xABu8; 4096];
+
+        // --- Pre-fix behaviour: no RevalidateChunkSlot available ---
+        let addr_a: SocketAddr = "127.0.0.1:19511".parse().unwrap();
+        let (rc_a, stale_reads_a) = spawn_poisoned_chunk_map_mock(
+            addr_a, file_id, chunk_idx, stale_id, fresh_id, fresh_content.clone(), false,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (result_a, _) = run_reconstruction(addr_a, file_id, chunk_idx, stale_id, &dirty).await;
+        assert!(result_a.is_err(),
+            "BUG NOT REPRODUCED: without the revalidate escalation the base is unreachable \
+             (every ReadChunk for the retired id 404s, slot hint included) — this must fail, \
+             which is exactly the EIO that wedged VM-108");
+        assert!(stale_reads_a.load(Ordering::SeqCst) > 0,
+            "precondition: the client must actually have tried the retired id");
+        assert_eq!(rc_a.load(Ordering::SeqCst), 0,
+            "precondition: this leg models the pre-fix client, which never revalidates");
+
+        // --- Post-fix behaviour: escalation to authoritative re-derivation ---
+        let addr_b: SocketAddr = "127.0.0.1:19512".parse().unwrap();
+        let (rc_b, _) = spawn_poisoned_chunk_map_mock(
+            addr_b, file_id, chunk_idx, stale_id, fresh_id, fresh_content.clone(), true,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (result_b, slot_data) = run_reconstruction(addr_b, file_id, chunk_idx, stale_id, &dirty).await;
+        assert!(result_b.is_ok(),
+            "FIX FAILED: with RevalidateChunkSlot answering authoritatively the flush must \
+             recover instead of discarding the guest's write: {:?}", result_b.err());
+        assert!(rc_b.load(Ordering::SeqCst) > 0,
+            "FIX FAILED: the client never escalated to RevalidateChunkSlot — it is the only \
+             path that bypasses the poisoned chunk_map");
+        assert_eq!(slot_data.len(), 4 * 1024 * 1024,
+            "reconstructed chunk must be the full 4MB, not just the dirty span");
+        assert_eq!(&slot_data[0..4096], &dirty[..],
+            "the guest's dirty range must be preserved verbatim");
+        assert!(slot_data[4096..].iter().all(|&b| b == 0xEE),
+            "untouched bytes must come from the real fetched base — any zeros here would be \
+             the silent-corruption failure mode, not a recovery");
     }
 }
 

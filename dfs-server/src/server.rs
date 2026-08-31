@@ -2406,6 +2406,12 @@ impl OverlayForkCtx {
     /// see MIN_PENDING_AGE_BEFORE_FILE_ABANDON_CHECK's doc comment. Caller
     /// gates on age; this function trusts whatever it's told.
     ///
+    /// `patch_client_write_seq` is the Pending patch's own delta seq, needed
+    /// because "a different occupant" is NOT on its own proof this patch is
+    /// dead — the occupant must also be causally LATER. See the causality
+    /// guard in the body for the 2026-08-30 VM-108 incident where an
+    /// eleven-day-stale occupant caused three nodes to delete a live write.
+    ///
     /// Returns true if the patch was abandoned (caller should return early
     /// without attempting any chunk read/hash work for it).
     async fn abandon_patch_if_slot_superseded(
@@ -2413,10 +2419,12 @@ impl OverlayForkCtx {
         file_id: FileId,
         chunk_idx: u64,
         public_token: ChunkId,
+        patch_client_write_seq: Option<u64>,
     ) -> bool {
         let current = self.chunk_map.get(&file_id).and_then(|entry| {
             let (locs, _) = entry.value();
-            Server::chunk_map_find_by_idx(locs, chunk_idx).map(|pos| locs[pos].chunk_id)
+            Server::chunk_map_find_by_idx(locs, chunk_idx)
+                .map(|pos| (locs[pos].chunk_id, locs[pos].client_write_seq))
         });
         // Only a CONFIRMED different occupant counts as superseded. `current == None`
         // (no chunk_map entry for this file/slot at all) is ambiguous, not negative
@@ -2427,11 +2435,56 @@ impl OverlayForkCtx {
         // from-scratch map hasn't been populated for it yet. Only unconditionally
         // ungating this check (see this function's call site) surfaced the gap — it
         // was always present, just unreachable behind the old 600s age gate.
-        let Some(current) = current else {
+        let Some((current, current_write_seq)) = current else {
             return false; // unknown, not superseded — proceed, don't abandon on ambiguity
         };
         if current == public_token {
             return false; // still the current occupant — genuinely needs folding
+        }
+        // A DIFFERENT occupant is not by itself evidence this patch is dead: it also
+        // has to be causally LATER. Root-caused 2026-08-30 (VM-108, file c42fa744,
+        // chunk_idx 2981 — the incident this guard exists for): gluster2/3/4 held an
+        // ELEVEN-DAY-OLD occupant (`1aea6eba…`, client_write_seq 163) in their local
+        // chunk_map, because the intervening fold's CHUNK_TABLE row never reached
+        // them and `location_supersedes`' durability guard then refused the new
+        // patch's own registration — its locally-known replica count (1) was below
+        // the stale row's claimed 2-3, exactly the "single-replica phantom" shape
+        // that guard exists to reject. Twenty seconds after the patch landed, all
+        // three nodes ran this check, saw the ancient occupant, and DELETED
+        // `df7ccd53…` (client_write_seq 38792) — a live, legitimate write — along
+        // with its delta. The leader meanwhile still named the token as the slot's
+        // current chunk, so every later read of chunk_idx 2981 either EIO'd or was
+        // served the eleven-day-old bytes. VM-108 could not boot.
+        //
+        // Ordering follows `location_supersedes`' own precedence: per-slot
+        // generation is authoritative when BOTH sides have one, client_write_seq is
+        // the fallback (it TIES rather than increments across fold generations under
+        // the pure-max `fold_successor_write_seq` rule, so a legitimate fold
+        // successor compares equal and is correctly still treated as superseding).
+        // When neither clock can order the pair we keep the old behaviour and
+        // abandon — this guard only fires on POSITIVE evidence that the map is
+        // behind, never on ambiguity, so it cannot resurrect the chronically-stuck
+        // Pending patches abandon_patch_if_slot_superseded was built to retire.
+        //
+        // Declining here is safe in the way abandoning is not: the fold simply runs,
+        // and either consolidates normally or fails its own base/hash verification
+        // and stays Pending for a later retry. Abandoning is unrecoverable.
+        let patch_gen = self.chunk_generations.get(&public_token).map(|v| *v);
+        let current_gen = self.chunk_generations.get(&current).map(|v| *v);
+        let occupant_is_causally_behind = match (current_gen, patch_gen) {
+            (Some(cur), Some(patch)) if cur != patch => cur < patch,
+            _ => match (current_write_seq, patch_client_write_seq) {
+                (Some(cur), Some(patch)) => cur < patch,
+                _ => false,
+            },
+        };
+        if occupant_is_causally_behind {
+            warn!("single fold: file {} chunk_idx {} chunk_map names {:?} (gen {:?}, seq {:?}) but that is \
+                   causally BEHIND Pending patch {} (gen {:?}, seq {:?}) — this node's map is stale, not \
+                   ahead; NOT abandoning. Folding anyway; a real supersede would compare equal or later.",
+                file_id, chunk_idx, current, current_gen, current_write_seq,
+                public_token, patch_gen, patch_client_write_seq);
+            return false;
         }
         warn!("single fold: file {} chunk_idx {} slot's current chunk_map entry ({:?}) no longer matches \
                Pending patch {} — slot was superseded by a different path; abandoning unfoldable patch",
@@ -3163,7 +3216,7 @@ impl OverlayForkCtx {
         // this function's fold_hash_semaphore acquire instrumentation just below.
         // The check itself is a single DashMap lookup — cheap enough to run on
         // every fold, not just ones that already waited 10 minutes.
-        if self.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token).await {
+        if self.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token, delta_client_write_seq).await {
             return None;
         }
 
@@ -19056,6 +19109,125 @@ mod tests {
         assert_eq!(current, Some(superseding_token),
             "the newer write's location must survive untouched — an abandoned stale \
              fold must never overwrite a slot it no longer has authority over");
+    }
+
+    /// REPRO (2026-08-30, VM-108 `vm-108-disk-0.qcow2` / file c42fa744 / chunk_idx
+    /// 2981 — the incident that left the VM unbootable and cost the last flush
+    /// before shutdown).
+    ///
+    /// `abandon_patch_if_slot_superseded` DELETES a Pending patch's state, which is
+    /// unrecoverable, on the strength of a single node-local chunk_map lookup. Its
+    /// justification for trusting that map unconditionally (see the UNGATED comment
+    /// at its call site) is that chunk_map is "synchronously updated by this node's
+    /// own apply_patch before responding to any client". Live counter-example: on
+    /// gluster2/3/4 the new patch's own registration was REFUSED by
+    /// `location_supersedes`' durability guard — those nodes knew of only 1 replica
+    /// for the fresh token while a stale row claimed 2-3, the exact
+    /// "single-replica phantom" shape that guard rejects — so their chunk_map stayed
+    /// pinned to `1aea6eba…` (client_write_seq 163), written ELEVEN DAYS earlier,
+    /// while the live patch `df7ccd53…` carried client_write_seq 38792. Twenty
+    /// seconds after the patch landed, all three nodes concluded "superseded" and
+    /// deleted it, along with its delta. The leader still named the token as the
+    /// slot's current chunk, so every subsequent read of chunk_idx 2981 either
+    /// EIO'd or was served eleven-day-old bytes.
+    ///
+    /// The real-incident seq values are used verbatim. Nothing here is timing- or
+    /// load-dependent: it is purely the ordering decision that destroyed the data.
+    #[tokio::test]
+    async fn test_abandon_declines_when_chunk_map_occupant_is_causally_behind() {
+        let temp_storage = TempDir::new().unwrap();
+        let temp_metadata = TempDir::new().unwrap();
+        let temp_metadata_dir = TempDir::new().unwrap();
+
+        let storage = Arc::new(ChunkStorage::new(temp_storage.path().to_path_buf()).unwrap());
+        let metadata = Arc::new(MetadataStore::new(temp_metadata.path().to_path_buf()).unwrap());
+
+        let node_id = NodeId::new();
+        let addr: SocketAddr = "127.0.0.1:8900".parse().unwrap();
+        let cluster = Arc::new(ClusterManager::new(node_id, addr, 10, 30));
+
+        let server = Server::new(
+            storage.clone(), metadata.clone(), 4 * 1024 * 1024, cluster.clone(), 3,
+            temp_metadata_dir.path().to_path_buf(), temp_metadata_dir.path().join("config.toml"), true,
+        );
+
+        let file_id = dfs_common::FileId::new();
+        let chunk_idx = 2981u64;
+        let chunk_file_offset = chunk_idx * 4 * 1024 * 1024;
+
+        // The live Pending patch (`df7ccd53…` in the incident).
+        let public_token = ChunkId::from_hash(compute_chunk_hash(b"live-patch-token-2981"));
+        // The eleven-day-stale occupant this node's chunk_map is stuck on
+        // (`1aea6eba…`), still claiming a healthy replica set.
+        let stale_occupant = ChunkId::from_hash(compute_chunk_hash(b"eleven-day-old-occupant"));
+
+        let put_occupant = |chunk_id: ChunkId, seq: Option<u64>| {
+            server.chunk_map_ref().insert(file_id, (vec![ChunkLocation {
+                chunk_id,
+                nodes: vec![node_id],
+                size: 4 * 1024 * 1024,
+                checksum: [0u8; 32],
+                file_offset: Some(chunk_file_offset),
+                written_at: Some(dfs_common::types::current_timestamp()),
+                client_write_seq: seq,
+                file_id: Some(file_id),
+            }], 1));
+        };
+
+        let ctx = server.overlay_ctx();
+
+        // --- The incident, by client_write_seq (chunk_generations is in-memory and
+        // was empty on those nodes after the 2026-08-25 restart, so seq is what the
+        // ordering actually fell back to).
+        put_occupant(stale_occupant, Some(163));
+        assert!(
+            !ctx.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token, Some(38792)).await,
+            "chunk_map naming an occupant with a LOWER client_write_seq (163) than the Pending \
+             patch (38792) means this node's map is behind, not ahead — abandoning there deletes \
+             a live write and its delta irrecoverably, which is exactly what left VM-108 unbootable"
+        );
+
+        // --- A genuine supersede by a later ordinary write must still be abandoned:
+        // the guard must fire only on positive evidence the map is behind, or it
+        // would resurrect the chronically-stuck Pending patches this function exists
+        // to retire (RESUME_SWEEP_PRESUMED_CHRONIC_AGE_SECS).
+        let newer_write = ChunkId::from_hash(compute_chunk_hash(b"genuinely-newer-write"));
+        put_occupant(newer_write, Some(38793));
+        assert!(
+            ctx.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token, Some(38792)).await,
+            "an occupant with a strictly HIGHER seq is a real supersede and must still be abandoned"
+        );
+
+        // --- A fold successor TIES rather than increments (pure-max
+        // `fold_successor_write_seq`, the T28 trap forbids minting), so equal seq
+        // must still count as superseded.
+        let fold_successor = ChunkId::from_hash(compute_chunk_hash(b"fold-successor"));
+        put_occupant(fold_successor, Some(38792));
+        assert!(
+            ctx.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token, Some(38792)).await,
+            "a fold successor carries an EQUAL seq by design and must still count as superseding"
+        );
+
+        // --- Per-slot generation is authoritative when both sides have one, and
+        // must override the seq fallback in both directions.
+        let gen_behind = ChunkId::from_hash(compute_chunk_hash(b"older-generation-occupant"));
+        put_occupant(gen_behind, Some(99999)); // seq alone would say "supersede"
+        server.record_chunk_generation(public_token, 500);
+        server.record_chunk_generation(gen_behind, 499);
+        assert!(
+            !ctx.abandon_patch_if_slot_superseded(file_id, chunk_idx, public_token, Some(38792)).await,
+            "a strictly-lower per-slot generation is authoritative and must veto the seq fallback"
+        );
+
+        // --- Ambiguity (neither clock can order the pair) keeps the old behaviour:
+        // abandon. This guard fires only on positive evidence.
+        let unordered_occupant = ChunkId::from_hash(compute_chunk_hash(b"unordered-occupant"));
+        let unordered_patch = ChunkId::from_hash(compute_chunk_hash(b"unordered-patch-token"));
+        put_occupant(unordered_occupant, None);
+        assert!(
+            ctx.abandon_patch_if_slot_superseded(file_id, chunk_idx, unordered_patch, None).await,
+            "with no generation and no seq on either side the pair is unordered — abandon, as before"
+        );
     }
 
     /// 2026-08-11: real VM-100 kdiskmark I/O errors (both the original disk's
